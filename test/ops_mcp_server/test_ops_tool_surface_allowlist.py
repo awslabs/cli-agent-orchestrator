@@ -360,6 +360,53 @@ class TestFailsClosed:
         assert reached == ["decision:off"]
 
 
+class TestAnEmptyIdentityIsNotAnOperatorContext:
+    """An explicitly empty ``CAO_TERMINAL_ID`` is a bound caller, and refused.
+
+    Found by independent review of #1062: boundness was
+    ``bool(os.environ.get("CAO_TERMINAL_ID"))``, so a PRESENT-but-empty value
+    took the unbound branch and every non-exempt ops tool dispatched as an
+    operator call with no row lookup (probe: ``EMPTY_ID outcome=allowed
+    lookup_calls=0``). Reachable from a profile: until the companion provider fix
+    a profile could list this server with ``env: {CAO_TERMINAL_ID: ""}``, omit
+    ``@cao-ops-mcp-server``, and hold the whole control plane.
+
+    The truth table for ``caller_is_bound`` itself is
+    ``test/security/test_mcp_tool_gate_boundness.py``.
+    """
+
+    @pytest.mark.parametrize("value", ["", " ", "\t"])
+    @pytest.mark.parametrize("tool", OPS_TOOLS)
+    def test_every_ops_tool_is_refused_without_a_lookup(self, tool, value, reached):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": value}):
+            with patch.object(mcp_utils, "get_json", side_effect=AssertionError) as lookup:
+                error = _dispatch(tool, ARGS[tool])
+        lookup.assert_not_called()
+        if tool in ops_gate.FAIL_SAFE_EXEMPT_TOOLS:
+            assert error is None, f"{tool} is the fail-safe but the gate refused it"
+            assert reached == ["decision:off"]
+            return
+        assert error is not None, (
+            f"{tool} dispatched for a caller whose CAO_TERMINAL_ID is {value!r}. An "
+            "empty or whitespace value is a caller claiming an identity that cannot "
+            "be resolved, not the operator context."
+        )
+        assert "could not be resolved" in error
+        assert reached == [], f"{tool} ran its body despite being refused"
+
+    @pytest.mark.parametrize("state", ["shadow", "on"])
+    def test_an_empty_identity_cannot_lift_a_halt(self, state, monkeypatch, tmp_path, reached):
+        """The halt is the thing the bypass was worth most: pin it directly."""
+        marker = tmp_path / "decisions.halt"
+        marker.touch()
+        monkeypatch.setattr(egress, "HALT_FILE", marker)
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            error = _dispatch("decisions_set_point", {"point": "model.route", "state": state})
+        assert error is not None and "could not be resolved" in error
+        assert reached == []
+        assert marker.exists()
+
+
 class TestTheSurfaceDeclarations:
     def test_the_argument_table_covers_every_ops_tool(self):
         assert set(ARGS) == set(OPS_TOOLS), (

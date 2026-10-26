@@ -64,8 +64,20 @@ def caller_is_bound() -> bool:
     malformed ``CAO_TERMINAL_ID`` and from its own trailing ``except Exception``.
     An unbound caller is the supported operator context -- ``cao assign`` and an
     operator's own MCP host run with no caller identity -- and is never gated.
+
+    PRESENCE is the question, not truthiness. ``bool(os.environ.get(...))``
+    collapsed three cases into two: the variable absent (the operator context),
+    present and usable (a bound terminal), and present but EMPTY -- which it read
+    as the operator context, so a caller supplying ``CAO_TERMINAL_ID=""`` was
+    never gated at all and no row was ever looked up. That value is reachable
+    from a profile (see ``utils.mcp_resolution.forward_terminal_identity``), so
+    the collapse was a bypass of both surfaces, not a theoretical one. A present
+    but empty or whitespace value is a caller CLAIMING an identity that cannot be
+    resolved, and resolution failure already denies -- which is where it now
+    lands, with the same wording as a malformed id. Found by independent review
+    of #1062.
     """
-    return bool(os.environ.get("CAO_TERMINAL_ID"))
+    return "CAO_TERMINAL_ID" in os.environ
 
 
 def caller_context_or_denial(
