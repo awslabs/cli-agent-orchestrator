@@ -17,6 +17,7 @@ import logging
 import os
 import pathlib
 import time
+import uuid
 from typing import Any, Dict
 from unittest.mock import patch
 
@@ -254,7 +255,8 @@ def _hermetic_ephemeral_store(monkeypatch, tmp_path_factory):
     from cli_agent_orchestrator.services import ephemeral_service
     from cli_agent_orchestrator.utils import agent_profiles, atomic_file
 
-    home = tmp_path_factory.mktemp("cao-home")
+    home = tmp_path_factory.getbasetemp() / "cao-homes" / uuid.uuid4().hex
+    home.mkdir(parents=True)
     monkeypatch.setattr(ephemeral_service, "EPHEMERAL_DIR", home / "ephemeral")
     monkeypatch.setattr(agent_profiles, "EPHEMERAL_LIVE_DIR", home / "ephemeral" / "live")
     monkeypatch.setattr(atomic_file, "LOCK_DIR", home / "locks")
