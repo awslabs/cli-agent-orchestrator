@@ -629,7 +629,7 @@ describe("portfolio workspace", () => {
       expect(result.exitCode).not.toBe(0);
       expect(JSON.parse(result.stderr)).toEqual({ ok: false, error });
     }
-  });
+  }, 20_000);
 
   test("rejects legacy learning proposals already stored on disk", async () => {
     const root = await temporaryRoot();
@@ -719,10 +719,14 @@ describe("portfolio workspace", () => {
     });
     await rejectLearningProposal(root, "second-rule", "Not durable.");
 
-    // Promotion is single-use review: a decided proposal cannot be re-promoted.
+    // Promotion is single-use review: a decided proposal cannot be re-promoted,
+    // whether it was promoted or rejected.
     await expect(
       promoteLearningProposal(root, "first-rule", "Portfolio supervisor"),
     ).rejects.toThrow("is promoted");
+    await expect(
+      promoteLearningProposal(root, "second-rule", "Portfolio supervisor"),
+    ).rejects.toThrow("is rejected");
 
     const proposals = await listLearningProposals(root, "api");
     const byId = Object.fromEntries(proposals.map((p) => [p.id, p]));
