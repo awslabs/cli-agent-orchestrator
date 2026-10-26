@@ -291,6 +291,17 @@ class TestServerEnv:
         monkeypatch.setattr(f"{MOD}.CAO_HOME_DIR", Path("/default/home"))
         assert "CAO_HOME_DIR" not in cao_server_env()
 
+    def test_wildcard_host_is_mapped_to_loopback(self, monkeypatch):
+        """#1075 note 4: an env-only CAO_API_HOST=0.0.0.0 must get the same
+        127.0.0.1 mapping main() applies to the --host flag, so the two paths
+        agree on what address a client can actually connect to."""
+        self._set(monkeypatch, CAO_API_HOST="0.0.0.0")
+        assert cao_server_env() == {"CAO_API_HOST": "127.0.0.1"}
+
+    def test_non_wildcard_host_passes_through(self, monkeypatch):
+        self._set(monkeypatch, CAO_API_HOST="10.0.0.5")
+        assert cao_server_env() == {"CAO_API_HOST": "10.0.0.5"}
+
     def test_the_entry_own_env_wins(self, monkeypatch):
         self._set(monkeypatch, CAO_API_PORT="9899")
         with patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"):

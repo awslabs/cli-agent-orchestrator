@@ -52,6 +52,11 @@ def cao_server_env() -> Dict[str, str]:
         # text. A child spawned in a different cwd would otherwise re-resolve a
         # relative value to a different, stray location of its own.
         env["CAO_HOME_DIR"] = str(CAO_HOME_DIR)
+    if env.get("CAO_API_HOST") == "0.0.0.0":
+        # Same mapping main() applies to the --host flag: an IPv4 wildcard
+        # bind is not a usable client address, so agents are pointed at
+        # loopback instead.
+        env["CAO_API_HOST"] = "127.0.0.1"
     return env
 
 
