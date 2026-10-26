@@ -31,8 +31,8 @@ USAGE_NORMALISER = 100
 
 # Whitelist for ``recall(sort_by=...)`` validation. Anything outside this
 # set raises ``ValueError`` — no silent fallback.
-SortBy = Literal["score", "recency", "usage"]
-SORT_BY_VALUES: frozenset = frozenset({"score", "recency", "usage"})
+SortBy = Literal["score", "recency", "usage", "relevance"]
+SORT_BY_VALUES: frozenset = frozenset({"score", "recency", "usage", "relevance"})
 
 # Scope precedence. Lower index = higher precedence in the
 # final scope-stable sort that runs AFTER score sorting in ``recall()``.
@@ -145,3 +145,24 @@ def scope_write_allowed(caller: str, target: str) -> bool:
     # by design: "Cross-sibling writes (project caller → agent
     # scope) are rejected."
     return bool(SCOPE_RANK[caller] > SCOPE_RANK[target])
+
+
+# Defaults proposed in #861, not yet measured; validate before any default change.
+RELEVANCE_RECENCY_FLOOR = 0.85
+RELEVANCE_RECENCY_SCALE_DAYS = 30.0
+
+
+def relevance_recency_factor(
+    updated_at: datetime,
+    *,
+    now: datetime,
+    floor: float = RELEVANCE_RECENCY_FLOOR,
+    scale_days: float = RELEVANCE_RECENCY_SCALE_DAYS,
+) -> float:
+    """Bound project-native age's relative effect; naive timestamps mean UTC."""
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    days = max(0.0, (now - updated_at).total_seconds() / 86400.0)
+    return floor + (1.0 - floor) / (1.0 + days / scale_days)

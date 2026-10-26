@@ -4,8 +4,6 @@ from unittest.mock import patch
 
 import pytest
 
-from cli_agent_orchestrator.api.main import app
-
 
 class TestGetAgentDirsEndpoint:
     """Tests for GET /settings/agent-dirs endpoint."""

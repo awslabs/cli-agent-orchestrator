@@ -13,6 +13,7 @@ Also exposes shared security fixtures (RSA keys, JWKS stub,
 that need to exercise the Auth0 paths.
 """
 
+import logging
 import os
 import pathlib
 import time
@@ -33,12 +34,62 @@ if str(_MOCK_CLI_BIN_DIR) not in os.environ.get("PATH", "").split(os.pathsep):
 # Expose the managed-subprocess fixtures (cao_server, cao_server_with_auth,
 # cao_terminal) and the shared infra fixtures (jwt_factory, jwks_server,
 # terminal_factory) to every test under test/ without per-conftest imports.
+#
+# ``test._must_run`` is the must_run assurance gate (see that module): it turns a
+# skipped or deselected assurance test into a session failure in the CI job that
+# owns the gate.
 pytest_plugins = (
+    "test._must_run",
     "test.fixtures.cao_server",
     "test.fixtures.jwt_factory",
     "test.fixtures.jwks_server",
     "test.fixtures.terminal_factory",
 )
+
+
+_DECISION_HOME_UNSTATABLE = object()
+_DECISION_HOME_SNAPSHOT = pytest.StashKey[dict[pathlib.Path, object]]()
+logger = logging.getLogger(__name__)
+
+
+def _decision_home_file_state(path: pathlib.Path) -> object:
+    try:
+        stat = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        logger.warning("Could not stat %s; skipping decision home guard comparison", path.name)
+        return _DECISION_HOME_UNSTATABLE
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def pytest_sessionstart(session):
+    # Resolve the startup home before any per-test redirects; inspect metadata only.
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+
+    session.stash[_DECISION_HOME_SNAPSHOT] = {
+        CAO_HOME_DIR / name: _decision_home_file_state(CAO_HOME_DIR / name)
+        for name in ("decisions.halt", "decisions-egress.lock")
+    }
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    before = session.stash.get(_DECISION_HOME_SNAPSHOT, {})
+    changed = []
+    for path, state in before.items():
+        if state is _DECISION_HOME_UNSTATABLE:
+            continue
+        current = _decision_home_file_state(path)
+        if current is not _DECISION_HOME_UNSTATABLE and current != state:
+            changed.append(path.name)
+    if changed:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            reporter.write_sep(
+                "=", "Decision state changed under startup CAO home: " + ", ".join(changed)
+            )
 
 
 _AUTH_TEST_DOMAIN = "test.local"
@@ -163,11 +214,22 @@ def _hermetic_cao_env(monkeypatch, tmp_path):
     stripping ``CAO_TERMINAL_ID`` is load-bearing for vault-recall exclusion
     tests as well as sender-id defaults.
     """
+    from cli_agent_orchestrator.decisions import egress
+    from cli_agent_orchestrator.decisions.settings import load_settings
     from cli_agent_orchestrator.services import settings_service
 
+    monkeypatch.setattr(egress, "HALT_FILE", tmp_path / "decisions.halt")
+    monkeypatch.setattr(egress, "EGRESS_LOCK_FILE", tmp_path / "decisions-egress.lock")
+    monkeypatch.setattr(egress, "_settings_loader", load_settings)
     monkeypatch.setattr(settings_service, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(settings_service, "_server_settings_cache", None)
     monkeypatch.setattr(settings_service, "_server_settings_mtime_ns", -1)
+    # The server lock (#406) lives beside settings.json in the real home. Every
+    # in-process ``lifespan`` run would otherwise contend with a cao-server the
+    # developer has running, so each test locks its own file.
+    from cli_agent_orchestrator.utils import server_lock
+
+    monkeypatch.setattr(server_lock, "SERVER_LOCK_FILE", tmp_path / "server.lock")
 
     # server.py defaults sender_id to "supervisor" when unset
     monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)

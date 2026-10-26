@@ -18,10 +18,7 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel, TerminalModel
 from cli_agent_orchestrator.models.memory import Memory
-from cli_agent_orchestrator.services.memory_service import (
-    MemoryService,
-    _redact_injected_vault_content,
-)
+from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.vault.binding import (
     VaultBinding,
     collect_binding_warnings,
@@ -625,27 +622,8 @@ def test_distributed_context_without_terminal_id_suppresses_ambient_identity(tmp
     assert resolutions == [(NO_REQUESTER_IDENTITY, "no_terminal")]
 
 
-def test_automatic_vault_redactor_leaves_native_content_and_removes_secret_shapes():
-    """The provider-bound helper changes vault content only and returns safe pattern names."""
-    clean = SimpleNamespace(source_kind="native", content="password: hunter2sixteen")
-    access_key = "AKIA" + "1234567890ABCDEF"
-    secret = SimpleNamespace(
-        source_kind="vault",
-        content=f"password: hunter2sixteen {access_key}",
-    )
-
-    assert _redact_injected_vault_content(clean) == (clean.content, ())
-    redacted, patterns = _redact_injected_vault_content(secret)
-
-    assert "hunter2sixteen" not in redacted
-    assert access_key not in redacted
-    assert "[REDACTED:secret_assignment]" in redacted
-    assert "[REDACTED:aws_access_key]" in redacted
-    assert patterns == ("aws_access_key", "secret_assignment")
-
-
-def test_warn_mode_vault_secret_is_redacted_only_for_automatic_injection(tmp_path, monkeypatch):
-    """Warn mode keeps source fidelity while the provider payload is always redacted."""
+def test_warn_mode_vault_secret_is_redacted_on_every_model_bound_path(tmp_path, monkeypatch):
+    """Warn mode indexes the note; injection AND recall carry the marker, never the bytes (#644)."""
     from test.services.vault.test_vault_injection_renderer import (
         _counter_values,
         _injectable_renderer,
@@ -686,6 +664,8 @@ def test_warn_mode_vault_secret_is_redacted_only_for_automatic_injection(tmp_pat
     assert _counter_values(_Session) == {
         "injection_redaction.memories_redacted": 1,
         "injection_redaction.pattern_matches": 1,
+        "secret_redaction.memories_redacted": 1,
+        "secret_redaction.pattern_matches": 1,
     }
     binding = resolve("project", "fixture-project", vault_config=warn_config)
     assert isinstance(binding, VaultBinding)
@@ -699,7 +679,12 @@ def test_warn_mode_vault_secret_is_redacted_only_for_automatic_injection(tmp_pat
     )[0]
     recalled = load_candidate(candidate, max_body_chars=4096, require_injectable=False)
     assert recalled is not None
-    assert secret_value in recalled.content
+    assert secret_value not in recalled.content
+    assert "[REDACTED:secret_assignment]" in recalled.content
+    assert recalled.redacted_patterns == ["secret_assignment"]
+    assert _counter_values(_Session)["secret_redaction.memories_redacted"] == 2
+    # The note itself is untouched: redaction happens on the way out, never in the vault.
+    assert secret_value in note.read_text(encoding="utf-8")
 
 
 def test_automatic_injection_applies_new_exclude_without_reconcile(tmp_path, monkeypatch):
@@ -743,6 +728,8 @@ def test_post_reconcile_secret_drift_is_redacted_from_automatic_injection(tmp_pa
     assert _counter_values(Session) == {
         "injection_redaction.memories_redacted": 1,
         "injection_redaction.pattern_matches": 1,
+        "secret_redaction.memories_redacted": 1,
+        "secret_redaction.pattern_matches": 1,
     }
     binding = resolve("project", "fixture-project", vault_config=config)
     assert isinstance(binding, VaultBinding)
@@ -757,7 +744,9 @@ def test_post_reconcile_secret_drift_is_redacted_from_automatic_injection(tmp_pa
     recalled = load_candidate(candidate, max_body_chars=4096, require_injectable=False)
     assert recalled is not None
     assert recalled.index_freshness == "stale"
-    assert secret_value in recalled.content
+    # A reject mapping: the drifted secret is redacted on recall too, acceptances or not.
+    assert secret_value not in recalled.content
+    assert "[REDACTED:secret_assignment]" in recalled.content
 
 
 def test_curator_refuses_indexed_agent_mapping_before_it_reaches_worker_context(

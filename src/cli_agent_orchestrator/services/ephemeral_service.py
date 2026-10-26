@@ -37,6 +37,7 @@ from cli_agent_orchestrator.services.settings_service import (
 )
 from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.caller_tools import caller_effective_allowed_tools
+from cli_agent_orchestrator.utils.delegation import tools_exceeding
 
 logger = logging.getLogger(__name__)
 EPHEMERAL_DIR = CAO_HOME_DIR / "ephemeral"
@@ -505,16 +506,14 @@ def create_ephemeral_agent(
             refusal = _value_refusal("effort.route", spec.effort, provider, bounds, tiers)
             if refusal is not None:
                 raise refusal
-        grants = set(atom for atom in TOOL_ATOMS if atom in creator_tools)
-        if "*" in creator_tools:
-            grants.update(TOOL_ATOMS)
-        if "fs_*" in creator_tools:
-            grants.update(("fs_read", "fs_list", "fs_write"))
         requested = sorted(
             set(spec.tools if spec.tools is not None else ("fs_read", "fs_list")),
             key=TOOL_ATOMS.index,
         )
-        excess = [atom for atom in requested if atom not in grants]
+        # The same comparator the installed-profile path uses in
+        # terminal_service.create_terminal (utils/delegation.py): ``*`` grants
+        # everything and ``fs_*`` expands to the three filesystem atoms.
+        excess = tools_exceeding(requested, creator_tools)
         if excess:
             raise EphemeralPolicyError("tool_exceeds_creator", ", ".join(excess))
         tools = requested + ["@cao-mcp-server"]

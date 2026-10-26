@@ -4,7 +4,6 @@ from typing import Dict
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.constants import (
@@ -154,6 +153,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "working_directory": str(tmp_path),
@@ -187,6 +187,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "caller_id": "dcba8765",
@@ -221,6 +222,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "claude_code",
                     "agent_profile": "analyst",
                     "model": "fable-5",
@@ -251,7 +253,11 @@ class TestTerminalCreationWithWorkingDirectory:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
             assert response.status_code == 201
@@ -274,6 +280,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "model": "fable-5\nrm -rf /",
@@ -307,6 +314,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "engine": "kas",
@@ -349,7 +357,12 @@ class TestTerminalCreationWithWorkingDirectory:
             ),
         ):
             response = client.post(
-                endpoint, params={"provider": "kiro_cli", "agent_profile": "analyst"}
+                endpoint,
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
         assert response.status_code == 400, response.text
@@ -368,7 +381,11 @@ class TestTerminalCreationWithWorkingDirectory:
         ):
             response = client.post(
                 "/sessions/missing/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
         assert response.status_code == 404
@@ -387,6 +404,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "caller_id": "not-a-terminal-id!",
@@ -418,6 +436,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "working_directory": "/session/path",
@@ -451,6 +470,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "use_worktree": "true",
@@ -481,7 +501,11 @@ class TestTerminalCreationWithWorkingDirectory:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
             assert response.status_code == 201
@@ -507,6 +531,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "use_worktree": "true",
@@ -538,6 +563,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "idempotency_key": "retry-1",
@@ -562,7 +588,11 @@ class TestTerminalCreationWithWorkingDirectory:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
                 json={"initial_message": "do work"},
             )
 
@@ -659,18 +689,30 @@ class TestCreateInboxMessageEndpoint:
     """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
 
     def test_create_inbox_message_success(self, client):
-        """POST creates an inbox message and returns success."""
+        """POST creates an inbox message and starts immediate delivery with the
+        P2-2 contract (#78, PR #1004): deliver_pending gets the app's plugin
+        registry and the endpoint's own after_dispatch callback. That the
+        callback releases the response is proven in
+        test_inbox_messages.py::TestCreateInboxMessageResponseTiming by calling
+        the endpoint directly; through TestClient the per-request loop shutdown
+        waits for the delivery thread, so no timing is asserted here."""
         mock_msg = MagicMock()
         mock_msg.id = 1
         mock_msg.sender_id = "sender1"
         mock_msg.receiver_id = "abcd1234"
         mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+        delivery_calls = []
+
+        def deliver(receiver_id, registry=None, after_dispatch=None):
+            delivery_calls.append((receiver_id, registry, after_dispatch))
+            after_dispatch()  # the paste reached the pane
 
         with (
             patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
             mock_create.return_value = mock_msg
+            mock_inbox.deliver_pending.side_effect = deliver
 
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
@@ -687,7 +729,15 @@ class TestCreateInboxMessageEndpoint:
                 "abcd1234",
                 "hello",
             )
-            mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
+
+        assert len(delivery_calls) == 1
+        receiver_id, registry, after_dispatch = delivery_calls[0]
+        assert receiver_id == "abcd1234"
+        assert registry is app.state.plugin_registry
+        assert callable(after_dispatch)
+        assert after_dispatch.__qualname__.endswith(
+            "create_inbox_message_endpoint.<locals>._mark_dispatched"
+        ), "deliver_pending must get the endpoint's own post-dispatch marker"
 
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""
@@ -1391,6 +1441,7 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "agent_profile": "developer",
                 },
             )
@@ -1423,6 +1474,7 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "reviewer",
                 },
@@ -1474,6 +1526,7 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "agent_profile": "developer",
                 },
             )

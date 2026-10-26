@@ -1,13 +1,23 @@
 """Elastic worker provisioning and acknowledged completion tests."""
 
 import asyncio
+import threading
 import time
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
+from cli_agent_orchestrator.constants import ADVERTISED_URL_ENV
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.utils import orchestration
+
+# Remote placement probes the target's /health for ``delegation_ceiling`` and
+# reads this terminal's own recorded ceiling before posting (fail closed on an
+# older node). The shared fixture answers both so these tests stay about elastic
+# provisioning; the probe itself is covered in test_delegation_remote.py.
+pytestmark = pytest.mark.usefixtures("remote_ceiling_ready")
 
 
 def test_assign_elastic_provisions_then_assigns(monkeypatch):
@@ -73,7 +83,7 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
     """Exercise the real elastic placement and deferred-session failure path."""
     monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
-    monkeypatch.setenv(server.ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
+    monkeypatch.setenv(ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
     monkeypatch.setenv("CAO_ELASTIC_CALLBACK_URL", "http://broker:9890")
 
     lease = Mock(status_code=200)
@@ -384,7 +394,7 @@ def test_assign_remote_does_not_wait_by_default(monkeypatch):
     A target_host naming a static pod is either up or genuinely broken, so a
     caller that did not just create it should still fail in seconds.
     """
-    monkeypatch.setenv(server.ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
+    monkeypatch.setenv(ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
     with (
         patch.object(server.requests, "post", return_value=_remote_session_response()),
         patch.object(orchestration, "_wait_remote_ready") as wait,
@@ -406,7 +416,7 @@ def test_assign_remote_does_not_wait_by_default(monkeypatch):
 
 def test_assign_remote_waits_before_it_posts_the_task(monkeypatch):
     """Order matters: POST /sessions is not idempotent, so it gets one shot."""
-    monkeypatch.setenv(server.ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
+    monkeypatch.setenv(ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
     calls = []
     with (
         patch.object(
@@ -465,15 +475,28 @@ def test_assign_elastic_calls_overlap_instead_of_serialising(monkeypatch):
     """Fan-out is the whole point of an elastic fleet.
 
     Both blocking legs (the broker POST and the assignment itself) run off the
-    event loop, so N delegations cost roughly one placement rather than N. With
-    either leg back on the loop this takes ~3x as long, which is what a
-    supervisor delegating five tasks used to pay.
+    event loop via `asyncio.to_thread`. This test guards the longer leg: three
+    concurrent delegations must all be in flight inside `_assign_impl` at once.
+    A three-party barrier proves that directly: it only releases once all three
+    callers have arrived, so a hang
+    (caught by its timeout, below) means the calls serialised instead of
+    overlapping. This replaces an earlier wall-clock assertion
+    (`elapsed < 0.8`) that flaked four times in one day on unrelated PRs
+    (#1003 twice, #999, #1012) at 0.90-0.98s on shared CI runners and passed on
+    every retry -- a timer can't distinguish a slow runner from real
+    serialisation, but a barrier can.
     """
     monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
 
+    barrier = threading.Barrier(3, timeout=5.0)
+    broken = []
+
     def slow_assign(*args, **kwargs):
-        time.sleep(0.3)
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            broken.append(True)
         return {"success": True}
 
     def slow_post(*args, **kwargs):
@@ -494,9 +517,9 @@ def test_assign_elastic_calls_overlap_instead_of_serialising(monkeypatch):
         patch.object(server.requests, "post", side_effect=slow_post),
         patch.object(server, "_assign_impl", side_effect=slow_assign),
     ):
-        started = time.monotonic()
         results = asyncio.run(three())
-        elapsed = time.monotonic() - started
 
     assert all(r["success"] for r in results)
-    assert elapsed < 0.8, f"three delegations took {elapsed:.2f}s; expected ~0.4s"
+    assert (
+        not broken
+    ), "the three delegations did not overlap: _assign_impl was never in flight for all three at once"

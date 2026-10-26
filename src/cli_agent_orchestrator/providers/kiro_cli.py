@@ -759,6 +759,59 @@ class KiroCliProvider(BaseProvider):
         # Default: Agent is IDLE, waiting for user input
         return TerminalStatus.IDLE
 
+    # The TUI's live prompt row: "› " then the first row of the text, or the
+    # placeholder / status text the TUI shows there when nothing is typed.
+    _COMPOSER_PROMPT_RE = re.compile(r"^\s*›(?:\s(.*)|\s*)$")
+    # Text the TUI itself paints in the prompt row; none of it is user input.
+    _COMPOSER_CHROME_RE = re.compile(
+        rf"{NEW_TUI_IDLE_PATTERN}|{TUI_PROCESSING_PATTERN}|{TUI_INITIALIZING_PATTERN}"
+        r"|type to queue a message|Type to steer"
+    )
+
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return the text sitting unsubmitted in the TUI's › prompt, if it is on screen.
+
+        Issue #78 (PR #1004 review, P2-1): the inbox recovery can only send the
+        bare Enter that submits a paste whose Enter was swallowed when the
+        provider can read its own composer; without this method kiro_cli had
+        no recovery at all and the next inbox message was pasted on top of the
+        first ({MSG1}{MSG2}).
+
+        The TUI pins its prompt to the bottom of the viewport below the last
+        "────" separator and a header row (agent · model · ◔ N% · auth). The
+        header text varies with the agent and the auth state, so the reader
+        anchors on the last separator and the first "›" row after it; the
+        composer is that row minus the glyph plus the indented continuation
+        rows a wrapped or multi-line paste occupies (real captures:
+        fixtures/COMPOSER_FIXTURES.md). Earlier "›" rows are transcript echoes
+        above the separator and are never included. Returns "" when the row
+        holds only the TUI's own text (the "ask a question" placeholder, "Kiro
+        is working", "Initializing") and None for frames without the TUI
+        prompt row (legacy "[agent]>" UI, boot screens).
+        """
+        rows = rendered_pane.splitlines()
+        separators = [
+            index for index, row in enumerate(rows) if re.match(TUI_SEPARATOR_PATTERN, row.strip())
+        ]
+        if not separators:
+            return None
+        prompt_index = next(
+            (
+                index
+                for index in range(separators[-1] + 1, len(rows))
+                if self._COMPOSER_PROMPT_RE.match(rows[index])
+            ),
+            None,
+        )
+        if prompt_index is None:
+            return None
+        match = self._COMPOSER_PROMPT_RE.match(rows[prompt_index])
+        first = ((match.group(1) if match else None) or "").strip()
+        if self._COMPOSER_CHROME_RE.search(first):
+            return ""
+        continuation = [row.strip() for row in rows[prompt_index + 1 :] if row.strip()]
+        return "\n".join([first] + continuation).strip()
+
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract agent's final response message using green arrow indicator."""
         # Strip ANSI codes for pattern matching

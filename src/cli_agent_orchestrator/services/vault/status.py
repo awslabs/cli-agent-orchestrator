@@ -49,6 +49,12 @@ class VaultStatus:
     inert_mappings: tuple[tuple[str, int], ...] = ()
     migration_receipts: tuple[tuple[str, int], ...] = ()
     process_local_boundary_write_refusals: int = 0
+    # Per-finding ``cao.secret_ok`` acceptances honoured at the last reconcile,
+    # as ``(vault_relpath, accepted span count)``. An acceptance passes raw
+    # credential-shaped bytes to agents under ``secret_gate: "warn"`` (#644),
+    # so it is never silent: it is listed here and in ``finding_counts`` as
+    # ``secret_accepted``. Paths and counts only; never the span or its hash.
+    secret_acceptances: tuple[tuple[str, int], ...] = ()
 
 
 def migration_receipt_write_guard_reason(
@@ -222,6 +228,13 @@ def get_vault_status(
                     "inert: recall=off inject=off write=off"
                 )
                 inert_mappings.append((label, residual_rows))
+            secret_acceptances = tuple(
+                sorted(
+                    (cast(str, finding.vault_relpath), _finding_count(cast(str, finding.detail)))
+                    for finding in findings
+                    if cast(str, finding.code) == "secret_accepted"
+                )
+            )
             statuses.append(
                 VaultStatus(
                     vault.id,
@@ -244,6 +257,16 @@ def get_vault_status(
                         ("inconsistent", inconsistent),
                     ),
                     boundary_write_refusal_count(vault.id),
+                    secret_acceptances,
                 )
             )
     return tuple(statuses)
+
+
+def _finding_count(detail: str) -> int:
+    """Read the ``count=N`` prefix reconcile folds into one row per code and path."""
+    if detail.startswith("count="):
+        head = detail.partition(";")[0].removeprefix("count=")
+        if head.isdigit():
+            return int(head)
+    return 1

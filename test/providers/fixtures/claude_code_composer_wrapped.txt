@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Fable 5.1 · Amazon Bedrock
+ ▝▝   ▝▝   /private/tmp/wt-fix-1004-cap/claude
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ MSG2: write tests for module B covering the retry policy, the backoff schedule, the jitter bounds, the max-attempts ceiling, the circuit breaker
+  reset, and the metrics emitted on every attempt so the dashboard can show failures per minute
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -383,6 +383,8 @@ class TestCreateTerminal:
             idempotency_key=None,
             # No key supplied, so no fingerprint is computed (review on PR #634).
             request_fingerprint=None,
+            # Operator launch: the profile's own list is its delegation ceiling.
+            delegate_tools=["fs_read"],
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
@@ -502,8 +504,10 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     async def test_create_terminal_persists_caller_id(
         self,
+        mock_caller_row,
         mock_load_profile,
         mock_gen_id,
         mock_gen_session,
@@ -517,6 +521,9 @@ class TestCreateTerminal:
         mock_delete_terminals_by_session,
     ):
         """caller_id reaches the database row and the returned Terminal (issue #284)."""
+        # The caller's stored row bounds the child; an unrestricted ceiling here
+        # keeps this test about persistence (test_delegation_ceiling.py covers the rule).
+        mock_caller_row.return_value = {"agent_profile": "supervisor", "delegate_tools": ["*"]}
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -2300,6 +2307,8 @@ class TestGetTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_success(self, mock_get_metadata, mock_status_monitor):
         """Test getting terminal successfully."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
         mock_get_metadata.return_value = {
             "id": "test1234",
             "tmux_window": "developer-abcd",
@@ -2309,7 +2318,9 @@ class TestGetTerminal:
             "session_incarnation_id": "inc-current",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.IDLE, 1
+        )
 
         result = get_terminal("test1234")
 
@@ -2333,7 +2344,11 @@ class TestGetTerminal:
             "caller_id": None,
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.IDLE, 1
+        )
         with patch(
             "cli_agent_orchestrator.services.terminal_service.get_session_env",
             return_value={
@@ -2360,7 +2375,11 @@ class TestGetTerminal:
             "caller_id": "abcd1234",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.IDLE, 1
+        )
         with patch(
             "cli_agent_orchestrator.services.terminal_service.get_session_env",
             return_value={"FOO": "bar"},
@@ -2380,6 +2399,8 @@ class TestGetTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_no_provider(self, mock_get_metadata, mock_status_monitor):
         """Test getting terminal returns status from status_monitor."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
         mock_get_metadata.return_value = {
             "id": "test1234",
             "tmux_window": "developer-abcd",
@@ -2388,7 +2409,9 @@ class TestGetTerminal:
             "agent_profile": "developer",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.UNKNOWN
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.UNKNOWN, 0
+        )
 
         result = get_terminal("test1234")
 
@@ -2586,6 +2609,40 @@ class TestSendInput:
 
         assert "sending assign input" in str(exc_info.value)
         assert "OrchestrationType.ASSIGN" not in str(exc_info.value)
+        mock_tmux.send_keys.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_blocks_send_message_when_provider_waits_for_user_answer(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
+    ):
+        """Inbox (send_message) text must not answer an active provider prompt either (#896).
+
+        Before this fix the guard only covered ASSIGN/HANDOFF, so an inbox
+        delivery was pasted into an open AskUserQuestion dialog: the dialog ate
+        the text and the trailing Enter selected whichever option was
+        highlighted, while the message was marked DELIVERED.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+
+        with pytest.raises(TerminalInputBlockedError, match="waiting for a user answer") as exc:
+            send_input(
+                "test1234",
+                "inbox message",
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
+
+        assert "sending send_message input" in str(exc.value)
         mock_tmux.send_keys.assert_not_called()
         mock_update.assert_not_called()
 
@@ -2915,6 +2972,158 @@ class TestGetOutput:
         assert "4800 lines retrieved" in result
         # 4 escalation steps + 1 full_history attempt = 5 total
         assert mock_tmux.get_history.call_count == 5
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_clips_the_ladder_and_threshold_to_the_backends_read_cap(
+        self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_provider_manager
+    ):
+        """A backend that can only return N lines per read must be classified
+        against N, not against the deepest rung it can never reach (#728).
+
+        herdr clamps every ``pane read`` to 1000 lines (herdr v0.9.5
+        ``src/app/api_helpers.rs:117``). Against the fixed 4500-line threshold
+        a herdr pane that overflowed its whole readable depth was reported as
+        "sparse buffer -> the agent produced no text response", and the
+        supervisor re-delegated a task the worker had finished.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "buffered output"
+        mock_tmux.max_history_lines = 1000
+
+        def clamped_history(*args, **kwargs):
+            # The pane holds far more than the cap; herdr hands back the cap.
+            requested = kwargs.get("tail_lines") or 1000
+            return "\n".join(f"worker line {i}" for i in range(min(requested, 1000)))
+
+        mock_tmux.get_history.side_effect = clamped_history
+        mock_provider = MagicMock(
+            spec=[
+                "extract_last_message_from_script",
+                "extraction_retries",
+            ]
+        )  # no extraction_tail_lines attribute → escalation path
+        mock_provider.extract_last_message_from_script.side_effect = ValueError("no marker")
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        # 1000 lines is >= 90% of the 1000 the backend can serve: overflow.
+        assert result.startswith("[PARTIAL RESPONSE"), result[:120]
+        assert "1000 lines retrieved" in result
+        assert "worker line 999" in result
+        # The rung above the cap is dead weight on this backend and is skipped.
+        requested = [c.kwargs.get("tail_lines") for c in mock_tmux.get_history.call_args_list]
+        assert 5000 not in requested, requested
+        assert requested[:3] == [200, 500, 1000], requested
+        # 3 rungs within the cap + 1 full_history attempt.
+        assert mock_tmux.get_history.call_count == 4
+        _, last_kwargs = mock_tmux.get_history.call_args
+        assert last_kwargs.get("full_history") is True
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_sparse_pane_under_the_read_cap_is_still_no_response(
+        self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_provider_manager
+    ):
+        """The numbers #728 reported on herdr: the 5000-line rung returned 604
+        lines and the flagless full read returned 80.
+
+        herdr serves up to 1000 lines, so a 604-line read means the pane HELD
+        604 lines, with no marker among them. Read depth is not what lost that
+        reply, and this code cannot recover it; the honest label is NO RESPONSE
+        with the full 604 lines attached. This test documents that gap so the
+        herdr half of #728 is tracked as its own defect, not claimed here.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "buffered output"
+        mock_tmux.max_history_lines = 1000
+
+        held = "\n".join(f"worker line {i}" for i in range(604))
+
+        def herdr_like_history(*args, **kwargs):
+            requested = kwargs.get("tail_lines") or 1000
+            return "\n".join(held.split("\n")[-min(requested, 1000) :])
+
+        mock_tmux.get_history.side_effect = herdr_like_history
+        mock_provider = MagicMock(
+            spec=[
+                "extract_last_message_from_script",
+                "extraction_retries",
+            ]
+        )  # no extraction_tail_lines attribute → escalation path
+        mock_provider.extract_last_message_from_script.side_effect = ValueError("no marker")
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        assert result.startswith("[NO RESPONSE")
+        assert "604 lines in buffer" in result
+        # Everything the pane held is handed back, not a screenful of it.
+        assert "worker line 0" in result and "worker line 603" in result
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_keeps_the_deepest_capture_when_the_ladder_is_not_monotonic(
+        self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_provider_manager
+    ):
+        """A deeper rung that reads SHALLOWER than an earlier one must not shrink
+        what the supervisor receives (#728).
+
+        Shaped like the herdr report (a capped backend whose final full read
+        came back as a screenful): the rungs return the 1000-line cap, the
+        full_history read returns 80 lines. Counting the final read's lines
+        would report "sparse buffer -> no text response" for a worker that
+        filled the whole readable depth.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "buffered output"
+        mock_tmux.max_history_lines = 1000
+
+        deep_tail = "\n".join(f"worker line {i}" for i in range(1000))
+
+        def history_side_effect(*args, **kwargs):
+            if kwargs.get("full_history"):
+                # A misbehaving last rung: roughly a screenful.
+                return "\n".join(f"tail line {i}" for i in range(80))
+            requested = kwargs.get("tail_lines") or 1000
+            return "\n".join(deep_tail.split("\n")[-min(requested, 1000) :])
+
+        mock_tmux.get_history.side_effect = history_side_effect
+        mock_provider = MagicMock(
+            spec=[
+                "extract_last_message_from_script",
+                "extraction_retries",
+            ]
+        )  # no extraction_tail_lines attribute → escalation path
+        mock_provider.extract_last_message_from_script.side_effect = ValueError("no marker")
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        # Classified from the deepest capture (1000 lines >= 900), not from the
+        # 80 lines the final rung returned.
+        assert result.startswith("[PARTIAL RESPONSE")
+        assert "buffer overflow likely" in result
+        assert "1000 lines retrieved" in result
+        # And the content handed back is the deepest capture, not the shallowest.
+        assert "worker line 999" in result
+        assert "tail line 0" not in result
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -4018,8 +4227,15 @@ class TestDeferredInitFailureNotification:
                 "update_terminal_deferred_init_external_owner",
                 database.update_terminal_deferred_init_external_owner,
             )
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
         monkeypatch.setattr(
             terminal_service.status_monitor, "get_status", lambda tid: TerminalStatus.ERROR
+        )
+        monkeypatch.setattr(
+            terminal_service.status_monitor,
+            "status_observation",
+            lambda tid: StatusObservation(TerminalStatus.ERROR, 1),
         )
 
         for _ in range(2):
@@ -4075,6 +4291,7 @@ class TestDeferredInitFailureNotification:
 
     def test_get_terminal_defers_external_error_until_failure_is_durable(self, monkeypatch):
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
 
         metadata = {
             "id": "worker99",
@@ -4093,6 +4310,7 @@ class TestDeferredInitFailureNotification:
         }
         monitor = MagicMock()
         monitor.get_status.return_value = TerminalStatus.ERROR
+        monitor.status_observation.return_value = StatusObservation(TerminalStatus.ERROR, 1)
         monkeypatch.setattr(terminal_service, "status_monitor", monitor)
         monkeypatch.setattr(
             terminal_service, "get_terminal_metadata", MagicMock(return_value=metadata)
@@ -4477,6 +4695,13 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             return TerminalStatus.WAITING_USER_ANSWER
 
         mock_status_monitor.get_status.side_effect = fake_get_status
+
+        def fake_observation(terminal_id):
+            from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+            return StatusObservation(fake_get_status(terminal_id), 1)
+
+        mock_status_monitor.status_observation.side_effect = fake_observation
 
         def fake_send_input(terminal_id, message, **kwargs):
             # Stands in for dispatch_input's pre-dispatch work — most of it
@@ -5837,6 +6062,7 @@ class TestGetTerminalMasksPendingDelivery:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_completable_status_reads_unknown_while_delivery_is_pending(self, mock_meta, raw):
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
 
         mock_meta.return_value = {
             "id": "pend5678",
@@ -5851,6 +6077,7 @@ class TestGetTerminalMasksPendingDelivery:
         }
         fake_monitor = MagicMock()
         fake_monitor.get_status.return_value = raw
+        fake_monitor.status_observation.return_value = StatusObservation(raw, 1)
         with (
             patch.object(terminal_service, "_pending_initial_delivery", {"pend5678"}),
             patch.object(terminal_service, "status_monitor", fake_monitor),
@@ -5862,6 +6089,7 @@ class TestGetTerminalMasksPendingDelivery:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_status_is_unmasked_once_delivery_is_settled(self, mock_meta):
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
 
         mock_meta.return_value = {
             "id": "done5678",
@@ -5876,6 +6104,9 @@ class TestGetTerminalMasksPendingDelivery:
         }
         fake_monitor = MagicMock()
         fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        fake_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.COMPLETED, 1
+        )
         with (
             patch.object(terminal_service, "_pending_initial_delivery", set()),
             patch.object(terminal_service, "status_monitor", fake_monitor),
@@ -6081,3 +6312,83 @@ class TestInitialDeliveryIsDurable:
         payload = upd.call_args.args[1]
         assert payload == {"state": "failed", "kind": "k", "message": "m"}
         assert upd.call_args.kwargs == {"only_if_pending": True}
+
+
+class TestDispatchLatchDeclaredOnAProvider:
+    """``assume_processing_on_dispatch`` declared on a provider, end to end.
+
+    No shipped provider sets the flag, so the ``is True`` branch in
+    ``dispatch_input`` was reachable only by calling the monitor directly, and
+    that call is what every earlier test did (review of PR #998). Here a
+    provider class declares it, ``dispatch_input`` reads it and arms the REAL
+    monitor, and the turn's chunks then go through ``_process_chunk``: the
+    optimistic latch is PROCESSING without a stamp, the mid-burst probe still
+    runs (#814), and once it has seen the spinner it stops.
+    """
+
+    class _LatchingCodex(CodexProvider):
+        assume_processing_on_dispatch = True
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_declared_flag_reaches_the_monitor_and_the_probe_still_runs(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_memory_service,
+        mock_sm_pm,
+        mock_settings,
+    ):
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+        from cli_agent_orchestrator.services.terminal_service import dispatch_input
+
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_tmux.supports_event_inbox.return_value = False
+        mock_tmux.get_native_status.return_value = None  # tmux: no native status
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = self._LatchingCodex(
+            terminal_id="t1", session_name="cao-session", window_name="developer-abcd"
+        )
+        assert provider.assume_processing_on_dispatch is True
+        provider.probe_processing_from_screen = MagicMock(
+            wraps=provider.probe_processing_from_screen
+        )
+        mock_pm.get_provider.return_value = provider
+        mock_sm_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._loop = MagicMock()  # edge-debounced path, as in production
+        sm._arm_quiesce_timer = lambda *a, **k: None
+        sm._cancel_quiesce_handle = lambda *a, **k: None
+        sm._detect_screen = lambda tid, prov: TerminalStatus.UNKNOWN  # torn rising edge
+        sm._last_status["t1"] = TerminalStatus.COMPLETED  # the previous turn
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", sm):
+            dispatch_input("t1", "next task")
+
+        # The declared flag took the ``is True`` branch: PROCESSING is published
+        # at the send, as an optimistic latch with no evidence stamp.
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert "t1" not in sm._processing_generation
+        assert sm._dispatch_generation["t1"] == sm._capture_generation["t1"]
+
+        sm._process_chunk("t1", "\x1b[H(torn frame)")  # rising edge: no evidence
+        assert provider.probe_processing_from_screen.call_count == 0
+        sm._process_chunk("t1", "\x1b[2J\x1b[H› next task\r\n• Working (1s • esc to interrupt)")
+        assert provider.probe_processing_from_screen.call_count == 1  # #814: probed
+        assert sm._processing_generation["t1"] > sm._dispatch_generation["t1"]
+        sm._midburst_probe_at.pop("t1")  # > PYTE_MIDBURST_PROBE_S later
+        sm._process_chunk("t1", "\x1b[H• Working (2s • esc to interrupt)")
+        assert provider.probe_processing_from_screen.call_count == 1  # observed: skip
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
