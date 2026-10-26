@@ -6,8 +6,11 @@ CLI handoff use it. Both decision points are **off by default**, so normal
 launches keep their existing behavior until an operator enables routing.
 
 Plain terminal creates and older clients that do not send the original task
-message are not routed. Reusing a terminal and replaying a workflow step launch
-nothing, so neither runs a decision. A script workflow's own step is out of
+message are not routed. An empty task message is also not routed: local and
+remote assign, elastic assign, handoff and CLI handoff launch it unrouted
+rather than refusing it, the same as when no message is sent at all. Reusing a
+terminal and replaying a workflow step launch nothing, so neither runs a
+decision. A script workflow's own step is out of
 scope for deciders; in shadow or on it gets an `out_of_scope` record. An agent's
 assign or handoff from inside that step remains an ordinary delegation.
 
@@ -82,7 +85,8 @@ startup. Point-state precedence is:
 variable or in `settings.json` means off at that layer; it does not fall through.
 An unreadable settings file makes every point off. `cao decisions status`
 describes the CLI's environment and cannot see a running server's flags; the
-server logs effective states at startup.
+server logs its effective settings at startup and when they change (see
+[Diagnostics](#diagnostics)).
 
 The server captures these overrides at startup and keeps them until it restarts.
 While one is set, `cao decisions set <point> off` and `decisions_set_point` change
@@ -177,7 +181,10 @@ can lose updates because the existing settings writer is not atomic.
 The node's SQLite `decision_records` table holds one record per point per
 launch in shadow or on. Records include state, decider name/version, fallback
 value/source, answer and probabilities, capped candidate, applied value, latency,
-reason, terminal ID, launched model and whether it was honored. A policy model
+reason, terminal ID, launched model and whether it was honored. `target_kind` is
+`installed`, `ephemeral` or `workflow`; `workflow` marks a script workflow's own
+step. Records written before the column existed keep `target_kind` null: the
+upgrade adds the column and does not backfill it. A policy model
 fallback records the tier as `fallback_value`; the mapped model appears in
 `launched_model` only when bound. Effort results are recorded but not carried in
 a launch plan in this version. A launch is recorded as launched when the
@@ -185,7 +192,21 @@ provider has been built and its start has completed or been scheduled. A
 deferred startup failure updates the record to `launch_failed` without emitting
 a second decision span. A cancelled deferred start also moves a previously
 launched row to `launch_failed`, with no second emission.
-A launch refused by the creator's delegation ceiling is recorded as `not_launched`.
+
+`not_launched` and `launch_failed` mark different points of failure.
+`not_launched` means the launch was refused or abandoned before a create
+attempt ran: a refusal by the creator's delegation ceiling binds it directly,
+and every create route (`POST /sessions`, `POST /sessions/{name}/terminals`,
+`POST /terminals/run-step`) also re-binds any record still `pending` to
+`not_launched` in a `finally` block once its handler returns. That `finally`
+bind is how the per-node terminal cap refusal (`CAO_MAX_TERMINALS`/
+`server.max_terminals` already reached) ends up `not_launched` too, even
+though it is raised earlier than, and independently of, the ceiling check.
+`launch_failed` instead means a create attempt was actually made and did not
+complete: once that attempt has started, any other exception is bound
+`launch_failed`, and the same status applies when a deferred startup failure
+or a cancelled deferred start moves a previously launched row back, in both
+cases without a second decision span.
 
 Records never hold task messages, descriptions, purposes, prompts or working directories.
 Messages, descriptions and purposes are redacted before every decider call, including the
@@ -218,6 +239,78 @@ Spans use `cao.decision`; metrics use `cao.decision.requests` and
 `cao.decision.latency`. No message, description, hash or probability vector is
 exported, and metric labels never contain terminal IDs. Without the
 OpenTelemetry packages (the `[otel]` extra), decision telemetry is a no-op.
+
+## Diagnostics
+
+The server logs one line of resolved settings at startup: the confidence
+threshold, the on and shadow timeouts, and each point's state and decider. It
+logs the line again when any of these change: within a few seconds of a save to
+`settings.json` or a change to the halt marker, and otherwise at the next launch.
+Decider configuration and excluded profiles are not logged.
+
+When a decider gives no usable answer, the server logs one warning that names
+the decider, the point and the reason:
+
+```text
+Decision decider failing: decider=external point=model.route reason=timeout
+```
+
+The reasons that count as failures are `timeout`, `error`, `invalid_answer`,
+`no_answer` and `decider_unavailable`. The built-in `fixed_table`'s `no_answer`
+is the exception: it's how the table abstains for a profile or role, or an
+ephemeral target, that has no entry, not a failure. Other deciders' `no_answer`
+still counts as a failure, since it can also mean a swallowed error. The same
+reason again logs nothing more, however long it lasts. A change to another
+reason warns again, at most once a minute for each decider, point and reason;
+a failure that is still there after that minute is warned about then. The next
+answer logs one `Decision decider recovered` line, if a warning was logged.
+`unsure`, `low_confidence` and `tier_unmapped` are answers, so they end a
+failure. `not_honored` never asks the decider and changes nothing.
+
+These lines hold labels only: never the task message, description, purpose,
+profile, decider configuration or exception text. A decider name with
+characters other than letters, digits, `_`, `.` and `-` is logged as
+`<invalid>`. An error while logging never changes a decision or a launch.
+
+`cao decisions status` and the operations MCP `decisions_status` also return
+`decider_status`:
+
+```json
+{
+  "decider_status": {
+    "window_hours": 24,
+    "since": "2026-10-19T12:00:00+00:00",
+    "available": true,
+    "deciders": {
+      "external": {
+        "last": {
+          "point": "model.route",
+          "outcome": "fallback",
+          "reason": "timeout",
+          "created_at": "2026-10-20T11:58:02.114203"
+        },
+        "counts": {"timeout": 31, "answer": 4}
+      },
+      "fixed_table": {"last": null, "counts": {}}
+    }
+  }
+}
+```
+
+For each decider with records, `last` is its newest record and `counts` counts
+its records created since `since`, by reason. A record with no reason counts as
+`answer`, or as `pending` or `interrupted` while its shadow decision is
+unfinished. Record times are UTC. The counts match
+`cao decisions list --since <since> --limit <n>` for the same records, with
+`--limit` large enough to include every record in the window (at most 10000;
+`list`'s default `--limit` is 100). Installed deciders
+with no records are listed with `last: null` and no counts. Records without a
+decider are not counted, such as policy refusals and `decider_unavailable` or
+`out_of_scope` records; `cao decisions list` shows them.
+
+Status opens the database read-only. It never creates, initializes or migrates
+it, and reports `available: false` when the database is missing or cannot be
+read. `cao decisions set` prints settings only.
 
 ## Decider packages
 
@@ -276,9 +369,13 @@ or saved, the marker still switches every point off and the result reports
 `settings_saved: false`. Fix the settings before re-enabling decisions.
 
 The marker overrides settings, environment and startup flags. Setting any point
-to `shadow` or `on` removes it and prints effective local states. This may also
+to `shadow` or `on` removes it; `cao decisions set` then prints effective local
+states. The ops MCP `decisions_set_point` tool calls the identical operator
+`set_point` path, so it lifts the marker the same way on the same condition,
+returning the new effective state instead of printing it. This may also
 re-enable other points whose environment or startup flags select `shadow` or `on`;
-the CLI cannot see a running server's startup flags. `cao decisions status` shows
+neither the CLI nor the ops MCP tool can see a running server's startup flags.
+`cao decisions status` shows
 `halted` and installed deciders' names, distribution versions and `builtin` or
 `external` classification without importing them. External entries carry the
 label “sends data off this machine only after its own consent”.

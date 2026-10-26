@@ -1657,9 +1657,9 @@ async def lifespan(app: FastAPI):
         decision_runner,
         settings_loader=decision_settings_loader,
     )
-    logger.info(
-        "Decision states: %s", {p: v.state.value for p, v in decision_settings.points.items()}
-    )
+    # Logs the resolved threshold, timeouts, point states and deciders, then each change.
+    app.state.decision_engine.log_settings(decision_settings)
+    decision_settings_task = asyncio.create_task(app.state.decision_engine.watch_settings())
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
@@ -1804,6 +1804,8 @@ async def lifespan(app: FastAPI):
     # asyncio.gather with the tasks above.
     fifo_manager.stop_watchdog()
 
+    decision_settings_task.cancel()
+    await asyncio.gather(decision_settings_task, return_exceptions=True)
     await decision_runner.close()
     await decision_registry.close()
     await registry.teardown()
@@ -10154,6 +10156,19 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
+    # Mirror --agents-dir above: export the resolved values so cao_server_env()
+    # (read by the MCP-env forwarding in utils/mcp_resolution.py) sees this
+    # launch's actual address, not whatever CAO_API_HOST/PORT happened to be
+    # set to (or left at the 9889 default) before these flags were applied.
+    # An IPv4 wildcard bind is not a usable client address, so agents are
+    # pointed at loopback instead. "::" is left unmapped: asyncio binds an
+    # IPv6-only listener for it, loopback (127.0.0.1) can't reach that
+    # listener, and CAO_API_BASE_URL can't express an IPv6 host either, so
+    # there is no address this code could forward that would actually work.
+    if args.host:
+        os.environ["CAO_API_HOST"] = "127.0.0.1" if args.host == "0.0.0.0" else args.host
+    if args.port:
+        os.environ["CAO_API_PORT"] = str(port)
     # The lifespan records this port in the server lock's diagnostics (#406).
     app.state.server_port = port
     # Extend the CORS allowlist so a custom --host/--port still permits

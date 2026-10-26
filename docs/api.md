@@ -272,6 +272,37 @@ description participates in the request fingerprint: omitting it is not
 equivalent to supplying a nonempty description on a retry. Normalization applies
 to new inputs and edits; existing rows and stored fingerprints are not migrated.
 
+#### Delegation body fields
+
+Three JSON bodies carry delegation-decision fields for the `model.route`/
+`effort.route` points (see [Launch decisions](decisions.md)): `CreateTerminalBody`
+(`POST /sessions/{session_name}/terminals`), `CreateSessionBody` (`POST /sessions`),
+and `RunStepRequest` (`POST /terminals/run-step`).
+
+- `delegation_message: string | null` (default `null`) is accepted by all three
+  bodies. If supplied, an empty string returns `422`; otherwise it must be a
+  nonempty string or omitted entirely. On `CreateTerminalBody`/`CreateSessionBody`
+  it is the only source the delegation decision reads — the decision runs only
+  when it is present. On `RunStepRequest` it substitutes for `prompt` as the
+  decision's input when supplied, and falls back to `prompt` when it is not.
+- `delegation_kind: "handoff" | null` (default `null`) is accepted by
+  `CreateTerminalBody` and `CreateSessionBody` only. Only the literal `"handoff"`
+  is accepted; any other value returns `422`. Setting it requires
+  `delegation_message` to also be set and `initial_message` to be absent, or the
+  request returns `422` ("delegation_kind requires delegation_message and no
+  initial_message"). Setting `delegation_message` without `delegation_kind`
+  instead requires `initial_message` to be set with
+  `initial_message_orchestration_type` equal to `"assign"`, or the request
+  returns `422` ("delegation_message requires delegation_kind or an ASSIGN
+  initial_message").
+- `orchestration_type: "handoff" | null` (default `null`) is `RunStepRequest`'s
+  equivalent of `delegation_kind` — this body has no `delegation_kind` field.
+  `orchestration_type` and `delegation_message` must be supplied together or
+  both omitted, or the request returns `422` ("orchestration_type and
+  delegation_message must travel together"). Either field combined with
+  `reuse_terminal_id` also returns `422` ("delegation fields cannot be combined
+  with reuse_terminal_id").
+
 ### Durable handoff results
 
 - `POST /terminals/run-step` runs one agent step and accepts an optional
