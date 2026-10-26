@@ -48,6 +48,7 @@ from cli_agent_orchestrator.clients.database import (
     count_runtime_allocated_terminals,
     create_inbox_message,
 )
+from cli_agent_orchestrator.clients.database import create_launch_record as db_create_launch_record
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_idempotency_key
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
@@ -281,6 +282,40 @@ def _bind_decision_launch(plan: "LaunchPlan | None", **values: Any) -> None:
             bind_launch(plan, **values)
         except Exception:
             logger.warning("Decision launch bind failed", exc_info=True)
+
+
+def _classify_launch_target_kind(
+    source: "agent_profiles.ProfileSource", env_vars: Optional[dict] = None
+) -> str:
+    """Issue #1082's target_kind vocabulary (installed/ephemeral/workflow).
+
+    Deliberately independent of ``decisions/targets.py``'s ``TargetKind``,
+    which has no ``workflow`` member today and may change on PR #1076's own
+    schedule -- reuses only the already-resolved profile ``source`` the launch
+    path computed for itself, plus the same ``CAO_WORKFLOW_RUN_ID`` signal the
+    run engine already injects for a workflow step's terminal (see
+    ``services/agent_step.py`` and ``services/script_runner.py``).
+    """
+    if env_vars and env_vars.get("CAO_WORKFLOW_RUN_ID"):
+        return "workflow"
+    if source is agent_profiles.ProfileSource.EPHEMERAL:
+        return "ephemeral"
+    return "installed"
+
+
+def _record_launch_best_effort(**values: Any) -> None:
+    """Write issue #1082's content-free launch record. Never raises or blocks.
+
+    A failure here must never fail or alter the launch it describes.
+    ``db_create_launch_record`` already swallows its own exceptions; this
+    wrapper additionally protects against a bad caller-side value (e.g. a
+    non-JSON-serializable ``record_ids``) blowing up before that function's
+    own try/except is reached.
+    """
+    try:
+        db_create_launch_record(**values)
+    except Exception:
+        logger.warning("Launch record create failed", exc_info=True)
 
 
 def resolve_launch_model(
@@ -2315,6 +2350,18 @@ async def _create_terminal_unguarded(
         # the skill catalog here; Kiro (skill:// resources) and OpenCode
         # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
         # Copilot gets the catalog baked at install time.
+        #
+        # Issue #1082 (provisional): a fresh (non-resume) Claude Code launch
+        # gets a CAO-generated session id, stored on the launch record so a
+        # later usage adapter can join provider-native session logs to this
+        # terminal without CAO reading any transcript itself. Only Claude Code
+        # exposes a caller-chosen session id today; every other provider's
+        # stored id stays None.
+        fresh_claude_session_id: Optional[str] = (
+            str(uuid.uuid4())
+            if provider == ProviderType.CLAUDE_CODE.value and not resume_session_id
+            else None
+        )
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,
@@ -2326,6 +2373,7 @@ async def _create_terminal_unguarded(
             model=launch_model,
             engine=resolved_engine,
             resume_session_id=resume_session_id,
+            session_id=fresh_claude_session_id,
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -2438,6 +2486,18 @@ async def _create_terminal_unguarded(
             honored=model_honored,
             launch_status="launched",
             not_honored=decision_not_honored,
+        )
+        _record_launch_best_effort(
+            terminal_id=terminal.id,
+            session_name=session_name,
+            provider=provider,
+            target_name=agent_profile,
+            target_kind=_classify_launch_target_kind(source, env_vars),
+            launched_model=launch_model,
+            model_honored=model_honored,
+            provider_session_id=resume_session_id or fresh_claude_session_id,
+            record_ids=launch_plan.record_ids if launch_plan is not None else (),
+            caller_id=caller_id,
         )
         return terminal
 

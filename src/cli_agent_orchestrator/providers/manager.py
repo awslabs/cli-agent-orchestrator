@@ -71,13 +71,24 @@ class ProviderManager:
         engine: Optional[KiroEngine] = None,
         resume_session_id: Optional[str] = None,
         provider_variant: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> BaseProvider:
-        """Create and store provider instance."""
+        """Create and store provider instance.
+
+        ``session_id`` (issue #1082): a CAO-generated id for a FRESH claude_code
+        launch, distinct from ``resume_session_id`` (which resumes a PRIOR one).
+        Supported only by claude_code, same restriction as ``resume_session_id``.
+        """
         try:
             provider: BaseProvider
             if resume_session_id and provider_type != ProviderType.CLAUDE_CODE.value:
                 raise ValueError(
                     "resume_session_id is only supported by the claude_code provider "
+                    f"(got provider '{provider_type}')"
+                )
+            if session_id and provider_type != ProviderType.CLAUDE_CODE.value:
+                raise ValueError(
+                    "session_id is only supported by the claude_code provider "
                     f"(got provider '{provider_type}')"
                 )
             if provider_type == ProviderType.KIRO_CLI.value:
@@ -105,6 +116,7 @@ class ProviderManager:
                     skill_prompt=skill_prompt,
                     model=model,
                     resume_session_id=resume_session_id,
+                    session_id=session_id,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(
