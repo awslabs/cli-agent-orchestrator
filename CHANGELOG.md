@@ -27,6 +27,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path, and the unbound marker is part of the `plan_id`, so the weaker binding is visible in the
   identifier an operator approves.
 
+- **A Git working directory replaced under a live run is now caught too, with no change to any Git
+  `plan_id`** (#827, #1051). A Git root's identity is its commit plus worktree digest, which settles
+  the case across runs — a different checkout at the same path is a different plan. It does not settle
+  it *within* a run: nothing recomputes the `plan_id` once a run is admitted, so `git worktree remove`
+  followed by `git worktree add <same path> <other branch>` during a long step, or a re-clone at the
+  path, left the script running in the old directory while every later terminal started by path inside
+  the replacement checkout, under the original approval, with nothing refusing it. The per-run launch
+  guard now records the device and inode for either kind of root, from the same single `stat` the
+  identifier used. That pair never reaches `plan_id`, so **Git identifiers do not move and existing
+  Git approvals stay valid.** A run admitted before this change carries no pair for a Git root and
+  keeps launching its remaining steps unchecked.
+
+- **A resume verifies the working directory before it re-drives anything** (#827, #1051). The root
+  comparison lived at agent launch, so a resumed run reached it only when it started a *new* agent
+  step: the script code before that step ran in the replacement directory, and a resume whose
+  remaining agent steps were all replays ran to completion there. Resume admission now does the same
+  comparison, after the approval gate and **before** the generation bump and before any recovery
+  decision is written, so a refused resume changes nothing and leaves a still-live process for that
+  run alone. `POST /workflows/runs/{run_id}/resume` answers `409` with
+  `{"kind": "plan_inputs_changed"}`, the same shape the agent-step route already returns; it
+  previously had no arm for this refusal. A resume whose directory never moved is unaffected, and so
+  is a run admitted before the root binding existed.
+
+- **A removed working directory gets its own refusal instead of being called a replacement** (#1051).
+  A bound root that is deleted, or whose `stat` fails with `EACCES`/`ESTALE`, could not be shown to be
+  the approved directory, so the guard refused — correctly — but under the "the directory at that path
+  has been replaced; start a new run" text. Starting a new run in a path that does not exist then
+  fails with `422`. The two states now say different things, and the refusal for a missing root tells
+  the operator to restore it.
+
 - **Breaking / migration:** every plan whose working directory is outside Git gets a new identifier
   and is refused once, until re-approved under it (#827). The `plan-v2` scheme is not bumped: the
   field set is unchanged and the root identity is new content inside the existing repository-baseline

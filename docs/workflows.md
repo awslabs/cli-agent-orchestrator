@@ -325,6 +325,17 @@ provider, the agent profile name, the prompt, and the other fields that determin
 actually runs. Change one of them at the same step key and the step diverges rather than
 replaying. That is why the determinism rules above are load-bearing.
 
+> **A resume checks that it is still the same working directory before it re-drives anything.**
+> While approval enforcement is on, a resume compares the run's working-directory root against the
+> identity recorded when the run was admitted, and refuses with `409 plan_inputs_changed` if the
+> directory at that path is no longer the one that was approved — or can no longer be read. This
+> happens at resume **admission**, before the generation bump and before any recovery decision is
+> written, so a refused resume changes nothing and leaves any still-live process for that run alone.
+> The check covers both root kinds; see
+> [Plan approval](#plan-approval-script-tier) for what the identity is and what it cannot catch.
+> A resume is otherwise unaffected: a run whose directory never moved resumes exactly as before, and
+> a run admitted before this check existed carries no recorded identity and is resumed without it.
+
 ### Halts and `--decide`
 
 A step halts when its outcome is genuinely unknown or unverifiable: it was dispatched and
@@ -524,22 +535,37 @@ and discarded; it is never written to the manifest as its own value.
 > `st_ino`) alongside its canonical path, and the launch guard re-checks the pair at every agent launch
 > in the run. Move the directory away and put a different directory at the path — or mount a different
 > filesystem there — and the next run gets a new `plan_id` and is refused until re-approved; do it
-> while a run is in flight and that run's next agent step is refused with `plan_inputs_changed`. What
-> this does **not** catch is a directory **deleted and created again** at the same path: ext4 and XFS
-> hand out the inode number that was just freed, so the recreated directory can get the same pair back
-> and keep the approval. See
+> while a run is in flight and that run's next agent step is refused with `plan_inputs_changed`, and so
+> is a **resume** of it. What this does **not** catch is a directory **deleted and created again** at
+> the same path: ext4 and XFS hand out the inode number that was just freed, so the recreated directory
+> can get the same pair back and keep the approval. See
 > [What an approval does not cover](#what-an-approval-does-not-cover).
 >
-> A **Git** root is deliberately not bound this way — its identity is the commit
-> plus the worktree digest, which is content rather than location, so a different directory at the same
-> path already produces a different `plan_id` and two checkouts in the same state keep sharing one
-> approval, on one machine or two.
+> A **Git** root's `plan_id` is deliberately not bound this way — its identity is the commit plus the
+> worktree digest, which is content rather than location, so a different directory at the same path
+> already produces a different `plan_id` and two checkouts in the same state keep sharing one approval,
+> on one machine or two.
+>
+> **The launch guard binds a Git root too, and that is not the same thing.** The argument above settles
+> the case ACROSS runs only. Nothing recomputes `plan_id` inside a run or at a resume: a resume reuses
+> the identifier already frozen on the run, and an agent launch compares only the per-run record. So
+> `git worktree remove` followed by `git worktree add <same path> <other branch>` during a long step,
+> or a re-clone at the path, would otherwise leave the script running in the old directory (its working
+> directory keeps the old inode alive) while every later terminal is started **by path** inside the
+> replacement checkout, under the original approval. The guard therefore records the same device and
+> inode pair for either kind of root, taken from the same single `stat` the identifier used. That pair
+> never reaches `plan_id`, so **no Git identifier moves and no existing Git approval is invalidated.**
 >
 > The pair identifies a directory on this machine, so a non-Git plan's identifier is machine-local by
 > construction, and anything that renumbers the directory without changing it — a restore from backup,
 > an `rsync` into a fresh directory, a remount that assigns a different device number — costs one
 > re-approval. That is the price of the binding, and it is the direction to prefer: a spurious
-> re-approval is a prompt, while a reused approval is a directory nobody reviewed.
+> re-approval is a prompt, while a reused approval is a directory nobody reviewed. **For a run that is
+> already in flight the cost can be the run**, not just one re-approval: some filesystems take their
+> device number at mount time (NFS is one), so a reboot or a remount between a crash and a resume makes
+> the recorded pair unmatchable. That resume is refused with `plan_inputs_changed` and the operator
+> starts a new run, which is the fail-closed direction — the guard cannot distinguish "same directory,
+> new device number" from "different directory".
 >
 > **Where the filesystem supplies no usable identity, CAO falls back and says so.** Some network
 > mounts, container overlays and Windows volumes report no inode for a directory. CAO does not refuse
@@ -747,7 +773,10 @@ from what was reviewed and still match the same `plan_id`:
   directory, often gives the new directory the inode number that was just freed, on the same device.
   The pair is then unchanged, so the `plan_id` is unchanged and the new directory keeps the approval,
   exactly as a rewrite of the old directory's contents does. A directory that is **moved away** rather
-  than deleted keeps its inode allocated, which is why that case is always caught. A stronger identity
+  than deleted keeps its inode allocated, which is why that case is always caught. The same gap
+  applies to a **Git** root replaced within a run or across a resume: the per-run launch guard binds a
+  Git root by the same pair, so the move-away case is caught, and the delete-and-recreate case is not.
+  A stronger identity
   — a birth time, where the platform exposes one — is tracked in #1050; `os.stat` does not supply one
   on Linux.
 - **A non-Git root on a filesystem with no usable inode.** Where the filesystem reports no inode for
