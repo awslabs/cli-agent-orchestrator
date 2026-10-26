@@ -208,10 +208,10 @@ complete: once that attempt has started, any other exception is bound
 `launch_failed`, and the same status applies when a deferred startup failure
 or a cancelled deferred start moves a previously launched row back, in both
 cases without a second decision span. The attempt starts right after the
-terminal cap check, so a validation refusal raised after that point — an
-unavailable ephemeral profile, a KAS request failure, a provider engine that
-is not Kiro, or a `caller_ceiling` conflict — is also bound `launch_failed`,
-even though nothing was actually allocated yet.
+terminal cap check, so any other validation refusal raised after that point —
+an unavailable ephemeral profile, a KAS request, an engine given for a
+provider other than Kiro, or a `caller_ceiling` conflict — is bound
+`launch_failed`, even though nothing was actually allocated yet.
 
 Records never hold task messages, descriptions, purposes, prompts or working directories.
 Messages, descriptions and purposes are redacted before every decider call, including the
