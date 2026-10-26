@@ -9839,6 +9839,11 @@ class OutcomeCreateBody(BaseModel):
     source_terminal_id: Optional[str] = None
     score: Optional[int] = None
     friction_notes: str = ""
+    # Issue #1082: joins this outcome to one launch record. The MCP tool binds
+    # it to the caller's assign/handoff tree before this ever reaches here
+    # (same pattern as #912); this route trusts that check already ran and
+    # only best-effort-links by id, never failing the outcome write itself.
+    launch_terminal_id: Optional[str] = None
 
 
 def _require_learning_enabled() -> None:
@@ -9908,6 +9913,19 @@ async def create_outcome_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    if body.launch_terminal_id:
+        # Issue #1082: best-effort join, never turns a recorded outcome into a
+        # failed response. The MCP tool already refused an out-of-tree id
+        # before this request was ever sent. ``link_launch_outcome`` already
+        # swallows its own exceptions; this try/except is defense in depth so
+        # a bad caller-side value can never surface as a 500 on an outcome
+        # that was already committed above.
+        try:
+            from cli_agent_orchestrator.clients.database import link_launch_outcome
+
+            link_launch_outcome(body.launch_terminal_id, body.success)
+        except Exception as e:
+            logger.warning(f"Launch outcome link failed for {body.launch_terminal_id}: {e}")
     return {"success": True, "outcome": outcome}
 
 

@@ -2253,6 +2253,14 @@ async def report_outcome(
             "Conclusions only — never transcripts, logs, or file contents. Max 1000 chars."
         ),
     ),
+    terminal_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Join this outcome to one launch (issue #1082): the terminal id of the "
+            "worker this unit of work was performed by. Must be your own terminal "
+            "or one you created via assign/handoff; anything else is refused."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Record the outcome of a unit of agent work (self-learning signal).
 
@@ -2270,6 +2278,10 @@ async def report_outcome(
                 "success": False,
                 "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
             }
+        if terminal_id:
+            denial = _target_binding_denial(terminal_id)
+            if denial:
+                return {"success": False, "error": denial}
         payload = mcp_utils.post_body_json(
             "/outcomes",
             {
@@ -2281,6 +2293,7 @@ async def report_outcome(
                 "source_terminal_id": terminal_context["terminal_id"],
                 "score": score,
                 "friction_notes": friction_notes,
+                "launch_terminal_id": terminal_id,
             },
             timeout=_mcp_timeout(),
         )
