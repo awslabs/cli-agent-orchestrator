@@ -61,10 +61,17 @@ class CallerPosture(Enum):
 #: Refused to a bound caller that would lift an active halt, by the mutation and
 #: (as a faster, friendlier refusal) by the ops MCP middleware. One string, so
 #: the two layers cannot describe the same rule differently.
+#:
+#: It does NOT say "over MCP": ``posture`` defaults to ``BOUND``, so a non-MCP
+#: in-process caller of ``set_point`` that states no posture gets this refusal
+#: too (deliberately -- a control that every future caller must remember to opt
+#: into is a control that lapses). Naming MCP would have misdescribed that
+#: caller's situation and sent it looking for an MCP setting to change.
 HALT_LIFT_DENIAL = (
     "'decisions_set_point' is not permitted: lifting an active decisions halt is "
-    "operator-only and is not available over MCP to a bound CAO terminal. Run "
-    "`cao decisions set <point> <state>` locally."
+    "operator-only and is not available to a bound CAO terminal. An operator "
+    "context -- the CLI, or an MCP host with no CAO_TERMINAL_ID -- may lift it: "
+    "run `cao decisions set <point> <state>` locally."
 )
 
 #: Refused to a bound caller when the halt state could not be read exclusively.

@@ -273,6 +273,24 @@ class TestTheHaltLiftRuleLivesInTheMutation:
         assert egress.is_halted()
         assert self._recorded_state() is None
 
+    def test_the_refusal_does_not_claim_the_caller_is_on_mcp(self):
+        """It said "not available over MCP to a bound CAO terminal" -- but since
+        ``posture`` defaults to ``BOUND``, a plain in-process caller that states
+        no posture receives it too, and would have gone looking for an MCP
+        setting that has nothing to do with its problem. Reported by independent
+        re-review of #1062. What the text must carry instead is the remedy: which
+        contexts may lift a halt.
+        """
+        egress.HALT_FILE.touch()
+        with pytest.raises(settings.HaltLiftRefused) as refusal:
+            settings.set_point("model.route", "on")  # no posture: the default
+        text = str(refusal.value)
+        assert "over MCP" not in text
+        assert "bound CAO terminal" in text
+        assert "operator context" in text
+        assert "CAO_TERMINAL_ID" in text
+        assert "cao decisions set <point> <state>" in text
+
     @pytest.mark.parametrize("state", ["shadow", "on"])
     def test_a_bound_caller_may_set_a_lifting_state_with_no_halt_in_place(self, state):
         assert not egress.is_halted()
