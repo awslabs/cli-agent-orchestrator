@@ -11,9 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #1000). A path is not an identity. Move a non-Git working directory away, put a different directory
   at the same path, and every value the plan identifier recorded was byte-identical, so the
   replacement ran under the first directory's approval. A non-Git root now contributes its device and
-  inode (`st_dev`, `st_ino`) to the `plan_id` and to the per-run launch guard: the next run of a
-  replaced root is refused until re-approved, and a root swapped while a run is in flight stops that
-  run's next agent step with `plan_inputs_changed`. A Git root is deliberately unchanged, because its
+  inode (`st_dev`, `st_ino`) to the `plan_id` and to the per-run launch guard: the next run of a root
+  that was moved or renamed away and replaced, or whose path now carries a different mount, is refused
+  until re-approved, and a root swapped that way while a run is in flight stops that run's next agent
+  step with `plan_inputs_changed`. This does NOT catch a directory deleted and created again at the
+  same path: ext4 and XFS reuse the inode number just freed, so the recreated directory can get the
+  same pair back and keeps the approval, the same as a rewrite of its contents does — recorded under
+  "What an approval does not cover" in `docs/workflows.md`, with a stronger identity tracked in #1050.
+  A Git root's `plan_id` is deliberately unchanged, because its
   identity is the commit plus the worktree digest, so two checkouts in the same state still share one
   approval. Where the filesystem supplies no usable inode (some network mounts, container overlays,
   Windows volumes with no file index), CAO falls back to the previous path-only identity rather than

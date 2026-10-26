@@ -522,9 +522,15 @@ and discarded; it is never written to the manifest as its own value.
 > identity: a directory moved away and replaced by a different directory at the same path keeps the
 > path. So for a non-Git root the identifier records the directory's device and inode (`st_dev`,
 > `st_ino`) alongside its canonical path, and the launch guard re-checks the pair at every agent launch
-> in the run. Replace the directory and the next run gets a new `plan_id` and is refused until
-> re-approved; replace it while a run is in flight and that run's next agent step is refused with
-> `plan_inputs_changed`. A **Git** root is deliberately not bound this way — its identity is the commit
+> in the run. Move the directory away and put a different directory at the path — or mount a different
+> filesystem there — and the next run gets a new `plan_id` and is refused until re-approved; do it
+> while a run is in flight and that run's next agent step is refused with `plan_inputs_changed`. What
+> this does **not** catch is a directory **deleted and created again** at the same path: ext4 and XFS
+> hand out the inode number that was just freed, so the recreated directory can get the same pair back
+> and keep the approval. See
+> [What an approval does not cover](#what-an-approval-does-not-cover).
+>
+> A **Git** root is deliberately not bound this way — its identity is the commit
 > plus the worktree digest, which is content rather than location, so a different directory at the same
 > path already produces a different `plan_id` and two checkouts in the same state keep sharing one
 > approval, on one machine or two.
@@ -613,7 +619,7 @@ The refusal causes are deliberately distinct, because the operator's next action
 | Status | Meaning | What to do |
 |---|---|---|
 | `403` | The plan's `plan_id` has no approval. | `cao workflow approve <plan_id>`, then run again. |
-| `409` | `plan_inputs_changed`: while approval enforcement is on, the run's recorded agent profile or memory setting changed, the directory at its working-directory path was replaced by a different directory, its launch state is unreadable, approval enforcement was turned on after this run started, or approval settings could not be read. This surfaces from an agent step's `POST /terminals/run-step`, not the initial run attempt. | Start a new run for changed inputs, a replaced working directory, unreadable launch state, or newly enabled enforcement. If approval settings could not be read, repair `settings.json`, then resume. |
+| `409` | `plan_inputs_changed`: while approval enforcement is on, the run's recorded agent profile or memory setting changed, the directory at its working-directory path was replaced or removed, its launch state is unreadable, approval enforcement was turned on after this run started, or approval settings could not be read. This surfaces from an agent step's `POST /terminals/run-step`, not the initial run attempt. | Start a new run for changed inputs, a replaced working directory, unreadable launch state, or newly enabled enforcement. A working directory that was **removed** rather than replaced needs restoring first — starting a new run in a path that does not exist is refused with `422`. If approval settings could not be read, repair `settings.json`, then resume. |
 | `503` | CAO could not compute a plan identifier: untracked files exceed 64 MiB or contain unsupported entries, Git is unavailable/unreadable/timed out, files changed during the snapshot, profiles are unreadable, the freeze failed, or an older run has no recorded identity. | Follow the message; retry only when it says the cause was transient. No approval will help. |
 | `503` | The approval store could not be read, so CAO cannot determine whether the plan is approved. | Restore database access, then retry. The run remains refused. |
 
@@ -715,8 +721,9 @@ which is bound whole because OpenCode reads the whole file, so an edit to your o
 every `plan_id`). For a Git repository the directory state is
 the commit and the worktree changes, not the path, so two checkouts in the same state share one
 approval. For a directory outside any Git repository it is the directory's canonical path plus its
-device and inode, so the path cannot be pointed at a different directory under an existing approval —
-but still nothing about the files inside it.
+device and inode, so the path cannot be pointed at a *moved-away* directory's replacement, or at a
+different mount, under an existing approval — but still nothing about the files inside it, and not a
+directory deleted and created again at the same path (see the inode-reuse item below).
 
 Everything else is read when a step runs, so a new run of an approved plan can do something different
 from what was reviewed and still match the same `plan_id`:
@@ -731,8 +738,18 @@ from what was reviewed and still match the same `plan_id`:
   only within a run. Tracked in #828.
 - **Files in a non-Git working directory.** The `plan_id` records which directory it is — its path and
   its device and inode — not what is inside it. Files added, changed or removed there after approval
-  are used by the next run under the original `plan_id`. Replacing the *directory* is caught;
-  rewriting its *contents* is not.
+  are used by the next run under the original `plan_id`. A directory *moved or renamed away* and
+  replaced by another at the path is caught, and so is a different filesystem mounted at the path;
+  rewriting the *contents* is not.
+- **A non-Git root deleted and created again at the same path.** The device and inode pair is the
+  filesystem's identity for the directory, and filesystems **reuse inode numbers**. On ext4 and XFS —
+  the Linux defaults — a `rm -rf <root> && mkdir <root>`, or any tool that wipes and recreates the
+  directory, often gives the new directory the inode number that was just freed, on the same device.
+  The pair is then unchanged, so the `plan_id` is unchanged and the new directory keeps the approval,
+  exactly as a rewrite of the old directory's contents does. A directory that is **moved away** rather
+  than deleted keeps its inode allocated, which is why that case is always caught. A stronger identity
+  — a birth time, where the platform exposes one — is tracked in #1050; `os.stat` does not supply one
+  on Linux.
 - **A non-Git root on a filesystem with no usable inode.** Where the filesystem reports no inode for
   the directory, the root falls back to path-only identity and the manifest records
   `root_identity.bound: false` with its reason. Such a plan is approvable, and on that filesystem a

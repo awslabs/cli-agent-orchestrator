@@ -671,6 +671,30 @@ def test_a_root_that_can_no_longer_be_identified_is_refused(tmp_path, monkeypatc
         launch_guard.check("run-1", "worker")
 
 
+def test_a_removed_root_is_refused_with_its_own_diagnosis(tmp_path, monkeypatch):
+    """fanhongy's P3-2 on PR #1051: fail closed, but do not call a missing directory a replacement.
+
+    A deleted root makes the live ``root_identity`` unbound, which differs from the recorded pair, so
+    the guard refused -- correctly -- under the "the directory at that path has been replaced" text.
+    That diagnosis sends the operator to "start a new run", which then fails with 422 because
+    ``working_directory`` must name an existing directory. Two states, two messages.
+    """
+    from cli_agent_orchestrator.services import manifest_freeze
+
+    _pinned_store(tmp_path, monkeypatch)
+    root = _non_git_root(tmp_path)
+    frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={}, cwd=str(root))
+    guard = launch_guard.capture(profile_set=frozen.profile_set, root_identity=frozen.root_identity)
+    _admit_with_root(monkeypatch, guard, root)
+
+    root.rmdir()
+
+    with pytest.raises(launch_guard.PlanInputsChangedError) as refusal:
+        launch_guard.check("run-1", "worker")
+    assert "no longer exists" in str(refusal.value)
+    assert "has been replaced" not in str(refusal.value)
+
+
 @pytest.mark.parametrize(
     "recorded,why",
     [

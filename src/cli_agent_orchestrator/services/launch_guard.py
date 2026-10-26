@@ -228,6 +228,13 @@ def _check_root_identity(guard: Mapping[str, Any], snapshot: Mapping[str, Any]) 
     A BOUND RECORD THAT CANNOT BE RE-VERIFIED IS A REFUSAL, not a skip: an identity that stops being
     readable, or a snapshot with no ``working_directory`` to re-stat, means the guard can no longer show
     the run is still in the approved directory, and the guard's whole posture is fail-closed.
+
+    THE TWO REFUSALS SAY DIFFERENT THINGS, because they call for different actions. A bound pair that
+    differs means a different directory is at the path, and "start a new run" is the fix. An identity
+    that cannot be read NOW — the root was deleted, or the stat failed with ``EACCES``/``ESTALE`` —
+    is not a replacement, and telling the operator to start a new run sends them into a 422
+    (``working_directory must name an existing directory``) instead of at the missing directory
+    (fanhongy's P3-2 on PR #1051).
     """
     if "root_identity" not in guard:
         return
@@ -237,7 +244,15 @@ def _check_root_identity(guard: Mapping[str, Any], snapshot: Mapping[str, Any]) 
     root = snapshot.get("working_directory")
     if not isinstance(root, str) or not root:
         raise PlanInputsChangedError(_UNREADABLE_MESSAGE)
-    if git_baseline.root_identity(root) != recorded:
+    # ONE stat, read once and then classified, so the two refusal arms cannot describe two different
+    # observations of the directory.
+    current = git_baseline.root_identity(root)
+    if not current.get("bound"):
+        raise PlanInputsChangedError(
+            "This run's working directory can no longer be read, or no longer exists, so it cannot be "
+            "shown to be the directory that was approved; restore it, or start a new run."
+        )
+    if current != recorded:
         raise PlanInputsChangedError(
             "This run's working directory is no longer the directory that was approved: its path is "
             "unchanged, but the directory at that path has been replaced; start a new run."
