@@ -37,14 +37,15 @@ other ephemerals, even when `child_may_delegate` allows the existing delegation 
 
 The last four keys control lifecycle cleanup. Their defaults are proposals that await
 maintainer confirmation (#1079). `max_live_per_session` is an opt-in cap on the pending,
-claimed and launched names one session holds. The default, `0`, means no cap, so current
-users see no change. To opt in, set a positive integer; `32` leaves room for a fleet-style
-supervisor. Collected names and expired pending names don't count. A create past the cap is refused with `max_live_exceeded` (409) before anything is
-written. If the value isn't a non-negative integer, every create is refused with
-`policy_config_error:max_live_per_session`. The other three keys tune the sweep described
-below. An unusable `launch_grace_seconds` skips the two steps that need it: periodic
-collection of launched names with no terminal row, and deletion of rowless live files. An
-unusable `retention_days` skips retention. An unusable interval falls back to the default.
+claimed and launched names one session holds. The default, `0`, means no cap, so current users
+see no change. To opt in, set a positive integer; `32` leaves room for a fleet-style
+supervisor. Collected names and expired pending names don't count. A create past the cap is
+refused with `max_live_exceeded` (409) before anything is written. If the value isn't a
+non-negative integer, every create is refused with `policy_config_error:max_live_per_session`.
+The other three keys tune the sweep described below. An unusable `launch_grace_seconds` skips
+the two steps that need it: periodic collection of launched names with no terminal row, and
+deletion of rowless live files. An unusable `retention_days` skips retention. An unusable
+interval falls back to the default.
 
 Creates take an inter-process `flock` lock under `CAO_HOME/locks/`, so the CAO home must be
 on a filesystem that supports `flock`. A create that can't take the lock within 10 seconds
