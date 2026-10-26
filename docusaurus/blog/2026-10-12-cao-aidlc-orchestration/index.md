@@ -31,7 +31,7 @@ underneath is Kiro CLI, Claude Code, or Codex.
 In other words: AI-DLC is the disciplined lifecycle for one intent, and CAO is the thing that can
 run many of those lifecycles at once and remember what they learn.
 
-Everything below was run against CAO `v2.5.3` and AI-DLC Workflows `2.x`. The example it refers to
+Everything below was run against CAO `v2.5.4` and AI-DLC Workflows `2.x`. The example it refers to
 lives in
 [`examples/aidlc-portfolio`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/aidlc-portfolio),
 and it is being updated alongside this post.
