@@ -1548,13 +1548,19 @@ class TestMcpKeyValidation:
         )
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
-        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+        # The bundled server's env table carries the coordinate. Since #1062 the
+        # launching terminal's own id travels in the SAME explicit table (not only
+        # via env_vars inheritance), so assert the coordinate is present rather than
+        # pinning the whole table.
+        assert '"CAO_API_PORT" = "9899"' in command
+        assert "mcp_servers.cao-mcp-server.env=" in command
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
-    def test_bundled_server_default_cao_is_unchanged(self, mock_load, monkeypatch):
-        """A default CAO (none of the three address vars set) writes exactly the
-        same command as before this fix: no ``.env=`` override for the bundled
-        server beyond what ``env_vars`` already adds."""
+    def test_bundled_server_default_cao_adds_no_coordinate(self, mock_load, monkeypatch):
+        """A default CAO (none of the three address vars set) adds no address
+        coordinate to the bundled server's env. The terminal id still travels there
+        since #1062 -- identity must reach the server even where env_vars inheritance
+        fails -- so the env table is exactly the id, with none of the three coordinates."""
         for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
             monkeypatch.delenv(key, raising=False)
         mock_load.return_value = self._profile_with(
@@ -1562,7 +1568,9 @@ class TestMcpKeyValidation:
         )
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
-        assert "mcp_servers.cao-mcp-server.env=" not in command
+        assert 'mcp_servers.cao-mcp-server.env={ "CAO_TERMINAL_ID" = "tid" }' in command
+        for coord in ("CAO_API_PORT", "CAO_API_HOST", "CAO_HOME_DIR"):
+            assert coord not in command
 
 
 class TestCodexProviderCodexConfig:
