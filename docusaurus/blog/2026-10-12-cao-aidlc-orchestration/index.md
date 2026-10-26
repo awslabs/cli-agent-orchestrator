@@ -68,11 +68,12 @@ discover in the API intent is one the client intent needs before it starts. A co
 once should carry into later intents. A per-space file cannot do that. It is local to its worktree,
 it knows nothing about other intents, and nothing coordinates concurrent writes.
 
-The portfolio example shows how much work that gap costs. To make the per-space files act like a
-shared, durable store, it builds a protocol on top of them: a revision recorded at dispatch to
-detect drift, a propose-and-approve flow for durable learnings, a lock so approval is replay-safe,
-and a compare-and-swap barrier at completion. That is careful work, and it is a lot of it, all to
-give flat files the behavior a memory system is supposed to provide.
+The first version of the portfolio example showed how much work that gap costs. To make the
+per-space files act like a shared, durable store, the example built a protocol on top of them: a
+revision recorded at dispatch to detect drift, a propose-and-approve flow for durable learnings, a
+lock so approval was replay-safe, and a compare-and-swap barrier at completion. That was careful
+work, and a lot of it, all to give flat files the behavior a memory system is supposed to provide.
+The example now keeps only the review step and leaves storage to CAO memory.
 
 ### What CAO memory adds
 
