@@ -129,6 +129,7 @@ BRACKETED_PASTE_INCOMPATIBLE_SHELLS = frozenset(
     {"sh", "dash", "bash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash"}
 )
 
+
 # =============================================================================
 # Application Directory Structure
 # =============================================================================
@@ -142,9 +143,22 @@ BRACKETED_PASTE_INCOMPATIBLE_SHELLS = frozenset(
 # Must be set before this module is first imported. Empty or whitespace-only
 # values are treated as unset; tilde is expanded and the result is resolved to
 # an absolute path.
+def canonical_cao_home(raw: str) -> Path:
+    """Canonicalise a ``CAO_HOME_DIR`` value: expand ``~``, resolve to absolute.
+
+    The single implementation of that rule. ``CAO_HOME_DIR`` below is the
+    server's own home; :func:`server_coordinate_env` canonicalises by the same
+    rule before handing the value to a subprocess, so a relative value cannot
+    mean one directory in cao-server and another in an MCP server a provider
+    starts from a different working directory (#1066). Callers pass a value
+    they have already established is non-blank.
+    """
+    return Path(raw).expanduser().resolve()
+
+
 _cao_home_raw = os.environ.get("CAO_HOME_DIR", "").strip()
 CAO_HOME_DIR = (
-    Path(_cao_home_raw).expanduser().resolve()
+    canonical_cao_home(_cao_home_raw)
     if _cao_home_raw
     else Path.home() / ".aws" / "cli-agent-orchestrator"
 )
@@ -500,20 +514,32 @@ SERVER_COORDINATE_ENV_VARS = ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR")
 def server_coordinate_env() -> dict[str, str]:
     """Return the coordinate env vars actually SET in this server's environment.
 
-    Raw values, never the defaults: a default CAO (none of the three set) gets
-    an empty mapping, so every launch command and MCP config built from it is
+    Never the defaults: a default CAO (none of the three set) gets an empty
+    mapping, so every launch command and MCP config built from it is
     byte-identical to one built before this existed. Empty or whitespace-only
-    is treated as unset, matching how ``CAO_HOME_DIR`` itself is read above.
+    is treated as unset, matching how ``CAO_HOME_DIR`` itself is read above --
+    so nothing blank is ever forwarded, and a child never has to parse one.
+
+    ``CAO_HOME_DIR`` is forwarded CANONICALISED (:func:`canonical_cao_home`,
+    the same rule that produced ``CAO_HOME_DIR`` above), not raw. A relative
+    value resolves against the *current working directory*, and a provider may
+    start the MCP subprocess from somewhere else: the raw string would then
+    name a different home and a second, empty state tree. Host and port carry
+    no such ambiguity and are forwarded as set.
 
     The single source for all three injection sites -- the runtime bundled
     cao-mcp-server entry (``utils.mcp_resolution``), the hand-built Copilot
     runtime entry, and herdr's pane ``--env`` -- so they cannot drift apart.
     """
-    return {
-        name: os.environ[name]
-        for name in SERVER_COORDINATE_ENV_VARS
-        if os.environ.get(name, "").strip()
-    }
+    coordinates: dict[str, str] = {}
+    for name in SERVER_COORDINATE_ENV_VARS:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            continue
+        coordinates[name] = (
+            str(canonical_cao_home(value)) if name == "CAO_HOME_DIR" else os.environ[name]
+        )
+    return coordinates
 
 
 # Default timeout (seconds) for HTTP calls to the CAO API server.

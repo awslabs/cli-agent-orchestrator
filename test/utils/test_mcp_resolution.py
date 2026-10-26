@@ -1,11 +1,13 @@
 """Unit tests for cao-mcp-server command resolution."""
 
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import yaml
 
 from cli_agent_orchestrator.constants import (
+    CAO_HOME_DIR,
     SERVER_COORDINATE_ENV_VARS,
     server_coordinate_env,
 )
@@ -286,6 +288,53 @@ class TestServerCoordinateEnv:
     def test_whitespace_only_is_unset(self, monkeypatch, default_cao_server):
         """Matches how ``CAO_HOME_DIR`` itself is read in constants."""
         monkeypatch.setenv("CAO_HOME_DIR", "   ")
+        assert server_coordinate_env() == {}
+
+    def test_a_relative_home_is_canonicalised(self, monkeypatch, default_cao_server):
+        """A relative ``CAO_HOME_DIR`` means cao-server's cwd, not the child's.
+
+        A provider may start the MCP subprocess from another working
+        directory; forwarding the raw string would send it to a different
+        home and a second, empty state tree.
+        """
+        monkeypatch.setenv("CAO_HOME_DIR", "relative-state")
+        forwarded = server_coordinate_env()["CAO_HOME_DIR"]
+        assert Path(forwarded).is_absolute()
+        assert forwarded == str((Path.cwd() / "relative-state").resolve())
+
+    def test_a_tilde_home_is_expanded(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_HOME_DIR", "~/cao-trial")
+        assert server_coordinate_env()["CAO_HOME_DIR"] == str(Path.home() / "cao-trial")
+
+    def test_an_absolute_home_is_unchanged(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-trial")
+        assert server_coordinate_env()["CAO_HOME_DIR"] == "/srv/cao-trial"
+
+    def test_an_unset_home_is_absent(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        assert "CAO_HOME_DIR" not in server_coordinate_env()
+
+    def test_the_forwarded_home_is_the_one_constants_resolved(self, monkeypatch):
+        """With the environment as it was at import, the child gets OUR home.
+
+        The reviewer's ask, pinned literally: the value handed to a subprocess
+        is ``str(CAO_HOME_DIR)``, the home this process actually uses.
+        """
+        monkeypatch.setenv("CAO_HOME_DIR", str(CAO_HOME_DIR))
+        assert server_coordinate_env()["CAO_HOME_DIR"] == str(CAO_HOME_DIR)
+
+    def test_nothing_blank_is_ever_forwarded(self, monkeypatch, default_cao_server):
+        """A blank value in the CHILD is what breaks it, so none is sent.
+
+        An empty ``CAO_API_PORT`` raises at the child's import of
+        ``constants`` (``int("")``) and an empty ``CAO_API_HOST`` yields a
+        ``http://:9889`` base URL. The filter here is what keeps either from
+        ever being handed over; constants' own parsing of a blank value set by
+        someone else is a separate matter and unchanged by this PR.
+        """
+        monkeypatch.setenv("CAO_API_HOST", "")
+        monkeypatch.setenv("CAO_API_PORT", "   ")
+        monkeypatch.setenv("CAO_HOME_DIR", "\t")
         assert server_coordinate_env() == {}
 
     def test_never_reports_the_defaults(self, default_cao_server):
