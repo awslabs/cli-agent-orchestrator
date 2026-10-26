@@ -957,8 +957,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covering it), which `@cao-mcp-server` does **not** imply. Two deliberate carve-outs:
   `decisions_off` stays reachable without the grant, because an argument-free off-only kill switch
   that needs a grant is not a fail-safe; and lifting a halt is refused for any bound terminal even
-  *with* the grant, so `cao decisions set` on the CLI is the only path. An operator MCP host, with
-  no `CAO_TERMINAL_ID`, is unchanged on both counts. The gate is #972's own middleware, moved to
+  *with* the grant, so it takes an operator context — `cao decisions set` on the CLI, or an MCP host
+  running the operations server with no `CAO_TERMINAL_ID`. That refusal is enforced inside the
+  mutation, under the same exclusive lock the halt marker is created and removed under, so a halt an
+  operator publishes while a call is in flight cannot be erased by it; the middleware refuses early
+  only to say so sooner. An operator MCP host, with
+  no `CAO_TERMINAL_ID`, is unchanged on both counts. A caller that claims an identity CAO cannot
+  resolve — including an explicitly empty `CAO_TERMINAL_ID` — is refused rather than treated as an
+  operator, and the providers that forward the variable now always inject the launching terminal's
+  own id, overriding (and logging) a profile that tries to pin one. The gate is #972's own
+  middleware, moved to
   `security/mcp_tool_gate.py` and installed on both surfaces, and the `@server` spelling rule is now
   `tool_mapping.mcp_reference_covers` — the same matcher the provider layer uses — so a documented
   glob grant such as `@cao-*` authorizes here what it already authorized there.

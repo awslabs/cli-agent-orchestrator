@@ -343,7 +343,7 @@ class TestTheHaltLiftRuleLivesInTheMutation:
         assert self._recorded_state() is None
 
     def test_an_operator_proceeds_without_the_lock(self, monkeypatch, caplog):
-        """The CLI is the only way to lift a halt; it may not lose that to a lock."""
+        """An operator context may lift a halt; it may not lose that to a lock."""
         import fcntl
 
         monkeypatch.setattr(egress, "HALT_CONTROL_TIMEOUT_S", 0)
