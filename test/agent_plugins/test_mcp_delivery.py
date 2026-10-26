@@ -1213,6 +1213,27 @@ class TestCwdSeam:
         assert profile.mcpServers["mine"]["cwd"] == "/somewhere"
 
 
+class TestPersistedProfileGainsNothing:
+    """P3-2: 'persisted config gains nothing' was proven only at the resolver
+    unit level (``test_mcp_resolution.py``), not through the real persisted
+    caller ``apply_plugin_mcp_servers(..., persisted=True)`` that
+    ``install_service`` actually uses before writing a provider's config file."""
+
+    def test_install_path_bundled_server_gains_nothing(self, monkeypatch):
+        from cli_agent_orchestrator.agent_plugins.mcp_delivery import apply_plugin_mcp_servers
+
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+
+        class _P:
+            mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+
+        profile = _P()
+        apply_plugin_mcp_servers(profile, provider="kiro_cli", persisted=True)
+        assert "env" not in profile.mcpServers["cao-mcp-server"]
+
+
 class TestCwdUnsupportedIsLoud:
     """Reported by review 5222539218 on #584 (item 4)."""
 
