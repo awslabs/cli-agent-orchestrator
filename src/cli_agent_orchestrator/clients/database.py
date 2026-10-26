@@ -372,9 +372,9 @@ class LaunchStatusEventModel(Base):
 
     Content-free: just the status label and when it was observed. tmux
     terminals get one row per detected change (``StatusMonitor._apply_detection``);
-    herdr terminals -- which derive status on demand rather than through that
-    pipeline -- get one row whenever a poll observes a different status than
-    the last one recorded.
+    herdr terminals get one row per change in the ``agent_status`` herdr
+    reports for a managed pane (``HerdrInboxService``). Rows carry only the
+    terminal id.
     """
 
     __tablename__ = "launch_status_events"
@@ -450,15 +450,25 @@ def finalize_launch_records(terminal_ids: List[str], end_reason: str) -> None:
         logger.warning(f"Launch record finalize failed for {terminal_ids}: {e}")
 
 
-def record_launch_status_event(terminal_id: str, status: str) -> None:
+def record_launch_status_event(
+    terminal_id: str, status: str, observed_at: Optional[datetime] = None
+) -> None:
     """Append one status-transition row for busy-time accounting (issue #1082).
 
-    Best-effort: never raises. Called from the live status-detection path, so
-    a write failure here must never affect the status a caller observes.
+    ``observed_at`` lets a caller that writes off its event loop stamp the
+    moment it saw the transition rather than the moment the write landed.
+    Best-effort: never raises. Called from the live status paths, so a write
+    failure here must never affect the status a caller observes.
     """
     try:
         with SessionLocal() as db:
-            db.add(LaunchStatusEventModel(terminal_id=terminal_id, status=status))
+            db.add(
+                LaunchStatusEventModel(
+                    terminal_id=terminal_id,
+                    status=status,
+                    created_at=observed_at if observed_at is not None else _utcnow(),
+                )
+            )
             db.commit()
     except Exception as e:
         logger.debug(f"Launch status event record failed for {terminal_id}: {e}")
