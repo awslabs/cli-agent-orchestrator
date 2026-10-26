@@ -215,6 +215,40 @@ def test_enabling_point_prints_effective_states():
     assert not egress.is_halted()
 
 
+@pytest.mark.parametrize("state", ["shadow", "on"])
+def test_the_mutation_lifts_the_halt_for_exactly_the_shared_states(monkeypatch, state):
+    """``set_point`` reads ``HALT_LIFTING_STATES``, the set the MCP gate asks about.
+
+    #1062 refuses a bound MCP caller the states that LIFT an operator's halt. The
+    gate asks ``settings.lifts_halt``, which reads this same set, so widening the
+    set moves both -- a guard with its own ``("shadow", "on")`` copy stops guarding
+    the day the mutation gains a state. The gate's half of this is
+    ``test/ops_mcp_server/test_ops_tool_surface_allowlist.py::
+    TestLiftingAHaltIsOperatorOnly::test_the_gate_has_no_private_copy_of_the_lifting_states``.
+    """
+    egress.HALT_FILE.touch()
+    assert settings.lifts_halt(state)
+
+    # Narrow the shared set and the mutation follows it, not a literal of its own.
+    monkeypatch.setattr(settings, "HALT_LIFTING_STATES", frozenset())
+    settings.set_point("model.route", state)
+    assert egress.is_halted(), "set_point lifted the halt for a non-lifting state"
+    assert not settings.lifts_halt(state)
+
+    monkeypatch.setattr(settings, "HALT_LIFTING_STATES", frozenset({state}))
+    settings.set_point("model.route", state)
+    assert not egress.is_halted()
+
+
+def test_lifts_halt_is_false_with_no_halt_and_for_a_non_string():
+    """Nothing to lift, and whatever arrived over the wire need not be a string."""
+    assert not egress.is_halted()
+    assert not settings.lifts_halt("on")
+    egress.HALT_FILE.touch()
+    assert not settings.lifts_halt(None) and not settings.lifts_halt(7)
+    assert not settings.lifts_halt("off")
+
+
 @pytest.mark.parametrize(
     "case", ["missing_metadata", "duplicate_script", "not_callable", "raises", "bad_exit"]
 )

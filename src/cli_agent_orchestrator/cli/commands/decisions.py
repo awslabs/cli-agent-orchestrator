@@ -40,7 +40,12 @@ def status() -> None:
 @click.argument("state", type=click.Choice(settings.STATES))
 @click.option("--decider", default=None)
 def set_point(point: str, state: str, decider: str | None) -> None:
-    """Set a point's state and optionally its installed decider name."""
+    """Set a point's state and optionally its installed decider name.
+
+    Setting shadow or on also lifts an active halt. This command is the ONLY way
+    to lift one: the operations MCP tool refuses it for any bound CAO terminal,
+    even one holding @cao-ops-mcp-server (#1062).
+    """
     _run(lambda: operator.set_point(point, state, decider))
 
 

@@ -22,7 +22,14 @@ RETENTION_DAYS_RANGE = (1, 36500)
 MAX_CONCURRENT_RANGE = (1, 1024)
 MAX_PENDING_RANGE = (0, 100000)
 SHADOW_TIMEOUT_MS_RANGE = (50, 60000)
-SAME_USER = "'Operator only' means not settable through MCP or any agent-facing API. It is a same-user local control, not a privilege boundary: settings.json can be edited by the same user, including an agent with shell access."
+SAME_USER = "'Operator only' means an operator context: over the operations MCP server a bound CAO terminal needs the '@cao-ops-mcp-server' grant, and lifting a halt is refused there even with it. It is a same-user local control, not a privilege boundary: settings.json can be edited by the same user, including an agent with shell access."
+
+#: The ``set_point`` states that CLEAR an active halt marker, named once so the
+#: mutation below and the MCP gate that refuses it (#1062 item 3,
+#: ``ops_mcp_server/gate.py``) cannot drift. Two hand-written ``("shadow", "on")``
+#: literals is how a guard stops guarding: the mutation gains a state and the
+#: gate keeps checking the old pair.
+HALT_LIFTING_STATES = frozenset({PointState.SHADOW.value, PointState.ON.value})
 
 
 @dataclass(frozen=True)
@@ -151,10 +158,31 @@ def set_point(point: str, state: str, decider: str | None = None) -> None:
     if decider is not None:
         item["decider"] = decider
     settings_service._save(data)
-    if state in ("shadow", "on"):
+    if state in HALT_LIFTING_STATES:
         from cli_agent_orchestrator.decisions import egress
 
         egress.HALT_FILE.unlink(missing_ok=True)
+
+
+def lifts_halt(state: Any) -> bool:
+    """Whether ``set_point(..., state)`` would clear an operator's active halt.
+
+    The predicate the ops MCP gate asks before letting a bound caller near
+    ``decisions_set_point`` (#1062 item 3). It reads the same
+    ``HALT_LIFTING_STATES`` that ``set_point`` acts on and the same live marker
+    ``egress.is_halted`` reads, so "would this lift the halt?" is answered once
+    rather than re-derived by the guard.
+
+    ``state`` is whatever arrived over the wire, so a non-string is simply not a
+    lifting state. With no halt in place there is nothing to lift and this is
+    False -- the gate's remaining selector check still applies.
+    """
+    if not isinstance(state, str) or state not in HALT_LIFTING_STATES:
+        return False
+
+    from cli_agent_orchestrator.decisions import egress
+
+    return egress.is_halted()
 
 
 def set_tier(provider: str, tier: str, model: str | None) -> None:

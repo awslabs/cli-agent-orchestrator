@@ -946,6 +946,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`cao-ops-mcp-server` is gated on the caller's `tools:` allowlist** (#1062). #972 gated every
+  `cao-mcp-server` tool on that allowlist and recorded the operations control plane as knowingly
+  ungated. The gap: `CAO_TERMINAL_ID` is forwarded into **every** server in a profile's
+  `mcpServers` map, so a bound terminal whose profile merely listed `cao-ops-mcp-server` reached all
+  18 ops tools — `launch_session`, `install_profile`, `shutdown_session`, `send_session_message`,
+  the session/terminal readers and the seven `decisions_*` controls — with its allowlist
+  unconsulted, and could lift an operator's `cao decisions off` by setting a point back to `shadow`
+  or `on`. Every ops tool now requires the new `@cao-ops-mcp-server` grant (or `*`, or a glob
+  covering it), which `@cao-mcp-server` does **not** imply. Two deliberate carve-outs:
+  `decisions_off` stays reachable without the grant, because an argument-free off-only kill switch
+  that needs a grant is not a fail-safe; and lifting a halt is refused for any bound terminal even
+  *with* the grant, so `cao decisions set` on the CLI is the only path. An operator MCP host, with
+  no `CAO_TERMINAL_ID`, is unchanged on both counts. The gate is #972's own middleware, moved to
+  `security/mcp_tool_gate.py` and installed on both surfaces, and the `@server` spelling rule is now
+  `tool_mapping.mcp_reference_covers` — the same matcher the provider layer uses — so a documented
+  glob grant such as `@cao-*` authorizes here what it already authorized there.
+  **How this slipped through:** the surface was recorded as ungated on purpose. #972's own guard
+  declared it in `UNGATED_SURFACES` with the reason and the shape of the risk written out, and the
+  suite stayed green because the declaration was the assertion. The follow-up had no owner and no
+  issue until #1062. `UNGATED_SURFACES` is now empty, and both surfaces are enumerated by
+  introspection in the per-tool coverage test, so a new ops tool is gated by default rather than by
+  someone remembering.
+  **Migration:** a profile that lists `cao-ops-mcp-server` in `mcpServers` and pins an explicit
+  `tools:`/`allowedTools:` list must add `@cao-ops-mcp-server` to it. Profiles granting `*`, and
+  operator MCP hosts, need no change.
+
 - **Vault `secret_gate: "warn"` no longer forwards raw secret matches to a model** (#644 AC10).
   Under `warn` a secret-bearing note is still indexed and recallable, but every match is replaced by
   `[REDACTED:<pattern_name>]` at the single vault read chokepoint, so automatic injection, explicit
