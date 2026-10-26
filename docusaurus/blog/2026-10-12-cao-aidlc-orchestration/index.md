@@ -64,9 +64,9 @@ AI-DLC keeps an intent's working knowledge in a two-tier set of Markdown files u
 what is specific to this one project. This works while you stay inside one intent in one worktree.
 
 It stops working the moment several intents need to share what they learn. A contract rule you
-discover in the API intent should reach the client intent. A convention you agree once should carry
-into later intents. A per-space file cannot do that. It is local to its worktree, it knows nothing
-about other intents, and nothing coordinates concurrent writes.
+discover in the API intent is one the client intent needs before it starts. A convention you agree
+once should carry into later intents. A per-space file cannot do that. It is local to its worktree,
+it knows nothing about other intents, and nothing coordinates concurrent writes.
 
 The portfolio example shows how much work that gap costs. To make the per-space files act like a
 shared, durable store, it builds a protocol on top of them: a revision recorded at dispatch to
@@ -78,21 +78,40 @@ give flat files the behavior a memory system is supposed to provide.
 
 CAO owns a memory layer that every agent uses through the same tools. It stores distilled
 conclusions, not raw transcripts. Agents write and read it with `memory_store` and `memory_recall`,
-not by hand-editing files. It is shared across sessions, and across intents, by construction. The
+not by hand-editing files, and it persists across sessions and restarts. The
 [first post in this series](../2026-10-08-cao-memory-design/index.md) covers how that layer works.
 
-Pointed at AI-DLC, it works two ways:
+One detail decides how it carries knowledge between intents: CAO resolves the project scope per
+terminal. It uses `CAO_PROJECT_ID` if you set one, and otherwise the git remote or the path of the
+terminal's working directory. In the portfolio layout, the parent runs in a portfolio root and each
+intent's runner runs in a worktree of its own repository, so each one lands in a different project
+scope. A runner's own `memory_recall` does not see what the parent stored. Sharing across intents is
+not automatic.
+
+So the example delivers it. At dispatch, the parent recalls the reviewed learnings from its own
+scope and puts the ones that apply to that intent into the runner's assignment, bounded and labelled
+as reference data rather than instructions. That is how the API intent's contract rule reaches the
+client intent: when the client waits on the API contract, the parent dispatches it after the API
+intent completes, and its assignment carries the rule. A runner that is already running does not get
+a learning promoted after its dispatch. If
+you would rather have every runner recall one scope directly, set `CAO_PROJECT_ID` for the CAO
+server. That works, but it applies to every terminal of that server, not only to the portfolio.
+
+Pointed at AI-DLC, CAO memory works two ways:
 
 - **Amplify.** Keep your per-space `project.md` and `team.md` as the intent's local scratch. Promote
   the durable learnings into CAO memory instead of into a hand-built approve-and-sync protocol.
-  Cross-intent recall, concurrency, and persistence become the store's job, not yours.
+  Persistence and concurrent writes become the store's job, not yours. Handing a learning to the
+  next intent is the orchestrator's job, done at dispatch.
 - **Replace.** For portfolio-level knowledge, let CAO memory be the store. That is the project
   catalog, the dependencies between intents, and the decisions already made. Nothing to journal by
-  hand, because durable cross-intent recall is native.
+  hand: the parent that owns that knowledge works from one place, so its own recall spans every
+  intent and survives a restart.
 
 The point is not that CAO also has memory. It is that your intent-local memory and CAO's
 cross-session memory compose. The intent keeps its scratch. Everything worth carrying forward lives
-in a store the next intent, and the next run after a restart, can recall.
+in a store the parent can recall after a restart, and the parent hands it to the next intent when it
+dispatches it.
 
 ## Orchestration: run several intents at once
 
@@ -132,9 +151,10 @@ decisions were real, so getting this binding right is what keeps the rest honest
 
 ## Summary
 
-You can run AI-DLC on CAO today, and it gives AI-DLC two things worth having. CAO's shared memory
-layer lets what one intent learns reach the next one and survive a restart, through the same
-`memory_store` and `memory_recall` every CAO agent uses. CAO's orchestration runs several intents at
+You can run AI-DLC on CAO today, and it gives AI-DLC two things worth having. CAO's memory layer
+keeps what one intent learns across restarts, through the same `memory_store` and `memory_recall`
+every CAO agent uses, and the orchestrator hands the reviewed learnings to the next intent when it
+dispatches it. CAO's orchestration runs several intents at
 once, each in its own worktree, coordinated and watched from one surface. The one rule to carry
 across: wherever CAO sits between AI-DLC and you, keep the orchestrator a relay for AI-DLC's human
 gates. Bind answers to a human approval record, and put that record outside the agent's write reach
