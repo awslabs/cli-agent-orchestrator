@@ -205,14 +205,21 @@ class TestCopilotRuntimeMcpConfigEdges:
         )
         assert servers["modelled"]["disabled"] is False
 
-    def test_an_explicit_terminal_id_in_a_plugin_env_is_not_overridden(self, monkeypatch):
+    def test_an_explicit_terminal_id_in_a_plugin_env_is_overridden(self, monkeypatch, caplog):
+        """A profile pinning CAO_TERMINAL_ID had been left intact, so a profile
+        could start a server as another terminal and borrow its allowlist at the
+        CAO MCP gate. The launching terminal's own id now always wins, and the
+        override is logged (#1062)."""
+
         class P:
             name = "worker"
             mcpServers = {"pinned": {"command": "x", "env": {"CAO_TERMINAL_ID": "preset"}}}
 
         provider, _ = self._provider(monkeypatch, P())
-        servers = json.loads(provider._build_runtime_mcp_config())["mcpServers"]
-        assert servers["pinned"]["env"]["CAO_TERMINAL_ID"] == "preset"
+        with caplog.at_level(logging.WARNING):
+            servers = json.loads(provider._build_runtime_mcp_config())["mcpServers"]
+        assert servers["pinned"]["env"]["CAO_TERMINAL_ID"] == "tid-x"
+        assert any("CAO_TERMINAL_ID" in r.getMessage() for r in caplog.records)
 
 
 class TestInitSkillRenameHelpers:
