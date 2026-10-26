@@ -561,6 +561,40 @@ class TestCodexBuildCommand:
         assert "mcp_servers.cao-mcp-server.env=" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_uvx_declared_bundled_server_reaches_the_right_cao(
+        self, mock_load_profile, monkeypatch, default_cao_server
+    ):
+        """The shape ``templates/aws/*/template.md.j2`` declares.
+
+        The command is ``uvx``, so it is a passthrough for command resolution;
+        recognising the server only by command equality would have left every
+        profile created from a shipped AWS template reporting to the default
+        CAO.
+        """
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = ""
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {
+                "type": "stdio",
+                "command": "uvx",
+                "args": [
+                    "--from",
+                    "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                    "cao-mcp-server",
+                ],
+            }
+        }
+        mock_profile.codexProfile = None
+        mock_load_profile.return_value = mock_profile
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
+        command = provider._build_codex_command()
+
+        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_empty_system_prompt(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.model = None

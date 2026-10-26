@@ -114,6 +114,37 @@ def resolve_cao_mcp_command(
     return interpreter, ["-m", CAO_MCP_SERVER_MODULE, *args]
 
 
+def is_bundled_cao_server(config: dict) -> bool:
+    """Return True when this entry starts CAO's OWN orchestration MCP server.
+
+    Four shapes reach callers, and all four name the server exactly:
+
+    1. the bare console script a bundled profile declares (``command:
+       cao-mcp-server``);
+    2. the absolute path :func:`resolve_cao_mcp_command` rewrites that to;
+    3. the module entrypoint it falls back to (``<python> -m
+       cli_agent_orchestrator.mcp_server.server``);
+    4. ``uvx --from git+…/cli-agent-orchestrator.git@main cao-mcp-server`` --
+       the form the shipped ``templates/aws/*`` profiles use, where the server
+       is a positional ARGUMENT rather than the command.
+
+    Checked structurally rather than by the entry's name in ``mcpServers``,
+    because the name is the profile author's label: shape 4 is what a profile
+    built from a template actually carries, and an entry labelled something
+    else that nonetheless launches this server still needs CAO's coordinates.
+    A third-party server cannot match by accident -- it would have to name
+    ``cao-mcp-server`` as its command or pass it as an argument.
+    """
+    command = config.get("command")
+    if isinstance(command, str) and command:
+        if Path(command).name in (CAO_MCP_SERVER_COMMAND, _SCRIPT_FILENAME):
+            return True
+    return any(
+        isinstance(arg, str) and arg in (CAO_MCP_SERVER_COMMAND, CAO_MCP_SERVER_MODULE)
+        for arg in (config.get("args") or [])
+    )
+
+
 def apply_server_coordinates(config: dict) -> dict:
     """Return ``config`` with the running server's coordinates added to its env.
 
@@ -161,13 +192,15 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     into a command-less entry would corrupt it for providers that emit every
     present key.
 
-    One exception to "leaves all other keys untouched": for the BUNDLED
-    ``cao-mcp-server`` on a RUNTIME path (``persisted=False``) the entry's
-    ``env`` also gains this server's coordinates, via
-    :func:`apply_server_coordinates`. This is the seam where the runtime entry
-    and the persisted entry already diverge, and every provider that builds a
-    bundled entry at launch already comes through here — so the injection
-    reaches all of them from one place and cannot leak into a persisted file.
+    One exception to "leaves all other keys untouched": an entry that starts
+    CAO's own server (:func:`is_bundled_cao_server`, so the ``uvx`` form the
+    shipped AWS templates use counts too) on a RUNTIME path
+    (``persisted=False``) also gains this server's coordinates in its ``env``,
+    via :func:`apply_server_coordinates`. This is the seam where the runtime
+    entry and the persisted entry already diverge, and every provider that
+    builds a bundled entry at launch already comes through here — so the
+    injection reaches all of them from one place and cannot leak into a
+    persisted file.
     """
     if "command" not in config:
         return dict(config)
@@ -175,17 +208,13 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     command = resolved.get("command", "")
     args = resolved.get("args", []) or []
     new_command, new_args = resolve_cao_mcp_command(command, args, persisted=persisted)
-    if (new_command, new_args) == (command, args):
-        # Passthrough (non-bundled command): don't write back keys the entry
-        # didn't have — e.g. don't add args=[] to an entry that omitted args.
-        return resolved
-    resolved["command"] = new_command
-    resolved["args"] = new_args
-    # Resolution fired, so this IS the bundled cao-mcp-server. A profile that
-    # starts the same server some other way (e.g. ``uvx --from git+…
-    # cao-mcp-server``) takes the passthrough return above and is not reached —
-    # telling it apart needs the entry's NAME, which this signature has not got.
-    if not persisted:
+    if (new_command, new_args) != (command, args):
+        resolved["command"] = new_command
+        resolved["args"] = new_args
+    # Otherwise this was a passthrough (a non-bundled command, or the uvx form):
+    # don't write back keys the entry didn't have — e.g. don't add args=[] to an
+    # entry that omitted args.
+    if not persisted and is_bundled_cao_server(resolved):
         resolved = apply_server_coordinates(resolved)
     return resolved
 

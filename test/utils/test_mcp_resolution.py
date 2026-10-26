@@ -9,6 +9,7 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_MCP_SERVER_MODULE,
     apply_server_coordinates,
+    is_bundled_cao_server,
     resolve_cao_mcp_command,
     resolve_mcp_server_config,
 )
@@ -383,4 +384,85 @@ class TestResolveCarriesServerCoordinates:
     def test_commandless_url_server_is_untouched(self, monkeypatch, default_cao_server):
         monkeypatch.setenv("CAO_API_PORT", "9899")
         original = {"type": "http", "url": "https://example.com/mcp"}
+        assert resolve_mcp_server_config(original) == original
+
+
+class TestIsBundledCaoServer:
+    """Every shape that starts CAO's own server is recognised structurally."""
+
+    def test_bare_console_script(self):
+        assert is_bundled_cao_server({"command": "cao-mcp-server", "args": []})
+
+    def test_resolved_absolute_path(self):
+        assert is_bundled_cao_server({"command": "/venv/bin/cao-mcp-server", "args": []})
+
+    def test_module_entrypoint(self):
+        assert is_bundled_cao_server(
+            {"command": "/venv/bin/python3", "args": ["-m", CAO_MCP_SERVER_MODULE]}
+        )
+
+    def test_uvx_form_used_by_the_shipped_aws_templates(self):
+        """``templates/aws/*/template.md.j2`` declares the server this way.
+
+        It is a passthrough for command resolution (the command is ``uvx``), so
+        a command-equality check alone would have left every profile created
+        from those templates reporting to the default CAO.
+        """
+        assert is_bundled_cao_server(
+            {
+                "type": "stdio",
+                "command": "uvx",
+                "args": [
+                    "--from",
+                    "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                    "cao-mcp-server",
+                ],
+            }
+        )
+
+    def test_third_party_server_is_not_bundled(self):
+        assert not is_bundled_cao_server({"command": "my-server", "args": ["--port", "9000"]})
+
+    def test_uvx_third_party_server_is_not_bundled(self):
+        assert not is_bundled_cao_server(
+            {"command": "uvx", "args": ["--from", "pkg", "some-other-server"]}
+        )
+
+    def test_commandless_url_server_is_not_bundled(self):
+        assert not is_bundled_cao_server({"type": "http", "url": "https://example.com/mcp"})
+
+    def test_a_command_merely_containing_the_name_is_not_bundled(self):
+        """Basename equality, not a substring match."""
+        assert not is_bundled_cao_server({"command": "/opt/bin/cao-mcp-server-proxy"})
+
+
+class TestUvxBundledServerCarriesCoordinates:
+    """The uvx form reaches the same outcome as the bare console script."""
+
+    def _uvx_entry(self):
+        return {
+            "type": "stdio",
+            "command": "uvx",
+            "args": [
+                "--from",
+                "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                "cao-mcp-server",
+            ],
+        }
+
+    def test_runtime_uvx_entry_carries_them(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        out = resolve_mcp_server_config(self._uvx_entry())
+        assert out["env"] == {"CAO_API_PORT": "9899"}
+        # Command resolution still passes uvx through untouched.
+        assert out["command"] == "uvx"
+        assert out["args"] == self._uvx_entry()["args"]
+
+    def test_persisted_uvx_entry_gains_nothing(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        out = resolve_mcp_server_config(self._uvx_entry(), persisted=True)
+        assert "env" not in out
+
+    def test_default_server_leaves_the_uvx_entry_byte_identical(self, default_cao_server):
+        original = self._uvx_entry()
         assert resolve_mcp_server_config(original) == original
