@@ -70,7 +70,9 @@ Generated AI-DLC questions are immutable, human-owned decision points.
    comes FROM the approval record, not from a caller-supplied argument. A
    packet with no matching, unconsumed, human-surface approval is refused, so
    the agent cannot resolve a packet by asserting an identity through the
-   `question answer` flag. The approval is single-use.
+   `question answer` flag. A replayed answer stops at the packet's status
+   gate, because an answered packet is no longer `pending`; the approval's
+   consumed flag is a second, defense-in-depth check.
 6. The runner resumes only after observing the answered packet.
 
 In this sample the approval record is a JSON file in `portfolio/approvals/`,

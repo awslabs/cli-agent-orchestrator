@@ -505,7 +505,9 @@ describe("portfolio workspace", () => {
     // The identity is derived from the verified approval record, never the caller.
     expect(resolved.answeredBy).toBe("Portfolio owner");
 
-    // The approval is single-use: it cannot be replayed to resolve again.
+    // A replay stops at the packet status gate: an answered packet is no longer
+    // pending, so the approval is never read. The approval's own consumed check
+    // is reached only by a packet restored to pending; see the test below.
     await expect(
       answerQuestionPacket(
         root,
@@ -539,6 +541,26 @@ describe("portfolio workspace", () => {
       await readFile(join(root, "portfolio/state.json"), "utf8"),
     );
     expect(stateCompleted.activeIntent).toBeNull();
+  }, 20_000);
+
+  test("refuses a consumed approval for a packet restored to pending", async () => {
+    const root = await temporaryRoot();
+    const { answered } = await waitingQuestionPacket(root, "restored");
+    const packetPath = join(root, "portfolio/questions/restored.json");
+    const statePath = join(root, "portfolio/state.json");
+    const pendingPacket = await readFile(packetPath, "utf8");
+    const waitingState = await readFile(statePath, "utf8");
+    await recordHumanApproval(root, "restored-approval", "restored", "Portfolio owner");
+    await answerQuestionPacket(root, "restored", answered, "guided", "restored-approval");
+
+    // Restore the packet and session from a backup, as if a write were undone.
+    // The status gate passes again, so only the consumed flag stops the replay.
+    await writeFile(packetPath, pendingPacket);
+    await writeFile(statePath, waitingState);
+    await expect(
+      answerQuestionPacket(root, "restored", answered, "guided", "restored-approval"),
+    ).rejects.toThrow("approval restored-approval has already been used");
+    expect(await readFile(packetPath, "utf8")).toBe(pendingPacket);
   }, 20_000);
 
   test("refuses a malformed approval record with a portfolio error", async () => {

@@ -303,9 +303,12 @@ bun "$SKILL_DIR/scripts/portfolio.ts" question answer \
   --mode guided --approval-id <approval-id>
 ```
 
-The command rejects changed question text, missing answers, invalid modes, a
-missing or already-consumed approval, and an approval bound to a different
-packet. It preserves the answered Markdown byte-for-byte, binds the resolution
+The command refuses a packet that is no longer `pending` before it reads any
+approval, so a replay of an answered packet stops at that status gate. It also
+rejects changed question text, missing answers, invalid modes, a missing or
+malformed approval, and an approval bound to a different packet. An approval
+already consumed is refused as well, as defense in depth for a packet restored
+to `pending`. It preserves the answered Markdown byte-for-byte, binds the resolution
 to the human-surface approval (the answerer identity comes from that record,
 not from a caller-supplied name), and returns the session to `active`. Use
 `question list` to verify status before asking the runner to resume.
