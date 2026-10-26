@@ -124,6 +124,7 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScope,
     MemoryScopeId,
     MemoryType,
+    recall_wire_dict,
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
@@ -1656,9 +1657,9 @@ async def lifespan(app: FastAPI):
         decision_runner,
         settings_loader=decision_settings_loader,
     )
-    logger.info(
-        "Decision states: %s", {p: v.state.value for p, v in decision_settings.points.items()}
-    )
+    # Logs the resolved threshold, timeouts, point states and deciders, then each change.
+    app.state.decision_engine.log_settings(decision_settings)
+    decision_settings_task = asyncio.create_task(app.state.decision_engine.watch_settings())
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
@@ -1803,6 +1804,8 @@ async def lifespan(app: FastAPI):
     # asyncio.gather with the tasks above.
     fifo_manager.stop_watchdog()
 
+    decision_settings_task.cancel()
+    await asyncio.gather(decision_settings_task, return_exceptions=True)
     await decision_runner.close()
     await decision_registry.close()
     await registry.teardown()
@@ -9258,19 +9261,9 @@ async def internal_memory_recall(
         sort_by=body.sort_by,
         include_related=body.include_related,
     )
-    return {
-        "memories": [
-            {
-                **memory.model_dump(mode="json"),
-                **(
-                    {"lifecycle_status": memory.lifecycle_status}
-                    if memory.lifecycle_status is not None
-                    else {}
-                ),
-            }
-            for memory in memories
-        ]
-    }
+    # One serializer for both recall surfaces (this route and the MCP
+    # memory_recall tool); see models/memory.py.
+    return {"memories": [recall_wire_dict(memory) for memory in memories]}
 
 
 @app.post("/internal/memory/forget")
