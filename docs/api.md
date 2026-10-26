@@ -24,7 +24,10 @@ see [Configuration](configuration.md) and [Security](../SECURITY.md).
 
 ### Health and auth discovery
 
-- `GET /health` reports service health.
+- `GET /health` reports service health. Its `features` list names capabilities a
+  peer node can rely on; `delegation_ceiling` means this node bounds created
+  terminals by the caller's delegation ceiling and honours `caller_ceiling` (see
+  [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance)).
 - `GET /.well-known/oauth-protected-resource` publishes OAuth protected
   resource metadata when applicable.
 
@@ -167,6 +170,33 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   if you need a different order.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- Terminal responses carry `delegate_tools`, the terminal's recorded delegation
+  ceiling. `POST /sessions/{session_name}/terminals` requires `caller_id` (403
+  without it) and checks the requested `allowed_tools` (client string or profile
+  resolution) against that caller's recorded ceiling, answering `403` when they
+  exceed it; the message names the parent, the child, the exceeding tools and
+  the remedy. An **operator** adding a terminal to an existing session (the Web
+  UI's Add Agent button) uses `POST /sessions/{session_name}/terminals:operator`
+  instead: same query parameters minus `caller_id`/`defer_init`, an optional
+  `{"description": ...}` body, and the new terminal records the profile's
+  declared ceiling exactly as `POST /sessions` does. It is a distinct sub-path
+  so no existing request can land on it by accident, and it answers `400` when
+  the request also names a caller (`caller_id`, `caller_ceiling`,
+  `delegating_terminal_id`, or a body `env_vars` carrying
+  `CAO_CALLBACK_TERMINAL_ID`). `POST /sessions?memory_manager=true` reports the
+  sidecar's outcome on the response as `memory_manager`
+  (`{"state": "scheduled" | "refused", "detail"}`); a primary whose ceiling does
+  not cover the sidecar's `@cao-mcp-server, fs_read, fs_list` gets `refused` and
+  no sidecar. `POST /sessions` and `POST /terminals/run-step` accept
+  `caller_ceiling` in the JSON body for a caller on another node (remote
+  `assign`/`handoff`); it is rejected together with a local `caller_id`, it is
+  required when the body's `env_vars` carry `CAO_CALLBACK_TERMINAL_ID` (the
+  remote-assign shape), and when that callback terminal has a local row the
+  asserted ceiling must fit inside the row's. `caller_id` and `caller_ceiling`
+  remain client assertions under the shared bearer (per-terminal credentials are
+  tracked in [#965](https://github.com/awslabs/cli-agent-orchestrator/issues/965)); see
+  [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance) for what
+  that does and does not guarantee.
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
   rolling buffer (most recent `state_buffer_max` bytes of streamed output —
   server setting, 32KB by default, see [Configuration](configuration.md)),
@@ -295,7 +325,12 @@ The spec-route scope checks apply when authentication is enabled.
 
 - `POST /workflows/runs` starts a run **inline** and holds the connection until it
   finishes, returning the complete result. Its optional `working_directory` field selects
-  the script run's project root; it is ignored for YAML workflows.
+  the script run's project root; it is ignored for YAML workflows. `caller_id` (also on
+  `:submit`, `resume` and step replay) names the terminal starting the run; every agent
+  step is then bounded by that terminal's recorded delegation ceiling. It is persisted on
+  the run's journal row, so a resume re-binds to the original caller. A script-tier
+  `POST /terminals/run-step` whose run has no live record (server restarted) is
+  refused with 403.
 - `POST /workflows/runs:submit` starts a run **asynchronously**: it returns `202` with
   `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
   the background. The `links` map always carries `self`/`status`/`result`/`cancel`;

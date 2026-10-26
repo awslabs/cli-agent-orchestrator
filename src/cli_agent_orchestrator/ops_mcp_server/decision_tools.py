@@ -24,9 +24,18 @@ def register_decision_tools(mcp: Any) -> None:
         return _result(operator.status)
 
     @mcp.tool
+    def decisions_off() -> dict[str, Any]:
+        """Halt all decision points and drain external requests."""
+        result = _result(operator.off)
+        if result["success"] and not result["data"]["success"]:
+            result["success"] = False
+            result["message"] = result["data"]["message"]
+        return result
+
+    @mcp.tool
     def decisions_set_point(point: str, state: str, decider: str | None = None) -> dict[str, Any]:
         """Set a point's state and installed decider name."""
-        return _result(lambda: settings.set_point(point, state, decider))
+        return _result(lambda: operator.set_point(point, state, decider))
 
     @mcp.tool
     def decisions_set_tier(provider: str, tier: str, model: str | None = None) -> dict[str, Any]:

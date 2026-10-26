@@ -23,7 +23,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import threading
 import time
 import uuid
@@ -31,16 +30,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from pydantic import ValidationError
 
 from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import (
-    delete_terminals_by_session,  # Compatibility/test seam: creation no longer bulk-deletes with this helper, but older integrations/tests patch the imported symbol while exercising create_terminal. Keep the name exported from this module until that seam can be retired separately.
-)
+
+# Compatibility/test seam: creation no longer bulk-deletes with this helper, but older
+# integrations/tests patch the imported symbol while exercising create_terminal. Keep the
+# name exported from this module until that seam can be retired separately. ``isort: skip``
+# keeps the line out of the merged import below so the ``noqa`` stays on this name only, and
+# ``fmt: skip`` stops black from wrapping it, which would move both pragmas off the name.
+from cli_agent_orchestrator.clients.database import delete_terminals_by_session  # noqa: F401  # isort: skip  # fmt: skip
 from cli_agent_orchestrator.clients.database import (
     count_runtime_allocated_terminals,
     create_inbox_message,
@@ -52,7 +55,6 @@ from cli_agent_orchestrator.clients.database import (
     get_idempotency_record,
     get_session_incarnation,
     get_terminal_metadata,
-    list_all_terminals,
     list_pending_deferred_init_external_owner_terminal_ids,
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
@@ -60,7 +62,6 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
-    update_terminal_deferred_init_runtime_reclaimed,
     update_terminal_description,
     update_terminal_group,
     update_terminal_initial_delivery,
@@ -86,6 +87,7 @@ from cli_agent_orchestrator.models.terminal import (
     ProviderExitedInputBlockedError,
     Terminal,
     TerminalInputBlockedError,
+    TerminalInputBlockedReason,
     TerminalLimitError,
     TerminalStatus,
 )
@@ -102,6 +104,7 @@ from cli_agent_orchestrator.providers.base import (
 )
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
+    KiroCapabilityError,
     KiroPhase0KASError,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
@@ -114,6 +117,8 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.install_service import (
+    installed_kiro_tools,
+    installed_opencode_permission,
     kiro_install_predates_native_enforcement,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
@@ -131,7 +136,11 @@ from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 from cli_agent_orchestrator.services.settings_service import get_max_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
-from cli_agent_orchestrator.utils import agent_profiles
+from cli_agent_orchestrator.utils import agent_profiles, delegation
+from cli_agent_orchestrator.utils.delegation import (
+    DelegationCeilingError,
+    InstalledPolicyExceedsAllowlistError,
+)
 from cli_agent_orchestrator.utils.enforcement import NATIVE as NATIVE_ENFORCEMENT
 from cli_agent_orchestrator.utils.enforcement import (
     PROVIDER_ENFORCEMENT,
@@ -146,7 +155,63 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_window_name,
 )
 
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
+
 logger = logging.getLogger(__name__)
+
+#: Every orchestration-type value that marks input as machine-originated, derived
+#: from the enum rather than hand-enumerated (#896). The dialog guard in
+#: ``send_input`` used to test ``{ASSIGN, HANDOFF}`` and ``SEND_MESSAGE`` walked
+#: past it into an open AskUserQuestion dialog. Deriving the set means a member
+#: added to ``OrchestrationType`` later inherits the guard the day it is defined;
+#: test/services/test_orchestrated_input_guard_invariants.py pins that per member
+#: and test/test_callsite_lint_rules.py refuses a return to a literal subset.
+_ORCHESTRATED_INPUT_VALUES = frozenset(t.value for t in OrchestrationType)
+
+
+def _orchestration_value(orchestration_type: "Optional[OrchestrationType]") -> str:
+    """Normalize an orchestration type to the string the dialog guard tests.
+
+    An operator typing by hand carries no type at all, which normalizes to ``""``
+    and is therefore never in ``_ORCHESTRATED_INPUT_VALUES``.
+    """
+    return (
+        orchestration_type.value
+        if isinstance(orchestration_type, OrchestrationType)
+        else str(orchestration_type or "")
+    )
+
+
+def _dialog_blocks_orchestrated_input(
+    provider: Any,
+    orchestration_type: "Optional[OrchestrationType]",
+    current_status: TerminalStatus,
+) -> bool:
+    """Whether machine-originated input must not be submitted into this terminal now.
+
+    The #896 predicate, in one place because it now has two enforcement sites and
+    they must not drift:
+
+    - :func:`dispatch_input`, which refuses the paste itself, and
+    - :func:`redeliver_dropped_message_with_boundary`'s bare-Enter recovery, which
+      submits what is already in the composer and so never reaches
+      ``dispatch_input`` at all.
+
+    Only a real ``answer_user_prompt`` call, or the operator typing by hand (no
+    orchestration type), may resolve a prompt. Keeping the membership test derived
+    from the enum means a member added to ``OrchestrationType`` inherits both
+    sites the day it is defined; test/test_callsite_lint_rules.py refuses a return
+    to a hand-written subset.
+    """
+    return (
+        provider is not None
+        and getattr(provider, "blocks_orchestrated_input_while_waiting_user_answer", False) is True
+        and _orchestration_value(orchestration_type) in _ORCHESTRATED_INPUT_VALUES
+        and current_status == TerminalStatus.WAITING_USER_ANSWER
+    )
+
 
 _DEFERRED_INIT_FAILURE_MESSAGE_MAX = 4096
 _DEFERRED_INIT_FAILURE_SCAN_MAX = 16384
@@ -208,9 +273,25 @@ TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
 CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 
 
-def resolve_launch_model(model: Optional[str], profile: Optional[AgentProfile]) -> Optional[str]:
+def _bind_decision_launch(plan: "LaunchPlan | None", **values: Any) -> None:
+    if plan is not None:
+        try:
+            from cli_agent_orchestrator.decisions.engine import bind_launch
+
+            bind_launch(plan, **values)
+        except Exception:
+            logger.warning("Decision launch bind failed", exc_info=True)
+
+
+def resolve_launch_model(
+    model: Optional[str], profile: Optional[AgentProfile], launch_plan: "LaunchPlan | None" = None
+) -> Optional[str]:
     """Resolve the model CAO passes to a provider for this launch."""
-    return model or (profile.model if profile else None)
+    return (
+        model
+        or (launch_plan.model if launch_plan else None)
+        or (profile.model if profile else None)
+    )
 
 
 # Track terminals that have already received memory injection (first message only).
@@ -834,8 +915,20 @@ def _request_fingerprint(
     initial_message_orchestration_type: Optional[OrchestrationType],
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    caller_ceiling: Optional[List[str]] = None,
+    delegating_terminal_id: Optional[str] = None,
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
+
+    ``caller_ceiling`` (a remote caller's asserted delegation ceiling, see
+    ``create_terminal``) and ``delegating_terminal_id`` (the terminal whose
+    recorded ceiling bounds the create when no ``caller_id`` names it: workflow
+    steps, the memory sidecar) are appended ONLY when supplied, like
+    ``claim_id``, so every request that does not carry them keeps the digest it
+    had before the fields existed. Both are hashed because each decides the
+    created terminal's recorded ceiling, i.e. a privilege, exactly as
+    ``allowed_tools`` does: two keyed creates that differ only in the bounding
+    terminal must collide (409), not resolve to the first one's terminal.
 
     Review on PR #634, issue #616. Stored alongside the key so a later call
     presenting the same key can be told apart: same fingerprint is a RETRY
@@ -1018,6 +1111,12 @@ def _request_fingerprint(
         parts.extend(["description", description])
     if claim_id is not None:
         parts.append(claim_id)
+    if caller_ceiling is not None:
+        parts.append(
+            _FP_TOOLS_SET + "".join(_fingerprint_component(t) for t in sorted(caller_ceiling))
+        )
+    if delegating_terminal_id is not None:
+        parts.extend(["delegating_terminal_id", delegating_terminal_id])
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
@@ -1053,6 +1152,9 @@ async def create_terminal(
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    launch_plan: "LaunchPlan | None" = None,
+    delegating_terminal_id: Optional[str] = None,
+    caller_ceiling: Optional[list[str]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1082,7 +1184,25 @@ async def create_terminal(
         caller_id: Terminal ID of the supervisor that created this terminal
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
-            None for operator-launched terminals.
+            None for operator-launched terminals. When set, the caller's STORED
+            ROW also bounds this terminal: its resolved ``allowed_tools`` must
+            fit inside the caller's recorded delegation ceiling and its own
+            ceiling is capped by it (``utils/delegation.py``); a caller whose
+            row cannot be read refuses the create (fail closed). A client
+            ``allowed_tools`` list is therefore never trusted beyond what the
+            caller may delegate.
+        delegating_terminal_id: The terminal whose stored ceiling bounds this
+            create when it is NOT recorded as ``caller_id``. Workflow steps use
+            it: the agent that ran ``workflow_run`` is not the step's callback
+            parent, but the step still inherits its ceiling. Ignored when
+            ``caller_id`` is set (the caller row wins).
+        caller_ceiling: A ceiling ASSERTED by the client, for a caller whose
+            row lives on another node (``assign``/``handoff`` with
+            ``target_host``). Accepted only when neither ``caller_id`` nor
+            ``delegating_terminal_id`` names a local row; the created
+            terminal is bounded by it exactly as by a stored ceiling. The
+            client sends its own stored ceiling and refuses to place on a node
+            that does not advertise ``delegation_ceiling`` in ``/health``.
         engine: Explicit Kiro engine. For Kiro, it must agree with the selected
             profile's engine when both are present; omitted resolves to v2.
         kiro_capability_probe: Optional test seam for the bounded wrapper probe.
@@ -1128,7 +1248,7 @@ async def create_terminal(
             THE FIELD SET IS CLOSED BY ENUMERATION, not by however many review
             rounds happened to run. Every caller-reachable parameter of BOTH
             create endpoints -- ``POST /sessions`` (including everything
-            ``CreateSessionBody`` and its ``CreateTerminalBody`` base carry)
+            ``CreateSessionBody`` and the shared ``_CreateMessageBody`` carry)
             and ``POST /sessions/{name}/terminals`` -- is classified below,
             hashed or excluded-with-a-reason. Adding a parameter to either
             endpoint means classifying it here.
@@ -1153,6 +1273,11 @@ async def create_terminal(
               The delivered payload and its routing, not the terminal: neither
               is persisted on the row, and a genuine retry re-sends the same
               message. These create endpoints do not own the prompt.
+            - ``delegation_message`` and ``delegation_kind``. These never reach
+              this function: the handler converts them into a launch plan that
+              selects a decision, not the terminal's identity. A genuine retry
+              re-sends them. The plan stays outside the fingerprint; a key hit
+              binds its decision rows ``not_launched``, as documented for replay.
             - ``defer_init``. Excluded, and this one was decided against the
               instinct that it looks like identity, because three things check
               out against the code:
@@ -1309,6 +1434,9 @@ async def create_terminal(
             description=description,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
+            launch_plan=launch_plan,
+            delegating_terminal_id=delegating_terminal_id,
+            caller_ceiling=caller_ceiling,
             ephemeral_state=state,
         )
     except BaseException as exc:
@@ -1343,6 +1471,9 @@ async def _create_terminal_unguarded(
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    launch_plan: "LaunchPlan | None" = None,
+    delegating_terminal_id: Optional[str] = None,
+    caller_ceiling: Optional[list[str]] = None,
     *,
     ephemeral_state: _EphemeralLaunchState,
 ) -> Terminal:
@@ -1374,6 +1505,8 @@ async def _create_terminal_unguarded(
             initial_message_orchestration_type,
             claim_id,
             description,
+            caller_ceiling=caller_ceiling,
+            delegating_terminal_id=delegating_terminal_id,
         )
         existing_record = get_idempotency_record(idempotency_key)
         existing_terminal_id = existing_record.terminal_id if existing_record else None
@@ -1441,6 +1574,7 @@ async def _create_terminal_unguarded(
                 # the first call produced without doing any real work -- the
                 # property haofeif signed off on, unchanged by the check above.
                 try:
+                    _bind_decision_launch(launch_plan, launch_status="not_launched")
                     return Terminal(**row)
                 except ValidationError as exc:
                     # Re-raised as a non-ValueError so a corrupt STORED row is
@@ -1510,7 +1644,8 @@ async def _create_terminal_unguarded(
         # accepting arbitrary attributes as configuration.
         if profile is not None and not isinstance(profile, AgentProfile):
             profile = None
-        launch_model = resolve_launch_model(model, profile)
+        decision_not_honored = False
+        launch_model = resolve_launch_model(model, profile, launch_plan)
         model_honored = ProviderManager.provider_class(provider).honors_model(
             agent_profile=agent_profile,
             profile=profile,
@@ -1542,7 +1677,20 @@ async def _create_terminal_unguarded(
                 yolo=True,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
-            await asyncio.to_thread(probe, resolved_engine, requested)
+            try:
+                await asyncio.to_thread(probe, resolved_engine, requested)
+            except KiroCapabilityError:
+                if model or launch_plan is None or launch_plan.model is None:
+                    raise
+                launch_model = resolve_launch_model(model, profile)
+                requested = requested_kiro_capabilities(
+                    resolved_engine, model=launch_model, yolo=True
+                )
+                await asyncio.to_thread(probe, resolved_engine, requested)
+                decision_not_honored = True
+                model_honored = ProviderManager.provider_class(provider).honors_model(
+                    agent_profile=agent_profile, profile=profile, requested_model=launch_model
+                )
             if resolved_engine == KiroEngine.KAS:
                 raise KiroPhase0KASError(
                     bool(profile and (profile.allowedTools or profile.toolsSettings))
@@ -1561,6 +1709,231 @@ async def _create_terminal_unguarded(
             allowed_tools = resolve_allowed_tools(
                 profile.allowedTools, profile.role, mcp_server_names
             )
+
+        # Step 0c: Delegation ceiling (utils/delegation.py). Runs on EVERY
+        # creation path -- in-session create, assign/handoff, run-step and
+        # workflow steps, remote placement -- because this is the one function
+        # they all reach, and before any backend resource is allocated. The
+        # bounding ceiling comes from the CALLER'S STORED ROW (never from a
+        # profile, which is how an intermediate ``role: supervisor`` profile
+        # would otherwise launder privilege), or, for a caller on another node,
+        # from the ceiling that caller asserted in the request. Whatever
+        # ``allowed_tools`` the client sent is checked against it here, so the
+        # server never trusts a client list beyond what the caller may delegate.
+        bounding_id = caller_id if caller_id is not None else delegating_terminal_id
+        if caller_ceiling is not None and bounding_id is not None:
+            raise ValueError(
+                "caller_ceiling is only accepted without caller_id/delegating_terminal_id: "
+                "a caller with a row on this node is bounded by that row"
+            )
+        declared_ceiling = delegation.resolve_delegate_tools(
+            getattr(profile, "delegateTools", None),
+            getattr(profile, "role", None),
+            allowed_tools,
+        )
+        parent_ceiling: Optional[List[str]] = None
+        parent_profile_name: Optional[str] = None
+        if bounding_id is not None:
+            parent_row = get_terminal_metadata(bounding_id)
+            if parent_row is None:
+                raise DelegationCeilingError(
+                    f"Delegation refused: caller terminal {bounding_id} has no registered "
+                    f"row on this node, so its delegation ceiling cannot be evaluated and "
+                    f"'{agent_profile}' is not launched. A remote caller must place through "
+                    f"assign/handoff with target_host, which carries its ceiling.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+            parent_profile_name = parent_row.get("agent_profile")
+            try:
+                parent_ceiling = delegation.ceiling_from_row(parent_row)
+            except Exception as exc:  # noqa: BLE001  (an unresolvable ceiling must refuse)
+                parent_ceiling = None
+                logger.warning(
+                    "delegation ceiling of caller %s could not be resolved: %s", bounding_id, exc
+                )
+            if parent_ceiling is None:
+                raise DelegationCeilingError(
+                    f"Delegation refused: the delegation ceiling of caller terminal "
+                    f"{bounding_id} (profile '{parent_profile_name}') could not be resolved, "
+                    f"so '{agent_profile}' is not launched. Relaunch the caller so its "
+                    f"ceiling is recorded.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+        else:
+            # Remote placement (assign/handoff with target_host) is recognised by
+            # the callback terminal the supervisor injects into the worker's env.
+            # Such a create MUST carry the supervisor's ceiling: without it the
+            # request would take the operator branch below and launch unbounded,
+            # which is exactly what an older or edited client would produce. When
+            # the callback terminal happens to have a row on THIS node (loopback,
+            # single-node fleets), the asserted ceiling must fit inside what that
+            # row records, and the ASSERTION then bounds the child: it is equal to
+            # or narrower than the row, so using it never widens, and a client
+            # that narrowed its own ceiling gets the narrower bound it asked for.
+            remote_marker = (env_vars or {}).get(CALLBACK_TERMINAL_ID_ENV)
+            if remote_marker and caller_ceiling is None:
+                raise DelegationCeilingError(
+                    f"Delegation refused: a remote placement for terminal {remote_marker} "
+                    f"must carry caller_ceiling (the supervisor's recorded delegation "
+                    f"ceiling); without it '{agent_profile}' would launch unbounded. "
+                    f"Upgrade the placing node's cao so assign/handoff send it.",
+                    parent_id=remote_marker,
+                    child_profile=agent_profile,
+                )
+            if remote_marker and caller_ceiling is not None:
+                local_row = get_terminal_metadata(remote_marker)
+                if local_row is not None:
+                    local_ceiling = delegation.ceiling_from_row(local_row)
+                    if local_ceiling is None:
+                        raise DelegationCeilingError(
+                            f"Delegation refused: the delegation ceiling of terminal "
+                            f"{remote_marker} (profile '{local_row.get('agent_profile')}') "
+                            f"could not be resolved, so '{agent_profile}' is not launched. "
+                            f"Relaunch it so its ceiling is recorded.",
+                            parent_id=remote_marker,
+                            child_profile=agent_profile,
+                        )
+                    over = delegation.tools_exceeding(caller_ceiling, local_ceiling)
+                    if over:
+                        raise DelegationCeilingError(
+                            f"Delegation refused: the asserted caller_ceiling for terminal "
+                            f"{remote_marker} grants {', '.join(over)} beyond that terminal's "
+                            f"recorded ceiling [{', '.join(local_ceiling)}]; the recorded "
+                            f"ceiling is authoritative.",
+                            excess=over,
+                            parent_id=remote_marker,
+                            child_profile=agent_profile,
+                        )
+                    parent_profile_name = local_row.get("agent_profile")
+                    bounding_id = remote_marker
+            if caller_ceiling is not None:
+                parent_ceiling = list(caller_ceiling)
+        if parent_ceiling is not None:
+            delegate_tools = delegation.bound_child(
+                child_allowed_tools=allowed_tools,
+                child_declared_ceiling=declared_ceiling,
+                caller_ceiling=parent_ceiling,
+                parent_id=bounding_id,
+                parent_profile=parent_profile_name,
+                child_profile=agent_profile,
+            )
+        else:
+            # Operator-launched (cao launch, POST /sessions without a caller):
+            # the operator is the authority and the profile's declaration stands.
+            delegate_tools = declared_ceiling
+
+        # Step 0d: install-time providers run the INSTALLED policy, not the list
+        # this request resolved. For a create bounded by a RESTRICTED ceiling the
+        # row must be the effective policy, so a Kiro agent file that grants more
+        # than the row is refused here, before allocation, with the remedy. An
+        # unrestricted delegator (ceiling ``*``) and operator launches keep the
+        # launch-time warning instead: nothing the creator may not delegate can
+        # leak there, and the launch prompt already says what runs.
+        if (
+            provider == ProviderType.KIRO_CLI.value
+            and parent_ceiling is not None
+            and "*" not in parent_ceiling
+            and allowed_tools is not None
+            and "*" not in allowed_tools
+        ):
+            from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
+
+            installed = installed_kiro_tools(agent_profile)
+            if installed is None:
+                # No readable agent file with a `tools` list: on Kiro the installed
+                # file IS the policy, so the server cannot say what this launch
+                # would run. A bounded create fails closed here rather than
+                # skipping the check; the operator path is untouched (Kiro would
+                # fail to start the agent anyway, this just names the reason).
+                raise InstalledPolicyExceedsAllowlistError(
+                    f"Delegation refused: no installed Kiro agent file with a `tools` list "
+                    f"was found for '{agent_profile}', so the policy this bounded launch "
+                    f"would run cannot be compared with the bounded allowlist "
+                    f"[{', '.join(allowed_tools)}] this terminal is allowed to run with. "
+                    f"Remedy: `cao install {agent_profile} --provider kiro_cli`, then retry.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+            else:
+                permitted = set(kiro_agent_tools(allowed_tools))
+                wider = [tool for tool in installed if tool not in permitted]
+                if wider:
+                    raise InstalledPolicyExceedsAllowlistError(
+                        f"Delegation refused: the installed Kiro agent '{agent_profile}' "
+                        f"grants {', '.join(wider)} beyond the bounded allowlist "
+                        f"[{', '.join(allowed_tools)}] this terminal is allowed to run with; "
+                        f"Kiro enforces the installed file, so the launch would exceed the "
+                        f"creator's delegation ceiling. Remedy: reinstall the profile with "
+                        f"the narrower policy (`cao install {agent_profile} --provider "
+                        f"kiro_cli` after setting allowedTools), or launch it without an "
+                        f"allowed_tools override.",
+                        excess=wider,
+                        parent_id=bounding_id,
+                        child_profile=agent_profile,
+                    )
+
+        # Same rule for OpenCode, the other install-time provider: the launch
+        # runs the installed ``permission:`` block, so under a restricted ceiling
+        # a block that allows a tool the bounded allowlist does not is refused.
+        if (
+            provider == ProviderType.OPENCODE_CLI.value
+            and parent_ceiling is not None
+            and "*" not in parent_ceiling
+            and allowed_tools is not None
+            and "*" not in allowed_tools
+        ):
+            from cli_agent_orchestrator.providers import opencode_cli
+            from cli_agent_orchestrator.utils.opencode_permissions import (
+                ALL_OPENCODE_TOOLS,
+                cao_tools_to_opencode_permission,
+            )
+
+            installed_permission = installed_opencode_permission(
+                agent_profile, opencode_cli.OPENCODE_CONFIG_DIR / "agents"
+            )
+            if installed_permission is None:
+                # No readable agent file with a dict `permission:` block: on
+                # OpenCode the installed file IS the policy, so the server
+                # cannot say what this launch would run. A bounded create
+                # fails closed here rather than skipping the check, mirroring
+                # the Kiro branch above.
+                raise InstalledPolicyExceedsAllowlistError(
+                    f"Delegation refused: no installed OpenCode agent file with a "
+                    f"`permission:` block was found for '{agent_profile}', so the policy "
+                    f"this bounded launch would run cannot be compared with the bounded "
+                    f"allowlist [{', '.join(allowed_tools)}] this terminal is allowed to "
+                    f"run with. Remedy: `cao install {agent_profile} --provider "
+                    f"opencode_cli`, then retry.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+            else:
+                bounded = cao_tools_to_opencode_permission(allowed_tools)
+                # Iterate the full vocabulary, not installed_permission's own keys:
+                # OpenCode treats an omitted tool as allowed, so a `{}` or partial
+                # block (e.g. only `read: allow`) must be read as allowing every
+                # tool it does not explicitly deny.
+                wider = sorted(
+                    tool
+                    for tool in ALL_OPENCODE_TOOLS
+                    if installed_permission.get(tool) != "deny" and bounded.get(tool) != "allow"
+                )
+                if wider:
+                    raise InstalledPolicyExceedsAllowlistError(
+                        f"Delegation refused: the installed OpenCode agent '{agent_profile}' "
+                        f"allows {', '.join(wider)} beyond the bounded allowlist "
+                        f"[{', '.join(allowed_tools)}] this terminal is allowed to run with; "
+                        f"OpenCode enforces the installed permission block, so the launch "
+                        f"would exceed the creator's delegation ceiling. Remedy: reinstall the "
+                        f"profile with the narrower policy (`cao install {agent_profile} "
+                        f"--provider opencode_cli` after setting allowedTools), or launch it "
+                        f"without an allowed_tools override.",
+                        excess=wider,
+                        parent_id=bounding_id,
+                        child_profile=agent_profile,
+                    )
 
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -1848,6 +2221,7 @@ async def _create_terminal_unguarded(
                         idempotency_key=idempotency_key,
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
+                        delegate_tools=delegate_tools,
                         # The initial message is ACCEPTED the moment this row is
                         # visible, so its outcome starts life as pending in the same
                         # transaction (#566): a restart between here and the deferred
@@ -1963,6 +2337,9 @@ async def _create_terminal_unguarded(
         # keeps the tool call under 2s.
         if defer_init:
             shell_command = None  # unknown until initialize() runs
+            launch_options: dict[str, Any] = (
+                {"launch_plan": launch_plan} if launch_plan is not None else {}
+            )
             # Freeze lifecycle ownership while creation inputs are still in
             # hand. A deferred failure may coincide with a database outage, so
             # deciding who owns teardown by re-reading the terminal row later
@@ -1977,6 +2354,7 @@ async def _create_terminal_unguarded(
                 registry,
                 initial_caller_id=caller_id,
                 delete_on_failure=deferred_delete_on_failure,
+                **launch_options,
             )
             # A handful of unit/integration seams patch the private scheduler
             # with a non-Task mock. Production always returns an asyncio.Task;
@@ -2018,6 +2396,7 @@ async def _create_terminal_unguarded(
             ),
             caller_id=caller_id,
             allowed_tools=allowed_tools,
+            delegate_tools=delegate_tools,
             engine=resolved_engine,
             shell_command=shell_command,
             group=group,
@@ -2052,9 +2431,25 @@ async def _create_terminal_unguarded(
                 svc.register_terminal(terminal_id, pane_id, is_kiro)
             except Exception as e:
                 logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
+        _bind_decision_launch(
+            launch_plan,
+            terminal_id=terminal.id,
+            model=launch_model,
+            honored=model_honored,
+            launch_status="launched",
+            not_honored=decision_not_honored,
+        )
         return terminal
 
     except Exception as e:
+        # A delegation-ceiling refusal (#948, Steps 0c/0d) is raised before
+        # anything is allocated: the launch was refused, not attempted.
+        _bind_decision_launch(
+            launch_plan,
+            launch_status=(
+                "not_launched" if isinstance(e, DelegationCeilingError) else "launch_failed"
+            ),
+        )
         if not isinstance(e, ephemeral_service.EphemeralPolicyError):
             logger.error(f"Failed to create terminal: {e}")
         # Everything this call built is torn down by ONE owned operation
@@ -3150,7 +3545,14 @@ def redeliver_dropped_message_with_boundary(
     The full re-send goes through ``dispatch_input`` with ``redelivery=True``: it
     repeats the dispatch CAO is already waiting on, so the provider must treat
     it as another delivery attempt of the same logical turn rather than as a
-    newly dispatched turn.
+    newly dispatched turn. That also means the full re-send inherits
+    ``dispatch_input``'s own guards: a terminal in ERROR or (for a dialog-blocking
+    provider carrying an orchestration type) in WAITING_USER_ANSWER raises
+    ``TerminalInputBlockedError`` out of this function rather than being pasted
+    into. The bare Enter does NOT go through ``dispatch_input``, so it checks
+    ``_dialog_blocks_orchestrated_input`` itself and sends nothing when a dialog
+    is open (#896) -- otherwise the one recovery that submits without pasting
+    would be the one recovery that can answer a human's question.
 
     Returns ``(started, boundary)``. ``started`` is True when the worker was
     found already running and nothing was sent; False when a redelivery was
@@ -3182,6 +3584,35 @@ def redeliver_dropped_message_with_boundary(
             return True, None
     in_composer = _message_in_composer(terminal_id, message)
     if in_composer is True:
+        # The bare Enter is machine-originated input too, and it is the ONE
+        # recovery that does not go through ``dispatch_input`` -- so #896's
+        # dialog guard, which lives there, never sees it. An Enter into an open
+        # choice widget is worse than a paste: it submits whichever option is
+        # highlighted, answering a question reserved for a human, with no text
+        # involved at all.
+        #
+        # Today this branch happens to be unreachable with a prompt open: on
+        # every real capture in test/providers/fixtures the dialog replaces the
+        # composer box, so ``extract_current_composer`` returns None for the only
+        # two providers that both block dialogs and read a composer (claude_code
+        # and codex -- the overlap is enumerated in
+        # test/services/test_inbox_service.py's
+        # TestDialogGuardCoversSubmitRecovery). But that is a property of those
+        # two extractors, not an invariant: the moment one of them learns to read
+        # the composer under an overlaying permission prompt, this Enter starts
+        # answering dialogs. Check the guard here rather than inherit it by
+        # coincidence.
+        if _dialog_blocks_orchestrated_input(
+            provider, orchestration_type, status_monitor.get_status(terminal_id)
+        ):
+            logger.warning(
+                "Delivery to %s is unsubmitted but the terminal is waiting on a user "
+                "answer; skipping the bare-Enter re-submit so it cannot answer the "
+                "dialog (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            return False, None
         logger.warning(
             "Delivery to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
             terminal_id,
@@ -3394,6 +3825,7 @@ def _schedule_deferred_init(
     *,
     initial_caller_id: Optional[str] = None,
     delete_on_failure: bool | None = None,
+    launch_plan: "LaunchPlan | None" = None,
 ) -> asyncio.Task | None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via dispatch_input.
@@ -3441,9 +3873,10 @@ def _schedule_deferred_init(
                 # Round-3 review fix (call-me-ram): a raw POST /sessions caller that
                 # supplies initial_message with no orchestration_type previously sailed
                 # straight past send_input's WAITING_USER_ANSWER guard entirely -- the
-                # guard only fires for OrchestrationType.ASSIGN/HANDOFF, so an unstated
-                # type meant no protection at all against pasting the initial task into
-                # a live choice prompt. Every call that reaches THIS function is by
+                # guard fires only for input carrying an OrchestrationType (every
+                # member, derived from the enum since #896), so an unstated type meant
+                # no protection at all against pasting the initial task into a live
+                # choice prompt. Every call that reaches THIS function is by
                 # construction an unattended initial-task delivery (never an interactive
                 # human answer -- those go through answer_user_prompt's own separate
                 # /terminals/{id}/input call, which never routes through
@@ -3569,6 +4002,7 @@ def _schedule_deferred_init(
                             "Deferred init for %s: provider entered ERROR after task delivery.",
                             terminal_id,
                         )
+                        _bind_decision_launch(launch_plan, launch_status="launch_failed")
                         await _surface_deferred_init_failure(
                             terminal_id,
                             kind="provider_error_after_delivery",
@@ -3583,6 +4017,7 @@ def _schedule_deferred_init(
                         )
                         return
                 if not started:
+                    _bind_decision_launch(launch_plan, launch_status="launch_failed")
                     logger.error(
                         "Deferred init for %s: worker never started after "
                         "resubmits; task not delivered.",
@@ -3687,7 +4122,11 @@ def _schedule_deferred_init(
                 registry,
                 delete_worker=False,
             )
+        except asyncio.CancelledError:
+            _bind_decision_launch(launch_plan, launch_status="launch_failed")
+            raise
         except Exception as e:
+            _bind_decision_launch(launch_plan, launch_status="launch_failed")
             # exc_info=True preserves the traceback for debugging; {e!r} avoids
             # newline/control-character injection into logs and the inbox message
             # (the exception text can contain provider-supplied content).
@@ -3782,6 +4221,56 @@ def _schedule_deferred_init(
 
     task.add_done_callback(_on_done)
     return task
+
+
+def memory_sidecar_refusal(
+    primary: Terminal, *, provider: str, sidecar_profile: str = "memory_manager"
+) -> Optional[str]:
+    """Why the ``memory_manager`` sidecar would be refused under ``primary``, or ``None``.
+
+    The sidecar is created with ``delegating_terminal_id=primary.id`` and so is
+    bounded by the primary's RECORDED ceiling in Step 0c. Its profile resolves
+    (``role: supervisor``, no ``allowedTools``) to ``@cao-mcp-server, fs_read,
+    fs_list``, which a narrow primary (``workflow_scout`` lacks ``fs_list``; a
+    profile with an explicit ``allowedTools`` list lacks ``@cao-mcp-server``)
+    does not cover. ``POST /sessions`` asks this BEFORE scheduling the
+    background create so the refusal reaches the operator in the response
+    instead of only a server log line. Same comparator, same text as the
+    refusal the create would raise. Returns ``None`` when the sidecar fits, and
+    also when the primary's ceiling is not readable from the response (no
+    ``delegate_tools`` and no ``allowed_tools``): then the create itself decides
+    and logs, exactly as before.
+    """
+    ceiling = (
+        primary.delegate_tools if primary.delegate_tools is not None else primary.allowed_tools
+    )
+    if ceiling is None:
+        return None
+    try:
+        profile, _ = agent_profiles.load_launch_profile(sidecar_profile)
+    except Exception:  # noqa: BLE001  (an unresolvable sidecar profile is the create's problem)
+        return None
+    if not isinstance(profile, AgentProfile):
+        return None
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
+    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+    sidecar_tools = resolve_allowed_tools(
+        profile.allowedTools, profile.role, grantable_server_names(profile)
+    )
+    excess = delegation.tools_exceeding(sidecar_tools, ceiling)
+    if not excess:
+        return None
+    return delegation.describe_rejection(
+        parent_id=primary.id,
+        parent_profile=primary.agent_profile,
+        child_profile=sidecar_profile,
+        excess=excess,
+        ceiling=ceiling,
+    ) + (
+        " The memory_manager sidecar (`cao launch --memory`, memory_manager=true) needs a primary whose delegation "
+        "ceiling covers @cao-mcp-server, fs_read and fs_list; it was not launched."
+    )
 
 
 def callback_terminal_id_for_session(session_name: Optional[str]) -> Optional[str]:
@@ -3882,6 +4371,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "caller_id": metadata.get("caller_id"),
             "callback_terminal_id": callback_terminal_id_for_session(metadata["tmux_session"]),
             "allowed_tools": metadata.get("allowed_tools"),
+            "delegate_tools": metadata.get("delegate_tools"),
             "engine": metadata.get("engine"),
             "group": metadata.get("group"),
             "metadata": public_metadata,
@@ -4158,11 +4648,7 @@ def dispatch_input(
             raise KiroPhase0KASError(profile_has_v2_policy=False)
 
         provider = provider_manager.get_provider(terminal_id)
-        orchestration_value = (
-            orchestration_type.value
-            if isinstance(orchestration_type, OrchestrationType)
-            else str(orchestration_type or "")
-        )
+        orchestration_value = _orchestration_value(orchestration_type)
 
         if provider:
             current_status = status_monitor.get_status(terminal_id)
@@ -4175,19 +4661,23 @@ def dispatch_input(
             if current_status == TerminalStatus.ERROR:
                 raise ProviderExitedInputBlockedError(
                     f"Terminal {terminal_id} provider is in ERROR state "
-                    "(provider process may have exited). Refusing to deliver input."
+                    "(provider process may have exited). Refusing to deliver input.",
+                    reason=TerminalInputBlockedReason.PROVIDER_ERROR,
                 )
 
-            if (
-                provider.blocks_orchestrated_input_while_waiting_user_answer is True
-                and orchestration_value
-                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-                and current_status == TerminalStatus.WAITING_USER_ANSWER
-            ):
+            # Any orchestration type is machine-originated input (#896): an inbox
+            # delivery is just as much so as an assign, and the dialog cannot
+            # tell them apart -- it ate the paste and the trailing Enter answered
+            # the question. Only a real answer_user_prompt call or the operator
+            # typing by hand (no orchestration type, so an empty value here) may
+            # resolve a prompt. Shared with the bare-Enter recovery's own check;
+            # see ``_dialog_blocks_orchestrated_input``.
+            if _dialog_blocks_orchestrated_input(provider, orchestration_type, current_status):
                 raise TerminalInputBlockedError(
                     f"Terminal {terminal_id} is waiting for a user answer. "
                     "Use answer_user_prompt to submit a selection or approval before "
-                    f"sending {orchestration_value} input."
+                    f"sending {orchestration_value} input.",
+                    reason=TerminalInputBlockedReason.WAITING_USER_ANSWER,
                 )
 
         # Inject memory context into the very first user message after init.

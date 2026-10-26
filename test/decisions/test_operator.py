@@ -325,7 +325,7 @@ def test_decision_catalog_help_and_group_order():
 
     text = (ROOT / "tui/src/catalog.rs").read_text()
     rows = re.findall(r"CommandId::Decisions\w+ => Command \{(.*?)\n        \},", text, re.S)
-    assert len(rows) == 8
+    assert len(rows) == 12
     for row in rows:
         leaf = re.search(r'leaf_name: "([^"]+)"', row).group(1)
         summary = re.search(r'summary: "([^"]+)"', row).group(1)
@@ -333,10 +333,14 @@ def test_decision_catalog_help_and_group_order():
     display = text.split("pub(crate) const DISPLAY_ORDER:", 1)[1].split("];", 1)[0]
     names = re.findall(r"CommandId::(\w+)", display)
     expected = [
+        "DecisionsDisable",
+        "DecisionsEnable",
         "DecisionsExclude",
         "DecisionsList",
+        "DecisionsOff",
         "DecisionsPurge",
         "DecisionsSet",
+        "DecisionsShow",
         "DecisionsStatus",
         "DecisionsTable",
         "DecisionsTier",

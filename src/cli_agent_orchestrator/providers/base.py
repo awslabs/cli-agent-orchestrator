@@ -388,12 +388,19 @@ class BaseProvider(ABC):
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
-        """Whether assign/handoff should pause when the provider is waiting on UI input.
+        """Whether orchestrated input should pause when the provider waits on UI input.
 
         Some CLIs render interactive pickers or approval prompts where pasted
         task text would be interpreted as the answer to that prompt. Providers
         with those surfaces can opt in so CAO blocks orchestrated task delivery
         while still allowing explicit user-prompt answers.
+
+        Read on two paths: ``terminal_service.send_input`` refuses assign,
+        handoff AND send_message (inbox) deliveries into WAITING_USER_ANSWER,
+        and ``inbox_service`` excludes WAITING_USER_ANSWER from eager delivery
+        for these providers. Both were needed for #896 — before that fix an
+        inbox message was pasted into an open Claude Code AskUserQuestion
+        dialog, which swallowed the text and answered itself.
         """
         return False
 

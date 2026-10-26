@@ -372,6 +372,21 @@ jobs:
       - name: Check import sorting with isort
         run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
 
+      # The dead-code gate (#1005). BLOCKING, like the mypy ratchet step below:
+      # the selected rules (F401 unused import, F841 unused local, F821/F822
+      # undefined name -- a removed import still used in the SAME file; ruff is
+      # per-file, cross-module uses are the import guard's and the unit tests'
+      # job) are green on main as of this change, so any new finding is
+      # introduced by the PR under test.
+      #
+      # Scope is wider than black/isort above on purpose -- all of examples/, not
+      # just the robotics example -- because an unread binding in an example is
+      # still an unread binding, and ruff has nothing to say about formatting so
+      # the broader scope costs no churn. Rule selection and the deliberately
+      # deferred rules (F811, ARG, B) are documented in pyproject.toml.
+      - name: Lint for dead code with ruff
+        run: uv run ruff check src/ test/ examples/
+
       - name: Run type checker with mypy (ratchet)
         # Issue #1005. This step used to be `uv run mypy src/` with
         # `continue-on-error: true`, so a red type check blocked nothing and the

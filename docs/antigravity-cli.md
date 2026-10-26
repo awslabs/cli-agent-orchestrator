@@ -72,7 +72,15 @@ Response extraction returns the text between the last echoed `> <query>` line an
 
 ## MCP Servers
 
-`agy` reads MCP servers from `~/.gemini/config/mcp_config.json` (top-level `mcpServers` key). The provider merges the agent profile's `mcpServers` into that file at launch — preserving any existing, non-CAO entries — and forwards `CAO_TERMINAL_ID` into each server's env so `cao-mcp-server` can resolve the current terminal for handoff / assign. Entries are removed on `cleanup()`. There is no per-invocation MCP config flag, but CAO serializes launches (initialize waits for the agent to become ready), so each `agy` process reads the config and spawns its MCP subprocess with the correct terminal id before the next terminal writes.
+`agy` reads MCP servers from `~/.gemini/config/mcp_config.json` (top-level `mcpServers` key). There is no per-invocation MCP config flag, a custom agent's `mcpServers` is not a working alternative, and a separate `HOME` per worker would need its own sign-in, so every CAO worker shares that one file — and every `agy` process starts **every** server listed in it.
+
+The provider therefore writes entries that carry no terminal identity:
+
+- `cao-mcp-server` gets `CAO_TERMINAL_ID` from the `agy` process itself. The backend sets it in the terminal's pane environment, and `agy` passes its environment to its stdio MCP servers (an entry's `env` is merged on top). Each worker's `agy` runs its own copy of the server, and each copy reports its own terminal. A `CAO_TERMINAL_ID` in a profile's server `env` is dropped with a warning.
+- Workers whose profiles declare the same server config share one entry, keyed `<server>-<8-hex digest of its config>`. A different config for the same server name gets its own key. The key stays the same across terminals and restarts, so the tool names `agy` shows the model do too.
+- Each entry lists the terminals using it under `caoTerminalIds`. `cleanup()` removes its own terminal, and the entry is removed with its last user. Registration also releases terminals that are no longer live. Fields you add to an entry (`disabled`, `disabledTools`, ...) are kept, and your own entries are never touched.
+
+Before #940 the provider wrote one entry per terminal (`<server>-<terminal_id>`) with `CAO_TERMINAL_ID` pinned in its `env`. A worker launched while another was alive also started that worker's entry, so its `send_message`, `handoff` and `assign` calls could reach the supervisor under the other terminal's id. Registration removes entries in that old shape. An `agy` that is already running keeps the servers it started, because `agy` reads the file when it launches.
 
 
 ### Agent-plugin MCP working directory

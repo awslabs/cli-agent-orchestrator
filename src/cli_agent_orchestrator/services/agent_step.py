@@ -25,7 +25,7 @@ it to an ``HTTPException``.
 import asyncio
 import logging
 import time
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from cli_agent_orchestrator.clients.database import upsert_handoff_result
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
@@ -42,6 +42,10 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.terminal import wait_until_status
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
 
 logger = logging.getLogger(__name__)
 
@@ -452,8 +456,17 @@ async def run_agent_step(
     job_id: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    launch_plan: "LaunchPlan | None" = None,
+    delegating_terminal_id: Optional[str] = None,
+    caller_ceiling: Optional[list[str]] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
+
+    ``delegating_terminal_id`` and ``caller_ceiling`` are forwarded to
+    ``create_terminal`` unchanged; see its docstring. Workflow steps pass the
+    first (the terminal that started the run bounds every step's tools);
+    remote handoff passes the second (the supervisor's ceiling asserted from
+    another node). Both are ignored when a terminal is reused.
 
     Sequence:
       1. Create a terminal (or reuse ``reuse_terminal_id``).
@@ -686,6 +699,9 @@ async def run_agent_step(
 
         # create_terminal already runs provider.initialize() (which waits for
         # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
+        launch_options: dict[str, Any] = (
+            {"launch_plan": launch_plan} if launch_plan is not None else {}
+        )
         terminal = await terminal_service.create_terminal(
             provider,
             agent,
@@ -700,6 +716,9 @@ async def run_agent_step(
             use_worktree=use_worktree,
             claim_id=claim_id,
             description=description,
+            **launch_options,
+            delegating_terminal_id=delegating_terminal_id,
+            caller_ceiling=caller_ceiling,
         )
         terminal_id = terminal.id
 

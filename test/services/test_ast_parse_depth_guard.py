@@ -38,7 +38,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Set, Tuple
+from typing import Dict, List, NamedTuple, Tuple
 
 import pytest
 

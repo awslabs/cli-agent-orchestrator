@@ -308,15 +308,15 @@ class VaultConfig(BaseModel):
         if len(self.vaults) > 1:
             raise ValueError("vaults supports only one vault in release one")
 
-        warnings = tuple(
-            f"mapping {mapping.folder!r} has secret_gate='warn' with inject=true"
-            for vault in self.vaults
-            for mapping in vault.mappings
-            if mapping.secret_gate == "warn" and mapping.inject
-        )
-        self._warnings = warnings
-        for message in warnings:
-            logger.warning(message)
+        # ``secret_gate: "warn"`` with ``inject: true`` used to be a config-load
+        # warning (ADR-007 rule 20). Since #644 every model-bound vault read is
+        # redacted at the ``load_candidate`` chokepoint and raw bytes pass only
+        # through a per-finding ``cao.secret_ok`` acceptance, which reconcile
+        # reports as a ``secret_accepted`` finding, so the pairing carries no
+        # exposure of its own and a standing warning would only train
+        # click-through. ``warnings`` stays as the status-visible channel for
+        # future config observations.
+        self._warnings = ()
         if self.max_recall_body_chars > MEMORY_SCOPE_BUDGET_CHARS:
             logger.warning(
                 "max_recall_body_chars=%s exceeds the injection scope budget %s; "
