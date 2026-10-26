@@ -6,13 +6,15 @@ every built-in tool (shell, write, use_aws and more). Measured on kiro-cli 2.32.
 the same fallback follows an agent file that does not parse. CAO therefore checks
 identity twice, and both checks fail closed:
 
-1. Before launch (``kiro_agent_defined``): some agent directory kiro-cli reads
-   must define the name. ``terminal_service.create_terminal`` refuses otherwise,
-   before any window exists.
+1. Before launch (``kiro_agent_defined``): one of the agent directories in
+   ``kiro_agent_dirs`` must define the name. ``terminal_service.create_terminal``
+   refuses otherwise, before any window exists.
 2. After launch, before any task is typed (``require_header_identity``): the
    TUI header row, ``<agent> · <model> · ◔ N% · ...``, must name the agent.
-   ``KiroCliProvider.initialize`` raises otherwise, so the creation path tears
-   the terminal down and delivers nothing.
+   ``KiroCliProvider.initialize`` raises otherwise, and the creation path closes
+   the terminal's window: a synchronous create rolls back, and a deferred create
+   always reclaims the runtime, keeping only the failure record. Nothing is
+   delivered.
 
 Check 1 deliberately over-accepts: an agent file it counts that kiro-cli then
 does not load still ends at check 2, which reads what kiro-cli actually started.
@@ -203,8 +205,8 @@ def require_header_identity(expected: str, observed: Optional[str]) -> None:
             expected,
             f"Kiro agent identity not confirmed for '{expected}': no TUI header row "
             f"('<agent> · <model> · ◔ N%') was found after kiro-cli started, so CAO "
-            f"cannot tell which agent is running. No task was sent and the launch was "
-            f"stopped. A kiro-cli TUI change can cause this; check the kiro-cli version.",
+            f"cannot tell which agent is running. No task was sent. A kiro-cli TUI "
+            f"change can cause this; check the kiro-cli version.",
         )
     if observed != expected or observed in KIRO_FALLBACK_AGENTS:
         raise KiroAgentIdentityError(
@@ -212,8 +214,9 @@ def require_header_identity(expected: str, observed: Optional[str]) -> None:
             expected,
             f"Kiro started agent '{observed}' instead of '{expected}'. kiro-cli falls "
             f"back to its built-in agent when the requested one is missing or does not "
-            f"load. No task was sent and the launch was stopped. Remedy: `cao install "
-            f"{expected} --provider kiro_cli`, check `kiro-cli agent list` for errors, "
-            f"then retry.",
+            f"load. No task was sent. Remedy: `cao install {expected} --provider "
+            f"kiro_cli`, check `kiro-cli agent list` for errors, then retry. If "
+            f"CAO_AGENTS_DIR is set, kiro-cli reads it only when it is ~/.kiro/agents "
+            f"or $KIRO_HOME/agents.",
             observed=observed,
         )

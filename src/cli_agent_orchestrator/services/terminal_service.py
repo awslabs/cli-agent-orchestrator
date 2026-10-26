@@ -62,6 +62,7 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
+    update_terminal_deferred_init_runtime_reclaimed,
     update_terminal_description,
     update_terminal_group,
     update_terminal_initial_delivery,
@@ -109,6 +110,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
+from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
 from cli_agent_orchestrator.services import ephemeral_service, worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
@@ -3205,6 +3207,51 @@ def _persist_deferred_init_failure(
     return failure
 
 
+def _reclaim_deferred_failure_runtime(terminal_id: str) -> bool:
+    """Close a failed deferred-init terminal's window and runtime; keep its row.
+
+    The tombstone reclaim the herdr reconciler runs for a pane that already
+    ended, with the window close included. The row carries its failure or the
+    creation-time external-owner bit, so ``dismantle_terminal_runtime`` closes
+    the window by exact terminal identity, never by its reusable name. On
+    success the row is marked ``deferred_init_runtime_reclaimed`` and stays as
+    the durable failure surface. Blocking tmux/DB I/O: callers to_thread it.
+
+    Returns False when the runtime could not be proven gone; the row is then
+    left unmarked, so a later delete retries the close, and ``dispatch_input``
+    refuses input to it meanwhile.
+    """
+    try:
+        # As the CAO-owned path does (_notify_caller_of_deferred_failure), release
+        # any ephemeral binding with the failure's reason first: the first
+        # release wins. Then snapshot the scrollback while the pane exists, and
+        # dismantle.
+        ephemeral_service.release(terminal_id, "launch_failed")
+        metadata = capture_terminal_snapshot(terminal_id)
+        if not metadata:
+            # The row is gone: a concurrent DELETE owns the teardown now.
+            return False
+        if not dismantle_terminal_runtime(terminal_id, metadata, kill_window=True):
+            logger.warning(
+                "Deferred-init failure %s: runtime reclaim deferred; its row is retained "
+                "and input to it is refused",
+                terminal_id,
+            )
+            return False
+        if not update_terminal_deferred_init_runtime_reclaimed(terminal_id, True):
+            return False
+    except Exception as exc:  # noqa: BLE001 — the failure record must survive a failed reclaim
+        logger.warning(
+            "Deferred-init failure %s: runtime reclaim failed; its row is retained and "
+            "input to it is refused: %s",
+            terminal_id,
+            exc,
+        )
+        return False
+    logger.info("Deferred-init failure %s: window closed, failure record retained", terminal_id)
+    return True
+
+
 async def _surface_deferred_init_failure(
     terminal_id: str,
     *,
@@ -3213,12 +3260,19 @@ async def _surface_deferred_init_failure(
     registry: PluginRegistry | None,
     exception_type: str | None = None,
     delete_on_failure: bool | None = None,
+    reclaim_runtime: bool = False,
 ) -> bool:
     """Persist/notify one init failure and apply lifecycle ownership.
 
     Returns True when CAO owns teardown, False when an external observer owns
     the retained terminal. Failure metadata is written before either branch so
     GET /terminals can remain an authoritative error surface across restarts.
+
+    ``reclaim_runtime`` is for a failure whose runtime must not outlive it even
+    when an external observer owns the row: a refused Kiro identity (#1074) is a
+    running agent CAO did not ask for, with its trust-all-tools consent already
+    accepted. Its window is closed and its runtime dismantled, and only the
+    failure row is retained. CAO-owned teardown already closes the window.
     """
 
     delete_worker = (
@@ -3275,6 +3329,12 @@ async def _surface_deferred_init_failure(
             await asyncio.to_thread(
                 _publish_deferred_failure_fallback, terminal_id, failure_payload
             )
+    # Close a refused runtime first, now that the row carries the failure (or the
+    # creation-time external-owner bit) and so is closed by exact terminal
+    # identity, never by its reusable name.
+    reclaimed: bool | None = None
+    if reclaim_runtime and not delete_worker and not terminal_missing:
+        reclaimed = await asyncio.to_thread(_reclaim_deferred_failure_runtime, terminal_id)
     # The initial message (if this terminal had one) is now known not to have
     # been delivered; settle its durable outcome alongside the failure marker
     # so a client waiting on initial_delivery stops with the reason (#566).
@@ -3285,6 +3345,17 @@ async def _surface_deferred_init_failure(
     notification = _sanitize_deferred_failure_message(message)
     if delete_worker:
         notification += " The failed worker terminal will be torn down."
+    elif reclaimed:
+        notification += (
+            " Its window was closed; the failure record is retained for its external "
+            "lifecycle owner."
+        )
+    elif reclaimed is False:
+        notification += (
+            " Closing its window could not be confirmed; input to it is refused. The "
+            "failure record is retained for its external lifecycle owner; deleting the "
+            "terminal closes the window."
+        )
     else:
         notification += " The failed worker terminal is retained for its external lifecycle owner."
     await asyncio.to_thread(
@@ -4155,6 +4226,12 @@ def _schedule_deferred_init(
                 exception_type=type(e).__name__,
                 registry=registry,
                 delete_on_failure=delete_on_failure,
+                # A refused Kiro identity is a live agent CAO did not ask for
+                # (kiro_default, with every built-in tool and its trust-all-tools
+                # consent already accepted). Its window is always closed, even
+                # when an external owner keeps the failure row. Provisional
+                # (#1074): only this failure is reclaimed; others keep theirs.
+                reclaim_runtime=isinstance(e, KiroAgentIdentityError),
             )
         finally:
             # The single release point for every path, and on the happy path the
@@ -4652,6 +4729,22 @@ def dispatch_input(
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        # A terminal whose deferred init failed durably is never typed into, so
+        # that a retained failure row is not a live input path (#1074). A refused
+        # Kiro identity has its window closed, but if that close could not be
+        # confirmed the pane may still be the kiro_default fallback, accepting
+        # input with every built-in tool. This reads the durable record, not the
+        # monitor's in-memory status, which can still say IDLE there.
+        # Provisional (#1074): every provider's durable failure is refused, with
+        # the reason string "init_failed".
+        failure = get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
+        if failure is not None:
+            raise ProviderExitedInputBlockedError(
+                f"Terminal {terminal_id} failed deferred initialization "
+                f"({failure.get('kind') or 'unknown'}). Refusing to deliver input.",
+                reason=TerminalInputBlockedReason.INIT_FAILED,
+            )
 
         if (
             metadata.get("provider") == ProviderType.KIRO_CLI.value

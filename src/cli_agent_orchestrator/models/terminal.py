@@ -32,6 +32,9 @@ class TerminalInputBlockedReason(str, Enum):
 
     PROVIDER_ERROR = "provider_error"
     WAITING_USER_ANSWER = "waiting_user_answer"
+    # The terminal's deferred initialization failed durably (#1074): a refused Kiro
+    # identity, say. Permanent, like PROVIDER_ERROR.
+    INIT_FAILED = "init_failed"
 
 
 class TerminalInputBlockedError(Exception):
@@ -82,7 +85,10 @@ class ProviderExitedInputBlockedError(TerminalInputBlockedError):
 
     Raised by ``services/terminal_service.py``'s delivery guards when the
     terminal's status is ERROR or its pane's foreground process is the shell that
-    was running before the CLI launched (#1018). Still a
+    was running before the CLI launched (#1018), and with
+    ``reason=TerminalInputBlockedReason.INIT_FAILED`` when the terminal carries a
+    durable deferred-init failure: its runtime is reclaimed, or is not trusted
+    with input until it is (#1074). Still a
     ``TerminalInputBlockedError`` so every existing handler keeps its answer --
     409 at ``/terminals/{id}/input``, 504 at ``run_step``, FAILED in the inbox --
     but the deferred-init path catches this subclass FIRST and tears the worker

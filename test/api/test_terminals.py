@@ -355,6 +355,33 @@ class TestTerminalCreationWithWorkingDirectory:
         assert response.status_code == 400, response.text
         assert "cao install analyst" in response.json()["detail"]
 
+    def test_input_to_a_terminal_with_a_deferred_init_failure_is_a_conflict(self, client):
+        """POST /terminals/{id}/input refuses a terminal whose deferred init failed
+        durably (#1074): 409, and no key reaches the pane."""
+        metadata = {
+            "id": "abcd1234",
+            "provider": "kiro_cli",
+            "tmux_session": "cao-s",
+            "tmux_window": "developer-w",
+            "deferred_init_failure": {
+                "phase": "deferred_init",
+                "kind": "provider_init_error",
+                "exception_type": "KiroAgentIdentityError",
+            },
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.get_backend") as backend,
+        ):
+            response = client.post("/terminals/abcd1234/input", params={"message": "SEND-CANARY"})
+
+        assert response.status_code == 409, response.text
+        assert "deferred initialization" in response.json()["detail"]
+        backend.return_value.send_keys.assert_not_called()
+
     @pytest.mark.parametrize(
         "endpoint,target",
         [

@@ -448,10 +448,11 @@ class KiroCliProvider(BaseProvider):
         kiro-cli answers an ``--agent`` it cannot load by starting its built-in
         ``kiro_default`` agent, which has every built-in tool, and reaches the
         same ready prompt. Called after the prompt is ready and before
-        ``initialize`` returns, so on a refusal no task has been typed: the
-        creation path tears the terminal down (or records the failure for its
-        external owner), and the pane receives no keys from here. Provisional
-        (#1074): no ``/exit`` is typed into the wrong agent either.
+        ``initialize`` returns, so on a refusal no task has been typed, and the
+        pane receives no keys from here. The creation path then closes the
+        window: a synchronous create rolls back, and a deferred create reclaims
+        the runtime even when an external owner keeps the failure row.
+        Provisional (#1074): no ``/exit`` is typed into the wrong agent either.
 
         Reads the rendered screen, not the scrollback, so the requested name in
         the echoed launch command is never what is matched (see
