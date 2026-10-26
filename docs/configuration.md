@@ -135,13 +135,17 @@ Only JSON `true` enables the tool, and agent terminals must restart to see it.
 | `enabled` | `false` | Enable ephemeral creation, claims and owner-only HTTP launch. |
 | `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex is an operator opt-in. |
 | `max_brief_bytes` | `8192` | Maximum UTF-8 bytes after brief normalization. |
-| `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched. |
+| `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched or swept. |
 | `claim_lease_seconds` | `60` | Lease from claim to terminal creation. |
 | `max_depth` | `1` | Only integer 1 is supported; ephemeral callers cannot create ephemerals. |
 | `child_may_delegate` | `false` | Permit the existing ephemeral delegation/workflow tools; never permits ephemeral creation by an ephemeral caller. |
+| `max_live_per_session` | `10` | Pending, claimed and launched names one session may hold. Collected and expired pending names don't count. |
+| `launch_grace_seconds` | `600` | How long periodic sweeps wait after a bind before collecting a launched name with no terminal row. The startup sweep doesn't wait. |
+| `sweep_interval_seconds` | `300` | Seconds between periodic sweeps, at most one day. |
+| `retention_days` | `14` | Days a collected name's archive and registry row are kept, counted only once its terminal and live files are gone. |
 
 See [Ephemeral agents](ephemeral-agents.md) for policy limits, ignored tier/effort keys,
-and the lifecycle residue warning. Keep the feature disabled outside testing.
+and lifecycle cleanup. Keep the feature disabled outside testing.
 
 ### Skills (`skills`)
 
