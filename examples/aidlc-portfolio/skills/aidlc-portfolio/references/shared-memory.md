@@ -72,9 +72,10 @@ The supervisor delivers promoted learnings at dispatch instead:
    supervisor memories or a rule whose proposal was rejected, are excluded.
 3. Delivered learnings use the recalled memory content, which is the current
    CAO version of the rule. They are bounded (at most 10 per assignment, each
-   truncated to 1,000 characters), fenced as inert text, and placed under
-   "Promoted portfolio learnings" in the assignment's Relevant Context with a
-   label that they are reference data, not instructions.
+   truncated to 1,000 characters), fenced so it cannot add sections to the
+   message, and placed under "Promoted portfolio learnings" in the
+   assignment's Relevant Context, labelled as reference data, not
+   instructions.
 4. The output lists `missing` promoted learnings the recall did not return
    (forgotten, or outside the recall's limit) and `pending` proposals that
    cannot be delivered until reviewed.
