@@ -2,8 +2,13 @@
 
 from unittest.mock import patch
 
+from cli_agent_orchestrator.constants import (
+    SERVER_COORDINATE_ENV_VARS,
+    server_coordinate_env,
+)
 from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_MCP_SERVER_MODULE,
+    apply_server_coordinates,
     resolve_cao_mcp_command,
     resolve_mcp_server_config,
 )
@@ -167,7 +172,10 @@ class TestPersistedResolution:
 class TestResolveMcpServerConfig:
     """resolve_mcp_server_config wraps the resolver over a config dict."""
 
-    def test_resolves_command_and_preserves_other_keys(self):
+    def test_resolves_command_and_preserves_other_keys(self, default_cao_server):
+        # default_cao_server: this asserts the exact runtime env of a DEFAULT
+        # server's bundled entry, which a developer's exported CAO_HOME_DIR
+        # would otherwise add a key to (#1066).
         with (
             patch(f"{MOD}._sibling_script", return_value=""),
             patch(f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"),
@@ -247,3 +255,132 @@ class TestResolveMcpServerConfig:
         out = resolve_mcp_server_config({"type": "stdio", "command": "my-server"})
         assert out["command"] == "my-server"
         assert "args" not in out
+
+
+class TestServerCoordinateEnv:
+    """``constants.server_coordinate_env`` reports only what is actually set."""
+
+    def test_empty_for_a_default_server(self, default_cao_server):
+        assert server_coordinate_env() == {}
+
+    def test_reports_only_the_vars_that_are_set(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        assert server_coordinate_env() == {"CAO_API_PORT": "9899"}
+
+    def test_reports_all_three(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_HOST", "10.0.0.4")
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-trial")
+        assert server_coordinate_env() == {
+            "CAO_API_HOST": "10.0.0.4",
+            "CAO_API_PORT": "9899",
+            "CAO_HOME_DIR": "/srv/cao-trial",
+        }
+
+    def test_whitespace_only_is_unset(self, monkeypatch, default_cao_server):
+        """Matches how ``CAO_HOME_DIR`` itself is read in constants."""
+        monkeypatch.setenv("CAO_HOME_DIR", "   ")
+        assert server_coordinate_env() == {}
+
+    def test_never_reports_the_defaults(self, default_cao_server):
+        """A default server must not advertise 127.0.0.1:9889 as an override.
+
+        An entry carrying the defaults explicitly is not byte-identical to one
+        that omits them, and would also pin a port the next CAO may not use.
+        """
+        assert "CAO_API_PORT" not in server_coordinate_env()
+        assert SERVER_COORDINATE_ENV_VARS == ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR")
+
+
+class TestApplyServerCoordinates:
+    """``apply_server_coordinates`` is the one place the coordinates are merged."""
+
+    def test_identity_for_a_default_server(self, default_cao_server):
+        original = {"command": "/venv/bin/cao-mcp-server", "args": []}
+        assert apply_server_coordinates(original) is original
+
+    def test_adds_the_set_coordinates(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        out = apply_server_coordinates({"command": "x", "env": {"CAO_TERMINAL_ID": "t1"}})
+        assert out["env"] == {"CAO_API_PORT": "9899", "CAO_TERMINAL_ID": "t1"}
+
+    def test_adds_env_to_an_entry_that_had_none(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        out = apply_server_coordinates({"command": "x"})
+        assert out["env"] == {"CAO_API_PORT": "9899"}
+
+    def test_the_entrys_own_env_wins(self, monkeypatch, default_cao_server):
+        """An author who pinned a port means it."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-trial")
+        out = apply_server_coordinates({"command": "x", "env": {"CAO_API_PORT": "7777"}})
+        assert out["env"]["CAO_API_PORT"] == "7777"
+        assert out["env"]["CAO_HOME_DIR"] == "/srv/cao-trial"
+
+    def test_does_not_mutate_the_caller(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        original = {"command": "x", "env": {"CAO_TERMINAL_ID": "t1"}}
+        apply_server_coordinates(original)
+        assert original["env"] == {"CAO_TERMINAL_ID": "t1"}
+
+
+class TestResolveCarriesServerCoordinates:
+    """The runtime bundled entry gains them; the persisted entry gains nothing."""
+
+    def _bundled(self):
+        return {"type": "stdio", "command": "cao-mcp-server", "args": []}
+
+    def test_runtime_entry_carries_them(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            out = resolve_mcp_server_config(self._bundled())
+        assert out["env"]["CAO_API_PORT"] == "9899"
+
+    def test_persisted_entry_gains_nothing(self, monkeypatch, default_cao_server):
+        """A persisted entry outlives this process; another CAO reads it."""
+        monkeypatch.setenv("CAO_API_HOST", "10.0.0.4")
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-trial")
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/versioned/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value="/stable/bin/cao-mcp-server"),
+        ):
+            out = resolve_mcp_server_config(self._bundled(), persisted=True)
+        assert "env" not in out
+
+    def test_runtime_entrys_own_env_still_wins(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        entry = dict(self._bundled(), env={"CAO_API_PORT": "7777", "CAO_TERMINAL_ID": "t1"})
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            out = resolve_mcp_server_config(entry)
+        assert out["env"] == {"CAO_API_PORT": "7777", "CAO_TERMINAL_ID": "t1"}
+
+    def test_default_server_leaves_the_entry_byte_identical(self, default_cao_server):
+        """No coordinates set: exactly the pre-change result, env key and all."""
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            out = resolve_mcp_server_config(self._bundled())
+        assert out == {
+            "type": "stdio",
+            "command": "/venv/bin/cao-mcp-server",
+            "args": [],
+        }
+
+    def test_third_party_server_is_untouched(self, monkeypatch, default_cao_server):
+        """Only the bundled server learns where this CAO lives."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        out = resolve_mcp_server_config({"type": "stdio", "command": "my-server"})
+        assert "env" not in out
+
+    def test_commandless_url_server_is_untouched(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        original = {"type": "http", "url": "https://example.com/mcp"}
+        assert resolve_mcp_server_config(original) == original

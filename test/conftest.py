@@ -241,6 +241,35 @@ def _hermetic_cao_env(monkeypatch, tmp_path):
 
 
 @pytest.fixture
+def default_cao_server(monkeypatch):
+    """Make this test's CAO look like a DEFAULT server (#1066).
+
+    ``constants.server_coordinate_env`` reports whichever of ``CAO_API_HOST`` /
+    ``CAO_API_PORT`` / ``CAO_HOME_DIR`` the running server has set, and every
+    runtime bundled ``cao-mcp-server`` entry and every herdr pane now carries
+    them. A developer who exports ``CAO_HOME_DIR`` — or who runs the suite the
+    CI-shaped way, with ``CAO_HOME_DIR=$(mktemp -d)`` — would otherwise build
+    different launch commands and MCP configs than a bare CI run does. Request
+    this from any test asserting on a built launch command, MCP config, or pane
+    env; a test that wants a NON-default server requests it and then sets the
+    vars it cares about, so the other two stay out of the assertion.
+
+    Deliberately not autouse: a test whose child PROCESS must agree with this
+    one on the CAO home needs the name to stay exported
+    (``test/utils/test_atomic_file.py`` re-derives ``LOCK_DIR`` from
+    ``CAO_HOME_DIR`` in a spawned process, and a blanket unset sends the child
+    to the default home and breaks the cross-process lock invariant).
+
+    Unsetting the names does NOT move ``constants.CAO_HOME_DIR``, which is
+    already resolved at import, so the on-disk test home is unaffected.
+    """
+    from cli_agent_orchestrator.constants import SERVER_COORDINATE_ENV_VARS
+
+    for coordinate in SERVER_COORDINATE_ENV_VARS:
+        monkeypatch.delenv(coordinate, raising=False)
+
+
+@pytest.fixture
 def isolated_memory_db(tmp_path, monkeypatch):
     """Route default memory sessions to an initialized per-test SQLite database."""
     from sqlalchemy import create_engine
