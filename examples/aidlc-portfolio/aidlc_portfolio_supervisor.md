@@ -141,7 +141,7 @@ identity, or the AI-DLC distribution cannot be discovered safely.
 - Never dispatch a worktree that fails `harness verify`.
 - Never launch a child outside the persisted Dispatch phase.
 - Never invoke `question answer` without a human-approval-surface record; the
-  utility refuses a packet that no verified human approved.
+  utility refuses a packet that has no matching approval record.
 - Treat child worktree memory files as local scratch. Promote durable learnings
   into CAO memory with `memory_store` + `learning promote` after review; never
   merge a worktree memory file into an integration branch.
