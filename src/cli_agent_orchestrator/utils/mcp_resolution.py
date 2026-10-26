@@ -226,9 +226,10 @@ def _uvx_entry_point(args: List[str]) -> Tuple[Optional[str], Optional[str]]:
 
 
 def is_bundled_cao_server(config: dict) -> bool:
-    """Return True when this entry starts CAO's OWN orchestration MCP server.
+    """Return True when this entry launches CAO's orchestration MCP server by
+    one of the shapes CAO itself produces.
 
-    Four shapes reach callers, and each is recognised by its whole shape — the
+    Three shapes reach callers, and each is recognised by its whole shape — the
     command AND the arguments that give that command its meaning:
 
     1. the bare console script a bundled profile declares (``command:
@@ -259,6 +260,16 @@ def is_bundled_cao_server(config: dict) -> bool:
     exotic uvx invocation, a ``--from`` pointing at a local checkout): that
     entry simply keeps today's behaviour and falls back to the default
     coordinates, which is the safe direction.
+
+    What this does NOT prove is provenance. The shapes are the operator's own
+    explicit command, and a command the operator pointed at other code still
+    matches: ``--from git+https://<any host>/cli-agent-orchestrator.git`` is
+    accepted on the repository basename, so it may be a fork; a shim named
+    ``python3`` earlier on ``PATH``, given the exact ``-m`` arguments, is
+    accepted too. That is the trust boundary of an explicit command rather than
+    a hole in the predicate — the operator chose to run that program, and the
+    three values are coordinates, not credentials. The line the predicate does
+    hold is that nothing gains them merely by NAMING ``cao-mcp-server``.
     """
     command = config.get("command")
     if not isinstance(command, str) or not command:

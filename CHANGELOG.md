@@ -250,17 +250,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server entry CAO builds for a launch now carries the server's own `CAO_API_HOST`,
   `CAO_API_PORT` and `CAO_HOME_DIR`, for whichever are set, below any `env` the entry already
   declares; herdr panes get them through `--env`, ahead of operator-forwarded variables and
-  without weakening the blocked-key filter. `cao-server` publishes its effective host and port
-  into its own environment at startup, so a coordinate given as a flag reaches the children too,
-  and `CAO_HOME_DIR` is handed over canonicalised, so a relative value cannot mean a different
-  directory in a subprocess started from another working directory. Only entries that start
-  CAO's own server receive them, recognised by the whole shape of the command — a third-party
-  server that merely names `cao-mcp-server` (as its own script under a different `uvx --from`,
-  or as an argument of its own) is not handed CAO's endpoint. A persisted entry — `cao install`'s
-  settings, a user-level MCP config, antigravity's shared `mcp_config.json` — deliberately gains
-  none of them, since the next `cao-server` to read it may be a different one. A default CAO
-  leaves its environment untouched and builds byte-identical launch commands and MCP configs
-  (#1066).
+  without weakening the blocked-key filter. `cao-server` reconciles its own environment with the
+  host and port it actually binds, at startup: a non-default value is published, and a variable
+  that conflicts with an explicit flag is overwritten or — when the flag spells out the default —
+  removed, so what the children are told is always what uvicorn bound. `CAO_HOME_DIR` is handed
+  over canonicalised, so a relative value cannot mean a different directory in a subprocess
+  started from another working directory. The values go only to an entry that launches CAO's own
+  MCP server by one of the shapes CAO itself produces, recognised by the whole shape of the
+  command; a command the operator pointed at a fork or a shim is trusted as the operator's
+  choice, and a third-party program that merely takes the name `cao-mcp-server` as an argument of
+  its own, or ships its own script of that name under a different `uvx --from`, is not matched. A
+  persisted entry — `cao install`'s settings, a user-level MCP config, antigravity's shared
+  `mcp_config.json` — deliberately gains none of them, since the next `cao-server` to read it may
+  be a different one. A default CAO with no coordinate set leaves its environment untouched and
+  builds byte-identical launch commands and MCP configs (#1066).
 - Antigravity CLI workers no longer report under another worker's terminal id.
   Every `agy` process starts every server in the shared
   `~/.gemini/config/mcp_config.json`, and each worker's entry pinned its
