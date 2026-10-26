@@ -2386,6 +2386,26 @@ class TestKimiMcpMerge:
     def test_profile_none_yields_user_servers(self):
         assert set(merge_mcp_servers({"u": {"command": "x"}}, None)) == {"u"}
 
+    def test_bundled_server_gains_this_cao_address(self, monkeypatch):
+        """P3-2: Kimi runtime-home is resolver-routed (``merge_mcp_servers``
+        calls ``resolve_mcp_server_config``) but was only covered through the
+        resolver's own unit tests, not at the provider level."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        merged = merge_mcp_servers(
+            {}, {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        )
+        assert merged["cao-mcp-server"]["env"]["CAO_API_PORT"] == "9899"
+
+    def test_default_cao_gains_nothing(self, monkeypatch):
+        for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        merged = merge_mcp_servers(
+            {}, {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        )
+        assert "env" not in merged["cao-mcp-server"]
+
 
 class TestResolveSourceHome:
     def test_absolute_captured_value_wins(self, tmp_path):
