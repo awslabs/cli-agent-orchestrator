@@ -87,7 +87,7 @@ It does not replace or infer child AI-DLC stages.
 - `skills/aidlc-portfolio/`: managed skill containing schemas, templates,
   reference guidance, and a deterministic portfolio CLI.
 - `tests/`: focused tests for workspace validation, harness projection,
-  lifecycle gates, shared-memory serialization, and dependency convergence.
+  lifecycle gates, learning review and delivery, and dependency convergence.
 
 The deterministic utility provides:
 
@@ -98,7 +98,8 @@ The deterministic utility provides:
 - unanswered Markdown question packets for child design decisions, resolved
   only through an approval bound to CAO's human-approval surface;
 - a reviewed proposal flow that promotes durable learnings into CAO's native
-  memory (`memory_store`/`memory_recall`) instead of a hand-built file;
+  memory (`memory_store`/`memory_recall`) instead of a hand-built file, and
+  delivers the promoted learnings that apply to each runner in its assignment;
 - structured child completion results and cycle-safe upstream/downstream
   convergence checks.
 
@@ -223,6 +224,29 @@ The two children have isolated files and AI-DLC state. Each treats its
 worktree-local `project.md`/`team.md` as scratch and submits durable learnings
 as proposals; only the supervisor reviews a proposal and promotes it into CAO's
 native memory.
+
+## How Promoted Learnings Reach Runners
+
+CAO resolves a project memory scope for each terminal: `CAO_PROJECT_ID` or
+`memory.project_id` if set, otherwise the `origin` remote of the terminal's
+working directory, otherwise a hash of its path. The supervisor runs in the
+portfolio root and each runner runs in a worktree of its own repository, so
+they resolve different scopes, and a runner's own `memory_recall` does not
+return what the supervisor promoted.
+
+The example therefore delivers learnings at dispatch. Before each assignment
+the supervisor runs `memory_recall` in its own scope, and `dispatch message`
+renders the runner message with the promoted learnings that apply to that
+project in its Relevant Context. They are bounded, and labelled as reference
+data rather than instructions. Unrelated memories and rejected or unreviewed
+proposals are left out. Delivery is a snapshot: a runner that is already
+running does not receive a learning promoted after its dispatch. See
+`skills/aidlc-portfolio/references/shared-memory.md` for the exact rules.
+
+If you want every terminal to recall one shared scope instead, set
+`CAO_PROJECT_ID` (or `memory.project_id`) for the CAO server that starts the
+supervisor and the runners. The trade-off is that the setting applies to every
+terminal of that server, not only to this portfolio.
 
 ## Human Control Points
 

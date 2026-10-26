@@ -42,6 +42,9 @@ Before dispatch:
 7. Confirm no pending human question packet exists for the child.
 8. Run `harness verify` for the exact project and intent.
 9. Pass only the relevant business, component, contract, and dependency slice.
+10. Recall promoted learnings in the supervisor's own memory scope and render
+    the assignment with `dispatch message`, which delivers only the reviewed
+    learnings that apply to this project.
 
 Use non-blocking CAO assignment for independent work and pass the registered
 absolute worktree as `working_directory`. Do not use CAO's inherited supervisor
@@ -98,15 +101,23 @@ sole authority that promotes a learning into that memory.
    contradiction, and scope.
 3. To accept, the supervisor writes the rule into CAO memory with `memory_store`
    (scope project, memory_type feedback), then records that promotion with
-   `learning promote --promoted-by <supervisor>`. To decline, use
-   `learning reject`.
+   `learning promote --promoted-by <supervisor> --memory-key <key>`, using the
+   key `memory_store` returned. To decline, use `learning reject`.
 4. A proposal is reviewed once; a promoted or rejected proposal cannot be
    re-promoted.
 5. Integration completion blocks while any proposal is still `pending`.
+6. Promoted learnings reach runners in the assignment. CAO resolves a project
+   memory scope per terminal, and each runner's worktree resolves its own
+   repository's scope, so a runner's `memory_recall` does not return what the
+   supervisor promoted. The supervisor recalls in its own scope at dispatch and
+   `dispatch message` places the relevant learnings, labelled as data, in the
+   runner message. A runner may still recall its own repository's scope.
 
 Per-space worktree memory files no longer block session completion and are not
 merged from feature branches. Durable knowledge is inspected with
-`memory_recall`, not a git diff.
+`memory_recall` in the supervisor's scope, not a git diff. See
+[shared-memory.md](shared-memory.md) for the delivery rules and the
+`CAO_PROJECT_ID` alternative.
 
 ## Contract Changes
 

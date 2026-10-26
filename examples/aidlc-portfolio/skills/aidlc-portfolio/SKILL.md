@@ -56,9 +56,10 @@ items. Perform setup on their behalf:
    `$HOME/Project/aidlc-workflows/dist/claude`. Run `harness stage`, `harness
    sync`, and `harness verify` to project one manifest-pinned Opus 5 runtime
    into every worktree.
-8. Run `doctor` and `dispatch check`, then assign all dependency-ready
-   `aidlc_runner` sessions concurrently with CAO `working_directory` set to
-   each absolute worktree.
+8. Run `doctor` and `dispatch check`, render each assignment with
+   `dispatch message`, then assign all dependency-ready `aidlc_runner`
+   sessions concurrently with CAO `working_directory` set to each absolute
+   worktree.
 9. Report the generated root, intent IDs, worktree paths, and terminal IDs.
 
 The operator owns creation of the empty parent/root directory and launches the
@@ -174,8 +175,39 @@ bun "$SKILL_DIR/scripts/portfolio.ts" dispatch check \
   --root <root> --project <project> --intent <intent>
 ```
 
-The worktree must pass harness verification and dispatch validation. Render
-`assets/templates/runner-message.md`, then use CAO `assign` with
+The worktree must pass harness verification and dispatch validation. Then
+render the assignment. CAO memory is scoped per terminal: you run in the
+portfolio root and each runner runs in its own repository worktree, so a
+runner's own `memory_recall` cannot see what you promoted. Deliver promoted
+learnings in the assignment instead:
+
+1. Call the `memory_recall` MCP tool in your own scope with `scope: "project"`,
+   `memory_type: "feedback"`, and a `limit` that covers the portfolio's
+   promoted learnings (at most 100). Save its JSON result to a file.
+2. Render `assets/templates/runner-message.md`, passing your own CAO terminal
+   ID for callbacks and, optionally, Markdown files for the business,
+   component, and dependency slice and for the contract inputs:
+
+```bash
+bun "$SKILL_DIR/scripts/portfolio.ts" dispatch message \
+  --root <root> --project <project> --intent <intent> \
+  --callback-terminal <supervisor-terminal-id> --recall <recall.json> \
+  [--context <context.md>] [--contracts <contracts.md>] --out <message.md>
+```
+
+The command repeats the dispatch check, then joins each recalled entry to the
+promotion ledger by memory key. It delivers a learning only if it was promoted
+and applies to this dispatch: a `team` learning, a learning for this project,
+or one for a project linked to it by a catalog dependency or `dependsOn`. It
+delivers at most 10, each truncated to 1,000 characters, fenced and labelled
+as reference data under Relevant Context. Its JSON output lists `excluded`
+recall entries with reasons, `missing` promoted learnings the recall did not
+return, and `pending` proposals not yet reviewed. Recall again if a learning
+is missing by accident, and review pending proposals first if this runner
+should receive them. Delivery is a snapshot: a runner already running does not
+receive a learning promoted after its dispatch.
+
+Use the rendered file as the CAO `assign` message, with
 `agent_profile: aidlc_runner` and `working_directory` set to the validated
 absolute worktree. The supervisor profile enables this CAO parameter through
 `CAO_ENABLE_WORKING_DIRECTORY=true`. After assignment returns a terminal ID,
@@ -284,6 +316,8 @@ Read [shared-memory.md](references/shared-memory.md) before processing child
 AI-DLC learnings. Durable portfolio knowledge lives in CAO native memory,
 written and read through the `memory_store` / `memory_recall` MCP tools —
 there is no canonical-file baseline revision to pass in the runner assignment.
+Promoted learnings reach runners through `dispatch message` (see Dispatch),
+not through the runners' own recall.
 
 Child runners submit structured proposals from
 `assets/templates/learning-proposal.yaml`:
@@ -301,13 +335,17 @@ bun "$SKILL_DIR/scripts/portfolio.ts" learning list \
 ```
 
 To accept, write the rule into CAO memory with the `memory_store` MCP tool
-(scope `project`, memory_type `feedback`), then record that promotion:
+(scope `project`, memory_type `feedback`), then record that promotion with
+the `key` that `memory_store` returned:
 
 ```bash
 bun "$SKILL_DIR/scripts/portfolio.ts" learning promote \
   --root <root> --id <proposal> --promoted-by "<supervisor>" \
-  [--memory-key <memory-key>]
+  --memory-key <returned-key>
 ```
+
+`dispatch message` joins recalled memory to this record by key, so the key is
+required, must be a CAO memory slug, and must name only one promoted learning.
 
 To decline, record the reviewed outcome instead of promoting:
 

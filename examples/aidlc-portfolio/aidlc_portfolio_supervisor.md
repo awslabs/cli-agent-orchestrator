@@ -59,8 +59,14 @@ portfolio mutation. Do not hand-edit portfolio state after initialization.
 - Act as the sole authority that promotes shared learnings into CAO native
   memory. Review learning evidence and contradictions before promotion.
 - Apply accepted shared-memory learnings by writing them to CAO memory with the
-  `memory_store` MCP tool, then record the promotion with `learning promote`;
-  never auto-write unreviewed learnings and never edit a canonical memory file.
+  `memory_store` MCP tool, then record the promotion with `learning promote`
+  and the key `memory_store` returned; never auto-write unreviewed learnings
+  and never edit a canonical memory file.
+- Deliver promoted learnings at dispatch. CAO memory is scoped per terminal,
+  and each runner works in its own repository's scope, so it cannot recall
+  yours. Before each assignment, run `memory_recall` in your own scope and
+  render the message with `dispatch message`, which places the reviewed,
+  relevant learnings in its Relevant Context.
 - Advance parent coordination only through `lifecycle advance` and
   `lifecycle complete`. On startup, resume from `lifecycle status`.
 
@@ -79,10 +85,11 @@ manifest-pinned Opus 5 copy, `harness sync` to project it into each child
 worktree, and `harness verify` before every dispatch. Never copy harness files
 directly or bypass a tracked-path refusal.
 
-Run portfolio doctor and dispatch checks, then launch one `aidlc_runner` per
-ready intent using non-blocking CAO assignment with `working_directory` set to
-that intent's absolute worktree. Never rely on CAO's inherited supervisor
-directory for a child AI-DLC session.
+Run portfolio doctor and dispatch checks, render each assignment with
+`dispatch message` from a fresh `memory_recall` of your own scope, then launch
+one `aidlc_runner` per ready intent using non-blocking CAO assignment with that
+message and `working_directory` set to that intent's absolute worktree. Never
+rely on CAO's inherited supervisor directory for a child AI-DLC session.
 
 Follow `Bootstrap -> Discover -> Confirm -> Plan -> Dispatch -> Integrate ->
 Learn` exactly. Never skip or infer a transition. Ask the human to accept the
