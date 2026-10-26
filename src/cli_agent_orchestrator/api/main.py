@@ -280,7 +280,14 @@ async def ephemeral_sweep_daemon() -> None:
     """
     logger.info("Ephemeral sweep daemon started")
     while True:
-        await asyncio.sleep(await asyncio.to_thread(ephemeral_service.sweep_interval_seconds))
+        # Read inside the error handling: if this task died, the lifespan shutdown's
+        # await would re-raise and skip every later shutdown step.
+        try:
+            interval = await asyncio.to_thread(ephemeral_service.sweep_interval_seconds)
+        except Exception:
+            logger.exception("Ephemeral sweep daemon error")
+            interval = cast(int, ephemeral_service.EPHEMERAL_DEFAULTS["sweep_interval_seconds"])
+        await asyncio.sleep(interval)
         try:
             await asyncio.to_thread(ephemeral_service.sweep, False)
         except Exception:

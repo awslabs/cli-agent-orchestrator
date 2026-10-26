@@ -97,6 +97,32 @@ async def test_daemon_runs_periodic_passes_survives_errors_and_cancels_cleanly(
     assert calls and set(calls) == {False}  # Periodic passes keep the launch grace.
 
 
+@pytest.mark.asyncio
+async def test_daemon_survives_a_failing_interval_read_and_shutdown_completes(monkeypatch):
+    """A dead daemon would make the shutdown's await re-raise and skip later steps."""
+    reads: list = []
+    swept = threading.Event()
+
+    def interval():
+        reads.append(None)
+        if len(reads) == 1:
+            raise RecursionError("settings nested too deeply")
+        return 0.01
+
+    monkeypatch.setattr(ephemeral_service, "sweep_interval_seconds", interval)
+    monkeypatch.setitem(ephemeral_service.EPHEMERAL_DEFAULTS, "sweep_interval_seconds", 0.01)
+    monkeypatch.setattr(ephemeral_service, "sweep", lambda startup: swept.set() or {})
+    task = asyncio.create_task(main.ephemeral_sweep_daemon())
+    for _ in range(500):
+        if swept.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert swept.is_set() and not task.done(), "the daemon stopped after a failing read"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):  # The lifespan shutdown's pattern.
+        await task
+
+
 # The suite's own hermeticity: no test may sweep or lock in the startup CAO home.
 
 

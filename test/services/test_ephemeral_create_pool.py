@@ -54,9 +54,9 @@ def pooled_create(tmp_path, monkeypatch):
         monkeypatch.setattr(settings_service, "get_agent_dirs", lambda: {})
         monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [])
         monkeypatch.setattr(settings_service, "get_disabled_agent_dirs", lambda: [])
-        # Forty-eight names from one session need more than the default live-name cap.
-        config = {"ephemeral": {"enabled": True, "max_live_per_session": 48}}
-        monkeypatch.setattr(settings_service, "_load_or_raise", lambda: config)
+        monkeypatch.setattr(
+            settings_service, "_load_or_raise", lambda: {"ephemeral": {"enabled": True}}
+        )
         lock = threading.Lock()
         counts = {"active": 0, "peak": 0}
 

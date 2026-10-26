@@ -31,7 +31,11 @@ from cli_agent_orchestrator.services.settings_service import (
     get_ephemeral_settings,
 )
 from cli_agent_orchestrator.utils import agent_profiles
-from cli_agent_orchestrator.utils.atomic_file import LockTimeoutError, strict_target_lock
+from cli_agent_orchestrator.utils.atomic_file import (
+    LockTimeoutError,
+    LockUnavailableError,
+    strict_target_lock,
+)
 from cli_agent_orchestrator.utils.caller_tools import caller_effective_allowed_tools
 from cli_agent_orchestrator.utils.delegation import tools_exceeding
 
@@ -322,6 +326,11 @@ def _safe_segment(value: Any) -> bool:
     )
 
 
+# The sweep never waits for the store lock: its only holders are creates in progress,
+# and a skipped rowless step simply runs again on the next pass (#1079).
+_SWEEP_LOCK_TIMEOUT_SECONDS = 0.0
+
+
 def _store_lock(timeout: float = 10.0) -> AbstractContextManager[None]:
     """The live store's create window, as an inter-process flock outside the store.
 
@@ -408,10 +417,10 @@ def create_ephemeral_agent(
         spec = validate_shape(raw)
         validate_block(config)
         limit = config["max_live_per_session"]
-        if not _positive_integer(limit):
+        if type(limit) is not int or limit < 0:
             raise EphemeralPolicyError(
                 "policy_config_error:max_live_per_session",
-                "ephemeral.max_live_per_session must be a positive integer",
+                "ephemeral.max_live_per_session must be a non-negative integer (0: no cap)",
             )
         try:
             if not caller_id or not re.fullmatch(r"[0-9a-f]{8}", caller_id):
@@ -487,14 +496,24 @@ def create_ephemeral_agent(
         notice = _ignored_policy_notice(config["_ignored_policy"])
         # Held from the cap count until the pending row commits, so concurrent creates
         # cannot pass the cap together and a sweep holding it sees every live file's row.
-        held.enter_context(_store_lock())
-        live = _live_names(session, created)
-        if live >= limit:
+        # Held with no cap too: the sweep's rowless step relies on it either way.
+        try:
+            held.enter_context(_store_lock())
+        except LockTimeoutError:
+            raise EphemeralPolicyError("store_busy", "store lock timed out; retry", 503) from None
+        except LockUnavailableError:
             raise EphemeralPolicyError(
-                "max_live_exceeded",
-                f"{live} live names in this session; ephemeral.max_live_per_session={limit}",
-                409,
-            )
+                "store_lock_unavailable", "the CAO home must support flock", 503
+            ) from None
+        # 0, the default, means no cap: the cap is an operator opt-in (#1079).
+        if limit:
+            live = _live_names(session, created)
+            if live >= limit:
+                raise EphemeralPolicyError(
+                    "max_live_exceeded",
+                    f"{live} live names in this session; ephemeral.max_live_per_session={limit}",
+                    409,
+                )
         for _ in range(5):
             name = f"{secrets.choice(BAND_NAMES)}-{spec.purpose}-{secrets.token_hex(2)}"
             if database.get_ephemeral_agent(
@@ -1115,7 +1134,7 @@ def bind_ephemeral_agent(
 
 
 def release(terminal_id: str, reason: str) -> None:
-    """Collect this terminal's live files once; keep its registry marker forever."""
+    """Collect this terminal's live files once; the gc row stays until retention prunes it."""
     try:
         if not database.is_ephemeral_terminal(terminal_id):
             return
@@ -1174,8 +1193,9 @@ def _sweep_row(
     """Re-decide one row inside its own write transaction; return it if now collected.
 
     The candidate list is a stale read. Re-reading here, with each change guarded by
-    the observed state and claim, means a concurrent claim, bind or terminal insert
-    always wins over the sweep.
+    the observed state and claim, means a concurrent claim or bind always wins over
+    the sweep. A terminal insert wins unless it lands more than the launch grace after
+    its bind (ADR-4's accepted trade-off).
     """
     with _transaction() as db:
         row = _row(db, name)
@@ -1216,8 +1236,13 @@ def _live_entries(name: str, regular_only: bool) -> bool:
         os.close(fd)
 
 
-def _sweep_rowless(counts: Counter[str]) -> None:
-    """Delete exact live files that have no registry row, only while creates are excluded."""
+def _sweep_rowless(counts: Counter[str], cutoff: Any) -> None:
+    """Delete exact live files that have no registry row, only while creates are excluded.
+
+    A file must also be older than the cutoff (the launch grace). Under the lock no
+    create can be in progress, so this costs nothing; it bounds what a registry that
+    doesn't match this store, such as a replacement database, can make look rowless.
+    """
     try:
         fd = os.open(EPHEMERAL_DIR / "live", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
@@ -1225,7 +1250,7 @@ def _sweep_rowless(counts: Counter[str]) -> None:
     held = ExitStack()
     try:
         try:
-            held.enter_context(_store_lock(timeout=0))
+            held.enter_context(_store_lock(timeout=_SWEEP_LOCK_TIMEOUT_SECONDS))
         except LockTimeoutError:
             return  # A create holds the store; its files get a row or are cleaned by it.
         files: dict[str, list[str]] = {}
@@ -1245,7 +1270,8 @@ def _sweep_rowless(counts: Counter[str]) -> None:
         for stem in files.keys() - known:
             for file in files[stem]:
                 try:
-                    if stat.S_ISREG(os.lstat(file, dir_fd=fd).st_mode):
+                    info = os.lstat(file, dir_fd=fd)
+                    if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff.timestamp():
                         os.unlink(file, dir_fd=fd)
                         counts["rowless"] += 1
                 except OSError:
@@ -1256,7 +1282,12 @@ def _sweep_rowless(counts: Counter[str]) -> None:
 
 
 def _remove_archive(session: str, name: str, cutoff: Any) -> str:
-    """Remove this name's exact archive once older than the cutoff: absent, removed or kept."""
+    """Remove this name's exact archive once older than the cutoff: absent, removed or kept.
+
+    The check and unlink hold the audit lock, so a refusal write in progress either
+    finishes first, making the archive new again, or finds it gone instead of
+    recreating an orphan.
+    """
     try:
         audit = os.open(EPHEMERAL_DIR / "audit", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
@@ -1267,14 +1298,15 @@ def _remove_archive(session: str, name: str, cutoff: Any) -> str:
         except FileNotFoundError:
             return "absent"
         try:
-            try:
-                info = os.lstat(name + ".json", dir_fd=folder)
-            except FileNotFoundError:
-                return "absent"
-            if not stat.S_ISREG(info.st_mode) or info.st_mtime >= cutoff.timestamp():
-                return "kept"
-            os.unlink(name + ".json", dir_fd=folder)
-            return "removed"
+            with _audit_lock:
+                try:
+                    info = os.lstat(name + ".json", dir_fd=folder)
+                except FileNotFoundError:
+                    return "absent"
+                if not stat.S_ISREG(info.st_mode) or info.st_mtime >= cutoff.timestamp():
+                    return "kept"
+                os.unlink(name + ".json", dir_fd=folder)
+                return "removed"
         finally:
             os.close(folder)
     finally:
@@ -1347,14 +1379,15 @@ def sweep(startup: bool) -> dict[str, int]:
     """Collect expired and abandoned names and their files; never raises (#1079).
 
     Runs whatever ``ephemeral.enabled`` says, so turning creation off does not strand
-    residue. The startup pass skips the launch grace. Only exact live files and the
-    archives of eligible gc rows are deleted, and the only file ever created is the
-    store's lock inside ``live/``. Returns the counts it logs, by reason.
+    residue. The startup pass skips the launch grace for launched rows. Only exact live
+    files and the archives of eligible gc rows are deleted. The only file a pass can
+    create is the store's lock, under ``CAO_HOME/locks/``, outside the store. Returns
+    the counts it logs, by reason.
     """
     counts: Counter[str] = Counter()
     try:
         config = get_ephemeral_settings()
-    except SettingsUnreadableError:
+    except Exception:  # Also errors the loader doesn't wrap, such as RecursionError.
         logger.warning("ephemeral sweep skipped: settings are unreadable")
         return {}
     grace = _sweep_window(config, "launch_grace_seconds", "seconds")
@@ -1380,8 +1413,9 @@ def sweep(startup: bool) -> dict[str, int]:
                     _finish_gc(row)
                     if not _live_entries(row["name"], regular_only=True):
                         counts["retried"] += 1
-    with _isolated("rowless"):
-        _sweep_rowless(counts)
+    if grace is not None:
+        with _isolated("rowless"):
+            _sweep_rowless(counts, now - grace)
     if retention is not None:
         with _isolated("retention"):
             cutoff = now - retention
@@ -1398,10 +1432,14 @@ def sweep(startup: bool) -> dict[str, int]:
 
 
 def sweep_interval_seconds() -> int:
-    """The periodic pass interval; unreadable or invalid settings keep the default."""
+    """The periodic pass interval; never raises, and bad settings keep the default.
+
+    Any failure counts as unreadable, including errors the settings loader doesn't
+    wrap (such as ``RecursionError`` from deeply nested JSON), so the daemon can't die.
+    """
     try:
         value = get_ephemeral_settings()["sweep_interval_seconds"]
-    except SettingsUnreadableError:
+    except Exception:
         value = None
     if not _positive_integer(value):
         value = EPHEMERAL_DEFAULTS["sweep_interval_seconds"]

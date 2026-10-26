@@ -112,7 +112,7 @@ EPHEMERAL_DEFAULTS = {
     "claim_lease_seconds": 60,
     "max_depth": 1,
     # Lifecycle cleanup (#1079); every default here awaits maintainer confirmation.
-    "max_live_per_session": 10,
+    "max_live_per_session": 0,  # No cap; operators opt in.
     "launch_grace_seconds": 600,
     "sweep_interval_seconds": 300,
     "retention_days": RETENTION_DAYS,

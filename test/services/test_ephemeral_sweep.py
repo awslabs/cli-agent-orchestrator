@@ -218,12 +218,19 @@ def test_sweep_runs_with_creation_disabled(store):
     assert row(name)["state"] == "gc"
 
 
-def test_unreadable_settings_skip_the_whole_pass(store, monkeypatch, caplog):
+@pytest.mark.parametrize(
+    "error",
+    [
+        SettingsUnreadableError(Path("settings.json"), ValueError("bad json")),
+        RecursionError("settings nested too deeply"),  # The loader doesn't wrap this one.
+    ],
+)
+def test_unreadable_settings_skip_the_whole_pass(store, monkeypatch, caplog, error):
     name = make(store)
     store.clock.at(seconds=TTL)
 
     def unreadable():
-        raise SettingsUnreadableError(Path("settings.json"), ValueError("bad json"))
+        raise error
 
     monkeypatch.setattr(settings_service, "_load_or_raise", unreadable)
     assert sweep(store) == {}
@@ -452,12 +459,40 @@ def test_rowless_live_files_are_removed_by_exact_name_only(store, tmp_path):
     (folder / "Folder-log_triage-f00d.md").mkdir()
     for other in ("notes.md", "lowercase-log_triage-abcd.md", ".Crashed-log_triage-beef.md.01.tmp"):
         (folder / other).write_bytes(b"other")
+    old = (store.clock.now - timedelta(seconds=GRACE + 1)).timestamp()
+    for path in folder.iterdir():  # Old enough to go, so only the name and type rules decide.
+        os.utime(path, (old, old), follow_symlinks=False)
     expected = snapshot(store.home, target.parent)
     for path in residue:
         del expected[path]
     assert sweep(store).get("rowless") == 2
     assert snapshot(store.home, target.parent) == expected
     assert row(kept)["state"] == "pending"
+
+
+@pytest.mark.parametrize("startup", [True, False])
+@pytest.mark.parametrize("offset,removed", [(-1, True), (0, False), (1, False)])
+def test_rowless_files_go_only_once_older_than_the_launch_grace(store, startup, offset, removed):
+    """Defense in depth, startup included: a registry that doesn't match this store,
+    such as a test's replacement database, can't make fresh live files look rowless."""
+    make(store)
+    folder = store.home / "ephemeral" / "live"
+    residue = [folder / ("Crashed-log_triage-beef" + suffix) for suffix in (".md", ".spec.json")]
+    for path in residue:
+        path.write_bytes(b"residue")
+        age(path, store.clock.now - timedelta(seconds=GRACE - offset))
+    assert sweep(store, startup).get("rowless", 0) == (2 if removed else 0)
+    assert [path.exists() for path in residue] == [not removed] * 2
+
+
+def test_unusable_grace_skips_the_rowless_step(store, caplog):
+    make(store)
+    residue = store.home / "ephemeral" / "live" / "Crashed-log_triage-beef.md"
+    residue.write_bytes(b"residue")
+    age(residue, NOW - timedelta(days=1))
+    store.config["launch_grace_seconds"] = "600"
+    assert sweep(store, startup=True).get("rowless") is None and residue.is_file()
+    assert "ephemeral.launch_grace_seconds" in caplog.text
 
 
 @pytest.mark.parametrize("startup", [True, False])
@@ -468,6 +503,8 @@ def test_no_sweep_deletes_the_files_of_a_create_in_progress(file_store, monkeypa
     try:
         written = sorted(path.name for path in folder.iterdir())
         assert len(written) == 2 and rows() == 0  # Both live files, and no row yet.
+        for path in folder.iterdir():  # Past the age guard, so only the lock protects them.
+            age(path, s.clock.now - timedelta(seconds=GRACE + 1))
         assert sweep(s, startup) == {}
         assert sorted(path.name for path in folder.iterdir()) == written
     finally:
@@ -524,11 +561,55 @@ def test_cap_is_per_session(store):
     assert row(make(store, caller=OTHER))["session_name"] == "other-session"
 
 
-@pytest.mark.parametrize("value", [0, -1, "10", True, None, 1.5])
+@pytest.mark.parametrize("configured", [False, True])
+def test_the_cap_is_off_by_default_and_zero_disables_it(store, monkeypatch, configured):
+    """Provisional (#1079): the cap is an operator opt-in, so current users see no change."""
+    if configured:
+        store.config["max_live_per_session"] = 0
+    counted: list = []
+    real = store.service._live_names
+    monkeypatch.setattr(store.service, "_live_names", lambda *a: counted.append(a) or real(*a))
+    names = {make(store) for _ in range(12)}  # More than the cap proposed in #1079.
+    assert len(names) == 12 and rows() == 12 and counted == []
+
+
+@pytest.mark.parametrize("value", [-1, "10", True, None, 1.5])
 def test_unusable_cap_is_a_policy_config_error(store, value):
     store.config["max_live_per_session"] = value
     assert outcome(store) == "policy_config_error:max_live_per_session"
     assert not (store.home / "ephemeral").exists() and rows() == 0
+
+
+def test_a_store_lock_timeout_refuses_with_store_busy(store, monkeypatch):
+    real = store.service._store_lock
+    monkeypatch.setattr(store.service, "_store_lock", lambda timeout=10.0: real(min(timeout, 0.2)))
+    held, release = threading.Event(), threading.Event()
+
+    def holder():
+        with real(timeout=0):
+            held.set()
+            assert release.wait(timeout=10)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        holding = pool.submit(holder)
+        assert held.wait(timeout=10)
+        try:
+            with pytest.raises(store.service.EphemeralPolicyError) as refused:
+                make(store)
+        finally:
+            release.set()
+        holding.result(timeout=10)
+    assert refused.value.rule == "store_busy" and refused.value.status_code == 503
+    assert rows() == 0 and not (store.home / "ephemeral").exists()
+    assert row(make(store))["state"] == "pending"  # A retry once the lock is free succeeds.
+
+
+def test_a_home_without_flock_refuses_creates_with_store_lock_unavailable(store, monkeypatch):
+    monkeypatch.setattr(atomic_file, "_FCNTL_AVAILABLE", False)
+    with pytest.raises(store.service.EphemeralPolicyError) as refused:
+        make(store)
+    assert refused.value.rule == "store_lock_unavailable" and refused.value.status_code == 503
+    assert rows() == 0 and not (store.home / "ephemeral").exists()
 
 
 def test_a_create_waiting_on_the_lock_sees_the_cap(file_store, monkeypatch):
@@ -642,6 +723,78 @@ def test_an_archive_replaced_by_a_link_is_kept_with_its_target(store, tmp_path):
     assert path.is_symlink() and target.read_bytes() == b"{}" and row(name) is not None
 
 
+def repoint(name, **values):
+    with database.SessionLocal() as db:
+        db.query(database.EphemeralAgentModel).filter_by(name=name).update(values)
+        db.commit()
+
+
+@pytest.mark.parametrize("variant", ["linked_session_dir", "foreign_audit_path", "dotdot_session"])
+def test_retention_keeps_what_it_cannot_prove_is_this_stores(store, tmp_path, variant):
+    """Defense in depth: create validates all three, so none arises in normal use."""
+    name = collected(store)
+    path = archive(name)
+    audit = store.home / "ephemeral" / "audit"
+    if variant == "linked_session_dir":
+        # The session dir is a link out of the store; the archive behind it isn't ours.
+        outside = tmp_path / "outside-session"
+        (audit / "cao-session").rename(outside)
+        (audit / "cao-session").symlink_to(outside, target_is_directory=True)
+        victim = outside / path.name
+    elif variant == "foreign_audit_path":
+        # Provisional (#1079): a row recorded under another home, such as a moved one.
+        other = tmp_path / "old-home" / "ephemeral" / "audit" / "cao-session" / path.name
+        repoint(name, audit_path=str(other))
+        victim = path
+    else:
+        # A session of ".." would make the store root the archive folder.
+        victim = store.home / "ephemeral" / path.name
+        victim.write_bytes(b"{}")
+        repoint(name, session_name="..", audit_path=str(audit / ".." / path.name))
+    age(victim, NOW - timedelta(days=365))
+    before = victim.read_bytes()
+    store.clock.at(days=60)
+    assert sweep(store) == {}
+    assert victim.read_bytes() == before and row(name) is not None
+
+
+def test_a_refusal_write_racing_retention_leaves_no_orphan_archive(file_store, monkeypatch):
+    """A claim refused for a collected name rewrites its archive while retention prunes."""
+    s = file_store
+    name = collected(s)
+    path = archive(name)
+    age(path, NOW - timedelta(days=365))
+    s.clock.at(days=60)
+    paused, resume = threading.Event(), threading.Event()
+    original = s.service._write_exclusive
+
+    def write(target, payload, owned):
+        original(target, payload, owned)
+        if target.parent == path.parent and target.name.startswith("." + path.name + "."):
+            paused.set()
+            assert resume.wait(timeout=10)
+
+    def refused_claim():
+        try:
+            claim(s, name)
+        except s.service.EphemeralPolicyError as exc:
+            return exc.rule
+
+    monkeypatch.setattr(s.service, "_write_exclusive", write)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        refusing = pool.submit(refused_claim)
+        assert paused.wait(timeout=10)  # Inside the refusal write, before its replace.
+        try:
+            sweeping = pool.submit(sweep, s)
+            concurrent.futures.wait([sweeping], timeout=1)
+        finally:
+            resume.set()
+        assert refusing.result(timeout=10) == "ephemeral_expired"
+        sweeping.result(timeout=10)
+    assert path.exists() == (row(name) is not None)
+    assert not [p for p in path.parent.iterdir() if p.name.endswith(".tmp")]
+
+
 @pytest.mark.parametrize("value", [0, -3, "14", None])
 def test_unusable_retention_prunes_nothing(store, value, caplog):
     name = collected(store)
@@ -706,8 +859,11 @@ def test_sweeps_touch_only_live_files_and_eligible_archives(store, tmp_path):
     residue = [folder / ("Crashed-log_triage-beef" + suffix) for suffix in (".md", ".spec.json")]
     for path in residue:
         path.write_bytes(b"residue")
+        age(path, NOW)
     (folder / "notes.md").write_bytes(b"decoy")
+    age(folder / "notes.md", NOW)
     (folder / "Linked-log_triage-cafe.md").symlink_to(outside / "keep.txt")
+    os.utime(folder / "Linked-log_triage-cafe.md", (NOW.timestamp(),) * 2, follow_symlinks=False)
     audit = s.home / "ephemeral" / "audit" / "cao-session"
     (audit / "foreign.json").write_bytes(b"{}")
     (audit / "Crashed-log_triage-beef.json").write_bytes(b"{}")  # A rowless archive stays.
@@ -760,3 +916,12 @@ def test_sweep_interval_keeps_the_default_when_settings_are_unreadable(store, mo
     monkeypatch.setattr(settings_service, "_load_or_raise", unreadable)
     expected = EPHEMERAL_DEFAULTS["sweep_interval_seconds"]
     assert store.service.sweep_interval_seconds() == expected
+
+
+def test_sweep_interval_keeps_the_default_for_errors_the_loader_does_not_wrap():
+    """Deeply nested JSON raises RecursionError; the daemon's interval read must not."""
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    settings_service.SETTINGS_FILE.write_text("[" * 100_000 + "]" * 100_000)
+    expected = EPHEMERAL_DEFAULTS["sweep_interval_seconds"]
+    assert ephemeral_service.sweep_interval_seconds() == expected
