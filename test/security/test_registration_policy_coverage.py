@@ -250,7 +250,6 @@ _CAO_MCP_EXEMPT: Dict[str, str] = {
     # right question to ask of them.
     "workflow_create": _IDENTITY_LOCAL,
     "workflow_update": _IDENTITY_LOCAL,
-    "workflow_cancel": _IDENTITY_LOCAL,
     "workflow_plan_approval": _IDENTITY_LOCAL,
     # delete_terminal and the ephemeral tools do their own, narrower checks:
     # delete_terminal refuses a terminal the caller does not own
