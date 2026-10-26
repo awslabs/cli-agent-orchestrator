@@ -23,6 +23,10 @@ Three decisions, each a proposal maintainers can flip:
    ``settings.set_point(point, "shadow"|"on")`` unlinks the halt marker -- so
    without this rule a caller holding the grant could undo an operator's
    ``cao decisions off`` through the same surface. The CLI path is untouched.
+   The refusal here is the FAST one; the rule is enforced inside the mutation,
+   under the lock that protects the marker, because a check taken before
+   dispatch cannot bind a halt published after it (see
+   ``decisions/settings.set_point``).
 
 The gate itself is ``security.mcp_tool_gate``'s, not a second one written here:
 boundness, caller resolution, allowlist resolution, the ``@server`` spelling rule
@@ -64,12 +68,11 @@ logger = logging.getLogger(__name__)
 #: reduce what the node is doing.
 FAIL_SAFE_EXEMPT_TOOLS = frozenset({"decisions_off"})
 
-#: Refused for a bound caller even with the grant: see decision 3 above.
-HALT_LIFT_DENIAL = (
-    "'decisions_set_point' is not permitted: lifting an active decisions halt is "
-    "operator-only and is not available over MCP to a bound CAO terminal. Run "
-    "`cao decisions set-point <point> <state>` locally."
-)
+#: Refused for a bound caller even with the grant: see decision 3 above. The
+#: string is ``decisions.settings``', because the MUTATION owns this rule and
+#: raises the same refusal under the lock (see below); one wording, so the fast
+#: path and the real control cannot describe the rule differently.
+HALT_LIFT_DENIAL = decision_settings.HALT_LIFT_DENIAL
 
 
 def ops_tool_denied_reason(tool_name: str, arguments: Mapping[str, Any]) -> Optional[str]:
@@ -97,9 +100,15 @@ def ops_tool_denied_reason(tool_name: str, arguments: Mapping[str, Any]) -> Opti
     if not allowlist_grants_mcp_server(allowed, CAO_OPS_MCP_SERVER_SELECTOR):
         return missing_grant_denial(tool_name, CAO_OPS_MCP_SERVER_SELECTOR)
 
-    # Decision 3. Checked AFTER the grant so an ungranted caller is told the one
-    # thing it needs to hear, and asked of ``decision_settings`` rather than
-    # restated here, so the gate and the mutation read one predicate.
+    # Decision 3, as a FAST refusal only -- the control is in the mutation.
+    # Checked here after the grant, so an ungranted caller is told the one thing
+    # it needs to hear, and asked of ``decision_settings`` rather than restated,
+    # so the gate and the mutation read one predicate. This check cannot be the
+    # control: it runs before dispatch, and an ``operator.off()`` landing between
+    # it and the write would be erased by a call it had already allowed
+    # (independent review of #1062). ``settings.set_point`` re-decides it under
+    # the exclusive egress lock, with the posture
+    # ``ops_mcp_server/decision_tools`` passes it.
     if tool_name == "decisions_set_point" and decision_settings.lifts_halt(arguments.get("state")):
         return HALT_LIFT_DENIAL
 

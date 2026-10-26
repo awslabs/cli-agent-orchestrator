@@ -26,8 +26,22 @@ def status() -> dict[str, Any]:
     return result
 
 
-def set_point(point: str, state: str, decider: str | None = None) -> dict[str, Any]:
-    settings.set_point(point, state, decider)
+def set_point(
+    point: str,
+    state: str,
+    decider: str | None = None,
+    *,
+    posture: settings.CallerPosture = settings.CallerPosture.BOUND,
+) -> dict[str, Any]:
+    """Set a point and report the effective settings.
+
+    ``posture`` is forwarded, not interpreted: only ``settings.set_point`` can
+    apply the "a bound caller may not lift a halt" rule, because only it holds
+    the lock that makes the answer true at the moment of the write (#1062). It
+    defaults to the restricted posture for the same reason it does there -- a
+    caller that says nothing does not get to lift a halt.
+    """
+    settings.set_point(point, state, decider, posture=posture)
     return status()
 
 
@@ -40,9 +54,23 @@ def _halt_marker_identity() -> tuple[int, int] | None:
 
 
 def off() -> dict[str, Any]:
-    """Publish the halt before saving states and waiting for outstanding egress."""
+    """Publish the halt before saving states and waiting for outstanding egress.
+
+    The marker is created under the exclusive egress lock when it is free, so a
+    concurrent ``set_point`` cannot be mid-way between reading the marker and
+    removing it while this one appears (#1062). Best effort, and deliberately
+    so: the shared side of that lock is held for the whole of an outstanding
+    external decision request, and a kill switch that waits on one is not a kill
+    switch. The invariant does not depend on winning it -- ``set_point`` only
+    removes a marker it observed while holding the lock, so a marker published
+    beside it survives, and ``drain`` below (plus the ``same_halt`` check) still
+    reports anything that disturbed this halt.
+    """
     egress.HALT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    egress.HALT_FILE.touch(mode=0o600)
+    with egress.exclusive(0) as held:
+        egress.HALT_FILE.touch(mode=0o600)
+        if not held:
+            logger.debug("Published the decisions halt without the exclusive lock")
     marker_identity = _halt_marker_identity()
     snapshot = load_settings()
     saved = False

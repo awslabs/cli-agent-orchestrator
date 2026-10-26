@@ -39,7 +39,9 @@ def test_halt_beats_flags_and_environment(egress, monkeypatch):
 @pytest.mark.parametrize("state", ["shadow", "on", "off"])
 def test_set_point_clears_halt_only_when_enabling(egress, state):
     egress.HALT_FILE.touch()
-    settings.set_point("model.route", state)
+    # The operator posture is stated: ``set_point`` defaults to the restricted
+    # one, which may not lift a halt (#1062).
+    settings.set_point("model.route", state, posture=settings.CallerPosture.OPERATOR)
     assert egress.is_halted() == (state == "off")
     assert settings.load_settings().points["model.route"].state.value == state
 
@@ -48,7 +50,7 @@ def test_failed_set_does_not_clear_halt(egress):
     egress.HALT_FILE.touch()
     settings_service.SETTINGS_FILE.write_text("invalid")
     with pytest.raises(settings_service.SettingsUnreadableError):
-        settings.set_point("model.route", "on")
+        settings.set_point("model.route", "on", posture=settings.CallerPosture.OPERATOR)
     assert egress.is_halted()
 
 

@@ -3,6 +3,7 @@
 from typing import Any, Callable
 
 from cli_agent_orchestrator.decisions import operator, settings
+from cli_agent_orchestrator.security.mcp_tool_gate import caller_is_bound
 
 
 def _result(action: Callable[[], Any]) -> dict[str, Any]:
@@ -35,7 +36,15 @@ def register_decision_tools(mcp: Any) -> None:
     @mcp.tool
     def decisions_set_point(point: str, state: str, decider: str | None = None) -> dict[str, Any]:
         """Set a point's state and installed decider name."""
-        return _result(lambda: operator.set_point(point, state, decider))
+        # The caller's posture is read at dispatch time, from the same predicate
+        # the gate uses, and carried INTO the mutation: "a bound caller may not
+        # lift a halt" has to be decided under the lock that protects the halt
+        # marker, or an operator.off() landing between the gate's check and the
+        # write is erased by it (#1062, independent review).
+        posture = (
+            settings.CallerPosture.BOUND if caller_is_bound() else settings.CallerPosture.OPERATOR
+        )
+        return _result(lambda: operator.set_point(point, state, decider, posture=posture))
 
     @mcp.tool
     def decisions_set_tier(provider: str, tier: str, model: str | None = None) -> dict[str, Any]:

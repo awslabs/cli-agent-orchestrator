@@ -360,6 +360,63 @@ class TestFailsClosed:
         assert reached == ["decision:off"]
 
 
+class TestTheHaltLiftRuleIsEnforcedInsideTheMutation:
+    """The reviewer's deterministic probe, as a test (#1062, independent review).
+
+    Every other test in this file fakes each tool's effect; this one must not,
+    because what is under test is precisely the gap between the middleware's
+    decision and the real write. The probe: the middleware authorizes
+    ``decisions_set_point(on)`` while no marker exists, THEN the real
+    ``operator.off()`` publishes one, THEN the authorized mutation runs. The
+    first implementation reported ``marker_after_off=True marker_after_set=False
+    final_state=on`` -- an operator halt erased by a call that was allowed
+    before the halt existed.
+
+    The mutation-level matrix is
+    ``test/decisions/test_external_controls.py::TestTheHaltLiftRuleLivesInTheMutation``.
+    """
+
+    @staticmethod
+    def _call(tool, arguments):
+        """Dispatch and return the tool's RESULT: a refusal here is not a ToolError."""
+
+        async def go():
+            async with Client(ops_server.mcp) as client:
+                return (await client.call_tool(tool, dict(arguments))).data
+
+        return asyncio.run(go())
+
+    @pytest.mark.parametrize("state", ["shadow", "on"])
+    def test_an_off_published_after_authorization_is_not_erased(self, state, monkeypatch):
+        real_set_point = decision_settings.set_point
+        halts = []
+
+        def off_then_set(point, state, decider=None, *, posture):
+            halts.append(decision_operator.off()["halted"])
+            return real_set_point(point, state, decider, posture=posture)
+
+        monkeypatch.setattr(decision_settings, "set_point", off_then_set)
+        monkeypatch.setattr(egress, "drain", lambda timeout: True)
+        with patch.dict(os.environ, BOUND), _as_bound(["*", GRANT]):
+            result = self._call("decisions_set_point", {"point": "model.route", "state": state})
+        assert halts == [True], "operator.off() did not publish a halt mid-call"
+        assert result["success"] is False
+        assert result["message"] == ops_gate.HALT_LIFT_DENIAL
+        assert egress.is_halted(), "the operator's halt was erased by an authorized call"
+        assert decision_operator.status()["points"]["model.route"]["state"] == "off"
+
+    @pytest.mark.parametrize("state", ["shadow", "on"])
+    def test_an_operator_context_is_not_refused_by_the_mutation(self, state, monkeypatch):
+        """The same race, from an operator MCP host: the halt is theirs to lift."""
+        marker = Path(str(egress.HALT_FILE))
+        marker.touch()
+        monkeypatch.setattr(egress, "drain", lambda timeout: True)
+        with patch.dict(os.environ, _unbound_env(), clear=True):
+            result = self._call("decisions_set_point", {"point": "model.route", "state": state})
+        assert result["success"] is True
+        assert not egress.is_halted()
+
+
 class TestAnEmptyIdentityIsNotAnOperatorContext:
     """An explicitly empty ``CAO_TERMINAL_ID`` is a bound caller, and refused.
 
