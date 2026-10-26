@@ -33,17 +33,25 @@ from cli_agent_orchestrator.constants import (
 
 @pytest.fixture(autouse=True)
 def _restore_the_coordinate_variables():
-    """Put the coordinate variables back exactly as this test found them.
+    """Put the coordinate variables back exactly as this test found them, and
+    PROVE at teardown that none of the three was left behind.
 
     ``main()`` writes them into ``os.environ`` ITSELF -- that is the behaviour
     under test -- and also removes them, so ``monkeypatch`` cannot undo it: it
     only reverses changes it made, and ``delenv(raising=False)`` on an absent
-    variable records nothing to reverse. Without this, a published ``9777``
-    outlived the test and any later ``importlib.reload(constants)`` in the same
-    session (``test/providers/test_cursor_cli_unit.py`` does one in a teardown)
-    recomputed ``API_BASE_URL`` from it, failing an unrelated test in
-    ``test/mcp_server``. Autouse rather than per-test, because every test in
-    this file runs ``main()``.
+    variable records nothing to reverse. Without restoration a published
+    ``9777`` outlived the test, and any later re-import of ``constants`` in the
+    same session (``test/providers/test_cursor_cli_unit.py`` does one in a
+    teardown) recomputed ``API_BASE_URL`` from it, failing tests in
+    ``test/security`` and ``test/mcp_server`` that never touched a flag. The
+    suite-wide net for every OTHER module that drives ``main()`` is
+    ``_no_leaked_server_coordinates`` in ``test/conftest.py``; this fixture is
+    the explicit, asserted guard for the module whose whole subject is
+    publication.
+
+    Autouse rather than per-test, because every test in this file runs
+    ``main()``. The assertion runs after the restoration deliberately: before
+    it, a changed variable is the expected result rather than a leak.
     """
     before = {name: os.environ.get(name) for name in SERVER_COORDINATE_ENV_VARS}
     yield
@@ -52,6 +60,8 @@ def _restore_the_coordinate_variables():
             os.environ.pop(name, None)
         else:
             os.environ[name] = value
+    after = {name: os.environ.get(name) for name in SERVER_COORDINATE_ENV_VARS}
+    assert after == before, f"this test leaked a server coordinate: {before} -> {after}"
 
 
 class Launch(NamedTuple):

@@ -193,6 +193,39 @@ def _no_llm_compile_in_tests(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_leaked_server_coordinates():
+    """Prevent a published server coordinate from crossing test boundaries (#1066).
+
+    ``api.main.main()`` reconciles ``CAO_API_HOST`` / ``CAO_API_PORT`` with the
+    host and port it binds by writing them into ``os.environ`` itself, and
+    ``monkeypatch`` cannot reverse a write it did not make. Any test that drives
+    the CLI entry point therefore leaves its own coordinate behind for the rest
+    of the session -- ``test/api/test_api_endpoints.py::TestMainEntryPoint::
+    test_main_custom_host_port`` leaked ``0.0.0.0`` / ``9999`` -- and
+    ``constants`` is re-imported during the run (for example by the teardown in
+    ``test/providers/test_cursor_cli_unit.py``), so ``API_BASE_URL`` was
+    recomputed from the leak. That turned three innocent tests in
+    ``test/security/test_auth.py`` and ``test/test_agent_plugins_docs.py`` red in
+    CI's single-process run, in an order-dependent way that no individual file
+    reproduces.
+
+    Restoring here rather than in each such test fixes the class: the
+    restoration lives next to the state, so a test added later that drives
+    ``main()`` cannot leak either. Values are restored exactly -- previously
+    absent means removed, not set to a default.
+    """
+    from cli_agent_orchestrator.constants import SERVER_COORDINATE_ENV_VARS
+
+    before = {name: os.environ.get(name) for name in SERVER_COORDINATE_ENV_VARS}
+    yield
+    for name, value in before.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+@pytest.fixture(autouse=True)
 def _reset_backend_registry():
     """Prevent leaked backend singletons from crossing test boundaries (fixes #522)."""
     from cli_agent_orchestrator.backends import registry
