@@ -32,6 +32,9 @@ The fallback order is the installed profile default, the policy default, then
 the provider default. A required policy tier must map to a model; otherwise the
 launch is refused. Policy checks run before scope and decider calls. An explicit
 value above a policy ceiling is refused; a decider answer above it is capped.
+A policy may also carry a model tier floor. An explicit tier below it is refused,
+and a decider answer below it is raised to the floor and recorded as `capped`. With
+a floor and a ceiling, every tier from the floor to the ceiling must be mapped.
 The launch-time policy check covers every checked provider in the envelope,
 including providers other than the target. A missing mapping anywhere in that
 set refuses the launch and names `model_tiers.<provider>.<tier>`.
@@ -216,7 +219,10 @@ provider other than Kiro, or a `caller_ceiling` conflict — is bound
 Records never hold task messages, descriptions, purposes, prompts or working directories.
 Messages, descriptions and purposes are redacted before every decider call, including the
 fixed table. Installed profile names and roles are bounded and redacted facts;
-ephemeral targets send neither. The message hash is a keyed HMAC of the redacted
+ephemeral targets send neither. An ephemeral target sends its redacted purpose and,
+when the creator wrote one, its redacted description in `profile_description`; it
+never sends the creator brief. A decider whose consent binds the fields it receives
+needs fresh operator consent before it sees an ephemeral description. The message hash is a keyed HMAC of the redacted
 canonical message, with a key identifier; the hash is never sent to deciders.
 
 The HMAC key is `decision-hash.key` in the database directory, mode 0600. Creation

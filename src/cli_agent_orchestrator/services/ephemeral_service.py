@@ -198,37 +198,23 @@ def policy_bounds(settings: dict[str, Any]) -> PolicyBounds:
         default_effort=settings.get("default_effort"),
         max_effort=settings.get("max_effort"),
         allowed_providers=frozenset(settings["allowed_providers"]),
+        min_tier=settings.get("min_tier"),
     )
 
 
 def _validate_floor(settings: dict[str, Any]) -> None:
-    """MF1 rules 9-10 (provisional, #801): the optional floor sits between nothing and max."""
-    floor = settings.get("min_tier")
-    if floor is None:
-        return
-    options = POINTS["model.route"].options
-    ceiling, default = settings.get("max_tier"), settings.get("default_tier")
-    if ceiling is not None and options.index(floor) > options.index(ceiling):
-        raise EphemeralPolicyError(
-            "policy_config_error:min_tier", "ephemeral.min_tier must not exceed ephemeral.max_tier"
-        )
-    if default is None or options.index(floor) > options.index(default):
+    """MF1 rules 9-10 through #810's PolicyBounds (MF5), once rules 1-2 have passed."""
+    try:
+        PolicyBounds(
+            default_tier=settings.get("default_tier"),
+            max_tier=settings.get("max_tier"),
+            min_tier=settings.get("min_tier"),
+        ).validate({})
+    except PolicyConfigError:
         raise EphemeralPolicyError(
             "policy_config_error:min_tier",
-            "ephemeral.min_tier requires ephemeral.default_tier at or above it",
-        )
-
-
-def _floor_refusal(tier: str, settings: dict[str, Any]) -> Optional[EphemeralPolicyError]:
-    """MF2 (provisional, #801): a tier under the floor refuses before the ceiling and mapping."""
-    floor = settings.get("min_tier")
-    options = POINTS["model.route"].options
-    if floor is None or options.index(tier) >= options.index(floor):
-        return None
-    return EphemeralPolicyError(
-        "tier_below_policy",
-        f"model_tier={tier} is below ephemeral.min_tier={floor}; request {floor} or higher, or omit model_tier",
-    )
+            "ephemeral.min_tier needs ephemeral.default_tier at or above it, and must not exceed ephemeral.max_tier",
+        ) from None
 
 
 _warned_keys: set[str] = set()
@@ -526,6 +512,12 @@ def _value_refusal(
                 rule,
                 f"{field}={value} is above ephemeral.{key}={ceiling}; request {ceiling} or lower, or omit {field}",
             )
+        if exc.reason == "below_floor":
+            floor = bounds.floor_for(point)
+            return EphemeralPolicyError(
+                "tier_below_policy",
+                f"model_tier={value} is below ephemeral.min_tier={floor}; request {floor} or higher, or omit model_tier",
+            )
         if exc.reason == "explicit_unmapped":
             return EphemeralPolicyError(
                 "tier_unmapped",
@@ -535,11 +527,10 @@ def _value_refusal(
     return None
 
 
-def _stored_default_refusal(
-    point: str, bounds: PolicyBounds, floor: Optional[str] = None
-) -> Optional[EphemeralPolicyError]:
+def _stored_default_refusal(point: str, bounds: PolicyBounds) -> Optional[EphemeralPolicyError]:
     """A5-3 (provisional M2), and MF3: a new floor or ceiling cannot bound a stored provider default."""
-    if point == "model.route" and floor is not None:
+    floor = bounds.floor_for(point)
+    if floor is not None:
         return EphemeralPolicyError(
             "tier_below_policy",
             f"stored model_tier is the provider default, which ephemeral.min_tier={floor} does not bound",
@@ -616,9 +607,7 @@ def create_ephemeral_agent(
         bounds = policy_bounds(config)
         tiers = config["_model_tiers"]
         if spec.model_tier is not None:
-            refusal = _floor_refusal(spec.model_tier, config) or _value_refusal(
-                "model.route", spec.model_tier, provider, bounds, tiers
-            )
+            refusal = _value_refusal("model.route", spec.model_tier, provider, bounds, tiers)
             if refusal is not None:
                 raise refusal
         if spec.effort is not None:
@@ -987,9 +976,7 @@ def _recheck_policy(
     else:
         tier = row["model_tier"]
         if tier is not None:
-            refusal = _floor_refusal(tier, settings) or _value_refusal(
-                "model.route", tier, row["provider"], bounds, tiers
-            )
+            refusal = _value_refusal("model.route", tier, row["provider"], bounds, tiers)
             if refusal is not None:
                 detail = refusal.detail.partition(";")[0]
                 if refusal.rule in ("tier_exceeds_policy", "tier_below_policy"):
@@ -997,7 +984,7 @@ def _recheck_policy(
                 refusal = EphemeralPolicyError(refusal.rule, detail)
         else:
             # A5-3 (and MF3): keep this stored-NULL check separable pending M2.
-            refusal = _stored_default_refusal("model.route", bounds, settings.get("min_tier"))
+            refusal = _stored_default_refusal("model.route", bounds)
     if refusal is None:
         effort = row["effort"]
         if effort is not None:

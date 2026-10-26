@@ -76,8 +76,9 @@ Configure the top-level tier table with model ids for each allowed provider:
 ```
 
 See [Launch decisions](decisions.md) and `cao decisions tier` to manage mappings.
-A ceiling needs a default at or below it. Every tier at or below `ephemeral.max_tier`,
-and the default tier, must be mapped for every allowed provider. An invalid model id
+A ceiling needs a default at or below it. Every tier from `ephemeral.min_tier` (or
+`small` without a floor) up to `ephemeral.max_tier`, and the default tier, must be mapped
+for every allowed provider. An invalid model id
 counts as unmapped. A broken block refuses every create and claim with
 `policy_config_error:<key>` until the operator fixes it.
 

@@ -65,6 +65,18 @@ def test_MF2_below_floor_refuses_before_ceiling_and_mapping(floor_store, ceiling
     assert "private-" not in err.message
 
 
+@pytest.mark.parametrize("missing", ["small", "medium", "large"])
+def test_MF5_mappings_run_from_the_floor(floor_store, missing):
+    raw = floor_store[4]
+    raw["ephemeral"].update(min_tier="medium", default_tier="medium", max_tier="large")
+    del raw["model_tiers"]["claude_code"][missing]
+    if missing == "small":
+        assert create(floor_store)["model_tier"] == "medium"
+    else:
+        err = assert_no_create(floor_store, SPEC, "policy_config_error:model_tiers")
+        assert "model_tiers.claude_code." + missing in err.detail
+
+
 def test_MF2_floor_absent_keeps_E2(floor_store):
     floor_store[4]["ephemeral"].update(default_tier="medium", max_tier="large")
     assert create(floor_store, {**SPEC, "model_tier": "small"})["model_tier"] == "small"
