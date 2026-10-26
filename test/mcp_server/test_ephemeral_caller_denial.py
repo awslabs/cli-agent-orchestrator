@@ -18,7 +18,15 @@ from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.services import settings_service, terminal_service
 from cli_agent_orchestrator.utils import orchestration
 
-TOOLS = ["assign", "handoff", "assign_elastic", "workflow_run", "workflow_resume", "workflow_start"]
+TOOLS = [
+    "assign",
+    "handoff",
+    "assign_elastic",
+    "workflow_run",
+    "workflow_resume",
+    "workflow_start",
+    "workflow_cancel",
+]
 
 
 @pytest.fixture
@@ -152,7 +160,9 @@ def test_empty_registry_is_inert_on_every_read(registry):
     assert database.get_ephemeral_agent(NAME) is None
 
 
-@pytest.mark.parametrize("tool", ["workflow_run", "workflow_resume", "workflow_start"])
+@pytest.mark.parametrize(
+    "tool", ["workflow_run", "workflow_resume", "workflow_start", "workflow_cancel"]
+)
 @pytest.mark.asyncio
 async def test_workflow_tools_enforce_gate(registry, monkeypatch, tool):
     seed(registry, "launched")
@@ -302,7 +312,9 @@ def test_installed_handler_guard_does_not_read_source(stores, monkeypatch, handl
     source.assert_not_called()
 
 
-@pytest.mark.parametrize("tool", ["workflow_run", "workflow_resume", "workflow_start"])
+@pytest.mark.parametrize(
+    "tool", ["workflow_run", "workflow_resume", "workflow_start", "workflow_cancel"]
+)
 @pytest.mark.parametrize("caller", ["installed", "unbound"])
 @pytest.mark.parametrize("allowed_tools", [["@cao-mcp-server"], ["*"], ["fs_read"], []])
 @pytest.mark.asyncio
@@ -337,7 +349,9 @@ async def test_workflows_authorize_installed_and_unbound_callers(
         post.assert_not_called()
 
 
-@pytest.mark.parametrize("tool", ["workflow_run", "workflow_resume", "workflow_start"])
+@pytest.mark.parametrize(
+    "tool", ["workflow_run", "workflow_resume", "workflow_start", "workflow_cancel"]
+)
 @pytest.mark.parametrize("status_code", [404, 500])
 @pytest.mark.asyncio
 async def test_workflows_refuse_unresolved_callers(registry, monkeypatch, tool, status_code):
@@ -363,3 +377,21 @@ def test_old_server_without_marker_keeps_installed_caller_compatible(registry, m
     monkeypatch.setattr(server.mcp_utils, "get_json", lambda *a, **k: metadata)
     assert server._get_terminal_context_from_env()["ephemeral"] is False
     assert server._tool_denied_reason(tool) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ephemeral, may_delegate", [(False, False), (True, True)])
+async def test_workflow_cancel_granted_callers_unchanged(
+    registry, monkeypatch, ephemeral, may_delegate
+):
+    if ephemeral:
+        seed(registry, "launched")
+    monkeypatch.setattr(
+        settings_service,
+        "_load_or_raise",
+        lambda: {"ephemeral": {"child_may_delegate": may_delegate}},
+    )
+    post = Mock(return_value=Mock(status_code=200))
+    monkeypatch.setattr(server.requests, "post", post)
+    assert await server.workflow_cancel("run") == {"ok": True, "run_id": "run"}
+    post.assert_called_once()

@@ -1083,7 +1083,7 @@ def _create_terminal(
                     else str(initial_message_orchestration_type)
                 )
 
-        if delegation_message is not None:
+        if delegation_message:
             json_body = json_body or {}
             json_body["delegation_message"] = delegation_message
             if delegation_kind is not None:
@@ -1164,7 +1164,7 @@ def _create_terminal(
                     else str(initial_message_orchestration_type)
                 )
 
-        if delegation_message is not None:
+        if delegation_message:
             json_body = json_body or {}
             json_body["delegation_message"] = delegation_message
             if delegation_kind is not None:
@@ -1963,9 +1963,10 @@ async def _handoff_impl(
                 "use_worktree": use_worktree,
                 "job_id": job_id,
                 "description": normalize_description(description, truncate=True),
-                "orchestration_type": "handoff",
-                "delegation_message": message,
             }
+            if message:
+                payload["orchestration_type"] = "handoff"
+                payload["delegation_message"] = message
             if ctx.session_name:
                 payload["session_name"] = ctx.session_name
             if ctx.caller_id:
@@ -2264,7 +2265,7 @@ def _assign_remote(
         },
         "caller_ceiling": caller_ceiling,
     }
-    if delegation_message is not None:
+    if delegation_message:
         payload["delegation_message"] = delegation_message
 
     response = requests.post(

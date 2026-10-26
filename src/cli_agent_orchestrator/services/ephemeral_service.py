@@ -253,6 +253,7 @@ def render_profile(
         ),
         "provider": provider,
         "allowedTools": tools,
+        "skills": [],
         "mcpServers": {
             "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
         },

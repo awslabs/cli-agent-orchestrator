@@ -124,6 +124,7 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScope,
     MemoryScopeId,
     MemoryType,
+    recall_wire_dict,
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
@@ -9258,19 +9259,9 @@ async def internal_memory_recall(
         sort_by=body.sort_by,
         include_related=body.include_related,
     )
-    return {
-        "memories": [
-            {
-                **memory.model_dump(mode="json"),
-                **(
-                    {"lifecycle_status": memory.lifecycle_status}
-                    if memory.lifecycle_status is not None
-                    else {}
-                ),
-            }
-            for memory in memories
-        ]
-    }
+    # One serializer for both recall surfaces (this route and the MCP
+    # memory_recall tool); see models/memory.py.
+    return {"memories": [recall_wire_dict(memory) for memory in memories]}
 
 
 @app.post("/internal/memory/forget")
