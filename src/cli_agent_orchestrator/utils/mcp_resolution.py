@@ -28,6 +28,8 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
+from cli_agent_orchestrator.constants import server_coordinate_env
+
 logger = logging.getLogger(__name__)
 
 # The bundled orchestration MCP server's console-script name.
@@ -112,6 +114,38 @@ def resolve_cao_mcp_command(
     return interpreter, ["-m", CAO_MCP_SERVER_MODULE, *args]
 
 
+def apply_server_coordinates(config: dict) -> dict:
+    """Return ``config`` with the running server's coordinates added to its env.
+
+    The bundled ``cao-mcp-server`` reads ``CAO_API_HOST`` / ``CAO_API_PORT`` /
+    ``CAO_HOME_DIR`` from its own environment to find the cao-server it reports
+    to. Claude Code and Codex hand an MCP subprocess only what the entry names,
+    so without this a server launched by a cao-server on a non-default port or
+    home fell back to ``127.0.0.1:9889`` and the default home and reported to a
+    different CAO, or to none (#1066).
+
+    The coordinates go BELOW the entry's own ``env``: an author who pinned a
+    value means it, so the entry still wins on a key collision.
+
+    Identity when none of the three is set in this process — the default-CAO
+    case — so it cannot change a default launch. Pure; returns a new dict only
+    when it has something to add.
+
+    RUNTIME ENTRIES ONLY. Never call this for an entry written to a config file
+    that outlives this process (``cao install`` settings, a user-level MCP
+    config, agy's shared ``mcp_config.json``): that file is read by whichever
+    CAO starts next, and a pinned port would point it at a server that is gone.
+    """
+    coordinates = server_coordinate_env()
+    if not coordinates:
+        return config
+    merged = dict(coordinates)
+    merged.update({str(k): str(v) for k, v in (config.get("env") or {}).items()})
+    carried = dict(config)
+    carried["env"] = merged
+    return carried
+
+
 def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     """Return a copy of an MCP server config with its command resolved.
 
@@ -126,6 +160,14 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     applies to command-launched servers, and injecting ``command=""``/``args``
     into a command-less entry would corrupt it for providers that emit every
     present key.
+
+    One exception to "leaves all other keys untouched": for the BUNDLED
+    ``cao-mcp-server`` on a RUNTIME path (``persisted=False``) the entry's
+    ``env`` also gains this server's coordinates, via
+    :func:`apply_server_coordinates`. This is the seam where the runtime entry
+    and the persisted entry already diverge, and every provider that builds a
+    bundled entry at launch already comes through here — so the injection
+    reaches all of them from one place and cannot leak into a persisted file.
     """
     if "command" not in config:
         return dict(config)
@@ -139,6 +181,12 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
         return resolved
     resolved["command"] = new_command
     resolved["args"] = new_args
+    # Resolution fired, so this IS the bundled cao-mcp-server. A profile that
+    # starts the same server some other way (e.g. ``uvx --from git+…
+    # cao-mcp-server``) takes the passthrough return above and is not reached —
+    # telling it apart needs the entry's NAME, which this signature has not got.
+    if not persisted:
+        resolved = apply_server_coordinates(resolved)
     return resolved
 
 

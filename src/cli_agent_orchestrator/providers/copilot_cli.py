@@ -22,7 +22,10 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    apply_server_coordinates,
+    resolve_cao_mcp_command,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
@@ -245,13 +248,20 @@ class CopilotCliProvider(BaseProvider):
         # Resolve the bundled cao-mcp-server console script to a PATH-independent
         # invocation via the shared resolver.
         mcp_command, mcp_args = resolve_cao_mcp_command("cao-mcp-server", [])
+        # This entry is built by hand rather than through
+        # ``resolve_mcp_server_config``, so the running server's coordinates are
+        # carried explicitly (#1066). ``_build_runtime_mcp_config`` is the
+        # runtime path by construction — the config it returns is passed on this
+        # launch's command line and never written to a file another CAO reads.
         merged_servers: dict = {
-            "cao-mcp-server": {
-                "command": mcp_command,
-                "args": mcp_args,
-                "disabled": False,
-                "env": {"CAO_TERMINAL_ID": self.terminal_id},
-            }
+            "cao-mcp-server": apply_server_coordinates(
+                {
+                    "command": mcp_command,
+                    "args": mcp_args,
+                    "disabled": False,
+                    "env": {"CAO_TERMINAL_ID": self.terminal_id},
+                }
+            )
         }
 
         # Agent Plugins: this runtime config is the only MCP configuration Copilot

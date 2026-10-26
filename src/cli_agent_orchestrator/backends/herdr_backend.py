@@ -29,6 +29,7 @@ from cli_agent_orchestrator.backends.base import (
 from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
     HERDR_PANE_READ_MAX_LINES,
+    server_coordinate_env,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -1088,7 +1089,18 @@ class HerdrBackend(TerminalBackend):
     ) -> List[str]:
         """Build ``--env KEY=VALUE`` argument pairs for a create command.
 
-        Operator-forwarded vars are merged first, filtered with the same policy
+        The running server's coordinates (``CAO_API_HOST`` / ``CAO_API_PORT`` /
+        ``CAO_HOME_DIR``, for whichever are set) are assigned FIRST, so an
+        operator ``--env`` still overrides them. A herdr pane's env starts
+        empty, so without them the pane inherited the herdr server's
+        environment -- which belongs to whichever process started that server,
+        not necessarily this CAO -- and a provider that takes its MCP server's
+        identity from the pane rather than from the entry (antigravity) reported
+        to the default CAO on 9889 (#1066). The tmux backend already inherits
+        every ``CAO_*`` var from this process, so this is parity, not a new
+        policy.
+
+        Operator-forwarded vars are merged next, filtered with the same policy
         TmuxClient applies to its ``-e`` argv (blocked provider prefixes, the
         startup-hijack keys from ``utils.forwarded_env``, per-value byte cap). The two CAO identity vars are assigned LAST so an operator
         ``--env CAO_TERMINAL_ID=...`` cannot override the real terminal identity
@@ -1105,7 +1117,8 @@ class HerdrBackend(TerminalBackend):
         """
         from cli_agent_orchestrator.clients.tmux import TmuxClient
 
-        env: Dict[str, str] = {}
+        # Ahead of the operator-forwarded vars, so an explicit --env wins.
+        env: Dict[str, str] = dict(server_coordinate_env())
         for key, value in (extra_env or {}).items():
             if TmuxClient._is_blocked_env_key(key):
                 logger.warning("Dropping forwarded env var with blocked key: %s", key)
