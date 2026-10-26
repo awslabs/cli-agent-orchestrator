@@ -4,8 +4,10 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 
+import cli_agent_orchestrator
 from cli_agent_orchestrator.constants import (
     CAO_HOME_DIR,
     SERVER_COORDINATE_ENV_VARS,
@@ -14,6 +16,7 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.services.agent_scaffold import _TEMPLATES_ROOT
 from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_DISTRIBUTION_NAME,
+    CAO_MCP_SERVER_COMMAND,
     CAO_MCP_SERVER_MODULE,
     apply_server_coordinates,
     is_bundled_cao_server,
@@ -594,40 +597,62 @@ class TestIsBundledCaoServer:
         assert not is_bundled_cao_server({"command": "/opt/bin/cao-mcp-server-proxy"})
 
 
-class TestShippedTemplatesAreRecognised:
-    """The uvx entries in the REAL shipped templates, not a copy of them.
+def _entries_in(files):
+    """Every ``mcpServers`` entry declared in these profile/template files."""
+    entries = []
+    for path in files:
+        frontmatter = path.read_text().split("---")[1]
+        servers = yaml.safe_load(frontmatter).get("mcpServers") or {}
+        for name, config in servers.items():
+            entries.append((f"{path.parent.name}/{path.name}", name, config))
+    return entries
 
-    ``templates/aws/*/template.md.j2`` is where the uvx shape comes from. A
+
+def _shipped_templates():
+    files = sorted((_TEMPLATES_ROOT / "aws").glob("*/template.md.j2"))
+    assert files, f"no shipped AWS templates under {_TEMPLATES_ROOT / 'aws'}"
+    return _entries_in(files)
+
+
+def _shipped_profiles():
+    root = Path(cli_agent_orchestrator.__file__).parent / "agent_store"
+    files = sorted(root.glob("*.md"))
+    assert files, f"no shipped agent profiles under {root}"
+    return _entries_in(files)
+
+
+class TestShippedTemplatesAreRecognised:
+    """The entries in the REAL shipped files, not a copy of them.
+
+    ``templates/aws/*/template.md.j2`` is where the uvx shape comes from and
+    ``agent_store/*.md`` is where the console-script shape comes from. A
     hand-written fixture would keep passing if someone edited those files; this
-    parses them.
+    parses them. Between them they cover two of the three recognised shapes;
+    the third (the module entrypoint) is what resolution falls back to.
     """
 
-    def _template_entries(self):
-        template_root = _TEMPLATES_ROOT / "aws"
-        files = sorted(template_root.glob("*/template.md.j2"))
-        assert files, f"no shipped AWS templates under {template_root}"
-        entries = []
-        for path in files:
-            frontmatter = path.read_text().split("---")[1]
-            servers = yaml.safe_load(frontmatter).get("mcpServers") or {}
-            for name, config in servers.items():
-                entries.append((path.name, path.parent.name, name, config))
-        return entries
-
     def test_every_shipped_uvx_entry_is_recognised(self):
-        entries = self._template_entries()
+        entries = _shipped_templates()
         assert entries, "the shipped templates declare no MCP server"
-        for _, template, name, config in entries:
+        for template, name, config in entries:
             assert config["command"] == "uvx", f"{template}:{name} changed shape"
             assert is_bundled_cao_server(config), f"{template}:{name} not recognised"
 
+    def test_every_bundled_profile_entry_is_recognised(self):
+        entries = _shipped_profiles()
+        assert entries, "the bundled profiles declare no MCP server"
+        for profile, name, config in entries:
+            assert config["command"] == CAO_MCP_SERVER_COMMAND, f"{profile}:{name} changed shape"
+            assert is_bundled_cao_server(config), f"{profile}:{name} not recognised"
+
+    @pytest.mark.parametrize("source", [_shipped_templates, _shipped_profiles])
     def test_every_shipped_entry_gains_the_coordinates_at_runtime(
-        self, monkeypatch, default_cao_server
+        self, source, monkeypatch, default_cao_server
     ):
         monkeypatch.setenv("CAO_API_PORT", "9777")
-        for _, template, name, config in self._template_entries():
+        for origin, name, config in source():
             out = resolve_mcp_server_config(config)
-            assert out["env"]["CAO_API_PORT"] == "9777", f"{template}:{name}"
+            assert out["env"]["CAO_API_PORT"] == "9777", f"{origin}:{name}"
 
 
 class TestNearMissesGainNoCoordinates:
