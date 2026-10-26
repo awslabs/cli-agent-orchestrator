@@ -568,7 +568,7 @@ The operator's local `memory.enabled` / `CAO_MEMORY_ENABLED` switch always wins 
 configured remote memory owner (`CAO_MEMORY_API_URL`) for context injection: with the
 switch off, the owner is never called and no block is injected, exactly as when there is
 no remote owner at all. This covers both injection routes above — the first-message block
-and the Claude Code/Codex/Kiro CLI provider-config-file plugins — because both call through
+and the Claude Code/Codex/Kiro CLI provider-config-file event plugins — because both call through
 the same gateway function (`memory_gateway.memory_context_for_terminal`), which checks the
 switch before reaching the owner. The frozen-replay path applies the same switch itself,
 before resolving through the gateway (`frozen_run_memory.py:144`) and again before injecting
