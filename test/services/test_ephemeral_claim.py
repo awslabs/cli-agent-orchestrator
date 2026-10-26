@@ -413,3 +413,35 @@ def test_policy_messages_use_contract_parentheses(claimed_store):
     with pytest.raises(env[0].EphemeralPolicyError) as exc:
         env[0]._recheck_policy(database.get_ephemeral_agent(name), config, None)
     assert exc.value.detail == "(claude_code); re-create the ephemeral agent"
+
+
+def test_pending_legacy_profile_claim_renders_empty_skills_and_new_hash(claimed_store, monkeypatch):
+    import frontmatter
+
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    env, name = claimed_store
+    path = env[2] / "ephemeral/live" / (name + ".md")
+    legacy = frontmatter.loads(path.read_text())
+    legacy.metadata.pop("skills", None)
+    before = frontmatter.dumps(legacy).encode()
+    path.write_bytes(before)
+    row_update(env, name, profile_sha256=hashlib.sha256(before).hexdigest())
+    original_replace = env[0].os.replace
+    observed = []
+
+    def replace_then_load(src, dst):
+        original_replace(src, dst)
+        if str(dst) == str(path):
+            with pytest.raises(agent_profiles.EphemeralProfileUnavailable):
+                agent_profiles.load_launch_profile(name)
+            observed.append(True)
+
+    monkeypatch.setattr(env[0].os, "replace", replace_then_load)
+    claim(env, name)
+    assert observed == [True]
+    after = path.read_bytes()
+    assert frontmatter.loads(after.decode()).metadata["skills"] == []
+    assert after != before
+    assert database.get_ephemeral_agent(name)["profile_sha256"] == hashlib.sha256(after).hexdigest()
+    assert agent_profiles.load_launch_profile(name)[0].skills == []

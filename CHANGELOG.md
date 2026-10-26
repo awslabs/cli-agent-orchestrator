@@ -241,6 +241,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Ephemeral profiles explicitly omit the inherited skill catalog while keeping named skill
+  loading available. Every live-profile load verifies the parsed bytes against the registry
+  hash and fails closed on missing or modified data, including claim-less launches and provider
+  reloads. `workflow_cancel` now requires `ephemeral.child_may_delegate` for ephemeral callers;
+  the guide also reflects terminal-target binding for MCP messaging, answers and deletion (#801).
+
 - Antigravity CLI workers no longer report under another worker's terminal id.
   Every `agy` process starts every server in the shared
   `~/.gemini/config/mcp_config.json`, and each worker's entry pinned its
@@ -251,6 +257,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workers with the same server config share one entry (owners listed under
   `caoTerminalIds`), and leftover per-terminal entries are removed at the next
   launch (#940).
+- Script-run frozen memory now uses the memory gateway, so a configured remote memory owner
+  supplies the same context as live terminals instead of freezing stale local memory. A journal
+  read failure for a known script run now withholds memory with a warning instead of falling back
+  to live, unfrozen memory; non-script runs keep their existing fallback. A remote memory owner
+  that is unreachable, errors, or has memory disabled now gives the step no memory with a warning,
+  as on the live path, instead of failing it (#828).
 - Every client call that creates a session or terminal synchronously (`cao launch` without
   `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
   `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
