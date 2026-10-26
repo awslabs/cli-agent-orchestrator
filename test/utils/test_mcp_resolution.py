@@ -312,3 +312,45 @@ class TestServerEnv:
         with patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"):
             default = resolve_mcp_server_config({"command": "cao-mcp-server"})
         assert "env" not in default
+
+    def test_uvx_launched_entry_named_cao_mcp_server_gains_the_address(self, monkeypatch):
+        """#1075 P3-1: the entry's own name in the profile's ``mcpServers`` map
+        identifies it as the CAO server too, the same way Codex's own
+        ``is_cao_server`` check already does, so a ``uvx`` launch is covered."""
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        out = resolve_mcp_server_config(
+            {"command": "uvx", "args": ["--from", "pkg", "cao-mcp-server"]},
+            name="cao-mcp-server",
+        )
+        assert out["env"] == {"CAO_API_PORT": "9899"}
+        # Name-matching only adds the address; it does not touch the uvx command.
+        assert out["command"] == "uvx"
+
+    def test_absolute_path_entry_gains_the_address_by_final_segment(self, monkeypatch):
+        """An entry started by an absolute path is the CAO server when the
+        path's final segment is the bare console-script name."""
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        out = resolve_mcp_server_config({"command": "/opt/cao/bin/cao-mcp-server"})
+        assert out["env"] == {"CAO_API_PORT": "9899"}
+
+    def test_non_cao_server_never_gains_the_address(self, monkeypatch):
+        """Neither the command, its final path segment, nor the entry name is
+        ``cao-mcp-server``, so no address is added — even via uvx."""
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        out = resolve_mcp_server_config(
+            {"command": "uvx", "args": ["--from", "pkg", "my-server"]},
+            name="my-server",
+        )
+        assert "env" not in out
+
+    def test_persisted_entry_never_gains_the_address_even_by_name(self, monkeypatch):
+        """``persisted=True`` is the off switch regardless of how the entry is
+        identified as the CAO server — a persisted config outlives this
+        process and may be read by another CAO."""
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        out = resolve_mcp_server_config(
+            {"command": "uvx", "args": ["--from", "pkg", "cao-mcp-server"]},
+            name="cao-mcp-server",
+            persisted=True,
+        )
+        assert "env" not in out
