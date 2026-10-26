@@ -253,6 +253,16 @@ class TestResolveMcpServerConfig:
         assert out["command"] == "my-server"
         assert "args" not in out
 
+    def test_non_string_command_passes_through_without_crashing(self):
+        """P2-1: ``AgentProfile.mcpServers`` is ``Dict[str, Any]``, so ``command``
+        can reach here as a list (OpenCode's own format) or any other non-str
+        value. The basename check must not call ``Path()`` on it."""
+        out = resolve_mcp_server_config({"command": ["uvx", "x"]})
+        assert out["command"] == ["uvx", "x"]
+
+        out = resolve_mcp_server_config({"command": 123})
+        assert out["command"] == 123
+
 
 class TestServerEnv:
     """A runtime bundled server learns the address and home of the CAO that launched it."""

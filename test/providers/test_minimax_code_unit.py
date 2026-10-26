@@ -491,3 +491,11 @@ def test_serialize_server_default_cao_is_unchanged(monkeypatch):
         "cao-mcp-server", {"command": "cao-mcp-server", "args": []}
     )
     assert not any(key.startswith("CAO_") for key in serialized["env"])
+
+
+def test_serialize_server_list_command_still_raises_provider_error():
+    """P2-1: a list ``command`` (a plausible slip, since OpenCode's own format
+    uses a list) must still reach the existing ``must define a command or
+    URL`` guard, not a bare ``TypeError`` from the resolver's basename check."""
+    with pytest.raises(ProviderError, match="must define a command or URL"):
+        MiniMaxCodeProvider._serialize_server("srv", {"command": ["uvx", "x"]})

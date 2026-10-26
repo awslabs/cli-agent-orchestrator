@@ -178,7 +178,7 @@ def resolve_mcp_server_config(
     is_cao_server = (
         command == CAO_MCP_SERVER_COMMAND
         or name == CAO_MCP_SERVER_COMMAND
-        or (command and Path(command).name == CAO_MCP_SERVER_COMMAND)
+        or (isinstance(command, str) and Path(command).name == CAO_MCP_SERVER_COMMAND)
     )
     if is_cao_server and not persisted:
         server_env = cao_server_env()
