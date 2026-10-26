@@ -6,8 +6,11 @@ CLI handoff use it. Both decision points are **off by default**, so normal
 launches keep their existing behavior until an operator enables routing.
 
 Plain terminal creates and older clients that do not send the original task
-message are not routed. Reusing a terminal and replaying a workflow step launch
-nothing, so neither runs a decision. A script workflow's own step is out of
+message are not routed. An empty task message is also not routed: local and
+remote assign, elastic assign, handoff and CLI handoff launch it unrouted
+rather than refusing it, the same as when no message is sent at all. Reusing a
+terminal and replaying a workflow step launch nothing, so neither runs a
+decision. A script workflow's own step is out of
 scope for deciders; in shadow or on it gets an `out_of_scope` record. An agent's
 assign or handoff from inside that step remains an ordinary delegation.
 
@@ -185,7 +188,21 @@ provider has been built and its start has completed or been scheduled. A
 deferred startup failure updates the record to `launch_failed` without emitting
 a second decision span. A cancelled deferred start also moves a previously
 launched row to `launch_failed`, with no second emission.
-A launch refused by the creator's delegation ceiling is recorded as `not_launched`.
+
+`not_launched` and `launch_failed` mark different points of failure.
+`not_launched` means the launch was refused or abandoned before a create
+attempt ran: a refusal by the creator's delegation ceiling binds it directly,
+and every create route (`POST /sessions`, `POST /sessions/{name}/terminals`,
+`POST /terminals/run-step`) also re-binds any record still `pending` to
+`not_launched` in a `finally` block once its handler returns. That `finally`
+bind is how the per-node terminal cap refusal (`CAO_MAX_TERMINALS`/
+`server.max_terminals` already reached) ends up `not_launched` too, even
+though it is raised earlier than, and independently of, the ceiling check.
+`launch_failed` instead means a create attempt was actually made and did not
+complete: once that attempt has started, any other exception is bound
+`launch_failed`, and the same status applies when a deferred startup failure
+or a cancelled deferred start moves a previously launched row back, in both
+cases without a second decision span.
 
 Records never hold task messages, descriptions, purposes, prompts or working directories.
 Messages, descriptions and purposes are redacted before every decider call, including the
@@ -276,9 +293,13 @@ or saved, the marker still switches every point off and the result reports
 `settings_saved: false`. Fix the settings before re-enabling decisions.
 
 The marker overrides settings, environment and startup flags. Setting any point
-to `shadow` or `on` removes it and prints effective local states. This may also
+to `shadow` or `on` removes it; `cao decisions set` then prints effective local
+states. The ops MCP `decisions_set_point` tool calls the identical operator
+`set_point` path, so it lifts the marker the same way on the same condition,
+returning the new effective state instead of printing it. This may also
 re-enable other points whose environment or startup flags select `shadow` or `on`;
-the CLI cannot see a running server's startup flags. `cao decisions status` shows
+neither the CLI nor the ops MCP tool can see a running server's startup flags.
+`cao decisions status` shows
 `halted` and installed deciders' names, distribution versions and `builtin` or
 `external` classification without importing them. External entries carry the
 label “sends data off this machine only after its own consent”.
