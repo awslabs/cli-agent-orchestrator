@@ -13,6 +13,7 @@ Two of these carry the unit's load:
 """
 
 import json
+import logging
 import subprocess
 
 import pytest
@@ -325,6 +326,46 @@ def test_a_git_roots_baseline_carries_no_root_identity_so_git_plan_ids_do_not_mo
         "two checkouts of the same commit with the same clean worktree are no longer one plan, so a "
         "Git root is being identified by location rather than by content"
     )
+
+
+def test_an_unbindable_non_git_root_logs_its_reason_at_warning_and_no_path(
+    tmp_path, monkeypatch, caplog
+):
+    """fanhongy's P3-4(b) on PR #1051: the promise that the server SAYS so was not pinned.
+
+    ``CHANGELOG.md`` and ``docs/workflows.md`` both promise that where the filesystem supplies no
+    usable inode, CAO records the fallback instead of skipping it and "the server logs that reason
+    with no path". fanhongy downgraded this ``logger.warning`` to ``debug`` and all 422 focused tests
+    passed, so the promise was documentation only.
+
+    WARNING specifically, not merely "a log line": a debug line is invisible at the default level,
+    which is the whole difference between a recorded fallback and a silent one. And no path, mirroring
+    ``test_returns_none_and_logs_rather_than_raising`` and this module's path-free diagnostics rule --
+    the unbound marker in the manifest is where the operator reads WHICH plan this is.
+    """
+    _store(tmp_path, monkeypatch)
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(
+        manifest_freeze,
+        "root_identity",
+        lambda path: {"bound": False, "reason": "root_identity_unsupported"},
+    )
+    with caplog.at_level("WARNING"):
+        frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={}, cwd=str(root))
+
+    assert frozen.manifest_json is not None, "an unbindable root is approvable, not a refusal"
+    unbound = [
+        record
+        for record in caplog.records
+        if "could not bind the working-directory root identity" in record.message
+    ]
+    assert len(unbound) == 1 and unbound[0].levelno == logging.WARNING, (
+        "the unbound-root fallback is not reported at WARNING, so an operator running at the default "
+        f"level never learns the plan they approved has a weaker binding (records={caplog.records})"
+    )
+    assert "root_identity_unsupported" in unbound[0].getMessage()
+    assert str(tmp_path) not in caplog.text, "this module's diagnostics must stay path-free"
 
 
 @pytest.mark.parametrize("kind", ["git", "non-git"])
