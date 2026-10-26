@@ -15,12 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wait `ephemeral.launch_grace_seconds` (default 600) after the bind; the startup sweep
   doesn't wait. Claims inside their lease and launched names whose terminal exists are never
   touched. Failed file deletions are retried. Live files left by a crashed create are deleted
-  under a lock shared with creation. `ephemeral.max_live_per_session` (default 10) caps
-  pending, claimed and launched names per session, and a create over the cap is refused with
-  `max_live_exceeded` before anything is written. After `ephemeral.retention_days` (default
-  14), a collected name's archive and then its registry row are deleted, but only once its
-  terminal and live files are gone. All four defaults are provisional, and the feature stays
-  off by default.
+  under a lock shared with creation, once older than the launch grace. The live-name cap is
+  opt-in: `ephemeral.max_live_per_session` defaults to 0 (no cap), so existing users see no
+  behaviour change. Set it, for example to 32, to cap pending, claimed and launched names per
+  session; a create over the cap is refused with `max_live_exceeded` before anything is
+  written. A create that can't take the store lock is refused with `store_busy` (503), or
+  with `store_lock_unavailable` (503) where the filesystem lacks `flock`. After
+  `ephemeral.retention_days` (default 14), a collected name's archive and then its registry
+  row are deleted, but only once its terminal and live files are gone. Earlier releases kept
+  them forever. All four defaults are provisional, and the feature stays off by default.
 
 - **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
   paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the

@@ -20,7 +20,7 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "pending_ttl_seconds": 900,
     "claim_lease_seconds": 60,
     "max_depth": 1,
-    "max_live_per_session": 10,
+    "max_live_per_session": 0,
     "launch_grace_seconds": 600,
     "sweep_interval_seconds": 300,
     "retention_days": 14
@@ -36,13 +36,21 @@ settings fail closed. `max_depth` accepts only integer 1. Ephemeral callers cann
 other ephemerals, even when `child_may_delegate` allows the existing delegation tools.
 
 The last four keys control lifecycle cleanup. Their defaults are proposals that await
-maintainer confirmation (#1079). `max_live_per_session` caps the pending, claimed and
-launched names one session holds. Collected names and expired pending names don't count.
-A create past the cap is refused with `max_live_exceeded` (409) before anything is written.
-If the value isn't a positive integer, every create is refused with
+maintainer confirmation (#1079). `max_live_per_session` is an opt-in cap on the pending,
+claimed and launched names one session holds. The default, `0`, means no cap, so current
+users see no change. To opt in, set a positive integer; `32` leaves room for a fleet-style
+supervisor. Collected names and expired pending names don't count. A create past the cap is refused with `max_live_exceeded` (409) before anything is
+written. If the value isn't a non-negative integer, every create is refused with
 `policy_config_error:max_live_per_session`. The other three keys tune the sweep described
-below. An unusable `launch_grace_seconds` or `retention_days` skips only the step that needs
-it. An unusable interval falls back to the default.
+below. An unusable `launch_grace_seconds` skips the two steps that need it: periodic
+collection of launched names with no terminal row, and deletion of rowless live files. An
+unusable `retention_days` skips retention. An unusable interval falls back to the default.
+
+Creates take an inter-process `flock` lock under `CAO_HOME/locks/`, so the CAO home must be
+on a filesystem that supports `flock`. A create that can't take the lock within 10 seconds
+is refused with `store_busy` (503) and can be retried. Without `flock` support, as on an NFS
+mount without locking, every create is refused with `store_lock_unavailable` (503), and each
+sweep skips its rowless-file step with a warning.
 
 `ephemeral.max_tier`, `default_tier`, `max_effort`, `default_effort`, and top-level
 `model_tiers` are **not applied yet**. In particular, `max_tier` sets no ceiling. Each
@@ -92,19 +100,24 @@ off does not strand files. Each pass applies these rules:
   bind and terminal insertion leaves one. The startup pass collects it at once; later
   passes wait until `launch_grace_seconds` have passed since the bind.
 - If deleting a collected name's live files failed, the pass deletes them again.
-- Live files with no registry row, left by a crashed create, are deleted by exact name. Creates
-  and this step share an inter-process lock, held from a create's cap check until its row is
-  inserted. A pass that finds the lock held skips this step until the next pass.
+- Live files with no registry row, left by a crashed create, are deleted by exact name once
+  they are older than `launch_grace_seconds`, on startup passes too. Creates and this step
+  share an inter-process lock, held from a create's cap check until its row is inserted. A
+  pass that finds the lock held skips this step until the next pass.
 
 A pass deletes only these exact regular files under `ephemeral/live/` and the archives
 that retention allows. Each change to a row is rechecked in its own transaction, so a
-concurrent claim, bind or terminal insertion always wins. A pass that changes anything
+concurrent claim or bind always wins, and a terminal insertion wins unless it comes more
+than `launch_grace_seconds` after the bind. A pass that changes anything
 logs one line of counts by reason. The line names no brief or other creator text.
 
 Retention keeps a collected name's archive for `retention_days`. The archive is deleted once
 it is older than that, and only after the name's terminal row and both live files are gone.
 The registry row is deleted after its archive, once every timestamp on it is also older than
-the window. Archives and rows of pending, claimed and launched names are never deleted.
+the window. If the archive is already gone, for example removed by hand, only those
+timestamps count, so a name that ran longer than the window is pruned on the first pass
+after its collection. Archives and rows of pending, claimed and launched names are never
+deleted.
 Neither is any row whose terminal still exists, so a surviving terminal stays marked
 ephemeral. A later create can reuse a deleted name. It still checks installed stores and
 creates the exact archive and live paths exclusively.
