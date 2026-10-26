@@ -23,6 +23,8 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_MCP_SERVER_COMMAND,
+    forward_terminal_identity,
+    is_bundled_cao_server,
     resolve_mcp_server_config,
 )
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -1753,15 +1755,22 @@ class CodexProvider(BaseProvider):
                         cfg = dict(server_config)
                     else:
                         cfg = server_config.model_dump(exclude_none=True)
-                    # The CAO server, by its usual name or its bundled command
-                    # (a profile can also start it through uvx).
-                    is_cao_server = (
-                        server_name == CAO_MCP_SERVER_COMMAND
-                        or cfg.get("command") == CAO_MCP_SERVER_COMMAND
+                    # The CAO server, by its usual name or by SHAPE -- its
+                    # bundled command, an absolute path to it, the module
+                    # entrypoint, or a `uvx --from ... cao-mcp-server`.
+                    is_cao_server = server_name == CAO_MCP_SERVER_COMMAND or is_bundled_cao_server(
+                        cfg
                     )
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
                     cfg = resolve_mcp_server_config(cfg)
+                    # This terminal's own id wins over anything the profile
+                    # declared. Requesting inheritance via `env_vars` below is
+                    # NOT enough on its own: the explicit `env` table is emitted
+                    # too, and a hostile value there is what Codex passes to the
+                    # server (#1062, review 2). Injecting it here also means the
+                    # identity reaches the server even where inheritance fails.
+                    cfg = forward_terminal_identity(cfg, self.terminal_id, server_name=server_name)
                     if "command" in cfg:
                         command_parts.extend(
                             ["-c", f"{prefix}.command={_toml_scalar(cfg['command'])}"]

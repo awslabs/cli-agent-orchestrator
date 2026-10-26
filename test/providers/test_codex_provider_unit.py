@@ -462,7 +462,13 @@ class TestCodexBuildCommand:
         assert "mcp_servers.test-server.command=" in command
         # Contract changed by review 5222539218 (item 6): env is one inline table
         # with quoted keys, so any schema-valid key is expressible.
-        assert 'mcp_servers.test-server.env={ "API_KEY" = "secret123" }' in command
+        # This terminal's own id joins the table since #1062: requesting
+        # inheritance via env_vars is not enough when the explicit table is what
+        # Codex passes (see TestCodexForwardsTheRealTerminalId).
+        assert (
+            'mcp_servers.test-server.env={ "API_KEY" = "secret123", '
+            '"CAO_TERMINAL_ID" = "test1234" }' in command
+        )
         assert "secret123" in command
         # CAO_TERMINAL_ID always forwarded even without explicit env_vars
         assert "mcp_servers.test-server.env_vars=" in command
@@ -1489,7 +1495,12 @@ class TestMcpKeyValidation:
         command = provider._build_codex_command()
         match = _re.search(r"mcp_servers\.srv\.env=(\{.*?\})'", command)
         assert match, command
-        assert tomllib.loads(f"x = {match.group(1)}")["x"] == {env_key: "value"}
+        # Every server's env table also carries this terminal's own
+        # CAO_TERMINAL_ID since #1062 (see TestCodexForwardsTheRealTerminalId).
+        assert tomllib.loads(f"x = {match.group(1)}")["x"] == {
+            env_key: "value",
+            "CAO_TERMINAL_ID": "tid",
+        }
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_an_empty_env_key_is_still_expressible(self, mock_load):
@@ -1508,7 +1519,10 @@ class TestMcpKeyValidation:
         command = provider._build_codex_command()
         match = _re.search(r"mcp_servers\.srv\.env=(\{.*?\})'", command)
         assert match, command
-        assert tomllib.loads(f"x = {match.group(1)}")["x"] == {"": "value"}
+        assert tomllib.loads(f"x = {match.group(1)}")["x"] == {
+            "": "value",
+            "CAO_TERMINAL_ID": "tid",
+        }
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_accepts_normal_names_and_env_keys(self, mock_load):
@@ -1518,7 +1532,10 @@ class TestMcpKeyValidation:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
         assert "mcp_servers.cao-mcp-server.command=" in command
-        assert 'mcp_servers.cao-mcp-server.env={ "API_KEY" = "v" }' in command
+        assert (
+            'mcp_servers.cao-mcp-server.env={ "API_KEY" = "v", "CAO_TERMINAL_ID" = "tid" }'
+            in command
+        )
 
 
 class TestCodexProviderCodexConfig:
@@ -5754,7 +5771,13 @@ class TestCodexEnvIsOneInlineTable:
 
     def test_env_is_written_as_one_inline_table(self):
         command = self._build({"A": "1", "LOG.LEVEL": "info"})
-        assert self._env_table(command) == {"A": "1", "LOG.LEVEL": "info"}
+        # Plus this terminal's own CAO_TERMINAL_ID, which #1062 writes into every
+        # server's table rather than trusting env_vars inheritance alone.
+        assert self._env_table(command) == {
+            "A": "1",
+            "LOG.LEVEL": "info",
+            "CAO_TERMINAL_ID": "test1234",
+        }
         assert "env.LOG.LEVEL" not in command, "the dotted key must not reach the path"
 
     def test_a_dotted_env_key_no_longer_aborts_the_launch(self):
@@ -5764,7 +5787,11 @@ class TestCodexEnvIsOneInlineTable:
 
     def test_env_values_with_quotes_and_newlines_round_trip_through_tomllib(self):
         command = self._build({'Q"K': 'a"b', "NL": "x\ny"})
-        assert self._env_table(command) == {'Q"K': 'a"b', "NL": "x\ny"}
+        assert self._env_table(command) == {
+            'Q"K': 'a"b',
+            "NL": "x\ny",
+            "CAO_TERMINAL_ID": "test1234",
+        }
 
     def test_a_dotted_server_name_still_raises_for_profile_entries(self):
         """Only PLUGIN entries are pre-filtered; a hand-written profile still fails fast.

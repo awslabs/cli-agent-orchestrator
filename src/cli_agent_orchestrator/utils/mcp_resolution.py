@@ -152,16 +152,67 @@ CAO_TERMINAL_ID_ENV = "CAO_TERMINAL_ID"
 #: that has one.
 _ENV_FIELD = "env"
 
+#: Console-script filenames that ARE the bundled CAO MCP server, whatever the
+#: entry happens to be called in a provider's ``mcpServers`` map.
+_CAO_SERVER_SCRIPT_NAMES = frozenset({CAO_MCP_SERVER_COMMAND, f"{CAO_MCP_SERVER_COMMAND}.exe"})
 
-def forward_terminal_identity(config: dict, terminal_id: str, *, server_name: str = "") -> dict:
+
+def _basename(token: str) -> str:
+    """Last path component of ``token`` under either separator.
+
+    Deliberately not ``Path(token).name``: a POSIX host must still recognise a
+    Windows-shaped path in a config file it did not write, and ``PurePath`` on
+    Linux treats a backslash as an ordinary character.
+    """
+    return token.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def is_bundled_cao_server(config: dict) -> bool:
+    """Does this MCP server entry launch **CAO's own** MCP server?
+
+    Identified by SHAPE, never by the key it sits under in ``mcpServers``. The
+    name is the attacker's to choose: review of #1062 found providers that
+    protected the entry literally named ``cao-mcp-server`` while a differently
+    named entry whose *command* was ``cao-mcp-server`` went through the
+    unprotected branch. Every form the resolver can emit or a profile can write
+    counts:
+
+    * the bare console script, an absolute path to it, or a ``.exe`` wrapper --
+      matched on the basename, so ``/opt/venv/bin/cao-mcp-server`` is caught;
+    * ``<python> -m cli_agent_orchestrator.mcp_server.server`` (what
+      :func:`resolve_cao_mcp_command` falls back to);
+    * the script named in ``args`` rather than ``command`` -- ``uvx --from ...
+      cao-mcp-server``, which the Codex writer already documented as reachable.
+
+    A ``command`` given as a list (OpenCode's flattened form) is read too.
+    """
+    tokens: List[str] = []
+    command = config.get("command")
+    if isinstance(command, str) and command:
+        tokens.append(command)
+    elif isinstance(command, (list, tuple)):
+        tokens.extend(str(part) for part in command)
+    tokens.extend(str(arg) for arg in (config.get("args") or []))
+    for index, token in enumerate(tokens):
+        if _basename(token) in _CAO_SERVER_SCRIPT_NAMES:
+            return True
+        if token == "-m" and index + 1 < len(tokens) and tokens[index + 1] == CAO_MCP_SERVER_MODULE:
+            return True
+    return False
+
+
+def forward_terminal_identity(
+    config: dict, terminal_id: str, *, server_name: str = "", inherited: bool = False
+) -> dict:
     """Return ``config`` with ``CAO_TERMINAL_ID`` pinned to the REAL terminal id.
 
     Providers whose agent does not pass its own environment to MCP subprocesses
-    have to inject the identity into each server entry's ``env``. Four of them
-    (claude_code, cursor_cli, omp, kimi_cli) each wrote
-    ``if "CAO_TERMINAL_ID" not in env`` -- "do not override an explicit preset",
-    from the days when the value was a convenience for handoff/assign rather than
-    an authorization input. It has been an authorization input since #671/#972:
+    have to inject the identity into each server entry's ``env``. Several of them
+    (claude_code, cursor_cli, omp, kimi_cli, copilot_cli, codex,
+    kimi_runtime_home) each wrote ``if "CAO_TERMINAL_ID" not in env`` /
+    ``env.setdefault(...)`` -- "do not override an explicit preset", from the days
+    when the value was a convenience for handoff/assign rather than an
+    authorization input. It has been an authorization input since #671/#972:
     the MCP gates read it to decide whether the caller is a bound terminal gated
     on its recorded allowlist, or an operator context that is not gated at all.
     Honouring a profile's preset therefore let the profile pick its own
@@ -176,6 +227,16 @@ def forward_terminal_identity(config: dict, terminal_id: str, *, server_name: st
     profile needs to know its line had no effect. Values other than
     ``CAO_TERMINAL_ID`` in ``env`` are untouched.
 
+    ``inherited=True`` is for the providers whose MCP children inherit the agent
+    process's environment (Kimi Code), where the launch line exports the identity
+    once for every server. There, an ABSENT value needs no injection and the
+    module documents why -- but a value the profile *declared* is what that server
+    is launched with for this key, inherited or not, so it is still overridden.
+    Absent plus ``inherited`` is therefore the only case that returns the entry
+    untouched. An empty ``terminal_id`` is also a no-op: there is nothing truer to
+    replace a declared value with, and writing ``""`` would strip the identity
+    rather than correct it.
+
     PURE: returns a new entry with a new ``env`` dict, so a caller iterating a
     profile's ``mcpServers`` cannot have the profile's own nested dict mutated
     underneath it (the previous in-place ``env[...] = ...`` did exactly that).
@@ -183,6 +244,12 @@ def forward_terminal_identity(config: dict, terminal_id: str, *, server_name: st
     entry = dict(config)
     env = dict(entry.get(_ENV_FIELD) or {})
     declared = env.get(CAO_TERMINAL_ID_ENV)
+    if not terminal_id or (inherited and declared is None):
+        # No-op, but still hand back the detached ``env`` when the entry had one,
+        # so every return from this function keeps the purity contract above.
+        if _ENV_FIELD in entry:
+            entry[_ENV_FIELD] = env
+        return entry
     if declared is not None and declared != terminal_id:
         logger.warning(
             "Overriding %s=%r declared in the env of MCP server %r: a profile does not "

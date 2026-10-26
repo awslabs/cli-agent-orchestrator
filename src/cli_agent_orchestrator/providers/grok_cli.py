@@ -43,7 +43,10 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    forward_terminal_identity,
+    resolve_mcp_server_config,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 from cli_agent_orchestrator.utils.tool_mapping import granted_mcp_servers
@@ -411,9 +414,11 @@ class GrokCliProvider(BaseProvider):
             config = self._server_dict(raw_server)
             if "command" in config:
                 config = resolve_mcp_server_config(config)
-                env = dict(config.get("env") or {})
-                env["CAO_TERMINAL_ID"] = self.terminal_id
-                config["env"] = env
+                # Already injected this terminal's own id unconditionally; routed
+                # through the shared helper so a profile that tried to pin one is
+                # LOGGED rather than silently discarded, and so every provider's
+                # identity write has one shape (#1062).
+                config = forward_terminal_identity(config, self.terminal_id, server_name=name)
 
             table = f"mcp_servers.{_toml_string(name)}"
             lines.extend(["", f"[{table}]"])

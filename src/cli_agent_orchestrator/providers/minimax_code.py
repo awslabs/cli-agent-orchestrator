@@ -24,7 +24,10 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    forward_terminal_identity,
+    resolve_mcp_server_config,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -374,9 +377,14 @@ class MiniMaxCodeProvider(BaseProvider):
             name: self._serialize_server(name, raw_config)
             for name, raw_config in mcp_servers.items()
         }
-        for server in servers.values():
+        for name, server in servers.items():
             if server["type"] == "stdio":
-                server["env"]["CAO_TERMINAL_ID"] = self.terminal_id
+                # This terminal's own id. Already unconditional; routed through
+                # the shared helper so a profile that tried to pin one is LOGGED
+                # and every provider's identity write has one shape (#1062).
+                servers[name] = forward_terminal_identity(
+                    server, self.terminal_id, server_name=name
+                )
 
         manifest = {
             "schemaVersion": 1,

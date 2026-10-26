@@ -1496,6 +1496,10 @@ class KimiCliProvider(BaseProvider):
         * ``CAO_TERMINAL_ID`` is exported for the Kimi process: Kimi Code's stdio
           MCP children inherit the parent environment, so one export reaches
           every server (including user-level ones) without per-server injection.
+          A server entry that *declares* the variable is a different matter and
+          is overridden with this terminal's own id in ``merge_mcp_servers`` --
+          a declared value is what Kimi passes for that key, and the MCP gates
+          authorize on it (#1062), so the builder is given the real id.
         * MCP timeouts travel as launch-scoped env bindings, never as a mutation
           of the user's ``config.toml``.
         * Auto-update is disabled for every CAO-managed worker, so N workers do
@@ -1557,7 +1561,7 @@ class KimiCliProvider(BaseProvider):
                 ) from exc
 
         mcp_servers = profile.mcpServers if profile is not None else None
-        builder = KimiCodeRuntimeHomeBuilder(source_home, terminal_dir)
+        builder = KimiCodeRuntimeHomeBuilder(source_home, terminal_dir, self.terminal_id)
         try:
             profile_tools = profile.tools if profile is not None else None
             runtime = builder.build(
