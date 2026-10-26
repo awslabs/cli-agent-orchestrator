@@ -287,6 +287,7 @@ characters other than letters, digits, `_`, `.` and `-` is logged as
           "point": "model.route",
           "outcome": "fallback",
           "reason": "timeout",
+          "decision_status": "done",
           "created_at": "2026-10-20T11:58:02.114203"
         },
         "counts": {"timeout": 31, "answer": 4}
@@ -300,7 +301,9 @@ characters other than letters, digits, `_`, `.` and `-` is logged as
 For each decider with records, `last` is its newest record and `counts` counts
 its records created since `since`, by reason. A record with no reason counts as
 `answer`, or as `pending` or `interrupted` while its shadow decision is
-unfinished. Record times are UTC. The counts match
+unfinished — `last.decision_status` carries this distinction too, so a
+pending or interrupted shadow record is never mistaken for an answer. Record
+times are UTC. The counts match
 `cao decisions list --since <since> --limit <n>` for the same records, with
 `--limit` large enough to include every record in the window (at most 10000;
 `list`'s default `--limit` is 100). Installed deciders
