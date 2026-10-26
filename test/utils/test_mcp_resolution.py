@@ -324,7 +324,13 @@ class TestServerCoordinateEnv:
         is ``str(CAO_HOME_DIR)``, the home this process actually uses.
         """
         monkeypatch.setenv("CAO_HOME_DIR", str(CAO_HOME_DIR))
-        assert server_coordinate_env()["CAO_HOME_DIR"] == str(CAO_HOME_DIR)
+        # Compared as resolved paths, not text: on a machine whose default home
+        # is a symlink (a shared state leaf, say), ``CAO_HOME_DIR`` is the
+        # unresolved default while the helper deliberately canonicalises, so a
+        # textual comparison fails for a reason that has nothing to do with the
+        # contract under test (independent review of #1066, round 3).
+        forwarded = server_coordinate_env()["CAO_HOME_DIR"]
+        assert Path(forwarded).resolve() == Path(CAO_HOME_DIR).resolve()
 
     def test_nothing_blank_is_ever_forwarded(self, monkeypatch, default_cao_server):
         """A blank value in the CHILD is what breaks it, so none is sent.
