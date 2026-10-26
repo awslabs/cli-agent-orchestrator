@@ -655,7 +655,8 @@ necessary because the `plan_id` does not exist before run admission computes it.
 A script-tier run resolves CAO memory **once**, at its first terminal, and records the content, its source and a
 hash of the **full** resolved content into the same manifest. Every later terminal of that run — and every resume,
 however long afterwards — is given that recorded copy. **Editing CAO memory after a failure therefore does not
-change what a resumed run sees.**
+change what a resumed run sees.** After a memory resolution error, nothing is recorded, so a later terminal or a
+resume resolves it again.
 Memory content is not part of plan identity; the memory-enabled setting is recorded at the
 approval check while approval enforcement is on, and changing it stops further agent launches for
 that run while enforcement remains on.
