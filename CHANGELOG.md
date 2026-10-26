@@ -270,9 +270,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Script-run frozen memory now uses the memory gateway, so a configured remote memory owner
   supplies the same context as live terminals instead of freezing stale local memory. A journal
   read failure for a known script run now withholds memory with a warning instead of falling back
-  to live, unfrozen memory; non-script runs keep their existing fallback. A remote memory owner
-  that is unreachable, errors, or has memory disabled now gives the step no memory with a warning,
-  as on the live path, instead of failing it (#828).
+  to live, unfrozen memory; non-script runs keep their existing fallback. A memory resolution error
+  now gives the step no memory with a warning, as on the live path, instead of failing it. This
+  includes a local read error and a remote owner that is unreachable, errors, or has memory
+  disabled (#828).
 - Every client call that creates a session or terminal synchronously (`cao launch` without
   `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
   `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
@@ -378,7 +379,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so `handoff` and workflow steps tore the worker down about 2s after sending the
   task. A `●` line whose ellipsis is followed by the spinner's status in
   parentheses (a running hook, the elapsed time, the token count or `thinking`)
-  is now treated as a live spinner, whatever the message before it (#908).
+  is now treated as a live spinner, whatever the message before it (#908). A
+  finished response that reports its own timing — `● Done. The fix is in place…
+  (3m 12s)` with the end-of-turn summary under it — is the same text, so both
+  detectors now look for a spinner only on the newest conversation row above the
+  input box, instead of holding the worker at processing until the step timed
+  out (#974). Blank rows, box chrome, the rows a wrapped chrome line continues
+  onto, and the status area Claude Code draws under the spinner — the task
+  list's indented checkbox rows and queued messages — are not conversation: one
+  shared walker skips them on the way up, so a `⎿ Tip:` line that wrapped in a
+  narrow pane, a task list or a queued message under the spinner cannot hide it
+  and report a working agent as completed either. The same scope stops a
+  response bullet in the bottom rows from reading as a spinner.
 
 - `store_lesson` no longer decides the learning gate, authorizes itself, or opens
   SQLite inside the agent's process. It writes through a new `POST /lessons`
