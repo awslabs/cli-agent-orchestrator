@@ -83,8 +83,9 @@ The supervisor delivers promoted learnings at dispatch instead:
 Delivery is a snapshot taken at dispatch. A runner already running does not
 receive a learning promoted later; the next dispatch does. A catalog
 dependency that blocks at `dispatch` gives the ordering the cross-project case
-needs: the dependent project is dispatched after its target completes and its
-learnings are reviewed.
+needs: the dependent project is dispatched after its target completes. Review
+the target's pending proposals before rendering; `dispatch message` lists
+them as `pending`.
 
 Runners treat delivered learnings as data. They do not override the runner
 profile, the AI-DLC engine, or a human decision, and a runner reports a

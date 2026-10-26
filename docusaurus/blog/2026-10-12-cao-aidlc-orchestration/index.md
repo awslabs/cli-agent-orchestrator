@@ -95,8 +95,9 @@ So the example delivers it. At dispatch, the parent recalls the reviewed learnin
 scope and puts the ones that apply to that intent into the runner's assignment, bounded and labelled
 as reference data rather than instructions. That is how the API intent's contract rule reaches the
 client intent: when the client waits on the API contract, the parent dispatches it after the API
-intent completes, and its assignment carries the rule. A runner that is already running does not get
-a learning promoted after its dispatch. If
+intent completes, and, once the parent has reviewed the API intent's learnings, its assignment
+carries the rule. A runner that is already running does not get a learning promoted after its
+dispatch. If
 you would rather have every runner recall one scope directly, set `CAO_PROJECT_ID` for the CAO
 server. That works, but it applies to every terminal of that server, not only to the portfolio.
 
