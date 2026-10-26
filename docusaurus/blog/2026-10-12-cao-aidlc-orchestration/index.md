@@ -31,8 +31,10 @@ underneath is Kiro CLI, Claude Code, or Codex.
 In other words: AI-DLC is the disciplined lifecycle for one intent, and CAO is the thing that can
 run many of those lifecycles at once and remember what they learn.
 
-Everything below was run against CAO `v2.5.4` and AI-DLC Workflows `2.x`. The example it refers to
-lives in
+The example below targets CAO `v2.5.4` and AI-DLC Workflows `2.x`. Its portfolio utility is covered
+by the example's own tests, and the memory behavior it depends on, one project scope per terminal,
+was checked against CAO `v2.5.4`'s own `memory_store` and `memory_recall` code. The hand-off of
+learnings at dispatch has not yet been run in a live CAO session. The example lives in
 [`examples/aidlc-portfolio`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/aidlc-portfolio),
 and it is being updated alongside this post.
 
