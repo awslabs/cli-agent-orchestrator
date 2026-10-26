@@ -181,8 +181,14 @@ two deliberate rules:
   over MCP would let a caller undo an operator's `cao decisions off`. It takes an
   operator context — `cao decisions set <point> <state>` on the CLI, or an MCP host
   running this server with no `CAO_TERMINAL_ID`. The refusal is enforced inside the
-  mutation, under the same lock the marker is created and removed under, so a halt
-  published while a call is already in flight cannot be erased by it.
+  mutation, not only in the middleware: `set_point` takes the exclusive egress lock,
+  re-reads the marker under it, refuses before writing anything, and removes the
+  marker only if it observed it under that lock — so a halt published beside a call
+  already in flight survives. `decisions_off` publishes its marker *without* waiting
+  for that lock, because the shared side is held for the whole of an outstanding
+  decision request and a kill switch that waits on one is not a kill switch; an
+  operator setter that finds the lock busy proceeds with a logged warning rather
+  than losing the only way to lift a halt, while a bound caller is refused.
 
 An operator context — an MCP host with no `CAO_TERMINAL_ID`, including `cao-ops` in
 the operator agent-plugin — is unchanged and may do all of the above.
