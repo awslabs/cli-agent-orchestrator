@@ -77,13 +77,16 @@ def kiro_agent_dirs(
     installed_dir: os.PathLike[str] | str,
     env_vars: Optional[Mapping[str, str]] = None,
 ) -> List[Path]:
-    """Every directory a Kiro launch from ``working_directory`` may read agents from.
+    """The directories the pre-launch check searches for a Kiro launch's agent.
 
-    The workspace directory (``<cwd>/.kiro/agents``), the directory ``cao
-    install`` writes, ``~/.kiro/agents``, and ``$KIRO_HOME/agents`` for each
-    absolute ``KIRO_HOME`` in the forwarded launch env or the server env
-    (kiro-cli treats a relative ``KIRO_HOME`` as ``~/.kiro``). Duplicates are
-    dropped and order is kept.
+    The workspace directory (``<cwd>/.kiro/agents``), ``~/.kiro/agents``, and
+    ``$KIRO_HOME/agents`` for each absolute ``KIRO_HOME`` in the forwarded launch
+    env or the server env (kiro-cli treats a relative ``KIRO_HOME`` as
+    ``~/.kiro``), which kiro-cli reads; plus ``installed_dir``, the directory
+    ``cao install`` writes. kiro-cli reads that one only when it is one of the
+    others: a ``CAO_AGENTS_DIR`` elsewhere passes this check, and the launch is
+    then refused at the header check instead. Duplicates are dropped and order
+    is kept.
 
     Provisional (#1074): the workspace is the launch cwd only, not its parents,
     and a workspace agent counts for installed launches; refusing a workspace
@@ -113,7 +116,8 @@ def _declares_name(path: Path, agent: str) -> bool:
         if not path.is_file() or path.stat().st_size > _MAX_AGENT_FILE_BYTES:
             return False
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # RecursionError: deeply nested JSON. An unreadable file declares nothing.
         return False
     return isinstance(data, dict) and data.get("name") == agent
 
@@ -168,7 +172,7 @@ def require_kiro_agent_defined(agent: str, directories: List[Path]) -> None:
         raise KiroAgentIdentityError(
             "agent_not_found",
             agent,
-            f"Kiro agent '{agent}' was not found in any agent directory kiro-cli reads "
+            f"Kiro agent '{agent}' was not found in any agent directory CAO searched "
             f"({searched}). kiro-cli would not refuse it: it would start its built-in "
             f"'kiro_default' agent, with every built-in tool, instead. Nothing was "
             f"launched. Remedy: `cao install {agent} --provider kiro_cli`, then retry.",

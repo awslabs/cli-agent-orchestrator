@@ -155,6 +155,65 @@ class TestBeforeLaunch:
         allocation.providers.create_provider.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_a_kiro_home_in_the_session_env_resolves_for_a_new_window(
+        self, agent_dirs, allocation
+    ):
+        """A window added to an existing session launches with the session env under
+        its own, so a KIRO_HOME forwarded at session creation counts."""
+        from cli_agent_orchestrator.services.session_env import (
+            clear_session_env,
+            set_session_env,
+        )
+
+        kiro_home = agent_dirs.root / "session-kiro-home"
+        (kiro_home / "agents").mkdir(parents=True)
+        (kiro_home / "agents" / "developer.json").write_text("{}")
+        allocation.backend.session_exists.return_value = True
+        allocation.backend.create_window.return_value = "developer-window"
+
+        async def _add_window():
+            return await create_terminal(
+                provider="kiro_cli",
+                agent_profile="developer",
+                session_name="cao-existing",
+                new_session=False,
+                working_directory=str(agent_dirs.cwd),
+                kiro_capability_probe=_probe(),
+            )
+
+        with pytest.raises(KiroAgentIdentityError):
+            await _add_window()
+        set_session_env("cao-existing", {"KIRO_HOME": str(kiro_home)})
+        try:
+            await _add_window()
+        finally:
+            clear_session_env("cao-existing")
+
+        allocation.providers.create_provider.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_agent_store_scan_runs_off_the_event_loop(
+        self, agent_dirs, allocation, monkeypatch
+    ):
+        """A miss parses every agent file in up to four directories; the create's
+        other blocking calls beside it already run in a worker thread."""
+        import threading
+
+        (agent_dirs.installed / "developer.json").write_text("{}")
+        threads = []
+        real = terminal_service.require_kiro_agent_resolves
+
+        def spy(*args, **kwargs):
+            threads.append(threading.current_thread())
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(terminal_service, "require_kiro_agent_resolves", spy)
+
+        await _create(agent_dirs)
+
+        assert threads and threading.main_thread() not in threads
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("agent", ["kiro_default", "cao-null"])
     async def test_a_fallback_agent_name_is_refused_even_when_a_file_exists(
         self, agent_dirs, allocation, agent

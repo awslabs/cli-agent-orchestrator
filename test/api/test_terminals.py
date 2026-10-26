@@ -355,6 +355,26 @@ class TestTerminalCreationWithWorkingDirectory:
         assert response.status_code == 400, response.text
         assert "cao install analyst" in response.json()["detail"]
 
+    @pytest.mark.parametrize("kind", ["agent_not_found", "identity_mismatch"])
+    def test_kiro_agent_identity_refusal_is_a_bad_request_on_run_step(self, client, kind):
+        """run-step maps the refusal ahead of its generic ValueError arm too (#1074)."""
+        from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
+        refusal = KiroAgentIdentityError(
+            kind, "analyst", "Kiro agent 'analyst' ... `cao install analyst --provider kiro_cli`"
+        )
+        with patch(
+            "cli_agent_orchestrator.api.main.run_agent_step",
+            new=AsyncMock(side_effect=refusal),
+        ):
+            response = client.post(
+                "/terminals/run-step",
+                json={"provider": "kiro_cli", "agent": "analyst", "prompt": "do it"},
+            )
+
+        assert response.status_code == 400, response.text
+        assert "cao install analyst" in response.json()["detail"]
+
     def test_input_to_a_terminal_with_a_deferred_init_failure_is_a_conflict(self, client):
         """POST /terminals/{id}/input refuses a terminal whose deferred init failed
         durably (#1074): 409, and no key reaches the pane."""

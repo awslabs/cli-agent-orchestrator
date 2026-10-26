@@ -1995,7 +1995,15 @@ async def _create_terminal_unguarded(
         # provider re-checks the pane header before any task is typed.
         # Provisional (#1074): installed launches refuse rather than warn.
         if provider == ProviderType.KIRO_CLI.value:
-            require_kiro_agent_resolves(agent_profile, resolved_working_directory, env_vars)
+            # A window joining an existing session launches with the session env
+            # under the per-launch env (Step 3c), so a forwarded KIRO_HOME there
+            # counts here too. Off the loop: a miss parses every agent file.
+            check_env = (
+                env_vars if new_session else {**get_session_env(session_name), **(env_vars or {})}
+            )
+            await asyncio.to_thread(
+                require_kiro_agent_resolves, agent_profile, resolved_working_directory, check_env
+            )
 
         # Normalize the session name BEFORE anything keys off it: the lifecycle
         # lock below is per session NAME, so it must be taken on the SAME string
@@ -4313,7 +4321,11 @@ def _schedule_deferred_init(
 
 
 def memory_sidecar_refusal(
-    primary: Terminal, *, provider: str, sidecar_profile: str = "memory_manager"
+    primary: Terminal,
+    *,
+    provider: str,
+    sidecar_profile: str = "memory_manager",
+    working_directory: Optional[str] = None,
 ) -> Optional[str]:
     """Why the ``memory_manager`` sidecar would be refused under ``primary``, or ``None``.
 
@@ -4329,7 +4341,31 @@ def memory_sidecar_refusal(
     also when the primary's ceiling is not readable from the response (no
     ``delegate_tools`` and no ``allowed_tools``): then the create itself decides
     and logs, exactly as before.
+
+    On ``kiro_cli`` the create's Step 1c agent check is asked too, from the
+    sidecar's ``working_directory`` and the primary session's env, as the create
+    would run it (#1074). Blocking file I/O: callers to_thread it.
     """
+    refusal = _memory_sidecar_ceiling_refusal(primary, sidecar_profile)
+    if refusal is None and provider == ProviderType.KIRO_CLI.value:
+        try:
+            require_kiro_agent_resolves(
+                sidecar_profile,
+                _resolve_working_directory(working_directory),
+                get_session_env(primary.session_name),
+            )
+        except KiroAgentIdentityError as exc:
+            refusal = (
+                f"{exc} The memory_manager sidecar (`cao launch --memory`, "
+                "memory_manager=true) was not launched."
+            )
+        except Exception:  # noqa: BLE001  (an unusable cwd is the create's problem)
+            return None
+    return refusal
+
+
+def _memory_sidecar_ceiling_refusal(primary: Terminal, sidecar_profile: str) -> Optional[str]:
+    """The delegation-ceiling half of ``memory_sidecar_refusal``."""
     ceiling = (
         primary.delegate_tools if primary.delegate_tools is not None else primary.allowed_tools
     )

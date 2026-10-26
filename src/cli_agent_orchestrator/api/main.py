@@ -3928,7 +3928,15 @@ async def create_session(
             # launch that reported success and no sidecar, so the bound is
             # checked HERE, with the same comparator, and the outcome rides on
             # the response as ``memory_manager`` for `cao launch` to print.
-            refusal = terminal_service.memory_sidecar_refusal(result, provider=sidecar_provider)
+            # On kiro_cli this also asks the create's agent check (#1074), so a
+            # memory_manager not installed for Kiro reads `refused` here rather
+            # than `scheduled` and a log line. Off the loop: it reads agent files.
+            refusal = await asyncio.to_thread(
+                terminal_service.memory_sidecar_refusal,
+                result,
+                provider=sidecar_provider,
+                working_directory=working_directory,
+            )
             if refusal is not None:
                 logger.warning(f"memory_manager sidecar not launched: {refusal}")
                 result.memory_manager = {"state": "refused", "detail": refusal}

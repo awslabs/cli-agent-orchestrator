@@ -2,8 +2,8 @@
 
 kiro-cli answers an ``--agent`` it cannot load with ``agent "<name>" not found,
 using "kiro_default"`` and starts its built-in default agent, which has every
-built-in tool. The pane strings below are the ones measured on kiro-cli 2.32.0
-(spike SK0), plus real captures from ``fixtures/``.
+built-in tool. The pane strings below are the ones measured on kiro-cli 2.32.0,
+plus real captures from ``fixtures/``.
 """
 
 import json
@@ -154,6 +154,29 @@ class TestKiroAgentDefined:
     def test_a_directory_named_like_the_file_does_not_count(self, tmp_path):
         (tmp_path / "developer.json").mkdir()
         assert not kiro_agent_defined("developer", [tmp_path])
+
+    def test_deeply_nested_json_declares_nothing_and_the_search_goes_on(self, tmp_path):
+        """A repo's ``.kiro/agents/x.json`` of nested brackets overflows the JSON
+        parser's recursion; it must read as "no name here", not escape the create
+        as a RecursionError (a 500) for every Kiro launch from that repo."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "x.json").write_text("[" * 200_000)
+        installed = tmp_path / "installed"
+        installed.mkdir()
+        (installed / "developer.json").write_text("{}")
+
+        assert not kiro_agent_defined("developer", [workspace])
+        assert kiro_agent_defined("developer", [workspace, installed])
+
+    def test_a_spec_over_the_size_cap_is_not_parsed_for_its_name(self, tmp_path):
+        """Files over 1 MiB are skipped by the ``name`` scan; the stem still counts."""
+        big = json.dumps({"name": "developer", "prompt": "x" * (1024 * 1024)})
+        (tmp_path / "big-spec.json").write_text(big)
+        assert not kiro_agent_defined("developer", [tmp_path])
+
+        (tmp_path / "developer.json").write_text(big)
+        assert kiro_agent_defined("developer", [tmp_path])
 
     def test_an_empty_agent_directory_does_not_count(self, tmp_path):
         (tmp_path / "developer").mkdir()
