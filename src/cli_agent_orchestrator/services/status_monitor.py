@@ -30,6 +30,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Issue #1082 (busy time): herdr terminals derive status on demand rather than
+# through the pipe-pane -> StatusMonitor pipeline (see get_status() below), so
+# there is no sticky-latch dedup for them to piggyback on. This is a SEPARATE
+# dict/lock from every StatusMonitor instance field above -- a pure
+# side-channel observer that never reads or writes any existing detection
+# state, so it cannot change what any caller of get_status() observes.
+_herdr_last_recorded_status: Dict[str, str] = {}
+_herdr_last_recorded_lock = threading.Lock()
+
+
+def _record_status_transition_best_effort(terminal_id: str, status: "TerminalStatus") -> None:
+    """Persist one status transition for busy-time accounting (issue #1082).
+
+    Side-effect only: never raises, so a recording failure can never affect
+    the status any caller observes.
+    """
+    try:
+        from cli_agent_orchestrator.clients import database
+
+        database.record_launch_status_event(terminal_id, status.value)
+    except Exception:
+        logger.debug("Launch status event recording failed for %s", terminal_id, exc_info=True)
+
 
 # Statuses that represent a stable "ready" state — the agent has finished
 # producing output and is waiting for further input. Once latched, the
@@ -406,6 +429,7 @@ class StatusMonitor:
             # re-enter StatusMonitor while the latch state is mid-update.
             bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
+            _record_status_transition_best_effort(terminal_id, detected)
         return True
 
     def _apply_detection_locked(self, terminal_id: str, detected: TerminalStatus) -> bool:
@@ -1113,6 +1137,8 @@ class StatusMonitor:
 
     def clear_terminal(self, terminal_id: str) -> None:
         """Free buffer and status for a deleted terminal."""
+        with _herdr_last_recorded_lock:
+            _herdr_last_recorded_status.pop(terminal_id, None)
         with self._lock:
             self._buffers.pop(terminal_id, None)
             self._buffer_epochs.pop(terminal_id, None)
@@ -1200,10 +1226,20 @@ class StatusMonitor:
                     # get_native_status()==None fallback still gets what we have.
                     # provider.get_status may shell out to the herdr CLI — call
                     # it outside the lock.
-                    return provider.get_status(buffer)
+                    result = provider.get_status(buffer)
                 except Exception as e:
                     logger.error(f"Error deriving native status for {terminal_id}: {e}")
                     return TerminalStatus.UNKNOWN
+                # Issue #1082 (busy time): herdr never feeds the sticky-latch
+                # pipeline above, so record a transition here on the first
+                # poll that observes a different status than the last one
+                # recorded -- a pure side effect, dedup'd in its own map so
+                # this can never alter the ``result`` returned below.
+                with _herdr_last_recorded_lock:
+                    if _herdr_last_recorded_status.get(terminal_id) != result.value:
+                        _herdr_last_recorded_status[terminal_id] = result.value
+                        _record_status_transition_best_effort(terminal_id, result)
+                return result
 
         revoked_ready = False
         with self._lock:
