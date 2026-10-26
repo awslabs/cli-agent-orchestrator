@@ -257,6 +257,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workers with the same server config share one entry (owners listed under
   `caoTerminalIds`), and leftover per-terminal entries are removed at the next
   launch (#940).
+- Script-run frozen memory now uses the memory gateway, so a configured remote memory owner
+  supplies the same context as live terminals instead of freezing stale local memory. A journal
+  read failure for a known script run now withholds memory with a warning instead of falling back
+  to live, unfrozen memory; non-script runs keep their existing fallback. A remote memory owner
+  that is unreachable, errors, or has memory disabled now gives the step no memory with a warning,
+  as on the live path, instead of failing it (#828).
 - Every client call that creates a session or terminal synchronously (`cao launch` without
   `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
   `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
