@@ -240,3 +240,35 @@ def test_recorded_profile_prompt_tools_and_cleanup(create_store, monkeypatch, pr
         assert prompt_file.stat().st_mode & 0o777 == 0o600
         provider.cleanup()
         assert not prompt_file.exists()
+
+
+@pytest.mark.parametrize("load", ["claude", "codex_command", "codex_timeout"])
+@pytest.mark.parametrize("tampered", [False, True])
+def test_provider_reload_verifies_finalized_bytes(create_store, monkeypatch, load, tampered):
+    from test.services.test_ephemeral_service import CALLER, create
+
+    env = create_store
+    name = create(env)["name"]
+    token = env[0].claim_ephemeral_agent(name, {}, CALLER)["claim_id"]
+    assert token
+    path = env[2] / "ephemeral/live" / (name + ".md")
+    if tampered:
+        path.write_bytes(path.read_bytes() + b"\nChanged after finalize.\n")
+    module = claude_code if load == "claude" else codex
+    cls = module.ClaudeCodeProvider if load == "claude" else module.CodexProvider
+    monkeypatch.setattr(module, "CAO_HOME_DIR", env[2])
+    provider = cls("eeeeeeee", "cao-session", "child", name)
+    if load == "codex_timeout":
+        profile = provider._try_load_profile()
+        assert (profile is None) == tampered
+    elif load == "claude":
+        if tampered:
+            with pytest.raises(module.ProviderError):
+                provider._load_profile()
+        else:
+            assert provider._load_profile().name == name
+    elif tampered:
+        with pytest.raises(module.ProviderError):
+            provider._build_codex_command()
+    else:
+        assert "codex" in provider._build_codex_command()

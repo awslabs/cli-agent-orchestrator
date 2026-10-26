@@ -185,3 +185,26 @@ def test_send_input_forwards_the_block_unchanged(monkeypatch):
 
     assert seen["frozen_memory"] == block, "the block must arrive unchanged"
     assert seen["message"] == "hello"
+
+
+def test_script_journal_read_fault_never_injects_live_memory(monkeypatch, spy):
+    """An empty result must reach injection; None would fall back to today's store."""
+    from types import SimpleNamespace
+
+    from cli_agent_orchestrator.services import (
+        frozen_run_memory,
+        workflow_journal,
+        workflow_service,
+    )
+
+    def fail_read(_run_id):
+        raise RuntimeError("journal unavailable")
+
+    monkeypatch.setattr(workflow_journal, "get_run", fail_read)
+    monkeypatch.setattr(
+        workflow_service, "run_registry", {"script-fault": SimpleNamespace(tier="script")}
+    )
+    block = frozen_run_memory.frozen_memory_for("script-fault", "term-fault", "task")
+
+    assert inject_memory_context("task", "term-fault", frozen_memory=block) == "task"
+    assert spy["constructed"] == 0

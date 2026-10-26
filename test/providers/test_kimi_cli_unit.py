@@ -740,6 +740,30 @@ class TestKimiCliProviderBuildCommand:
         provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_bundled_server_gains_this_cao_address(
+        self, mock_load, tmp_path, monkeypatch
+    ):
+        """P3-2: Kimi (legacy CLI) is resolver-routed but was only covered
+        through the resolver's own unit tests, not at the provider level."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path):
+            command = provider._build_kimi_command()
+
+        assert '"CAO_API_PORT": "9899"' in command
+        provider.cleanup()
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_creates_agent_yaml(self, mock_load):
         """Test that agent YAML and system prompt files are created correctly."""
         mock_profile = MagicMock()

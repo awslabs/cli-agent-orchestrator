@@ -2,7 +2,9 @@
 
 import json
 import logging
-from datetime import datetime, timezone
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +22,70 @@ from cli_agent_orchestrator.decisions.hashing import (
 )
 
 logger = logging.getLogger(__name__)
+STATUS_WINDOW_HOURS = 24
+
+
+def _count_label(reason: str | None, decision_status: str | None) -> str:
+    if reason is not None:
+        return reason
+    if decision_status in ("pending", "interrupted"):
+        return decision_status
+    return "answer"
+
+
+def read_decider_status(
+    database_file: Path | None = None, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """Each decider's last outcome and its counts by reason over the last 24 hours.
+
+    The database is opened read-only, so a missing one is reported, never created, and an
+    old one is never migrated. Only labels are selected: no hash, message size or profile.
+    """
+    from cli_agent_orchestrator import constants
+
+    current = database.as_utc(now) or datetime.now(timezone.utc)
+    since = current - timedelta(hours=STATUS_WINDOW_HOURS)
+    result: dict[str, Any] = {
+        "window_hours": STATUS_WINDOW_HOURS,
+        "since": since.isoformat(),
+        "available": False,
+        "deciders": {},
+    }
+    path = database_file if database_file is not None else constants.DATABASE_FILE
+    deciders: dict[str, dict[str, Any]] = {}
+    try:
+        uri = path.resolve().as_uri() + "?mode=ro"
+        # isolation_level=None: autocommit, so the explicit BEGIN below starts the only
+        # transaction on this connection; nothing it does is a write.
+        with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as db:
+            # One read transaction, so `last` and `counts` come from the same snapshot.
+            db.execute("BEGIN")
+            for name, point, outcome, reason, created_at in db.execute(
+                "SELECT decider, point, outcome, reason, created_at FROM decision_records "
+                "WHERE id IN (SELECT MAX(id) FROM decision_records "
+                "WHERE decider IS NOT NULL GROUP BY decider)"
+            ):
+                try:
+                    created_at = datetime.fromisoformat(created_at).isoformat()
+                except (TypeError, ValueError):
+                    pass
+                last = {"point": point, "outcome": outcome, "reason": reason}
+                deciders[name] = {"last": {**last, "created_at": created_at}, "counts": {}}
+            # Compare in the stored format, as the ORM does for `cao decisions list --since`.
+            for name, reason, decision_status, count in db.execute(
+                "SELECT decider, reason, decision_status, COUNT(*) FROM decision_records "
+                "WHERE decider IS NOT NULL AND created_at >= ? "
+                "GROUP BY decider, reason, decision_status",
+                (since.strftime("%Y-%m-%d %H:%M:%S.%f"),),
+            ):
+                counts = deciders.setdefault(name, {"last": None, "counts": {}})["counts"]
+                label = _count_label(reason, decision_status)
+                counts[label] = counts.get(label, 0) + count
+    except (sqlite3.Error, OSError, RuntimeError):
+        # Missing, locked, foreign or pre-decision databases report as unavailable.
+        return result
+    result.update(available=True, deciders=deciders)
+    return result
 
 
 class DecisionStore:

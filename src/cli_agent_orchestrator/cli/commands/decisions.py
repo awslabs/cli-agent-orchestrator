@@ -30,7 +30,9 @@ def decisions() -> None:
 def status() -> None:
     """Show effective local settings.
 
-    A running server's flags are not visible here; the server logs its effective states at startup.
+    Also shows each decider's last outcome and its 24-hour counts by reason, read from the
+    database without changing it. A running server's flags are not visible here; the server
+    logs its effective settings at startup and when they change.
     """
     _run(operator.status)
 

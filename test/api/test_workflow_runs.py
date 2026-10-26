@@ -2639,7 +2639,10 @@ def test_non_git_approval_cannot_transfer_to_another_root(
     monkeypatch.setattr(
         launch_guard,
         "capture",
-        lambda profile_set=None: {"profiles": {}, "memory_enabled": False},
+        lambda profile_set=None, root_identity=None: {
+            "profiles": {},
+            "memory_enabled": False,
+        },
     )
 
     async def drive(record, source, env, *, working_directory=None):
@@ -2667,6 +2670,73 @@ def test_non_git_approval_cannot_transfer_to_another_root(
         == workflow_service.run_registry["root-a"].working_directory
         == os.path.realpath(a)
     )
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+def test_non_git_approval_cannot_transfer_to_a_replacement_at_the_same_path(
+    client, async_script_env, tmp_path, monkeypatch, endpoint
+):
+    """Issue #827 criterion 2, end to end through the real start paths.
+
+    The sibling above covers the MOVE case -- a different path is a different plan because the path is
+    in the baseline. This is the case that path alone cannot answer: the directory is moved away and a
+    different one is put at the same path, so every value the baseline carried before this fix is
+    byte-identical and the replacement inherits the approval. The run must be refused with a 403
+    carrying a plan_id the operator has not approved.
+    """
+    from cli_agent_orchestrator.services import (
+        approval_gate,
+        approval_store,
+        launch_guard,
+        manifest_freeze,
+        script_runner,
+    )
+
+    root = tmp_path / "work"
+    root.mkdir()
+    spec = async_script_env["spec"]
+    manifest = manifest_freeze.build_manifest_json(
+        source_hash=spec.content_hash, inputs={}, cwd=str(root)
+    )
+    approved = json.loads(manifest)["plan_id"]
+    assert json.loads(manifest)["repo_baseline"]["root_identity"]["bound"] is True, (
+        "fixture assumption broken: this root must be outside Git and on a filesystem with usable "
+        "inodes for the replacement case to be the one under test"
+    )
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    monkeypatch.setattr(
+        approval_store,
+        "approval_state",
+        lambda plan: approval_store.APPROVED if plan == approved else approval_store.ABSENT,
+    )
+    monkeypatch.setattr(
+        launch_guard,
+        "capture",
+        lambda profile_set=None, root_identity=None: {
+            "profiles": {},
+            "memory_enabled": False,
+        },
+    )
+
+    async def drive(record, source, env, *, working_directory=None):
+        return _result(state=RunState.COMPLETED)
+
+    monkeypatch.setattr(script_runner, "_drive_frozen", drive)
+    body = {"name_or_path": "scr", "inputs": {}, "working_directory": str(root)}
+    ok = client.post(endpoint, json={**body, "run_id": "root-original"})
+    assert ok.status_code == (202 if endpoint.endswith(":submit") else 200), ok.text
+
+    root.rename(tmp_path / "moved-away")
+    (tmp_path / "work").mkdir()
+
+    refused = client.post(endpoint, json={**body, "run_id": "root-replacement"})
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"]["plan_id"] != approved
+    assert workflow_journal.get_run("root-replacement") is None
+    # The path really is unchanged: the refusal came from the root's identity, not from the string.
+    assert json.loads(workflow_journal.get_run("root-original").manifest_json)["repo_baseline"][
+        "root"
+    ] == os.path.realpath(tmp_path / "work")
 
 
 @pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])

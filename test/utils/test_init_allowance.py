@@ -73,21 +73,14 @@ def test_resolve_init_timeout_falls_back_when_the_profile_cannot_be_loaded():
         assert resolve_init_timeout("missing", _SETTINGS) == 60
 
 
-def test_resolve_init_timeout_sees_a_reserved_ephemeral_profile_override():
-    """A reserved ephemeral name is served exclusively from the server-owned
-    live store by ``load_launch_profile`` (``agent_profiles.py``), never by
-    ``load_agent_profile`` alone. The client must resolve through the same
-    loader the server uses (``terminal_service.py:1497``), or it silently
-    falls back to the server default while the server applies the ephemeral
-    override."""
-    from cli_agent_orchestrator.utils.agent_profiles import ProfileSource
-
-    profile = SimpleNamespace(provider_init_timeout=300)
+def test_resolve_init_timeout_skips_reserved_ephemeral_profile_override():
+    """Generated profiles have no override; MCP sizing must not load their registry."""
     with patch(
         "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
-        return_value=(profile, ProfileSource.EPHEMERAL),
-    ):
-        assert resolve_init_timeout("Agent-fixup-1a2b", _SETTINGS) == 300
+        side_effect=AssertionError("MCP sizing must not load an ephemeral profile"),
+    ) as load:
+        assert resolve_init_timeout("Agent-fixup-1a2b", _SETTINGS) == 60
+        load.assert_not_called()
 
 
 def test_resolve_init_timeout_falls_back_when_ephemeral_profile_unavailable():
@@ -202,3 +195,55 @@ def test_synchronous_create_timeout_reads_settings_when_none_passed():
         return_value=_SETTINGS,
     ):
         assert synchronous_create_timeout() == (_CONNECT_TIMEOUT_S, 430.0)
+
+
+@pytest.mark.parametrize("set_cao_home", [True, False])
+def test_mcp_ephemeral_init_allowance_never_connects_registry(tmp_path, set_cao_home):
+    """Exercise the three MCP caller aliases in a fresh process with a live profile."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    home = tmp_path / "home"
+    home.mkdir()
+    cao = tmp_path / "cao" if set_cao_home else home / ".aws" / "cli-agent-orchestrator"
+    live = cao / "ephemeral" / "live"
+    live.mkdir(parents=True)
+    (live / "ACDC-reviewer-1a2b.md").write_text(
+        "---\nname: ACDC-reviewer-1a2b\ndescription: test\nprovider: claude_code\n"
+        "provider_init_timeout: 999\n---\nBody.\n"
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("CAO_", "HERDR_", "TMUX"))
+    }
+    env.update(HOME=str(home), TMUX_TMPDIR=str(tmp_path / "tmux"), CAO_API_PORT="9")
+    if set_cao_home:
+        env["CAO_HOME_DIR"] = str(cao)
+    script = """
+import json
+from sqlalchemy.engine import Engine
+seen = []
+original = Engine.connect
+def spy(self, *args, **kwargs):
+    seen.append(str(self.url))
+    return original(self, *args, **kwargs)
+Engine.connect = spy
+from cli_agent_orchestrator.mcp_server import server, app_tools
+from cli_agent_orchestrator.ops_mcp_server import server as ops
+from cli_agent_orchestrator.utils import orchestration
+from cli_agent_orchestrator.constants import DATABASE_FILE
+settings = {'provider_init_timeout': 60, 'mcp_request_timeout': 30}
+results = [caller.synchronous_create_timeout('ACDC-reviewer-1a2b', settings)
+           for caller in (orchestration, app_tools, ops)]
+print(json.dumps({'engine_connects': seen, 'db_file_created': DATABASE_FILE.exists(),
+                  'timeouts': results}))
+"""
+    child = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True)
+    assert child.returncode == 0, child.stdout + child.stderr
+    result = json.loads(child.stdout)
+    assert result["engine_connects"] == [], result
+    assert result["db_file_created"] is False, result
+    assert result["timeouts"] == [[5.0, 430.0]] * 3, result

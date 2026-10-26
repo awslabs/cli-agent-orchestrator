@@ -160,8 +160,10 @@ def test_brief_is_internal_verbatim_prompt_structure(create_store, brief):
         "description",
         "provider",
         "allowedTools",
+        "skills",
         "mcpServers",
     }
+    assert parsed.skills == []
     assert set(parsed.mcpServers) == {"cao-mcp-server"}
     assert parsed.native_agent is None and parsed.hooks is None
 

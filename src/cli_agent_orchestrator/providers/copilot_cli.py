@@ -24,7 +24,7 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import (
     forward_terminal_identity,
-    resolve_cao_mcp_command,
+    resolve_mcp_server_config,
 )
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
@@ -246,11 +246,19 @@ class CopilotCliProvider(BaseProvider):
 
     def _build_runtime_mcp_config(self) -> str:
         # Resolve the bundled cao-mcp-server console script to a PATH-independent
-        # invocation via the shared resolver.
-        mcp_command, mcp_args = resolve_cao_mcp_command("cao-mcp-server", [])
+        # invocation, and forward this CAO's own address/home, via the shared
+        # resolver. This config is rebuilt fresh at every launch (persisted=False),
+        # so the bundled server always learns the CAO that is about to start it.
         merged_servers: dict = {
             "cao-mcp-server": forward_terminal_identity(
-                {"command": mcp_command, "args": mcp_args, "disabled": False},
+                resolve_mcp_server_config(
+                    {
+                        "command": "cao-mcp-server",
+                        "args": [],
+                        "disabled": False,
+                        "env": {"CAO_TERMINAL_ID": self.terminal_id},
+                    }
+                ),
                 self.terminal_id,
                 server_name="cao-mcp-server",
             )

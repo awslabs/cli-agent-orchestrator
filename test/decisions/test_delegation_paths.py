@@ -1,9 +1,7 @@
 """Conformance and unchanged results through the real delegation entry points."""
 
-import json
 from test.fixtures.decision_conformance import ConfidentDecider, conformance_cases, run_case
 from test.fixtures.delegation_conformance import DelegationAdapter
-from test.fixtures.delegation_goldens import GOLDEN_RESULTS
 
 import pytest
 
@@ -37,32 +35,56 @@ async def test_empty_task_launches_with_points_off(entrypoint, tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "entrypoint,key", [("assign", "assign"), ("handoff", "handoff"), ("elastic", "assign_elastic")]
-)
-@pytest.mark.parametrize("mode", ["off", "shadow", "explicit", "excluded"])
-async def test_unchanged_results_equal_captured_goldens(
-    entrypoint, key, mode, tmp_path, monkeypatch
+@pytest.mark.parametrize("entrypoint", ["assign", "handoff", "elastic"])
+async def test_decision_state_does_not_change_the_caller_visible_result(
+    entrypoint, tmp_path, monkeypatch
 ):
-    adapter = DelegationAdapter(tmp_path, monkeypatch, entrypoint)
-    adapter.exclude = mode == "excluded"
+    """Decision routing must be invisible to the caller: the same task gets the
+    same result whether the point is off, shadow, driven by an explicit model,
+    or bypassed by an excluded profile. This is the regression the old
+    byte-for-byte golden text guarded: enabling/disabling decisions must not
+    change what assign/handoff/elastic hand back. Comparing the four modes to
+    each other (instead of to stored text) still catches that regression
+    without pinning wording that is free to change for unrelated reasons.
+    """
+    from cli_agent_orchestrator.constants import DECISION_RESPONSE_HEADER
+
     decider = ConfidentDecider("small", 0.91)
-    adapter.configure(
-        states={
-            "model.route": "off" if mode == "off" else ("shadow" if mode == "shadow" else "on")
-        },
-        deciders={"model.route": decider},
-        model_tiers={"codex": {"small": "model-x"}},
-    )
-    await adapter.delegate(message="fixture task", model="explicit" if mode == "explicit" else None)
-    result = (
-        adapter.result
-        if isinstance(adapter.result, dict)
-        else adapter.result.model_dump(mode="json")
-    )
-    assert json.dumps(result) == json.dumps(GOLDEN_RESULTS[key])
-    await adapter.engine.runner.drain()
-    await adapter.engine.runner.close()
+    results = {}
+    for mode in ("off", "shadow", "explicit", "excluded"):
+        adapter = DelegationAdapter(tmp_path, monkeypatch, entrypoint)
+        adapter.exclude = mode == "excluded"
+        adapter.configure(
+            states={
+                "model.route": "off" if mode == "off" else ("shadow" if mode == "shadow" else "on")
+            },
+            deciders={"model.route": decider},
+            model_tiers={"codex": {"small": "model-x"}},
+        )
+        await adapter.delegate(
+            message="fixture task", model="explicit" if mode == "explicit" else None
+        )
+        result = (
+            adapter.result
+            if isinstance(adapter.result, dict)
+            else adapter.result.model_dump(mode="json")
+        )
+        results[mode] = result
+        leaked = set(result) & _decision_only_fields()
+        assert not leaked, f"{entrypoint} [{mode}] returns decision field(s) {sorted(leaked)}"
+        assert not [
+            r for r in adapter.responses if DECISION_RESPONSE_HEADER in r.headers
+        ], f"{entrypoint} [{mode}] sent a decision note"
+        await adapter.engine.runner.drain()
+        await adapter.engine.runner.close()
+
+    off_result = results["off"]
+    assert off_result["success"] is True
+    assert off_result.get("terminal_id")
+    for mode, result in results.items():
+        assert (
+            result == off_result
+        ), f"{entrypoint}: {mode} result differs from off: {result} != {off_result}"
 
 
 @pytest.mark.asyncio
@@ -231,25 +253,82 @@ async def test_real_capability_reprobe_is_reflected_in_tool_result(
     await adapter.engine.runner.close()
 
 
-def test_agent_tool_definitions_and_models_are_unchanged():
-    import hashlib
-    from pathlib import Path
-    from test.fixtures.delegation_goldens import TOOL_DEFINITIONS_SHA256, TOOL_MODELS_SHA256
-    from test.fixtures.tool_definitions import definition_fingerprint
+# Decision-record column names (clients/database.py
+# DecisionRecordModel) that are also used elsewhere on the MCP surface for
+# something unrelated to decisions: agent_profile (params of assign,
+# assign_elastic, handoff, list_outcomes, report_outcome), answer
+# (answer_user_prompt param), provider (params of assign_elastic and
+# create_ephemeral_agent), state (workflow_list param) and terminal_id
+# (params plus HandoffResult). These are excluded because flagging them
+# would fail this test today for reasons that have nothing to do with a
+# decision leaking onto the public surface.
+_GENERIC_DECISION_RECORD_FIELDS = frozenset(
+    {"agent_profile", "answer", "provider", "state", "terminal_id"}
+)
 
-    root = Path(__file__).resolve().parents[2]
-    assert (
-        definition_fingerprint(
-            (root / "src/cli_agent_orchestrator/mcp_server/server.py").read_text()
-        )
-        == TOOL_DEFINITIONS_SHA256
+
+def _decision_only_fields():
+    from cli_agent_orchestrator.clients.database import DecisionRecordModel
+
+    return frozenset(
+        c
+        for c in DecisionRecordModel.__table__.columns.keys()
+        if c not in _GENERIC_DECISION_RECORD_FIELDS
     )
-    assert (
-        hashlib.sha256(
-            (root / "src/cli_agent_orchestrator/mcp_server/models.py").read_bytes()
-        ).hexdigest()
-        == TOOL_MODELS_SHA256
-    )
+
+
+def test_no_mcp_tool_param_or_output_model_has_a_decision_field():
+    """No `@mcp.tool` parameter or result model may expose a decision-record
+    field (candidate_model, launched_model, applied_value, decider, ...): the
+    decision platform is meant to stay an internal routing concern, invisible
+    on the public MCP surface. This replaces a byte-for-byte hash of
+    `server.py`/`models.py`, which broke on any unrelated docstring edit or
+    new tool and didn't explain what changed; this check instead fails only
+    when a decision field actually appears on a tool param or result model.
+    """
+    import ast
+    import asyncio
+    import inspect
+
+    from fastmcp import FastMCP
+    from pydantic import BaseModel
+
+    from cli_agent_orchestrator.mcp_server import models as result_models
+    from cli_agent_orchestrator.mcp_server import server as cao_mcp
+
+    decision_fields = _decision_only_fields()
+
+    tools = asyncio.run(cao_mcp.mcp._list_tools())
+    assert tools, "expected at least one registered MCP tool"
+    scratch = FastMCP("scratch")
+    cao_mcp._register_ephemeral_tool(scratch, True)
+    tools += asyncio.run(scratch._list_tools())
+    for tool in tools:
+        params = set(tool.parameters.get("properties", {}))
+        leaked = params & decision_fields
+        assert not leaked, f"{tool.name} takes decision field(s) {sorted(leaked)}"
+        output_props = set((tool.output_schema or {}).get("properties", {}))
+        leaked = output_props & decision_fields
+        assert not leaked, f"{tool.name} returns decision field(s) {sorted(leaked)}"
+
+    for name, obj in vars(result_models).items():
+        if isinstance(obj, type) and issubclass(obj, BaseModel) and obj is not BaseModel:
+            leaked = set(obj.model_fields) & decision_fields
+            assert not leaked, f"{name} has decision field(s) {sorted(leaked)}"
+
+    for node in ast.walk(ast.parse(inspect.getsource(cao_mcp))):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+            isinstance(d, ast.Call) and getattr(d.func, "attr", None) == "tool"
+            for d in node.decorator_list
+        ):
+            names = {a.arg for a in node.args.args + node.args.kwonlyargs}
+            leaked = names & decision_fields
+            assert not leaked, f"{node.name} (any branch) takes decision field(s) {sorted(leaked)}"
+
+
+def test_decision_response_header_name_is_shared():
+    # The header name is a wire-format value callers key off of -- an exact
+    # pin is the contract here, not brittleness.
     from cli_agent_orchestrator.api import main as api
     from cli_agent_orchestrator.utils import orchestration
 
@@ -319,3 +398,9 @@ async def test_invalid_shadow_answer_is_invisible_to_delegation(entrypoint, tmp_
     )
     assert "auto:" not in message
     await adapter.engine.runner.close()
+
+
+def test_no_decision_note_leaves_the_message_unchanged():
+    from cli_agent_orchestrator.utils import orchestration
+
+    assert orchestration._append_decision_note("task text", []) == "task text"
