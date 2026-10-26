@@ -1547,6 +1547,106 @@ class TestClaudeCodeProviderMisc:
         assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
 
 
+class TestClaudeCodeMcpServerCoordinates:
+    """A non-default cao-server's coordinates reach the bundled MCP server (#1066).
+
+    Claude Code hands an MCP subprocess only what the entry's ``env`` names, so
+    a server launched by a cao-server on port 9899 otherwise fell back to
+    127.0.0.1:9889 and sent its assign/handoff calls to a different CAO.
+    """
+
+    def _profile(self):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.permissionMode = None
+        profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        return profile
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_non_default_port_reaches_the_bundled_server(
+        self, mock_load, monkeypatch, default_cao_server
+    ):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        mock_load.return_value = self._profile()
+
+        provider = ClaudeCodeProvider("term-1066", "test-session", "window-0", "test-agent")
+        mcp_data = _extract_mcp_config(provider._build_claude_command())
+
+        server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env["CAO_API_PORT"] == "9899"
+        assert server_env["CAO_TERMINAL_ID"] == "term-1066"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_all_three_coordinates_reach_the_bundled_server(
+        self, mock_load, monkeypatch, default_cao_server
+    ):
+        monkeypatch.setenv("CAO_API_HOST", "10.0.0.4")
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-trial")
+        mock_load.return_value = self._profile()
+
+        provider = ClaudeCodeProvider("term-1066", "test-session", "window-0", "test-agent")
+        mcp_data = _extract_mcp_config(provider._build_claude_command())
+
+        server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env["CAO_API_HOST"] == "10.0.0.4"
+        assert server_env["CAO_API_PORT"] == "9899"
+        assert server_env["CAO_HOME_DIR"] == "/srv/cao-trial"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_the_entrys_own_env_still_wins(self, mock_load, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        profile = self._profile()
+        profile.mcpServers["cao-mcp-server"]["env"] = {"CAO_API_PORT": "7777"}
+        mock_load.return_value = profile
+
+        provider = ClaudeCodeProvider("term-1066", "test-session", "window-0", "test-agent")
+        mcp_data = _extract_mcp_config(provider._build_claude_command())
+
+        assert mcp_data["mcpServers"]["cao-mcp-server"]["env"]["CAO_API_PORT"] == "7777"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_default_server_writes_the_pre_change_config(self, mock_load, default_cao_server):
+        """None of the three set: only CAO_TERMINAL_ID, exactly as before."""
+        mock_load.return_value = self._profile()
+
+        provider = ClaudeCodeProvider("term-1066", "test-session", "window-0", "test-agent")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            mcp_data = _extract_mcp_config(provider._build_claude_command())
+
+        assert mcp_data == {
+            "mcpServers": {
+                "cao-mcp-server": {
+                    "type": "stdio",
+                    "command": "/venv/bin/cao-mcp-server",
+                    "args": [],
+                    "env": {"CAO_TERMINAL_ID": "term-1066"},
+                }
+            }
+        }
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_a_third_party_server_does_not_learn_the_coordinates(
+        self, mock_load, monkeypatch, default_cao_server
+    ):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        profile = self._profile()
+        profile.mcpServers = {"my-server": {"command": "my-server", "args": []}}
+        mock_load.return_value = profile
+
+        provider = ClaudeCodeProvider("term-1066", "test-session", "window-0", "test-agent")
+        mcp_data = _extract_mcp_config(provider._build_claude_command())
+
+        assert mcp_data["mcpServers"]["my-server"]["env"] == {"CAO_TERMINAL_ID": "term-1066"}
+
+
 class TestClaudeCodeProviderContainerPathTranslation:
     """_build_claude_command must translate temp-file paths for container profiles.
 

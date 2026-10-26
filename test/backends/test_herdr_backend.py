@@ -1427,6 +1427,80 @@ class TestBuildEnvArgs:
         assert "CAO_SESSION_NAME=cao-proj" in joined
         assert "CAO_SESSION_NAME=evil" not in joined
 
+    def test_build_env_args_carries_server_coordinates(self, monkeypatch, default_cao_server):
+        """A new pane carries the running server's coordinates (#1066).
+
+        A herdr pane's env starts empty, so it otherwise inherited the herdr
+        server's environment -- whichever CAO (or none) started that server.
+        The tmux backend already inherits every ``CAO_*`` var from this
+        process; this is parity.
+        """
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        monkeypatch.setenv("CAO_API_HOST", "10.0.0.4")
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-trial")
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(terminal_id="term_x", session_name="sess-a")
+        assert "CAO_API_HOST=10.0.0.4" in pairs
+        assert "CAO_API_PORT=9899" in pairs
+        assert "CAO_HOME_DIR=/srv/cao-trial" in pairs
+
+    def test_build_env_args_default_server_adds_no_coordinates(self, default_cao_server):
+        """None of the three set: exactly the two identity vars, as before."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(terminal_id="term_x", session_name="sess-a")
+        assert pairs == [
+            "--env",
+            "CAO_TERMINAL_ID=term_x",
+            "--env",
+            "CAO_SESSION_NAME=sess-a",
+        ]
+
+    def test_build_env_args_operator_env_overrides_coordinates(
+        self, monkeypatch, default_cao_server
+    ):
+        """The coordinates are assigned AHEAD of operator-forwarded vars."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="term_x",
+            session_name="sess-a",
+            extra_env={"CAO_API_PORT": "7777"},
+        )
+        assert "CAO_API_PORT=7777" in pairs
+        assert "CAO_API_PORT=9899" not in pairs
+
+    def test_build_env_args_coordinates_do_not_weaken_the_blocklist(
+        self, monkeypatch, default_cao_server
+    ):
+        """Blocked keys are still dropped, and CAO_TERMINAL_ID still cannot be
+        overridden, with the coordinates in play."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="real-tid",
+            session_name="sess-a",
+            extra_env={
+                "CAO_TERMINAL_ID": "spoofed",
+                "CLAUDE_SECRET": "x",
+                "LD_PRELOAD": "/tmp/evil.so",
+                "PATH": "/tmp/evil",
+            },
+        )
+        assert "CAO_API_PORT=9899" in pairs
+        assert "CAO_TERMINAL_ID=real-tid" in pairs
+        assert "CAO_TERMINAL_ID=spoofed" not in pairs
+        assert all("CLAUDE_SECRET" not in tok for tok in pairs)
+        assert all("LD_PRELOAD" not in tok for tok in pairs)
+        assert all(not tok.startswith("PATH=") for tok in pairs)
+
 
 class TestEnvValueRedaction:
     """P1: operator-forwarded --env values are secrets; they must never appear

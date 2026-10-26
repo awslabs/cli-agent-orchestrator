@@ -492,6 +492,109 @@ class TestCodexBuildCommand:
         assert "CAO_TERMINAL_ID" in command
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_non_default_port_reaches_the_bundled_server(
+        self, mock_load_profile, monkeypatch, default_cao_server
+    ):
+        """A cao-server on 9899 hands its port to the bundled MCP server (#1066).
+
+        Codex passes an MCP subprocess only what the entry names, so the
+        coordinates have to be VALUES in the env inline table -- naming them in
+        ``env_vars`` would inherit whatever the pane happens to hold.
+        """
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = ""
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_profile.codexProfile = None
+        mock_load_profile.return_value = mock_profile
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
+        command = provider._build_codex_command()
+
+        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_bundled_server_env_entry_still_wins(
+        self, mock_load_profile, monkeypatch, default_cao_server
+    ):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-trial")
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = ""
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {
+                "type": "stdio",
+                "command": "cao-mcp-server",
+                "args": [],
+                "env": {"CAO_API_PORT": "7777"},
+            }
+        }
+        mock_profile.codexProfile = None
+        mock_load_profile.return_value = mock_profile
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
+        command = provider._build_codex_command()
+
+        assert '"CAO_API_PORT" = "7777"' in command
+        assert '"CAO_API_PORT" = "9899"' not in command
+        assert '"CAO_HOME_DIR" = "/srv/cao-trial"' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_default_server_emits_no_env_override(self, mock_load_profile, default_cao_server):
+        """None of the three set: no ``.env=`` override at all, as before."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = ""
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_profile.codexProfile = None
+        mock_load_profile.return_value = mock_profile
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
+        command = provider._build_codex_command()
+
+        assert "mcp_servers.cao-mcp-server.env=" not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_uvx_declared_bundled_server_reaches_the_right_cao(
+        self, mock_load_profile, monkeypatch, default_cao_server
+    ):
+        """The shape ``templates/aws/*/template.md.j2`` declares.
+
+        The command is ``uvx``, so it is a passthrough for command resolution;
+        recognising the server only by command equality would have left every
+        profile created from a shipped AWS template reporting to the default
+        CAO.
+        """
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = ""
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {
+                "type": "stdio",
+                "command": "uvx",
+                "args": [
+                    "--from",
+                    "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                    "cao-mcp-server",
+                ],
+            }
+        }
+        mock_profile.codexProfile = None
+        mock_load_profile.return_value = mock_profile
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
+        command = provider._build_codex_command()
+
+        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_empty_system_prompt(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.model = None

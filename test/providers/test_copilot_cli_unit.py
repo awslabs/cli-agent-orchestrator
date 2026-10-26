@@ -1554,6 +1554,33 @@ class TestCopilotCliProviderMisc:
             runtime_cfg = json.loads(provider._build_runtime_mcp_config())
         assert runtime_cfg["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
 
+    def test_build_runtime_mcp_config_carries_server_coordinates(
+        self, monkeypatch, default_cao_server
+    ):
+        """A non-default cao-server's coordinates reach the hand-built entry (#1066).
+
+        This entry is assembled here rather than through
+        ``resolve_mcp_server_config``, so it needs its own
+        ``apply_server_coordinates`` call to stay in step with the providers
+        that get it from the shared resolver.
+        """
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-trial")
+        provider = CopilotCliProvider("abc12345", "test-session", "window-0")
+        runtime_cfg = json.loads(provider._build_runtime_mcp_config())
+        server_env = runtime_cfg["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env["CAO_API_PORT"] == "9899"
+        assert server_env["CAO_HOME_DIR"] == "/srv/cao-trial"
+        assert server_env["CAO_TERMINAL_ID"] == "abc12345"
+
+    def test_build_runtime_mcp_config_default_server_carries_terminal_id_only(
+        self, default_cao_server
+    ):
+        """None of the three set: byte-identical to the pre-change entry."""
+        provider = CopilotCliProvider("abc12345", "test-session", "window-0")
+        runtime_cfg = json.loads(provider._build_runtime_mcp_config())
+        assert runtime_cfg["mcpServers"]["cao-mcp-server"]["env"] == {"CAO_TERMINAL_ID": "abc12345"}
+
     def test_cleanup_resets_initialized_state(self):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         provider._initialized = True

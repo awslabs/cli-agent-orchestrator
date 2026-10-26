@@ -241,6 +241,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An agent launched by a `cao-server` running on a non-default port, host or home now reaches
+  that server rather than the default one, whether the operator gave the coordinate as a
+  `--host` / `--port` flag or as an environment variable. The bundled `cao-mcp-server` was told
+  only `CAO_TERMINAL_ID`, and Claude Code and Codex hand an MCP subprocess nothing else, so it
+  fell back to `127.0.0.1:9889` and `~/.aws/cli-agent-orchestrator` — the agent's `assign`,
+  `handoff`, `send_message` and memory calls went to a different CAO, or to none. The runtime MCP
+  server entry CAO builds for a launch now carries the server's own `CAO_API_HOST`,
+  `CAO_API_PORT` and `CAO_HOME_DIR`, for whichever are set, below any `env` the entry already
+  declares; herdr panes get them through `--env`, ahead of operator-forwarded variables and
+  without weakening the blocked-key filter. `cao-server` publishes its effective host and port
+  into its own environment at startup, so a coordinate given as a flag reaches the children too,
+  and `CAO_HOME_DIR` is handed over canonicalised, so a relative value cannot mean a different
+  directory in a subprocess started from another working directory. Only entries that start
+  CAO's own server receive them, recognised by the whole shape of the command — a third-party
+  server that merely names `cao-mcp-server` (as its own script under a different `uvx --from`,
+  or as an argument of its own) is not handed CAO's endpoint. A persisted entry — `cao install`'s
+  settings, a user-level MCP config, antigravity's shared `mcp_config.json` — deliberately gains
+  none of them, since the next `cao-server` to read it may be a different one. A default CAO
+  leaves its environment untouched and builds byte-identical launch commands and MCP configs
+  (#1066).
 - Antigravity CLI workers no longer report under another worker's terminal id.
   Every `agy` process starts every server in the shared
   `~/.gemini/config/mcp_config.json`, and each worker's entry pinned its

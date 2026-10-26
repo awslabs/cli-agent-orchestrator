@@ -1143,6 +1143,59 @@ def test_prune_stale_mcp_entries_on_register(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Persisted config never pins this server's coordinates (#1066)
+# --------------------------------------------------------------------------- #
+
+
+def test_shared_mcp_config_never_pins_the_server_coordinates(
+    tmp_path, monkeypatch, default_cao_server
+):
+    """agy's ``mcp_config.json`` outlives this process, so it gains none of them.
+
+    Every ``agy`` on this machine starts every server listed in that file,
+    including agy processes a LATER cao-server launches. A pinned
+    ``CAO_API_PORT`` there would send those agents to a server that is gone --
+    the same class of bug as the pinned ``CAO_TERMINAL_ID`` of #940. The
+    coordinates reach this provider's MCP server through the agy process's own
+    pane environment instead (tmux inherits every ``CAO_*`` var; herdr is given
+    them explicitly by ``_build_env_args``).
+    """
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    monkeypatch.setenv("CAO_API_HOST", "10.0.0.4")
+    monkeypatch.setenv("CAO_API_PORT", "9899")
+    monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-trial")
+
+    cfg = tmp_path / "mcp_config.json"
+    profile = AgentProfile(
+        name="dev_gemini",
+        description="Dev",
+        system_prompt="You develop.",
+        mcpServers={"cao-mcp-server": {"command": "cao-mcp-server", "args": []}},
+    )
+    p = make_provider(terminal_id="new-tid", agent_profile="dev_gemini")
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p._build_agy_command()
+
+    raw = cfg.read_text()
+    for name in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+        assert name not in raw, f"{name} was pinned into the shared, persisted {cfg.name}"
+    _, entry = _cao_entry(json.loads(raw)["mcpServers"], "cao-mcp-server")
+    assert "env" not in entry
+
+
+# --------------------------------------------------------------------------- #
 # Cleanup future exception surfacing (finding 3)
 # --------------------------------------------------------------------------- #
 
