@@ -1009,7 +1009,33 @@ async function readHumanApproval(
       `no human-surface approval found for ${approvalId}; a human must action the approval surface before the packet can be resolved`,
     );
   }
-  return readJson<HumanApprovalRecord>(path);
+  const record = await readJson<unknown>(path);
+  const problems = approvalShapeProblems(record, approvalId);
+  if (problems.length > 0) {
+    throw new PortfolioError(
+      `approval ${approvalId} is malformed: ${problems.join("; ")}`,
+    );
+  }
+  return record as HumanApprovalRecord;
+}
+
+function approvalShapeProblems(record: unknown, approvalId: string): string[] {
+  if (!isRecord(record)) return ["record must be a JSON object"];
+  const problems: string[] = [];
+  if (record.schemaVersion !== 1) problems.push("schemaVersion must be 1");
+  for (const field of ["id", "packet", "answeredBy", "source", "recordedAt"]) {
+    if (typeof record[field] !== "string") problems.push(`${field} must be a string`);
+  }
+  if (typeof record.id === "string" && record.id !== approvalId) {
+    problems.push(`id ${record.id} does not match ${approvalId}`);
+  }
+  if (record.consumed !== undefined && typeof record.consumed !== "boolean") {
+    problems.push("consumed must be a boolean");
+  }
+  if (record.consumedAt !== undefined && typeof record.consumedAt !== "string") {
+    problems.push("consumedAt must be a string");
+  }
+  return problems;
 }
 
 export async function listQuestionPackets(

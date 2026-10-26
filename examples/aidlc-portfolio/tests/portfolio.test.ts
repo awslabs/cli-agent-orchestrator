@@ -541,6 +541,53 @@ describe("portfolio workspace", () => {
     expect(stateCompleted.activeIntent).toBeNull();
   }, 20_000);
 
+  test("refuses a malformed approval record with a portfolio error", async () => {
+    const root = await temporaryRoot();
+    const { answered } = await waitingQuestionPacket(root, "malformed");
+    const approvals = join(root, "portfolio/approvals");
+    const packetPath = join(root, "portfolio/questions/malformed.json");
+    const pendingPacket = await readFile(packetPath, "utf8");
+    const cases: Array<[string, unknown, string]> = [
+      [
+        "no-identity",
+        {
+          schemaVersion: 1,
+          id: "no-identity",
+          packet: "malformed",
+          source: "human-surface",
+          recordedAt: "2026-07-26T00:00:00.000Z",
+        },
+        "approval no-identity is malformed: answeredBy must be a string",
+      ],
+      ["not-object", [], "not-object is malformed: record must be a JSON object"],
+      [
+        "other-id",
+        {
+          schemaVersion: 1,
+          id: "someone-else",
+          packet: "malformed",
+          answeredBy: "Portfolio owner",
+          source: "human-surface",
+          recordedAt: "2026-07-26T00:00:00.000Z",
+        },
+        "id someone-else does not match other-id",
+      ],
+    ];
+    for (const [approvalId, record, message] of cases) {
+      await writeFile(join(approvals, `${approvalId}.json`), JSON.stringify(record));
+      const attempt = answerQuestionPacket(
+        root,
+        "malformed",
+        answered,
+        "guided",
+        approvalId,
+      );
+      await expect(attempt).rejects.toBeInstanceOf(PortfolioError);
+      await expect(attempt).rejects.toThrow(message);
+    }
+    expect(await readFile(packetPath, "utf8")).toBe(pendingPacket);
+  }, 20_000);
+
   test("CLI requires approval-id even when answered-by is supplied", async () => {
     const root = await temporaryRoot();
     await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
@@ -1134,6 +1181,39 @@ function section(message: string, start: string, end: string): string {
   expect(from).toBeGreaterThanOrEqual(0);
   expect(to).toBeGreaterThan(from);
   return message.slice(from, to);
+}
+
+// One active api session with a submitted, unanswered question packet, and
+// the human's answered Markdown ready to submit.
+async function waitingQuestionPacket(
+  root: string,
+  id: string,
+): Promise<{ answered: string }> {
+  await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
+  await registerProject(root, "api");
+  await registerIntent(root, {
+    id: "feature",
+    projects: [
+      {
+        project: "api",
+        aidlcIntent: "feature-api",
+        branch: "feat/feature-api",
+        worktree: "worktrees/api/feature",
+        dependsOn: [],
+      },
+    ],
+  });
+  await createHarness(root, "api/feature");
+  await confirmDefaultDiscovery(root);
+  await advanceToDispatch(root);
+  await updateSession(root, "feature", "api", "active", "runner-terminal");
+  const questionText = "## Storage\n\nA. SQL\nB. Object storage\n\n[Answer]:\n";
+  const generated = join(root, `${id}-questions.md`);
+  await writeFile(generated, questionText);
+  await submitQuestionPacket(root, id, "api", "feature", "application-design", generated);
+  const answered = join(root, `${id}-answers.md`);
+  await writeFile(answered, questionText.replace("[Answer]:", "[Answer]: A. SQL"));
+  return { answered };
 }
 
 async function temporaryRoot(): Promise<string> {
