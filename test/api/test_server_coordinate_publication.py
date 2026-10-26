@@ -26,8 +26,32 @@ import pytest
 from cli_agent_orchestrator.constants import (
     DEFAULT_SERVER_HOST,
     DEFAULT_SERVER_PORT,
+    SERVER_COORDINATE_ENV_VARS,
     server_coordinate_env,
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_the_coordinate_variables():
+    """Put the coordinate variables back exactly as this test found them.
+
+    ``main()`` writes them into ``os.environ`` ITSELF -- that is the behaviour
+    under test -- and also removes them, so ``monkeypatch`` cannot undo it: it
+    only reverses changes it made, and ``delenv(raising=False)`` on an absent
+    variable records nothing to reverse. Without this, a published ``9777``
+    outlived the test and any later ``importlib.reload(constants)`` in the same
+    session (``test/providers/test_cursor_cli_unit.py`` does one in a teardown)
+    recomputed ``API_BASE_URL`` from it, failing an unrelated test in
+    ``test/mcp_server``. Autouse rather than per-test, because every test in
+    this file runs ``main()``.
+    """
+    before = {name: os.environ.get(name) for name in SERVER_COORDINATE_ENV_VARS}
+    yield
+    for name, value in before.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 class Launch(NamedTuple):
