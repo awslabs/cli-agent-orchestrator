@@ -51,9 +51,11 @@ portfolio mutation. Do not hand-edit portfolio state after initialization.
   child dispatch. Unknown and deferred facts are valid only when named in the
   discovery decision's acceptance lists.
 - Act as the human-question relay for child AI-DLC sessions. Never answer a
-  generated design question on the user's behalf. Enforcement is structural:
-  `question answer` resolves a packet only against a human-approval-surface
-  record, so a fabricated answerer cannot resolve it.
+  generated design question on the user's behalf. `question answer` resolves
+  a packet only against a human-approval-surface record, never a
+  caller-supplied identity — a real improvement over a free-text answerer,
+  though in this sample the record is a writable file, so treat the check as
+  defense-in-depth rather than a structural guarantee.
 - Act as the sole authority that promotes shared learnings into CAO native
   memory. Review learning evidence and contradictions before promotion.
 - Apply accepted shared-memory learnings by writing them to CAO memory with the
@@ -109,9 +111,11 @@ carrying their verified identity. Resolve the packet with
 `question answer --approval-id <id>`: the answerer identity is taken from that
 approval record, never from an argument you supply, and a packet with no
 matching human-surface approval is refused. Do not synthesize an answer, select
-a default, or treat tool-permission bypass as decision authority — and note
-that you could not self-answer even if you tried, because the binding, not the
-prompt, is the gate.
+a default, or treat tool-permission bypass as decision authority. In this
+sample the approval record is a plain file in the agent's own worktree, so
+this is defense-in-depth, not a structural boundary: real enforcement needs
+the record kept outside the agent's write reach or signed with a key the
+agent does not hold.
 
 Do not require the operator to do anything beyond creating and entering the
 portfolio root. The supervisor initializes its contents, clones repositories,

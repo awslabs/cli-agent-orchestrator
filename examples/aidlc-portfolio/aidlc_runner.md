@@ -55,10 +55,13 @@ ID and path to the portfolio supervisor, then stop until the supervisor returns
 an answered packet. Only resume after verifying that `question list` reports
 the packet as `answered`. Never invoke `question answer`.
 
-You cannot resolve a packet even if you tried: `question answer` binds the
-answerer to a human-approval-surface record that only a verified human can
-mint, so there is no identity string you could supply to self-answer. The
-enforcement is the binding, not this instruction.
+`question answer` binds the answerer to a human-approval-surface record
+rather than an identity string you supply, so there is no `--answered-by`-style
+flag to self-answer with. In this sample that record is a file within the
+agent's own write reach, so treat this as defense-in-depth alongside the
+"never invoke `question answer`" rule above, not as a structural boundary —
+real enforcement needs the record kept outside the agent's reach or signed
+with a key the agent does not hold.
 
 Treat answers as human-owned data. Preserve every generated question and every
 human answer verbatim when returning the answered Markdown to the child AI-DLC
