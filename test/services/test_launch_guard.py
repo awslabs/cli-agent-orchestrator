@@ -625,6 +625,23 @@ def _non_git_root(tmp_path):
     return root
 
 
+def _git_root(path, *, content: str):
+    """A real one-commit repository at ``path``, so the Git branch of the freeze is exercised."""
+    import subprocess
+
+    path.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "T"],
+    ):
+        subprocess.run(args, cwd=path, check=True, capture_output=True)
+    (path / "f.txt").write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, capture_output=True)
+    return path
+
+
 def _admit_with_root(monkeypatch, guard: dict, root) -> None:
     """Admit a run whose snapshot carries the working directory, as both start paths write it."""
     row = _script_row(json.dumps({"launch_guard": guard, "working_directory": str(root)}))
@@ -671,6 +688,40 @@ def test_a_root_that_can_no_longer_be_identified_is_refused(tmp_path, monkeypatc
         launch_guard.check("run-1", "worker")
 
 
+def test_a_git_root_replaced_at_the_same_path_is_refused_at_the_next_launch(tmp_path, monkeypatch):
+    """PIN 3 of fanhongy's ask 2 on PR #1051. This is fanhongy's probe, as a test.
+
+    The reason a Git root's inode stays out of ``plan_id`` -- a different directory at the same path
+    already yields a different identifier -- holds ACROSS runs only. Nothing recomputes ``plan_id``
+    inside a run or at resume: resume compares the stored value and an agent launch compares only the
+    guard record. So ``git worktree remove`` plus ``git worktree add <same path> <other branch>``
+    during a long step, or a re-clone at the path, left the script running in the old directory (its
+    cwd pins the old inode) while every later terminal was started BY PATH inside the replacement
+    checkout, under the original approval, with nothing refusing it.
+
+    The freeze now hands the guard its one stat for a Git root too, so this is refused. ``plan_id`` is
+    unaffected; ``test_manifest_freeze``'s pins 1 and 2 hold that side.
+    """
+    from cli_agent_orchestrator.services import manifest_freeze
+
+    _pinned_store(tmp_path, monkeypatch)
+    root = _git_root(tmp_path / "work", content="one")
+    frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={}, cwd=str(root))
+    assert frozen.root_identity is not None and frozen.root_identity["bound"] is True, (
+        "a Git root reached the guard with nothing to compare, which is the defect itself "
+        f"(root_identity={frozen.root_identity!r})"
+    )
+    guard = launch_guard.capture(profile_set=frozen.profile_set, root_identity=frozen.root_identity)
+    _admit_with_root(monkeypatch, guard, root)
+    launch_guard.check("run-1", "worker")  # the approved checkout: passes
+
+    root.rename(tmp_path / "moved-away")
+    _git_root(tmp_path / "work", content="a different repository, at a different commit")
+
+    with pytest.raises(launch_guard.PlanInputsChangedError, match="path is unchanged"):
+        launch_guard.check("run-1", "worker")
+
+
 def test_a_removed_root_is_refused_with_its_own_diagnosis(tmp_path, monkeypatch):
     """fanhongy's P3-2 on PR #1051: fail closed, but do not call a missing directory a replacement.
 
@@ -698,7 +749,11 @@ def test_a_removed_root_is_refused_with_its_own_diagnosis(tmp_path, monkeypatch)
 @pytest.mark.parametrize(
     "recorded,why",
     [
-        (None, "a Git root: identified by commit and worktree digest, so nothing to compare"),
+        (
+            None,
+            "no stat was ever taken: a record from the build that bound non-Git roots only, or a "
+            "caller with no freeze, so there is nothing to compare it against",
+        ),
         (
             {"bound": False, "reason": "root_identity_unsupported"},
             "no usable inode on this filesystem; the unbound marker is already in plan_id",
@@ -717,6 +772,27 @@ def test_records_with_nothing_to_compare_do_not_refuse(tmp_path, monkeypatch, re
     _admit_with_root(monkeypatch, guard, root)
     root.rename(tmp_path / "moved-away")
     (tmp_path / "work").mkdir()
+    launch_guard.check("run-1", "worker")
+
+
+def test_a_git_run_admitted_before_the_git_binding_still_launches(tmp_path, monkeypatch):
+    """The migration half of ask 2: a run already admitted is checked under what it was admitted under.
+
+    Before the freeze handed over a Git root's stat, a Git-root record carried ``root_identity: None``.
+    Such a run is resumable -- resume reuses the frozen ``plan_id`` -- so refusing it now for a pair it
+    never recorded would stop every in-flight Git-root run at its next agent step, the regression
+    PR #1000's P3-1 fixed for the scheme marker. It keeps launching, unchecked; the next NEW run of
+    that plan is admitted with the pair and is checked with it.
+    """
+    _pinned_store(tmp_path, monkeypatch)
+    root = _git_root(tmp_path / "work", content="one")
+    guard = launch_guard.capture(root_identity=None)
+    assert guard["root_identity"] is None
+    _admit_with_root(monkeypatch, guard, root)
+
+    root.rename(tmp_path / "moved-away")
+    _git_root(tmp_path / "work", content="a different repository")
+
     launch_guard.check("run-1", "worker")
 
 

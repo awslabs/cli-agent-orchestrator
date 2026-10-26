@@ -112,10 +112,13 @@ def capture(
     ``root_identity`` is the same seam for the working-directory root's ``st_dev``/``st_ino``
     (``FrozenManifest.root_identity``, issue #827 criterion 2), and it CANNOT fall back to reading it
     here: this function is not told the root path, and inventing one from ``os.getcwd()`` would bind a
-    different directory than the identifier did. ``None`` therefore means "no path-only root identity to
-    bind" — a Git root, whose identity is its commit and worktree digest — and the same call-site lint
-    requires every production admission path to pass it, so "forgot the keyword" cannot masquerade as
-    "Git root".
+    different directory than the identifier did. BOTH ROOT KINDS ARE BOUND HERE: a Git root's inode
+    stays out of ``plan_id`` (its identity is its commit and worktree digest), but the guard binds it
+    anyway, because nothing recomputes ``plan_id`` inside a run or at resume — see
+    ``manifest_freeze.FrozenManifest.root_identity``. ``None`` therefore means "this caller has no
+    freeze to hand one from" (tests, and a freeze that never reached a baseline, whose run is refused
+    anyway), and the call-site lint requires every production admission path to pass it, so "forgot the
+    keyword" cannot masquerade as "nothing to bind".
     """
     if not settings_service.is_workflow_approval_required():
         return {"approval_required": False}
@@ -207,10 +210,16 @@ def check(run_id: Optional[str], agent: str) -> None:
 def _check_root_identity(guard: Mapping[str, Any], snapshot: Mapping[str, Any]) -> None:
     """Refuse when the run's working directory is no longer the directory that was approved (#827).
 
-    The path is not the identity. A non-Git root recorded as ``st_dev``/``st_ino`` at admission is
-    re-stat'd here through the SAME path the run was admitted with (``spec_snapshot``'s
-    ``working_directory``, which the start paths already write), so a directory moved away and replaced
-    by another at the same path is refused instead of inheriting the original's approval.
+    The path is not the identity. A root recorded as ``st_dev``/``st_ino`` at admission is re-stat'd
+    here through the SAME path the run was admitted with (``spec_snapshot``'s ``working_directory``,
+    which the start paths already write), so a directory moved away and replaced by another at the same
+    path is refused instead of inheriting the original's approval.
+
+    BOTH ROOT KINDS, GIT AND NOT. A Git root's inode is deliberately absent from ``plan_id``, but that
+    only answers the CROSS-run case: inside a run and at resume nothing recomputes ``plan_id``, so
+    without this comparison a Git worktree replaced at the same path kept launching the run's remaining
+    terminals inside the replacement checkout under the original approval (fanhongy's ask 2 on
+    PR #1051). ``manifest_freeze`` therefore hands over its one stat for either kind.
 
     THREE RECORDED STATES SKIP THE COMPARISON, each for its own reason, and none of them is a silent
     skip — every one of them is visible in the stored record:
@@ -218,12 +227,14 @@ def _check_root_identity(guard: Mapping[str, Any], snapshot: Mapping[str, Any]) 
     * key ABSENT — a ``launch-guard-v2`` record written before this field existed. Refusing it would
       turn every in-flight pre-upgrade run into a false refusal at its next agent step, which is the
       regression PR #1000's P3-1 fixed for the scheme marker.
-    * ``None`` — a Git root. Its identity is the commit plus worktree digest in ``plan_id``, so a
-      replacement at the same path is already a different plan.
+    * ``None`` — a record written by a build whose freeze bound non-Git roots only, so a Git root
+      arrived here as ``None``; or a caller with no freeze at all. Same reasoning as the absent key: a
+      run admitted under a weaker binding is checked under it, and the next NEW run gets the current
+      one. The stat never happened, so there is nothing to compare.
     * ``bound: False`` — the filesystem supplied no usable inode (``root_identity_unsupported``) or the
       root could not be stat'd at freeze (``root_identity_unreadable``). There is no pair to compare
-      against; the freeze recorded the unbound marker into ``plan_id`` and logged the reason, so the
-      operator approved a plan that says its root identity is not bound.
+      against; for a non-Git root the freeze also recorded that unbound marker into ``plan_id`` and
+      logged the reason, so the operator approved a plan that says its root identity is not bound.
 
     A BOUND RECORD THAT CANNOT BE RE-VERIFIED IS A REFUSAL, not a skip: an identity that stops being
     readable, or a snapshot with no ``working_directory`` to re-stat, means the guard can no longer show

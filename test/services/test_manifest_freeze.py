@@ -13,6 +13,7 @@ Two of these carry the unit's load:
 """
 
 import json
+import subprocess
 
 import pytest
 
@@ -267,6 +268,122 @@ def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkey
         _frozen()["plan_id"]
         == "plan-v2:c89991b472d5f8aed662a8677d00770f3ae19224d17c95112f3863545f248d38"
     )
+
+
+# ---------------------------------------------------------------------------
+# The freeze's ONE root stat reaches the guard for EITHER root kind, while only a
+# non-Git root's pair reaches plan_id (fanhongy's ask 2 on PR #1051, pins 1 and 2)
+# ---------------------------------------------------------------------------
+
+
+def _git_repository(path, *, content: str):
+    """A real one-commit repository at ``path``, so the Git branch of the baseline is exercised.
+
+    A patched ``derive_baseline`` cannot stand in here: the whole question is what the REAL derivation
+    puts in, and leaves out of, the baseline for a directory that is genuinely inside Git.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "T"],
+    ):
+        subprocess.run(args, cwd=path, check=True, capture_output=True)
+    (path / "f.txt").write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, capture_output=True)
+    return path
+
+
+def test_a_git_roots_baseline_carries_no_root_identity_so_git_plan_ids_do_not_move(
+    tmp_path, monkeypatch
+):
+    """PIN 1. The guard now binds a Git root; ``plan_id`` still must not.
+
+    ``freeze_manifest`` hands ``launch_guard.capture`` its one stat for either root kind, because
+    nothing recomputes ``plan_id`` inside a run or at resume. The IDENTIFIER side has to be untouched
+    by that: the pair must stay out of ``repo_baseline``, or "two checkouts in the same state are ONE
+    plan" dies and every Git plan on every machine needs a fresh approval.
+
+    Two assertions, because each fails on its own. The absent key is the mechanism. The two clones
+    sharing one ``plan_id`` is the property the mechanism exists for, and it is the thing a reader of
+    ``git_baseline``'s module docstring is promised. The golden value in
+    ``test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged`` carries the arithmetic: it was
+    computed before this change and is unchanged by it.
+    """
+    _store(tmp_path, monkeypatch)
+    repo = _git_repository(tmp_path / "repo", content="one")
+    document = _frozen(cwd=str(repo))
+    assert "root_identity" not in document["repo_baseline"], (
+        "a Git root's device and inode reached repo_baseline, therefore plan_id: every existing Git "
+        "approval is now invalid and two checkouts in the same state are two plans"
+    )
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(repo), str(clone)], check=True, capture_output=True)
+    assert _frozen(cwd=str(clone))["plan_id"] == document["plan_id"], (
+        "two checkouts of the same commit with the same clean worktree are no longer one plan, so a "
+        "Git root is being identified by location rather than by content"
+    )
+
+
+@pytest.mark.parametrize("kind", ["git", "non-git"])
+def test_the_freeze_hands_the_guard_the_one_stat_it_took_for_either_root_kind(
+    tmp_path, monkeypatch, kind
+):
+    """PIN 2. ``FrozenManifest.root_identity`` IS the single stat, for a Git root as much as a non-Git one.
+
+    Two regressions this catches, and both are silent:
+
+    * reading the guard's value back off the baseline (``baseline.get("root_identity")``) rather than
+      from the stat. That is what left a Git root arriving at the guard as ``None``, so a Git worktree
+      replaced mid-run or across a resume was never detected (ask 2).
+    * taking a SECOND stat for the guard. The second would be read after the approval gate, so a root
+      replaced in that window would be recorded as the approved one -- the P3-3 window this PR exists
+      to keep closed. Exactly one call is the only form of that assertion that cannot be satisfied by
+      two stats that happen to agree on an idle filesystem.
+    """
+    _store(tmp_path, monkeypatch)
+    if kind == "git":
+        root = _git_repository(tmp_path / "root", content="one")
+    else:
+        root = tmp_path / "root"
+        root.mkdir()
+        from cli_agent_orchestrator.utils import git_baseline
+
+        assert git_baseline.derive_baseline(str(root)).get("repository") is False, (
+            "fixture assumption broken: this root must be outside Git for the non-Git case to mean "
+            "anything"
+        )
+
+    observed = []
+    real = manifest_freeze.root_identity
+
+    def counting(path):
+        value = real(path)
+        observed.append(value)
+        return value
+
+    monkeypatch.setattr(manifest_freeze, "root_identity", counting)
+    frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={}, cwd=str(root))
+
+    assert len(observed) == 1, (
+        f"the freeze stat'd the root {len(observed)} times for a {kind} root; the identifier and the "
+        "guard must describe one observation of the directory, not two either side of the gate"
+    )
+    assert frozen.root_identity == observed[0], (
+        f"a {kind} root's guard value is not the stat the freeze took "
+        f"(got {frozen.root_identity!r}, stat was {observed[0]!r})"
+    )
+    assert frozen.root_identity is not None and frozen.root_identity["bound"] is True
+
+    baseline = json.loads(frozen.manifest_json or "{}")["repo_baseline"]
+    if kind == "git":
+        assert "root_identity" not in baseline, "see PIN 1: the pair must not reach plan_id here"
+    else:
+        assert (
+            baseline["root_identity"] == frozen.root_identity
+        ), "a non-Git root's plan_id and its guard disagree about which directory was approved"
 
 
 # ---------------------------------------------------------------------------
