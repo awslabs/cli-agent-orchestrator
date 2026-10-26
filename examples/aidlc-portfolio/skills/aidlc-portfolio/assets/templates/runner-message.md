@@ -18,6 +18,8 @@ Harness manifest revision: `{{harness_manifest_revision}}`
 
 {{business_component_and_dependency_slice}}
 
+{{promoted_learnings}}
+
 ## Contract Inputs
 
 {{contract_inputs}}
@@ -37,7 +39,9 @@ portfolio supervisor.
 Do not operate outside the assigned worktree or edit AI-DLC state directly.
 Treat worktree-local `project.md`/`team.md` as scratch. Submit durable
 learnings as portfolio proposals (`learning propose`); only the supervisor
-reviews and promotes a proposal into CAO's native memory.
+reviews and promotes a proposal into CAO's native memory. Promoted portfolio
+learnings reach you in Relevant Context above, not through your own
+`memory_recall`, which reads your repository's project scope.
 
 For human decision questions, submit the unchanged unanswered Markdown as a
 portfolio question packet, report its ID and path, and wait. Never answer a

@@ -88,7 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `memory refresh` / `inspect` / `clean` in favor of `learning propose` / `list` /
   `promote` / `reject`, with promotion recorded against a CAO memory entry. `dispatch check`
   no longer returns memory baseline revisions, and learning proposals now record promotion
-  metadata instead of `baseRevision` (#936).
+  metadata instead of `baseRevision`. CAO resolves project memory per terminal, so runners
+  cannot recall the supervisor's scope: the new `dispatch message` renders the runner
+  assignment with the promoted learnings that apply to it, from the supervisor's own
+  `memory_recall`, and `learning promote` now requires the `--memory-key` that `memory_store`
+  returned (#936).
 
 - Opt-in non-accessing inspection for CLI memory list/show and HTTP GET
   memory views. Agent recall still reinforces access counts; repeated

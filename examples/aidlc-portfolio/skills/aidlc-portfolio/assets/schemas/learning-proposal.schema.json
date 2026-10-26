@@ -52,12 +52,16 @@
     "promotedBy": { "type": "string", "minLength": 1 },
     "memory": {
       "type": "object",
-      "required": ["scope", "memoryType"],
+      "required": ["scope", "memoryType", "key"],
       "additionalProperties": false,
       "properties": {
         "scope": { "type": "string", "minLength": 1 },
         "memoryType": { "type": "string", "minLength": 1 },
-        "key": { "type": "string", "minLength": 1 }
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "maxLength": 60
+        }
       }
     },
     "rejectedAt": { "type": "string", "minLength": 1 },

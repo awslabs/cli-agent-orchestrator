@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 
+import { readFile, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import {
   advanceLifecycle,
   answerQuestionPacket,
@@ -17,9 +19,11 @@ import {
   listQuestionPackets,
   migrateLifecycle,
   portfolioStatus,
+  readRecalledMemories,
   registerDocument,
   registerLearningProposal,
   rejectLearningProposal,
+  renderRunnerMessage,
   submitQuestionPacket,
   updateSession,
   type LearningStatus,
@@ -216,7 +220,7 @@ async function main(argv: string[]): Promise<void> {
           root,
           required(options, "id"),
           required(options, "promoted-by"),
-          optional(options, "memory-key"),
+          required(options, "memory-key"),
         )),
       });
       return;
@@ -291,6 +295,28 @@ async function main(argv: string[]): Promise<void> {
         )),
       });
       return;
+    case "dispatch message": {
+      const recalled = await readRecalledMemories(required(options, "recall"));
+      const contextFile = optional(options, "context");
+      const contractsFile = optional(options, "contracts");
+      const out = resolve(required(options, "out"));
+      const { message, learnings } = await renderRunnerMessage(
+        root,
+        required(options, "project"),
+        required(options, "intent"),
+        {
+          callbackTerminal: required(options, "callback-terminal"),
+          recalled,
+          context: contextFile ? await readFile(resolve(contextFile), "utf8") : undefined,
+          contractInputs: contractsFile
+            ? await readFile(resolve(contractsFile), "utf8")
+            : undefined,
+        },
+      );
+      await writeFile(out, message);
+      printJson({ ok: true, path: out, learnings });
+      return;
+    }
     case "session update": {
       const status = required(options, "status") as SessionStatus;
       if (!SESSION_STATUSES.includes(status)) {
@@ -397,13 +423,14 @@ Usage:
   portfolio.ts intent create --root PATH --file FILE
   portfolio.ts learning propose --root PATH --file FILE
   portfolio.ts learning list --root PATH [--project ID] [--status STATUS]
-  portfolio.ts learning promote --root PATH --id ID --promoted-by NAME [--memory-key KEY]
+  portfolio.ts learning promote --root PATH --id ID --promoted-by NAME --memory-key KEY
   portfolio.ts learning reject --root PATH --id ID --reason TEXT
   portfolio.ts question submit --root PATH --id ID --project ID --intent ID --stage ID --file FILE
   portfolio.ts question answer --root PATH --id ID --file FILE --mode guided|markdown|chat --approval-id APPROVAL
   portfolio.ts question list --root PATH [--project ID] [--intent ID] [--status pending|answered]
   portfolio.ts worktree create --root PATH --project ID --intent ID --branch NAME [--base REF]
   portfolio.ts dispatch check --root PATH --project ID --intent ID
+  portfolio.ts dispatch message --root PATH --project ID --intent ID --callback-terminal ID --recall FILE --out FILE [--context FILE] [--contracts FILE]
   portfolio.ts session update --root PATH --project ID --intent ID --status STATUS [--terminal ID]
 `);
 }
