@@ -328,6 +328,211 @@ class DecisionRecordModel(Base):
     )
 
 
+# target_kind vocabulary (issue #1082), independent of decisions/targets.py's
+# TargetKind: that module currently has no "workflow" value, and PR #1076 may
+# change it on its own schedule. Plain strings here so either lands first.
+LAUNCH_TARGET_KINDS = ("installed", "ephemeral", "workflow")
+
+
+class LaunchRecordModel(Base):
+    """Content-free per-launch record, kept after teardown (issue #1082).
+
+    One row per created terminal: never prompts, briefs, messages or output --
+    only labels, timings, ids and outcomes. ``terminal_id`` is the primary key
+    and is NEVER removed when the terminal row is deleted; teardown only
+    stamps ``ended_at``/``end_reason`` via ``finalize_launch_records``.
+    """
+
+    __tablename__ = "launch_records"
+
+    terminal_id = Column(String, primary_key=True)
+    session_name = Column(String, nullable=False)
+    provider = Column(String, nullable=False)
+    target_name = Column(String, nullable=True)  # agent profile or ephemeral name
+    target_kind = Column(String, nullable=False)  # one of LAUNCH_TARGET_KINDS
+    launched_model = Column(String, nullable=True)
+    model_honored = Column(Boolean, nullable=True)
+    provider_session_id = Column(String, nullable=True)
+    # JSON-encoded tuple of decision_records ids this launch applied (LaunchPlan.record_ids).
+    record_ids = Column(Text, nullable=True)
+    caller_id = Column(String, nullable=True)
+    outcome = Column(String, nullable=True)  # "success" | "failure", via report_outcome
+    outcome_recorded_at = Column(UTCDateTime, nullable=True)
+    created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    ended_at = Column(UTCDateTime, nullable=True)
+    end_reason = Column(String, nullable=True)
+    __table_args__ = (
+        Index("ix_launch_records_created_at", "created_at"),
+        Index("ix_launch_records_ended_at", "ended_at"),
+    )
+
+
+class LaunchStatusEventModel(Base):
+    """Status transitions for a launch, used to compute busy time (issue #1082).
+
+    Content-free: just the status label and when it was observed. tmux
+    terminals get one row per detected change (``StatusMonitor._apply_detection``);
+    herdr terminals -- which derive status on demand rather than through that
+    pipeline -- get one row whenever a poll observes a different status than
+    the last one recorded.
+    """
+
+    __tablename__ = "launch_status_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    terminal_id = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    __table_args__ = (
+        Index("ix_launch_status_events_terminal_created", "terminal_id", "created_at"),
+        {"sqlite_autoincrement": True},
+    )
+
+
+def create_launch_record(
+    terminal_id: str,
+    session_name: str,
+    provider: str,
+    target_name: Optional[str],
+    target_kind: str,
+    launched_model: Optional[str],
+    model_honored: Optional[bool],
+    provider_session_id: Optional[str] = None,
+    record_ids: tuple[int, ...] = (),
+    caller_id: Optional[str] = None,
+) -> None:
+    """Write the one content-free launch row for a freshly created terminal.
+
+    Best-effort: never raises. A failure here must never fail or alter the
+    launch it describes (issue #1082 acceptance criteria).
+    """
+    try:
+        with SessionLocal() as db:
+            db.add(
+                LaunchRecordModel(
+                    terminal_id=terminal_id,
+                    session_name=session_name,
+                    provider=provider,
+                    target_name=target_name,
+                    target_kind=target_kind,
+                    launched_model=launched_model,
+                    model_honored=model_honored,
+                    provider_session_id=provider_session_id,
+                    record_ids=_json.dumps(list(record_ids)) if record_ids else None,
+                    caller_id=caller_id,
+                )
+            )
+            db.commit()
+    except Exception as e:
+        logger.warning(f"Launch record create failed for {terminal_id}: {e}")
+
+
+def finalize_launch_records(terminal_ids: List[str], end_reason: str) -> None:
+    """Stamp ``ended_at``/``end_reason`` on launch records for torn-down terminals.
+
+    Best-effort and idempotent: a terminal with no launch record (e.g. a
+    pre-migration row) or one already finalized is silently skipped. Never
+    raises -- a failure here must never fail or alter teardown.
+    """
+    if not terminal_ids:
+        return
+    try:
+        with SessionLocal() as db:
+            db.query(LaunchRecordModel).filter(
+                LaunchRecordModel.terminal_id.in_(terminal_ids),
+                LaunchRecordModel.ended_at.is_(None),
+            ).update(
+                {"ended_at": _utcnow(), "end_reason": end_reason},
+                synchronize_session=False,
+            )
+            db.commit()
+    except Exception as e:
+        logger.warning(f"Launch record finalize failed for {terminal_ids}: {e}")
+
+
+def record_launch_status_event(terminal_id: str, status: str) -> None:
+    """Append one status-transition row for busy-time accounting (issue #1082).
+
+    Best-effort: never raises. Called from the live status-detection path, so
+    a write failure here must never affect the status a caller observes.
+    """
+    try:
+        with SessionLocal() as db:
+            db.add(LaunchStatusEventModel(terminal_id=terminal_id, status=status))
+            db.commit()
+    except Exception as e:
+        logger.debug(f"Launch status event record failed for {terminal_id}: {e}")
+
+
+def link_launch_outcome(terminal_id: str, success: bool) -> None:
+    """Join a reported outcome to one launch record (issue #1082).
+
+    Best-effort: never raises. A missing launch record is a silent no-op, so
+    this can never turn a successful ``report_outcome`` call into a failure.
+    """
+    try:
+        with SessionLocal() as db:
+            db.query(LaunchRecordModel).filter(LaunchRecordModel.terminal_id == terminal_id).update(
+                {
+                    "outcome": "success" if success else "failure",
+                    "outcome_recorded_at": _utcnow(),
+                }
+            )
+            db.commit()
+    except Exception as e:
+        logger.warning(f"Launch outcome link failed for {terminal_id}: {e}")
+
+
+def get_launch_record(terminal_id: str) -> Optional[Dict[str, Any]]:
+    """Read one launch record. Read-only; raises on a genuine DB error."""
+    with SessionLocal() as db:
+        row = (
+            db.query(LaunchRecordModel).filter(LaunchRecordModel.terminal_id == terminal_id).first()
+        )
+        if row is None:
+            return None
+        result = {
+            column.name: getattr(row, column.name) for column in LaunchRecordModel.__table__.columns
+        }
+        if result["record_ids"]:
+            result["record_ids"] = _json.loads(result["record_ids"])
+        return result
+
+
+def compute_busy_seconds(terminal_id: str) -> float:
+    """Sum durations spent in a 'processing' status transition (issue #1082).
+
+    Provisional "busy time" definition, stated explicitly because the issue
+    leaves it ambiguous: time from each transition INTO ``processing`` to the
+    next recorded transition, or -- for the terminal's last event -- to its
+    launch record's ``ended_at`` (or now, if the launch is still live). This
+    is the simplest measurable definition, not a settled accounting policy.
+    """
+    with SessionLocal() as db:
+        events = (
+            db.query(LaunchStatusEventModel)
+            .filter(LaunchStatusEventModel.terminal_id == terminal_id)
+            .order_by(LaunchStatusEventModel.id.asc())
+            .all()
+        )
+        record = (
+            db.query(LaunchRecordModel).filter(LaunchRecordModel.terminal_id == terminal_id).first()
+        )
+    if not events:
+        return 0.0
+    closing = as_utc(record.ended_at) if record and record.ended_at else _utcnow()
+    total = timedelta()
+    for i, event in enumerate(events):
+        if event.status != "processing":
+            continue
+        boundary = events[i + 1].created_at if i + 1 < len(events) else closing
+        start = as_utc(event.created_at)
+        end = as_utc(boundary)
+        if start and end and end > start:
+            total += end - start
+    return total.total_seconds()
+
+
 class MemoryMetadataModel(Base):
     """SQLAlchemy model for memory metadata (Phase 2 U1).
 
@@ -805,6 +1010,10 @@ def init_db() -> None:
     # Appended LAST (issue #447, ``handoff_results``). Its own new table, no shared
     # columns with anything above, so registry order is immaterial here too.
     _migrate_add_handoff_results()
+    # Appended LAST (issue #1082, ``launch_records`` / ``launch_status_events``).
+    # Two of its own new tables, no shared columns with anything above, so
+    # registry order is immaterial here too.
+    _migrate_add_launch_records()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -866,6 +1075,65 @@ def _migrate_add_handoff_results() -> None:
             conn.commit()
     except Exception as e:
         logger.warning(f"Migration check for handoff_results failed: {e}")
+
+
+def _migrate_add_launch_records() -> None:
+    """Create the launch_records / launch_status_events tables (issue #1082).
+
+    ``Base.metadata.create_all`` already handles fresh databases; this
+    idempotent migration handles existing ones, same pattern as
+    ``_migrate_add_handoff_results``: ``CREATE TABLE IF NOT EXISTS`` via raw
+    sqlite3 rather than a full schema rebuild. Both tables are additive and
+    brand new, so there is no legacy-row backfill to perform.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS launch_records (
+                    terminal_id TEXT PRIMARY KEY,
+                    session_name TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    target_name TEXT,
+                    target_kind TEXT NOT NULL,
+                    launched_model TEXT,
+                    model_honored BOOLEAN,
+                    provider_session_id TEXT,
+                    record_ids TEXT,
+                    caller_id TEXT,
+                    outcome TEXT,
+                    outcome_recorded_at DATETIME,
+                    created_at DATETIME,
+                    ended_at DATETIME,
+                    end_reason TEXT
+                )
+                """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_launch_records_created_at "
+                "ON launch_records (created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_launch_records_ended_at "
+                "ON launch_records (ended_at)"
+            )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS launch_status_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    terminal_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at DATETIME
+                )
+                """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_launch_status_events_terminal_created "
+                "ON launch_status_events (terminal_id, created_at)"
+            )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration check for launch_records failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -2953,25 +3221,59 @@ def fail_orphaned_pending_messages(min_age_seconds: int) -> List[str]:
         return failed_ids
 
 
-def delete_terminal(terminal_id: str) -> bool:
-    """Delete terminal metadata."""
+def _finalize_launch_records_best_effort(terminal_ids: List[str], end_reason: str) -> None:
+    """Defense in depth around ``finalize_launch_records`` (issue #1082).
+
+    ``finalize_launch_records`` already swallows its own exceptions; this
+    second layer additionally protects every teardown caller below from a bad
+    ``end_reason``/``terminal_ids`` value raising before that function's own
+    try/except is even reached -- same double-wrap convention as
+    ``_bind_decision_launch`` around ``bind_launch``.
+    """
+    try:
+        finalize_launch_records(terminal_ids, end_reason)
+    except Exception as e:
+        logger.warning(f"Launch record finalize failed for {terminal_ids}: {e}")
+
+
+def delete_terminal(terminal_id: str, end_reason: str = "deleted") -> bool:
+    """Delete terminal metadata.
+
+    Finalizes this terminal's launch record (issue #1082) AFTER the delete
+    commits, in a separate transaction, so a finalize failure can never roll
+    back or block the teardown itself.
+    """
     with SessionLocal() as db:
         deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
         db.commit()
-        return deleted > 0
+    if deleted:
+        _finalize_launch_records_best_effort([terminal_id], end_reason)
+    return deleted > 0
 
 
-def delete_terminals_by_session(tmux_session: str) -> int:
-    """Delete all terminals in a session."""
+def delete_terminals_by_session(tmux_session: str, end_reason: str = "session_cleanup") -> int:
+    """Delete all terminals in a session.
+
+    Finalizes each deleted terminal's launch record (issue #1082); see
+    ``delete_terminal`` for why that runs after commit, in its own transaction.
+    """
     with SessionLocal() as db:
+        ids = [
+            row[0]
+            for row in db.query(TerminalModel.id)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .all()
+        ]
         deleted = (
             db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
         )
         db.commit()
-        return deleted
+    if ids:
+        _finalize_launch_records_best_effort(ids, end_reason)
+    return deleted
 
 
-def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
+def delete_terminals_by_ids(terminal_ids: List[str], end_reason: str = "bulk_cleanup") -> int:
     """Delete specific terminal rows by id. Returns the number deleted.
 
     Unlike ``delete_terminals_by_session`` (which deletes EVERY row for a
@@ -2979,6 +3281,10 @@ def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
     scope its reconciliation sweep to the incarnation it started tearing down,
     so a concurrent same-name recreate — whose rows carry freshly generated ids
     — is never swept (#498).
+
+    Finalizes each requested terminal's launch record (issue #1082), which is
+    a safe no-op for any id that had none (never created, or already
+    finalized) -- see ``delete_terminal`` for why that runs after commit.
     """
     if not terminal_ids:
         return 0
@@ -2989,7 +3295,8 @@ def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
             .delete(synchronize_session=False)
         )
         db.commit()
-        return deleted
+    _finalize_launch_records_best_effort(terminal_ids, end_reason)
+    return deleted
 
 
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:

@@ -201,9 +201,17 @@ class TestTerminalOperations:
 
         assert result is False
 
+    @patch("cli_agent_orchestrator.clients.database._finalize_launch_records_best_effort")
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_delete_terminal(self, mock_session_class):
-        """Test deleting a terminal."""
+    def test_delete_terminal(self, mock_session_class, mock_finalize):
+        """Test deleting a terminal.
+
+        ``_finalize_launch_records_best_effort`` (issue #1082) is mocked out: it
+        runs its own separate SessionLocal() + commit() AFTER this one, which
+        would otherwise double the commit count this test pins. Its own
+        behavior is covered in test/clients/test_launch_record.py and
+        test/services/test_launch_record_integration.py.
+        """
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)
         mock_session.__exit__ = MagicMock(return_value=False)
@@ -217,6 +225,7 @@ class TestTerminalOperations:
 
         assert result is True
         mock_session.commit.assert_called_once()
+        mock_finalize.assert_called_once_with(["test123"], "deleted")
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminal_not_found(self, mock_session_class):
