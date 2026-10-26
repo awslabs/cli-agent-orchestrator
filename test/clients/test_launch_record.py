@@ -1,37 +1,98 @@
-"""Tests for issue #1082's launch-record store: additive migration, content-free
-write/finalize/status-event/outcome-link functions, and busy-time computation."""
+"""Tests for issue #1082's launch-record store: the schema (surrogate key,
+created by ``create_all`` on new and existing databases), content-free
+write/finalize/status-event/outcome-link functions, and busy-time computation
+per launch."""
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database as db_mod
-from cli_agent_orchestrator.clients.database import Base, LaunchStatusEventModel
+from cli_agent_orchestrator.clients.database import Base
 
 CANARY = "synthetic-canary-9f3c1e"
+T0 = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+# Column names that would mean task content had a place to land.
+CONTENT_WORDS = ("prompt", "message", "brief", "description", "output", "transcript", "note")
 
 
 @pytest.fixture
 def fresh_db(tmp_path, monkeypatch):
-    """A fresh sqlite file wired as both DATABASE_FILE (for the migrator's raw
-    sqlite3 connect) and SessionLocal/engine (for ORM inserts)."""
+    """A fresh sqlite file wired as SessionLocal/engine."""
     db_path = tmp_path / "test.db"
-    import cli_agent_orchestrator.constants as consts
-
-    monkeypatch.setattr(consts, "DATABASE_FILE", db_path, raising=False)
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
     monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
     return db_path, engine
 
 
-def test_table_shapes(fresh_db):
-    db_path, _ = fresh_db
-    conn = sqlite3.connect(str(db_path))
-    launch_cols = {r[1] for r in conn.execute("PRAGMA table_info(launch_records)")}
-    assert launch_cols == {
+@pytest.fixture
+def clock(monkeypatch):
+    """Drive ``database._utcnow`` explicitly: ``clock.at(seconds)``."""
+
+    class _Clock:
+        now = T0
+
+        def at(self, seconds: float) -> datetime:
+            self.now = T0 + timedelta(seconds=seconds)
+            return self.now
+
+    c = _Clock()
+    monkeypatch.setattr(db_mod, "_utcnow", lambda: c.now)
+    return c
+
+
+def _launch(terminal_id, **overrides):
+    values = dict(
+        terminal_id=terminal_id,
+        session_name="s",
+        provider="kiro_cli",
+        target_name="developer",
+        target_kind="installed",
+        launched_model=None,
+        model_honored=None,
+    )
+    values.update(overrides)
+    db_mod.create_launch_record(**values)
+
+
+def _rows(terminal_id):
+    with db_mod.SessionLocal() as db:
+        rows = (
+            db.query(db_mod.LaunchRecordModel)
+            .filter_by(terminal_id=terminal_id)
+            .order_by(db_mod.LaunchRecordModel.id.asc())
+            .all()
+        )
+        return [db_mod._launch_record_dict(r) for r in rows]
+
+
+def _event(terminal_id, status, at_seconds):
+    db_mod.record_launch_status_event(
+        terminal_id, status, observed_at=T0 + timedelta(seconds=at_seconds)
+    )
+
+
+def _columns(conn, table):
+    return {r[1]: r for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _indexed_columns(conn, table):
+    cols = set()
+    for index in conn.execute(f"PRAGMA index_list({table})"):
+        cols |= {r[2] for r in conn.execute(f"PRAGMA index_info({index[1]})")}
+    return cols
+
+
+def _assert_launch_schema(conn):
+    launch = _columns(conn, "launch_records")
+    # Required columns present; additions are fine (no full-field-list pin).
+    assert set(launch) >= {
+        "id",
         "terminal_id",
         "session_name",
         "provider",
@@ -44,50 +105,65 @@ def test_table_shapes(fresh_db):
         "caller_id",
         "outcome",
         "outcome_recorded_at",
+        "outcome_reporter_id",
         "created_at",
         "ended_at",
         "end_reason",
     }
-    event_cols = {r[1] for r in conn.execute("PRAGMA table_info(launch_status_events)")}
-    assert event_cols == {"id", "terminal_id", "status", "created_at"}
+    # ``id`` is the integer primary key; terminal_id is indexed, not unique.
+    assert launch["id"][2].upper() == "INTEGER" and launch["id"][5] == 1
+    assert launch["terminal_id"][5] == 0
+    assert "terminal_id" in _indexed_columns(conn, "launch_records")
+    events = _columns(conn, "launch_status_events")
+    assert set(events) >= {"id", "terminal_id", "status", "created_at"}
+    for table in (launch, events):
+        for column in table:
+            assert not any(word in column for word in CONTENT_WORDS), column
 
 
-def test_migrator_idempotent_rerun_on_legacy_db(fresh_db):
-    """On a DB that predates the two tables, the raw-SQL migrator creates them,
-    and re-running it is a no-op (no duplicate table, no error)."""
-    db_path, engine = fresh_db
-    # Simulate a legacy DB: drop the two tables Base.metadata.create_all made.
+def test_schema_shape_and_no_content_columns(fresh_db):
+    db_path, _ = fresh_db
+    with sqlite3.connect(str(db_path)) as conn:
+        _assert_launch_schema(conn)
+
+
+def test_init_db_creates_tables_on_an_existing_database(tmp_path, monkeypatch):
+    """Migration probe: a database that predates the two tables (with data in
+    it) gets them from ``init_db``'s ``create_all``, with the surrogate key;
+    reruns are idempotent and existing rows survive."""
+    db_path = tmp_path / "existing.db"
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute("DROP TABLE launch_records")
         conn.execute("DROP TABLE launch_status_events")
-        conn.commit()
+        conn.execute(
+            "INSERT INTO terminals (id, tmux_session, tmux_window, provider) "
+            "VALUES ('pre00001', 's', 'w', 'kiro_cli')"
+        )
+    import cli_agent_orchestrator.constants as consts
 
-    db_mod._migrate_add_launch_records()
-    db_mod._migrate_add_launch_records()  # re-run: no error, no duplicate
+    monkeypatch.setattr(consts, "DATABASE_FILE", db_path, raising=False)
+    monkeypatch.setattr(db_mod, "engine", engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
-    conn = sqlite3.connect(str(db_path))
-    n = conn.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN "
-        "('launch_records', 'launch_status_events')"
-    ).fetchone()[0]
-    assert n == 2
+    db_mod.init_db()
+    db_mod.init_db()  # rerun: no error, no duplicate
 
-
-def test_migrator_registered_last_in_init_db():
-    import inspect
-
-    src = inspect.getsource(db_mod.init_db)
-    assert "_migrate_add_launch_records()" in src
-    assert src.index("_migrate_add_handoff_results()") < src.index("_migrate_add_launch_records()")
+    with sqlite3.connect(str(db_path)) as conn:
+        _assert_launch_schema(conn)
+        assert conn.execute("SELECT id FROM terminals").fetchall() == [("pre00001",)]
+    _launch("pre00001")
+    _launch("pre00001")  # a reused id is a plain second row
+    assert [r["terminal_id"] for r in _rows("pre00001")] == ["pre00001", "pre00001"]
+    engine.dispose()
 
 
 def test_create_and_get_launch_record(fresh_db):
-    db_mod.create_launch_record(
-        terminal_id="t1",
+    _launch(
+        "t1",
         session_name="cao-session",
         provider="claude_code",
-        target_name="developer",
-        target_kind="installed",
         launched_model="claude-sonnet",
         model_honored=True,
         provider_session_id="sid-123",
@@ -95,6 +171,7 @@ def test_create_and_get_launch_record(fresh_db):
         caller_id="caller1",
     )
     record = db_mod.get_launch_record("t1")
+    assert isinstance(record["id"], int)
     assert record["terminal_id"] == "t1"
     assert record["session_name"] == "cao-session"
     assert record["provider"] == "claude_code"
@@ -113,57 +190,49 @@ def test_get_launch_record_missing_returns_none(fresh_db):
     assert db_mod.get_launch_record("does-not-exist") is None
 
 
+def test_get_launch_record_returns_the_newest_launch(fresh_db):
+    _launch("t1", caller_id="old")
+    db_mod.finalize_launch_records(["t1"], "deleted")
+    _launch("t1", caller_id="new")
+    assert db_mod.get_launch_record("t1")["caller_id"] == "new"
+
+
 def test_create_launch_record_never_raises_on_bad_input(fresh_db):
-    """Mutation guard for the AC: a write failure must never surface as a raised
-    exception (never fail or alter the launch it describes)."""
-    # record_ids deliberately not a tuple of ints: list(...) + json.dumps still
-    # succeeds for simple values, so force a real failure via an invalid kwarg
-    # type that breaks the ORM insert (model_honored expects bool/None).
-    db_mod.create_launch_record(
-        terminal_id="t-bad",
-        session_name="s",
-        provider="claude_code",
-        target_name="x",
-        target_kind="installed",
-        launched_model=None,
-        model_honored=object(),  # not JSON/SQLite-serializable as a bool
-    )  # must not raise
-    # No row persisted on failure, but the call itself completed cleanly.
+    """A write failure must never surface as a raised exception (never fail
+    or alter the launch it describes)."""
+    _launch("t-bad", model_honored=object())  # not storable as a bool: insert fails
+    assert db_mod.get_launch_record("t-bad") is None
 
 
-def test_finalize_sets_ended_at_and_reason(fresh_db):
-    db_mod.create_launch_record(
-        terminal_id="t2",
-        session_name="s",
-        provider="kiro_cli",
-        target_name="developer",
-        target_kind="installed",
-        launched_model=None,
-        model_honored=None,
-    )
+def test_finalize_sets_ended_at_and_reason(fresh_db, clock):
+    _launch("t2")
+    clock.at(30)
     db_mod.finalize_launch_records(["t2"], "deleted")
     record = db_mod.get_launch_record("t2")
-    assert record["ended_at"] is not None
+    assert record["ended_at"] == T0 + timedelta(seconds=30)
     assert record["end_reason"] == "deleted"
 
 
 def test_finalize_is_idempotent_first_reason_wins(fresh_db):
-    """Mutation guard: finalize must only touch rows where ended_at IS NULL, so a
+    """Mutation guard: finalize only touches rows where ended_at IS NULL, so a
     later teardown signal (e.g. a duplicate sweep) cannot overwrite the first
-    one's reason. Dropping that filter would make this test fail."""
-    db_mod.create_launch_record(
-        terminal_id="t3",
-        session_name="s",
-        provider="kiro_cli",
-        target_name="developer",
-        target_kind="installed",
-        launched_model=None,
-        model_honored=None,
-    )
+    one's reason."""
+    _launch("t3")
     db_mod.finalize_launch_records(["t3"], "deleted")
-    db_mod.finalize_launch_records(["t3"], "session_cleanup")
-    record = db_mod.get_launch_record("t3")
-    assert record["end_reason"] == "deleted"
+    db_mod.finalize_launch_records(["t3"], "session_teardown")
+    assert db_mod.get_launch_record("t3")["end_reason"] == "deleted"
+
+
+def test_finalize_closes_only_the_newest_open_launch(fresh_db, clock):
+    """Surrogate key: with two open rows under one id (an older launch whose
+    best-effort finalize was lost), one teardown ends one launch -- the newest."""
+    _launch("t4", caller_id="old")
+    _launch("t4", caller_id="new")
+    clock.at(10)
+    db_mod.finalize_launch_records(["t4"], "pane_closed")
+    old, new = _rows("t4")
+    assert old["ended_at"] is None and old["end_reason"] is None
+    assert new["end_reason"] == "pane_closed"
 
 
 def test_finalize_unknown_terminal_is_a_noop(fresh_db):
@@ -173,129 +242,6 @@ def test_finalize_unknown_terminal_is_a_noop(fresh_db):
 
 def test_finalize_empty_list_is_a_noop(fresh_db):
     db_mod.finalize_launch_records([], "deleted")  # must not raise
-
-
-def test_link_launch_outcome_success_and_failure(fresh_db):
-    db_mod.create_launch_record(
-        terminal_id="t4",
-        session_name="s",
-        provider="kiro_cli",
-        target_name="developer",
-        target_kind="installed",
-        launched_model=None,
-        model_honored=None,
-    )
-    db_mod.link_launch_outcome("t4", True)
-    record = db_mod.get_launch_record("t4")
-    assert record["outcome"] == "success"
-    assert record["outcome_recorded_at"] is not None
-
-    db_mod.link_launch_outcome("t4", False)
-    record = db_mod.get_launch_record("t4")
-    assert record["outcome"] == "failure"
-
-
-def test_link_launch_outcome_missing_terminal_is_a_noop(fresh_db):
-    db_mod.link_launch_outcome("ghost", True)  # must not raise
-    assert db_mod.get_launch_record("ghost") is None
-
-
-def test_compute_busy_seconds_no_events_is_zero(fresh_db):
-    assert db_mod.compute_busy_seconds("no-events") == 0.0
-
-
-def test_compute_busy_seconds_sums_processing_intervals(fresh_db):
-    """Busy time (provisional definition): seconds spent in 'processing' between
-    consecutive recorded transitions."""
-    with db_mod.SessionLocal() as db:
-        db.add(LaunchStatusEventModel(terminal_id="t5", status="idle"))
-        db.commit()
-    import time as _time
-
-    _time.sleep(0.01)
-    with db_mod.SessionLocal() as db:
-        db.add(LaunchStatusEventModel(terminal_id="t5", status="processing"))
-        db.commit()
-    _time.sleep(0.05)
-    with db_mod.SessionLocal() as db:
-        db.add(LaunchStatusEventModel(terminal_id="t5", status="idle"))
-        db.commit()
-
-    busy = db_mod.compute_busy_seconds("t5")
-    assert busy >= 0.04  # the processing->idle gap, not the idle->processing one
-
-
-def test_compute_busy_seconds_mutation_guard_non_processing_excluded(fresh_db):
-    """Mutation guard: only 'processing' intervals count. An idle->idle gap of the
-    same duration must contribute nothing."""
-    import time as _time
-
-    with db_mod.SessionLocal() as db:
-        db.add(LaunchStatusEventModel(terminal_id="t6", status="idle"))
-        db.commit()
-    _time.sleep(0.05)
-    with db_mod.SessionLocal() as db:
-        db.add(LaunchStatusEventModel(terminal_id="t6", status="idle"))
-        db.commit()
-
-    assert db_mod.compute_busy_seconds("t6") == 0.0
-
-
-def test_compute_busy_seconds_still_running_uses_now(fresh_db):
-    """A terminal with no ended_at and a trailing 'processing' event is still
-    live: the open interval counts up to 'now', not zero."""
-    import time as _time
-
-    db_mod.create_launch_record(
-        terminal_id="t7",
-        session_name="s",
-        provider="kiro_cli",
-        target_name="developer",
-        target_kind="installed",
-        launched_model=None,
-        model_honored=None,
-    )
-    with db_mod.SessionLocal() as db:
-        db.add(LaunchStatusEventModel(terminal_id="t7", status="processing"))
-        db.commit()
-    _time.sleep(0.03)
-    assert db_mod.compute_busy_seconds("t7") >= 0.02
-
-
-def test_privacy_spy_launch_record_has_no_free_text_fields():
-    """Issue #1082 acceptance criterion: a spy test with a synthetic secret finds
-    no prompt, brief, message or output text in a launch record. The write path
-    (``create_launch_record``) does not even accept such a parameter -- assert
-    that by construction, and separately prove a CANARY placed in any accepted
-    field only ever lands in a documented label column, never anywhere else."""
-    import inspect
-
-    params = set(inspect.signature(db_mod.create_launch_record).parameters)
-    forbidden_names = {"prompt", "message", "brief", "description", "output", "initial_message"}
-    assert params.isdisjoint(forbidden_names)
-
-
-def test_privacy_spy_canary_confined_to_target_name_column(fresh_db):
-    """A CANARY placed in the one free-ish label field (``target_name``, the
-    agent profile / ephemeral name) must not leak into any OTHER column, and no
-    other write path exists for task text to reach this table at all."""
-    db_mod.create_launch_record(
-        terminal_id="t8",
-        session_name="s",
-        provider="claude_code",
-        target_name=CANARY,
-        target_kind="ephemeral",
-        launched_model=None,
-        model_honored=None,
-        provider_session_id="sid",
-        record_ids=(1,),
-        caller_id="caller",
-    )
-    record = db_mod.get_launch_record("t8")
-    for column, value in record.items():
-        if column == "target_name":
-            continue
-        assert CANARY not in str(value), f"canary leaked into {column!r}: {value!r}"
 
 
 def test_end_reason_vocabulary():
@@ -332,18 +278,128 @@ def test_delete_terminals_by_ids_finalizes(fresh_db):
         for tid in ("ids00001", "ids00002"):
             db.add(TerminalModel(id=tid, tmux_session="s", tmux_window=tid, provider="kiro_cli"))
         db.commit()
-    for tid in ("ids00001", "ids00002"):
-        db_mod.create_launch_record(
-            terminal_id=tid,
-            session_name="s",
-            provider="kiro_cli",
-            target_name="developer",
-            target_kind="installed",
-            launched_model=None,
-            model_honored=None,
-        )
+    _launch("ids00001")
+    _launch("ids00002")
 
     assert db_mod.delete_terminals_by_ids(["ids00001", "ids00002"], end_reason="session_teardown")
 
     for tid in ("ids00001", "ids00002"):
         assert db_mod.get_launch_record(tid)["end_reason"] == "session_teardown"
+
+
+def test_find_bound_launch_record(fresh_db):
+    _launch("t5", caller_id="creator")
+    record_id = db_mod.get_launch_record("t5")["id"]
+    assert db_mod.find_bound_launch_record("t5", "t5") == (record_id, True)  # self
+    assert db_mod.find_bound_launch_record("t5", "creator") == (record_id, True)
+    assert db_mod.find_bound_launch_record("t5", "outsider") == (None, True)
+    assert db_mod.find_bound_launch_record("nope", "creator") == (None, False)
+
+
+@pytest.mark.parametrize("reporter", [None, ""])
+def test_find_bound_launch_record_never_binds_a_missing_reporter(fresh_db, reporter):
+    """A workflow step's record has no caller_id; an anonymous report must not
+    match it as if None were its creator."""
+    _launch("step0001", caller_id=None)
+    assert db_mod.find_bound_launch_record("step0001", reporter) == (None, True)
+
+
+def test_link_launch_outcome_by_record_id(fresh_db):
+    _launch("t6", caller_id="creator")
+    record_id = db_mod.get_launch_record("t6")["id"]
+
+    assert db_mod.link_launch_outcome(record_id, True, "t6") is True
+    record = db_mod.get_launch_record("t6")
+    assert (record["outcome"], record["outcome_reporter_id"]) == ("success", "t6")
+    assert record["outcome_recorded_at"] is not None
+
+    assert db_mod.link_launch_outcome(record_id, False, "creator") is True
+    record = db_mod.get_launch_record("t6")
+    assert (record["outcome"], record["outcome_reporter_id"]) == ("failure", "creator")
+
+
+def test_link_launch_outcome_missing_record_is_a_noop(fresh_db):
+    assert db_mod.link_launch_outcome(999, True, "x") is False  # must not raise
+
+
+def test_compute_busy_seconds_missing_record_is_zero(fresh_db):
+    assert db_mod.compute_busy_seconds(999) == 0.0
+
+
+def test_compute_busy_seconds_sums_processing_intervals(fresh_db, clock):
+    """Busy time (provisional definition): seconds spent in 'processing'
+    between consecutive recorded transitions. Only 'processing' counts."""
+    _launch("t7")
+    _event("t7", "idle", 0)
+    _event("t7", "processing", 10)
+    _event("t7", "idle", 70)
+    _event("t7", "idle", 500)  # an idle->idle gap contributes nothing
+    clock.at(1000)
+    db_mod.finalize_launch_records(["t7"], "deleted")
+    assert db_mod.compute_busy_seconds(db_mod.get_launch_record("t7")["id"]) == 60.0
+
+
+def test_compute_busy_seconds_on_torn_down_launch_closes_at_ended_at(fresh_db, clock):
+    """The AC's own scenario: a launch still processing at teardown counts up
+    to its ``ended_at``, not to whenever the record is read."""
+    _launch("t8")
+    _event("t8", "processing", 100)
+    clock.at(160)
+    db_mod.finalize_launch_records(["t8"], "deleted")
+    record_id = db_mod.get_launch_record("t8")["id"]
+    clock.at(5000)  # read long after teardown
+    assert db_mod.compute_busy_seconds(record_id) == 60.0
+
+
+def test_compute_busy_seconds_still_running_uses_now(fresh_db, clock):
+    _launch("t9")
+    _event("t9", "processing", 100)
+    clock.at(130)
+    assert db_mod.compute_busy_seconds(db_mod.get_launch_record("t9")["id"]) == 30.0
+
+
+def test_compute_busy_seconds_per_incarnation(fresh_db, clock):
+    """Surrogate-key test 2: with events from two launches under one reused
+    terminal id, each launch counts only its own window."""
+    clock.at(0)
+    _launch("reused01")
+    _event("reused01", "processing", 10)
+    _event("reused01", "idle", 40)  # first launch: 30 s
+    clock.at(100)
+    db_mod.finalize_launch_records(["reused01"], "deleted")
+    clock.at(200)
+    _launch("reused01")
+    _event("reused01", "processing", 210)
+    clock.at(215)
+    db_mod.finalize_launch_records(["reused01"], "pane_closed")  # second: 5 s, open at end
+    _event("reused01", "processing", 300)  # stray event after both ended
+
+    first, second = _rows("reused01")
+    assert db_mod.compute_busy_seconds(first["id"]) == 30.0
+    assert db_mod.compute_busy_seconds(second["id"]) == 5.0
+
+
+def test_compute_busy_seconds_unfinalized_older_launch_stops_at_the_next(fresh_db, clock):
+    """If an older launch's best-effort finalize was lost, the next launch's
+    ``created_at`` stands in for its end, so it never absorbs the newer
+    launch's work, and the newer launch never absorbs the older one's."""
+    clock.at(0)
+    _launch("lost0001")
+    _event("lost0001", "processing", 10)
+    clock.at(50)
+    _launch("lost0001")  # no finalize for the first
+    _event("lost0001", "idle", 60)
+    _event("lost0001", "processing", 70)
+    clock.at(100)
+
+    first, second = _rows("lost0001")
+    assert db_mod.compute_busy_seconds(first["id"]) == 40.0
+    assert db_mod.compute_busy_seconds(second["id"]) == 30.0
+
+
+def test_privacy_spy_launch_record_has_no_free_text_parameter():
+    """The write path does not even accept a prompt/brief/message/output."""
+    import inspect
+
+    params = set(inspect.signature(db_mod.create_launch_record).parameters)
+    assert not any(word in p for p in params for word in CONTENT_WORDS)

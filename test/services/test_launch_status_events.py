@@ -226,4 +226,5 @@ class TestHerdrBusyTimeFromEvents:
         monkeypatch.setattr(database, "_utcnow", lambda: T0 + timedelta(seconds=3600))
         database.finalize_launch_records(["h1"], "deleted")
 
-        assert database.compute_busy_seconds("h1") == 60.0
+        record_id = database.get_launch_record("h1")["id"]
+        assert database.compute_busy_seconds(record_id) == 60.0

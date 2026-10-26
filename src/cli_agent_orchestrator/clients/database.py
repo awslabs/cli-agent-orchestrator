@@ -353,15 +353,19 @@ LAUNCH_END_REASONS = (
 class LaunchRecordModel(Base):
     """Content-free per-launch record, kept after teardown (issue #1082).
 
-    One row per created terminal: never prompts, briefs, messages or output --
-    only labels, timings, ids and outcomes. ``terminal_id`` is the primary key
-    and is NEVER removed when the terminal row is deleted; teardown only
-    stamps ``ended_at``/``end_reason`` via ``finalize_launch_records``.
+    One row per launch: never prompts, briefs, messages or output -- only
+    labels, timings, ids and outcomes. Terminal ids are 8 hex characters and
+    are not checked against past launches, so a later terminal can reuse one;
+    ``id`` is therefore a surrogate key and ``terminal_id`` is indexed, not
+    unique. A row is NEVER removed when the terminal row is deleted; teardown
+    only stamps ``ended_at``/``end_reason`` on the newest open row for that
+    terminal id via ``finalize_launch_records``.
     """
 
     __tablename__ = "launch_records"
 
-    terminal_id = Column(String, primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    terminal_id = Column(String, nullable=False)
     session_name = Column(String, nullable=False)
     provider = Column(String, nullable=False)
     target_name = Column(String, nullable=True)  # agent profile or ephemeral name
@@ -374,12 +378,17 @@ class LaunchRecordModel(Base):
     caller_id = Column(String, nullable=True)
     outcome = Column(String, nullable=True)  # "success" | "failure", via report_outcome
     outcome_recorded_at = Column(UTCDateTime, nullable=True)
+    # source_terminal_id of the report that set ``outcome`` (last write wins),
+    # so a worker's self-report can be told apart from its creator's verdict.
+    outcome_reporter_id = Column(String, nullable=True)
     created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
     ended_at = Column(UTCDateTime, nullable=True)
     end_reason = Column(String, nullable=True)  # one of LAUNCH_END_REASONS
     __table_args__ = (
+        Index("ix_launch_records_terminal_id", "terminal_id"),
         Index("ix_launch_records_created_at", "created_at"),
         Index("ix_launch_records_ended_at", "ended_at"),
+        {"sqlite_autoincrement": True},
     )
 
 
@@ -390,7 +399,7 @@ class LaunchStatusEventModel(Base):
     terminals get one row per detected change (``StatusMonitor._apply_detection``);
     herdr terminals get one row per change in the ``agent_status`` herdr
     reports for a managed pane (``HerdrInboxService``). Rows carry only the
-    terminal id.
+    terminal id; ``compute_busy_seconds`` attributes them to one launch by time.
     """
 
     __tablename__ = "launch_status_events"
@@ -436,6 +445,7 @@ def create_launch_record(
                     provider_session_id=provider_session_id,
                     record_ids=_json.dumps(list(record_ids)) if record_ids else None,
                     caller_id=caller_id,
+                    created_at=_utcnow(),
                 )
             )
             db.commit()
@@ -446,22 +456,33 @@ def create_launch_record(
 def finalize_launch_records(terminal_ids: List[str], end_reason: str) -> None:
     """Stamp ``ended_at``/``end_reason`` on launch records for torn-down terminals.
 
-    Best-effort and idempotent: a terminal with no launch record (e.g. a
-    pre-migration row) or one already finalized is silently skipped. Never
-    raises -- a failure here must never fail or alter teardown.
+    Per terminal id, only the newest still-open row is stamped: one teardown
+    ends one launch, so an older launch under a reused id keeps its own end.
+    Best-effort and idempotent: a terminal with no open launch record (never
+    recorded, pre-migration, or already finalized, so the first reason wins)
+    is silently skipped. Never raises -- a failure here must never fail or
+    alter teardown.
     """
     if not terminal_ids:
         return
     try:
         with SessionLocal() as db:
-            db.query(LaunchRecordModel).filter(
-                LaunchRecordModel.terminal_id.in_(terminal_ids),
-                LaunchRecordModel.ended_at.is_(None),
-            ).update(
-                {"ended_at": _utcnow(), "end_reason": end_reason},
-                synchronize_session=False,
-            )
-            db.commit()
+            newest_open = [
+                row[0]
+                for row in db.query(func.max(LaunchRecordModel.id))
+                .filter(
+                    LaunchRecordModel.terminal_id.in_(terminal_ids),
+                    LaunchRecordModel.ended_at.is_(None),
+                )
+                .group_by(LaunchRecordModel.terminal_id)
+                .all()
+            ]
+            if newest_open:
+                db.query(LaunchRecordModel).filter(LaunchRecordModel.id.in_(newest_open)).update(
+                    {"ended_at": _utcnow(), "end_reason": end_reason},
+                    synchronize_session=False,
+                )
+                db.commit()
     except Exception as e:
         logger.warning(f"Launch record finalize failed for {terminal_ids}: {e}")
 
@@ -490,63 +511,138 @@ def record_launch_status_event(
         logger.debug(f"Launch status event record failed for {terminal_id}: {e}")
 
 
-def link_launch_outcome(terminal_id: str, success: bool) -> None:
-    """Join a reported outcome to one launch record (issue #1082).
+def find_bound_launch_record(
+    launch_terminal_id: str, source_terminal_id: str
+) -> tuple[Optional[int], bool]:
+    """Resolve which launch record a reported outcome may link to (issue #1082).
 
-    Best-effort: never raises. A missing launch record is a silent no-op, so
-    this can never turn a successful ``report_outcome`` call into a failure.
+    The stored record authorises the link, not the live terminal row, because
+    the record outlives teardown and outcomes are often reported after it. A
+    record is bound to the reporter when it is the launch itself (a
+    self-report) or when the reporter is the record's ``caller_id`` (the
+    direct creator, the same relation #912 applies to live rows). Grandparents
+    and anyone else are not bound.
+
+    Returns ``(record_id, any_records)``: the newest bound record for that
+    terminal id, or ``None`` with ``any_records`` saying whether records exist
+    for the id at all (so a refusal can be told apart from "nothing recorded
+    here"). A missing reporter is never bound, so a record with no
+    ``caller_id`` (a workflow step's) cannot match an anonymous report.
+    Read-only; raises on a genuine DB error so the caller decides.
+    """
+    with SessionLocal() as db:
+        rows = (
+            db.query(LaunchRecordModel.id, LaunchRecordModel.caller_id)
+            .filter(LaunchRecordModel.terminal_id == launch_terminal_id)
+            .order_by(LaunchRecordModel.id.desc())
+            .all()
+        )
+    if source_terminal_id:
+        for record_id, caller_id in rows:
+            if launch_terminal_id == source_terminal_id or caller_id == source_terminal_id:
+                return record_id, True
+    return None, bool(rows)
+
+
+def link_launch_outcome(record_id: int, success: bool, reporter_id: str) -> bool:
+    """Join a reported outcome to one launch record by its id (issue #1082).
+
+    Last write wins: a later report from either bound reporter replaces the
+    outcome and ``outcome_reporter_id``. The caller resolves ``record_id``
+    with ``find_bound_launch_record`` first. Best-effort: never raises;
+    returns True only when a row was updated.
     """
     try:
         with SessionLocal() as db:
-            db.query(LaunchRecordModel).filter(LaunchRecordModel.terminal_id == terminal_id).update(
-                {
-                    "outcome": "success" if success else "failure",
-                    "outcome_recorded_at": _utcnow(),
-                }
+            updated = (
+                db.query(LaunchRecordModel)
+                .filter(LaunchRecordModel.id == record_id)
+                .update(
+                    {
+                        "outcome": "success" if success else "failure",
+                        "outcome_recorded_at": _utcnow(),
+                        "outcome_reporter_id": reporter_id,
+                    }
+                )
             )
             db.commit()
+            return updated > 0
     except Exception as e:
-        logger.warning(f"Launch outcome link failed for {terminal_id}: {e}")
+        logger.warning(f"Launch outcome link failed for record {record_id}: {e}")
+        return False
+
+
+def _launch_record_dict(row: LaunchRecordModel) -> Dict[str, Any]:
+    result = {
+        column.name: getattr(row, column.name) for column in LaunchRecordModel.__table__.columns
+    }
+    if result["record_ids"]:
+        result["record_ids"] = _json.loads(result["record_ids"])
+    return result
 
 
 def get_launch_record(terminal_id: str) -> Optional[Dict[str, Any]]:
-    """Read one launch record. Read-only; raises on a genuine DB error."""
+    """Read the newest launch record for a terminal id. Read-only; raises on a
+    genuine DB error."""
     with SessionLocal() as db:
         row = (
-            db.query(LaunchRecordModel).filter(LaunchRecordModel.terminal_id == terminal_id).first()
+            db.query(LaunchRecordModel)
+            .filter(LaunchRecordModel.terminal_id == terminal_id)
+            .order_by(LaunchRecordModel.id.desc())
+            .first()
         )
-        if row is None:
-            return None
-        result = {
-            column.name: getattr(row, column.name) for column in LaunchRecordModel.__table__.columns
-        }
-        if result["record_ids"]:
-            result["record_ids"] = _json.loads(result["record_ids"])
-        return result
+        return None if row is None else _launch_record_dict(row)
 
 
-def compute_busy_seconds(terminal_id: str) -> float:
+def compute_busy_seconds(record_id: int) -> float:
     """Sum durations spent in a 'processing' status transition (issue #1082).
 
     Provisional "busy time" definition, stated explicitly because the issue
     leaves it ambiguous: time from each transition INTO ``processing`` to the
-    next recorded transition, or -- for the terminal's last event -- to its
-    launch record's ``ended_at`` (or now, if the launch is still live). This
-    is the simplest measurable definition, not a settled accounting policy.
+    next recorded transition, or -- for the launch's last event -- to its
+    ``ended_at`` (or now, if the launch is still live). This is the simplest
+    measurable definition, not a settled accounting policy.
+
+    Status events carry only a terminal id, so they are attributed to this
+    launch by time: events after the previous same-id launch's ``ended_at``
+    and up to this launch's ``ended_at``. Two launches under one id cannot
+    overlap (``terminals.id`` is a primary key), so each counts only its own
+    window. If a neighbouring launch was never finalized (its best-effort
+    finalize failed), this launch's ``created_at`` or the next launch's
+    ``created_at`` stands in for the missing boundary.
     """
     with SessionLocal() as db:
-        events = (
-            db.query(LaunchStatusEventModel)
-            .filter(LaunchStatusEventModel.terminal_id == terminal_id)
-            .order_by(LaunchStatusEventModel.id.asc())
-            .all()
+        record = db.query(LaunchRecordModel).filter(LaunchRecordModel.id == record_id).first()
+        if record is None:
+            return 0.0
+        same_id = LaunchRecordModel.terminal_id == record.terminal_id
+        previous = (
+            db.query(LaunchRecordModel)
+            .filter(same_id, LaunchRecordModel.id < record.id)
+            .order_by(LaunchRecordModel.id.desc())
+            .first()
         )
-        record = (
-            db.query(LaunchRecordModel).filter(LaunchRecordModel.terminal_id == terminal_id).first()
+        following = (
+            db.query(LaunchRecordModel)
+            .filter(same_id, LaunchRecordModel.id > record.id)
+            .order_by(LaunchRecordModel.id.asc())
+            .first()
         )
+        lower = None
+        if previous is not None:
+            lower = previous.ended_at or record.created_at
+        upper = record.ended_at or (following.created_at if following is not None else None)
+        query = db.query(LaunchStatusEventModel).filter(
+            LaunchStatusEventModel.terminal_id == record.terminal_id
+        )
+        if lower is not None:
+            query = query.filter(LaunchStatusEventModel.created_at > lower)
+        if upper is not None:
+            query = query.filter(LaunchStatusEventModel.created_at <= upper)
+        events = query.order_by(LaunchStatusEventModel.id.asc()).all()
     if not events:
         return 0.0
-    closing = as_utc(record.ended_at) if record and record.ended_at else _utcnow()
+    closing = as_utc(upper) if upper is not None else _utcnow()
     total = timedelta()
     for i, event in enumerate(events):
         if event.status != "processing":
@@ -1036,10 +1132,6 @@ def init_db() -> None:
     # Appended LAST (issue #447, ``handoff_results``). Its own new table, no shared
     # columns with anything above, so registry order is immaterial here too.
     _migrate_add_handoff_results()
-    # Appended LAST (issue #1082, ``launch_records`` / ``launch_status_events``).
-    # Two of its own new tables, no shared columns with anything above, so
-    # registry order is immaterial here too.
-    _migrate_add_launch_records()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1101,65 +1193,6 @@ def _migrate_add_handoff_results() -> None:
             conn.commit()
     except Exception as e:
         logger.warning(f"Migration check for handoff_results failed: {e}")
-
-
-def _migrate_add_launch_records() -> None:
-    """Create the launch_records / launch_status_events tables (issue #1082).
-
-    ``Base.metadata.create_all`` already handles fresh databases; this
-    idempotent migration handles existing ones, same pattern as
-    ``_migrate_add_handoff_results``: ``CREATE TABLE IF NOT EXISTS`` via raw
-    sqlite3 rather than a full schema rebuild. Both tables are additive and
-    brand new, so there is no legacy-row backfill to perform.
-    """
-    import sqlite3
-
-    from cli_agent_orchestrator.constants import DATABASE_FILE
-
-    try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS launch_records (
-                    terminal_id TEXT PRIMARY KEY,
-                    session_name TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    target_name TEXT,
-                    target_kind TEXT NOT NULL,
-                    launched_model TEXT,
-                    model_honored BOOLEAN,
-                    provider_session_id TEXT,
-                    record_ids TEXT,
-                    caller_id TEXT,
-                    outcome TEXT,
-                    outcome_recorded_at DATETIME,
-                    created_at DATETIME,
-                    ended_at DATETIME,
-                    end_reason TEXT
-                )
-                """)
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS ix_launch_records_created_at "
-                "ON launch_records (created_at)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS ix_launch_records_ended_at "
-                "ON launch_records (ended_at)"
-            )
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS launch_status_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    terminal_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at DATETIME
-                )
-                """)
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS ix_launch_status_events_terminal_created "
-                "ON launch_status_events (terminal_id, created_at)"
-            )
-            conn.commit()
-    except Exception as e:
-        logger.warning(f"Migration check for launch_records failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:

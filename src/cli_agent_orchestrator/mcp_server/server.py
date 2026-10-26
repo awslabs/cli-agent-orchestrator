@@ -2258,7 +2258,9 @@ async def report_outcome(
         description=(
             "Join this outcome to one launch (issue #1082): the terminal id of the "
             "worker this unit of work was performed by. Must be your own terminal "
-            "or one you created via assign/handoff; anything else is refused."
+            "or one you created directly via assign/handoff (still allowed after it "
+            "was deleted); anything else is refused. The result's launch_linked "
+            "says whether a launch record was joined."
         ),
     ),
 ) -> Dict[str, Any]:
@@ -2279,6 +2281,9 @@ async def report_outcome(
                 "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
             }
         if terminal_id:
+            # Stops a live outsider before anything is posted. POST /outcomes
+            # is the authority: it re-checks against the stored launch record,
+            # which also covers a torn-down target this lookup cannot see.
             denial = _target_binding_denial(terminal_id)
             if denial:
                 return {"success": False, "error": denial}
@@ -2299,7 +2304,10 @@ async def report_outcome(
         )
         # Only the id: the route returns the whole record, and echoing it would
         # newly surface friction_notes back to the agent that wrote them.
-        return {"success": True, "outcome_id": payload["outcome"]["id"]}
+        result: Dict[str, Any] = {"success": True, "outcome_id": payload["outcome"]["id"]}
+        if terminal_id:
+            result["launch_linked"] = payload.get("launch_linked") is True
+        return result
     except requests.RequestException as e:
         return _outcome_tool_error(e, "Failed to record outcome")
     except Exception as e:

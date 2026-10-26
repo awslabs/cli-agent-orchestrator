@@ -1,6 +1,8 @@
 """Issue #1082: report_outcome's optional terminal_id joins the outcome to one
-launch, bound to the caller's own assign/handoff tree (same ``_target_binding_denial``
-helper #912 wired into delete_terminal/answer_user_prompt/send_message)."""
+launch. ``POST /outcomes`` authorises the link from the STORED launch record,
+which outlives teardown: a self-report, or a report from the launch's direct
+creator (its recorded ``caller_id``). The MCP tool keeps #912's
+``_target_binding_denial`` pre-check, which only stops a live outsider early."""
 
 from __future__ import annotations
 
@@ -8,6 +10,7 @@ import asyncio
 from unittest.mock import patch
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -29,6 +32,22 @@ def isolated_db(tmp_path):
         yield engine
 
 
+@pytest.fixture
+def learning_on():
+    with patch(LEARNING_TARGET, return_value=True):
+        yield
+
+
+@pytest.fixture
+def api(isolated_db, learning_on):
+    """Direct HTTP client for the route, which is the binding's authority."""
+    from cli_agent_orchestrator.api.main import app
+    from cli_agent_orchestrator.plugins import PluginRegistry
+
+    app.state.plugin_registry = PluginRegistry()
+    return TestClient(app, headers={"Host": "localhost"})
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -47,12 +66,20 @@ def _report(**overrides):
     return report_outcome(**kwargs)
 
 
+def _post(api, *, launch, source, success=True):
+    body = {"session_name": "s", "task_label": "t", "success": success}
+    if launch is not None:
+        body["launch_terminal_id"] = launch
+    if source is not None:
+        body["source_terminal_id"] = source
+    return api.post("/outcomes", json=body)
+
+
 def _seed_target_terminal(*, terminal_id: str, caller_id):
-    """Register a real terminal row so GET /terminals/{terminal_id} -- which
+    """Register a live terminal row so GET /terminals/{terminal_id} -- which
     _target_binding_denial issues through the SAME ``requests`` module
-    mcp_over_testclient already routes into the real FastAPI app -- resolves
-    against real data instead of a hand-written stub that would also leak
-    into the caller-identity lookup (same module-level ``requests.get``)."""
+    mcp_over_testclient routes into the real FastAPI app -- resolves against
+    real data."""
     from cli_agent_orchestrator.clients import database
 
     with database.SessionLocal() as db:
@@ -68,84 +95,283 @@ def _seed_target_terminal(*, terminal_id: str, caller_id):
         db.commit()
 
 
+def _seed_launch(terminal_id: str, caller_id, *, torn_down: bool = True) -> int:
+    """Write a launch record (no live terminal row) and return its id."""
+    from cli_agent_orchestrator.clients import database
+
+    database.create_launch_record(
+        terminal_id=terminal_id,
+        session_name="s",
+        provider="kiro_cli",
+        target_name="developer",
+        target_kind="installed",
+        launched_model=None,
+        model_honored=None,
+        caller_id=caller_id,
+    )
+    if torn_down:
+        database.finalize_launch_records([terminal_id], "deleted")
+    with database.SessionLocal() as db:
+        return max(
+            row.id
+            for row in db.query(database.LaunchRecordModel).filter_by(terminal_id=terminal_id)
+        )
+
+
+def _record(record_id: int) -> dict:
+    from cli_agent_orchestrator.clients import database
+
+    with database.SessionLocal() as db:
+        row = db.query(database.LaunchRecordModel).filter_by(id=record_id).one()
+        return database._launch_record_dict(row)
+
+
+def _outcome_count() -> int:
+    from cli_agent_orchestrator.clients import database
+
+    with database.SessionLocal() as db:
+        return db.query(database.WorkflowOutcomeModel).count()
+
+
 class TestReportOutcomeWithoutTerminalId:
-    def test_default_omits_launch_terminal_id(self, mcp_over_testclient, isolated_db):
+    def test_default_omits_launch_terminal_id(self, mcp_over_testclient, isolated_db, learning_on):
         """Unaffected default behavior: no terminal_id means no link attempt."""
-        with patch(LEARNING_TARGET, return_value=True):
-            result = _run(_report())
+        result = _run(_report())
         assert result["success"] is True, result
+        assert "launch_linked" not in result
         assert mcp_over_testclient.last.json["launch_terminal_id"] is None
 
 
-class TestReportOutcomeSelfBinding:
-    def test_self_report_is_allowed(self, mcp_over_testclient, isolated_db):
-        """AC: the caller's own terminal is always allowed."""
-        with patch(LEARNING_TARGET, return_value=True):
-            result = _run(_report(terminal_id=OWN_ID))
+class TestTornDownBinding:
+    """The cases the live-row check cannot see: the target is gone."""
+
+    def test_creator_links_after_teardown(self, mcp_over_testclient, isolated_db, learning_on):
+        """Ruling test 1. Mutation guard: comparing ``caller_id`` against the
+        LAUNCH's own id instead of the reporter breaks this."""
+        record_id = _seed_launch("feedf00d", caller_id=OWN_ID)
+
+        result = _run(_report(terminal_id="feedf00d", success=False))
+
         assert result["success"] is True, result
-        assert mcp_over_testclient.last.json["launch_terminal_id"] == OWN_ID
+        assert result["launch_linked"] is True
+        record = _record(record_id)
+        assert record["outcome"] == "failure"
+        assert record["outcome_reporter_id"] == OWN_ID
+        assert record["outcome_recorded_at"] is not None
 
-
-class TestReportOutcomeChildBinding:
-    def test_child_terminal_is_allowed_and_linked(self, mcp_over_testclient, isolated_db):
-        """AC: report_outcome(terminal_id=<child>) from the child's creator links
-        the outcome to that launch."""
-        _seed_target_terminal(terminal_id="deadbeef", caller_id=OWN_ID)
-        with patch(LEARNING_TARGET, return_value=True):
-            result = _run(_report(terminal_id="deadbeef"))
-        assert result["success"] is True, result
-        assert mcp_over_testclient.last.json["launch_terminal_id"] == "deadbeef"
-
-    def test_unrelated_terminal_is_refused_and_posts_nothing(
-        self, mcp_over_testclient, isolated_db
+    def test_outsider_on_torn_down_launch_is_refused_and_writes_nothing(
+        self, mcp_over_testclient, isolated_db, learning_on
     ):
-        """AC: the same call from a caller outside the tree is refused -- no
-        /outcomes request is ever issued for a denied link."""
-        _seed_target_terminal(terminal_id="deadbeef", caller_id="someone-else")
-        with patch(LEARNING_TARGET, return_value=True):
-            result = _run(_report(terminal_id="deadbeef"))
+        """Ruling test 2 (the fail-open case): the MCP pre-check lets a 404
+        through, so only the route can refuse. Nothing is written: neither
+        the launch record nor a workflow_outcomes row."""
+        record_id = _seed_launch("feedf00d", caller_id="someone-else")
+        before = _outcome_count()
+
+        result = _run(_report(terminal_id="feedf00d", success=False))
+
         assert result["success"] is False
-        assert "error" in result
+        assert "feedf00d" in result["error"] and OWN_ID in result["error"]
+        assert "launch_linked" not in result
+        record = _record(record_id)
+        assert record["outcome"] is None
+        assert record["outcome_reporter_id"] is None
+        assert _outcome_count() == before
+
+    def test_grandparent_is_refused(self, mcp_over_testclient, isolated_db, learning_on):
+        """Ruling test 4: A -> B -> C with C torn down. Only C's direct
+        creator B may report on C; A, one level up, may not."""
+        _seed_target_terminal(terminal_id="bbbb2222", caller_id=OWN_ID)  # B, live
+        record_id = _seed_launch("cccc3333", caller_id="bbbb2222")  # C, torn down
+        before = _outcome_count()
+
+        result = _run(_report(terminal_id="cccc3333"))
+
+        assert result["success"] is False
+        assert _record(record_id)["outcome"] is None
+        assert _outcome_count() == before
+
+    def test_unknown_id_writes_the_outcome_unlinked(
+        self, mcp_over_testclient, isolated_db, learning_on
+    ):
+        """Ruling test 6: no record for the id (a remote worker, a failed
+        best-effort write, a pre-migration launch) is not a refusal."""
+        before = _outcome_count()
+
+        result = _run(_report(terminal_id="0badc0de"))
+
+        assert result["success"] is True, result
+        assert result["launch_linked"] is False
+        assert _outcome_count() == before + 1
+
+
+class TestLiveBinding:
+    def test_unrelated_live_terminal_is_refused_and_posts_nothing(
+        self, mcp_over_testclient, isolated_db, learning_on
+    ):
+        """Ruling test 3: a live outsider is still stopped at the MCP layer --
+        no /outcomes request is ever issued."""
+        _seed_target_terminal(terminal_id="deadbeef", caller_id="someone-else")
+        _seed_launch("deadbeef", caller_id="someone-else", torn_down=False)
+
+        result = _run(_report(terminal_id="deadbeef"))
+
+        assert result["success"] is False
+        assert "deadbeef" in result["error"]
         assert [r for r in mcp_over_testclient.requests if r.path == "/outcomes"] == []
 
-    def test_refusal_mutation_guard_mentions_both_terminals(self, mcp_over_testclient, isolated_db):
-        """Mutation guard against a refusal that silently drops the terminal_id
-        check: the denial message names the target, so a blanket True/False
-        swap or a dropped id argument is observable, not just 'False'."""
-        _seed_target_terminal(terminal_id="deadbeef", caller_id="someone-else")
-        with patch(LEARNING_TARGET, return_value=True):
-            result = _run(_report(terminal_id="deadbeef"))
-        assert "deadbeef" in result["error"]
+    def test_live_child_is_linked(self, mcp_over_testclient, isolated_db, learning_on):
+        _seed_target_terminal(terminal_id="deadbeef", caller_id=OWN_ID)
+        record_id = _seed_launch("deadbeef", caller_id=OWN_ID, torn_down=False)
 
+        result = _run(_report(terminal_id="deadbeef"))
 
-class TestOutcomeEndpointLinksLaunchRecord:
-    """The /outcomes route itself: launch_terminal_id joins the outcome to a
-    launch record, best-effort, never failing the outcome write."""
-
-    def test_link_is_called_on_success(self, mcp_over_testclient, isolated_db, monkeypatch):
-        calls = []
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.clients.database.link_launch_outcome",
-            lambda terminal_id, success: calls.append((terminal_id, success)),
-        )
-        with patch(LEARNING_TARGET, return_value=True):
-            result = _run(_report(terminal_id=OWN_ID, success=False))
         assert result["success"] is True, result
-        assert calls == [(OWN_ID, False)]
+        assert result["launch_linked"] is True
+        assert _record(record_id)["outcome"] == "success"
 
-    def test_link_failure_never_fails_the_outcome_write(
-        self, mcp_over_testclient, isolated_db, monkeypatch
-    ):
-        """AC: a failure writing the record must never fail the launch it
-        describes -- here, must never fail report_outcome's own success. The
-        injected failure bypasses link_launch_outcome's OWN try/except
-        entirely (it replaces the whole function), so this is a genuine test
-        of the endpoint's defense-in-depth wrapper, not a tautology."""
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.clients.database.link_launch_outcome",
-            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("db is down")),
-        )
-        with patch(LEARNING_TARGET, return_value=True):
-            result = _run(_report(terminal_id=OWN_ID))
+    def test_self_report_links(self, mcp_over_testclient, isolated_db, learning_on):
+        """Ruling test 5, first half."""
+        record_id = _seed_launch(OWN_ID, caller_id="creator1", torn_down=False)
+
+        result = _run(_report(terminal_id=OWN_ID))
+
         assert result["success"] is True, result
-        assert "outcome_id" in result
+        assert result["launch_linked"] is True
+        assert _record(record_id)["outcome_reporter_id"] == OWN_ID
+
+
+class TestWorkflowStepBinding:
+    """Ruling test 5, second half: a workflow step's record has no
+    ``caller_id`` (its delegating terminal is not its callback parent), so
+    only a self-report links and the run's starter is refused."""
+
+    def test_step_self_report_links(self, api):
+        record_id = _seed_launch("step0001", caller_id=None, torn_down=False)
+
+        response = _post(api, launch="step0001", source="step0001")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["launch_linked"] is True
+        assert _record(record_id)["outcome_reporter_id"] == "step0001"
+
+    def test_run_starter_is_refused(self, api):
+        record_id = _seed_launch("step0002", caller_id=None)
+        before = _outcome_count()
+
+        response = _post(api, launch="step0002", source="starter1")
+
+        assert response.status_code == 403
+        assert _record(record_id)["outcome"] is None
+        assert _outcome_count() == before
+
+
+class TestRouteBinding:
+    def test_binding_read_failure_writes_the_outcome_unlinked(self, api, monkeypatch):
+        """Ruling test 7: a failing binding read never fails the outcome, and
+        links nothing."""
+        record_id = _seed_launch("feedf00d", caller_id=OWN_ID)
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("db is down")
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.find_bound_launch_record", _boom
+        )
+        before = _outcome_count()
+
+        response = _post(api, launch="feedf00d", source=OWN_ID)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["launch_linked"] is False
+        assert _record(record_id)["outcome"] is None
+        assert _outcome_count() == before + 1
+
+    @pytest.mark.parametrize("seeded", [None, "creator", "no-caller"])
+    def test_launch_id_without_source_is_refused(self, api, seeded):
+        """Ruling test 8: the new field fails closed without a reporter --
+        whether or not records exist for the id, and also for a record with
+        no ``caller_id`` (a workflow step's), which an anonymous report must
+        never match."""
+        if seeded == "creator":
+            _seed_launch("feedf00d", caller_id=OWN_ID)
+        elif seeded == "no-caller":
+            _seed_launch("feedf00d", caller_id=None)
+        before = _outcome_count()
+
+        response = _post(api, launch="feedf00d", source=None)
+
+        assert response.status_code == 403
+        assert _outcome_count() == before
+
+    def test_creator_verdict_replaces_self_report(self, api):
+        """Ruling test 9: last write wins between the two allowed reporters,
+        and ``outcome_reporter_id`` says whose verdict stands."""
+        record_id = _seed_launch("worker01", caller_id="creator1", torn_down=False)
+
+        assert _post(api, launch="worker01", source="worker01", success=True).status_code == 200
+        assert _record(record_id)["outcome"] == "success"
+        assert _post(api, launch="worker01", source="creator1", success=False).status_code == 200
+
+        record = _record(record_id)
+        assert record["outcome"] == "failure"
+        assert record["outcome_reporter_id"] == "creator1"
+
+    def test_reused_id_links_each_creator_to_its_own_launch(self, api):
+        """Surrogate-key test 3: under a reused terminal id, each creator's
+        report lands on the launch it created, never on the other one."""
+        old_id = _seed_launch("reused01", caller_id="creatorA")
+        new_id = _seed_launch("reused01", caller_id="creatorB", torn_down=False)
+
+        assert _post(api, launch="reused01", source="creatorA", success=True).status_code == 200
+        assert _post(api, launch="reused01", source="creatorB", success=False).status_code == 200
+        assert _post(api, launch="reused01", source="outsider", success=True).status_code == 403
+
+        assert (_record(old_id)["outcome"], _record(old_id)["outcome_reporter_id"]) == (
+            "success",
+            "creatorA",
+        )
+        assert (_record(new_id)["outcome"], _record(new_id)["outcome_reporter_id"]) == (
+            "failure",
+            "creatorB",
+        )
+
+    def test_link_failure_never_fails_the_outcome_write(self, api, monkeypatch):
+        """AC: a failure writing the record must never fail report_outcome's
+        own success. The injected failure replaces link_launch_outcome
+        entirely, so this tests the route's own wrapper."""
+        _seed_launch("feedf00d", caller_id=OWN_ID)
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("db is down")
+
+        monkeypatch.setattr("cli_agent_orchestrator.clients.database.link_launch_outcome", _boom)
+
+        response = _post(api, launch="feedf00d", source=OWN_ID)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["launch_linked"] is False
+        assert "id" in response.json()["outcome"]
+
+    def test_link_never_copies_free_text_into_the_record(self, api):
+        """Privacy: task_label and friction_notes stay in workflow_outcomes;
+        the launch record gets only the verdict, its time and the reporter."""
+        canary = "synthetic-canary-5d21a7"
+        record_id = _seed_launch("feedf00d", caller_id=OWN_ID)
+
+        response = api.post(
+            "/outcomes",
+            json={
+                "session_name": "s",
+                "task_label": f"label {canary}",
+                "friction_notes": f"notes {canary}",
+                "success": True,
+                "source_terminal_id": OWN_ID,
+                "launch_terminal_id": "feedf00d",
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["launch_linked"] is True
+        for column, value in _record(record_id).items():
+            assert canary not in str(value), f"canary leaked into {column!r}"

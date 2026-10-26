@@ -9840,10 +9840,8 @@ class OutcomeCreateBody(BaseModel):
     source_terminal_id: Optional[str] = None
     score: Optional[int] = None
     friction_notes: str = ""
-    # Issue #1082: joins this outcome to one launch record. The MCP tool binds
-    # it to the caller's assign/handoff tree before this ever reaches here
-    # (same pattern as #912); this route trusts that check already ran and
-    # only best-effort-links by id, never failing the outcome write itself.
+    # Issue #1082: joins this outcome to one launch record. The route checks
+    # the binding against the stored record (see create_outcome_endpoint).
     launch_terminal_id: Optional[str] = None
 
 
@@ -9892,6 +9890,7 @@ async def create_outcome_endpoint(
     )
 
     _require_learning_enabled()
+    link_record_id = _bound_launch_record_id(body)
     try:
         outcome = OutcomeService().record_outcome(
             session_name=body.session_name,
@@ -9914,20 +9913,74 @@ async def create_outcome_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    if body.launch_terminal_id:
-        # Issue #1082: best-effort join, never turns a recorded outcome into a
-        # failed response. The MCP tool already refused an out-of-tree id
-        # before this request was ever sent. ``link_launch_outcome`` already
-        # swallows its own exceptions; this try/except is defense in depth so
-        # a bad caller-side value can never surface as a 500 on an outcome
-        # that was already committed above.
+    if not body.launch_terminal_id:
+        return {"success": True, "outcome": outcome}
+    launch_linked = False
+    if link_record_id is not None:
+        # Best-effort join: never turns a recorded outcome into a failed
+        # response. ``link_launch_outcome`` already swallows its own
+        # exceptions; this try/except is defense in depth so a bad value can
+        # never surface as a 500 on an outcome already committed above.
         try:
             from cli_agent_orchestrator.clients.database import link_launch_outcome
 
-            link_launch_outcome(body.launch_terminal_id, body.success)
+            launch_linked = link_launch_outcome(
+                link_record_id, body.success, cast(str, body.source_terminal_id)
+            )
         except Exception as e:
             logger.warning(f"Launch outcome link failed for {body.launch_terminal_id}: {e}")
-    return {"success": True, "outcome": outcome}
+    return {"success": True, "outcome": outcome, "launch_linked": launch_linked}
+
+
+def _bound_launch_record_id(body: OutcomeCreateBody) -> Optional[int]:
+    """Authorise an outcome's launch link from the stored launch record (issue #1082).
+
+    Runs before the outcome is written, so a refusal writes nothing. The
+    stored record, which outlives teardown, is the authority, not the live
+    terminal row: a link is allowed only for a self-report or from the
+    launch's direct creator (its recorded ``caller_id``). The MCP tool's own
+    pre-check only stops live outsiders early.
+
+    - Records exist for the id but none is bound to the reporter: 403.
+    - ``launch_terminal_id`` without ``source_terminal_id``: 403 (fail closed).
+    - No record for the id (a remote worker's record lives on its own node, a
+      best-effort write failed, or it predates this table), or the binding
+      read raises: returns None, so the outcome is written but not linked.
+
+    Same trust class as #912: ``source_terminal_id`` is asserted by the
+    client and this API authorises by scope only, so this stops a confused or
+    prompt-injected agent working through the tool, not a direct HTTP caller
+    holding ``cao:write``.
+    """
+    if not body.launch_terminal_id:
+        return None
+    if not body.source_terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Refusing to link an outcome to launch {body.launch_terminal_id}: "
+                "no source_terminal_id names the reporter."
+            ),
+        )
+    try:
+        from cli_agent_orchestrator.clients.database import find_bound_launch_record
+
+        record_id, any_records = find_bound_launch_record(
+            body.launch_terminal_id, body.source_terminal_id
+        )
+    except Exception as e:
+        logger.warning(f"Launch outcome binding read failed for {body.launch_terminal_id}: {e}")
+        return None
+    if record_id is None and any_records:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Terminal {body.source_terminal_id} may not report an outcome for launch "
+                f"{body.launch_terminal_id}: only that terminal itself or the terminal that "
+                "created it may; refusing."
+            ),
+        )
+    return record_id
 
 
 class LessonCreateBody(BaseModel):

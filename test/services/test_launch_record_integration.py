@@ -1,6 +1,7 @@
-"""Issue #1082: create_terminal writes one launch record on success, a record
-write/finalize failure never fails or alters a launch or teardown, and
-target_kind is classified correctly (installed / ephemeral / workflow)."""
+"""Issue #1082: create_terminal writes one launch record per launch (also when
+a terminal id is reused), a record write/finalize failure never fails or
+alters a launch or teardown, target_kind is classified correctly
+(installed / ephemeral / workflow), and no task text reaches the record."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -312,6 +313,163 @@ class TestLaunchRecordOnTeardown:
             database, "finalize_launch_records", side_effect=RuntimeError("db is down")
         ):
             database._finalize_launch_records_best_effort(["x"], "deleted")  # must not raise
+
+
+def _insert_terminal_row(terminal_id, session_name):
+    """db_create_terminal is mocked (as in TestCreateTerminal), so add the row
+    teardown needs by hand."""
+    from cli_agent_orchestrator.clients import database
+
+    with database.SessionLocal() as db:
+        db.add(
+            database.TerminalModel(
+                id=terminal_id,
+                tmux_session=session_name,
+                tmux_window="developer-abcd",
+                provider="kiro_cli",
+            )
+        )
+        db.commit()
+
+
+class TestReusedTerminalId:
+    @pytest.mark.asyncio
+    @_patch_create_terminal_collaborators
+    async def test_reused_id_gets_its_own_record_and_teardown(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_delete_terminals_by_session,
+        monkeypatch,
+    ):
+        """Surrogate-key test 1: ``generate_terminal_id`` repeats an id after
+        the first terminal is torn down. Both launches are recorded, and the
+        second teardown closes only the second record."""
+        from datetime import datetime, timedelta, timezone
+
+        from cli_agent_orchestrator.clients import database
+
+        _wire_common_mocks(
+            mock_load_profile,
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_db_create,
+            mock_provider_manager,
+            mock_fifo_dir,
+        )
+        t0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        clock = {"now": t0}
+        monkeypatch.setattr(database, "_utcnow", lambda: clock["now"])
+
+        first = await create_terminal("kiro_cli", "developer", new_session=True, model="m-first")
+        _insert_terminal_row(first.id, first.session_name)
+        clock["now"] = t0 + timedelta(seconds=100)
+        assert database.delete_terminal(first.id, end_reason="deleted") is True
+
+        clock["now"] = t0 + timedelta(seconds=200)
+        second = await create_terminal("kiro_cli", "developer", new_session=True, model="m-second")
+        assert second.id == first.id  # the repeated id
+        _insert_terminal_row(second.id, second.session_name)
+        clock["now"] = t0 + timedelta(seconds=300)
+        assert database.delete_terminal(second.id, end_reason="pane_closed") is True
+
+        with database.SessionLocal() as db:
+            rows = [
+                database._launch_record_dict(r)
+                for r in db.query(database.LaunchRecordModel)
+                .filter_by(terminal_id=first.id)
+                .order_by(database.LaunchRecordModel.id.asc())
+            ]
+        assert [r["launched_model"] for r in rows] == ["m-first", "m-second"]
+        assert (rows[0]["ended_at"], rows[0]["end_reason"]) == (
+            t0 + timedelta(seconds=100),
+            "deleted",
+        )
+        assert (rows[1]["ended_at"], rows[1]["end_reason"]) == (
+            t0 + timedelta(seconds=300),
+            "pane_closed",
+        )
+        assert database.get_launch_record(first.id)["launched_model"] == "m-second"
+
+
+class TestLaunchRecordPrivacy:
+    @pytest.mark.asyncio
+    @_patch_create_terminal_collaborators
+    async def test_task_text_never_reaches_either_table(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_delete_terminals_by_session,
+    ):
+        """AC: a spy with a synthetic canary finds no prompt, brief, message
+        or output in the record. The canary goes through the REAL create path
+        in every free-text input a launch has: the initial message, the
+        terminal description and metadata, an env value, and the profile's
+        description and system prompt. Then both tables are dumped whole."""
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        canary = "synthetic-canary-7b4e02"
+        _wire_common_mocks(
+            mock_load_profile,
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_db_create,
+            mock_provider_manager,
+            mock_fifo_dir,
+            profile=AgentProfile(
+                name="developer",
+                description=f"profile {canary}",
+                system_prompt=f"system {canary}",
+            ),
+        )
+
+        result = await create_terminal(
+            "claude_code",
+            "developer",
+            new_session=True,
+            initial_message=f"do the task {canary}",
+            description=f"desc {canary}",
+            metadata={"note": canary},
+            env_vars={"PROBE_VALUE": canary},
+        )
+        with patch("cli_agent_orchestrator.backends.registry.get_backend") as mock_get_backend:
+            mock_get_backend.return_value.supports_event_inbox.return_value = False
+            StatusMonitor()._apply_detection(result.id, TerminalStatus.PROCESSING)
+        database.finalize_launch_records([result.id], "deleted")
+
+        with database.SessionLocal() as db:
+            records = db.query(database.LaunchRecordModel).all()
+            events = db.query(database.LaunchStatusEventModel).all()
+            dumped = [
+                {c.name: getattr(row, c.name) for c in row.__table__.columns}
+                for row in [*records, *events]
+            ]
+        assert len(records) == 1 and len(events) == 1
+        for row in dumped:
+            for column, value in row.items():
+                assert canary not in str(value), f"canary leaked into {column!r}"
 
 
 class TestClaudeCodeProviderSessionId:
