@@ -4,7 +4,7 @@ import os
 import re
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Optional
+from typing import Annotated, Any, Dict, Optional, Tuple
 
 from pydantic import (
     AfterValidator,
@@ -217,3 +217,95 @@ class Memory(BaseModel):
         if v not in valid:
             raise ValueError(f"memory_type must be one of {valid}, got '{v}'")
         return v
+
+
+# ---------------------------------------------------------------------------
+# The recalled-memory wire shape (#968, #1034)
+# ---------------------------------------------------------------------------
+#
+# Two client surfaces return recalled memories: the MCP ``memory_recall`` tool
+# and ``POST /internal/memory/recall``. Both used to decide the shape at their
+# own call site -- the route dumped the model, the tool hand-built a dict from a
+# key allowlist -- so a field added to ``Memory`` widened one surface and not
+# the other. #1034 is that bug: ``redacted_patterns`` appeared on the route and
+# was invisible on the tool, and only the route's #968 pin caught it.
+#
+# Both surfaces now call into this section, so there is one place to edit. The
+# serialized field list itself stays where it belongs, on the model: adding a
+# field to ``Memory`` without ``exclude=True`` puts it on the wire, and
+# ``test/models/test_memory_wire_shape.py`` is the pin that makes that
+# deliberate.
+
+#: Keys the MCP ``memory_recall`` tool projects out of the full wire dict, in
+#: the order the tool emits them (#968 ``MCP_PIN``). A strict subset of
+#: :func:`recall_wire_dict`'s keys -- projecting a key the model does not
+#: serialize is a ``KeyError``, not a silently missing field.
+MCP_RECALL_KEYS: Tuple[str, ...] = (
+    "key",
+    "content",
+    "memory_type",
+    "scope",
+    "tags",
+    "file_path",
+    "source_kind",
+    "source_path",
+    "indexed_at",
+    "index_freshness",
+    "content_truncated",
+    "updated_at",
+)
+
+#: Second-precision Zulu, the stamp format the MCP tool has always emitted.
+#: Narrower than pydantic's JSON encoding (which keeps microseconds and renders
+#: a non-UTC offset as an offset), so the tool cannot adopt the shared dict's
+#: stamps without changing its wire shape.
+_MCP_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _mcp_stamp(value: Optional[datetime]) -> Optional[str]:
+    """Render a timestamp the way the MCP recall tool renders it."""
+    return value.strftime(_MCP_STAMP_FORMAT) if value else None
+
+
+def recall_wire_dict(memory: "Memory") -> Dict[str, Any]:
+    """Serialize one recalled memory for a client.
+
+    Every field ``Memory`` declares without ``exclude=True``, JSON-encoded by
+    pydantic, plus the transient ``lifecycle_status`` label when it is set (it
+    is ``exclude=True`` because it is not persisted, but recall does report it).
+
+    This is the payload ``POST /internal/memory/recall`` returns verbatim and
+    the dict :func:`mcp_recall_wire_dict` projects.
+    """
+    wire: Dict[str, Any] = memory.model_dump(mode="json")
+    if memory.lifecycle_status is not None:
+        wire["lifecycle_status"] = memory.lifecycle_status
+    return wire
+
+
+def mcp_recall_wire_dict(memory: "Memory") -> Dict[str, Any]:
+    """Project :func:`recall_wire_dict` down to the MCP ``memory_recall`` shape.
+
+    ``MCP_RECALL_KEYS`` selects the fields; the values come from the shared
+    dict, except for three the MCP contract has always rendered differently and
+    #968 pins that way:
+
+    * ``file_path`` carries the vault-relative source path for a vault-backed
+      memory, never the absolute vault path the model stores;
+    * ``indexed_at`` and ``updated_at`` are second-precision Zulu.
+
+    The overrides are applied after the projection, so they land in their
+    projected key positions and cannot add a key.
+    """
+    wire = recall_wire_dict(memory)
+    projected: Dict[str, Any] = {}
+    # lifecycle_status leads on this surface and trails on the route's; both
+    # appear only when set.
+    if memory.lifecycle_status is not None:
+        projected["lifecycle_status"] = memory.lifecycle_status
+    projected.update({key: wire[key] for key in MCP_RECALL_KEYS})
+    if memory.source_kind == "vault":
+        projected["file_path"] = memory.source_path
+    projected["indexed_at"] = _mcp_stamp(memory.indexed_at)
+    projected["updated_at"] = _mcp_stamp(memory.updated_at)
+    return projected

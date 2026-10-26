@@ -316,6 +316,7 @@ def render_profile(
         "provider": provider,
         **({"model": model} if model is not None else {}),
         "allowedTools": tools,
+        "skills": [],
         "mcpServers": {
             "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
         },
@@ -923,7 +924,8 @@ def finalize(name: str, claim_id: str, values: dict[str, Any]) -> None:
             changed = _change(db, name, "claimed", dict(profile_sha256=digest), claim_id)
             if changed:
                 os.replace(temp, EPHEMERAL_DIR / "live" / (name + ".md"))
-                # Failed commit: next finalize repairs both; launch never reads profile_sha256.
+                # Failed commit: every load verifies profile_sha256 (#1063), so the
+                # name fails closed until the next finalize repairs both.
         if not changed:
             raise EphemeralPolicyError("claim_expired", status_code=409)
         _audit_update(row, "finalized", profile_sha256=digest, **values)

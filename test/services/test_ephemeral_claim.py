@@ -8,7 +8,8 @@ from test.services.test_ephemeral_service import CALLER, SPEC, create, create_st
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import update
+from sqlalchemy import create_engine, update
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database
 
@@ -425,3 +426,78 @@ def test_policy_messages_use_contract_parentheses(claimed_store):
     with pytest.raises(env[0].EphemeralPolicyError) as exc:
         env[0]._recheck_policy(database.get_ephemeral_agent(name), config, None)
     assert exc.value.detail == "(claude_code); re-create the ephemeral agent"
+
+
+@pytest.fixture
+def file_claimed_store(create_store, monkeypatch, tmp_path):
+    """claimed_store over a SQLite file: each session gets its own connection.
+
+    The StaticPool fixture shares one connection, so a load inside finalize's
+    transaction would see its uncommitted hash; a concurrent launch never does.
+    """
+    engine = create_engine(
+        "sqlite:///" + str(tmp_path / "registry.sqlite"),
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    database.Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    database.create_terminal(
+        CALLER,
+        "cao-session",
+        "window",
+        "claude_code",
+        agent_profile="reviewer",
+        allowed_tools=["@cao-mcp-server", "fs_read", "fs_list"],
+    )
+    env = (create_store[0], factory, *create_store[2:])
+    service = env[0]
+    monkeypatch.setattr(database, "_utcnow", lambda: NOW)
+    name = create(env)["name"]
+    tokens = iter(range(1, 100))
+    monkeypatch.setattr(service.secrets, "token_hex", lambda n: f"{next(tokens):0{n * 2}x}")
+    yield env, name
+    engine.dispose()
+
+
+def test_pending_legacy_profile_claim_renders_empty_skills_and_new_hash(
+    file_claimed_store, monkeypatch
+):
+    import frontmatter
+
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    env, name = file_claimed_store
+    path = env[2] / "ephemeral/live" / (name + ".md")
+    legacy = frontmatter.loads(path.read_text())
+    legacy.metadata.pop("skills", None)
+    before = frontmatter.dumps(legacy).encode()
+    path.write_bytes(before)
+    row_update(env, name, profile_sha256=hashlib.sha256(before).hexdigest())
+    original_replace = env[0].os.replace
+    observed = []
+
+    def replace_then_load(src, dst):
+        original_replace(src, dst)
+        if str(dst) == str(path):
+            # Recorded, not asserted: claim would turn an AssertionError here into
+            # unexpected_failure.
+            committed = database.get_ephemeral_agent(name)["profile_sha256"]
+            try:
+                agent_profiles.load_launch_profile(name)
+                loaded = True
+            except agent_profiles.EphemeralProfileUnavailable:
+                loaded = False
+            observed.append((committed, hashlib.sha256(path.read_bytes()).hexdigest(), loaded))
+
+    monkeypatch.setattr(env[0].os, "replace", replace_then_load)
+    claim(env, name)
+    after = path.read_bytes()
+    # Between the replace and the commit, another connection still reads the
+    # committed old hash next to the new bytes, so the load refuses.
+    old, new = hashlib.sha256(before).hexdigest(), hashlib.sha256(after).hexdigest()
+    assert observed == [(old, new, False)]
+    assert frontmatter.loads(after.decode()).metadata["skills"] == []
+    assert after != before
+    assert database.get_ephemeral_agent(name)["profile_sha256"] == hashlib.sha256(after).hexdigest()
+    assert agent_profiles.load_launch_profile(name)[0].skills == []
