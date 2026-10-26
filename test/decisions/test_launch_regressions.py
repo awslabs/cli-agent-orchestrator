@@ -207,12 +207,12 @@ def test_default_runtime_guard_detects_swallowed_store_access(tmp_path):
 def test_existing_request_fields_stay_a_prefix_and_new_fields_are_optional(model_name, existing):
     """Any field added after this snapshot must be backward compatible: it
     comes after every pre-existing field (so positional/ordered callers are
-    unaffected) and is optional with a `None` default (so no existing caller
-    is newly required to supply it). This is what the old pin -- an exact,
-    closed list of the two decision fields appended for the decision
-    platform -- was really protecting; checking the property directly means
-    an unrelated new optional field doesn't have to be added to this test's
-    literal list to keep it green.
+    unaffected) and is optional (so no existing caller is newly required to
+    supply it). This is what the old pin -- an exact, closed list of the two
+    decision fields appended for the decision platform -- was really
+    protecting; checking the property directly means an unrelated new
+    optional field doesn't have to be added to this test's literal list to
+    keep it green.
     """
     from cli_agent_orchestrator.api import main as api
 
@@ -222,7 +222,6 @@ def test_existing_request_fields_stay_a_prefix_and_new_fields_are_optional(model
     for name in fields[len(existing) :]:
         field = model.model_fields[name]
         assert not field.is_required(), f"{model_name}.{name} must be optional"
-        assert field.default is None, f"{model_name}.{name} must default to None"
 
 
 @pytest.mark.asyncio

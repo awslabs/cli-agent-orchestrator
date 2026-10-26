@@ -47,6 +47,8 @@ async def test_decision_state_does_not_change_the_caller_visible_result(
     each other (instead of to stored text) still catches that regression
     without pinning wording that is free to change for unrelated reasons.
     """
+    from cli_agent_orchestrator.constants import DECISION_RESPONSE_HEADER
+
     decider = ConfidentDecider("small", 0.91)
     results = {}
     for mode in ("off", "shadow", "explicit", "excluded"):
@@ -70,8 +72,6 @@ async def test_decision_state_does_not_change_the_caller_visible_result(
         results[mode] = result
         leaked = set(result) & _decision_only_fields()
         assert not leaked, f"{entrypoint} [{mode}] returns decision field(s) {sorted(leaked)}"
-        from cli_agent_orchestrator.constants import DECISION_RESPONSE_HEADER
-
         assert not [
             r for r in adapter.responses if DECISION_RESPONSE_HEADER in r.headers
         ], f"{entrypoint} [{mode}] sent a decision note"
@@ -400,7 +400,7 @@ async def test_invalid_shadow_answer_is_invisible_to_delegation(entrypoint, tmp_
     await adapter.engine.runner.close()
 
 
-def test_no_decision_header_leaves_the_message_unchanged():
+def test_no_decision_note_leaves_the_message_unchanged():
     from cli_agent_orchestrator.utils import orchestration
 
     assert orchestration._append_decision_note("task text", []) == "task text"
