@@ -15,7 +15,9 @@
 and
 [optional min_tier, MF1–MF6](https://github.com/awslabs/cli-agent-orchestrator/issues/801#issuecomment-6306655853).
 These await maintainer confirmation; local E2 implementation is not on this pin.
-**Code baseline:** checked `path:line` citations are to main at `69909e98035905b612fd6b117abff8bf8876220f`.
+**Code baseline:** numeric `path:line` citations refer to unchanged code on main
+`a3829744c6df8f074bab9c713906720ad6ba87fd`. This PR's additions are described
+without line numbers; they are not attributed to that main commit.
 
 ---
 
@@ -25,7 +27,8 @@ These await maintainer confirmation; local E2 implementation is not on this pin.
    assign/handoff launch the returned name; their public schemas are unchanged.
 2. E1 stores a canonical spec, deterministic profile and archive, enforces the
    native-tool ceiling, and releases live files on teardown. Orphan sweeping,
-   retention, catalog trimming and additional caller denial remain follow-ups.
+   retention and lifecycle cleanup remain follow-ups. This PR ships empty skill catalogs,
+   every-load profile integrity and workflow cancellation gating.
 3. E1 is opt-in and off by default. Claude Code enforces native tools; Codex is
    operator opt-in with advisory tools. Neither is a same-user privilege boundary.
 4. E2 proposes explicit/default model tiers and effort without a decider. E4
@@ -38,7 +41,8 @@ These await maintainer confirmation; local E2 implementation is not on this pin.
   issue design records. The earlier feature-branch merge-target idea is superseded
   because E1 is now on main. Maintainer confirmation is still requested.
 - E1a shipped in #866. E1b shipped across #881 (create), #898 (claim/bind/release)
-  and #905 (delegation). As-built notes and section 0 describe the pinned code.
+  and #905 (delegation). This PR implements the E1 integrity, catalog and cancellation
+  follow-ups. As-built notes and section 0 describe the pinned code, including #954/#955.
 - E2 is proposed and implemented locally, not shipped at the citation pin.
   E3–E5 remain planned. The feature stays disabled outside testing until lifecycle
   cleanup and the workflow runtime-creation refusal both ship.
@@ -63,8 +67,10 @@ These await maintainer confirmation; local E2 implementation is not on this pin.
 
 ## 0. Baseline facts
 
-**E** = this ephemeral layer, E1a–E5. All code citations below refer to main at
-`69909e98035905b612fd6b117abff8bf8876220f`. Paths are relative to
+**E** = this ephemeral layer, E1a–E5. Numeric source citations below are pinned to
+main `a3829744c6df8f074bab9c713906720ad6ba87fd` (#860/#954/#955), a commit
+available on main. Own additions such as hash verification and cancellation gating
+are labeled "this PR" without numeric line citations. Paths are relative to
 `src/cli_agent_orchestrator/` unless prefixed with `src/`, `docs/` or `test/`.
 Old baseline line numbers have been removed from the future plan; the checked
 implementation anchors here and in the as-built notes replace them. **[A#]**
@@ -79,28 +85,30 @@ means an assumption in section 7.
   `services/ephemeral_service.py:206` defines canonical JSON; the brief is LF
   normalized, controls removed except LF/TAB, and tools deduplicated in atom order.
   The spec includes purpose, brief and description: hashes alone are not its source.
-- **Launch loader, shipped in #866.** `utils/agent_profiles.py:45` parses the
+- **Launch loader, shipped in #866.** `load_launch_profile` in `utils/agent_profiles.py` (this PR) parses the
   regular live file verbatim, using containment checks and `O_NOFOLLOW`.
-  Missing, malformed or nonregular files fail closed. Reserved names never fall
+  This PR verifies SHA256 of the exact byte snapshot parsed against the registry
+  profile_sha256 before parsing. Missing rows/hashes, mismatched, malformed or
+  nonregular files fail closed. Reserved names never fall
   back to installed stores. Profile APIs and installed listing exclude them.
-- **Model precedence at the pin.** `services/terminal_service.py:270` resolves
-  per-call model then profile model. The load is at
-  `services/terminal_service.py:1602`; `create_provider` begins at
-  `services/terminal_service.py:2273`, with `model=launch_model` at
-  `services/terminal_service.py:2281`. These replace the obsolete model-precedence/provider-call citations.
+- **Model precedence at the pin.** `services/terminal_service.py:286` resolves
+  per-call model, then decision launch-plan model, then profile model (#954). The load is at
+  `services/terminal_service.py:1633`; `create_provider` begins at
+  `services/terminal_service.py:2318`, with `model=launch_model` at
+  `services/terminal_service.py:2326`. These replace the obsolete model-precedence/provider-call citations.
   `models/terminal.py:121` already records model and model_honored.
 - **Claim and bind, shipped in #898.** `services/ephemeral_service.py:782`
   atomically claims, checks current policy and finalizes before responding.
   `services/ephemeral_service.py:989` binds by owner, provider and lease.
-  `services/terminal_service.py:1894` generates the ID and binds before backend
+  `services/terminal_service.py:1939` generates the ID and binds before backend
   resources or the terminal row. Claim-less owner binds use the already loaded
   live profile. Both providers reload it at init after bind:
   `providers/claude_code.py:404`, `providers/codex.py:1590` and
-  `providers/codex.py:2143`. No live Markdown load verifies profile_sha256,
-  including the claimed path's provider reload after finalize.
+  `providers/codex.py:2143`. This PR verifies profile_sha256 on every live load,
+  including all three provider reloads after finalize.
 - **Replay limits, shipped in #905.** `utils/orchestration.py:826` claims before
-  creation; assign calls it without a stable key at `utils/orchestration.py:2338`.
-  Handoff forwards a key only on early/nowait paths (`utils/orchestration.py:1852`).
+  creation; assign calls it without a stable key at `utils/orchestration.py:2402`.
+  Handoff forwards a key only on early/nowait paths (`utils/orchestration.py:1891`).
   Public assign/handoff do not promise lost-response replay or durable output.
   See [recovery instructions](../../ephemeral-agents.md#claim-launch-and-release).
 - **Release, shipped in #898/#905.** `services/ephemeral_service.py:659` removes
@@ -109,24 +117,30 @@ means an assumption in section 7.
   No startup/periodic orphan sweep or GC-row/audit-retention pruning ships yet.
 - **Generated keys, shipped in #881.** `services/ephemeral_service.py:246`
   writes name, description, provider, allowedTools and CAO-only mcpServers.
-  It writes neither model/effort nor skills. `models/agent_profile.py:55` defaults
-  skills to None, and `services/terminal_service.py:1952` builds that full catalog.
-  The trimmed-catalog goal is therefore not achieved; an explicit `skills: []`
-  renderer change and regression test remain a proposed small E1 follow-up.
-- **Caller gate, shipped in #866.** `mcp_server/server.py:1623` always refuses
-  ephemeral creation by an ephemeral caller; `mcp_server/server.py:1626` denies
-  the six delegation/workflow-start tools unless child_may_delegate is enabled.
+  It writes neither model nor effort. This PR adds `skills: []`, so
+  `services/terminal_service.py:1997` builds no inherited catalog for Claude Code
+  or Codex. Named skills remain callable through load_skill. Pending legacy
+  profiles receive the new shape and hash on their next claimed launch. If a
+  pending pre-upgrade name is launched without a claim, it keeps its old profile
+  and advertises the inherited catalog; that launch consumes the name.
+- **Caller gate, shipped in #866.** `mcp_server/server.py:1620` always refuses
+  ephemeral creation by an ephemeral caller. This PR extends _tool_denied_reason
+  in `mcp_server/server.py` to deny seven delegation/workflow-start/cancel tools
+  unless child_may_delegate is enabled.
   At this pin, general MCP middleware also gates other tools on the server grant
-  (`mcp_server/server.py:1691`), but every ephemeral carries that grant.
+  (`mcp_server/server.py:1688`), but every ephemeral carries that grant.
   [#912](https://github.com/awslabs/cli-agent-orchestrator/pull/912) already binds
   answer_user_prompt/delete_terminal to the caller's own assign/handoff tree
   (`utils/orchestration.py:339`). With child_may_delegate false, an ephemeral can
   answer/delete only itself, not its creator or siblings. Existing regression pins:
-  `test/mcp_server/test_terminal_target_binding.py:308` and
-  `test/mcp_server/test_terminal_target_binding.py:469`.
+  `test/mcp_server/test_terminal_target_binding.py:307` and
+  `test/mcp_server/test_terminal_target_binding.py:468`.
   answer_user_prompt is callback-exempt only from allowlist middleware, not binding.
-  workflow_cancel (`mcp_server/server.py:2752`) has no caller binding; the child
-  holds its server grant, so only that action remains a small E1 follow-up.
+  This PR gates workflow_cancel in `mcp_server/server.py` when
+  child_may_delegate is false; with it true, cancellation has no run-ownership binding.
+  The server grant remains coarse: memory_forget with global or project scope,
+  and workflow_create/workflow_update, remain reachable. A changed workflow spec
+  requires new plan approval; approval enforcement is on by default.
   This binding is MCP-side; raw HTTP remains scope-only, under the same-user caveat.
 - **Installed child tools at the pin.** `utils/orchestration.py:621` prechecks
   the recorded delegation ceiling; installed children are no longer unbounded
@@ -138,10 +152,10 @@ means an assumption in section 7.
   classifications. The shipped names supersede the earlier #801 wording.
   `services/model_tiers.py:12` and `services/model_tiers.py:23` define the
   top-level provider/tier reader. E2 must reuse it; E1 does not apply it.
-- **Tests already on main.** `test/utils/test_agent_profiles_ephemeral.py:298`
+- **Tests at the merged pin.** `test/utils/test_agent_profiles_ephemeral.py:298`
   preserves `${X}`, `$X` and `$$` for a reserved live profile, with a mapped fake
   resolver, and asserts that resolver is never called. No real environment file
-  is needed. `test/services/test_ephemeral_service.py:335` checks the 94 names,
+  is needed. `test/services/test_ephemeral_service.py:334` checks the 94 names,
   case-insensitive uniqueness, reserved-name composition and collision retry;
   equality with this document is not pinned by a committed test.
 
@@ -166,8 +180,8 @@ original future-plan phrasing below if confirmed.
 E1 accepts omitted tier/effort only; explicit values refuse tier_not_supported or
 effort_not_supported, and auto refuses auto_requires_decision_platform even though
 #863 has merged. Only E5 lifts auto rejection. The E1 generated keys are name,
-description, provider, allowedTools and CAO-only mcpServers; skills are omitted,
-not explicitly disabled. See section 0 for checked code and coverage.
+description, provider, allowedTools, CAO-only mcpServers and `skills: []`.
+The empty list explicitly disables inherited catalog injection. See section 0 for checked code and coverage.
 
 **Context.**
 - **Profiles:** frontmatter is parsed into `AgentProfile`. Many of its free-form fields grant capabilities:
@@ -318,21 +332,22 @@ A durable request fingerprint and result cache would require a separate proposal
 **As built: claim-less owner launch.** The raw API may bind pending → launched
 without claim_id. It rechecks policy and requires the creator, stored provider
 and a literal subset of stored tools; a caller-less CLI launch refuses not_owner.
-It loads the regular Markdown file before bind and does not finalize or hash-check
-it. A same-user modified file can therefore supply profile fields on this path.
-The fixed generated shape describes what CAO writes, not tamper-proof storage.
-Claimed launches regenerate from the verified spec, but providers reload the live
-Markdown after bind on both paths (`providers/claude_code.py:404`,
-`providers/codex.py:1590`, `providers/codex.py:2143`). A same-user write after
-finalize can therefore affect provider initialization even on the claimed path.
-Neither path is a same-user privilege boundary.
+It loads the regular Markdown file before bind without re-finalizing it. This PR
+verifies the exact parsed bytes against the registry profile_sha256 on every
+load (`load_launch_profile` in `utils/agent_profiles.py` (this PR)), including the claim-less preflight and
+provider reloads (`providers/claude_code.py:404`, `providers/codex.py:1590`,
+`providers/codex.py:2143`). Missing hashes and modified bytes refuse before parsing.
+Finalize still replaces the file before updating the registry hash; a concurrent
+load can transiently refuse a mismatched pair. It cannot parse unverified bytes.
+The fixed generated shape is not tamper-proof against edits to both file and
+registry by the same OS user, and neither path is a privilege boundary.
 
-**Proposed small E1 follow-up (awaiting confirmation):** on every ephemeral
-live-profile load, compare sha256(the exact bytes parsed) with row.profile_sha256
-in load_launch_profile, wherever the file is read. Never verify one read then parse
-another. Tests must modify the file before a claim-less load and after finalize
-but before provider init; every load must refuse mismatch. This is proposed
-hardening, not an implemented guarantee or a first-load-only check.
+**As built: E1 follow-up in this PR.** Regression tests cover mutation before a
+claim-less bind, after finalize and at all provider reads, missing rows/hashes,
+and parsing the verified snapshot after a subsequent file replacement. The next
+claimed launch re-renders a pending pre-upgrade profile with `skills: []` and
+updates its hash. A claim-less launch of that legacy pending name keeps its old
+profile and inherited catalog, consuming the name rather than reaching a later claim. E2's guarded finalize transaction remains a separate change.
 
 **Future seam (E5, proposed).** A successful claim must precede any decision;
 placement awaits M7. No decision_inputs adapter or auto support ships in E1.
@@ -464,12 +479,14 @@ max_depth exactly 1. It enforces the recorded literal-atom tool ceiling and stor
 provider/tools at bind. The JSON below also contains proposed E2/E3/E4 keys:
 max/default tier and effort and model_tiers are ignored with warnings in E1;
 max_live_per_session, workflow_tool_ceiling and runtime refusal remain planned.
-The six-tool caller denial is implemented. #912 already binds answer/delete to
-self or workers the caller created; with child_may_delegate false, an ephemeral
-can act only on itself. Only workflow_cancel lacks this binding. A small E1
-follow-up must bound that action; ephemeral-specific answer/delete sibling tests
-would pin existing protection, not fix an unbounded action. General middleware
-passes workflow_cancel because children hold its server grant (section 0).
+The caller denial now includes workflow_cancel: this PR refuses cancellation
+by ephemerals while child_may_delegate is false. #912 binds answer/delete to self
+or workers the caller created; with delegation disabled, an ephemeral can act
+only on itself. Cancellation is not bound to run ownership when delegation is
+allowed. The server grant remains coarse: memory_forget in global/project scope
+and workflow_create/workflow_update remain reachable. Changed specs require a
+new plan approval, enforced by default. Explicit ephemeral answer/delete sibling
+tests would pin existing protection rather than fix an unbounded action.
 
 **Context.** Creator-authored frontmatter can grant capabilities. E1's recorded
 native-tool list is authoritative at create/launch, but a server-level MCP grant
@@ -543,15 +560,17 @@ child; it would not be a “correct result only by accident.”
 
 **As-built depth/caller denial (shipped in #866/#881).** max_depth is exactly
 integer 1, effectively a one-generation rule, not arbitrary depth tracking.
-Creation by an ephemeral always refuses. child_may_delegate can lift the six
-delegation/workflow-start gates, but not ephemeral creation. Membership comes
+Creation by an ephemeral always refuses. child_may_delegate can lift the seven
+delegation/workflow-start/cancel gates, but not ephemeral creation. Membership comes
 from the registry including GC rows and retained terminal IDs, never PATCHable
 metadata or a caller assertion. send_message remains available for callbacks.
 #912's MCP-side tree binding already refuses answer/delete against the creator
 or siblings; own workers are allowed if child_may_delegate enabled their creation.
 The test_terminal_target_binding regressions are cited in section 0. Additional
-explicit ephemeral cases can pin that behavior. workflow_cancel has no binding
-and needs a small E1 follow-up; the coarse server grant does not close this gap.
+explicit ephemeral cases can pin that behavior. This PR gates workflow_cancel
+while child_may_delegate is false; enabling it permits cancellation without
+run-ownership binding. Shared-state memory and workflow authoring retain the
+coarse server grant described above.
 Raw HTTP is still scope-only, not server-side caller identity.
 
 **Honesty statement:**
@@ -561,9 +580,10 @@ Raw HTTP is still scope-only, not server-side caller identity.
 > skips installed plugin MCP servers. This is not a same-user privilege boundary.
 > Claude native tools are enforced; Codex tools are advisory. The CAO server grant
 > remains coarse. #912 binds MCP answer/delete to the caller's own tree;
-> workflow_cancel remains unbound, raw HTTP remains scope-only, and omission of
-> skills currently inherits the full catalog. Installed delegation
-> ceilings do not cure those ephemeral limitations.
+> workflow_cancel is denied unless child_may_delegate is enabled. The generated
+> skills list is empty, with named skill loading still available. Shared-state
+> memory and workflow authoring retain the coarse grant, and raw HTTP remains
+> scope-only. Installed delegation ceilings do not cure those limitations.
 
 **Consequences.** Default supervisors cannot grant shell atoms they lack; policy
 errors tell the operator what to fix. Provider tightening needs a new name;
@@ -598,16 +618,16 @@ content. The existing secret-gate callers refuse on a hit and name the pattern, 
   reports source `EPHEMERAL`, and Claude's and Codex's profile loads skip `with_plugin_mcp` for it (`claude_code.py`,
   `codex.py`). On Claude, `<tid>.mcp.json` then holds only `cao-mcp-server`, and `--strict-mcp-config`
   (`claude_code.py`) keeps it that way. On Codex, the servers in the user's `~/.codex/config.toml` still load [A16].
-- **Skills:** no creator-settable field in v1. As built, the renderer omits skills, so the full installed catalog is
-  advertised. Proposed small E1 follow-up: generate `skills: []` and test that no
-  catalog is injected. The child may still call `load_skill` through cao-mcp-server;
+- **Skills:** no creator-settable field in v1. This PR generates `skills: []`;
+  regression tests show that no installed catalog is injected for Claude Code or Codex. The child may still call `load_skill` through cao-mcp-server;
   skills carry instructions, not capabilities.
 - **Denied by construction:** hooks, `toolsSettings`, `toolAliases`, `permissionMode`, `native_agent`,
   `codexProfile`, `codexConfig`/`claudeConfig` passthrough (E1 sets neither; E2 proposes only its effort key), `env`,
   `resources`.
 - **Prompt injection is bounded, not solved.** On Claude Code its reach is limited by the Hard native-tool ceiling, the
-  absence of profile and plugin MCP servers, and the ephemeral-caller denial (ADR-5). Its identity does not restrict
-  workflow_cancel on the CAO MCP surface. #912 already binds answer_user_prompt
+  absence of profile and plugin MCP servers, and the ephemeral-caller denial (ADR-5). This PR refuses workflow_cancel
+  for an ephemeral caller unless child_may_delegate is enabled. Shared-state
+  memory and workflow authoring still use the coarse server grant (ADR-5). #912 already binds answer_user_prompt
   and delete_terminal to its own tree; send_message retains the creator callback. On
   Codex the ceiling is advisory (ADR-5). Deciders never see the brief, and the creator-written `description` and
   `purpose` reach them only through #810's consent and redaction (C6, Q11).
@@ -830,8 +850,8 @@ allocation and finalizes a verified canonical spec without model/effort values.
 6. Proposed E2 finalize(name, claim_id, values) applies the claim snapshot.
    E5 recaps/replaces unusable answers with fallback. Finalize must finish before
    the initial model/skills/tool load; variable renders need stale-claim fencing.
-   Providers reload the live file after bind on both paths. Proposed E1 integrity
-   hardening checks profile_sha256 on every load, including provider init. A
+   Providers reload the live file after bind on both paths. This PR
+   checks profile_sha256 on every load, including provider init. A
    claim-less launch uses the existing live profile, as stated in A1-3.
 7. Off: fallback/no record; shadow: fallback without delay, answer only recorded;
    on: capped usable answer or fallback on timeout/unsure/error/out-of-set.
@@ -917,7 +937,7 @@ E1 has shipped. E2 is proposed; E3–E5 remain planned. #863 already supplies th
 
 The loader split, reserved-name refusal/startup warning, plugin-MCP skip, registry
 readers, server-computed Terminal.ephemeral/context field and six-tool caller
-denial shipped. See section 0 and ADR-3/ADR-5. Existing coverage is in
+denial shipped in #866. This PR adds cancellation to that gate. See section 0 and ADR-3/ADR-5. Existing coverage is in
 `test/utils/test_agent_profiles_ephemeral.py`,
 `test/mcp_server/test_ephemeral_caller_denial.py` and
 `test/providers/test_ephemeral_launch.py`. The verbatim `${VAR}`/`$VAR` regression
@@ -928,8 +948,8 @@ and #905 (`5f84a50f`).**
 
 Create/persist, claims/binds/releases and assign/handoff integration shipped in
 that order. E1 accepts only omitted tier/effort; explicit values and auto refuse.
-The generated profile contains no model or effort. It also omits skills; catalog
-trimming remains a small E1 follow-up. No sweep, max_live_per_session enforcement,
+The generated profile contains no model or effort. This PR writes `skills: []`,
+verifies every live-profile read and gates workflow_cancel. No sweep, max_live_per_session enforcement,
 audit pruning, workflow agent_spec or SDK ephemeral helper ships yet.
 
 The state-machine regression suites are `test/services/test_ephemeral_service.py`,
@@ -1009,8 +1029,8 @@ amendment notes; the optional floor remains separately pending MF1–MF6.
     only;
   - pending-TTL expiry, max_live_per_session, audit retention and guarded GC-row pruning (ADR-3);
   - serialized create/sweep or a staging protocol, exact GC-file retries and band-list parity;
-  - separate small E1 follow-ups: every-load profile_sha256 integrity checks,
-    generated skills: [] and workflow_cancel binding, without waiting for E3;
+  - integrity, catalog trimming and workflow_cancel gating are implemented by
+    this PR independently of E3; they are not open lifecycle work;
   - the ephemeral marker in terminal lists, the dashboard and logs (E1a already adds the top-level `ephemeral` field to
     cao-server's terminal JSON);
 - *Files:* `services/ephemeral_service.py`, `services/cleanup_service.py`, `api/main.py` (lifespan task), terminal
@@ -1033,11 +1053,9 @@ amendment notes; the optional floor remains separately pending MF1–MF6.
     test boundary times, surviving terminal markers and reused-name audit collisions;
   - existing count=94, uniqueness and full reserved composition already cover the
     segment regex; add built-in name clash and BAND_NAMES == band-names.md in CI;
-  - the small E1 catalog follow-up uses skills: [] to prevent installed catalog
-    injection; load_skill remains callable;
-  - in the small E1 integrity follow-up, modify the live file before a claim-less
-    load and after finalize/before provider init; check profile_sha256 on every load;
-  - in the small E1 caller follow-up, workflow_cancel against another run refuses;
+  - shipped by this PR: skills: [] prevents installed catalog injection while
+    load_skill remains callable; tampered claim-less and post-finalize profiles
+    refuse through every load; workflow_cancel refuses with delegation disabled;
     answer/delete sibling cases pin #912's existing tree binding, and creator
     send_message callbacks still work;
   - nothing outside `ephemeral/live/` is touched;
@@ -1054,13 +1072,16 @@ amendment notes; the optional floor remains separately pending MF1–MF6.
 
 For a missing optional seam module, use pytest.importorskip or
 pytest.mark.skipif(importlib.util.find_spec(...) is None), not a module-top
-import that fails collection. Do not skip on a missing method inside a present
-module: the second merger must fail if the seam is absent. At this pin #863's
-modules already exist; a test must also prove it exercised an actual launch site,
-rather than pass vacuously before integration.
+import that fails collection. At this pin #863/#954's decision modules already
+exist. The explicit future-site skip keys on the missing run-step agent_spec
+site, not on engine.py or an arbitrary missing method. Once that site exists,
+missing integration must fail: prove that the spy exercised a real launch site
+rather than passing vacuously before integration.
 - *Requires:* #810's run-step handler site, in either order: E4 makes run-step's `agent_spec` branch skip it if it is on
   main when E4 merges, and otherwise #810 S1c, which adds it, carries the skip. E4's spy test ships either way, skipped
-  only while `decisions/engine.py` is absent, so that change fails CI without the skip (C8).
+  only while the S1c run-step `agent_spec` launch site is absent. The decision
+  engine already exists (#863/#954); its presence cannot key this skip. Once the
+  agent_spec site lands, missing integration must fail CI (C8).
 - *Scope:*
   - SDK `ephemeral()`/`EphemeralAgent`, local literal sets plus a set-equality test, and serialization in
     `_execute_step`;
@@ -1103,9 +1124,11 @@ rather than pass vacuously before integration.
   - pre-flight on literal versus computed specs;
   - a `model` passed with `ephemeral()` raises `ShimError` before any HTTP call;
   - `validate_static_specs` reports unmapped tiers, and reports each `auto` field with its fallback;
-  - always shipped, skipped only while `decisions/engine.py` is absent (C8): with `model.route` on, and with it in
+  - always ship the spy; skip only while the S1c run-step `agent_spec` launch site
+    is absent (C8), never merely on engine presence. With `model.route` on, and with it in
     shadow, a spy that enters through the run-step route in `api/main.py` (where S1c adds its site) and wraps
-    `DecisionEngine.prepare_launch` on the class shows that every call made for an `agent_spec` step is E's own, with
+    the real prepare_launch seam, prove the site executed and show that every call
+    made for an `agent_spec` step is E's own, with
     `target_kind=EPHEMERAL` and `allowed_providers` set: none before E5, one from E5. The step makes no decider request,
     any #810 record for it comes from that call, and its launched model equals `finalize`'s;
   - e2e (local, not CI): kill the script mid-step; the BR-31 sweep removes the live file (AC-2.6).
@@ -1266,17 +1289,19 @@ manifest paths only. Until it lands, Kiro gets `provider_unsupported`.
   - *Given* the Kiro slice is not merged. *Then* a `kiro_cli` spec gets `provider_unsupported`, rather than a launch
     from a file in the user-shared agents dir.
 
-**Coverage:** Shipped E1 six-tool denial and #912 answer/delete tree binding; workflow_cancel follow-up.
+**Coverage:** Shipped E1 caller denial and #912 answer/delete tree binding; this PR adds workflow_cancel gating.
 
 - **AC-1.10 Depth and delegation** (E1a; `create_ephemeral_agent` in E1b). *Given* ephemeral child C and
   `child_may_delegate=false`. *When* C calls `create_ephemeral_agent`, `assign(developer)`, `handoff(developer)`,
-  `assign_elastic`, `workflow_run`, `workflow_resume` or `workflow_start`. *Then* each is refused with a reason
+  `assign_elastic`, `workflow_run`, `workflow_resume`, `workflow_start` or `workflow_cancel`. *Then* each is refused with a reason
   naming the depth or delegation rule, and no terminal or run starts. *And* C's `send_message` to T still works (#671).
   - *When* C answers a prompt in its creator or a sibling, or deletes a sibling.
     *Then* #912's existing MCP tree binding refuses before the state-changing call
     (section 0 regressions); with child_may_delegate false, only self is allowed.
-  - workflow_cancel remains unbound at the pin; refusal/binding and its regression
-    are a small E1 follow-up, not shipped behavior. Raw HTTP remains scope-only.
+  - This PR refuses workflow_cancel with child_may_delegate false, and tests the
+    installed caller and enabled-delegation cases. With delegation enabled there
+    is no run-ownership binding. Raw HTTP remains scope-only; shared-state memory
+    and workflow authoring retain the coarse grant (ADR-5).
 
 **Coverage:** Shipped E1 refusal; explicit fields E2.
 
@@ -1430,7 +1455,8 @@ manifest paths only. Until it lands, Kiro gets `provider_unsupported`.
 
 1. Strict native-tool ceiling blocks shell children from creators without shell atoms (Q1).
 2. Coarse server grant and same-user access: #912 binds MCP answer/delete to the
-   caller's own tree, but workflow_cancel remains unbound and raw HTTP scope-only. Codex native tools remain advisory;
+   caller's own tree. This PR gates workflow_cancel with child_may_delegate, but shared-state
+   memory/workflow authoring remain reachable and raw HTTP is scope-only. Codex native tools remain advisory;
    opt-in only.
 3. E5 contract dependency: #863 exists, but placement/facts/refusal seams need review.
 4. E4 fingerprint drift can break replay; pin canonical spec equality at both sites.
@@ -1439,7 +1465,7 @@ manifest paths only. Until it lands, Kiro gets `provider_unsupported`.
    Planned E3 must serialize create/sweep and retry exact GC paths.
 7. Reserved-pattern installed profiles become unreadable; startup warns and APIs refuse new ones.
 8. Terminal model records report requested model/provider capability, not observed vendor resolution.
-9. Enabled creation advertises a new tool; current skills omission also adds the full catalog.
+9. Enabled creation advertises a new tool. This PR suppresses the inherited catalog; named skill loading remains.
 10. Workflow/auth/remote integration needs E4 review; reserved remote placement remains refused.
 11. Real band labels have trademark/log-safety optics; the curated list is shipped data,
     not a recorded maintainer endorsement. Rule-4 exceptions are explicit in band-names.md.
@@ -1448,7 +1474,7 @@ manifest paths only. Until it lands, Kiro gets `provider_unsupported`.
 14. Proposed workflow detector is advisory; policy must run independently of decider eligibility.
 15. HTTP launched-claim replay is limited. Public MCP retries may see already_claimed;
     do not create another agent without inspecting/deleting a possibly running child.
-16. Code moves: citations are pinned to 69909e98; later slices must reverify, not copy old lines.
+16. Code moves: unchanged-code citations are pinned to main a3829744; later slices must reverify, not copy old lines.
 17. Broken blocks revert matching claims to pending; configuration must be repaired before retry.
 18. Proposed E5 rejected-record/state-transition window can leave an extra record;
     lease recovery and registry-only state reads must never permit a refused launch.
@@ -1467,8 +1493,8 @@ request/creation/approval (Q8–Q10), and decider content/policy/eligibility
 about what main implements, nor a claim of maintainer approval.
 
 E2's M1–M7 and optional min_tier MF1–MF6 remain pending; see the linked public
-proposals in the status block. Small E1 follow-ups for every-load profile_sha256,
-`skills: []` and workflow_cancel, and E3 lifecycle follow-ups also need review.
+proposals in the status block. This PR implements every-load profile_sha256,
+`skills: []` and workflow_cancel gating. E3 lifecycle follow-ups remain open.
 The document does not say the E side has no open items.
 
 ## 7. Assumptions
@@ -1505,8 +1531,12 @@ The claim path is claim → policy recheck → finalize(name, claim_id) → init
 model/skills/tool profile load → bind → provider init with a live-profile reload.
 The claim-less owner path loads the existing profile and binds without finalize,
 then provider init reloads it too. Claude reloads at `providers/claude_code.py:404`;
-Codex reads at `providers/codex.py:1590` and `providers/codex.py:2143`. The proposed
-small E1 follow-up checks profile_sha256 on every load, not just the first.
+Codex reads at `providers/codex.py:1590` and `providers/codex.py:2143`. This PR
+checks profile_sha256 on every load, not just the first. #954's claimed-ephemeral
+guard classifies reserved names without reading profile files and skips the
+real delegation decision site even for an unavailable profile. Terminal preflight
+and provider reloads verify the file; #955's external-decider controls
+do not bypass the shared profile loader or change empty skill catalogs.
 Public MCP response replay is not promised.
 
 **Proposed E2 integration (awaiting M1–M7).** Reuse #863's pure policy and types,
