@@ -34,6 +34,16 @@ def mock_kiro_capability_probe(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def kiro_agent_store_is_hermetic(hermetic_kiro_agent_store):
+    """Every service test sees an empty Kiro agent store, home and launch cwd (#1074).
+
+    Service tests create ``kiro_cli`` terminals throughout, and the agent check
+    would otherwise read the developer's real ``~/.kiro/agents``. See
+    ``hermetic_kiro_agent_store`` in ``test/conftest.py``.
+    """
+
+
 @pytest.fixture
 def kiro_agent_store_not_under_test(monkeypatch):
     """Skip the Kiro agent-store check for tests that use ``kiro_cli`` as a stand-in.

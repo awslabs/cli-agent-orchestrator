@@ -90,7 +90,11 @@ def test_scan_findings_delegate_severity_to_the_closed_vocabulary():
 
 
 def test_every_finding_code_has_a_live_emit_site():
-    source_root = Path("src/cli_agent_orchestrator/services/vault")
+    from cli_agent_orchestrator.services import vault
+
+    # The imported package, not a cwd-relative path: service tests run from an
+    # empty directory (test/services/conftest.py).
+    source_root = Path(vault.__file__).parent
     implementation = "\n".join(
         path.read_text(encoding="utf-8")
         for path in source_root.glob("*.py")
