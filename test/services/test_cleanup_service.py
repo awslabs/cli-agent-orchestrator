@@ -200,7 +200,7 @@ class TestCleanupOldData:
         cleanup_old_data()
 
         mock_delete_row.assert_called_once_with(
-            "old-normal", mock_get_meta.return_value, registry=None
+            "old-normal", mock_get_meta.return_value, registry=None, end_reason="stale_cleanup"
         )
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")

@@ -179,7 +179,7 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
         kwargs for url, kwargs in posts if url.endswith("/workers/deadbeef/terminal-ended")
     )
     assert terminal_ended["headers"] == {"X-CAO-Release-Token": "release-token"}
-    delete.assert_called_once_with("def67890", registry=None)
+    delete.assert_called_once_with("def67890", registry=None, end_reason="launch_failed")
 
 
 def _lease_response():

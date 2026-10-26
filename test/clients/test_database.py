@@ -221,7 +221,7 @@ class TestTerminalOperations:
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
-        result = delete_terminal("test123")
+        result = delete_terminal("test123", end_reason="deleted")
 
         assert result is True
         mock_session.commit.assert_called_once()
@@ -239,7 +239,7 @@ class TestTerminalOperations:
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
-        result = delete_terminal("nonexistent")
+        result = delete_terminal("nonexistent", end_reason="deleted")
 
         assert result is False
 
@@ -459,7 +459,7 @@ class TestTerminalOperations:
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
-        result = delete_terminals_by_session("cao-session")
+        result = delete_terminals_by_session("cao-session", end_reason="session_teardown")
 
         assert result == 2
 
@@ -2662,7 +2662,7 @@ class TestListTerminalsInSessions:
         """
         self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
         self._add(db, "20000000", "cao-alpha", agent_profile="developer")
-        delete_terminal("20000000")  # frees the max rowid
+        delete_terminal("20000000", end_reason="deleted")  # frees the max rowid
         self._add(db, "10000000", "cao-alpha", agent_profile="developer")
 
         result = list_terminals_in_sessions(["cao-alpha"])

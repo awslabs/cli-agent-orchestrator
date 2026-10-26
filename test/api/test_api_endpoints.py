@@ -1738,7 +1738,9 @@ class TestDeleteTerminal:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
+        mock_svc.delete_terminal.assert_called_once_with(
+            "abcd1234", registry=ANY, end_reason="deleted"
+        )
 
     def test_delete_terminal_deferred_cleanup_is_conflict(self, client):
         """HTTP 200 + success:false would hide a still-retryable Grok home."""

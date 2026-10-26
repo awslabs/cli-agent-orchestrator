@@ -653,7 +653,9 @@ class TestDeleteTerminalEndpoint:
 
             assert response.status_code == 200
             assert response.json() == {"success": True}
-            mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
+            mock_svc.delete_terminal.assert_called_once_with(
+                "abcd1234", registry=ANY, end_reason="deleted"
+            )
 
     def test_delete_terminal_deferred_cleanup_is_conflict(self, client):
         """A retained Grok home is a failed delete, not HTTP 200."""

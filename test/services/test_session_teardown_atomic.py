@@ -486,7 +486,7 @@ def test_rerun_after_partial_runtime_teardown_is_idempotent(real_db, runtime):
     terminal_service.dismantle_terminal_runtime(
         "t1", database.get_terminal_metadata("t1"), kill_window=False
     )
-    database.delete_terminal("t1")
+    database.delete_terminal("t1", end_reason="deleted")
     assert runtime.is_fully_gone("t1")
 
     result = session_service.delete_session("cao-partial")
@@ -510,10 +510,10 @@ def test_leftover_row_from_failed_row_delete_is_reconciled(real_db, runtime, mon
 
     real_delete_row = terminal_service.delete_terminal_row
 
-    def _flaky(terminal_id, metadata, registry=None):
+    def _flaky(terminal_id, metadata, registry=None, *, end_reason):
         if terminal_id == "t1":
             raise RuntimeError("boom during t1 row delete")
-        return real_delete_row(terminal_id, metadata, registry=registry)
+        return real_delete_row(terminal_id, metadata, registry=registry, end_reason=end_reason)
 
     monkeypatch.setattr(terminal_service, "delete_terminal_row", _flaky)
 
@@ -687,10 +687,10 @@ def test_disappearance_between_check_and_kill_is_success_and_cleans_up(
 
     real_delete_row = terminal_service.delete_terminal_row
 
-    def _flaky(terminal_id, metadata, registry=None):
+    def _flaky(terminal_id, metadata, registry=None, *, end_reason):
         if terminal_id == "t-leak":
             raise RuntimeError("boom during t-leak row delete")
-        return real_delete_row(terminal_id, metadata, registry=registry)
+        return real_delete_row(terminal_id, metadata, registry=registry, end_reason=end_reason)
 
     monkeypatch.setattr(terminal_service, "delete_terminal_row", _flaky)
 
@@ -1348,7 +1348,9 @@ def test_tail_guard_does_not_mask_an_unconfirmed_kill(real_db, runtime, monkeypa
     _seed(backend, "cao-tailsafe", [("t1", "w1")], runtime)
     swept: List[List[str]] = []
     monkeypatch.setattr(
-        session_service, "delete_terminals_by_ids", lambda ids: swept.append(list(ids))
+        session_service,
+        "delete_terminals_by_ids",
+        lambda ids, *, end_reason: swept.append(list(ids)),
     )
 
     registry = RecordingRegistry()
@@ -1589,8 +1591,8 @@ def _signalling_row_delete(monkeypatch, rolled_back):
     """Patch terminal_service.db_delete_terminal to signal after deleting."""
     real_delete = terminal_service.db_delete_terminal
 
-    def signalling(terminal_id):
-        result = real_delete(terminal_id)
+    def signalling(terminal_id, *, end_reason):
+        result = real_delete(terminal_id, end_reason=end_reason)
         rolled_back.set()
         return result
 
@@ -1813,7 +1815,7 @@ def test_post_commit_failure_rollback_leaves_a_newer_incarnation_alone(
         # Runs inside the outer failure handler, BEFORE the backend rollback:
         # models another caller tearing the name down and rebuilding it.
         runtime.fifo_readers.discard(tid)
-        database.delete_terminals_by_session(name)
+        database.delete_terminals_by_session(name, end_reason="session_teardown")
         backend.kill_session(name)
         backend.add_session(name, {"w-new"})
         database.create_terminal(
@@ -1858,7 +1860,7 @@ def test_post_commit_window_rollback_leaves_a_window_it_no_longer_owns_alone(
         # another lifecycle operation removed this terminal's row (a
         # delete_terminal by id), so the name is no longer ours to clean up.
         runtime.fifo_readers.discard(tid)
-        database.delete_terminal(tid)
+        database.delete_terminal(tid, end_reason="deleted")
 
     monkeypatch.setattr(
         terminal_service.fifo_manager, "stop_reader", _someone_else_took_over_the_window
@@ -2122,7 +2124,7 @@ def test_cancelled_create_compensation_leaves_a_replacement_alone(real_db, runti
     def replaced_then_compensate(session_name, terminal_id, window_name, *, created_session):
         # On the compensator's worker thread, BEFORE it acquires the lock:
         # models a delete_session plus a successful new create reusing the name.
-        database.delete_terminals_by_session(session_name)
+        database.delete_terminals_by_session(session_name, end_reason="session_teardown")
         backend.kill_session(session_name)
         backend.add_session(session_name, {"w-new"})
         database.create_terminal(

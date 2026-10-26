@@ -53,6 +53,9 @@ from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import delete_idempotency_key
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
+    finalize_launch_records as db_finalize_launch_records,
+)
+from cli_agent_orchestrator.clients.database import (
     get_idempotency_record,
     get_session_incarnation,
     get_terminal_metadata,
@@ -692,7 +695,7 @@ def _roll_back_cancelled_create(
                 session_name, window_name, created_session=created_session
             )
         try:
-            db_delete_terminal(terminal_id)
+            db_delete_terminal(terminal_id, end_reason="launch_failed")
         except Exception:
             logger.exception(
                 f"Rollback: failed to delete registry row {terminal_id} " "after a cancelled create"
@@ -842,7 +845,7 @@ def _roll_back_failed_create(
             ephemeral_service.release(terminal_id, "launch_failed")
         try:
             if terminal_id is not None:
-                db_delete_terminal(terminal_id)
+                db_delete_terminal(terminal_id, end_reason="launch_failed")
         except Exception:
             pass  # Ignore cleanup errors
     elif terminal_id is not None:
@@ -2487,6 +2490,12 @@ async def _create_terminal_unguarded(
             launch_status="launched",
             not_honored=decision_not_honored,
         )
+        # Issue #1082: on the synchronous path the provider is up by now; on
+        # the deferred path init is only scheduled, and a failed init later
+        # finalizes this record as ``launch_failed``. Deliberately not
+        # offloaded with ``to_thread``: no await may separate scheduling the
+        # deferred init from this write, or a fast init failure could finalize
+        # before the record exists and leave it open for good.
         _record_launch_best_effort(
             terminal_id=terminal.id,
             session_name=session_name,
@@ -2654,7 +2663,7 @@ def _notify_caller_of_deferred_failure(
         try:
             # Pass registry so post_kill_terminal hooks fire — parity with the
             # DELETE endpoint and agent_step teardown.
-            delete_terminal(terminal_id, registry=registry)
+            delete_terminal(terminal_id, registry=registry, end_reason="launch_failed")
         except Exception as exc:  # noqa: BLE001 — teardown is best-effort
             logger.warning(
                 "Deferred-init failure: teardown of worker %s failed (zombie "
@@ -2877,7 +2886,7 @@ def _purge_stale_session_rows_for_recreate(session_name: str) -> None:
                 session_name,
             )
             continue
-        delete_terminal_row(terminal_id, metadata, registry=None)
+        delete_terminal_row(terminal_id, metadata, registry=None, end_reason="stale_cleanup")
 
 
 def _resolve_existing_session_incarnation_locked(session_name: str) -> str:
@@ -3330,6 +3339,13 @@ async def _surface_deferred_init_failure(
         await asyncio.to_thread(
             _persist_initial_delivery, terminal_id, "failed", kind=kind, message=message
         )
+    if not terminal_missing:
+        # Issue #1082: the launch ended here, whoever owns the row's teardown.
+        # A retained external-owner tombstone (or a deferred Grok cleanup)
+        # would otherwise keep the record open until some later delete stamped
+        # an unrelated reason. First reason wins, so the CAO-owned teardown
+        # below cannot overwrite it.
+        await asyncio.to_thread(db_finalize_launch_records, [terminal_id], "launch_failed")
     notification = _sanitize_deferred_failure_message(message)
     if delete_worker:
         notification += " The failed worker terminal will be torn down."
@@ -5589,6 +5605,8 @@ def delete_terminal_row(
     terminal_id: str,
     metadata: Optional[Dict],
     registry: PluginRegistry | None = None,
+    *,
+    end_reason: str,
 ) -> bool:
     """Drop a terminal's registry row and emit ``post_kill_terminal``.
 
@@ -5604,13 +5622,16 @@ def delete_terminal_row(
     that no third-party plugin ever runs inside its critical section; the
     single-terminal ``delete_terminal`` path holds no such lock and passes its
     registry straight through.
+
+    ``end_reason`` (one of ``database.LAUNCH_END_REASONS``) is stamped on the
+    terminal's launch record (issue #1082); the caller names why it ended.
     """
     # Serialize row deletion with fallback publication. Otherwise a deferred
     # init task can exhaust DB retries, a concurrent DELETE can remove the row
     # and existing sidecars, and then the background task can publish a new
     # orphan sidecar after DELETE has already returned.
     with _DEFERRED_INIT_SIDECAR_LOCK:
-        deleted = db_delete_terminal(terminal_id)
+        deleted = db_delete_terminal(terminal_id, end_reason=end_reason)
         # Sidecars are keyed by terminal id and are safe to remove even when the
         # DB row was already deleted by another lifecycle owner.
         _delete_deferred_failure_fallback(terminal_id)
@@ -5631,7 +5652,9 @@ def delete_terminal_row(
     return deleted
 
 
-def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
+def delete_terminal(
+    terminal_id: str, registry: PluginRegistry | None = None, *, end_reason: str
+) -> bool:
     """Delete terminal and kill its tmux window.
 
     Single-terminal teardown: all three thirds back to back, in the order they
@@ -5640,6 +5663,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
 
     Returns False when the teardown was deferred (see
     ``dismantle_terminal_runtime``), leaving the row in place for a retry.
+    ``end_reason`` is passed through to ``delete_terminal_row``.
     """
     try:
         metadata = capture_terminal_snapshot(terminal_id)
@@ -5648,7 +5672,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
             )
             return False
-        return delete_terminal_row(terminal_id, metadata, registry=registry)
+        return delete_terminal_row(terminal_id, metadata, registry=registry, end_reason=end_reason)
 
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")

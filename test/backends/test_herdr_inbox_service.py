@@ -590,7 +590,7 @@ class TestHerdrInboxServiceReconcile:
         assert "pane-live" in service._pane_to_terminal
         assert "tid1" in service._terminal_to_pane
         # DB record for stale terminal deleted
-        mock_delete.assert_called_once_with("tid2")
+        mock_delete.assert_called_once_with("tid2", end_reason="pane_closed")
 
     @patch.object(HerdrInboxService, "_fetch_snapshot")
     def test_reconcile_no_op_when_all_panes_live(self, mock_snap):
@@ -648,7 +648,7 @@ class TestHerdrInboxServiceReconcile:
         _run_async(service._reconcile())
 
         # Only the ghost terminal should be deleted
-        mock_delete.assert_called_once_with("tid-ghost")
+        mock_delete.assert_called_once_with("tid-ghost", end_reason="pane_closed")
 
     @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
@@ -1006,7 +1006,7 @@ class TestHerdrInboxServiceStartupDbCleanup:
 
         _run_async(service._startup_db_cleanup())
 
-        mock_delete.assert_called_once_with("tid-ghost")
+        mock_delete.assert_called_once_with("tid-ghost", end_reason="pane_closed")
 
     @patch("cli_agent_orchestrator.clients.database.list_all_terminals", return_value=[])
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
@@ -1189,8 +1189,8 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         assert service._cleanup_closed_session("cao-reused") is True
 
-        mock_delete.assert_called_once_with("old00001")
-        assert call("new00001") not in mock_delete.call_args_list
+        mock_delete.assert_called_once_with("old00001", end_reason="pane_closed")
+        assert call("new00001", end_reason="pane_closed") not in mock_delete.call_args_list
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
@@ -1443,7 +1443,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "tid1" not in service._terminal_to_pane
         assert "tid1" not in service._kiro_terminals
         assert "tid1" not in service._working_since
-        mock_delete.assert_called_once_with("tid1")
+        mock_delete.assert_called_once_with("tid1", end_reason="pane_closed")
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
@@ -1531,7 +1531,7 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-3"})
 
-        mock_delete.assert_called_once_with("9d00610c")
+        mock_delete.assert_called_once_with("9d00610c", end_reason="pane_closed")
         assert "pane-3" not in service._pane_to_terminal
         assert "9d00610c" not in service._terminal_to_pane
 
@@ -1575,7 +1575,7 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-retained"})
 
-        mock_teardown.assert_called_once_with("retained-grok")
+        mock_teardown.assert_called_once_with("retained-grok", end_reason="pane_closed")
         mock_database_delete.assert_not_called()
 
     @patch.object(HerdrInboxService, "_label_still_live", return_value=False)
@@ -1646,7 +1646,10 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "ws-abc" not in service._workspace_to_session
         # Each persisted terminal goes through the normal provider-aware
         # teardown rather than a bulk DB delete.
-        assert mock_delete_terminal.call_args_list == [call("tid1"), call("tid2")]
+        assert mock_delete_terminal.call_args_list == [
+            call("tid1", end_reason="pane_closed"),
+            call("tid2", end_reason="pane_closed"),
+        ]
 
     @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
     def test_workspace_closed_unknown_workspace_is_noop(self, mock_delete):
@@ -1755,7 +1758,7 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         assert "pane-x" not in service._pane_to_terminal
         assert "tid-x" not in service._terminal_to_pane
-        mock_delete.assert_called_once_with("tid-x")
+        mock_delete.assert_called_once_with("tid-x", end_reason="pane_closed")
 
     def test_event_loop_agent_status_real_shape_delivers(self):
         """A real-shape broadcast pane_updated (event key, nested data.pane) triggers delivery."""
@@ -1878,7 +1881,7 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
         _run_async(service._reconcile())
 
         # Genuinely-closed terminal is cleaned up.
-        mock_delete.assert_called_once_with("tid1")
+        mock_delete.assert_called_once_with("tid1", end_reason="pane_closed")
         assert "pane-old" not in service._pane_to_terminal
         assert "tid1" not in service._terminal_to_pane
         assert "tid1" not in service._working_since
@@ -1966,7 +1969,7 @@ class TestHerdrInboxServiceWorkspaceClosedLiveResolution:
         service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-new"})
 
         # Resolved live -> persisted terminal gets provider-aware teardown.
-        mock_delete_terminal.assert_called_once_with("tid1")
+        mock_delete_terminal.assert_called_once_with("tid1", end_reason="pane_closed")
         # Map pruned for the closed session's terminal.
         assert "p-1" not in service._pane_to_terminal
         assert "tid1" not in service._terminal_to_pane

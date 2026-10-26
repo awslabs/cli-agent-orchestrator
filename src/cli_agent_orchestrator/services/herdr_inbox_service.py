@@ -43,7 +43,7 @@ def _delete_ghost_terminal_row(terminal_id: str) -> None:
     from cli_agent_orchestrator.clients.database import delete_terminal
     from cli_agent_orchestrator.services import ephemeral_service
 
-    if delete_terminal(terminal_id):
+    if delete_terminal(terminal_id, end_reason="pane_closed"):
         ephemeral_service.release(terminal_id, "terminal_gone")
 
 
@@ -446,7 +446,7 @@ class HerdrInboxService:
                     )
                     continue
                 try:
-                    if teardown_terminal(terminal_id) is False:
+                    if teardown_terminal(terminal_id, end_reason="pane_closed") is False:
                         complete = False
                         logger.warning(
                             "workspace.closed: cleanup deferred for terminal %s", terminal_id
@@ -1278,7 +1278,7 @@ class HerdrInboxService:
                     )
                 else:
                     try:
-                        teardown_terminal(terminal_id)
+                        teardown_terminal(terminal_id, end_reason="pane_closed")
                     except Exception as cleanup_exc:  # noqa: BLE001 — lifecycle is best-effort
                         logger.warning(
                             "pane.closed: DB-outage cleanup failed for terminal %s: %s",
@@ -1347,7 +1347,7 @@ class HerdrInboxService:
                 # direct DB delete, so a Grok private home can return explicit
                 # deferred cleanup and retain its terminal row for retry.
                 try:
-                    if teardown_terminal(terminal_id) is False:
+                    if teardown_terminal(terminal_id, end_reason="pane_closed") is False:
                         logger.warning("pane.closed: cleanup deferred for terminal %s", terminal_id)
                 except Exception as e:
                     logger.warning(f"pane.closed: failed to delete terminal {terminal_id}: {e}")

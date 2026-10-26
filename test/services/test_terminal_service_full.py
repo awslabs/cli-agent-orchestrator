@@ -1430,7 +1430,8 @@ class TestCreateTerminalIdempotencyKey:
             "developer",
             idempotency_key="stale-key",
         )
-        assert db_delete_terminal("long-gone-terminal") is True  # orphans the key row
+        # orphans the key row
+        assert db_delete_terminal("long-gone-terminal", end_reason="deleted") is True
 
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
@@ -3223,7 +3224,7 @@ class TestDeleteTerminal:
         }
         mock_db_delete.return_value = True
 
-        result = delete_terminal("test1234")
+        result = delete_terminal("test1234", end_reason="deleted")
 
         assert result is True
         mock_tmux.stop_pipe_pane.assert_called_once()
@@ -3253,7 +3254,7 @@ class TestDeleteTerminal:
         mock_db_delete.return_value = True
 
         # Should not raise, just warn
-        result = delete_terminal("test1234")
+        result = delete_terminal("test1234", end_reason="deleted")
 
         assert result is True
 
@@ -3280,7 +3281,7 @@ class TestDeleteTerminal:
         }
         mock_provider_manager.cleanup_provider.return_value = False
 
-        assert delete_terminal("test1234") is False
+        assert delete_terminal("test1234", end_reason="deleted") is False
         mock_db_delete.assert_not_called()
         mock_provider_manager.cleanup_provider.assert_called_once_with("test1234")
 
@@ -3301,7 +3302,7 @@ class TestDeleteTerminal:
         mock_get_metadata.return_value = None
         mock_db_delete.return_value = True
 
-        result = delete_terminal("test1234")
+        result = delete_terminal("test1234", end_reason="deleted")
 
         assert result is True
 
@@ -3340,7 +3341,7 @@ class TestDeleteTerminalWorktree:
         mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
         mock_db_delete.return_value = True
 
-        result = delete_terminal("test1234")
+        result = delete_terminal("test1234", end_reason="deleted")
 
         assert result is True
         mock_worktree_service.remove_worktree.assert_called_once_with("/repo", "test1234")
@@ -3383,7 +3384,7 @@ class TestDeleteTerminalWorktree:
         mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
         mock_db_delete.return_value = True
 
-        result = delete_terminal("terminalB")
+        result = delete_terminal("terminalB", end_reason="deleted")
 
         assert result is True
         mock_worktree_service.remove_worktree.assert_not_called()
@@ -3417,7 +3418,7 @@ class TestDeleteTerminalWorktree:
         mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
         mock_db_delete.return_value = True
 
-        result = delete_terminal("test1234")
+        result = delete_terminal("test1234", end_reason="deleted")
 
         assert result is True
         mock_worktree_service.remove_worktree.assert_not_called()
@@ -3459,7 +3460,7 @@ class TestDeleteTerminalWorktree:
         mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
         mock_db_delete.return_value = True
 
-        result = delete_terminal("test1234")  # must not raise
+        result = delete_terminal("test1234", end_reason="deleted")  # must not raise
 
         assert result is True
         mock_worktree_service.remove_worktree.assert_not_called()
@@ -3503,7 +3504,9 @@ class TestDeferredInitFailureNotification:
 
         terminal_service._purge_stale_session_rows_for_recreate("cao-reused")
 
-        assert delete_row.call_args_list == [call("stale001", metadata["stale001"], registry=None)]
+        assert delete_row.call_args_list == [
+            call("stale001", metadata["stale001"], registry=None, end_reason="stale_cleanup")
+        ]
 
     """PR #390 must-fixes #1/#3: a deferred-init failure must be OBSERVABLE to
     the supervisor (assign already returned success=True), teardown must pass
@@ -3535,7 +3538,9 @@ class TestDeferredInitFailureNotification:
         assert kwargs["sender_id"] == "worker99"
         assert "init failed: boom" in kwargs["message"]
         # Teardown passes the registry so post_kill_terminal hooks fire.
-        mock_delete.assert_called_once_with("worker99", registry=registry)
+        mock_delete.assert_called_once_with(
+            "worker99", registry=registry, end_reason="launch_failed"
+        )
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
@@ -3623,7 +3628,7 @@ class TestDeferredInitFailureNotification:
                 "worker99", "provider startup failed", None, delete_worker=True
             )
 
-        mock_delete.assert_called_once_with("worker99", registry=None)
+        mock_delete.assert_called_once_with("worker99", registry=None, end_reason="launch_failed")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
@@ -3666,7 +3671,7 @@ class TestDeferredInitFailureNotification:
         await task
 
         mock_create_inbox.assert_called_once()
-        mock_delete.assert_called_once_with("worker99", registry=None)
+        mock_delete.assert_called_once_with("worker99", registry=None, end_reason="launch_failed")
         mock_terminal_ended.assert_called_once_with("worker99")
 
     @pytest.mark.asyncio

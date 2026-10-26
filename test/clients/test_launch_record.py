@@ -296,3 +296,54 @@ def test_privacy_spy_canary_confined_to_target_name_column(fresh_db):
         if column == "target_name":
             continue
         assert CANARY not in str(value), f"canary leaked into {column!r}: {value!r}"
+
+
+def test_end_reason_vocabulary():
+    assert set(db_mod.LAUNCH_END_REASONS) == {
+        "launch_failed",
+        "deleted",
+        "pane_closed",
+        "stale_cleanup",
+        "session_teardown",
+    }
+
+
+@pytest.mark.parametrize(
+    "fn, args",
+    [
+        (db_mod.delete_terminal, ("t1",)),
+        (db_mod.delete_terminals_by_session, ("s",)),
+        (db_mod.delete_terminals_by_ids, (["t1"],)),
+    ],
+)
+def test_teardown_functions_require_an_end_reason(fresh_db, fn, args):
+    """Every teardown function that finalizes takes the reason as a required
+    keyword, so a new call site has to choose one."""
+    with pytest.raises(TypeError, match="end_reason"):
+        fn(*args)
+
+
+def test_delete_terminals_by_ids_finalizes(fresh_db):
+    """The only teardown path for flow recycling and the session-teardown
+    sweep: if it stopped finalizing, those records would stay open forever."""
+    from cli_agent_orchestrator.clients.database import TerminalModel
+
+    with db_mod.SessionLocal() as db:
+        for tid in ("ids00001", "ids00002"):
+            db.add(TerminalModel(id=tid, tmux_session="s", tmux_window=tid, provider="kiro_cli"))
+        db.commit()
+    for tid in ("ids00001", "ids00002"):
+        db_mod.create_launch_record(
+            terminal_id=tid,
+            session_name="s",
+            provider="kiro_cli",
+            target_name="developer",
+            target_kind="installed",
+            launched_model=None,
+            model_honored=None,
+        )
+
+    assert db_mod.delete_terminals_by_ids(["ids00001", "ids00002"], end_reason="session_teardown")
+
+    for tid in ("ids00001", "ids00002"):
+        assert db_mod.get_launch_record(tid)["end_reason"] == "session_teardown"

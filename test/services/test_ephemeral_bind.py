@@ -582,7 +582,7 @@ async def test_deferred_provider_cleanup_waits_for_delete(release_runtime, monke
     )
     assert database.get_ephemeral_agent(name)["state"] == "launched"
     monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda _: True)
-    assert terminal_service.delete_terminal(CHILD)
+    assert terminal_service.delete_terminal(CHILD, end_reason="deleted")
     assert_released(env, name, "terminal_deleted")
 
 
@@ -1071,7 +1071,7 @@ def test_ordinary_delete_never_opens_ephemeral_write_transaction(release_runtime
     database.create_terminal(ordinary, "cao-session", "ordinary", "claude_code")
     transaction = Mock(side_effect=AssertionError("ordinary deletion must not take write lock"))
     monkeypatch.setattr(env[0], "_transaction", transaction)
-    assert terminal_service.delete_terminal_row(ordinary, None) is True
+    assert terminal_service.delete_terminal_row(ordinary, None, end_reason="deleted") is True
     transaction.assert_not_called()
 
 

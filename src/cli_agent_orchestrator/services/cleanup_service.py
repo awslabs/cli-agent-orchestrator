@@ -142,7 +142,9 @@ def cleanup_old_data():
 
             try:
                 metadata = terminal_service.get_terminal_metadata(terminal_id)
-                if terminal_service.delete_terminal_row(terminal_id, metadata, registry=None):
+                if terminal_service.delete_terminal_row(
+                    terminal_id, metadata, registry=None, end_reason="stale_cleanup"
+                ):
                     deleted_terminals += 1
             except Exception as exc:  # noqa: BLE001 — retention sweep is best-effort
                 logger.warning("Failed to delete stale terminal %s: %s", terminal_id, exc)

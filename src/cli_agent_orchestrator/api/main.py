@@ -8528,6 +8528,7 @@ async def delete_terminal(
             terminal_service.delete_terminal,
             terminal_id,
             registry=get_plugin_registry(request),
+            end_reason="deleted",
         )
         if not success:
             raise HTTPException(

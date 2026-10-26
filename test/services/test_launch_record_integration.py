@@ -268,7 +268,7 @@ class TestLaunchRecordOnTeardown:
             )
             db.commit()
 
-        assert database.delete_terminal(result.id) is True
+        assert database.delete_terminal(result.id, end_reason="deleted") is True
 
         record = database.get_launch_record(result.id)
         assert record is not None  # survives deletion of the terminal row
@@ -299,7 +299,7 @@ class TestLaunchRecordOnTeardown:
         with patch.object(
             database, "finalize_launch_records", side_effect=RuntimeError("db is down")
         ):
-            assert database.delete_terminal("t-teardown") is True
+            assert database.delete_terminal("t-teardown", end_reason="deleted") is True
 
         with database.SessionLocal() as db:
             assert db.query(database.TerminalModel).filter_by(id="t-teardown").first() is None

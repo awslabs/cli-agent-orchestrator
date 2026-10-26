@@ -778,7 +778,9 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                     )
                     continue
                 try:
-                    if terminal_service.delete_terminal_row(terminal_id, metadata, registry=None):
+                    if terminal_service.delete_terminal_row(
+                        terminal_id, metadata, registry=None, end_reason="session_teardown"
+                    ):
                         if metadata:
                             torn_down.append((terminal_id, metadata))
                 except Exception as e:
@@ -815,7 +817,7 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             # are the retry handle for cleanup that has NOT happened yet.
             try:
                 sweep_ids = [i for i in incarnation_ids if i not in deferred_ids]
-                if delete_terminals_by_ids(sweep_ids):
+                if delete_terminals_by_ids(sweep_ids, end_reason="session_teardown"):
                     from cli_agent_orchestrator.services import ephemeral_service
 
                     for terminal_id in sweep_ids:

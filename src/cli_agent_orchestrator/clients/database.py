@@ -333,6 +333,22 @@ class DecisionRecordModel(Base):
 # change it on its own schedule. Plain strings here so either lands first.
 LAUNCH_TARGET_KINDS = ("installed", "ephemeral", "workflow")
 
+# Why a launch ended (issue #1082, provisional vocabulary). Each names the
+# cause, not the DB function that ran: ``launch_failed`` (create rollback or a
+# failed deferred init), ``deleted`` (an explicit delete, or handoff/workflow
+# step teardown), ``pane_closed`` (herdr reported the pane or workspace gone),
+# ``stale_cleanup`` (a sweep of rows nobody owns any more) and
+# ``session_teardown`` (session delete or flow recycle). Every teardown
+# function that finalizes takes one as a required keyword, so a new call site
+# has to choose.
+LAUNCH_END_REASONS = (
+    "launch_failed",
+    "deleted",
+    "pane_closed",
+    "stale_cleanup",
+    "session_teardown",
+)
+
 
 class LaunchRecordModel(Base):
     """Content-free per-launch record, kept after teardown (issue #1082).
@@ -360,7 +376,7 @@ class LaunchRecordModel(Base):
     outcome_recorded_at = Column(UTCDateTime, nullable=True)
     created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
     ended_at = Column(UTCDateTime, nullable=True)
-    end_reason = Column(String, nullable=True)
+    end_reason = Column(String, nullable=True)  # one of LAUNCH_END_REASONS
     __table_args__ = (
         Index("ix_launch_records_created_at", "created_at"),
         Index("ix_launch_records_ended_at", "ended_at"),
@@ -3246,12 +3262,13 @@ def _finalize_launch_records_best_effort(terminal_ids: List[str], end_reason: st
         logger.warning(f"Launch record finalize failed for {terminal_ids}: {e}")
 
 
-def delete_terminal(terminal_id: str, end_reason: str = "deleted") -> bool:
+def delete_terminal(terminal_id: str, *, end_reason: str) -> bool:
     """Delete terminal metadata.
 
-    Finalizes this terminal's launch record (issue #1082) AFTER the delete
-    commits, in a separate transaction, so a finalize failure can never roll
-    back or block the teardown itself.
+    Finalizes this terminal's launch record (issue #1082) with ``end_reason``
+    (one of ``LAUNCH_END_REASONS``) AFTER the delete commits, in a separate
+    transaction, so a finalize failure can never roll back or block the
+    teardown itself.
     """
     with SessionLocal() as db:
         deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
@@ -3261,7 +3278,7 @@ def delete_terminal(terminal_id: str, end_reason: str = "deleted") -> bool:
     return deleted > 0
 
 
-def delete_terminals_by_session(tmux_session: str, end_reason: str = "session_cleanup") -> int:
+def delete_terminals_by_session(tmux_session: str, *, end_reason: str) -> int:
     """Delete all terminals in a session.
 
     Finalizes each deleted terminal's launch record (issue #1082); see
@@ -3283,7 +3300,7 @@ def delete_terminals_by_session(tmux_session: str, end_reason: str = "session_cl
     return deleted
 
 
-def delete_terminals_by_ids(terminal_ids: List[str], end_reason: str = "bulk_cleanup") -> int:
+def delete_terminals_by_ids(terminal_ids: List[str], *, end_reason: str) -> int:
     """Delete specific terminal rows by id. Returns the number deleted.
 
     Unlike ``delete_terminals_by_session`` (which deletes EVERY row for a
