@@ -111,6 +111,7 @@ EPHEMERAL_DEFAULTS = {
     "pending_ttl_seconds": 900,
     "claim_lease_seconds": 60,
     "max_depth": 1,
+    "min_tier": None,
     "max_tier": None,
     "default_tier": None,
     "max_effort": None,
@@ -133,6 +134,8 @@ def get_ephemeral_settings() -> Dict[str, Any]:
         block = {}
     result = {**EPHEMERAL_DEFAULTS, **block}
     result["_model_tiers"] = load_model_tiers(settings)
+    # child_may_delegate() reads its own key from the same block.
+    result["_unknown_keys"] = sorted(set(block) - set(EPHEMERAL_DEFAULTS) - {"child_may_delegate"})
     return result
 
 

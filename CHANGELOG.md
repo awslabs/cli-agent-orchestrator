@@ -183,6 +183,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ephemeral agents (#801) accept an optional `ephemeral.min_tier` floor. An explicit tier below it refuses with `tier_below_policy`, and a stored tier or provider default below a floor raised since create refuses at claim with `policy_changed_since_create:tier_below_policy`. Unknown `ephemeral.*` keys now log one warning per server process naming the keys, never their values.
+
 - Ephemeral agents (#801) accept an explicit `effort` and apply `ephemeral.default_effort` and `ephemeral.max_effort` (Claude Code `--effort`, Codex `model_reasoning_effort`).
 
 - Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim. `auto` still refuses.

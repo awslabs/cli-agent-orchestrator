@@ -138,6 +138,7 @@ Only JSON `true` enables the tool, and agent terminals must restart to see it.
 | `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched or swept. |
 | `claim_lease_seconds` | `60` | Lease from claim to terminal creation. |
 | `max_depth` | `1` | Only integer 1 is supported; ephemeral callers cannot create ephemerals. |
+| `min_tier` | `null` | Optional minimum model tier; must not exceed `max_tier` and needs a `default_tier` at or above it. |
 | `max_tier` | `null` | Maximum model tier; a ceiling requires a default at or below it and mappings for every permitted tier and allowed provider. |
 | `default_tier` | `null` | Model tier used when the spec omits `model_tier`, resolved once at creation and required to be mapped for every allowed provider. |
 | `max_effort` | `null` | Maximum reasoning effort; a ceiling requires a default at or below it. |

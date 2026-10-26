@@ -485,8 +485,9 @@ def test_B_R1_stored_effort_and_A5_3(create_store, claimless, null):
     assert json.loads(Path(row["audit_path"]).read_text())["events"][-1]["event"] == "released"
 
 
-def test_unknown_keys_ignored(create_store, caplog):
-    create_store[4]["ephemeral"]["min_tier"] = "private-setting"
+def test_unknown_keys_ignored(create_store, monkeypatch, caplog):
+    monkeypatch.setattr(create_store[0], "_warned_keys", set())
+    create_store[4]["ephemeral"]["min_tierr"] = "private-setting"
     result = create(create_store)
     assert "private-setting" not in str(result) + caplog.text
-    assert not caplog.records
+    assert "ephemeral.min_tierr" in caplog.text

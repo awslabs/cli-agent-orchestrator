@@ -19,6 +19,7 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "max_brief_bytes": 8192,
     "pending_ttl_seconds": 900,
     "claim_lease_seconds": 60,
+    "min_tier": null,
     "max_tier": null,
     "default_tier": null,
     "max_effort": null,
@@ -78,8 +79,17 @@ See [Launch decisions](decisions.md) and `cao decisions tier` to manage mappings
 A ceiling needs a default at or below it. Every tier at or below `ephemeral.max_tier`,
 and the default tier, must be mapped for every allowed provider. An invalid model id
 counts as unmapped. A broken block refuses every create and claim with
-`policy_config_error:<key>` until the operator fixes it. Unknown ephemeral keys, such
-as `min_tier`, remain silently ignored.
+`policy_config_error:<key>` until the operator fixes it.
+
+The optional `ephemeral.min_tier` floor bounds tiers from below.
+It must not exceed `max_tier`, and it needs a `default_tier` at or above it, so
+`min_tier <= default_tier <= max_tier`. The floor need not equal the default: a creator can
+still choose a cheaper explicit tier, down to the floor. An explicit tier below the floor
+refuses with `tier_below_policy`, before the ceiling and mapping checks. A broken floor is
+`policy_config_error:min_tier`.
+
+Unknown keys in the block are accepted. The first create that sees one logs a single warning
+per server process naming it, never its value, so a typo such as `min_tierr` is visible.
 
 An explicit tier or effort above its ceiling gives `tier_exceeds_policy` or
 `effort_exceeds_policy`; an unmapped explicit tier with no ceiling gives `tier_unmapped`.
@@ -223,7 +233,9 @@ reverts that claim to pending; fix the named setting and retry. A removed provid
 A stored tier or effort above a tightened ceiling, an unmapped stored tier, or a stored provider
 default under a newly added ceiling returns `policy_changed_since_create:tier_exceeds_policy`
 or `policy_changed_since_create:effort_exceeds_policy`, or
-`policy_changed_since_create:tier_unmapped`, and collects the name; re-create it.
+`policy_changed_since_create:tier_unmapped`, and collects the name; re-create it. A stored
+tier below a floor raised since create, or a stored provider default under a newly added floor,
+returns `policy_changed_since_create:tier_below_policy` and collects the name the same way.
 A broken table names `model_tiers`, never `ephemeral.model_tiers`.
 The stored spec is verified and the profile is finalized before the claim response.
 An owner may also launch a pending name without a claim identifier; that bind applies the
@@ -243,12 +255,12 @@ extraction failure tear down terminals owned by that call.
 | --- | --- |
 | 404 | `ephemeral_disabled`, `unknown_ephemeral` |
 | 409 | `already_claimed`, `claim_expired`, `ephemeral_expired`, `spec_unavailable` |
-| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy` |
+| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_below_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy` |
 | 422 | `invalid_request` for the claim body; invalid launch claim identifiers or claim-plus-reuse requests |
 | 500 | `unexpected_failure` |
 
-Create also refuses with `tier_unmapped`, `tier_exceeds_policy`, `effort_exceeds_policy` and
-`policy_config_error:<key>`, all HTTP 400.
+Create also refuses with `tier_unmapped`, `tier_exceeds_policy`, `tier_below_policy`,
+`effort_exceeds_policy` and `policy_config_error:<key>`, all HTTP 400.
 
 Every ephemeral live-profile load verifies the exact bytes parsed against the registry's
 `profile_sha256`, including claim-less launches and provider reloads. Missing rows or hashes
