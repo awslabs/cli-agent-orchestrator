@@ -6,6 +6,7 @@ flow_daemon, lifespan, and the main() entry point.
 """
 
 import asyncio
+import os
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
@@ -2066,6 +2067,15 @@ class TestLifespan:
 class TestMainEntryPoint:
     """Tests for the main() CLI entry point."""
 
+    @pytest.fixture(autouse=True)
+    def _restore_environ(self):
+        """main() writes CAO_API_HOST/PORT (and CAO_AGENTS_DIR) straight into
+        os.environ to mirror the real CLI entry point, which leaks into every
+        test that runs later in the same process. Snapshot and restore it so
+        these tests stay self-contained."""
+        with patch.dict(os.environ):
+            yield
+
     def test_main_default_args(self):
         """main() runs uvicorn with default host/port."""
         with (
@@ -2104,6 +2114,65 @@ class TestMainEntryPoint:
             assert call_kwargs["port"] == 9999
             assert call_kwargs["proxy_headers"] is True
             assert "forwarded_allow_ips" in call_kwargs
+
+    def test_main_custom_host_port_exports_to_environ(self, monkeypatch):
+        """P2-2: ``--host``/``--port`` must land in ``os.environ`` the same way
+        ``--agents-dir`` already does, so ``cao_server_env()`` (read by the MCP
+        env forwarding) sees this launch's actual address instead of whatever
+        was there before (or the 9889 default). A wildcard bind is mapped to
+        loopback since it isn't a usable client address."""
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_API_PORT", raising=False)
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+        ):
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host="0.0.0.0", port=9999, terminal=None
+            )
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert os.environ["CAO_API_HOST"] == "127.0.0.1"
+            assert os.environ["CAO_API_PORT"] == "9999"
+
+    def test_main_without_flags_does_not_touch_environ(self, monkeypatch):
+        """The env-var path (no CLI flags) already works because
+        ``cao_server_env()`` reads ``os.environ`` directly -- ``main()`` must
+        not overwrite it when no flag was given."""
+        monkeypatch.setenv("CAO_API_HOST", "10.0.0.5")
+        monkeypatch.setenv("CAO_API_PORT", "7000")
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None, terminal=None)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert os.environ["CAO_API_HOST"] == "10.0.0.5"
+            assert os.environ["CAO_API_PORT"] == "7000"
+
+    def test_main_flag_port_overrides_a_stale_env_var(self, monkeypatch):
+        """Mixed launch (``CAO_API_PORT=9899 cao-server --port 9900``): the
+        flag must win in the forwarded env too, not just in ``app.state``."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=9900, terminal=None)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert os.environ["CAO_API_PORT"] == "9900"
 
     def test_main_with_agents_dir(self):
         """main() sets KIRO_AGENTS_DIR when --agents-dir is provided."""

@@ -335,6 +335,22 @@ def _hermetic_cao_env(monkeypatch, tmp_path):
     monkeypatch.delenv("CAO_WORKFLOW_STEP_ID", raising=False)
     # cli/commands/info.py uses this for session detection
     monkeypatch.delenv("CAO_SESSION_NAME", raising=False)
+    # utils/mcp_resolution.cao_server_env() reads these directly; an inherited
+    # value (e.g. a developer's pane on a non-default port) would otherwise
+    # leak into any test asserting an exact bundled-server `env`. Tests can
+    # still set them explicitly after fixture setup.
+    #
+    # CAO_HOME_DIR is deliberately NOT stripped here: constants.CAO_HOME_DIR is
+    # resolved once at interpreter import, before this fixture ever runs, so
+    # delenv'ing the raw env var would not change it for this process -- but it
+    # WOULD change it for any test that spawns a real subprocess (e.g.
+    # test/utils/test_atomic_file.py's multiprocess lock test), which
+    # re-resolves CAO_HOME_DIR from its own (now-stripped) inherited env and
+    # disagrees with the already-imported value here. A test asserting an
+    # exact forwarded CAO_HOME_DIR must still set/patch it itself (see
+    # test/utils/test_mcp_resolution.py's TestServerEnv for the pattern).
+    monkeypatch.delenv("CAO_API_HOST", raising=False)
+    monkeypatch.delenv("CAO_API_PORT", raising=False)
 
 
 @pytest.fixture

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Decision points say when a decider keeps failing, and records carry their target kind**
+  (#1067). The server logs one warning when a decider starts failing at a point (`timeout`,
+  `error`, `invalid_answer`, `no_answer` or `decider_unavailable`), at most once a minute for
+  each decider, point and reason, and one line when it answers again. These lines name only
+  the decider, point and reason. The server also logs its resolved threshold, timeouts, point
+  states and deciders at startup and when they change. `cao decisions status` adds
+  `decider_status`: each decider's last outcome, reason and time, and its counts by reason over
+  the last 24 hours, read from the database read-only. `decision_records` gains a nullable
+  `target_kind` column (`installed`, `ephemeral` or `workflow`); existing rows stay null.
+
 - **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
   paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
   terminal still read IDLE, so the sender waited forever and the next message was pasted on top
@@ -260,9 +270,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Script-run frozen memory now uses the memory gateway, so a configured remote memory owner
   supplies the same context as live terminals instead of freezing stale local memory. A journal
   read failure for a known script run now withholds memory with a warning instead of falling back
-  to live, unfrozen memory; non-script runs keep their existing fallback. A remote memory owner
-  that is unreachable, errors, or has memory disabled now gives the step no memory with a warning,
-  as on the live path, instead of failing it (#828).
+  to live, unfrozen memory; non-script runs keep their existing fallback. A memory resolution error
+  now gives the step no memory with a warning, as on the live path, instead of failing it. This
+  includes a local read error and a remote owner that is unreachable, errors, or has memory
+  disabled (#828).
 - Every client call that creates a session or terminal synchronously (`cao launch` without
   `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
   `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`

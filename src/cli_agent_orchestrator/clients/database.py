@@ -301,6 +301,8 @@ class DecisionRecordModel(Base):
     kind = Column(String, nullable=False)
     provider = Column(String, nullable=False)
     agent_profile = Column(String, nullable=True)
+    # installed, ephemeral or workflow; NULL on rows written before the column existed.
+    target_kind = Column(String, nullable=True)
     fallback_value = Column(String, nullable=True)
     fallback_source = Column(String, nullable=False)
     answer = Column(String, nullable=True)
@@ -805,6 +807,9 @@ def init_db() -> None:
     # Appended LAST (issue #447, ``handoff_results``). Its own new table, no shared
     # columns with anything above, so registry order is immaterial here too.
     _migrate_add_handoff_results()
+    # Appended LAST (issue #1067). One nullable column on decision_records, which
+    # create_all made above; no backfill, so registry order is immaterial here too.
+    _migrate_decision_records_target_kind()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -866,6 +871,30 @@ def _migrate_add_handoff_results() -> None:
             conn.commit()
     except Exception as e:
         logger.warning(f"Migration check for handoff_results failed: {e}")
+
+
+def _migrate_decision_records_target_kind() -> None:
+    """Add the nullable target_kind column to decision_records if missing (issue #1067).
+
+    Idempotent: PRAGMA table_info gate, ALTER TABLE ADD COLUMN only when missing. Fresh
+    DBs already have the column from ``Base.metadata.create_all``. Existing rows keep
+    NULL: their target kind was never recorded, and deriving it now from a profile name
+    could mislabel them, so they are not backfilled.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(decision_records)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if columns and "target_kind" not in columns:
+                conn.execute("ALTER TABLE decision_records ADD COLUMN target_kind TEXT")
+                logger.info("Migration: added target_kind column to decision_records")
+    except Exception as e:
+        # Records cannot be written without the column, so this is louder than debug.
+        logger.warning(f"Migration check for decision_records target_kind failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:

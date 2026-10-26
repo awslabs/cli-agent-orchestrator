@@ -1427,6 +1427,59 @@ class TestBuildEnvArgs:
         assert "CAO_SESSION_NAME=cao-proj" in joined
         assert "CAO_SESSION_NAME=evil" not in joined
 
+    def test_build_env_args_forwards_this_cao_address_and_home(self, monkeypatch):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-b")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="tid", session_name="s", extra_env={"CAO_HOME_DIR": "/srv/override"}
+        )
+        values = [pairs[i + 1] for i in range(0, len(pairs), 2)]
+        # A pane must reach the CAO that created it, whoever started the herdr server.
+        assert "CAO_API_PORT=9899" in values
+        assert not any(v.startswith("CAO_API_HOST=") for v in values)
+        # An operator-forwarded value still overrides, and identity still comes last.
+        assert "CAO_HOME_DIR=/srv/override" in values and "CAO_HOME_DIR=/srv/cao-b" not in values
+        assert values[-2:] == ["CAO_TERMINAL_ID=tid", "CAO_SESSION_NAME=s"]
+
+    def test_build_env_args_drops_a_server_env_value_the_sanitizer_would_reject(
+        self, monkeypatch, caplog
+    ):
+        """P3-1: before this PR, an unresolvable CAO_HOME_DIR made the server
+        fall back to defaults -- wrong, but the pane still launched. Baking
+        cao_server_env() values into ``--env`` must not turn that into a hard
+        failure for every pane on this CAO: an unsafe value is dropped (with a
+        warning), not forwarded raw into the sanitizer's ValueError."""
+        from pathlib import Path
+
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        monkeypatch.setenv("CAO_HOME_DIR", "irrelevant-now-only-presence-matters")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.mcp_resolution.CAO_HOME_DIR",
+            Path("/Users/me/R&D/cao-b"),
+        )
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_API_PORT", raising=False)
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(terminal_id="tid", session_name="s")
+        values = [pairs[i + 1] for i in range(0, len(pairs), 2)]
+        assert not any(v.startswith("CAO_HOME_DIR=") for v in values)
+        assert "CAO_TERMINAL_ID=tid" in values
+        assert "dropping" in caplog.text.lower() and "CAO_HOME_DIR" in caplog.text
+
+    def test_build_env_args_adds_nothing_for_a_default_cao(self, monkeypatch):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(terminal_id="tid", session_name="s")
+        assert pairs == ["--env", "CAO_TERMINAL_ID=tid", "--env", "CAO_SESSION_NAME=s"]
+
 
 class TestEnvValueRedaction:
     """P1: operator-forwarded --env values are secrets; they must never appear

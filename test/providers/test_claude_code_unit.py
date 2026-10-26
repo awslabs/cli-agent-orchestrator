@@ -1550,6 +1550,52 @@ class TestClaudeCodeProviderMisc:
         # Should keep the user-provided value, NOT overwrite with term-99
         assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
 
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_build_command_mcp_forwards_this_cao_address_and_home(self, mock_load, monkeypatch):
+        """A CAO running on a non-default port/home tells its agents' bundled
+        cao-mcp-server, so their tool calls reach this CAO and not the default."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-b")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.mcp_resolution.CAO_HOME_DIR", Path("/srv/cao-b")
+        )
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-55", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        mcp_data = _extract_mcp_config(command)
+        server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env["CAO_API_PORT"] == "9899"
+        assert server_env["CAO_HOME_DIR"] == "/srv/cao-b"
+        assert "CAO_API_HOST" not in server_env
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_build_command_mcp_adds_nothing_for_a_default_cao(self, mock_load, monkeypatch):
+        """A default CAO (none of the three address vars set) writes exactly the
+        same MCP config as before this fix."""
+        for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-56", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        mcp_data = _extract_mcp_config(command)
+        server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env == {"CAO_TERMINAL_ID": "term-56"}
+
 
 class TestClaudeCodeProviderContainerPathTranslation:
     """_build_claude_command must translate temp-file paths for container profiles.
