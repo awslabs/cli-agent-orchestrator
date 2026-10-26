@@ -23,10 +23,12 @@ server, or an explicit absolute path) passes through unchanged.
 """
 
 import logging
+import re
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from cli_agent_orchestrator.constants import server_coordinate_env
 
@@ -39,11 +41,33 @@ CAO_MCP_SERVER_COMMAND = "cao-mcp-server"
 # interpreter directly, with no dependency on a script being on PATH.
 CAO_MCP_SERVER_MODULE = "cli_agent_orchestrator.mcp_server.server"
 
+# The distribution name this package publishes under. A ``uvx``/``uv tool run``
+# entry whose positional entry point is ``cao-mcp-server`` only starts OUR
+# server if its ``--from`` names this distribution (or a git URL for it) — any
+# other package is free to ship a console script by the same name.
+CAO_DISTRIBUTION_NAME = "cli-agent-orchestrator"
+
 # Console-script filename to look for next to the interpreter. On Windows the
 # script is installed as a .exe wrapper.
 _SCRIPT_FILENAME = (
     f"{CAO_MCP_SERVER_COMMAND}.exe" if sys.platform == "win32" else CAO_MCP_SERVER_COMMAND
 )
+
+# A Python interpreter, by basename: ``python``, ``python3``, ``python3.12``
+# (``.exe`` on Windows). Only such a command can be running ``-m <module>``.
+_PYTHON_BASENAME = re.compile(r"^python(?:\d+(?:\.\d+)*)?(?:\.exe)?$", re.IGNORECASE)
+
+# ``uvx`` and its long form ``uv tool run``, by basename.
+_UVX_BASENAMES = frozenset({"uvx", "uvx.exe"})
+_UV_BASENAMES = frozenset({"uv", "uv.exe"})
+
+# A PEP 508 requirement's name, optional extras, and whatever follows (a version
+# specifier). ``--from cli-agent-orchestrator[all]>=0.2`` is still us.
+_REQUIREMENT = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)(?:\[[^\]]*\])?(?P<rest>.*)$")
+
+# VCS prefixes/schemes uv accepts for a git source. ``--from`` values that are
+# not one of these and are not a bare requirement are somebody else's.
+_GIT_SCHEMES = ("git+", "git://")
 
 
 def _sibling_script() -> str:
@@ -114,35 +138,153 @@ def resolve_cao_mcp_command(
     return interpreter, ["-m", CAO_MCP_SERVER_MODULE, *args]
 
 
+def _is_python_interpreter(command: str) -> bool:
+    """Whether ``command`` names a Python interpreter (so ``-m`` means ours)."""
+    if sys.executable and command == sys.executable:
+        return True
+    return bool(_PYTHON_BASENAME.match(Path(command).name))
+
+
+def _normalize_distribution(name: str) -> str:
+    """PEP 503 normalisation: runs of ``-``/``_``/``.`` collapse, lowercased."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _names_this_distribution(spec: str) -> bool:
+    """Whether a ``uvx --from`` value names THIS package.
+
+    Two accepted forms, per uv's own source syntax:
+
+    - the published distribution name, with any extras or version specifier
+      (``cli-agent-orchestrator``, ``cli_agent_orchestrator[all]``,
+      ``cli-agent-orchestrator==0.1.0``) — compared after PEP 503
+      normalisation, so ``-``/``_``/``.`` and case do not matter;
+    - a git source whose repository path is this distribution, at any ref
+      (``git+https://github.com/awslabs/cli-agent-orchestrator.git@main``,
+      ``git+ssh://git@host/org/cli-agent-orchestrator``).
+
+    Everything else -- another distribution, a local directory, an archive URL,
+    a PyPI index pin -- is somebody else's package, even when it happens to
+    expose a ``cao-mcp-server`` entry point.
+    """
+    spec = spec.strip()
+    if not spec:
+        return False
+    if spec.startswith(_GIT_SCHEMES):
+        url = spec[len("git+") :] if spec.startswith("git+") else spec
+        url = url.split("#", 1)[0]  # drop #subdirectory=... / #egg=...
+        # scp-style ``git@host:org/repo`` has no scheme for urlsplit to find.
+        path = urlsplit(url).path if "://" in url else url.rpartition(":")[2]
+        last = path.rstrip("/").rpartition("/")[2]
+        last = last.partition("@")[0]  # @ref
+        if last.endswith(".git"):
+            last = last[: -len(".git")]
+        return _normalize_distribution(last) == CAO_DISTRIBUTION_NAME
+    match = _REQUIREMENT.match(spec)
+    if not match:
+        return False
+    rest = match.group("rest").strip()
+    # A bare name, or a name followed by a version specifier. A ``@`` here is a
+    # PEP 508 direct reference (``name @ https://...``) pointing somewhere we
+    # have not verified, so it is not accepted.
+    if rest and rest[0] not in "<>=!~":
+        return False
+    return _normalize_distribution(match.group("name")) == CAO_DISTRIBUTION_NAME
+
+
+def _uvx_entry_point(args: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Return ``(--from value, first positional)`` from a uvx argument list.
+
+    ``--from`` is read in both spellings uv accepts (``--from X`` and
+    ``--from=X``). The first token that is neither an option nor a ``--from``
+    value is the entry point uvx will execute. Options other than ``--from``
+    that take a *separate* value (``--python 3.12``) make that value look
+    positional; the caller treats an unrecognised positional as a third party,
+    which is the safe direction (no coordinates handed out).
+    """
+    from_spec: Optional[str] = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if not isinstance(arg, str):
+            return None, None
+        if arg == "--from":
+            if index + 1 >= len(args):
+                return from_spec, None
+            from_spec = args[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--from="):
+            from_spec = arg[len("--from=") :]
+            index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return from_spec, arg
+    return from_spec, None
+
+
 def is_bundled_cao_server(config: dict) -> bool:
     """Return True when this entry starts CAO's OWN orchestration MCP server.
 
-    Four shapes reach callers, and all four name the server exactly:
+    Four shapes reach callers, and each is recognised by its whole shape — the
+    command AND the arguments that give that command its meaning:
 
     1. the bare console script a bundled profile declares (``command:
-       cao-mcp-server``);
-    2. the absolute path :func:`resolve_cao_mcp_command` rewrites that to;
-    3. the module entrypoint it falls back to (``<python> -m
-       cli_agent_orchestrator.mcp_server.server``);
-    4. ``uvx --from git+…/cli-agent-orchestrator.git@main cao-mcp-server`` --
-       the form the shipped ``templates/aws/*`` profiles use, where the server
-       is a positional ARGUMENT rather than the command.
+       cao-mcp-server``), or the absolute path
+       :func:`resolve_cao_mcp_command` rewrites it to — basename equality
+       against the console script / its Windows ``.exe`` wrapper;
+    2. the module entrypoint that resolution falls back to: the command must be
+       a Python interpreter AND its arguments must begin with ``-m
+       cli_agent_orchestrator.mcp_server.server`` (server flags may follow);
+    3. ``uvx --from <this distribution> cao-mcp-server`` -- the form the
+       shipped ``templates/aws/*`` profiles use, where the server is a
+       positional ARGUMENT rather than the command. The command must be
+       ``uvx`` (or ``uv tool run``), the ``--from`` must name THIS
+       distribution (see :func:`_names_this_distribution`), and the positional
+       entry point must be ``cao-mcp-server``.
 
     Checked structurally rather than by the entry's name in ``mcpServers``,
-    because the name is the profile author's label: shape 4 is what a profile
+    because the name is the profile author's label: shape 3 is what a profile
     built from a template actually carries, and an entry labelled something
     else that nonetheless launches this server still needs CAO's coordinates.
-    A third-party server cannot match by accident -- it would have to name
-    ``cao-mcp-server`` as its command or pass it as an argument.
+
+    Deliberately NOT a name heuristic. ``cao-mcp-server`` appearing anywhere in
+    an argument list is not enough: ``uvx --from some-other-package
+    cao-mcp-server`` runs somebody else's script of that name, and an unrelated
+    program is free to take ``cao-mcp-server`` as an argument of its own.
+    Neither may be handed this server's host, port and home, so both are
+    rejected. The cost of this strictness is the occasional false negative (an
+    exotic uvx invocation, a ``--from`` pointing at a local checkout): that
+    entry simply keeps today's behaviour and falls back to the default
+    coordinates, which is the safe direction.
     """
     command = config.get("command")
-    if isinstance(command, str) and command:
-        if Path(command).name in (CAO_MCP_SERVER_COMMAND, _SCRIPT_FILENAME):
-            return True
-    return any(
-        isinstance(arg, str) and arg in (CAO_MCP_SERVER_COMMAND, CAO_MCP_SERVER_MODULE)
-        for arg in (config.get("args") or [])
-    )
+    if not isinstance(command, str) or not command:
+        return False
+    args = list(config.get("args") or [])
+
+    # (1) console script, bare or resolved to an absolute path.
+    if Path(command).name in (CAO_MCP_SERVER_COMMAND, _SCRIPT_FILENAME):
+        return True
+
+    # (2) module entrypoint, run by an interpreter.
+    if _is_python_interpreter(command):
+        return args[:2] == ["-m", CAO_MCP_SERVER_MODULE]
+
+    # (3) uvx / uv tool run, sourced from this distribution.
+    basename = Path(command).name
+    if basename in _UV_BASENAMES:
+        if args[:2] != ["tool", "run"]:
+            return False
+        args = args[2:]
+    elif basename not in _UVX_BASENAMES:
+        return False
+    from_spec, entry_point = _uvx_entry_point(args)
+    if from_spec is None or entry_point != CAO_MCP_SERVER_COMMAND:
+        return False
+    return _names_this_distribution(from_spec)
 
 
 def apply_server_coordinates(config: dict) -> dict:

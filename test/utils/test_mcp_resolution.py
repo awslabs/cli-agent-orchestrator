@@ -1,12 +1,17 @@
 """Unit tests for cao-mcp-server command resolution."""
 
+import sys
 from unittest.mock import patch
+
+import yaml
 
 from cli_agent_orchestrator.constants import (
     SERVER_COORDINATE_ENV_VARS,
     server_coordinate_env,
 )
+from cli_agent_orchestrator.services.agent_scaffold import _TEMPLATES_ROOT
 from cli_agent_orchestrator.utils.mcp_resolution import (
+    CAO_DISTRIBUTION_NAME,
     CAO_MCP_SERVER_MODULE,
     apply_server_coordinates,
     is_bundled_cao_server,
@@ -388,7 +393,13 @@ class TestResolveCarriesServerCoordinates:
 
 
 class TestIsBundledCaoServer:
-    """Every shape that starts CAO's own server is recognised structurally."""
+    """Every shape that starts CAO's own server is recognised by its SHAPE.
+
+    The command and the arguments that give that command its meaning are
+    checked together. Naming ``cao-mcp-server`` (or the module) somewhere in an
+    argument list is not enough -- a third party is free to do that, and must
+    not be handed this server's host, port and home.
+    """
 
     def test_bare_console_script(self):
         assert is_bundled_cao_server({"command": "cao-mcp-server", "args": []})
@@ -399,6 +410,17 @@ class TestIsBundledCaoServer:
     def test_module_entrypoint(self):
         assert is_bundled_cao_server(
             {"command": "/venv/bin/python3", "args": ["-m", CAO_MCP_SERVER_MODULE]}
+        )
+
+    def test_module_entrypoint_via_sys_executable(self):
+        """The exact interpreter ``resolve_cao_mcp_command`` falls back to."""
+        assert is_bundled_cao_server(
+            {"command": sys.executable, "args": ["-m", CAO_MCP_SERVER_MODULE]}
+        )
+
+    def test_module_entrypoint_with_trailing_server_args(self):
+        assert is_bundled_cao_server(
+            {"command": "python3.12", "args": ["-m", CAO_MCP_SERVER_MODULE, "--verbose"]}
         )
 
     def test_uvx_form_used_by_the_shipped_aws_templates(self):
@@ -420,6 +442,65 @@ class TestIsBundledCaoServer:
             }
         )
 
+    def test_uvx_from_the_published_distribution_name(self):
+        assert is_bundled_cao_server(
+            {"command": "uvx", "args": ["--from", CAO_DISTRIBUTION_NAME, "cao-mcp-server"]}
+        )
+
+    def test_uvx_from_the_distribution_with_extras_and_a_version(self):
+        """PEP 503 spelling and a version pin are still this package."""
+        assert is_bundled_cao_server(
+            {
+                "command": "uvx",
+                "args": ["--from=cli_agent_orchestrator[all]>=0.2", "cao-mcp-server"],
+            }
+        )
+
+    def test_uv_tool_run_long_form(self):
+        assert is_bundled_cao_server(
+            {
+                "command": "/home/op/.local/bin/uv",
+                "args": ["tool", "run", "--from", CAO_DISTRIBUTION_NAME, "cao-mcp-server"],
+            }
+        )
+
+    def test_uvx_from_a_git_url_without_the_dot_git_suffix(self):
+        assert is_bundled_cao_server(
+            {
+                "command": "uvx",
+                "args": [
+                    "--from",
+                    "git+ssh://git@github.com/awslabs/cli-agent-orchestrator",
+                    "cao-mcp-server",
+                ],
+            }
+        )
+
+    # ── the three near-misses the independent review found (#1066 review) ──
+
+    def test_uvx_from_another_package_is_not_bundled(self):
+        """``--from`` decides whose ``cao-mcp-server`` script runs.
+
+        Any distribution may ship a console script by that name; handing it
+        CAO's internal endpoint and ``CAO_HOME_DIR`` would leak both to a
+        third party.
+        """
+        assert not is_bundled_cao_server(
+            {"command": "uvx", "args": ["--from", "some-other-package", "cao-mcp-server"]}
+        )
+
+    def test_a_third_party_taking_the_name_as_an_argument_is_not_bundled(self):
+        assert not is_bundled_cao_server(
+            {"command": "my-server", "args": ["--helper", "cao-mcp-server"]}
+        )
+
+    def test_a_third_party_taking_the_module_as_an_argument_is_not_bundled(self):
+        assert not is_bundled_cao_server(
+            {"command": "my-server", "args": ["--module", CAO_MCP_SERVER_MODULE]}
+        )
+
+    # ── further negatives ──
+
     def test_third_party_server_is_not_bundled(self):
         assert not is_bundled_cao_server({"command": "my-server", "args": ["--port", "9000"]})
 
@@ -428,12 +509,99 @@ class TestIsBundledCaoServer:
             {"command": "uvx", "args": ["--from", "pkg", "some-other-server"]}
         )
 
+    def test_uvx_without_a_from_is_not_bundled(self):
+        """Without ``--from``, uvx resolves the name on the index -- not ours."""
+        assert not is_bundled_cao_server({"command": "uvx", "args": ["cao-mcp-server"]})
+
+    def test_uvx_from_a_lookalike_repository_is_not_bundled(self):
+        assert not is_bundled_cao_server(
+            {
+                "command": "uvx",
+                "args": [
+                    "--from",
+                    "git+https://example.invalid/x/cli-agent-orchestrator-fork.git",
+                    "cao-mcp-server",
+                ],
+            }
+        )
+
+    def test_uv_without_tool_run_is_not_bundled(self):
+        assert not is_bundled_cao_server(
+            {"command": "uv", "args": ["run", "--from", CAO_DISTRIBUTION_NAME, "cao-mcp-server"]}
+        )
+
+    def test_a_non_interpreter_running_the_module_flag_is_not_bundled(self):
+        """``-m`` only means our module when a Python interpreter reads it."""
+        assert not is_bundled_cao_server({"command": "node", "args": ["-m", CAO_MCP_SERVER_MODULE]})
+
+    def test_an_interpreter_running_another_module_is_not_bundled(self):
+        assert not is_bundled_cao_server({"command": "python3", "args": ["-m", "http.server"]})
+
     def test_commandless_url_server_is_not_bundled(self):
         assert not is_bundled_cao_server({"type": "http", "url": "https://example.com/mcp"})
 
     def test_a_command_merely_containing_the_name_is_not_bundled(self):
         """Basename equality, not a substring match."""
         assert not is_bundled_cao_server({"command": "/opt/bin/cao-mcp-server-proxy"})
+
+
+class TestShippedTemplatesAreRecognised:
+    """The uvx entries in the REAL shipped templates, not a copy of them.
+
+    ``templates/aws/*/template.md.j2`` is where the uvx shape comes from. A
+    hand-written fixture would keep passing if someone edited those files; this
+    parses them.
+    """
+
+    def _template_entries(self):
+        template_root = _TEMPLATES_ROOT / "aws"
+        files = sorted(template_root.glob("*/template.md.j2"))
+        assert files, f"no shipped AWS templates under {template_root}"
+        entries = []
+        for path in files:
+            frontmatter = path.read_text().split("---")[1]
+            servers = yaml.safe_load(frontmatter).get("mcpServers") or {}
+            for name, config in servers.items():
+                entries.append((path.name, path.parent.name, name, config))
+        return entries
+
+    def test_every_shipped_uvx_entry_is_recognised(self):
+        entries = self._template_entries()
+        assert entries, "the shipped templates declare no MCP server"
+        for _, template, name, config in entries:
+            assert config["command"] == "uvx", f"{template}:{name} changed shape"
+            assert is_bundled_cao_server(config), f"{template}:{name} not recognised"
+
+    def test_every_shipped_entry_gains_the_coordinates_at_runtime(
+        self, monkeypatch, default_cao_server
+    ):
+        monkeypatch.setenv("CAO_API_PORT", "9777")
+        for _, template, name, config in self._template_entries():
+            out = resolve_mcp_server_config(config)
+            assert out["env"]["CAO_API_PORT"] == "9777", f"{template}:{name}"
+
+
+class TestNearMissesGainNoCoordinates:
+    """End to end: a near-miss goes through the resolver and gains NOTHING.
+
+    The predicate is the gate, but the leak the review found was in the
+    resolved entry, so that is what these assert.
+    """
+
+    NEAR_MISSES = [
+        {"command": "uvx", "args": ["--from", "some-other-package", "cao-mcp-server"]},
+        {"command": "my-server", "args": ["--helper", "cao-mcp-server"]},
+        {"command": "my-server", "args": ["--module", CAO_MCP_SERVER_MODULE]},
+    ]
+
+    def test_all_three_coordinates_are_withheld(self, monkeypatch, default_cao_server):
+        monkeypatch.setenv("CAO_API_HOST", "10.0.0.4")
+        monkeypatch.setenv("CAO_API_PORT", "9777")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-trial")
+        for entry in self.NEAR_MISSES:
+            out = resolve_mcp_server_config(dict(entry))
+            assert "env" not in out, entry
+            assert out == entry, entry
 
 
 class TestUvxBundledServerCarriesCoordinates:
