@@ -207,6 +207,41 @@ def check(run_id: Optional[str], agent: str) -> None:
     _check_root_identity(guard, snapshot)
 
 
+def ensure_root_unchanged(snapshot: Mapping[str, Any]) -> None:
+    """The root comparison alone, for RESUME admission (#827 criterion 2; ask 3 on PR #1051).
+
+    :func:`check` is per-AGENT-LAUNCH, so a resumed run reached its first root comparison only when it
+    started a NEW agent step. Two consequences, and #827's second criterion names both ("a running
+    **or resumed** script run"):
+
+    * the script code BEFORE the first new agent step — every line of it, including anything
+      side-effecting — ran in the replacement directory;
+    * a resume whose remaining agent steps are all REPLAYS ran to completion there, because a replayed
+      step returns before ``run_agent_step`` and nothing else compares the root.
+
+    SHARES :func:`_check_root_identity` WITH :func:`check` rather than restating the comparison. Two
+    spellings of "is this still the directory that was approved" would drift, and the three skip arms
+    (absent key, ``None``, ``bound: False``) are the migration posture that must be IDENTICAL at both
+    call sites or a run would be refused at resume for a record the next agent launch accepts.
+
+    TAKES THE SNAPSHOT, NOT A ``run_id``: resume has already parsed ``spec_snapshot`` at its gate 4,
+    and a second read here could see a different row.
+
+    TWO DELIBERATE NON-REFUSALS, because this function adds the ROOT comparison to resume and nothing
+    else. Approval enforcement being off skips it, mirroring :func:`check` and gate 6's own predicate.
+    A snapshot with no usable ``launch_guard`` mapping (a run admitted while enforcement was off, which
+    records ``{"approval_required": False}``) skips it too: diagnosing a posture change is
+    :func:`check`'s job at the next agent launch, and inventing that refusal here would make resume
+    answer a question it was not asked.
+    """
+    if not settings_service.is_workflow_approval_required():
+        return
+    guard = snapshot.get("launch_guard")
+    if not isinstance(guard, Mapping):
+        return
+    _check_root_identity(guard, snapshot)
+
+
 def _check_root_identity(guard: Mapping[str, Any], snapshot: Mapping[str, Any]) -> None:
     """Refuse when the run's working directory is no longer the directory that was approved (#827).
 

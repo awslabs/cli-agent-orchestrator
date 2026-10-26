@@ -8165,6 +8165,7 @@ async def resume_workflow_run_endpoint(
     would re-execute the very step the operator asked to skip, silently.
     """
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+    from cli_agent_orchestrator.services.launch_guard import PlanInputsChangedError
 
     decisions = body.decisions if body is not None else None
 
@@ -8209,6 +8210,17 @@ async def resume_workflow_run_endpoint(
             # a fact about the plan, and the operator's next action is completely different.
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail=_approval_refusal_detail(e)
+            )
+        except PlanInputsChangedError as e:
+            # issue #827 criterion 2's resume gate (ask 3 on PR #1051). 409 with the SAME
+            # ``plan_inputs_changed`` kind the agent-step route uses at ``/terminals/run-step``,
+            # because it is the same refusal about the same record -- a client that already handles
+            # one needs no new branch for the other. This route had no arm for this error, so before
+            # this it would have fallen through: not to the 400 below (``PlanInputsChangedError`` is
+            # deliberately not a ``ValueError``) but out of the handler entirely, as a kind-less 500.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"message": str(e), "kind": "plan_inputs_changed"},
             )
         except workflow_service.ResumeNotAllowedError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
