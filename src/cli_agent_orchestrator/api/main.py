@@ -10085,6 +10085,34 @@ if (WEB_DIST / "index.html").exists():
     app.mount("/", StaticFiles(directory=str(WEB_DIST), html=True), name="web")
 
 
+def _publish_server_coordinate(name: str, effective: object, default: object) -> None:
+    """Make the environment agree with the coordinate the server actually binds.
+
+    ``server_coordinate_env()`` -- the single source for what a launched agent's
+    bundled ``cao-mcp-server`` is told -- reads the ENVIRONMENT, while
+    ``--host``/``--port`` reach only uvicorn. The child's coordinate must equal
+    the parent's effective bind whichever way the operator expressed it, so
+    there are exactly three outcomes:
+
+    * the environment already spells the effective value -> touch nothing (this
+      is the default ``cao-server`` with no flags, whose launch commands and MCP
+      configs therefore stay byte-identical);
+    * the effective value is not the default -> publish it, overwriting a
+      conflicting value;
+    * the effective value IS the default and the environment disagrees -> REMOVE
+      the variable, so the children fall back to the same default the server
+      bound. ``CAO_API_PORT=9777 cao-server --port 9889`` binds 9889, and
+      without this the stale 9777 would still be forwarded (#1066).
+    """
+    value = str(effective)
+    if os.environ.get(name) == value:
+        return
+    if effective == default:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+
+
 def main():
     """Entry point for cao-server command."""
     import argparse
@@ -10141,27 +10169,12 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
-    # Publish the EFFECTIVE coordinates into the environment, before the
-    # lifespan can start and before any terminal can be created.
-    #
-    # ``server_coordinate_env()`` -- the single source for what a launched
-    # agent's bundled cao-mcp-server is told -- reads the ENVIRONMENT, while
-    # ``--host``/``--port`` previously reached only uvicorn. A server started
-    # with ``--port 9777`` and no ``CAO_API_PORT`` therefore handed its
-    # children nothing, and their assign/handoff/send_message calls went to
-    # 127.0.0.1:9889 (#1066). Writing the resolved values here makes what the
-    # children are told identical to what uvicorn binds, whichever way the
-    # operator expressed it.
-    #
-    # Only NON-DEFAULT values are published: a default ``cao-server`` leaves
-    # its environment untouched, so every launch command and MCP config it
-    # builds stays byte-identical. An env var that is already set and matches
-    # the default is left alone too -- it is still the operator's, and
-    # ``server_coordinate_env()`` already reports it.
-    if host != DEFAULT_SERVER_HOST:
-        os.environ["CAO_API_HOST"] = host
-    if port != DEFAULT_SERVER_PORT:
-        os.environ["CAO_API_PORT"] = str(port)
+    # Reconcile the environment with the EFFECTIVE coordinates, before the
+    # lifespan can start and before any terminal can be created. Both
+    # coordinates go through the same helper so neither can grow a case the
+    # other lacks; see ``_publish_server_coordinate`` for the three outcomes.
+    _publish_server_coordinate("CAO_API_HOST", host, DEFAULT_SERVER_HOST)
+    _publish_server_coordinate("CAO_API_PORT", port, DEFAULT_SERVER_PORT)
     # The lifespan records this port in the server lock's diagnostics (#406).
     app.state.server_port = port
     # Extend the CORS allowlist so a custom --host/--port still permits
