@@ -245,8 +245,10 @@ running does not receive a learning promoted after its dispatch. See
 
 If you want every terminal to recall one shared scope instead, set
 `CAO_PROJECT_ID` (or `memory.project_id`) for the CAO server that starts the
-supervisor and the runners. The trade-off is that the setting applies to every
-terminal of that server, not only to this portfolio.
+supervisor and the runners. Runners can then also write that scope, so a
+runner's `memory_store` under a promoted key changes what later dispatches
+deliver; the review step becomes advisory. The trade-off is that the setting
+applies to every terminal of that server, not only to this portfolio.
 
 ## Human Control Points
 

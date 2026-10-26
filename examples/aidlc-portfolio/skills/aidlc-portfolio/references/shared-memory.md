@@ -98,10 +98,12 @@ An operator who wants every terminal to recall the same project scope can set
 `CAO_PROJECT_ID` (or `memory.project_id` in CAO settings) for the CAO server
 that starts the supervisor and the runners. All of its terminals then resolve
 that one id, and a runner's own `memory_recall` returns the supervisor's
-promoted learnings. The trade-off: the setting applies to every terminal of
-that server, not only to this portfolio, so unrelated sessions read and write
-the same project scope. The example does not require it and still delivers
-learnings at dispatch.
+promoted learnings. Runners can then also write that scope, so a runner's
+`memory_store` under a promoted key changes what later dispatches deliver;
+the review step becomes advisory. The trade-off: the setting applies to every
+terminal of that server, not only to this portfolio, so unrelated sessions
+read and write the same project scope. The example does not require it and
+still delivers learnings at dispatch.
 
 ## Accepted Trade-off
 
