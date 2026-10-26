@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_MCP_SERVER_MODULE,
     cao_server_env,
@@ -362,6 +364,24 @@ class TestServerEnv:
             {"command": "uvx", "args": ["--from", "pkg", "my-server"]},
             name="my-server",
         )
+        assert "env" not in out
+
+    @pytest.mark.parametrize(
+        "config,name",
+        [
+            ({"command": "/usr/local/bin/my-cao-mcp-server"}, None),
+            ({"command": "cao-mcp-server-dev"}, None),
+            ({"command": "node"}, "cao-mcp-server-2"),
+        ],
+    )
+    def test_near_miss_entries_never_gain_the_address(self, monkeypatch, config, name):
+        """P3-1: these entries each contain ``cao-mcp-server`` as a substring
+        of the basename or the name, but neither equals it exactly. A
+        substring regression on either clause (``CAO_MCP_SERVER_COMMAND in
+        str(command)`` or `` in (name or "")``) would wrongly match them."""
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        kwargs = {"name": name} if name is not None else {}
+        out = resolve_mcp_server_config(config, **kwargs)
         assert "env" not in out
 
     def test_persisted_entry_never_gains_the_address_even_by_name(self, monkeypatch):
