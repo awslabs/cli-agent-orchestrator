@@ -367,10 +367,10 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Check code formatting with black
-        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
+        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/ examples/robotics/hierarchical-factory/ examples/skills/
 
       - name: Check import sorting with isort
-        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
+        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/robotics/hierarchical-factory/ examples/skills/
 
       # The dead-code gate (#1005). BLOCKING, like the mypy ratchet step below:
       # the selected rules (F401 unused import, F841 unused local, F821/F822

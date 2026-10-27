@@ -1,0 +1,21 @@
+[project]
+name = "cao-hierarchical-factory"
+version = "0.1.0"
+description = "Simulation-only 3-layer CAO organization: a supervisor, three team managers, and their robot teams"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "fastmcp==4.1.2",
+    "httpx2==2.14.0",
+    "mujoco==3.16.0",
+    "pydantic>=2.11,<3",
+    "pyyaml==6.0.3",
+]
+
+[dependency-groups]
+dev = ["jsonschema==4.26.0", "pytest==9.1.1", "uvicorn==0.54.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

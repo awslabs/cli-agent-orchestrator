@@ -33,6 +33,7 @@ updates:
       - "/"
       - "/examples/fleet/panel"
       - "/examples/robotics/cross-zone-transport"
+      - "/examples/robotics/hierarchical-factory"
     schedule:
       interval: "weekly"
     cooldown:

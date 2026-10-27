@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Hierarchical robot factory example** (`examples/robotics/hierarchical-factory/`): a
+  simulation-only, 3-layer CAO organization drives a MuJoCo factory floor. A supervisor assigns three
+  team managers with `assign`; each manager runs its own robot team (a serial queue of 3, two parallel
+  assembly lines, and a 4-robot formation that spins, turns, and runs to the dock) through scoped MCP
+  tools and reports with `send_message`; the supervisor balances the line when a team blocks. Scoped
+  per-team credentials, a loopback-only controller, operator stop, recorded frames and a GIF, and a
+  `Robotics factory example` CI workflow. No CAO core change.
+
 - **Breaking: CAO now requires Python 3.11 or later** (CVE-2026-114605). dnspython, which CAO pulls in
   through fastmcp, pydantic and email-validator, fixes CVE-2026-114605 (HIGH) only in 2.9.0, and 2.9.0
   requires Python 3.11. Python 3.10 reached end-of-life on 2026-10-01. `requires-python` is now `>=3.11`,
