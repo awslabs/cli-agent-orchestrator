@@ -200,18 +200,156 @@ ROBOT_COLORS = (
 BLOCKED_COLOR = (0.86, 0.08, 0.1, 1)
 BUFFER_COLOR = "1 0.72 0.1 1"
 PLACE_COLOR = "0.3 0.3 0.34 1"
-NOSE_COLOR = "0.12 0.12 0.14 1"
+# The robots look like small walking duck robots: a white shell with a band in
+# the color of the team, dark joints, and a lamp on an antenna for the state.
+SHELL_COLOR = (0.94, 0.94, 0.96, 1)
+JOINT_COLOR = "0.22 0.22 0.25 1"
+EYE_COLOR = "0.05 0.05 0.06 1"
+BEAK_COLOR = "0.98 0.62 0.16 1"
+LAMP_COLORS = {
+    "working": (0.15, 0.85, 0.3, 1),
+    "waiting": (1.0, 0.72, 0.1, 1),
+    "blocked": (0.95, 0.1, 0.1, 1),
+}
 # Part colors by stage: grey raw part, pink machined part, purple assembled unit.
 STAGE_COLORS = {
     "raw": (0.62, 0.62, 0.66, 1),
     "machined": (0.9, 0.12, 0.5, 1),
     "assembled": (0.5, 0.18, 0.86, 1),
 }
-CAMERA_TILT_DEGREES = 32.0
+CAMERA_TILT_DEGREES = 50.0
 CAMERA_FOVY_DEGREES = 45.0
 CAMERA_ASPECT = 16 / 9
-ROBOT_TOP = 0.16
+# The top of the shell, where a robot carries a part.
+ROBOT_TOP = 0.42
 PART_HALF = 0.06
+HIP_HEIGHT = 0.24
+STRIDE_M = 0.22
+STEP_DEGREES = 30.0
+WAITING_LABELS = ("idle", "waiting", "starved")
+
+
+def _rgba(color) -> str:
+    return " ".join(str(value) for value in color)
+
+
+def _add_robot(parent: ET.Element, name: str, robot: Robot, color: tuple) -> None:
+    """Add one duck robot: a mocap root, two jointed legs, and a jointed neck.
+
+    The legs and the neck only animate the robot: the controller sets their
+    joint angles from the motion of the robot. No geom has contact.
+    """
+    no_contact = {"contype": "0", "conaffinity": "0"}
+    root = ET.SubElement(
+        parent,
+        "body",
+        name=f"robot/{name}",
+        mocap="true",
+        pos=f"{robot.xy[0]} {robot.xy[1]} 0",
+        quat=_rgba(_quat(robot.heading_deg)),
+    )
+
+    def geom(body: ET.Element, part: str, **attributes) -> None:
+        ET.SubElement(body, "geom", name=f"robot/{name}/{part}", **attributes, **no_contact)
+
+    geom(
+        root,
+        "shell",
+        type="ellipsoid",
+        size="0.16 0.12 0.1",
+        pos="0 0 0.32",
+        rgba=_rgba(SHELL_COLOR),
+    )
+    geom(root, "band", type="ellipsoid", size="0.165 0.125 0.035", pos="0 0 0.3", rgba=_rgba(color))
+    geom(
+        root,
+        "tail",
+        type="ellipsoid",
+        size="0.05 0.06 0.03",
+        pos="-0.15 0 0.36",
+        euler="0 -25 0",
+        rgba=_rgba(color),
+    )
+    for side, y in (("left", 0.115), ("right", -0.115)):
+        geom(
+            root,
+            f"wing_{side}",
+            type="ellipsoid",
+            size="0.1 0.025 0.055",
+            pos=f"-0.01 {y} 0.33",
+            euler="0 -10 0",
+            rgba=_rgba(color),
+        )
+    neck = ET.SubElement(root, "body", name=f"robot/{name}/neck", pos="0.1 0 0.38")
+    ET.SubElement(neck, "joint", name=f"robot/{name}/neck", type="hinge", axis="0 1 0")
+    geom(neck, "neck", type="capsule", fromto="0 0 0 0.05 0 0.1", size="0.025", rgba=JOINT_COLOR)
+    geom(
+        neck,
+        "head",
+        type="ellipsoid",
+        size="0.075 0.065 0.055",
+        pos="0.06 0 0.13",
+        rgba=_rgba(SHELL_COLOR),
+    )
+    geom(
+        neck,
+        "beak",
+        type="ellipsoid",
+        size="0.045 0.03 0.014",
+        pos="0.135 0 0.115",
+        rgba=BEAK_COLOR,
+    )
+    for side, y in (("left", 0.03), ("right", -0.03)):
+        geom(
+            neck, f"eye_{side}", type="sphere", size="0.015", pos=f"0.115 {y} 0.145", rgba=EYE_COLOR
+        )
+    geom(
+        neck,
+        "antenna",
+        type="capsule",
+        fromto="0.04 0 0.18 0.03 0 0.25",
+        size="0.007",
+        rgba=JOINT_COLOR,
+    )
+    geom(
+        neck,
+        "lamp",
+        type="sphere",
+        size="0.022",
+        pos="0.03 0 0.26",
+        rgba=_rgba(LAMP_COLORS["waiting"]),
+    )
+    for side, y in (("left", 0.07), ("right", -0.07)):
+        hip = ET.SubElement(
+            root, "body", name=f"robot/{name}/hip_{side}", pos=f"0 {y} {HIP_HEIGHT}"
+        )
+        ET.SubElement(hip, "joint", name=f"robot/{name}/hip_{side}", type="hinge", axis="0 1 0")
+        geom(
+            hip,
+            f"thigh_{side}",
+            type="capsule",
+            fromto="0 0 0 0 0 -0.11",
+            size="0.024",
+            rgba=JOINT_COLOR,
+        )
+        knee = ET.SubElement(hip, "body", name=f"robot/{name}/knee_{side}", pos="0 0 -0.11")
+        ET.SubElement(knee, "joint", name=f"robot/{name}/knee_{side}", type="hinge", axis="0 1 0")
+        geom(
+            knee,
+            f"shin_{side}",
+            type="capsule",
+            fromto="0 0 0 0 0 -0.105",
+            size="0.021",
+            rgba=_rgba(SHELL_COLOR),
+        )
+        geom(
+            knee,
+            f"foot_{side}",
+            type="box",
+            size="0.055 0.032 0.012",
+            pos="0.025 0 -0.115",
+            rgba=JOINT_COLOR,
+        )
 
 
 def _add_scene_visuals(root: ET.Element, world: ET.Element, scene: Scene) -> None:
@@ -303,7 +441,7 @@ def _add_scene_visuals(root: ET.Element, world: ET.Element, scene: Scene) -> Non
     # far enough back that every zone fits a 16:9 frame with a margin.
     tilt = math.radians(CAMERA_TILT_DEGREES)
     tan_v = math.tan(math.radians(CAMERA_FOVY_DEGREES) / 2)
-    distance = 1.05 * max((half_w + 0.3) / (tan_v * CAMERA_ASPECT), (half_h + 0.3) / tan_v)
+    distance = 1.0 * max((half_w + 0.3) / (tan_v * CAMERA_ASPECT), (half_h + 0.3) / tan_v)
     ET.SubElement(
         world,
         "camera",
@@ -360,6 +498,11 @@ class RobotState:
     goal: Pose | None = None
     label: str = "idle"
     carrying: str | None = None
+    # The heading to turn to after the robot arrives at its goal.
+    face: float | None = None
+    # Animation only: the phase of the walk, and the last rendered pose.
+    gait: float = 0.0
+    shown: Pose | None = None
 
 
 @dataclass
@@ -440,34 +583,8 @@ class World:
         _add_scene_visuals(root, bodies, scene)
         no_contact = {"contype": "0", "conaffinity": "0"}
         for name, robot in scene.robots.items():
-            color = ROBOT_COLORS[zone_index[robot.zone] % len(ROBOT_COLORS)]
-            body = ET.SubElement(
-                bodies,
-                "body",
-                name=f"robot/{name}",
-                mocap="true",
-                pos=f"{robot.xy[0]} {robot.xy[1]} 0.08",
-                quat=" ".join(str(value) for value in _quat(robot.heading_deg)),
-            )
-            ET.SubElement(
-                body,
-                "geom",
-                name=f"robot/{name}/body",
-                type="box",
-                size="0.15 0.11 0.08",
-                rgba=" ".join(str(value) for value in color),
-                **no_contact,
-            )
-            # The nose shows the heading, so that spins and turns are visible.
-            ET.SubElement(
-                body,
-                "geom",
-                name=f"robot/{name}/nose",
-                type="box",
-                size="0.04 0.07 0.03",
-                pos="0.17 0 0.03",
-                rgba=NOSE_COLOR,
-                **no_contact,
+            _add_robot(
+                bodies, name, robot, ROBOT_COLORS[zone_index[robot.zone] % len(ROBOT_COLORS)]
             )
         for name in self.part_names:
             body = ET.SubElement(bodies, "body", name=f"part/{name}", mocap="true", pos="0 0 0")
@@ -486,10 +603,19 @@ class World:
             name: self.model.body(f"robot/{name}").mocapid[0] for name in scene.robots
         }
         self.part_mocap = {name: self.model.body(f"part/{name}").mocapid[0] for name in self.parts}
-        self.robot_geom = {name: self.model.geom(f"robot/{name}/body").id for name in scene.robots}
-        self.robot_color = {
-            name: ROBOT_COLORS[zone_index[robot.zone] % len(ROBOT_COLORS)]
-            for name, robot in scene.robots.items()
+        self.robot_geom = {
+            name: (
+                self.model.geom(f"robot/{name}/shell").id,
+                self.model.geom(f"robot/{name}/lamp").id,
+            )
+            for name in scene.robots
+        }
+        self.robot_joints = {
+            name: {
+                joint: self.model.joint(f"robot/{name}/{joint}").qposadr[0]
+                for joint in ("neck", "hip_left", "knee_left", "hip_right", "knee_right")
+            }
+            for name in scene.robots
         }
         self.part_geom = {name: self.model.geom(f"part/{name}/geom").id for name in self.parts}
         self._restack(scene.raw_store)
@@ -521,23 +647,49 @@ class World:
 
     def _push(self) -> None:
         for name, robot in self.robots.items():
-            mocap = self.robot_mocap[name]
-            self.data.mocap_pos[mocap] = [robot.x, robot.y, 0.08]
-            self.data.mocap_quat[mocap] = _quat(robot.heading)
-            if robot.label == "blocked":
-                color = BLOCKED_COLOR
-            elif robot.label in ("idle", "waiting", "starved"):
-                strong = self.robot_color[name]
-                color = (*(0.55 * value + 0.45 for value in strong[:3]), 1)
-            else:
-                color = self.robot_color[name]
-            self.model.geom_rgba[self.robot_geom[name]] = color
+            self._animate(name, robot)
         for name, part in self.parts.items():
             if part.at is not None and part.at.startswith("robot:"):
                 carrier = self.robots[part.at.split(":", 1)[1]]
                 part.xyz = [carrier.x, carrier.y, ROBOT_TOP + PART_HALF]
             self.data.mocap_pos[self.part_mocap[name]] = part.xyz
             self.model.geom_rgba[self.part_geom[name]] = STAGE_COLORS[part.stage]
+
+    def _animate(self, name: str, robot: RobotState) -> None:
+        """Set the rendered pose, the walking legs, the nod, and the colors of a robot."""
+        if robot.shown is not None:
+            moved = math.dist(robot.shown[:2], (robot.x, robot.y))
+            turned = abs((robot.heading - robot.shown[2] + 180) % 360 - 180)
+            # A robot steps when it walks, and steps in place when it turns.
+            robot.gait += 2 * math.pi * (moved / STRIDE_M + turned / (4 * STEP_DEGREES * 3))
+        robot.shown = (robot.x, robot.y, robot.heading)
+        swing = math.sin(robot.gait)
+        stepping = robot.label not in WAITING_LABELS + ("blocked", "working")
+        amplitude = 0.5 if stepping else 0.0
+        joints, qpos = self.robot_joints[name], self.data.qpos
+        qpos[joints["hip_left"]] = amplitude * swing
+        qpos[joints["hip_right"]] = -amplitude * swing
+        qpos[joints["knee_left"]] = amplitude * max(0.0, -swing) * 1.4
+        qpos[joints["knee_right"]] = amplitude * max(0.0, swing) * 1.4
+        # A working robot nods over its part.
+        nod = 0.35 * math.sin(self.now() * 7) if robot.label == "working" else 0.0
+        qpos[joints["neck"]] = nod
+        bob = 0.012 * abs(swing) if stepping else 0.0
+        mocap = self.robot_mocap[name]
+        self.data.mocap_pos[mocap] = [robot.x, robot.y, bob]
+        self.data.mocap_quat[mocap] = _quat(robot.heading)
+        shell, lamp = self.robot_geom[name]
+        self.model.geom_rgba[shell] = BLOCKED_COLOR if robot.label == "blocked" else SHELL_COLOR
+        if robot.label == "blocked":
+            light = LAMP_COLORS["blocked"]
+        elif robot.label in WAITING_LABELS:
+            light = LAMP_COLORS["waiting"]
+        else:
+            light = LAMP_COLORS["working"]
+        self.model.geom_rgba[lamp] = light
+
+    def carry_height(self, robot: str) -> float:
+        return float(self.data.mocap_pos[self.robot_mocap[robot]][2]) + ROBOT_TOP + PART_HALF
 
     def _xy(self, robot: str) -> XY:
         pose = self.data.body(f"robot/{robot}").xpos
@@ -618,7 +770,7 @@ class World:
             state.formed, state.forming, state.program = False, command, None
             state.centre, state.angle, state.spin = team.centre(), 0.0, 0.0
             for robot, slot in team.slots.items():
-                self.robots[robot].goal = slot
+                self._go(robot, slot[:2], face=slot[2])
                 self.robots[robot].label = "moving"
             return self._set(command, "accepted")
 
@@ -735,13 +887,20 @@ class World:
         limit = self.scene.robot_turn_deg_s * dt
         robot.heading = gh if abs(turn) <= limit else robot.heading + math.copysign(limit, turn)
         if (robot.x, robot.y) == (gx, gy) and robot.heading == gh:
-            robot.goal = None
+            if robot.face is not None and robot.face != gh:
+                robot.goal, robot.face = (gx, gy, robot.face), None
+                return False
+            robot.goal = robot.face = None
             return True
         return False
 
-    def _go(self, robot: str, xy: XY) -> None:
+    def _go(self, robot: str, xy: XY, face: float | None = None) -> None:
+        """Walk a robot to ``xy`` facing the way it walks; then turn it to ``face``."""
         state = self.robots[robot]
-        state.goal = (xy[0], xy[1], state.heading)
+        heading = state.heading
+        if math.dist((state.x, state.y), xy) > self.scene.arrival_tolerance_m:
+            heading = math.degrees(math.atan2(xy[1] - state.y, xy[0] - state.x))
+        state.goal, state.face = (xy[0], xy[1], heading), face
 
     def _arrived(self, robot: str) -> bool:
         return self.robots[robot].goal is None
@@ -877,7 +1036,7 @@ class World:
                 line["phase"] = "picking"
             elif phase == "picking" and self.parts[line["part"]].goal is None:
                 line["phase"] = "to_line"
-                self._go(robot_name, slot[:2])
+                self._go(robot_name, slot[:2], face=slot[2])
             elif phase == "to_line" and self._arrived(robot_name):
                 line.update(phase="assembling", timer=state.cycle_seconds)
             elif phase == "assembling":
@@ -892,7 +1051,7 @@ class World:
                 if self._space(team.output):
                     self._send(line["part"], "place", team.output, self._delivered(program))
                     line.update(phase="to_home", part=None)
-                    self._go(robot_name, slot[:2])
+                    self._go(robot_name, slot[:2], face=slot[2])
                 else:
                     blocked = True
             elif line["phase"] == "to_home" and self._arrived(robot_name):
@@ -917,7 +1076,7 @@ class World:
             robot = self.robots[robot_name]
             robot.x, robot.y = state.centre[0] + dx, state.centre[1] + dy
             robot.heading = (slot[2] + state.angle + state.spin) % 360
-            robot.goal = None
+            robot.goal = robot.face = None
 
     def _run_formation(self, name: str, team: Team, state: TeamState, dt: float) -> None:
         program = state.program
@@ -1021,6 +1180,11 @@ class World:
                         state.forming = None
                 program = state.program
                 if program is None or program.done:
+                    # A robot can still walk home after the last part of its program.
+                    if program is not None:
+                        for robot in team.slots:
+                            if self._arrived(robot):
+                                self.robots[robot].label = "idle"
                     continue
                 runner = {
                     "serial": self._run_serial,

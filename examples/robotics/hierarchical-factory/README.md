@@ -10,7 +10,7 @@ line.
 ![The simulated floor during the demo. In the blue west zone, Team A stands in one queue. In the green middle zone, the two robots of Team B work as two parallel assembly lines. In the orange east zone, the four robots of Team C stand in a diamond, and assembled units wait at the dock.](images/run-3-shipping.png)
 
 <details>
-<summary>Play the animation of the demo (50 seconds, repeats)</summary>
+<summary>Play the animation of the demo (47 seconds, repeats)</summary>
 
 ![Animation of the demo in MuJoCo. The robots of the three teams drive to their formations. Team A passes grey parts down its queue, and its robots turn red when the buffer in front of Team B is full. The supervisor slows Team A to the pace of Team B. Team B fetches pink parts and delivers purple units. Team C loads two units, spins, turns, runs to the dock, unloads, and runs back, until all 16 units are at the dock.](images/hierarchical-factory.gif)
 
@@ -112,10 +112,22 @@ dynamics with Contact) is a free, open-source physics engine. Step 1 installs
 it as a Python package. No robot hardware is necessary.
 
 This exercise uses MuJoCo in a simple way, like the
-[cross-zone transport example](../cross-zone-transport/README.md). A robot is
-a box with a dark nose that shows its heading. The robots and the parts are
-kinematic mocap bodies that move at set speeds. The simulator measures their
-positions.
+[cross-zone transport example](../cross-zone-transport/README.md). Each robot
+is a small walking duck robot, built from MuJoCo shapes in the style of the
+[Open Duck Mini](https://github.com/apirrone/Open_Duck_Mini) robot that
+[Strands Robots](https://github.com/strands-labs/robots) uses in its demos:
+
+- a white shell with wings and a tail in the color of its team,
+- a head with eyes and a beak that show where it faces,
+- a lamp on an antenna that shows its state: green when it works or moves,
+  amber when it waits, and red when it is blocked,
+- two legs with hips and knees that step when the robot walks, turns, spins,
+  or runs. A working robot nods over its part.
+
+The robots and the parts are kinematic: the root of each robot is a mocap body
+that moves at a set speed, and the controller sets the leg and neck angles from
+that motion. Nothing has contact or gravity. The simulator measures the
+positions. The example needs no robot model download and no mesh files.
 
 A local process, the **controller** (`demo.py serve`), runs the MuJoCo world.
 The agents use the world only through the MCP tools of the controller.
@@ -824,9 +836,10 @@ simulation.
 | In the picture | Item |
 | --- | --- |
 | Light blue, light green, and light orange areas | Zones `west`, `middle`, and `east` |
-| Strong blue, green, and orange boxes | The robots of Team A, Team B, and Team C. The dark nose shows the heading. |
-| A pale robot | The robot waits, for example for a part |
-| A red robot | The robot is blocked: it holds a finished part that cannot move on |
+| Duck robots with blue, green, and orange wings | The robots of Team A, Team B, and Team C. The head and the beak show the heading. |
+| A green, amber, or red lamp on the antenna | The robot works or moves, waits (for example for a part), or is blocked |
+| A red shell | The robot is blocked: it holds a finished part that cannot move on |
+| A cube on the back of a robot | The part that the robot carries |
 | Grey, pink, and purple cubes | A raw part, a machined part, and an assembled unit |
 | Amber discs | The buffers `west_middle` (capacity 2) and `middle_east` (capacity 4) |
 | Dark discs | The raw store (west) and the dock (east) |

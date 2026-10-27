@@ -317,9 +317,10 @@ _INDEX_HTML = """<!doctype html>
 <body>
 <h1>Factory run <code>__RUN_ID__</code></h1>
 <p>Each colored area is the zone of one robot team: Team A (blue, west), Team B
-(green, middle), and Team C (orange, east). A robot is a box in the strong color
-of its zone, with a dark nose that shows its heading. A pale robot waits, and a
-red robot is blocked. A part is grey when raw, pink when machined, and purple
+(green, middle), and Team C (orange, east). A robot is a small duck robot with
+wings in the color of its team; its beak shows its heading. The lamp on its
+antenna is green when it works, amber when it waits, and red when it is blocked;
+a blocked robot also has a red shell. A part is grey when raw, pink when machined, and purple
 when assembled. The amber discs are the buffers between the zones; the dark
 discs are the raw store and the dock.</p>
 <figure>

@@ -244,6 +244,9 @@ def test_a_full_order_moves_every_part_from_raw_to_the_dock():
     assert {part["stage"] for part in state["parts"].values()} == {"assembled"}
     assert all(team["program"]["output"] == 16 for team in state["teams"].values())
     assert state["teams"]["middle"]["program"]["starved_seconds"] > 0
+    # Robots that walk home after the last part become idle when they arrive.
+    run(world, 5)
+    assert {robot.label for robot in world.robots.values()} == {"idle"}
     finished = {
         (c["actor"], c["command_id"]) for c in state["commands"] if c["status"] == "finished"
     }
