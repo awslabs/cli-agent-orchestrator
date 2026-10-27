@@ -259,6 +259,11 @@ class KiroCliProvider(BaseProvider):
         self._agent_profile = agent_profile
         self._engine = resolve_kiro_engine(persisted=engine)
         self._model = model
+        # The evidence that this runtime's TUI header named the agent (#1074).
+        # Only _verify_agent_identity sets it, and only once the check passed;
+        # terminal_service records it on the row before any task is typed.
+        # initialize() returning is not evidence on its own.
+        self.identity_verified = False
 
         # Build dynamic prompt pattern based on agent profile
         # This pattern matches various Kiro prompt formats after ANSI stripping:
@@ -488,6 +493,7 @@ class KiroCliProvider(BaseProvider):
                 "kiro_cli: terminal %s refused before any input: %s", self.terminal_id, exc
             )
             raise
+        self.identity_verified = True
 
     async def _wait_ready_accepting_trust_dialog(self) -> bool:
         """Wait for the agent prompt, auto-answering the trust-all-tools dialog.

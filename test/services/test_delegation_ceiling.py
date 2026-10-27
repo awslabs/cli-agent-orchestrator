@@ -57,6 +57,7 @@ def launch(monkeypatch):
     monkeypatch.setattr(f"{_TS}.FIFO_DIR", fifo_dir)
     provider = AsyncMock()
     provider.initialize.return_value = True
+    provider.identity_verified = True  # a healthy Kiro launch (#1074)
     pm = MagicMock()
     pm.create_provider.return_value = provider
     monkeypatch.setattr(f"{_TS}.provider_manager", pm)

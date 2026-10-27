@@ -93,6 +93,7 @@ def create_mocks():
         # create_terminal awaits provider.initialize(); make it a coroutine.
         provider_instance = m.provider_manager.create_provider.return_value
         provider_instance.initialize = AsyncMock(return_value=True)
+        provider_instance.identity_verified = True  # a healthy Kiro launch (#1074)
 
         service = MagicMock()
         m.get_herdr_inbox_service.return_value = service

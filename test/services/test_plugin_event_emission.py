@@ -512,6 +512,7 @@ class TestTerminalPluginEvents:
             side_effect=lambda: call_order.append("provider_initialize")
         )
         provider.shell_baseline = None
+        provider.identity_verified = True  # a healthy Kiro launch (#1074)
         mock_provider_manager.create_provider.return_value = provider
 
         log_path = MagicMock()

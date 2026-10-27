@@ -167,6 +167,7 @@ async def test_omitted_engine_launches_as_explicitly_pinned_v2():
     )
     provider = MagicMock()
     provider.initialize = AsyncMock(return_value=True)
+    provider.identity_verified = True  # a healthy Kiro launch (#1074)
     provider.shell_baseline = None
 
     with (
@@ -176,6 +177,7 @@ async def test_omitted_engine_launches_as_explicitly_pinned_v2():
         ),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal") as db_create,
+        patch(f"{_MODULE}.mark_terminal_identity_verified", return_value=True),
         patch(f"{_MODULE}.delete_terminals_by_session"),
         patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,
@@ -217,6 +219,7 @@ async def test_explicit_model_override_is_probed_even_when_profile_has_none():
     )
     provider = MagicMock()
     provider.initialize = AsyncMock(return_value=True)
+    provider.identity_verified = True  # a healthy Kiro launch (#1074)
     provider.shell_baseline = None
 
     with (
@@ -226,6 +229,7 @@ async def test_explicit_model_override_is_probed_even_when_profile_has_none():
         ),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal"),
+        patch(f"{_MODULE}.mark_terminal_identity_verified", return_value=True),
         patch(f"{_MODULE}.delete_terminals_by_session"),
         patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,
@@ -276,12 +280,14 @@ async def test_v2_launches_on_a_wrapper_that_does_not_advertise_legacy_ui():
     profile = AgentProfile(name="developer", description="Developer")
     provider = MagicMock()
     provider.initialize = AsyncMock(return_value=True)
+    provider.identity_verified = True  # a healthy Kiro launch (#1074)
     provider.shell_baseline = None
 
     with (
         patch(f"{_MODULE}.agent_profiles.load_agent_profile", return_value=profile),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal"),
+        patch(f"{_MODULE}.mark_terminal_identity_verified", return_value=True),
         patch(f"{_MODULE}.delete_terminals_by_session"),
         patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,

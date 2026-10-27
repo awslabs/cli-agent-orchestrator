@@ -2000,6 +2000,7 @@ class TestTerminalsSchemaMigration:
         assert columns.count("session_incarnation_id") == 1
         assert columns.count("model") == 1
         assert columns.count("model_honored") == 1
+        assert columns.count("identity_verified") == 1
 
     def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
         """#432: a pre-existing terminals table (predating group/metadata) gains both
@@ -2153,6 +2154,8 @@ class TestTerminalsSchemaMigration:
                 assert row["provider_variant"] is None
                 assert row["model"] is None
                 assert row["model_honored"] is None
+                # Legacy rows, never False: the Kiro input gate grandfathers them (#1074).
+                assert row["identity_verified"] is None
 
             # Original pre-migration data must survive untouched.
             assert aaaa["tmux_session"] == "cao-sess-1"

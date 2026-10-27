@@ -25,6 +25,8 @@ def install_launch_stubs(monkeypatch, root, *, profile_model="model-y"):
     provider = AsyncMock()
     provider.shell_baseline = None
     provider.runtime_variant = None
+    # A healthy launch: a Kiro provider reports its passed identity check (#1074).
+    provider.identity_verified = True
     providers = MagicMock()
     providers.create_provider.return_value = provider
     for name, value in {
@@ -34,6 +36,8 @@ def install_launch_stubs(monkeypatch, root, *, profile_model="model-y"):
         "generate_session_name": Mock(return_value="cao-fixture"),
         "get_max_terminals": Mock(return_value=None),
         "db_create_terminal": Mock(),
+        # The row is mocked, so the identity record has none to be written to.
+        "mark_terminal_identity_verified": Mock(return_value=True),
         "db_delete_terminal": Mock(),
         "delete_terminals_by_session": Mock(),
         "fifo_manager": MagicMock(),

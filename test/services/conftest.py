@@ -58,6 +58,19 @@ def kiro_agent_store_not_under_test(monkeypatch):
         "cli_agent_orchestrator.services.terminal_service.require_kiro_agent_resolves",
         lambda *args, **kwargs: None,
     )
+    # These modules also mock the registry row (``db_create_terminal``), so a
+    # healthy Kiro launch has no row to record its passed identity check on.
+    # The record is still written to a real row when there is one, and the
+    # provider double must still report ``identity_verified = True``: only the
+    # missing row is forgiven (#1074).
+    from cli_agent_orchestrator.services import terminal_service
+
+    real_mark = terminal_service.mark_terminal_identity_verified
+    monkeypatch.setattr(
+        terminal_service,
+        "mark_terminal_identity_verified",
+        lambda terminal_id: real_mark(terminal_id) or True,
+    )
 
 
 @pytest.fixture
