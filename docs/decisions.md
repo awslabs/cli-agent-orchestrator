@@ -8,7 +8,8 @@ launches keep their existing behavior until an operator enables routing.
 Plain terminal creates and older clients that do not send the original task
 message are not routed. An empty task message is also not routed: local and
 remote assign, elastic assign, handoff and CLI handoff launch it unrouted
-rather than refusing it, the same as when no message is sent at all. Reusing a
+rather than refusing it, the same as when no message is sent at all. The CLI
+still refuses an empty `--message-file` before it launches anything. Reusing a
 terminal and replaying a workflow step launch nothing, so neither runs a
 decision. A script workflow's own step is out of
 scope for deciders; in shadow or on it gets an `out_of_scope` record. An agent's
@@ -206,7 +207,11 @@ though it is raised earlier than, and independently of, the ceiling check.
 complete: once that attempt has started, any other exception is bound
 `launch_failed`, and the same status applies when a deferred startup failure
 or a cancelled deferred start moves a previously launched row back, in both
-cases without a second decision span.
+cases without a second decision span. The attempt starts right after the
+terminal cap check, so any other validation refusal raised after that point —
+an unavailable ephemeral profile, a KAS request, an engine given for a
+provider other than Kiro, or a `caller_ceiling` conflict — is bound
+`launch_failed`, even though nothing was actually allocated yet.
 
 Records never hold task messages, descriptions, purposes, prompts or working directories.
 Messages, descriptions and purposes are redacted before every decider call, including the
@@ -287,6 +292,7 @@ characters other than letters, digits, `_`, `.` and `-` is logged as
           "point": "model.route",
           "outcome": "fallback",
           "reason": "timeout",
+          "decision_status": "done",
           "created_at": "2026-10-20T11:58:02.114203"
         },
         "counts": {"timeout": 31, "answer": 4}
@@ -300,7 +306,9 @@ characters other than letters, digits, `_`, `.` and `-` is logged as
 For each decider with records, `last` is its newest record and `counts` counts
 its records created since `since`, by reason. A record with no reason counts as
 `answer`, or as `pending` or `interrupted` while its shadow decision is
-unfinished. Record times are UTC. The counts match
+unfinished — `last.decision_status` carries this distinction too, so a
+pending or interrupted shadow record is never mistaken for an answer. Record
+times are UTC. The counts match
 `cao decisions list --since <since> --limit <n>` for the same records, with
 `--limit` large enough to include every record in the window (at most 10000;
 `list`'s default `--limit` is 100). Installed deciders

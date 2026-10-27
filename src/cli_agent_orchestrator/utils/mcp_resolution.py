@@ -27,7 +27,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 
@@ -52,6 +52,11 @@ def cao_server_env() -> Dict[str, str]:
         # text. A child spawned in a different cwd would otherwise re-resolve a
         # relative value to a different, stray location of its own.
         env["CAO_HOME_DIR"] = str(CAO_HOME_DIR)
+    if env.get("CAO_API_HOST") == "0.0.0.0":
+        # Same mapping main() applies to the --host flag: an IPv4 wildcard
+        # bind is not a usable client address, so agents are pointed at
+        # loopback instead.
+        env["CAO_API_HOST"] = "127.0.0.1"
     return env
 
 
@@ -134,7 +139,9 @@ def resolve_cao_mcp_command(
     return interpreter, ["-m", CAO_MCP_SERVER_MODULE, *args]
 
 
-def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
+def resolve_mcp_server_config(
+    config: dict, *, persisted: bool = False, name: Optional[str] = None
+) -> dict:
     """Return a copy of an MCP server config with its command resolved.
 
     ``persisted`` is forwarded to :func:`resolve_cao_mcp_command`; set it True
@@ -153,13 +160,27 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     under any ``env`` the entry already sets, so the server reaches the CAO that
     launched it. A persisted entry gains nothing: it outlives this process and
     may be read by another CAO.
+
+    ``name`` is the entry's own key in the profile's ``mcpServers`` map, for a
+    caller that iterates it by name (every provider using this function does).
+    A profile can start the bundled server through ``uvx`` or an absolute path
+    rather than the bare console-script command, same as Codex already
+    recognises in its own launch config (``codex.py``'s ``is_cao_server``). The
+    entry is still treated as the CAO server — and so still gains the address —
+    when its name is ``cao-mcp-server`` or its command's final path segment is,
+    even though ``command`` itself is not the bare string.
     """
     if "command" not in config:
         return dict(config)
     resolved = dict(config)
     command = resolved.get("command", "")
     args = resolved.get("args", []) or []
-    if command == CAO_MCP_SERVER_COMMAND and not persisted:
+    is_cao_server = (
+        command == CAO_MCP_SERVER_COMMAND
+        or name == CAO_MCP_SERVER_COMMAND
+        or (isinstance(command, str) and Path(command).name == CAO_MCP_SERVER_COMMAND)
+    )
+    if is_cao_server and not persisted:
         server_env = cao_server_env()
         if server_env:
             resolved["env"] = {**server_env, **(resolved.get("env") or {})}
