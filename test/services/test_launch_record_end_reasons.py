@@ -112,6 +112,40 @@ async def test_herdr_pane_closed_records_pane_closed(release_runtime, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_herdr_pane_closed_db_outage_confirmed_loss_records_pane_closed(
+    release_runtime, monkeypatch
+):
+    """D-P3-3 (E9): the DB-outage branch of ``_handle_lifecycle_event`` --
+    ``get_terminal_metadata`` raises, herdr's own snapshot confirms the pane
+    is really gone, and there is no deferred-failure tombstone to retain --
+    tears the terminal down with the same reason as the normal path."""
+    from cli_agent_orchestrator.clients import database as database_module
+    from cli_agent_orchestrator.services import herdr_inbox_service
+
+    env, _, _, _ = release_runtime
+    await launch_runtime(release_runtime)
+    service = herdr_inbox_service.HerdrInboxService(socket_path=str(env[2] / "fake.sock"))
+    service._pane_to_terminal = {"child": CHILD, "parent": CALLER}
+    service._terminal_to_pane = {CHILD: "child", CALLER: "parent"}
+
+    real_get_terminal_metadata = database_module.get_terminal_metadata
+    calls = []
+
+    def _boom_once(terminal_id):
+        calls.append(terminal_id)
+        if len(calls) == 1:
+            raise RuntimeError("database is locked")
+        return real_get_terminal_metadata(terminal_id)
+
+    monkeypatch.setattr(database_module, "get_terminal_metadata", _boom_once)
+    monkeypatch.setattr(service, "_fetch_snapshot", lambda: {"panes": []})
+
+    service._handle_lifecycle_event("pane.closed", {"pane_id": "child"})
+
+    _ended("pane_closed")
+
+
+@pytest.mark.asyncio
 async def test_herdr_ghost_delete_records_pane_closed(release_runtime):
     from cli_agent_orchestrator.services import herdr_inbox_service
 

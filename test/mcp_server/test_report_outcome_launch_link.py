@@ -178,10 +178,21 @@ class TestTornDownBinding:
         assert record["outcome_reporter_id"] is None
         assert _outcome_count() == before
 
-    def test_grandparent_is_refused(self, mcp_over_testclient, isolated_db, learning_on):
+    @pytest.mark.parametrize("b_torn_down", [False, True])
+    def test_grandparent_is_refused(
+        self, mcp_over_testclient, isolated_db, learning_on, b_torn_down
+    ):
         """Ruling test 4: A -> B -> C with C torn down. Only C's direct
-        creator B may report on C; A, one level up, may not."""
-        _seed_target_terminal(terminal_id="bbbb2222", caller_id=OWN_ID)  # B, live
+        creator B may report on C; A, one level up, may not -- whether or
+        not B's own launch record (whose caller_id is A) is still live.
+
+        D-P3-3 (P1d): B must have a launch record of its own here, as the
+        real create path always writes one. Without it, a resolver that
+        wrongly extended itself one level up -- from C's creator B to B's
+        OWN creator A, via ``launch_records.caller_id`` -- would have
+        nothing to walk, and this test would miss that bug."""
+        _seed_target_terminal(terminal_id="bbbb2222", caller_id=OWN_ID)  # B, live row
+        _seed_launch("bbbb2222", caller_id=OWN_ID, torn_down=b_torn_down)  # B's own launch
         record_id = _seed_launch("cccc3333", caller_id="bbbb2222")  # C, torn down
         before = _outcome_count()
 
@@ -335,6 +346,37 @@ class TestRouteBinding:
             "failure",
             "creatorB",
         )
+
+        # D-P3-2: a self-report under the same reused id binds only the
+        # newest, still-open row (mutant S6: iterating oldest-first would
+        # bind this to old_id instead).
+        assert _post(api, launch="reused01", source="reused01", success=True).status_code == 200
+        assert (_record(new_id)["outcome"], _record(new_id)["outcome_reporter_id"]) == (
+            "success",
+            "reused01",
+        )
+        assert (_record(old_id)["outcome"], _record(old_id)["outcome_reporter_id"]) == (
+            "success",
+            "creatorA",
+        )
+
+    def test_self_report_unlinked_when_the_only_row_for_the_id_is_closed(self, api):
+        """D-P3-2 (probes/selfreuse.py): if the id's newest row is already
+        finalized -- a stale incarnation after reuse, since the new one's
+        best-effort write may have failed -- a self-report must not reopen
+        its verdict. It lands unlinked instead."""
+        old_id = _seed_launch("stale001", caller_id="creatorA")
+        _post(api, launch="stale001", source="creatorA", success=False)
+        assert _record(old_id)["outcome"] == "failure"
+        before = _outcome_count()
+
+        response = _post(api, launch="stale001", source="stale001", success=True)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["launch_linked"] is False
+        assert _record(old_id)["outcome"] == "failure"
+        assert _record(old_id)["outcome_reporter_id"] == "creatorA"
+        assert _outcome_count() == before + 1
 
     def test_link_failure_never_fails_the_outcome_write(self, api, monkeypatch):
         """AC: a failure writing the record must never fail report_outcome's

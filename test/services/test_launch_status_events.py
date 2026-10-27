@@ -177,6 +177,29 @@ class TestHerdrBusyTimeFromEvents:
         asyncio.run(service._deliver_settled_panes())
         assert [r.status for r in _rows("h1")] == ["processing"]
 
+    def test_status_write_runs_off_the_event_loop(self):
+        """D-P3-3 (H8): the write goes through ``asyncio.to_thread``, so it
+        never shares the event-loop thread every herdr caller runs on (P3-6).
+        Moving it back onto the loop (calling ``record_launch_status_event``
+        directly, synchronously) would leave every other test in this file
+        green, since none of them inspects which thread wrote the row."""
+        import threading
+
+        main_thread = threading.current_thread()
+        seen_threads = []
+
+        def _spy(terminal_id, status, observed_at=None):
+            seen_threads.append(threading.current_thread())
+
+        with patch(
+            "cli_agent_orchestrator.clients.database.record_launch_status_event",
+            side_effect=_spy,
+        ):
+            _feed(_service(), [_pane_event("pane-1", "working")])
+
+        assert seen_threads, "no write observed"
+        assert all(t is not main_thread for t in seen_threads)
+
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     def test_get_status_poll_records_nothing_on_herdr(self, mock_get_backend, mock_pm):
