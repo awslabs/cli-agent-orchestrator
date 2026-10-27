@@ -4796,7 +4796,7 @@ def dispatch_input(
         # leave the runtime itself trustworthy and accept input again, so
         # "re-send the task" stays true. See _deferred_failure_distrusts_runtime.
         failure = get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
-        if _deferred_failure_distrusts_runtime(failure):
+        if failure is not None and _deferred_failure_distrusts_runtime(failure):
             raise ProviderExitedInputBlockedError(
                 f"Terminal {terminal_id} failed deferred initialization "
                 f"({failure.get('kind') or 'unknown'}). Refusing to deliver input.",
@@ -5012,7 +5012,7 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         # Kiro identity otherwise leaves open to a single-character-per-request
         # client.
         failure = get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
-        if _deferred_failure_distrusts_runtime(failure):
+        if failure is not None and _deferred_failure_distrusts_runtime(failure):
             raise ProviderExitedInputBlockedError(
                 f"Terminal {terminal_id} failed deferred initialization "
                 f"({failure.get('kind') or 'unknown'}). Refusing to deliver input.",
