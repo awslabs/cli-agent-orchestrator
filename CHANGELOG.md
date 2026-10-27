@@ -86,7 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour change. Set it, for example to 32, to cap pending, claimed and launched names per
   session; a create over the cap is refused with `max_live_exceeded` before anything is
   written. A create that can't take the store lock is refused with `store_busy` (503), or
-  with `store_lock_unavailable` (503) where the filesystem lacks `flock`. After
+  with `store_lock_unavailable` (503) when the lock is unavailable — for example, no `flock`
+  support, or the lock file can't be created, as on a read-only home. After
   `ephemeral.retention_days` (default 14), a collected name's archive and then its registry
   row are deleted, but only once its terminal and live files are gone. Earlier releases kept
   them forever. All four defaults are provisional, and the feature stays off by default.
