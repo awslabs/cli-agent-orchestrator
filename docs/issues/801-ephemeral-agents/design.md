@@ -2,7 +2,7 @@
 
 **Issue:** [#801](https://github.com/awslabs/cli-agent-orchestrator/issues/801)
 **Depends on:** [#810](https://github.com/awslabs/cli-agent-orchestrator/issues/810) (decision platform)
-**Status:** E1–E3 shipped; E4–E5 planned.
+**Status:** E1–E2 shipped; E3's core shipped in #1091 and #1103; E4–E5 planned.
 **E1:** [#866](https://github.com/awslabs/cli-agent-orchestrator/pull/866)
 (`8ddbd814ede42f3c2d7e67d76aae4306421fc036`),
 [#881](https://github.com/awslabs/cli-agent-orchestrator/pull/881)
@@ -14,7 +14,7 @@
 **E2 proposals:** [M1–M7](https://github.com/awslabs/cli-agent-orchestrator/issues/801#issuecomment-6282810139)
 and
 [optional min_tier, MF1–MF6](https://github.com/awslabs/cli-agent-orchestrator/issues/801#issuecomment-6306655853).
-These await maintainer confirmation. **E2 (#1100)** shipped on this pin; M1 and M2 from its review remain open for maintainers.
+These await maintainer confirmation. **E2 (#1100)** shipped on main in `a7a1db9c`, after this pin; its open items are tracked in the linked proposal comments above, not restated here.
 **Code baseline:** numeric `path:line` citations refer to unchanged code on main
 `a3829744c6df8f074bab9c713906720ad6ba87fd`. #1063's additions are described
 without line numbers; they are not attributed to that main commit.
@@ -26,12 +26,13 @@ without line numbers; they are not attributed to that main commit.
 1. E1 creates typed, creator-owned, single-launch profiles with one MCP tool.
    assign/handoff launch the returned name; their public schemas are unchanged.
 2. E1 stores a canonical spec, deterministic profile and archive, enforces the
-   native-tool ceiling, and releases live files on teardown. Orphan sweeping,
-   retention and lifecycle cleanup remain follow-ups. #1063 ships empty skill catalogs,
-   every-load profile integrity and workflow cancellation gating.
+   native-tool ceiling, and releases live files on teardown. E3 (#1079) adds
+   orphan sweeping and retention; remaining lifecycle hardening is a follow-up.
+   #1063 ships empty skill catalogs, every-load profile integrity and workflow
+   cancellation gating.
 3. E1 is opt-in and off by default. Claude Code enforces native tools; Codex is
    operator opt-in with advisory tools. Neither is a same-user privilege boundary.
-4. E2 proposes explicit/default model tiers and effort without a decider. E4
+4. E2 (#1100) ships explicit/default model tiers and effort without a decider. E4
    plans script-authored workflow specs; E5 plans auto through #810, with placement
    awaiting M7. These later-slice contracts are proposals, not shipped promises.
 
@@ -44,9 +45,10 @@ without line numbers; they are not attributed to that main commit.
   and #905 (delegation). #1063 implements the E1 integrity, catalog and cancellation
   follow-ups. As-built notes and section 0 describe the pinned code, including #954/#955.
 - **E2 (#1100)** shipped explicit/default model tier and effort without a decider.
-  **E3 (#1079)** shipped the sweep, retention and the opt-in max_live_per_session
-  cap. E4–E5 remain planned. The feature stays disabled outside testing until
-  lifecycle cleanup and the workflow runtime-creation refusal both ship.
+  **E3's core (#1091, #1103)** shipped the sweep, retention and the opt-in
+  max_live_per_session cap; the band-list parity test and the ephemeral marker
+  remain open. E4–E5 remain planned. The feature stays disabled outside testing
+  until those E3 items and the E4 workflow runtime-creation refusal ship.
 - Decisions about future behavior await maintainer confirmation (section 9).
   Implementation evidence does not establish maintainer approval.
 
@@ -941,7 +943,7 @@ comment establishes a maintainer decision.
   join launch records but does not create a public MCP replay contract.
 
 ## 3. Slices (in order, each independently mergeable)
-E1 has shipped. E2 is proposed; E3–E5 remain planned. #863 already supplies the decision core and tier reader.
+E1 and E2 (#1100) have shipped; E3's core (#1091, #1103) has shipped and the items named above remain open; E4–E5 remain planned. #863 already supplies the decision core and tier reader.
 
 **E1a: Security groundwork — shipped in #866 (`8ddbd814`).**
 
@@ -960,8 +962,9 @@ Create/persist, claims/binds/releases and assign/handoff integration shipped in
 that order. E1 accepted only omitted tier/effort; explicit values and auto refused.
 The E1 generated profile contained no model or effort. #1063 writes `skills: []`,
 verifies every live-profile read and gates workflow_cancel. **E2 (#1100)** later
-applied explicit/default model tier and effort and stores the resolved model on
-the generated profile; auto still refuses auto_requires_decision_platform. E3
+applied explicit/default model tier and effort and stores the resolved model
+and the provider's effort key on the generated profile; auto still refuses
+auto_requires_decision_platform. E3
 (#1079) added the sweep, the opt-in max_live_per_session cap and audit pruning;
 no workflow agent_spec or SDK ephemeral helper ships yet.
 
