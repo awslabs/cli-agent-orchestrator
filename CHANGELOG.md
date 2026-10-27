@@ -13,17 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installed for Kiro, or whose agent file did not load, ran unrestricted. Every `kiro_cli` launch now
   refuses an agent that none of the agent directories CAO searches defines, before any terminal
   exists (`400`, with the `cao install` remedy). It also refuses a pane whose TUI header names a
-  different agent, before any task is typed, and closes that terminal's window -- or, if that close
-  cannot be confirmed, refuses input to it instead -- including a deferred launch with no caller
-  whose failure record is kept. Other durable failures that leave the pane itself healthy, such as
-  one recorded after a server restart, still accept input, so "re-send the task" stays true. A
-  correctly installed profile launches exactly as before. **Behaviour change:** Kiro launches of a
-  profile not installed for `kiro_cli`, or of a Kiro built-in agent, are now refused; `cao launch
-  --memory` on Kiro reports the `memory_manager` sidecar as `refused` unless it is installed for
-  Kiro; and with `CAO_AGENTS_DIR` set in the server's environment outside `~/.kiro/agents` and
-  `$KIRO_HOME/agents`, a launch now fails at the header check, after kiro-cli has started (`cao-server
-  --agents-dir` instead fails early, as `agent_not_found`). See `docs/kiro-cli.md`, troubleshooting
-  item 7.
+  different agent, before any task is typed. A Kiro terminal now takes typed input (`/input`,
+  `/key`, `cao send`, inbox delivery, the `/ws` web terminal) only once CAO has recorded that its
+  header check passed. While it is still starting, input is refused and queued inbox messages wait,
+  and the web terminal shows output but drops keystrokes. A Kiro launch whose startup ended without
+  that record -- a refused identity, a timeout before the header was read, a server restart mid-start
+  -- has its window closed, even a deferred launch with no caller whose failure record is kept (if
+  the close cannot be confirmed, input to it stays refused). A Kiro terminal verified before a server
+  restart still accepts a re-sent task, and other providers are unchanged. Kiro terminals launched
+  before this change are not re-verified: they keep accepting input unless they carry a startup
+  failure. A correctly installed profile launches exactly as before. **Behaviour change:** Kiro
+  launches of a profile not installed for `kiro_cli`, or of a Kiro built-in agent, are now refused;
+  `cao launch --memory` on Kiro reports the `memory_manager` sidecar as `refused` unless it is
+  installed for Kiro; and with `CAO_AGENTS_DIR` set in the server's environment outside
+  `~/.kiro/agents` and `$KIRO_HOME/agents`, a launch now fails at the header check, after kiro-cli
+  has started (`cao-server --agents-dir` instead fails early, as `agent_not_found`). See
+  `docs/kiro-cli.md`, troubleshooting item 7.
 
 - **A plan approval now names the working directory it was granted for, not just its path** (#827,
   #1000). A path is not an identity. Move a non-Git working directory away, put a different directory
