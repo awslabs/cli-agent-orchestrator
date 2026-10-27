@@ -126,7 +126,13 @@ from cli_agent_orchestrator.models.memory import (
     MemoryType,
     recall_wire_dict,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.models.terminal import (
+    Terminal,
+    TerminalId,
+    TerminalInputBlockedReason,
+    TerminalLimitError,
+)
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
@@ -4777,7 +4783,7 @@ async def send_terminal_key(
         success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
     except TerminalInputBlockedError as e:
-        # send_special_key carries typed text (#1074 D-P3-3), so it is refused
+        # send_special_key carries typed text (#1074), so it is refused
         # the same way /input is: a conflict with the terminal's state, not a
         # server fault.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
@@ -8762,6 +8768,20 @@ async def get_inbox_messages_endpoint(
         )
 
 
+def _ws_input_refusal(
+    terminal_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[TerminalInputBlockedError]]:
+    """The terminal's row and the refusal for input to it, for ``/ws`` (#1074).
+
+    ``(None, None)`` when the row is gone. Blocking DB and file I/O: callers
+    to_thread it.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        return None, None
+    return metadata, terminal_service.terminal_input_refusal(terminal_id, metadata)
+
+
 @app.websocket("/terminals/{terminal_id}/ws")
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
@@ -8793,6 +8813,14 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     devcontainers or Codespaces exposed full PTY control with no credential.
     Do NOT expose the server to untrusted networks (e.g. --host 0.0.0.0)
     without authentication.
+
+    Provisional (#1074): a Kiro terminal whose identity CAO has not verified
+    (``terminal_service.terminal_input_refusal``) gets output but no input. The
+    attach is accepted, its output is forwarded, and each ``input`` frame is
+    re-checked and dropped while the terminal is refused, so typing starts once
+    its identity check passes. The attach is refused before accept, with 4409,
+    only when CAO itself already reclaimed that untrusted runtime: an attach by
+    the row's session and window names could then only reach another window.
     """
     # Reject connections from clients outside the configured allowlist.
     # Defaults to loopback; operators running cao-server inside a container can
@@ -8881,9 +8909,25 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             await websocket.close(code=4401, reason="Unauthorized")
             return
 
+    # The row, and whether input to it is refused, read off the loop before
+    # accept (#1074).
+    metadata, input_refusal = await asyncio.to_thread(_ws_input_refusal, terminal_id)
+    if (
+        metadata
+        and metadata.get("provider") == ProviderType.KIRO_CLI.value
+        and input_refusal is not None
+        and input_refusal.reason == TerminalInputBlockedReason.INIT_FAILED
+        and metadata.get("deferred_init_runtime_reclaimed")
+    ):
+        logger.warning(
+            "Rejected WebSocket attach for terminal %r: its untrusted runtime was reclaimed",
+            terminal_id,
+        )
+        await websocket.close(code=4409, reason="Terminal runtime was reclaimed")
+        return
+
     await websocket.accept()
 
-    metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         await websocket.close(code=4004, reason="Terminal not found")
         return
@@ -8977,6 +9021,38 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             except (Exception, asyncio.CancelledError):
                 break
 
+    # A terminal trusted at attach time is never re-checked; one that is not has
+    # each input frame re-checked until it passes, and trust only moves one way.
+    input_trusted = input_refusal is None
+    input_drop_logged = False
+
+    async def _input_allowed() -> bool:
+        nonlocal input_trusted, input_drop_logged
+        if input_trusted:
+            return True
+        try:
+            row, refusal = await asyncio.to_thread(_ws_input_refusal, terminal_id)
+        except Exception:  # noqa: BLE001 — an unreadable row is not a trusted one
+            reason = "check_failed"
+        else:
+            if row and refusal is None:
+                input_trusted = True
+                return True
+            reason = (
+                refusal.reason.value
+                if refusal is not None and refusal.reason is not None
+                else "terminal_not_found"
+            )
+        if not input_drop_logged:
+            input_drop_logged = True
+            logger.warning(
+                "Dropping WebSocket input for terminal %r until its Kiro identity is "
+                "verified (%s)",
+                terminal_id,
+                reason,
+            )
+        return False
+
     async def _forward_input():
         """Receive from WebSocket and write to PTY."""
         try:
@@ -8984,6 +9060,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                 msg = await websocket.receive_text()
                 payload = json.loads(msg)
                 if payload.get("type") == "input":
+                    if not await _input_allowed():
+                        # Dropped: zero bytes reach the PTY (#1074).
+                        continue
                     raw = payload["data"].encode()
                     # Write in chunks to avoid overflowing the PTY buffer
                     chunk_size = 1024
