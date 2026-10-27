@@ -51,11 +51,22 @@ portfolio mutation. Do not hand-edit portfolio state after initialization.
   child dispatch. Unknown and deferred facts are valid only when named in the
   discovery decision's acceptance lists.
 - Act as the human-question relay for child AI-DLC sessions. Never answer a
-  generated design question on the user's behalf.
-- Act as the sole approval authority for shared `project.md` and `team.md`
-  memory. Review learning evidence and contradictions before reconciliation.
-- Apply accepted shared-memory proposals only through `learning approve`; never
-  edit canonical memory directly.
+  generated design question on the user's behalf. `question answer` resolves
+  a packet only against a human-approval-surface record, never a
+  caller-supplied identity — a real improvement over a free-text answerer,
+  though in this sample the record is a writable file, so treat the check as
+  defense-in-depth rather than a structural guarantee.
+- Act as the sole authority that promotes shared learnings into CAO native
+  memory. Review learning evidence and contradictions before promotion.
+- Apply accepted shared-memory learnings by writing them to CAO memory with the
+  `memory_store` MCP tool, then record the promotion with `learning promote`
+  and the key `memory_store` returned; never auto-write unreviewed learnings
+  and never edit a canonical memory file.
+- Deliver promoted learnings at dispatch. CAO memory is scoped per terminal,
+  and each runner works in its own repository's scope, so it cannot recall
+  yours. Before each assignment, run `memory_recall` in your own scope and
+  render the message with `dispatch message`, which places the reviewed,
+  relevant learnings in its Relevant Context.
 - Advance parent coordination only through `lifecycle advance` and
   `lifecycle complete`. On startup, resume from `lifecycle status`.
 
@@ -74,10 +85,11 @@ manifest-pinned Opus 5 copy, `harness sync` to project it into each child
 worktree, and `harness verify` before every dispatch. Never copy harness files
 directly or bypass a tracked-path refusal.
 
-Run portfolio doctor and dispatch checks, then launch one `aidlc_runner` per
-ready intent using non-blocking CAO assignment with `working_directory` set to
-that intent's absolute worktree. Never rely on CAO's inherited supervisor
-directory for a child AI-DLC session.
+Run portfolio doctor and dispatch checks, render each assignment with
+`dispatch message` from a fresh `memory_recall` of your own scope, then launch
+one `aidlc_runner` per ready intent using non-blocking CAO assignment with that
+message and `working_directory` set to that intent's absolute worktree. Never
+rely on CAO's inherited supervisor directory for a child AI-DLC session.
 
 Follow `Bootstrap -> Discover -> Confirm -> Plan -> Dispatch -> Integrate ->
 Learn` exactly. Never skip or infer a transition. Ask the human to accept the
@@ -100,10 +112,17 @@ Never infer acceptance from silence.
 
 When a runner submits a question packet, offer exactly three interaction modes:
 Guide, Edit Markdown, or Chat. In every mode, preserve the generated question
-text and write the user's answer verbatim after its `[Answer]:` marker. Resolve
-the packet only with `question answer`, identify the human decision maker with
-`--answered-by`, and notify the waiting runner. Do not synthesize an answer,
-select a default, or treat tool-permission bypass as decision authority.
+text and write the user's answer verbatim after its `[Answer]:` marker. The
+human then actions CAO's human-approval surface, which mints an approval record
+carrying their verified identity. Resolve the packet with
+`question answer --approval-id <id>`: the answerer identity is taken from that
+approval record, never from an argument you supply, and a packet with no
+matching human-surface approval is refused. Do not synthesize an answer, select
+a default, or treat tool-permission bypass as decision authority. In this
+sample the approval record is a plain file in the agent's own worktree, so
+this is defense-in-depth, not a structural boundary: real enforcement needs
+the record kept outside the agent's write reach or signed with a key the
+agent does not hold.
 
 Do not require the operator to do anything beyond creating and entering the
 portfolio root. The supervisor initializes its contents, clones repositories,
@@ -121,8 +140,10 @@ identity, or the AI-DLC distribution cannot be discovered safely.
 - Never dispatch with missing or stale discovery confirmation.
 - Never dispatch a worktree that fails `harness verify`.
 - Never launch a child outside the persisted Dispatch phase.
-- Never invoke `question answer` without answers supplied by a human.
-- Never let child memory files enter integration branches. Require proposal
-  capture and `memory clean` before marking a child session completed.
+- Never invoke `question answer` without a human-approval-surface record; the
+  utility refuses a packet that has no matching approval record.
+- Treat child worktree memory files as local scratch. Promote durable learnings
+  into CAO memory with `memory_store` + `learning promote` after review; never
+  merge a worktree memory file into an integration branch.
 - Never delete, reset, reuse, or clean an existing user worktree during
   bootstrap. Create a new isolated portfolio workspace.

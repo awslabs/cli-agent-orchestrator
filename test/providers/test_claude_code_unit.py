@@ -1596,6 +1596,58 @@ class TestClaudeCodeProviderMisc:
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env == {"CAO_TERMINAL_ID": "term-56"}
 
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_uvx_launched_entry_named_cao_mcp_server_gets_the_address(self, mock_load, monkeypatch):
+        """#1075 P3-1: an entry started through ``uvx`` is still the CAO server
+        when its own entry name is ``cao-mcp-server``, even though ``command``
+        is ``uvx`` rather than the bare console script. Claude Code does not
+        forward the parent env, so without this the server would fall back to
+        the default CAO."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {
+                "command": "uvx",
+                "args": ["--from", "cli-agent-orchestrator", "cao-mcp-server"],
+            }
+        }
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-57", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        mcp_data = _extract_mcp_config(command)
+        server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env["CAO_API_PORT"] == "9899"
+        # The uvx args are untouched: this is name-matching, not command resolution.
+        assert mcp_data["mcpServers"]["cao-mcp-server"]["command"] == "uvx"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_non_cao_server_never_gets_the_address(self, mock_load, monkeypatch):
+        """A server that is neither named nor commanded cao-mcp-server never
+        gains the address, even if it happens to be launched through uvx."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "my-server": {"command": "uvx", "args": ["--from", "pkg", "my-server"]}
+        }
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-58", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        mcp_data = _extract_mcp_config(command)
+        server_env = mcp_data["mcpServers"]["my-server"].get("env", {})
+        assert "CAO_API_PORT" not in server_env
+
 
 class TestClaudeCodeProviderContainerPathTranslation:
     """_build_claude_command must translate temp-file paths for container profiles.
