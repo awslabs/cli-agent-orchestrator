@@ -719,6 +719,22 @@ class TestExitTerminalEndpoint:
             assert response.status_code == 500
             assert "Failed to exit terminal" in response.json()["detail"]
 
+    def test_exit_terminal_input_blocked_maps_to_409_not_500(self, client):
+        """A text exit command going through dispatch_input's refusal (#1074
+        D-P3-1) is a conflict with the terminal's state, not a server fault."""
+        from cli_agent_orchestrator.models.terminal import ProviderExitedInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.exit_terminal_cli.side_effect = ProviderExitedInputBlockedError(
+                "Terminal abcd1234 failed deferred initialization (identity_mismatch). "
+                "Refusing to deliver input."
+            )
+
+            response = client.post("/terminals/abcd1234/exit")
+
+            assert response.status_code == 409
+            assert "Refusing to deliver input" in response.json()["detail"]
+
 
 class TestDeleteTerminalEndpoint:
     """Test DELETE /terminals/{terminal_id} endpoint."""

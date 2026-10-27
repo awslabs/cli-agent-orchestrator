@@ -1666,6 +1666,25 @@ class TestSendTerminalKey:
         assert response.status_code == 500
         assert "Failed to send key" in response.json()["detail"]
 
+    def test_send_key_refused_terminal_is_409(self, client):
+        """POST /terminals/{id}/key returns 409, not 500, for a refused terminal.
+
+        A special key is typed input (#1074 D-P3-3): a terminal whose deferred
+        init left the runtime untrusted refuses it the same way /input does.
+        """
+        from cli_agent_orchestrator.models.terminal import ProviderExitedInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = ProviderExitedInputBlockedError(
+                "Terminal abcd1234 failed deferred initialization (identity_mismatch). "
+                "Refusing to deliver input."
+            )
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Enter"})
+
+        assert response.status_code == 409
+        assert "Refusing to deliver input" in response.json()["detail"]
+
 
 class TestGetTerminalOutput:
     """Tests for GET /terminals/{terminal_id}/output endpoint."""

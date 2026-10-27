@@ -460,7 +460,12 @@ class TestDispatchRefusesADurableInitFailure:
         """The durable record is the DB column or, after a DB outage, the sidecar."""
         row = external_owner_row
         assert terminal_service._write_deferred_failure_fallback(
-            row.id, {"phase": "deferred_init", "kind": "provider_init_error"}
+            row.id,
+            {
+                "phase": "deferred_init",
+                "kind": "provider_init_error",
+                "exception_type": "KiroAgentIdentityError",
+            },
         )
 
         with pytest.raises(ProviderExitedInputBlockedError) as excinfo:
@@ -484,3 +489,111 @@ class TestDispatchRefusesADurableInitFailure:
             terminal_service.dispatch_input(row.id, "SEND-CANARY", frozen_memory="")
 
         assert _typed(row.backend) == ["SEND-CANARY"]
+
+
+class TestDispatchNarrowsTheGateToUntrustedRuntimes:
+    """Only a Kiro identity refusal distrusts the pane it leaves behind (#1074
+    review round 2, D-P3-1/D-P3-2). A durable failure that leaves a healthy
+    pane running the right agent -- an ``interrupted_init`` row recorded after
+    a server restart -- must accept input again, so "re-send the task" stays
+    true. Replaces the earlier "every provider's durable failure is refused"
+    provisional choice."""
+
+    def test_a_non_kiro_interrupted_init_row_accepts_input_again(self, external_owner_row):
+        row = external_owner_row
+        assert terminal_service._persist_deferred_init_failure(
+            row.id,
+            kind="interrupted_init",
+            message="cao-server restarted before the initial delivery completed",
+            exception_type="ServerRestart",
+        )
+        provider = MagicMock()
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0
+        provider.assume_processing_on_dispatch = False
+        provider.shell_baseline = None
+        with (
+            patch.object(terminal_service.provider_manager, "get_provider", return_value=provider),
+            patch.object(terminal_service, "_dialog_blocks_orchestrated_input", return_value=False),
+        ):
+            terminal_service.dispatch_input(row.id, "RESEND-CANARY", frozen_memory="")
+
+        assert "RESEND-CANARY" in _typed(row.backend)
+
+    def test_a_kiro_interrupted_init_row_also_accepts_input_again(self, external_owner_row):
+        """The gate is keyed on the failure's exception_type, not the terminal's
+        provider: a kiro_cli terminal interrupted by a server restart (not an
+        identity refusal) is just as healthy as any other provider's."""
+        row = external_owner_row
+        assert terminal_service._persist_deferred_init_failure(
+            row.id,
+            kind="interrupted_init",
+            message="cao-server restarted before the initial delivery completed",
+            exception_type="ServerRestart",
+        )
+        provider = MagicMock()
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0
+        provider.assume_processing_on_dispatch = False
+        provider.shell_baseline = None
+        with (
+            patch.object(terminal_service.provider_manager, "get_provider", return_value=provider),
+            patch.object(terminal_service, "_dialog_blocks_orchestrated_input", return_value=False),
+        ):
+            terminal_service.dispatch_input(row.id, "RESEND-CANARY", frozen_memory="")
+
+        assert "RESEND-CANARY" in _typed(row.backend)
+
+    @pytest.mark.asyncio
+    async def test_a_kiro_identity_refusal_still_refuses_even_when_reclaim_confirmed(
+        self, external_owner_row
+    ):
+        row = external_owner_row
+        await _refused_deferred_launch(row)
+
+        metadata = terminal_service.get_terminal_metadata(row.id)
+        assert metadata["deferred_init_runtime_reclaimed"] is True
+
+        with pytest.raises(ProviderExitedInputBlockedError):
+            terminal_service.dispatch_input(row.id, "SEND-CANARY")
+
+    @pytest.mark.asyncio
+    async def test_an_unconfirmed_reclaim_of_a_kiro_identity_refusal_still_refuses(
+        self, external_owner_row
+    ):
+        row = external_owner_row
+        row.backend.cleanup_terminal_exact.return_value = TerminalCleanupResult(
+            TerminalCleanupOutcome.STILL_PRESENT, "the window is still there"
+        )
+        await _refused_deferred_launch(row)
+
+        metadata = terminal_service.get_terminal_metadata(row.id)
+        assert metadata["deferred_init_runtime_reclaimed"] is False
+
+        with pytest.raises(ProviderExitedInputBlockedError):
+            terminal_service.dispatch_input(row.id, "SEND-CANARY")
+
+
+class TestSendSpecialKeyRefusesAnUntrustedRuntime:
+    """``/key``, MCP answer_user_prompt and the AG-UI path all reach
+    send_special_key (#1074 D-P3-3): a special key is still typed input, and
+    must be refused the same way dispatch_input refuses it."""
+
+    @pytest.mark.asyncio
+    async def test_a_refused_terminal_refuses_the_key_too(self, external_owner_row):
+        row = external_owner_row
+        await _refused_deferred_launch(row)
+
+        with pytest.raises(ProviderExitedInputBlockedError):
+            terminal_service.send_special_key(row.id, "Enter")
+
+        row.backend.send_special_key.assert_not_called()
+
+    def test_a_healthy_terminal_still_takes_the_key(self, external_owner_row):
+        row = external_owner_row
+
+        assert terminal_service.send_special_key(row.id, "Enter") is True
+
+        row.backend.send_special_key.assert_called_once_with(
+            "cao-session", "developer-abcd", "Enter"
+        )

@@ -2741,6 +2741,26 @@ def get_deferred_init_failure(terminal_id: str, candidate: Any = None) -> dict[s
     return _read_deferred_failure_fallback(terminal_id)
 
 
+# Provisional (#1074): narrowed from "every provider's durable failure" after
+# review -- a broad gate also refuses a healthy pane recovering from an
+# ``interrupted_init``/``ServerRestart`` row, which would make "re-send the
+# task" permanently false after a routine restart. Only a Kiro identity
+# refusal distrusts the runtime it leaves behind: the pane may still be the
+# unrestricted ``kiro_default`` fallback with its trust-all-tools consent
+# already accepted, whether or not the reclaim that tried to close it
+# (``deferred_init_runtime_reclaimed``) came back confirmed (UNKNOWN or
+# STILL_PRESENT).
+_UNTRUSTED_DEFERRED_FAILURE_EXCEPTION_TYPES = frozenset({"KiroAgentIdentityError"})
+
+
+def _deferred_failure_distrusts_runtime(failure: dict[str, Any] | None) -> bool:
+    """True when a durable deferred-init failure means the pane can't be trusted."""
+
+    if failure is None:
+        return False
+    return failure.get("exception_type") in _UNTRUSTED_DEFERRED_FAILURE_EXCEPTION_TYPES
+
+
 def _delete_deferred_failure_fallback(terminal_id: str) -> None:
     try:
         _deferred_failure_fallback_path(terminal_id).unlink(missing_ok=True)
@@ -4766,16 +4786,17 @@ def dispatch_input(
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        # A terminal whose deferred init failed durably is never typed into, so
-        # that a retained failure row is not a live input path (#1074). A refused
-        # Kiro identity has its window closed, but if that close could not be
-        # confirmed the pane may still be the kiro_default fallback, accepting
-        # input with every built-in tool. This reads the durable record, not the
-        # monitor's in-memory status, which can still say IDLE there.
-        # Provisional (#1074): every provider's durable failure is refused, with
-        # the reason string "init_failed".
+        # A terminal whose deferred init left the runtime untrusted is never
+        # typed into (#1074): a refused Kiro identity has its window closed,
+        # but if that close could not be confirmed the pane may still be the
+        # kiro_default fallback, accepting input with every built-in tool.
+        # This reads the durable record, not the monitor's in-memory status,
+        # which can still say IDLE there. Other durable failures (e.g. an
+        # ``interrupted_init`` row on a healthy pane after a server restart)
+        # leave the runtime itself trustworthy and accept input again, so
+        # "re-send the task" stays true. See _deferred_failure_distrusts_runtime.
         failure = get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
-        if failure is not None:
+        if _deferred_failure_distrusts_runtime(failure):
             raise ProviderExitedInputBlockedError(
                 f"Terminal {terminal_id} failed deferred initialization "
                 f"({failure.get('kind') or 'unknown'}). Refusing to deliver input.",
@@ -4984,6 +5005,19 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        # Same narrowed gate as dispatch_input (#1074): a special key is still
+        # typed input, and ``/key``, MCP answer_user_prompt and the AG-UI path
+        # all reach here. Refusing it closes the gap a refused-but-unconfirmed
+        # Kiro identity otherwise leaves open to a single-character-per-request
+        # client.
+        failure = get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
+        if _deferred_failure_distrusts_runtime(failure):
+            raise ProviderExitedInputBlockedError(
+                f"Terminal {terminal_id} failed deferred initialization "
+                f"({failure.get('kind') or 'unknown'}). Refusing to deliver input.",
+                reason=TerminalInputBlockedReason.INIT_FAILED,
+            )
 
         # Arm StatusMonitor stickiness: special keys (Enter on a permission
         # prompt, C-c interrupting work, C-d sending EOF) all initiate a new

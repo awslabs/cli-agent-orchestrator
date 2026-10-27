@@ -4774,6 +4774,11 @@ async def send_terminal_key(
         # Blocking tmux send-keys — off the loop.
         success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
+    except TerminalInputBlockedError as e:
+        # send_special_key carries typed text (#1074 D-P3-3), so it is refused
+        # the same way /input is: a conflict with the terminal's state, not a
+        # server fault.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -4866,6 +4871,12 @@ async def exit_terminal(
         # Blocking tmux I/O — off the loop.
         await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
+    except TerminalInputBlockedError as e:
+        # A text exit command (e.g. "/exit") goes through dispatch_input, which
+        # refuses a terminal CAO does not trust (#1074) the same way /input
+        # does. That is a conflict with the terminal's state, not a server
+        # fault -- matching the 409 POST /terminals/{id}/input already returns.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
