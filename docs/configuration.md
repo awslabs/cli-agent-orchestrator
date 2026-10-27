@@ -158,6 +158,7 @@ Only JSON `true` enables the tool, and agent terminals must restart to see it.
 | `min_tier` | `null` | Optional minimum model tier; must not exceed `max_tier` and needs a `default_tier` at or above it. |
 | `max_tier` | `null` | Maximum model tier; a ceiling requires a default at or below it and mappings for every permitted tier, from the floor up, and allowed provider. |
 | `default_tier` | `null` | Model tier used when the spec omits `model_tier`, resolved once at creation and required to be mapped for every allowed provider. |
+| `min_effort` | `null` | Optional minimum reasoning effort; must not exceed `max_effort` and needs a `default_effort` at or above it. |
 | `max_effort` | `null` | Maximum reasoning effort; a ceiling requires a default at or below it. |
 | `default_effort` | `null` | Reasoning effort used when the spec omits `effort`, resolved once at creation. |
 | `child_may_delegate` | `false` | Permit the existing ephemeral delegation/workflow tools; never permits ephemeral creation by an ephemeral caller. |

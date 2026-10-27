@@ -205,21 +205,23 @@ def policy_bounds(settings: dict[str, Any]) -> PolicyBounds:
         max_effort=settings.get("max_effort"),
         allowed_providers=frozenset(settings["allowed_providers"]),
         min_tier=settings.get("min_tier"),
+        min_effort=settings.get("min_effort"),
     )
 
 
-def _validate_floor(settings: dict[str, Any]) -> None:
-    """MF1 rules 9-10 through #810's PolicyBounds (MF5), once rules 1-2 have passed."""
+def _validate_floor(settings: dict[str, Any], field: str = "tier") -> None:
+    """MF1 rules 9-10 through #810's PolicyBounds (MF5), once rules 1-2 have passed.
+
+    #1083 Q2 (provisional): the effort floor follows the same rules as the tier floor.
+    """
     try:
         PolicyBounds(
-            default_tier=settings.get("default_tier"),
-            max_tier=settings.get("max_tier"),
-            min_tier=settings.get("min_tier"),
+            **{bound + field: settings.get(bound + field) for bound in ("default_", "max_", "min_")}
         ).validate({})
     except PolicyConfigError:
         raise EphemeralPolicyError(
-            "policy_config_error:min_tier",
-            "ephemeral.min_tier needs ephemeral.default_tier at or above it, and must not exceed ephemeral.max_tier",
+            f"policy_config_error:min_{field}",
+            f"ephemeral.min_{field} needs ephemeral.default_{field} at or above it, and must not exceed ephemeral.max_{field}",
         ) from None
 
 
@@ -312,7 +314,7 @@ def validate_block(settings: dict[str, Any]) -> None:
             "ephemeral.default_tier must be set when ephemeral.max_tier is set, and must not exceed it",
         ) from None
     _validate_floor(settings)
-    for key in ("max_effort", "default_effort"):
+    for key in ("max_effort", "default_effort", "min_effort"):
         value = settings.get(key)
         options = POINTS["effort.route"].options
         if value is not None and (not isinstance(value, str) or value not in options):
@@ -329,6 +331,7 @@ def validate_block(settings: dict[str, Any]) -> None:
             "policy_config_error:default_effort",
             "ephemeral.default_effort must be set when ephemeral.max_effort is set, and must not exceed it",
         ) from None
+    _validate_floor(settings, "effort")
     try:
         policy_bounds(settings).validate(settings.get("_model_tiers", {}))
     except PolicyConfigError as exc:
@@ -557,10 +560,15 @@ def _value_refusal(
                 f"{field}={value} is above ephemeral.{key}={ceiling}; request {ceiling} or lower, or omit {field}",
             )
         if exc.reason == "below_floor":
+            field, key, rule = (
+                ("model_tier", "min_tier", "tier_below_policy")
+                if point == "model.route"
+                else ("effort", "min_effort", "effort_below_policy")
+            )
             floor = bounds.floor_for(point)
             return EphemeralPolicyError(
-                "tier_below_policy",
-                f"model_tier={value} is below ephemeral.min_tier={floor}; request {floor} or higher, or omit model_tier",
+                rule,
+                f"{field}={value} is below ephemeral.{key}={floor}; request {floor} or higher, or omit {field}",
             )
         if exc.reason == "explicit_unmapped":
             return EphemeralPolicyError(
@@ -575,9 +583,14 @@ def _stored_default_refusal(point: str, bounds: PolicyBounds) -> Optional[Epheme
     """A5-3 (provisional M2), and MF3: a new floor or ceiling cannot bound a stored provider default."""
     floor = bounds.floor_for(point)
     if floor is not None:
+        field, key, rule = (
+            ("model_tier", "min_tier", "tier_below_policy")
+            if point == "model.route"
+            else ("effort", "min_effort", "effort_below_policy")
+        )
         return EphemeralPolicyError(
-            "tier_below_policy",
-            f"stored model_tier is the provider default, which ephemeral.min_tier={floor} does not bound",
+            rule,
+            f"stored {field} is the provider default, which ephemeral.{key}={floor} does not bound",
         )
     ceiling = bounds.ceiling_for(point)
     if ceiling is None:

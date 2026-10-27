@@ -22,6 +22,7 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "min_tier": null,
     "max_tier": null,
     "default_tier": null,
+    "min_effort": null,
     "max_effort": null,
     "default_effort": null,
     "max_depth": 1,
@@ -90,6 +91,14 @@ It must not exceed `max_tier`, and it needs a `default_tier` at or above it, so
 still choose a cheaper explicit tier, down to the floor. An explicit tier below the floor
 refuses with `tier_below_policy`, before the ceiling and mapping checks. A broken floor is
 `policy_config_error:min_tier`.
+
+The optional `ephemeral.min_effort` floor bounds effort the same way: `min_effort <=
+default_effort <= max_effort`. An explicit effort below it refuses with `effort_below_policy`,
+before the ceiling check, and a broken floor is `policy_config_error:min_effort`. At claim, and
+at a launch without a claim identifier, a stored effort below a floor raised since create, or a
+stored provider default under a new floor, refuses with
+`policy_changed_since_create:effort_below_policy` and collects the name. This floor is
+provisional (#1083) and follows whatever #1068 settles for the tier floor.
 
 Unknown keys in the block are accepted. The first create that sees one logs a single warning
 per server process naming it, never its value, so a typo such as `min_tierr` is visible.
@@ -310,8 +319,9 @@ A stored tier or effort above a tightened ceiling, an unmapped stored tier, or a
 default under a newly added ceiling returns `policy_changed_since_create:tier_exceeds_policy`
 or `policy_changed_since_create:effort_exceeds_policy`, or
 `policy_changed_since_create:tier_unmapped`, and collects the name; re-create it. A stored
-tier below a floor raised since create, or a stored provider default under a newly added floor,
-returns `policy_changed_since_create:tier_below_policy` and collects the name the same way.
+tier or effort below a floor raised since create, or a stored provider default under a newly
+added floor, returns `policy_changed_since_create:tier_below_policy` or
+`policy_changed_since_create:effort_below_policy` and collects the name the same way.
 A broken table names `model_tiers`, never `ephemeral.model_tiers`.
 The stored spec is verified and the profile is finalized before the claim response.
 An owner may also launch a pending name without a claim identifier; that bind applies the
@@ -331,13 +341,13 @@ extraction failure tear down terminals owned by that call.
 | --- | --- |
 | 404 | `ephemeral_disabled`, `unknown_ephemeral` |
 | 409 | `already_claimed`, `claim_expired`, `ephemeral_expired`, `spec_unavailable` |
-| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:provider_unsupported`, `policy_changed_since_create:tool_unsupported_on_provider:<atom>`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_below_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy` |
+| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:provider_unsupported`, `policy_changed_since_create:tool_unsupported_on_provider:<atom>`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_below_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy`, `policy_changed_since_create:effort_below_policy` |
 | 422 | `invalid_request` for the claim body; invalid launch claim identifiers or claim-plus-reuse requests |
 | 500 | `unexpected_failure` |
 
 Create also refuses with `provider_unsupported`, `provider_not_allowed`,
 `tool_unsupported_on_provider:<atom>`, `tier_unmapped`, `tier_exceeds_policy`,
-`tier_below_policy`, `effort_exceeds_policy`, `auto_requires_bounds` and
+`tier_below_policy`, `effort_exceeds_policy`, `effort_below_policy`, `auto_requires_bounds` and
 `policy_config_error:<key>`, all HTTP 400. The three provider refusals come before the tier
 and effort refusals other than `auto_requires_bounds`, and before the creator tool-ceiling
 check (`tool_exceeds_creator:<atoms>`).
