@@ -150,6 +150,7 @@ from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
     approval_store,
+    ephemeral_service,
     flow_service,
     manifest_freeze,
     secret_gate,
@@ -269,6 +270,28 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
             await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
         except Exception:
             logger.exception("Inbox reconciliation daemon error")
+
+
+async def ephemeral_sweep_daemon() -> None:
+    """Background task that collects expired and abandoned ephemeral names (#1079).
+
+    The startup pass runs in the lifespan before requests are served; this loop runs
+    the periodic passes, which keep the bind-to-terminal-insert grace.
+    """
+    logger.info("Ephemeral sweep daemon started")
+    while True:
+        # Read inside the error handling: if this task died, the lifespan shutdown's
+        # await would re-raise and skip every later shutdown step.
+        try:
+            interval = await asyncio.to_thread(ephemeral_service.sweep_interval_seconds)
+        except Exception:
+            logger.exception("Ephemeral sweep daemon error")
+            interval = cast(int, ephemeral_service.EPHEMERAL_DEFAULTS["sweep_interval_seconds"])
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(ephemeral_service.sweep, False)
+        except Exception:
+            logger.exception("Ephemeral sweep daemon error")
 
 
 # Response Models
@@ -1666,6 +1689,13 @@ async def lifespan(app: FastAPI):
     await registry.load()
     app.state.plugin_registry = registry
 
+    # Ephemeral residue (#1079). Awaited, so this pass ends before any request is served
+    # and can collect a launched row whose terminal vanished without waiting the grace.
+    try:
+        await asyncio.to_thread(ephemeral_service.sweep, True)
+    except Exception:  # noqa: BLE001 — never block startup on a maintenance sweep
+        logger.warning("ephemeral startup sweep failed", exc_info=True)
+
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
     asyncio.create_task(cleanup_expired_memories())
@@ -1721,6 +1751,7 @@ async def lifespan(app: FastAPI):
     # Start provider-agnostic reconciliation sweep for orphaned PENDING messages
     # the immediate and event-driven status paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
+    ephemeral_sweep_task = asyncio.create_task(ephemeral_sweep_daemon())
 
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
@@ -1796,6 +1827,14 @@ async def lifespan(app: FastAPI):
     inbox_reconcile_task.cancel()
     try:
         await inbox_reconcile_task
+    except asyncio.CancelledError:
+        pass
+
+    # Cancel the periodic ephemeral sweep on shutdown. A pass already running in its
+    # worker thread finishes on its own; each row change is its own transaction.
+    ephemeral_sweep_task.cancel()
+    try:
+        await ephemeral_sweep_task
     except asyncio.CancelledError:
         pass
 

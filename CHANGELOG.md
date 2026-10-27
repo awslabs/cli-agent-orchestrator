@@ -73,6 +73,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the last 24 hours, read from the database read-only. `decision_records` gains a nullable
   `target_kind` column (`installed`, `ephemeral` or `workflow`); existing rows stay null.
 
+- **Ephemeral agents: startup and periodic sweeps, a live-name cap and retention** (#1079).
+  cao-server now collects expired and abandoned ephemeral names. It sweeps once at startup,
+  before serving requests, then every `ephemeral.sweep_interval_seconds` (default 300).
+  A sweep collects pending names past their TTL or whose creator terminal is gone, lapsed
+  claims past their TTL, and launched names with no terminal row. For those, periodic sweeps
+  wait `ephemeral.launch_grace_seconds` (default 600) after the bind; the startup sweep
+  doesn't wait. Claims inside their lease and launched names whose terminal exists are never
+  touched. Failed file deletions are retried. Live files left by a crashed create are deleted
+  under a lock shared with creation, once older than the launch grace. The live-name cap is
+  opt-in: `ephemeral.max_live_per_session` defaults to 0 (no cap), so existing users see no
+  behaviour change. Set it, for example to 32, to cap pending, claimed and launched names per
+  session; a create over the cap is refused with `max_live_exceeded` before anything is
+  written. A create that can't take the store lock is refused with `store_busy` (503), or
+  with `store_lock_unavailable` (503) where the filesystem lacks `flock`. After
+  `ephemeral.retention_days` (default 14), a collected name's archive and then its registry
+  row are deleted, but only once its terminal and live files are gone. Earlier releases kept
+  them forever. All four defaults are provisional, and the feature stays off by default.
+
 - **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
   paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
   terminal still read IDLE, so the sender waited forever and the next message was pasted on top
