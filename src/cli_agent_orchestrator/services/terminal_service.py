@@ -292,12 +292,17 @@ def _classify_launch_target_kind(
 ) -> str:
     """Issue #1082's target_kind vocabulary (installed/ephemeral/workflow).
 
-    Deliberately independent of ``decisions/targets.py``'s ``TargetKind``,
-    which has no ``workflow`` member today and may change on PR #1076's own
-    schedule -- reuses only the already-resolved profile ``source`` the launch
-    path computed for itself, plus the same ``CAO_WORKFLOW_RUN_ID`` signal the
-    run engine already injects for a workflow step's terminal (see
-    ``services/agent_step.py`` and ``services/script_runner.py``).
+    Deliberately independent of ``decisions/targets.py``'s ``TargetKind``.
+    #1076 merged without adding a ``workflow`` member there either: it labels
+    a workflow step's own decision record with the bare string ``"workflow"``,
+    outside the enum, resolving the same way this function does. For
+    installed/ephemeral the two stay equivalent by construction -- both
+    resolve from the same reserved-name check (``routes_to_ephemeral_store``)
+    -- but this function reuses only the already-resolved profile ``source``
+    the launch path computed for itself, rather than re-deriving it from the
+    name, plus the same ``CAO_WORKFLOW_RUN_ID`` signal the run engine already
+    injects for a workflow step's terminal (see ``services/agent_step.py`` and
+    ``services/script_runner.py``).
     """
     if env_vars and env_vars.get("CAO_WORKFLOW_RUN_ID"):
         return "workflow"
