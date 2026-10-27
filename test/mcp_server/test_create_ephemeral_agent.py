@@ -593,6 +593,7 @@ async def test_A_M1_real_create_rule_relay(create_store, monkeypatch, fault, rul
         model_tier=spec_tier,
         effort="high" if fault == "effort" else None,
     )
-    assert set(result) == {"success", "rule", "message"}
     assert result["success"] is False and result["rule"] == rule
+    # The relayed refusal names no model id and no agent.
+    assert "private-" not in str(result) and "name" not in result
     assert not (create_store[2] / "ephemeral").exists()

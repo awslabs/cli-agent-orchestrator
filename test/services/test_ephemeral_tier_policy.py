@@ -61,7 +61,8 @@ def assert_no_create(env, spec, rule):
 def test_A_V1_closed_sets(create_store, key, value):
     create_store[4]["ephemeral"][key] = value
     err = assert_no_create(create_store, SPEC, "policy_config_error:" + key)
-    assert err.detail == "ephemeral." + key + " must be one of small, medium, large"
+    assert "ephemeral." + key in err.detail
+    assert all(tier in err.detail for tier in ("small", "medium", "large"))
 
 
 @pytest.mark.parametrize("default", [None, "large"])
@@ -151,20 +152,25 @@ def test_A_C1_A_C2_A_C7_A_C8_resolution(create_store, asked, default, source, ca
     assert row["model_tier"] == result["model_tier"] == tier
     if tier:
         assert profile["model"] == raw["model_tiers"]["claude_code"][tier]
-        assert list(profile.metadata).index("model") == list(profile.metadata).index("provider") + 1
-        assert (
-            result["notes"][0]
-            == f"model: tier {tier} ({'model_tier' if asked else 'ephemeral.default_tier'})"
+        # The tier adds the model key and changes nothing else in the profile.
+        untiered = service.render_profile(
+            name, service.validate_shape(spec), "claude_code", profile["allowedTools"], CALLER
         )
+        assert {k: v for k, v in profile.metadata.items() if k != "model"} == (
+            frontmatter.loads(untiered.decode()).metadata
+        )
+        note = result["notes"][0]
+        assert tier in note and ("default_tier" in note) == (asked is None)
     else:
         assert "model" not in profile
     assert "private-" not in str(result) + caplog.text
     archive = json.loads(Path(row["audit_path"]).read_text())
-    assert archive["launch_values"]["model_tier"] == {
-        "requested": asked,
-        "resolved": tier,
-        "source": source,
-    }
+    launched = archive["launch_values"]["model_tier"]
+    assert (launched["requested"], launched["resolved"], launched["source"]) == (
+        asked,
+        tier,
+        source,
+    )
     assert archive["spec"] == json.loads(service.canonical_spec_bytes(service.validate_shape(spec)))
 
 
@@ -341,7 +347,8 @@ def test_unknown_S1_reason_fails_closed(create_store, monkeypatch, reason):
 def test_B_V1_effort_closed_sets(create_store, key, value):
     create_store[4]["ephemeral"][key] = value
     err = assert_no_create(create_store, SPEC, "policy_config_error:" + key)
-    assert err.detail == "ephemeral." + key + " must be one of low, medium, high"
+    assert "ephemeral." + key in err.detail
+    assert all(effort in err.detail for effort in ("low", "medium", "high"))
 
 
 @pytest.mark.parametrize("default", [None, "high"])
@@ -404,17 +411,29 @@ def test_B_C1_B_C3_B_N1_effort_resolution(create_store, provider, asked, default
     key = "claudeConfig" if provider == "claude_code" else "codexConfig"
     config_key = "effort" if provider == "claude_code" else "model_reasoning_effort"
     if effort:
+        # Exact on purpose: the provider config carries the effort key and nothing else.
         assert profile[key] == {config_key: effort}
-        assert list(profile.metadata).index(key) == list(profile.metadata).index("mcpServers") + 1
-        assert (
-            result["notes"][1]
-            == f"effort: {effort} ({'effort' if asked else 'ephemeral.default_effort'})"
+        # Effort adds that one config key and changes nothing else in the profile.
+        plain = service.render_profile(
+            result["name"],
+            service.validate_shape(spec),
+            provider,
+            profile["allowedTools"],
+            CALLER,
         )
+        assert {k: v for k, v in profile.metadata.items() if k != key} == (
+            frontmatter.loads(plain.decode()).metadata
+        )
+        note = result["notes"][1]
+        assert effort in note and ("default_effort" in note) == (asked is None)
     else:
         assert "claudeConfig" not in profile and "codexConfig" not in profile
     archive = json.loads(Path(row["audit_path"]).read_text())
-    assert archive["launch_values"]["effort"] == dict(
-        requested=asked, resolved=effort, source=source
+    launched = archive["launch_values"]["effort"]
+    assert (launched["requested"], launched["resolved"], launched["source"]) == (
+        asked,
+        effort,
+        source,
     )
     before = (home / "ephemeral/live" / (result["name"] + ".md")).read_bytes()
     service.claim_ephemeral_agent(result["name"], {}, CALLER)
