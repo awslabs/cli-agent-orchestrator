@@ -529,12 +529,34 @@ class DecisionEngine:
             if decider is None:
                 values["reason"] = "decider_unavailable"
                 return values
-            response = await asyncio.wait_for(
+            task = asyncio.ensure_future(
                 decider.decide(
                     replace(request, points=(point,)), settings.deciders.get(decider.name, {})
-                ),
-                timeout_ms / 1000,
+                )
             )
+            try:
+                # wait does not raise the decider's own cancellation. Cancellation
+                # of this launch still propagates from the await, including on 3.10.
+                done, _ = await asyncio.wait({task}, timeout=timeout_ms / 1000)
+                if not done:
+                    # Match wait_for: wait for cancellation cleanup, including a
+                    # decider that returns an answer or raises another error there.
+                    task.cancel()
+                    await asyncio.wait({task})
+                    if task.cancelled():
+                        raise asyncio.TimeoutError()
+                try:
+                    response = task.result()
+                except asyncio.CancelledError:
+                    values["reason"] = "error"
+                    return values
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                elif not task.cancelled():
+                    # The owner may have been cancelled as the decider failed.
+                    task.exception()
             answer = response.get(point) if isinstance(response, Mapping) else None
             if answer is None:
                 values["reason"] = "no_answer"
