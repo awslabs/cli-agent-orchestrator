@@ -14,9 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses an agent that none of the agent directories CAO searches defines, before any terminal
   exists (`400`, with the `cao install` remedy). It also refuses a pane whose TUI header names a
   different agent, before any task is typed. A Kiro terminal now takes typed input (`/input`,
-  `/key`, `cao send`, inbox delivery, the `/ws` web terminal) only once CAO has recorded that its
-  header check passed. While it is still starting, input is refused and queued inbox messages wait,
-  and the web terminal shows output but drops keystrokes. A Kiro launch whose startup ended without
+  `/key`, `/exit`, `cao send`, inbox delivery, MCP `answer_user_prompt` and AG-UI) only once CAO has
+  recorded that its header check passed. While it is still starting, input is refused and queued
+  inbox messages wait. The `/ws` web terminal drops the attached pane's own keystrokes the same way,
+  and refuses attaching to a pane whose runtime was already reclaimed -- but `/ws` is a full tmux (or
+  herdr) client of the whole session, and its prefix keys, mouse and command prompt can still reach
+  another pane in that session, including an unverified one; that gap predates this change and is not
+  closed by it (tracked as a follow-up). A Kiro launch whose startup ended without
   that record -- a refused identity, a timeout before the header was read, a server restart mid-start
   -- has its window closed, even a deferred launch with no caller whose failure record is kept (if
   the close cannot be confirmed, input to it stays refused). A Kiro terminal verified before a server
