@@ -1670,8 +1670,8 @@ class TestSendTerminalKey:
     def test_send_key_refused_terminal_is_409(self, client):
         """POST /terminals/{id}/key returns 409, not 500, for a refused terminal.
 
-        A special key is typed input (#1074 D-P3-3): a terminal whose deferred
-        init left the runtime untrusted refuses it the same way /input does.
+        A special key is typed input (#1074): a Kiro terminal CAO has not
+        verified refuses it the same way /input does.
         """
         from cli_agent_orchestrator.models.terminal import ProviderExitedInputBlockedError
 

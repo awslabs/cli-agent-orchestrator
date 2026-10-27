@@ -720,8 +720,8 @@ class TestExitTerminalEndpoint:
             assert "Failed to exit terminal" in response.json()["detail"]
 
     def test_exit_terminal_input_blocked_maps_to_409_not_500(self, client):
-        """A text exit command going through dispatch_input's refusal (#1074
-        D-P3-1) is a conflict with the terminal's state, not a server fault."""
+        """A text exit command going through dispatch_input's refusal (#1074) is
+        a conflict with the terminal's state, not a server fault."""
         from cli_agent_orchestrator.models.terminal import ProviderExitedInputBlockedError
 
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
