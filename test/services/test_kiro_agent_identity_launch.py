@@ -801,6 +801,27 @@ class TestInputBeforeOrWithoutTheRecord:
         assert message.status == MessageStatus.DELIVERED
         assert _typed(pane.backend) == [_LAUNCH, "INBOX-CANARY"]
 
+    @pytest.mark.asyncio
+    async def test_input_during_a_synchronous_create_waits_not_fails(self, kiro_create, pane):
+        """The same race as the deferred launch above, but for a synchronous
+        create: the pre-insert in-flight mark is this path's only fence (the
+        deferred path also re-marks when its background task starts). While
+        the create is still inside ``initialize()``, input must be pending,
+        not a permanent failure."""
+        reached, release = _blocking_header_read(pane.backend)
+        try:
+            create = asyncio.ensure_future(kiro_create.create())
+            await _until(reached.is_set)
+
+            assert terminal_service.get_terminal_metadata(_TID)["identity_verified"] is False
+            _refused(_TID, TerminalInputBlockedReason.IDENTITY_PENDING)
+            assert _inbox_status(_TID) == MessageStatus.PENDING
+        finally:
+            release.set()
+        await create
+
+        assert terminal_service.get_terminal_metadata(_TID)["identity_verified"] is True
+
     def test_a_stranded_row_is_refused_and_its_inbox_message_fails(self, pane):
         tid = _row(identity_verified=False)
 

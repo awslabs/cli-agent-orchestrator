@@ -26,6 +26,7 @@ from fastapi import WebSocketDisconnect
 from cli_agent_orchestrator.api import main as main_module
 from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import (
+    delete_terminal,
     mark_terminal_identity_verified,
     update_terminal_deferred_init_failure,
     update_terminal_deferred_init_runtime_reclaimed,
@@ -354,4 +355,26 @@ class TestTheWebAttachIsOutputOnlyUntilVerified:
             await _attach([mark, _frame("input", data="WS-CANARY")])
 
         assert len(calls) == 2
+        assert state.writes == []
+
+    @pytest.mark.asyncio
+    async def test_a_row_deleted_mid_connection_is_never_trusted(self, pending):
+        """A row that vanishes mid-connection must never be read as trusted.
+
+        ``_ws_input_refusal`` answers ``(None, None)`` for a gone row.
+        Dropping the ``row and`` guard (keeping only ``refusal is None``)
+        would read that the same way as a healthy, verified row.
+        """
+        _row(identity_verified=False)
+
+        with _pty_attach() as state:
+            ws = await _attach(
+                [
+                    _frame("input", data="EARLY"),
+                    lambda: delete_terminal(_TID),
+                    _frame("input", data="GONE-ROW-CANARY"),
+                ],
+            )
+
+        ws.accept.assert_awaited_once()
         assert state.writes == []
