@@ -2,7 +2,7 @@
 
 **Issue:** [#801](https://github.com/awslabs/cli-agent-orchestrator/issues/801)
 **Depends on:** [#810](https://github.com/awslabs/cli-agent-orchestrator/issues/810) (decision platform)
-**Status:** E1 shipped; E2 proposed; E3–E5 planned.
+**Status:** E1–E3 shipped; E4–E5 planned.
 **E1:** [#866](https://github.com/awslabs/cli-agent-orchestrator/pull/866)
 (`8ddbd814ede42f3c2d7e67d76aae4306421fc036`),
 [#881](https://github.com/awslabs/cli-agent-orchestrator/pull/881)
@@ -14,7 +14,7 @@
 **E2 proposals:** [M1–M7](https://github.com/awslabs/cli-agent-orchestrator/issues/801#issuecomment-6282810139)
 and
 [optional min_tier, MF1–MF6](https://github.com/awslabs/cli-agent-orchestrator/issues/801#issuecomment-6306655853).
-These await maintainer confirmation; local E2 implementation is not on this pin.
+These await maintainer confirmation. **E2 (#1100)** shipped on this pin; M1 and M2 from its review remain open for maintainers.
 **Code baseline:** numeric `path:line` citations refer to unchanged code on main
 `a3829744c6df8f074bab9c713906720ad6ba87fd`. #1063's additions are described
 without line numbers; they are not attributed to that main commit.
@@ -43,9 +43,10 @@ without line numbers; they are not attributed to that main commit.
 - E1a shipped in #866. E1b shipped across #881 (create), #898 (claim/bind/release)
   and #905 (delegation). #1063 implements the E1 integrity, catalog and cancellation
   follow-ups. As-built notes and section 0 describe the pinned code, including #954/#955.
-- E2 is proposed and implemented locally, not shipped at the citation pin.
-  E3–E5 remain planned. The feature stays disabled outside testing until lifecycle
-  cleanup and the workflow runtime-creation refusal both ship.
+- **E2 (#1100)** shipped explicit/default model tier and effort without a decider.
+  **E3 (#1079)** shipped the sweep, retention and the opt-in max_live_per_session
+  cap. E4–E5 remain planned. The feature stays disabled outside testing until
+  lifecycle cleanup and the workflow runtime-creation refusal both ship.
 - Decisions about future behavior await maintainer confirmation (section 9).
   Implementation evidence does not establish maintainer approval.
 
@@ -182,6 +183,9 @@ effort_not_supported, and auto refuses auto_requires_decision_platform even thou
 #863 has merged. Only E5 lifts auto rejection. The E1 generated keys are name,
 description, provider, allowedTools, CAO-only mcpServers and `skills: []`.
 The empty list explicitly disables inherited catalog injection. See section 0 for checked code and coverage.
+**E2 (#1100)** replaces the explicit-value refusals above with policy-checked
+`tier_exceeds_policy`/`effort_exceeds_policy`/`tier_unmapped`; auto still refuses
+auto_requires_decision_platform.
 
 **Context.**
 - **Profiles:** frontmatter is parsed into `AgentProfile`. Many of its free-form fields grant capabilities:
@@ -348,7 +352,7 @@ claim-less bind, after finalize and at all provider reads, missing rows/hashes,
 and parsing the verified snapshot after a subsequent file replacement. The next
 claimed launch re-renders a pending pre-upgrade profile with `skills: []` and
 updates its hash. A claim-less launch of that legacy pending name keeps its old
-profile and inherited catalog, consuming the name rather than reaching a later claim. E2's guarded finalize transaction remains a separate change.
+profile and inherited catalog, consuming the name rather than reaching a later claim. **E2 (#1100)** ships the guarded finalize transaction described above.
 
 **Future seam (E5, proposed).** A successful claim must precede any decision;
 placement awaits M7. No decision_inputs adapter or auto support ships in E1.
@@ -370,9 +374,10 @@ CAO_HOME/ephemeral/live/&lt;name&gt;.spec.json, not a hash-only registry or the 
 archive. It contains purpose, brief and description and exactly the bytes hashed
 by spec_sha256. finalize(name, claim_id) verifies that digest, validates the spec,
 re-renders &lt;name&gt;.md and updates profile_sha256 under the matching claim.
-Missing/corrupt specs refuse spec_unavailable and collect that claim. At this pin,
-the file replacement precedes the guarded hash update; E2 must address stale
-claimers before variable model renders ship. The E1 render is deterministic.
+Missing/corrupt specs refuse spec_unavailable and collect that claim. **E2 (#1100)**
+moved the file replacement into the same transaction as the guarded hash update,
+closing the stale-claimer race before variable model renders shipped. The E1 render
+is deterministic.
 
 Creation writes archive, spec and profile exclusively, fsyncs each file, then
 inserts the pending row; failure cleans only owned paths. Files are 0600 in 0700
@@ -479,9 +484,11 @@ contains the alternatives and full rules.
 providers, positive max_brief_bytes/pending_ttl_seconds/claim_lease_seconds, and
 max_depth exactly 1. It enforces the recorded literal-atom tool ceiling and stored
 provider/tools at bind. The JSON below also contains proposed E2/E3/E4 keys:
-max/default tier and effort and model_tiers are ignored with warnings in E1;
-max_live_per_session ships in E3 (#1079) as an opt-in cap that defaults to 0 (no cap);
-workflow_tool_ceiling and runtime refusal remain planned.
+max/default tier and effort and model_tiers are ignored with warnings in E1.
+**E2 (#1100)** validates them strictly instead, through `PolicyBounds.validate`
+and the tier table; max_live_per_session ships in E3 (#1079) as an opt-in cap
+that defaults to 0 (no cap); workflow_tool_ceiling and runtime refusal remain
+planned.
 The caller denial now includes workflow_cancel: #1063 refuses cancellation
 by ephemerals while child_may_delegate is false. #912 binds answer/delete to self
 or workers the caller created; with delegation disabled, an ephemeral can act
@@ -950,11 +957,13 @@ already exists; no new test is required for that review item.
 and #905 (`5f84a50f`).**
 
 Create/persist, claims/binds/releases and assign/handoff integration shipped in
-that order. E1 accepts only omitted tier/effort; explicit values and auto refuse.
-The generated profile contains no model or effort. #1063 writes `skills: []`,
-verifies every live-profile read and gates workflow_cancel. E3 (#1079) later added the
-sweep, the opt-in max_live_per_session cap and audit pruning; no workflow agent_spec or SDK
-ephemeral helper ships yet.
+that order. E1 accepted only omitted tier/effort; explicit values and auto refused.
+The E1 generated profile contained no model or effort. #1063 writes `skills: []`,
+verifies every live-profile read and gates workflow_cancel. **E2 (#1100)** later
+applied explicit/default model tier and effort and stores the resolved model on
+the generated profile; auto still refuses auto_requires_decision_platform. E3
+(#1079) added the sweep, the opt-in max_live_per_session cap and audit pruning;
+no workflow agent_spec or SDK ephemeral helper ships yet.
 
 The state-machine regression suites are `test/services/test_ephemeral_service.py`,
 `test/services/test_ephemeral_claim.py`,
