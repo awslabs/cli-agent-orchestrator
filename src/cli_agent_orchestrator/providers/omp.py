@@ -210,7 +210,7 @@ class OmpProvider(BaseProvider):
                 config = copy.deepcopy(raw_config)
             else:
                 config = raw_config.model_dump(exclude_none=True)
-            config = resolve_mcp_server_config(config, persisted=False)
+            config = resolve_mcp_server_config(config, persisted=False, name=name)
             if "command" in config:
                 # This terminal's own id always wins: the CAO MCP gates authorize
                 # on it, so a profile does not get to declare it (#1062).

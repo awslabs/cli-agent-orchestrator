@@ -623,7 +623,9 @@ class ClaudeCodeProvider(BaseProvider):
 
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
-                    mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
+                    mcp_config[server_name] = resolve_mcp_server_config(
+                        mcp_config[server_name], name=server_name
+                    )
 
                     mcp_config[server_name] = forward_terminal_identity(
                         mcp_config[server_name], self.terminal_id, server_name=server_name

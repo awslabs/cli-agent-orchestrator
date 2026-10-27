@@ -462,6 +462,10 @@ def inject_memory_context(
 
     try:
         if remote_memory_url():
+            # The operator's local kill switch (#1071) is enforced inside
+            # memory_context_for_terminal itself, which is the single choke
+            # point shared by this call, the frozen-replay path, and the
+            # three provider memory plugins — so there is nothing to check here.
             context = memory_context_for_terminal(
                 terminal_id,
                 task_description=first_message[:200],

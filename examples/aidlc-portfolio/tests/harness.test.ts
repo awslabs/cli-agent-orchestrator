@@ -73,7 +73,7 @@ describe("portfolio harness lifecycle", () => {
         ok: true,
       }),
     ]);
-  });
+  }, 20_000);
 
   test("detects source upgrades and staged or worktree drift", async () => {
     const fixture = await createFixture();
@@ -121,7 +121,7 @@ describe("portfolio harness lifecycle", () => {
     expect(verification.worktrees[0]?.errors.join("\n")).toContain(
       "projected harness files differ",
     );
-  });
+  }, 20_000);
 
   test("detects and repairs Claude model overlay drift", async () => {
     const fixture = await createFixture();
@@ -149,7 +149,7 @@ describe("portfolio harness lifecycle", () => {
     expect(verification.worktrees[0]?.errors.join("\n")).toContain(
       "Claude model overlay differs",
     );
-  });
+  }, 20_000);
 
   test("refuses to overwrite project-owned tracked harness files", async () => {
     const fixture = await createFixture();

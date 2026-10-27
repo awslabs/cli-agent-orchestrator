@@ -417,7 +417,7 @@ def merge_mcp_servers(
     for name, raw in (profile_servers or {}).items():
         config = _normalise_profile_server(raw)
         if "command" in config:
-            config = resolve_mcp_server_config(config)
+            config = resolve_mcp_server_config(config, name=str(name))
         # Inherited: absent is fine (the launch line exports it), declared is not.
         config = forward_terminal_identity(
             config, terminal_id, server_name=str(name), inherited=True

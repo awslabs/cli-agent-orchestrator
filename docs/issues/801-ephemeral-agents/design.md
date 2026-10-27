@@ -426,10 +426,11 @@ Policy removal and workflow end_claim GC transitions also try immediate exact-fi
 deletion. Expiry is lazy: a later claim or bind must observe it before deletion;
 untouched expired pending names keep their live files. Thus release is not the only deletion path (section 0).
 
-**As built: no sweep.** E1 has lazy pending/lease expiry only. A creation crash
+**As built (E1): no sweep.** E1 has lazy pending/lease expiry only. A creation crash
 can leave rowless files; a bind-to-row-insert crash can leave launched residue.
 Best-effort deletion can fail. These artifacts persist until E3 cleanup, so the
-feature remains disabled outside tests.
+feature remains disabled outside tests. **E3 (#1079)** adds the startup and periodic
+sweeps, rowless-file deletion and retention described in `docs/ephemeral-agents.md`.
 
 **Planned E3 sweep (proposal, awaiting maintainer confirmation).** Startup and
 periodic sweeps must preserve a launched row with a live terminal, regardless of
@@ -478,7 +479,8 @@ providers, positive max_brief_bytes/pending_ttl_seconds/claim_lease_seconds, and
 max_depth exactly 1. It enforces the recorded literal-atom tool ceiling and stored
 provider/tools at bind. The JSON below also contains proposed E2/E3/E4 keys:
 max/default tier and effort and model_tiers are ignored with warnings in E1;
-max_live_per_session, workflow_tool_ceiling and runtime refusal remain planned.
+max_live_per_session ships in E3 (#1079) as an opt-in cap that defaults to 0 (no cap);
+workflow_tool_ceiling and runtime refusal remain planned.
 The caller denial now includes workflow_cancel: #1063 refuses cancellation
 by ephemerals while child_may_delegate is false. #912 binds answer/delete to self
 or workers the caller created; with delegation disabled, an ephemeral can act
@@ -949,8 +951,9 @@ and #905 (`5f84a50f`).**
 Create/persist, claims/binds/releases and assign/handoff integration shipped in
 that order. E1 accepts only omitted tier/effort; explicit values and auto refuse.
 The generated profile contains no model or effort. #1063 writes `skills: []`,
-verifies every live-profile read and gates workflow_cancel. No sweep, max_live_per_session enforcement,
-audit pruning, workflow agent_spec or SDK ephemeral helper ships yet.
+verifies every live-profile read and gates workflow_cancel. E3 (#1079) later added the
+sweep, the opt-in max_live_per_session cap and audit pruning; no workflow agent_spec or SDK
+ephemeral helper ships yet.
 
 The state-machine regression suites are `test/services/test_ephemeral_service.py`,
 `test/services/test_ephemeral_claim.py`,

@@ -413,7 +413,7 @@ class GrokCliProvider(BaseProvider):
         for name, raw_server in (mcp_servers or {}).items():
             config = self._server_dict(raw_server)
             if "command" in config:
-                config = resolve_mcp_server_config(config)
+                config = resolve_mcp_server_config(config, name=name)
                 # Already injected this terminal's own id unconditionally; routed
                 # through the shared helper so a profile that tried to pin one is
                 # LOGGED rather than silently discarded, and so every provider's

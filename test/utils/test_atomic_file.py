@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from cli_agent_orchestrator.constants import LOCK_DIR
+from cli_agent_orchestrator.utils import atomic_file
 from cli_agent_orchestrator.utils.atomic_file import (
     LockTimeoutError,
     LockUnavailableError,
@@ -87,7 +87,7 @@ def test_no_lock_file_pollutes_target_directory(tmp_path: Path) -> None:
     # And the lock file that WAS used lives under the CAO-owned LOCK_DIR, keyed
     # by the target's resolved absolute path.
     lock_path = _lock_path_for(target)
-    assert LOCK_DIR in lock_path.parents
+    assert atomic_file.LOCK_DIR in lock_path.parents
     assert lock_path.exists(), "lock file should be created (and kept) under LOCK_DIR"
 
 
@@ -422,19 +422,23 @@ def test_concurrent_writers_never_produce_filenotfound_on_replace(tmp_path: Path
 
 
 def _hold_lock_in_subprocess(
-    target_str: str, hold_seconds: float, ready_event
+    target_str: str, lock_dir_str: str, hold_seconds: float, ready_event
 ) -> None:  # noqa: ANN001
     """Helper run in a child process: acquire the flock and hold it.
 
     Crucially, the child computes the lock path ITSELF from the target via
     ``_lock_path_for`` rather than receiving a precomputed path — so a green
     test proves two independent processes derive the SAME lock file for the
-    same target (the cross-process correctness invariant).
+    same target (the cross-process correctness invariant). Only the lock
+    directory is handed over: a spawned child re-imports ``LOCK_DIR`` from its
+    CAO home, while the parent's tests use a per-test one.
     """
     import fcntl
 
+    from cli_agent_orchestrator.utils import atomic_file
     from cli_agent_orchestrator.utils.atomic_file import _lock_path_for
 
+    atomic_file.LOCK_DIR = Path(lock_dir_str)
     lock_path = _lock_path_for(Path(target_str))
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
@@ -466,7 +470,7 @@ def test_second_writer_blocked_by_subprocess_holding_lock(tmp_path: Path) -> Non
     hold_seconds = 1.5
     proc = ctx.Process(
         target=_hold_lock_in_subprocess,
-        args=(str(target), hold_seconds, ready_event),
+        args=(str(target), str(atomic_file.LOCK_DIR), hold_seconds, ready_event),
     )
     proc.start()
     try:
@@ -655,7 +659,7 @@ def test_write_uses_the_same_lock_file_as_rewrite(tmp_path: Path) -> None:
     locked_atomic_write(target, "written\n")
 
     assert lock_path.exists()
-    assert LOCK_DIR in lock_path.parents
+    assert atomic_file.LOCK_DIR in lock_path.parents
 
 
 def test_write_serializes_concurrent_writers(tmp_path: Path) -> None:
@@ -900,7 +904,7 @@ def test_delete_does_not_disturb_the_lock_file_itself(tmp_path: Path) -> None:
 
     assert not target.exists()
     assert lock_path.exists()
-    assert LOCK_DIR in lock_path.parents
+    assert atomic_file.LOCK_DIR in lock_path.parents
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
@@ -936,7 +940,8 @@ def test_new_file_mode_follows_a_restrictive_umask_too(tmp_path: Path) -> None:
 
 
 def _lock_dir_entries() -> set:
-    return set(LOCK_DIR.iterdir()) if LOCK_DIR.exists() else set()
+    lock_dir = atomic_file.LOCK_DIR
+    return set(lock_dir.iterdir()) if lock_dir.exists() else set()
 
 
 class TestUnlockedAtomicWrite:

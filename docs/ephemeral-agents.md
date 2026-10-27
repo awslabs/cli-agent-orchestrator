@@ -19,7 +19,11 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "max_brief_bytes": 8192,
     "pending_ttl_seconds": 900,
     "claim_lease_seconds": 60,
-    "max_depth": 1
+    "max_depth": 1,
+    "max_live_per_session": 0,
+    "launch_grace_seconds": 600,
+    "sweep_interval_seconds": 300,
+    "retention_days": 14
   }
 }
 ```
@@ -30,6 +34,24 @@ so an already registered tool is refused after the feature is turned off. Claims
 recheck whether the feature is enabled before touching a name. Unreadable
 settings fail closed. `max_depth` accepts only integer 1. Ephemeral callers cannot create
 other ephemerals, even when `child_may_delegate` allows the existing delegation tools.
+
+The last four keys control lifecycle cleanup. Their defaults are proposals that await
+maintainer confirmation (#1079). `max_live_per_session` is an opt-in cap on the pending,
+claimed and launched names one session holds. The default, `0`, means no cap, so current users
+see no change. To opt in, set a positive integer; `32` leaves room for a fleet-style
+supervisor. Collected names and expired pending names don't count. A create past the cap is
+refused with `max_live_exceeded` (409) before anything is written. If the value isn't a
+non-negative integer, every create is refused with `policy_config_error:max_live_per_session`.
+The other three keys tune the sweep described below. An unusable `launch_grace_seconds` skips
+the two steps that need it: periodic collection of launched names with no terminal row, and
+deletion of rowless live files. An unusable `retention_days` skips retention. An unusable
+interval falls back to the default.
+
+Creates take an inter-process `flock` lock under `CAO_HOME/locks/`, so the CAO home must be
+on a filesystem that supports `flock`. A create that can't take the lock within 10 seconds
+is refused with `store_busy` (503) and can be retried. Without `flock` support, as on an NFS
+mount without locking, every create is refused with `store_lock_unavailable` (503), and each
+sweep skips its rowless-file step with a warning.
 
 `ephemeral.max_tier`, `default_tier`, `max_effort`, `default_effort`, and top-level
 `model_tiers` are **not applied yet**. In particular, `max_tier` sets no ceiling. Each
@@ -62,12 +84,44 @@ archive, canonical spec, and deterministic profile are written and fsynced in th
 then the pending row is inserted. The spec file holds exactly the bytes hashed by
 `spec_sha256`; `profile_sha256` hashes the Markdown bytes.
 
-Pending names expire lazily when touched by claim or bind. A lapsed, unbound claim
-returns to pending, or is collected if the name has expired. Collection removes the two
-live files and keeps the registry row and archive. There is no background or startup sweep
-in this release. A creation crash can leave rowless files; a crash between bind and terminal
-insertion can leave a launched row whose terminal vanished without a delete. That row and
-its live files persist until the later orphan sweep. Keep the feature disabled outside tests.
+Pending names expire when a claim or bind touches them, or when a sweep reaches them.
+A lapsed, unbound claim returns to pending, or is collected if the name has expired.
+Collection removes the two live files and keeps the registry row and archive.
+
+cao-server sweeps once at startup, before it serves any request, and then every
+`sweep_interval_seconds`. Sweeps run whether or not `enabled` is true, so turning creation
+off does not strand files. Each pass applies these rules:
+
+- A pending name past its TTL is collected as `ephemeral_expired`. A pending name whose
+  creator's terminal row is gone is collected as `owner_gone`.
+- A claim inside its lease is never touched. A lapsed claim follows the rule above.
+- A launched name whose terminal row exists is never touched, whatever its TTL, even if a
+  live file is missing.
+- A launched name with no terminal row is collected as `terminal_gone`. A crash between
+  bind and terminal insertion leaves one. The startup pass collects it at once; later
+  passes wait until `launch_grace_seconds` have passed since the bind.
+- If deleting a collected name's live files failed, the pass deletes them again.
+- Live files with no registry row, left by a crashed create, are deleted by exact name once
+  they are older than `launch_grace_seconds`, on startup passes too. Creates and this step
+  share an inter-process lock, held from a create's cap check until its row is inserted. A
+  pass that finds the lock held skips this step until the next pass.
+
+A pass deletes only these exact regular files under `ephemeral/live/` and the archives
+that retention allows. Each change to a row is rechecked in its own transaction, so a
+concurrent claim or bind always wins, and a terminal insertion wins unless it comes more
+than `launch_grace_seconds` after the bind. A pass that changes anything
+logs one line of counts by reason. The line names no brief or other creator text.
+
+Retention keeps a collected name's archive for `retention_days`. The archive is deleted once
+it is older than that, and only after the name's terminal row and both live files are gone.
+The registry row is deleted after its archive, once every timestamp on it is also older than
+the window. If the archive is already gone, for example removed by hand, only those
+timestamps count, so a name that ran longer than the window is pruned on the first pass
+after its collection. Archives and rows of pending, claimed and launched names are never
+deleted.
+Neither is any row whose terminal still exists, so a surviving terminal stays marked
+ephemeral. A later create can reuse a deleted name. It still checks installed stores and
+creates the exact archive and live paths exclusively.
 
 The prompt surrounds the normalized brief with constant ASCII markers
 `[[BEGIN CREATOR BRIEF]]` and `[[END CREATOR BRIEF]]`. The markers are prompt structure,
@@ -139,7 +193,7 @@ allocation and terminal insertion. An unbound failed launch ends its own claim; 
 or a completed rollback after bind collects the live files. A deleted terminal or session releases the name, as do herdr pane closes, including
 those reconciled at startup or on reconnect.
 A release that fails is logged as a warning naming the terminal id, and its live files
-stay until a later sweep. Retention cleanup and stale-session row purges also release it.
+stay until the next sweep deletes them. Retention cleanup and stale-session row purges also release it.
 A run-step timeout retains its live terminal and files; success, cancellation and output
 extraction failure tear down terminals owned by that call.
 

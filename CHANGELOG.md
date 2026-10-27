@@ -73,6 +73,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the last 24 hours, read from the database read-only. `decision_records` gains a nullable
   `target_kind` column (`installed`, `ephemeral` or `workflow`); existing rows stay null.
 
+- **Ephemeral agents: startup and periodic sweeps, a live-name cap and retention** (#1079).
+  cao-server now collects expired and abandoned ephemeral names. It sweeps once at startup,
+  before serving requests, then every `ephemeral.sweep_interval_seconds` (default 300).
+  A sweep collects pending names past their TTL or whose creator terminal is gone, lapsed
+  claims past their TTL, and launched names with no terminal row. For those, periodic sweeps
+  wait `ephemeral.launch_grace_seconds` (default 600) after the bind; the startup sweep
+  doesn't wait. Claims inside their lease and launched names whose terminal exists are never
+  touched. Failed file deletions are retried. Live files left by a crashed create are deleted
+  under a lock shared with creation, once older than the launch grace. The live-name cap is
+  opt-in: `ephemeral.max_live_per_session` defaults to 0 (no cap), so existing users see no
+  behaviour change. Set it, for example to 32, to cap pending, claimed and launched names per
+  session; a create over the cap is refused with `max_live_exceeded` before anything is
+  written. A create that can't take the store lock is refused with `store_busy` (503), or
+  with `store_lock_unavailable` (503) where the filesystem lacks `flock`. After
+  `ephemeral.retention_days` (default 14), a collected name's archive and then its registry
+  row are deleted, but only once its terminal and live files are gone. Earlier releases kept
+  them forever. All four defaults are provisional, and the feature stays off by default.
+
 - **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
   paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
   terminal still read IDLE, so the sender waited forever and the next message was pasted on top
@@ -146,6 +164,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
   run-step transport does not yet receive that credential; subprocess credential delivery
   remains a separate security-boundary decision.
+
+### Changed
+
+- `examples/aidlc-portfolio`: `question answer` now requires a packet-bound, single-use
+  `--approval-id` instead of `--answered-by`; removed `learning approve` / `learning reconcile`
+  and `memory refresh` / `inspect` / `clean` in favor of `learning propose` / `list` /
+  `promote` / `reject`, with promotion recorded against a CAO memory entry. `dispatch check`
+  no longer returns memory baseline revisions, and learning proposals now record promotion
+  metadata instead of `baseRevision`. CAO resolves project memory per terminal, so runners
+  cannot recall the supervisor's scope: the new `dispatch message` renders the runner
+  assignment with the promoted learnings that apply to it, from the supervisor's own
+  `memory_recall`, and `learning promote` now requires the `--memory-key` that `memory_store`
+  returned (#936).
 
 - Opt-in non-accessing inspection for CLI memory list/show and HTTP GET
   memory views. Agent recall still reinforces access counts; repeated
@@ -330,6 +361,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now gives the step no memory with a warning, as on the live path, instead of failing it. This
   includes a local read error and a remote owner that is unreachable, errors, or has memory
   disabled (#828).
+- Context injection with a configured remote memory owner now honours the operator's local
+  memory switch. The switch was only checked on the local curated path and on the
+  frozen-replay path (#828); with a remote owner configured and the switch off, a live
+  terminal's first message, and the Claude Code/Codex/Kiro CLI provider-config-file memory
+  plugins, still called out to the owner and injected its block. The check now sits in
+  `memory_gateway.memory_context_for_terminal`, the single choke point all five callers
+  (the first-message path, the frozen-replay path, and the three provider plugins) go
+  through, so the owner is no longer called at all for context injection when the switch is
+  off; it is unreachable, not merely unused (#1071).
 - Every client call that creates a session or terminal synchronously (`cao launch` without
   `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
   `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`

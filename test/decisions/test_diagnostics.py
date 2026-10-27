@@ -552,6 +552,7 @@ def test_status_opens_read_only_and_matches_list_for_the_window(setup_engine, mo
             "point": newest["point"],
             "outcome": newest["outcome"],
             "reason": newest["reason"],
+            "decision_status": newest["decision_status"],
             "created_at": newest["created_at"],
         }
     rendered = json.dumps(status)
@@ -600,6 +601,35 @@ def test_status_counts_label_interrupted_separately_from_an_answer(setup_engine)
     path = Path(store.sessions.kw["bind"].url.database)
     status = read_decider_status(path, now=NOW)
     assert status["deciders"]["fixture"]["counts"] == {"interrupted": 1, "answer": 1}
+
+
+@pytest.mark.parametrize("decision_status", ["pending", "interrupted"])
+def test_status_last_shows_decision_status_for_an_unfinished_shadow_record(
+    setup_engine, decision_status
+):
+    """#1076 P3-1: a pending or interrupted shadow record has no reason, so it
+    looked identical to an answered record in `last`. `last` must carry
+    `decision_status` so a reader can tell the two apart."""
+    from cli_agent_orchestrator.decisions.store import read_decider_status
+
+    _, _, _, store, _, _ = setup_engine
+    _seed(
+        store,
+        [
+            dict(
+                decider="fixture",
+                state="shadow",
+                outcome="shadow",
+                decision_status=decision_status,
+                created_at=NOW,
+            )
+        ],
+    )
+    path = Path(store.sessions.kw["bind"].url.database)
+    status = read_decider_status(path, now=NOW)
+    last = status["deciders"]["fixture"]["last"]
+    assert last["reason"] is None
+    assert last["decision_status"] == decision_status
 
 
 def test_status_since_is_utc_even_under_a_non_utc_local_timezone(monkeypatch, tmp_path):

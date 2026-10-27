@@ -358,7 +358,7 @@ def test_extension_root_merges_mcp_and_overrides_a_declared_terminal_id(tmp_path
         patch("cli_agent_orchestrator.providers.omp.load_agent_profile", return_value=profile),
         patch(
             "cli_agent_orchestrator.providers.omp.resolve_mcp_server_config",
-            side_effect=lambda config, persisted: config,
+            side_effect=lambda config, persisted, name=None: config,
         ) as resolve,
     ):
         parts = shlex.split(provider._build_omp_command())
@@ -532,7 +532,7 @@ def test_extension_serializes_model_config_and_status_unknown_paths(tmp_path, mo
 
     with patch(
         "cli_agent_orchestrator.providers.omp.resolve_mcp_server_config",
-        side_effect=lambda config, persisted: config,
+        side_effect=lambda config, persisted, name=None: config,
     ):
         provider._write_extension_root({"model": mcp_model})
 

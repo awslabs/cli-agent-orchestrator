@@ -208,3 +208,83 @@ def test_script_journal_read_fault_never_injects_live_memory(monkeypatch, spy):
 
     assert inject_memory_context("task", "term-fault", frozen_memory=block) == "task"
     assert spy["constructed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The live path's remote-owner arm (issue #1071)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def remote_owner(monkeypatch):
+    """Point the live path at a remote memory owner."""
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner.invalid")
+
+
+def test_remote_owner_is_never_called_with_the_switch_off(remote_owner, memory_disabled, mocker):
+    """#1071: the operator's local kill switch must bind the live remote-owner arm too.
+
+    A spy on the actual HTTP POST, not just on the returned text, so a regression that
+    still calls the owner but discards its answer would also be caught. ``_get_terminal_context``
+    is stubbed to a real context so the switch check — not a missing terminal — is what the
+    test proves stops the call; without the stub, a nonexistent test terminal would make
+    ``memory_context_for_terminal`` return early on its own and the test would pass for the
+    wrong reason even with the switch check deleted.
+    """
+    from cli_agent_orchestrator.services import memory_gateway
+
+    context = {"terminal_id": "term-remote-off", "cwd": "/workspace"}
+    mocker.patch.object(memory_gateway.MemoryService, "_get_terminal_context", return_value=context)
+    post = mocker.patch.object(memory_gateway, "_post")
+
+    result = inject_memory_context("do the thing", "term-remote-off")
+
+    assert result == "do the thing", "with the switch off, no memory block may be injected"
+    post.assert_not_called()
+
+
+def test_remote_owner_is_called_with_the_switch_on(remote_owner, mocker):
+    """With the switch on and a remote owner configured, the owner is POSTed to and its
+    block is injected — unchanged from before #1071."""
+    from cli_agent_orchestrator.services import memory_gateway
+
+    context = {"terminal_id": "term-remote-on", "cwd": "/workspace"}
+    mocker.patch.object(memory_gateway.MemoryService, "_get_terminal_context", return_value=context)
+    post = mocker.patch.object(
+        memory_gateway, "_post", return_value={"context": "<cao-memory>OWNER</cao-memory>"}
+    )
+
+    result = inject_memory_context("do the thing", "term-remote-on")
+
+    assert result == "<cao-memory>OWNER</cao-memory>" + "\n\n" + "do the thing"
+    post.assert_called_once_with(
+        "/internal/memory/context", {"terminal_context": context, "budget_chars": 3000}
+    )
+
+
+def test_with_no_remote_owner_the_switch_check_is_unaffected(
+    spy, memory_disabled, mocker, monkeypatch
+):
+    """No remote owner configured: behaviour is unchanged by #1071 — the local arm is
+    reached and applies its own switch check, exactly as
+    ``test_the_live_path_is_unaffected_when_memory_is_disabled`` already covers for the
+    non-remote arm.
+
+    Hermetic: ``CAO_MEMORY_API_URL`` is explicitly unset, so this exercises the local
+    arm even on a worker-node pane where that variable happens to be exported (the
+    fixture that strips runtime env vars, ``_hermetic_cao_env``, does not touch it).
+    Non-vacuous: ``spy["constructed"] == 1`` can fail (e.g. if an empty/falsy
+    ``CAO_MEMORY_API_URL`` were ever treated as configured and routed into the
+    gateway's remote branch instead), which the previous `post.assert_not_called()`-only
+    version could not.
+    """
+    from cli_agent_orchestrator.services import memory_gateway
+
+    monkeypatch.delenv("CAO_MEMORY_API_URL", raising=False)
+    post = mocker.patch.object(memory_gateway, "_post")
+
+    result = inject_memory_context("do the thing", "term-no-owner-off")
+
+    assert result == "<cao-memory>LIVE</cao-memory>" + "\n\n" + "do the thing"
+    assert spy["constructed"] == 1, "the local arm, not the gateway, must be reached"
+    post.assert_not_called()

@@ -1763,7 +1763,7 @@ class CodexProvider(BaseProvider):
                     )
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
-                    cfg = resolve_mcp_server_config(cfg)
+                    cfg = resolve_mcp_server_config(cfg, name=server_name)
                     # This terminal's own id wins over anything the profile
                     # declared. Requesting inheritance via `env_vars` below is
                     # NOT enough on its own: the explicit `env` table is emitted

@@ -16,8 +16,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.constants import LOCK_DIR
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.utils import atomic_file
 
 TID = "abcd1234"
 ROW = {
@@ -33,7 +33,8 @@ ROW = {
 
 
 def _lock_dir_entries() -> set:
-    return set(LOCK_DIR.iterdir()) if LOCK_DIR.exists() else set()
+    lock_dir = atomic_file.LOCK_DIR
+    return set(lock_dir.iterdir()) if lock_dir.exists() else set()
 
 
 @pytest.fixture

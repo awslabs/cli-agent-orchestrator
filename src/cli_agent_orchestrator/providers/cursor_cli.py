@@ -531,7 +531,7 @@ class CursorCliProvider(BaseProvider):
                 servers[server_name] = server_config.model_dump(exclude_none=True)
             # Resolve the bundled cao-mcp-server console script to a
             # PATH-independent invocation.
-            servers[server_name] = resolve_mcp_server_config(servers[server_name])
+            servers[server_name] = resolve_mcp_server_config(servers[server_name], name=server_name)
             servers[server_name] = forward_terminal_identity(
                 servers[server_name], self.terminal_id, server_name=server_name
             )

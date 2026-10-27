@@ -9,14 +9,15 @@ import secrets
 import stat
 import threading
 import unicodedata
-from contextlib import contextmanager
+from collections import Counter
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterator, NoReturn, Optional, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import update
+from sqlalchemy import and_, delete, or_, update
 from sqlalchemy.exc import IntegrityError
 
 from cli_agent_orchestrator.clients import database
@@ -30,6 +31,11 @@ from cli_agent_orchestrator.services.settings_service import (
     get_ephemeral_settings,
 )
 from cli_agent_orchestrator.utils import agent_profiles
+from cli_agent_orchestrator.utils.atomic_file import (
+    LockTimeoutError,
+    LockUnavailableError,
+    strict_target_lock,
+)
 from cli_agent_orchestrator.utils.caller_tools import caller_effective_allowed_tools
 from cli_agent_orchestrator.utils.delegation import tools_exceeding
 
@@ -309,6 +315,55 @@ def _cleanup(owned: list[tuple[Path, int, int]]) -> None:
             pass
 
 
+def _safe_segment(value: Any) -> bool:
+    """A session name usable as exactly one audit path segment."""
+    return (
+        isinstance(value, str)
+        and value not in ("", ".", "..")
+        and "/" not in value
+        and "\\" not in value
+        and not any(unicodedata.category(c) == "Cc" for c in value)
+    )
+
+
+# The sweep never waits for the store lock: its only holders are creates in progress,
+# and a skipped rowless step simply runs again on the next pass (#1079).
+_SWEEP_LOCK_TIMEOUT_SECONDS = 0.0
+
+
+def _store_lock(timeout: float = 10.0) -> AbstractContextManager[None]:
+    """The live store's create window, as an inter-process flock outside the store.
+
+    Create holds it from its cap count until its pending row commits, so a sweep that
+    holds it sees a registry row for every live file a create has written (#1079's
+    serialization proposal, chosen over a staging state). Each holder opens its own
+    descriptor, so it also excludes other threads of this process.
+    """
+    return strict_target_lock(EPHEMERAL_DIR / "live", lock_timeout=timeout)
+
+
+def _live_names(session: str, now: Any) -> int:
+    """Count claimed, launched and unexpired pending names; gc never counts.
+
+    Not counting an expired pending name, which no claim or bind can use, is a
+    provisional reading of #1079's cap.
+    """
+    table = database.EphemeralAgentModel
+    with database.SessionLocal() as db:
+        return cast(
+            int,
+            db.query(table)
+            .filter(
+                table.session_name == session,
+                or_(
+                    table.state.in_(("claimed", "launched")),
+                    and_(table.state == "pending", table.expires_at > now),
+                ),
+            )
+            .count(),
+        )
+
+
 def _ignored_policy_notice(keys: list[str]) -> Optional[str]:
     if not keys:
         return None
@@ -355,11 +410,18 @@ def create_ephemeral_agent(
 ) -> dict[str, Any]:
     """Validate before persistence; archive/spec/profile precede the pending row."""
     name = None
+    held = ExitStack()
     try:
         config = read_settings() if settings is None else settings
         require_enabled(config)
         spec = validate_shape(raw)
         validate_block(config)
+        limit = config["max_live_per_session"]
+        if type(limit) is not int or limit < 0:
+            raise EphemeralPolicyError(
+                "policy_config_error:max_live_per_session",
+                "ephemeral.max_live_per_session must be a non-negative integer (0: no cap)",
+            )
         try:
             if not caller_id or not re.fullmatch(r"[0-9a-f]{8}", caller_id):
                 raise ValueError("invalid creator id")
@@ -367,13 +429,7 @@ def create_ephemeral_agent(
             if creator is None:
                 raise ValueError("missing creator")
             session = creator["tmux_session"]
-            if (
-                not session
-                or session in (".", "..")
-                or "/" in session
-                or "\\" in session
-                or any(unicodedata.category(c) == "Cc" for c in session)
-            ):
+            if not _safe_segment(session):
                 raise ValueError("invalid session segment")
             creator_tools = caller_effective_allowed_tools(creator)
             if creator_tools is None:
@@ -438,6 +494,26 @@ def create_ephemeral_agent(
         expires_at = expires.isoformat()
         notes = _policy_notes(config)
         notice = _ignored_policy_notice(config["_ignored_policy"])
+        # Held from the cap count until the pending row commits, so concurrent creates
+        # cannot pass the cap together and a sweep holding it sees every live file's row.
+        # Held with no cap too: the sweep's rowless step relies on it either way.
+        try:
+            held.enter_context(_store_lock())
+        except LockTimeoutError:
+            raise EphemeralPolicyError("store_busy", "store lock timed out; retry", 503) from None
+        except LockUnavailableError:
+            raise EphemeralPolicyError(
+                "store_lock_unavailable", "the CAO home must support flock", 503
+            ) from None
+        # 0, the default, means no cap: the cap is an operator opt-in (#1079).
+        if limit:
+            live = _live_names(session, created)
+            if live >= limit:
+                raise EphemeralPolicyError(
+                    "max_live_exceeded",
+                    f"{live} live names in this session; ephemeral.max_live_per_session={limit}",
+                    409,
+                )
         for _ in range(5):
             name = f"{secrets.choice(BAND_NAMES)}-{spec.purpose}-{secrets.token_hex(2)}"
             if database.get_ephemeral_agent(
@@ -533,6 +609,8 @@ def create_ephemeral_agent(
         error = EphemeralPolicyError("unexpected_failure", status_code=500)
         log_refusal(error.rule, caller_id, None, "")
         raise error from None
+    finally:
+        held.close()
 
 
 class _ClaimRequest(BaseModel):
@@ -1056,7 +1134,7 @@ def bind_ephemeral_agent(
 
 
 def release(terminal_id: str, reason: str) -> None:
-    """Collect this terminal's live files once; keep its registry marker forever."""
+    """Collect this terminal's live files once; the gc row stays until retention prunes it."""
     try:
         if not database.is_ephemeral_terminal(terminal_id):
             return
@@ -1083,3 +1161,286 @@ def release(terminal_id: str, reason: str) -> None:
             reason,
             type(exc).__name__,
         )
+
+
+def _terminal_exists(db: Any, terminal_id: Optional[str]) -> bool:
+    return terminal_id is not None and db.get(database.TerminalModel, terminal_id) is not None
+
+
+def _sweep_due(
+    db: Any, row: dict[str, Any], now: Any, startup: bool, grace: Optional[timedelta]
+) -> bool:
+    """ADR-4's per-state rules: an in-lease claim or a launched row with a terminal never is."""
+    if row["state"] == "pending":
+        return _expired(row["expires_at"], now) or (
+            row["owner_kind"] == "terminal" and not _terminal_exists(db, row["owner_id"])
+        )
+    if row["state"] == "claimed":
+        return _expired(row["claim_expires_at"], now)
+    if row["state"] != "launched" or _terminal_exists(db, row["launched_terminal_id"]):
+        return False
+    # Bind precedes the terminal insert, so a periodic pass waits out the grace. The
+    # startup pass runs before requests are served, when no launch can be in between.
+    if startup:
+        return True
+    bound = database.as_utc(row["bound_at"])
+    return grace is not None and bound is not None and _expired(bound + grace, now)
+
+
+def _sweep_row(
+    name: str, now: Any, startup: bool, grace: Optional[timedelta]
+) -> Optional[dict[str, Any]]:
+    """Re-decide one row inside its own write transaction; return it if now collected.
+
+    The candidate list is a stale read. Re-reading here, with each change guarded by
+    the observed state and claim, means a concurrent claim or bind always wins over
+    the sweep. A terminal insert wins unless it lands more than the launch grace after
+    its bind (ADR-4's accepted trade-off).
+    """
+    with _transaction() as db:
+        row = _row(db, name)
+        if row is None or not _sweep_due(db, row, now, startup, grace):
+            return None
+        if row["state"] == "launched":
+            reason = "terminal_gone"
+        else:
+            row = _lapse(db, row, now)
+            owner_gone = row["owner_kind"] == "terminal" and not _terminal_exists(
+                db, row["owner_id"]
+            )
+            if row["state"] != "pending" or not owner_gone:
+                return row if row["state"] == "gc" else None
+            reason = "owner_gone"
+        if not _change(db, name, row["state"], dict(state="gc", gc_reason=reason)):
+            return None
+        row.update(state="gc", gc_reason=reason)
+        return row
+
+
+def _live_entries(name: str, regular_only: bool) -> bool:
+    """Whether either exact live file of this name exists (or is a regular file)."""
+    try:
+        fd = os.open(EPHEMERAL_DIR / "live", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    try:
+        for suffix in (".md", ".spec.json"):
+            try:
+                mode = os.lstat(name + suffix, dir_fd=fd).st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(mode) or not regular_only:
+                return True
+        return False
+    finally:
+        os.close(fd)
+
+
+def _sweep_rowless(counts: Counter[str], cutoff: Any) -> None:
+    """Delete exact live files that have no registry row, only while creates are excluded.
+
+    A file must also be older than the cutoff (the launch grace). Under the lock no
+    create can be in progress, so this costs nothing; it bounds what a registry that
+    doesn't match this store, such as a replacement database, can make look rowless.
+    """
+    try:
+        fd = os.open(EPHEMERAL_DIR / "live", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    held = ExitStack()
+    try:
+        try:
+            held.enter_context(_store_lock(timeout=_SWEEP_LOCK_TIMEOUT_SECONDS))
+        except LockTimeoutError:
+            return  # A create holds the store; its files get a row or are cleaned by it.
+        files: dict[str, list[str]] = {}
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                for suffix in (".md", ".spec.json"):
+                    stem = entry.name[: -len(suffix)]
+                    if entry.name.endswith(suffix) and agent_profiles.routes_to_ephemeral_store(
+                        stem
+                    ):
+                        files.setdefault(stem, []).append(entry.name)
+        if not files:
+            return
+        table = database.EphemeralAgentModel
+        with database.SessionLocal() as db:
+            known = {n for (n,) in db.query(table.name).filter(table.name.in_(list(files)))}
+        for stem in files.keys() - known:
+            for file in files[stem]:
+                try:
+                    info = os.lstat(file, dir_fd=fd)
+                    if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff.timestamp():
+                        os.unlink(file, dir_fd=fd)
+                        counts["rowless"] += 1
+                except OSError:
+                    pass
+    finally:
+        held.close()
+        os.close(fd)
+
+
+def _remove_archive(session: str, name: str, cutoff: Any) -> str:
+    """Remove this name's exact archive once older than the cutoff: absent, removed or kept.
+
+    The check and unlink hold the audit lock, so a refusal write in progress either
+    finishes first, making the archive new again, or finds it gone instead of
+    recreating an orphan.
+    """
+    try:
+        audit = os.open(EPHEMERAL_DIR / "audit", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "absent"
+    try:
+        try:
+            folder = os.open(session, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=audit)
+        except FileNotFoundError:
+            return "absent"
+        try:
+            with _audit_lock:
+                try:
+                    info = os.lstat(name + ".json", dir_fd=folder)
+                except FileNotFoundError:
+                    return "absent"
+                if not stat.S_ISREG(info.st_mode) or info.st_mtime >= cutoff.timestamp():
+                    return "kept"
+                os.unlink(name + ".json", dir_fd=folder)
+                return "removed"
+        finally:
+            os.close(folder)
+    finally:
+        os.close(audit)
+
+
+def _retain(row: dict[str, Any], cutoff: Any, counts: Counter[str]) -> None:
+    """ADR-3: a gc row goes only after its terminal, live files and archive are gone."""
+    name, session = row["name"], row["session_name"]
+    if not agent_profiles.routes_to_ephemeral_store(name) or not _safe_segment(session):
+        return
+    if row["audit_path"] != str(EPHEMERAL_DIR / "audit" / session / (name + ".json")):
+        return  # Only the archive this store would have written can be proven gone.
+    with database.SessionLocal() as db:
+        if _terminal_exists(db, row["launched_terminal_id"]):
+            return  # A surviving terminal stays marked ephemeral through this row.
+    if _live_entries(name, regular_only=False):
+        return
+    archive = _remove_archive(session, name, cutoff)
+    if archive == "kept":
+        return
+    if archive == "removed":
+        counts["archives"] += 1
+    stamps = ("created_at", "expires_at", "claim_expires_at", "bound_at")
+    if any(not _expired(row[key], cutoff) for key in stamps if row[key] is not None):
+        return
+    table = database.EphemeralAgentModel
+    with _transaction() as db:
+        if _terminal_exists(db, row["launched_terminal_id"]):
+            return
+        deleted = db.execute(delete(table).where(table.name == name, table.state == "gc"))
+        if deleted.rowcount:
+            counts["pruned"] += 1
+
+
+def _sweep_window(config: dict[str, Any], key: str, unit: str) -> Optional[timedelta]:
+    """A positive integer setting as a window; anything else skips the step that needs it."""
+    value = config[key]
+    if _positive_integer(value):
+        try:
+            return timedelta(**{unit: value})
+        except OverflowError:
+            pass
+    logger.warning("ephemeral sweep: ephemeral.%s is not a usable positive integer", key)
+    return None
+
+
+@contextmanager
+def _isolated(step: str, name: Optional[str] = None) -> Iterator[None]:
+    """One failing row or step is logged by type and never stops the rest of the pass."""
+    try:
+        yield
+    except Exception as exc:
+        logger.warning(
+            "ephemeral sweep step=%s name=%s failed exception=%s",
+            step,
+            name or "-",
+            type(exc).__name__,
+        )
+
+
+def _gc_rows() -> list[dict[str, Any]]:
+    table = database.EphemeralAgentModel
+    with database.SessionLocal() as db:
+        rows = [_row(db, str(x.name)) for x in db.query(table).filter(table.state == "gc").all()]
+    return [row for row in rows if row is not None]
+
+
+def sweep(startup: bool) -> dict[str, int]:
+    """Collect expired and abandoned names and their files; never raises (#1079).
+
+    Runs whatever ``ephemeral.enabled`` says, so turning creation off does not strand
+    residue. The startup pass skips the launch grace for launched rows. Only exact live
+    files and the archives of eligible gc rows are deleted. The only file a pass can
+    create is the store's lock, under ``CAO_HOME/locks/``, outside the store. Returns
+    the counts it logs, by reason.
+    """
+    counts: Counter[str] = Counter()
+    try:
+        config = get_ephemeral_settings()
+    except Exception:  # Also errors the loader doesn't wrap, such as RecursionError.
+        logger.warning("ephemeral sweep skipped: settings are unreadable")
+        return {}
+    grace = _sweep_window(config, "launch_grace_seconds", "seconds")
+    retention = _sweep_window(config, "retention_days", "days")
+    now = database._utcnow()
+    table = database.EphemeralAgentModel
+    with _isolated("rows"):
+        with database.SessionLocal() as db:
+            records = db.query(table).filter(table.state != "gc").all()
+            rows = [r for r in (_row(db, str(x.name)) for x in records) if r is not None]
+            due = [r["name"] for r in rows if _sweep_due(db, r, now, startup, grace)]
+        for name in due:
+            with _isolated("rows", name):
+                collected = _sweep_row(name, now, startup, grace)
+                if collected is not None:
+                    _finish_gc(collected)
+                    counts[collected["gc_reason"]] += 1
+    with _isolated("gc_files"):
+        # Collection deletes best-effort; retry any gc row whose exact files survived.
+        for row in _gc_rows():
+            with _isolated("gc_files", row["name"]):
+                if _live_entries(row["name"], regular_only=True):
+                    _finish_gc(row)
+                    if not _live_entries(row["name"], regular_only=True):
+                        counts["retried"] += 1
+    if grace is not None:
+        with _isolated("rowless"):
+            _sweep_rowless(counts, now - grace)
+    if retention is not None:
+        with _isolated("retention"):
+            cutoff = now - retention
+            for row in _gc_rows():
+                with _isolated("retention", row["name"]):
+                    _retain(row, cutoff, counts)
+    if counts:
+        logger.info(
+            "ephemeral sweep startup=%s %s",
+            startup,
+            " ".join(f"{reason}={count}" for reason, count in sorted(counts.items())),
+        )
+    return dict(counts)
+
+
+def sweep_interval_seconds() -> int:
+    """The periodic pass interval; never raises, and bad settings keep the default.
+
+    Any failure counts as unreadable, including errors the settings loader doesn't
+    wrap (such as ``RecursionError`` from deeply nested JSON), so the daemon can't die.
+    """
+    try:
+        value = get_ephemeral_settings()["sweep_interval_seconds"]
+    except Exception:
+        value = None
+    if not _positive_integer(value):
+        value = EPHEMERAL_DEFAULTS["sweep_interval_seconds"]
+    return min(cast(int, value), 86400)
