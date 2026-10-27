@@ -513,6 +513,8 @@ class TestKiroCliAgentIdentityGuard:
         assert len(reads) == 1
         assert reads[0].kwargs["strip_escapes"] is True
         assert provider._initialized is True
+        # The evidence terminal_service records on the row (#1074).
+        assert provider.identity_verified is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("running", ["kiro_default", "cao-null", "reviewer"])
@@ -531,6 +533,7 @@ class TestKiroCliAgentIdentityGuard:
         # A wrong header is final: it is not read again.
         assert len(self._identity_reads(launch)) == 1
         assert provider._initialized is False
+        assert provider.identity_verified is False
 
     @pytest.mark.asyncio
     async def test_a_screen_without_a_header_is_reread_then_refused(self, launch):
@@ -546,6 +549,25 @@ class TestKiroCliAgentIdentityGuard:
         assert len(self._identity_reads(launch)) == IDENTITY_HEADER_READS > 1
         launch.send_keys.assert_called_once()
         launch.send_special_key.assert_not_called()
+        assert provider.identity_verified is False
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_before_the_header_check_reports_no_evidence(self, launch):
+        """Only the passed header check sets the evidence, not reaching any step."""
+        launch.get_history.return_value = _launch_screen("developer · auto · ◔ 3% · auth ok")
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.identity_verified is False
+
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.kiro_cli.wait_until_status", return_value=False
+            ),
+            pytest.raises(TimeoutError),
+        ):
+            await provider.initialize()
+
+        assert provider.identity_verified is False
+        assert self._identity_reads(launch) == []
 
     @pytest.mark.asyncio
     async def test_a_header_drawn_after_the_prompt_is_accepted(self, launch):
@@ -557,6 +579,7 @@ class TestKiroCliAgentIdentityGuard:
 
         assert await provider.initialize() is True
         assert len(self._identity_reads(launch)) == 2
+        assert provider.identity_verified is True
 
     @pytest.mark.asyncio
     async def test_unreadable_screens_fail_closed(self, launch):
