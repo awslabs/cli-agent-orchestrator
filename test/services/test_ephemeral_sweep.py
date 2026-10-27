@@ -12,7 +12,7 @@ import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from test.services.test_ephemeral_claim import NOW
 from test.services.test_ephemeral_service import CALLER, SPEC, create_store  # noqa: F401
@@ -394,6 +394,47 @@ def test_unusable_grace_leaves_terminalless_launches_to_startup(store, caplog):
     assert row(name)["state"] == "launched"
     assert "ephemeral.launch_grace_seconds" in caplog.text
     assert sweep(store, startup=True).get("terminal_gone") == 1
+
+
+def test_a_bound_near_datetime_max_does_not_overflow_and_other_rows_still_sweep(store):
+    """``bound + grace`` overflows past ``datetime.max`` (P3-1); elapsed time must not,
+    and a row that can't overflow must still be collected in the same pass."""
+    near_max = datetime.max.replace(tzinfo=timezone.utc) - timedelta(days=1)
+    store.clock.now = near_max - timedelta(seconds=TTL)
+    name = make(store)
+    launch(store, name, with_row=False)
+    store.config["launch_grace_seconds"] = 2 * 24 * 3600  # outlives the 1-day gap to max
+    store.config["retention_days"] = 0  # irrelevant here; real archive mtimes predate near_max
+    other = make(store, purpose="code_review")
+    store.clock.now = near_max
+    assert sweep(store) == {"ephemeral_expired": 1}
+    assert row(name)["state"] == "launched"
+    assert all(path.is_file() for path in live(store, name))
+    assert row(other)["gc_reason"] == "ephemeral_expired"
+
+
+def test_an_unrepresentable_grace_is_rejected_without_raising(store, caplog):
+    """A grace that ``now`` can't subtract must be refused, not crash the rows step."""
+    name = make(store)
+    launch(store, name, with_row=False)
+    other = make(store, purpose="code_review")
+    store.config["launch_grace_seconds"] = 10**12  # ~31,700 years: not usable as a cutoff
+    store.clock.at(seconds=TTL)
+    assert sweep(store) == {"ephemeral_expired": 1}
+    assert row(name)["state"] == "launched"
+    assert row(other)["gc_reason"] == "ephemeral_expired"
+    assert "ephemeral.launch_grace_seconds" in caplog.text
+
+
+def test_an_unrepresentable_retention_is_rejected_without_raising(store, caplog):
+    """A retention window that ``now`` can't subtract must be refused, not crash the pass."""
+    name = collected(store)
+    age(archive(name), NOW - timedelta(days=365))
+    store.config["retention_days"] = 10**6  # ~2,740 years: not usable as a cutoff
+    store.clock.at(days=60)
+    assert sweep(store) == {}
+    assert archive(name).is_file() and row(name) is not None
+    assert "ephemeral.retention_days" in caplog.text
 
 
 def test_a_terminal_inserted_after_the_candidate_read_wins(file_store, monkeypatch):

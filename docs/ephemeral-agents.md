@@ -47,11 +47,11 @@ the two steps that need it: periodic collection of launched names with no termin
 deletion of rowless live files. An unusable `retention_days` skips retention. An unusable
 interval falls back to the default.
 
-Creates take an inter-process `flock` lock under `CAO_HOME/locks/`, so the CAO home must be
-on a filesystem that supports `flock`. A create that can't take the lock within 10 seconds
-is refused with `store_busy` (503) and can be retried. Without `flock` support, as on an NFS
-mount without locking, every create is refused with `store_lock_unavailable` (503), and each
-sweep skips its rowless-file step with a warning.
+Creates take an inter-process `flock` lock under `CAO_HOME/locks/`. A create that can't take
+the lock within 10 seconds is refused with `store_busy` (503) and can be retried. If the lock
+is unavailable — for example, no `flock` support, as on an NFS mount without locking, or the
+lock file can't be created, as on a read-only home — every create is refused with
+`store_lock_unavailable` (503), and each sweep skips its rowless-file step with a warning.
 
 `ephemeral.max_tier`, `default_tier`, `max_effort`, `default_effort`, and top-level
 `model_tiers` are **not applied yet**. In particular, `max_tier` sets no ceiling. Each

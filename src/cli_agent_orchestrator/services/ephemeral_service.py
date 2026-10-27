@@ -32,6 +32,7 @@ from cli_agent_orchestrator.services.settings_service import (
 )
 from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.atomic_file import (
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
     LockTimeoutError,
     LockUnavailableError,
     strict_target_lock,
@@ -331,7 +332,7 @@ def _safe_segment(value: Any) -> bool:
 _SWEEP_LOCK_TIMEOUT_SECONDS = 0.0
 
 
-def _store_lock(timeout: float = 10.0) -> AbstractContextManager[None]:
+def _store_lock(timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS) -> AbstractContextManager[None]:
     """The live store's create window, as an inter-process flock outside the store.
 
     Create holds it from its cap count until its pending row commits, so a sweep that
@@ -503,7 +504,9 @@ def create_ephemeral_agent(
             raise EphemeralPolicyError("store_busy", "store lock timed out; retry", 503) from None
         except LockUnavailableError:
             raise EphemeralPolicyError(
-                "store_lock_unavailable", "the CAO home must support flock", 503
+                "store_lock_unavailable",
+                "lock unavailable (for example, no flock, or the lock file can't be created)",
+                503,
             ) from None
         # 0, the default, means no cap: the cap is an operator opt-in (#1079).
         if limit:
@@ -1184,7 +1187,12 @@ def _sweep_due(
     if startup:
         return True
     bound = database.as_utc(row["bound_at"])
-    return grace is not None and bound is not None and _expired(bound + grace, now)
+    now_utc = database.as_utc(now)
+    # Elapsed time, not ``bound + grace``: adding an absurd grace to a real timestamp
+    # can overflow past ``datetime.max`` and would stop the whole rows step.
+    return (
+        grace is not None and bound is not None and now_utc is not None and now_utc - bound >= grace
+    )
 
 
 def _sweep_row(
@@ -1342,14 +1350,21 @@ def _retain(row: dict[str, Any], cutoff: Any, counts: Counter[str]) -> None:
             counts["pruned"] += 1
 
 
-def _sweep_window(config: dict[str, Any], key: str, unit: str) -> Optional[timedelta]:
-    """A positive integer setting as a window; anything else skips the step that needs it."""
+def _sweep_window(now: Any, config: dict[str, Any], key: str, unit: str) -> Optional[timedelta]:
+    """A positive integer setting as a window; anything else skips the step that needs it.
+
+    Also refuses a window that ``now - window`` cannot represent, since callers use
+    that subtraction as a cutoff (the rowless and retention steps).
+    """
     value = config[key]
     if _positive_integer(value):
         try:
-            return timedelta(**{unit: value})
+            window = timedelta(**{unit: value})
+            _ = now - window
         except OverflowError:
             pass
+        else:
+            return window
     logger.warning("ephemeral sweep: ephemeral.%s is not a usable positive integer", key)
     return None
 
@@ -1390,9 +1405,9 @@ def sweep(startup: bool) -> dict[str, int]:
     except Exception:  # Also errors the loader doesn't wrap, such as RecursionError.
         logger.warning("ephemeral sweep skipped: settings are unreadable")
         return {}
-    grace = _sweep_window(config, "launch_grace_seconds", "seconds")
-    retention = _sweep_window(config, "retention_days", "days")
     now = database._utcnow()
+    grace = _sweep_window(now, config, "launch_grace_seconds", "seconds")
+    retention = _sweep_window(now, config, "retention_days", "days")
     table = database.EphemeralAgentModel
     with _isolated("rows"):
         with database.SessionLocal() as db:
