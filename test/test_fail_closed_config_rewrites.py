@@ -69,7 +69,12 @@ ALLOWLIST: Dict[str, str] = {
         "written: every JSON write it reaches is an archive update through _audit_update "
         "(the refusal count, the released event when a tightened policy or end_claim "
         "collects the name, the decided event's record ids), which re-reads the archive "
-        "itself and skips the write when that read fails."
+        "itself and skips the write when that read fails. #1083's second write, the live "
+        "profile through finalize_decided()/finalize(), carries only recheck_decided's own "
+        "validated values (the launched effort and the snapshot it was checked against), "
+        "never the degraded None itself, and only when the launched effort actually "
+        "differs from the stored one; finalize() is claim-fenced, so a lapsed or replaced "
+        "claim refuses with claim_expired and leaves a newer claim's profile untouched."
     ),
     # --- Live instances of the #737 class, found by this guard. Each rewrites the
     # --- same file it read leniently. Recorded, not fixed here: they are separate

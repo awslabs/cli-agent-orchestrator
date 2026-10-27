@@ -3818,18 +3818,30 @@ async def _prepare_delegation(
                 description=inputs.description,
             )
         )
-        if plan is not None:
-            # The operator may have changed the policy while the decider ran: recheck the
-            # launched tier before the bind, whatever the outcome.
-            try:
-                model = ephemeral_service.recheck_decided(
-                    name, claim_id, caller_id, _recorded_tier(plan), plan.model
-                )
-            except BaseException:
-                _bind_unlaunched(plan)
-                raise
-            if model is not None and model != plan.model:
-                plan = replace(plan, model=model)
+        # The operator may have changed the policy while the decider ran: recheck the
+        # launched values before the bind, whatever the outcome, and even when the engine
+        # returned no plan, as an effort-only launch can (#1083).
+        try:
+            decided = ephemeral_service.recheck_decided(
+                name,
+                claim_id,
+                caller_id,
+                _recorded_tier(plan) if plan is not None else None,
+                plan.effort if plan is not None else None,
+                plan.model if plan is not None else None,
+            )
+            if decided is not None and decided.finalize is not None:
+                # #1083 Q1 (provisional): a decided effort reaches the provider through the
+                # live profile, so it is written there before the bind.
+                ephemeral_service.finalize_decided(name, claim_id, caller_id, decided.finalize)
+        except BaseException:
+            _bind_unlaunched(plan)
+            raise
+        if decided is not None and decided.model is not None:
+            if plan is None:
+                plan = LaunchPlan(model=decided.model)
+            elif decided.model != plan.model:
+                plan = replace(plan, model=decided.model)
     except DecisionInputError as error:
         raise ephemeral_service.decision_refusal(name, claim_id, caller_id, error) from None
     except BaseException:

@@ -63,9 +63,8 @@ lock file can't be created, as on a read-only home — every create is refused w
 ## Model tier and effort
 
 `model_tier` accepts `small`, `medium`, `large` or `auto`; `effort` accepts `low`,
-`medium`, or `high`. Either can be omitted. `auto` asks a decider at launch (see
-[Model tier `auto`](#model-tier-auto)); `effort: "auto"` still refuses with
-`auto_requires_decision_platform`.
+`medium`, `high` or `auto`. Either can be omitted. `auto` asks a decider at launch (see
+[Model tier `auto`](#model-tier-auto) and [Effort `auto`](#effort-auto)).
 
 Tier and effort resolve once at create: the explicit value, else
 `ephemeral.default_tier` or `ephemeral.default_effort`, else none. The registry row and response hold that resolved
@@ -165,6 +164,50 @@ snapshot it has just checked to recover its tier, so a block broken during the d
 refuses as above. The store's own warning is the signal that a record went unwritten, and
 `Decision record read failed` that it could not be read. A decision that outlives the
 claim lease cannot bind: the launch refuses with `claim_expired`, and no terminal is created.
+
+### Effort `auto`
+
+With `effort: "auto"`, the `effort.route` decision point sets the child's reasoning effort at
+launch, under the same rules as `model_tier: "auto"`. Only this literal value asks; an explicit
+or omitted effort never does, whatever the tier field says. This is provisional (#1083).
+
+`auto` needs both `ephemeral.min_effort` and `ephemeral.max_effort`; without them create
+refuses with `auto_requires_bounds`, naming the missing keys. The lease must cover one on-mode
+wait per field declared `auto`: `claim_lease_seconds` of at least `n *
+decisions.on_timeout_ms / 1000 + 30`, where `n` is 1 or 2. The default 60-second lease covers
+both fields even at the 5000 ms maximum timeout. An `auto` effort stores `default_effort` as
+its fallback: the row, response and live profile hold that effort, the stored spec keeps
+`auto`, and the create note says the effort is decided at launch and names the fallback.
+
+The decision runs at the same point as for the tier:
+
+- **off**, or after `cao decisions off`: nothing is asked or recorded, and the child runs on the stored effort.
+- **shadow**: one `effort.route` record names the ephemeral agent. The child launches on the stored effort without waiting; the answer is recorded and never applied.
+- **on**: the server waits up to `decisions.on_timeout_ms`. A confident answer is capped into `[min_effort, max_effort]`. An `unsure`, low-confidence, timed-out, failed or out-of-set answer runs the stored effort, and the record names the reason.
+
+With both fields `auto`, the server asks `model.route` and then `effort.route`, one point per
+request with the same request id and facts, so an on-mode launch can wait up to twice
+`decisions.on_timeout_ms`. Neither request sees the other's answer, and one point's failure
+doesn't affect the other. A provider that can't apply an effort is never asked: the record
+says `not_honored`. Claude Code (outside a native agent) and Codex apply it.
+
+A decided effort that differs from the stored one is written into the live profile by a second
+finalize, after the pre-bind recheck and before the bind. Like the claim's own finalize, it
+replaces the profile only for that claim, so a lapsed or replaced claim refuses with
+`claim_expired` and leaves a newer claim's profile alone. The provider then reads Claude Code's
+`claudeConfig.effort` or Codex's `codexConfig.model_reasoning_effort` from the hash-verified
+profile, just as for an explicit effort. The archive gains a second `finalized` event naming
+the launched effort; when the effort is unchanged there is no second write and no second event.
+The registry row keeps the stored effort. The answer applies even when its decision record
+can't be written.
+
+The pre-bind recheck runs for every claimed `auto` launch, even when the engine returned no
+launch plan. A stored or decided effort now outside `[min_effort, max_effort]` gives
+`policy_changed_since_create:effort_exceeds_policy` or `:effort_below_policy` and collects the
+name. With only effort `auto`, the explicit or default tier still runs on its tier's current
+model id. A keyed retry of a launched name reattaches without a second decision or finalize,
+and a launch without a claim identifier asks nothing and runs the live profile. The creator's
+launch note stays model-only, so an effort-only launch gets none.
 
 **Upgrade note:** earlier releases ignored the tier and effort keys and table with a warning,
 whatever their values. All five tier and effort keys, including the new `min_tier`, are now
