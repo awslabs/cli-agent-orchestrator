@@ -26,7 +26,7 @@ hand-written dict in another module.
 from __future__ import annotations
 
 import ast
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from test._support import callsite_lint as cl
 from typing import Dict, Optional, Tuple
 
@@ -96,7 +96,7 @@ def _vault_memory(**overrides: object) -> Memory:
         source_kind="vault",
         source_path="Projects/CAO Design/Note.md",
         file_path="/abs/vault/Projects/CAO Design/Note.md",
-        indexed_at=datetime(2026, 1, 3, tzinfo=timezone(timedelta(hours=-5))),
+        indexed_at=datetime(2026, 1, 3, 4, 5, 6, 789, tzinfo=timezone.utc),
         index_freshness="stale",
         **overrides,
     )
@@ -142,6 +142,19 @@ def test_the_declared_deviations_all_actually_deviate() -> None:
     assert {key for key in MCP_VALUE_DEVIATIONS if shared[key] != projected[key]} == (
         MCP_VALUE_DEVIATIONS
     )
+
+
+def test_mcp_deviations_render_the_contract_values() -> None:
+    """The test above proves the overrides deviate from the shared dict; this
+    proves they deviate to the *right* value -- the vault-relative path and the
+    second-precision Zulu stamp, not merely something different."""
+    vault = mcp_recall_wire_dict(_vault_memory())
+    assert vault["file_path"] == "Projects/CAO Design/Note.md"
+    assert vault["indexed_at"] == "2026-01-03T04:05:06Z"
+    assert vault["updated_at"] == "2026-01-02T03:04:05Z"
+    native = mcp_recall_wire_dict(_memory())
+    assert native["file_path"] == "/abs/root/pin-project/wiki/project/pin-key.md"
+    assert native["indexed_at"] is None
 
 
 @pytest.mark.parametrize("builder", [_memory, _vault_memory], ids=["native", "vault"])

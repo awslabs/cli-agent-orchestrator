@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **A plan approval now names the working directory it was granted for, not just its path** (#827,
+  #1000). A path is not an identity. Move a non-Git working directory away, put a different directory
+  at the same path, and every value the plan identifier recorded was byte-identical, so the
+  replacement ran under the first directory's approval. A non-Git root now contributes its device and
+  inode (`st_dev`, `st_ino`) to the `plan_id` and to the per-run launch guard: the next run of a root
+  that was moved or renamed away and replaced, or whose path now carries a different mount, is refused
+  until re-approved, and a root swapped that way while a run is in flight stops that run's next agent
+  step with `plan_inputs_changed`. This does NOT catch a directory deleted and created again at the
+  same path: ext4 and XFS reuse the inode number just freed, so the recreated directory can get the
+  same pair back and keeps the approval, the same as a rewrite of its contents does — recorded under
+  "What an approval does not cover" in `docs/workflows.md`, with a stronger identity tracked in #1050.
+  A Git root's `plan_id` is deliberately unchanged, because its
+  identity is the commit plus the worktree digest, so two checkouts in the same state still share one
+  approval. Where the filesystem supplies no usable inode (some network mounts, container overlays,
+  Windows volumes with no file index), CAO falls back to the previous path-only identity rather than
+  refusing the run, and records the fallback instead of skipping it: the manifest carries
+  `repo_baseline.root_identity.bound: false` with a closed reason, the server logs that reason with no
+  path, and the unbound marker is part of the `plan_id`, so the weaker binding is visible in the
+  identifier an operator approves.
+
+- **A Git working directory replaced under a live run is now caught too, with no change to any Git
+  `plan_id`** (#827, #1051). A Git root's identity is its commit plus worktree digest, which settles
+  the case across runs — a different checkout at the same path is a different plan. It does not settle
+  it *within* a run: nothing recomputes the `plan_id` once a run is admitted, so `git worktree remove`
+  followed by `git worktree add <same path> <other branch>` during a long step, or a re-clone at the
+  path, left the script running in the old directory while every later terminal started by path inside
+  the replacement checkout, under the original approval, with nothing refusing it. The per-run launch
+  guard now records the device and inode for either kind of root, from the same single `stat` the
+  identifier used. That pair never reaches `plan_id`, so **Git identifiers do not move and existing
+  Git approvals stay valid.** A run admitted before this change carries no pair for a Git root and
+  keeps launching its remaining steps unchecked.
+
+- **A resume verifies the working directory before it re-drives anything** (#827, #1051). The root
+  comparison lived at agent launch, so a resumed run reached it only when it started a *new* agent
+  step: the script code before that step ran in the replacement directory, and a resume whose
+  remaining agent steps were all replays ran to completion there. Resume admission now does the same
+  comparison, after the approval gate and **before** the generation bump and before any recovery
+  decision is written, so a refused resume changes nothing and leaves a still-live process for that
+  run alone. `POST /workflows/runs/{run_id}/resume` answers `409` with
+  `{"kind": "plan_inputs_changed"}`, the same shape the agent-step route already returns; it
+  previously had no arm for this refusal. A resume whose directory never moved is unaffected, and so
+  is a run admitted before the root binding existed.
+
+- **A removed working directory gets its own refusal instead of being called a replacement** (#1051).
+  A bound root that is deleted, or whose `stat` fails with `EACCES`/`ESTALE`, could not be shown to be
+  the approved directory, so the guard refused — correctly — but under the "the directory at that path
+  has been replaced; start a new run" text. Starting a new run in a path that does not exist then
+  fails with `422`. The two states now say different things, and the refusal for a missing root tells
+  the operator to restore it.
+
+- **Breaking / migration:** every plan whose working directory is outside Git gets a new identifier
+  and is refused once, until re-approved under it (#827). The `plan-v2` scheme is not bumped: the
+  field set is unchanged and the root identity is new content inside the existing repository-baseline
+  field. Plans in a Git working directory keep their existing identifiers. A run already admitted and
+  left resumable keeps launching its steps, because a `launch-guard-v2` record written before the
+  binding carries no root identity and is checked without it rather than refused.
+- **Decision points say when a decider keeps failing, and records carry their target kind**
+  (#1067). The server logs one warning when a decider starts failing at a point (`timeout`,
+  `error`, `invalid_answer`, `no_answer` or `decider_unavailable`), at most once a minute for
+  each decider, point and reason, and one line when it answers again. These lines name only
+  the decider, point and reason. The server also logs its resolved threshold, timeouts, point
+  states and deciders at startup and when they change. `cao decisions status` adds
+  `decider_status`: each decider's last outcome, reason and time, and its counts by reason over
+  the last 24 hours, read from the database read-only. `decision_records` gains a nullable
+  `target_kind` column (`installed`, `ephemeral` or `workflow`); existing rows stay null.
+
 - **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
   paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
   terminal still read IDLE, so the sender waited forever and the next message was pasted on top
@@ -261,9 +327,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Script-run frozen memory now uses the memory gateway, so a configured remote memory owner
   supplies the same context as live terminals instead of freezing stale local memory. A journal
   read failure for a known script run now withholds memory with a warning instead of falling back
-  to live, unfrozen memory; non-script runs keep their existing fallback. A remote memory owner
-  that is unreachable, errors, or has memory disabled now gives the step no memory with a warning,
-  as on the live path, instead of failing it (#828).
+  to live, unfrozen memory; non-script runs keep their existing fallback. A memory resolution error
+  now gives the step no memory with a warning, as on the live path, instead of failing it. This
+  includes a local read error and a remote owner that is unreachable, errors, or has memory
+  disabled (#828).
 - Every client call that creates a session or terminal synchronously (`cao launch` without
   `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
   `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
@@ -369,7 +436,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so `handoff` and workflow steps tore the worker down about 2s after sending the
   task. A `●` line whose ellipsis is followed by the spinner's status in
   parentheses (a running hook, the elapsed time, the token count or `thinking`)
-  is now treated as a live spinner, whatever the message before it (#908).
+  is now treated as a live spinner, whatever the message before it (#908). A
+  finished response that reports its own timing — `● Done. The fix is in place…
+  (3m 12s)` with the end-of-turn summary under it — is the same text, so both
+  detectors now look for a spinner only on the newest conversation row above the
+  input box, instead of holding the worker at processing until the step timed
+  out (#974). Blank rows, box chrome, the rows a wrapped chrome line continues
+  onto, and the status area Claude Code draws under the spinner — the task
+  list's indented checkbox rows and queued messages — are not conversation: one
+  shared walker skips them on the way up, so a `⎿ Tip:` line that wrapped in a
+  narrow pane, a task list or a queued message under the spinner cannot hide it
+  and report a working agent as completed either. The same scope stops a
+  response bullet in the bottom rows from reading as a spinner.
 
 - `store_lesson` no longer decides the learning gate, authorizes itself, or opens
   SQLite inside the agent's process. It writes through a new `POST /lessons`

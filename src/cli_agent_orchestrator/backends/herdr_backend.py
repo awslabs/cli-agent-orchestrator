@@ -1102,10 +1102,24 @@ class HerdrBackend(TerminalBackend):
         whereas the tmux backend accepts such values. This is an intentional,
         safety-conservative divergence; operator env values on herdr must be
         sanitizer-safe.
+
+        The running CAO's own address and home (``cao_server_env``) come first.
+        A pane otherwise inherits the herdr server's environment, which belongs
+        to whatever process started that server, not necessarily this CAO.
         """
         from cli_agent_orchestrator.clients.tmux import TmuxClient
+        from cli_agent_orchestrator.utils.mcp_resolution import cao_server_env
 
         env: Dict[str, str] = {}
+        for key, value in cao_server_env().items():
+            if not _SAFE_ARG_RE.fullmatch(f"{key}={value}"):
+                logger.warning(
+                    "Dropping this CAO's %s from herdr pane env -- value contains "
+                    "characters the herdr arg sanitizer rejects",
+                    key,
+                )
+                continue
+            env[key] = value
         for key, value in (extra_env or {}).items():
             if TmuxClient._is_blocked_env_key(key):
                 logger.warning("Dropping forwarded env var with blocked key: %s", key)

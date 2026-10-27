@@ -9,7 +9,7 @@ from cli_agent_orchestrator.clients.database import init_db
 from cli_agent_orchestrator.decisions import egress, settings
 from cli_agent_orchestrator.decisions.packages import installed_deciders
 from cli_agent_orchestrator.decisions.settings import load_settings
-from cli_agent_orchestrator.decisions.store import DecisionStore
+from cli_agent_orchestrator.decisions.store import DecisionStore, read_decider_status
 from cli_agent_orchestrator.decisions.types import POINTS
 from cli_agent_orchestrator.services import settings_service
 
@@ -19,16 +19,26 @@ OFF_REENABLED_MESSAGE = (
 )
 
 
-def status() -> dict[str, Any]:
+def _effective() -> dict[str, Any]:
     result = asdict(load_settings())
     result["halted"] = egress.is_halted()
     result["installed_deciders"] = installed_deciders()
     return result
 
 
+def status() -> dict[str, Any]:
+    result = _effective()
+    result["decider_status"] = read_decider_status()
+    for decider in result["installed_deciders"]:
+        result["decider_status"]["deciders"].setdefault(
+            decider["name"], {"last": None, "counts": {}}
+        )
+    return result
+
+
 def set_point(point: str, state: str, decider: str | None = None) -> dict[str, Any]:
     settings.set_point(point, state, decider)
-    return status()
+    return _effective()
 
 
 def _halt_marker_identity() -> tuple[int, int] | None:
