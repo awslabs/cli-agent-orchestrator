@@ -190,6 +190,38 @@ async def test_disabled_memory_writes_nothing(
 
 
 @pytest.mark.asyncio
+async def test_remote_owner_is_never_called_with_the_switch_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mocker
+) -> None:
+    """#1071: with a remote memory owner configured and the local switch off, this
+    plugin must not POST to the owner or write the steering file.
+    ``_get_terminal_context`` is stubbed to a real context so the switch — not a
+    missing terminal — is what the test proves stops the call.
+    """
+    from cli_agent_orchestrator.services import memory_gateway
+
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner.invalid")
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service.is_memory_enabled",
+        lambda: False,
+    )
+    _install_metadata_and_cwd(monkeypatch, tmp_path)
+    mocker.patch.object(
+        memory_gateway.MemoryService,
+        "_get_terminal_context",
+        return_value={"terminal_id": "t1", "cwd": str(tmp_path)},
+    )
+    post = mocker.patch.object(memory_gateway, "_post")
+
+    plugin = KiroCliMemoryPlugin()
+    await plugin.on_post_create_terminal(_event())
+
+    post.assert_not_called()
+    assert not (tmp_path / STEERING_SUBDIR / MEMORY_FILENAME).exists()
+    assert list(tmp_path.iterdir()) == [], "the owner's block must not reach the cwd"
+
+
+@pytest.mark.asyncio
 async def test_memory_fetch_failure_is_logged_not_raised(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

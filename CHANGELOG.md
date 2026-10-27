@@ -330,6 +330,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now gives the step no memory with a warning, as on the live path, instead of failing it. This
   includes a local read error and a remote owner that is unreachable, errors, or has memory
   disabled (#828).
+- Context injection with a configured remote memory owner now honours the operator's local
+  memory switch. The switch was only checked on the local curated path and on the
+  frozen-replay path (#828); with a remote owner configured and the switch off, a live
+  terminal's first message, and the Claude Code/Codex/Kiro CLI provider-config-file memory
+  plugins, still called out to the owner and injected its block. The check now sits in
+  `memory_gateway.memory_context_for_terminal`, the single choke point all five callers
+  (the first-message path, the frozen-replay path, and the three provider plugins) go
+  through, so the owner is no longer called at all for context injection when the switch is
+  off; it is unreachable, not merely unused (#1071).
 - Every client call that creates a session or terminal synchronously (`cao launch` without
   `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
   `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
