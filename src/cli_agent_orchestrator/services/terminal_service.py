@@ -45,6 +45,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 # ``fmt: skip`` stops black from wrapping it, which would move both pragmas off the name.
 from cli_agent_orchestrator.clients.database import delete_terminals_by_session  # noqa: F401  # isort: skip  # fmt: skip
 from cli_agent_orchestrator.clients.database import (
+    LAUNCH_TARGET_KINDS,
     count_runtime_allocated_terminals,
     create_inbox_message,
 )
@@ -292,17 +293,27 @@ def _classify_launch_target_kind(
 ) -> str:
     """Issue #1082's target_kind vocabulary (installed/ephemeral/workflow).
 
-    Deliberately independent of ``decisions/targets.py``'s ``TargetKind``.
-    #1076 merged without adding a ``workflow`` member there either: it labels
-    a workflow step's own decision record with the bare string ``"workflow"``,
-    outside the enum, resolving the same way this function does. For
-    installed/ephemeral the two stay equivalent by construction -- both
-    resolve from the same reserved-name check (``routes_to_ephemeral_store``)
-    -- but this function reuses only the already-resolved profile ``source``
-    the launch path computed for itself, rather than re-deriving it from the
-    name, plus the same ``CAO_WORKFLOW_RUN_ID`` signal the run engine already
-    injects for a workflow step's terminal (see ``services/agent_step.py`` and
-    ``services/script_runner.py``).
+    Deliberately independent of ``decisions/targets.py``'s ``TargetKind``,
+    which still has no ``workflow`` member at #1076 (merged at 2192bd43): it
+    labels a workflow step's own decision record with the bare string
+    ``"workflow"``, outside the enum. For installed/ephemeral the two stay
+    equivalent by construction -- both resolve from the same reserved-name
+    check (``routes_to_ephemeral_store``) -- but this function reuses only
+    the already-resolved profile ``source`` the launch path computed for
+    itself, rather than re-deriving it from the name.
+
+    This function's ``"workflow"`` is WIDER than #1076's: it fires on any
+    terminal launched with ``CAO_WORKFLOW_RUN_ID`` in its env, which also
+    covers YAML engine steps (``services/workflow_service.py``), not only a
+    live script run's own step (``launch_owner("run_step", ...)`` ->
+    ``script_step_of``). The two vocabularies are not merged; this is a
+    provisional choice for issue #1082, which leaves the question open.
+
+    The result is always a member of ``LAUNCH_TARGET_KINDS``; callers that
+    write it still check that against the database module's tuple rather
+    than trusting this function's return type, so a future change to this
+    classifier that drifted from that vocabulary would fail closed instead
+    of writing silently.
     """
     if env_vars and env_vars.get("CAO_WORKFLOW_RUN_ID"):
         return "workflow"
@@ -319,7 +330,19 @@ def _record_launch_best_effort(**values: Any) -> None:
     wrapper additionally protects against a bad caller-side value (e.g. a
     non-JSON-serializable ``record_ids``) blowing up before that function's
     own try/except is reached.
+
+    Also the one place that checks ``target_kind`` against
+    ``LAUNCH_TARGET_KINDS`` before it reaches the row. An unknown value fails
+    closed: it is logged and the row is written with no kind (``None``)
+    rather than with a value the vocabulary does not recognize.
     """
+    target_kind = values.get("target_kind")
+    if target_kind is not None and target_kind not in LAUNCH_TARGET_KINDS:
+        logger.warning(
+            f"Launch record target_kind {target_kind!r} is not one of "
+            f"LAUNCH_TARGET_KINDS {LAUNCH_TARGET_KINDS}; recording no kind"
+        )
+        values["target_kind"] = None
     try:
         db_create_launch_record(**values)
     except Exception:

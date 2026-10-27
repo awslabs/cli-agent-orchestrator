@@ -186,6 +186,38 @@ class TestLaunchRecordOnCreate:
             _classify_launch_target_kind(agent_profiles.ProfileSource.INSTALLED, {}) == "installed"
         )
 
+    def test_record_launch_best_effort_fails_closed_on_an_unknown_target_kind(self, caplog):
+        """The write checks the classifier's result against
+        LAUNCH_TARGET_KINDS. An unknown kind is logged and stored as no kind
+        (None), not written through as the bad value -- unlike a DB-layer
+        failure, which drops the whole record (see
+        test_launch_record_write_failure_never_fails_create)."""
+        import logging
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _record_launch_best_effort,
+        )
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_create_launch_record"
+            ) as mock_db_create,
+            caplog.at_level(logging.WARNING),
+        ):
+            _record_launch_best_effort(
+                terminal_id="test1234",
+                session_name="cao-session",
+                provider="kiro_cli",
+                target_name="developer",
+                target_kind="not-a-real-kind",
+                launched_model=None,
+                model_honored=None,
+            )
+
+        mock_db_create.assert_called_once()
+        assert mock_db_create.call_args.kwargs["target_kind"] is None
+        assert any("not-a-real-kind" in record.message for record in caplog.records)
+
     @pytest.mark.asyncio
     @_patch_create_terminal_collaborators
     async def test_launch_record_write_failure_never_fails_create(

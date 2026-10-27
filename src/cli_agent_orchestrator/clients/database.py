@@ -331,8 +331,14 @@ class DecisionRecordModel(Base):
 
 
 # target_kind vocabulary (issue #1082), independent of decisions/targets.py's
-# TargetKind: that module currently has no "workflow" value, and PR #1076 may
-# change it on its own schedule. Plain strings here so either lands first.
+# TargetKind: that module still has no "workflow" value at #1076 (merged at
+# 2192bd43); it labels a workflow step's own decision record with the bare
+# string "workflow", outside the enum. This module's "workflow" is wider --
+# any terminal launched with CAO_WORKFLOW_RUN_ID, YAML engine steps included,
+# not only a live script run's own step -- so the two vocabularies are kept
+# separate rather than merged. See _classify_launch_target_kind. Every write
+# through _record_launch_best_effort checks its result against this tuple and
+# fails closed (logs, stores no kind) rather than writing an unknown value.
 LAUNCH_TARGET_KINDS = ("installed", "ephemeral", "workflow")
 
 # Why a launch ended (issue #1082, provisional vocabulary). Each names the
@@ -371,7 +377,9 @@ class LaunchRecordModel(Base):
     session_name = Column(String, nullable=False)
     provider = Column(String, nullable=False)
     target_name = Column(String, nullable=True)  # agent profile or ephemeral name
-    target_kind = Column(String, nullable=False)  # one of LAUNCH_TARGET_KINDS
+    # One of LAUNCH_TARGET_KINDS, or NULL if the classifier's result failed
+    # that check and _record_launch_best_effort recorded no kind instead.
+    target_kind = Column(String, nullable=True)
     launched_model = Column(String, nullable=True)
     model_honored = Column(Boolean, nullable=True)
     provider_session_id = Column(String, nullable=True)
@@ -421,7 +429,7 @@ def create_launch_record(
     session_name: str,
     provider: str,
     target_name: Optional[str],
-    target_kind: str,
+    target_kind: Optional[str],
     launched_model: Optional[str],
     model_honored: Optional[bool],
     provider_session_id: Optional[str] = None,
