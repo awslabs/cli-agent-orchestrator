@@ -19,6 +19,7 @@ import pathlib
 import time
 from typing import Any, Dict
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 
@@ -267,7 +268,12 @@ def hermetic_kiro_agent_store(_empty_home, tmp_path_factory, monkeypatch):
     Autouse for ``test/services`` (its conftest); opt in elsewhere. It moves the
     cwd, which tests that read repo files by relative path cannot take.
     """
-    agents = tmp_path_factory.mktemp("kiro-agents")
+    # A UUID-named directory under the shared basetemp, not a numbered
+    # tmp_path_factory.mktemp(): mktemp scans every existing basetemp entry to
+    # pick its next number, which is O(n) per call and quadratic over a run
+    # that creates one of these per test (#1074).
+    agents = tmp_path_factory.getbasetemp() / f"kiro-agents-{uuid4().hex}"
+    agents.mkdir()
     monkeypatch.setenv("HOME", str(_empty_home))
     monkeypatch.delenv("KIRO_HOME", raising=False)
     monkeypatch.setattr("cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", agents)
