@@ -18,6 +18,7 @@ import logging
 import os
 import pathlib
 import time
+import uuid
 from typing import Any, Dict
 from unittest.mock import patch
 from uuid import uuid4
@@ -393,6 +394,27 @@ def hermetic_kiro_agent_store(_empty_home, tmp_path_factory, monkeypatch):
     # A create with no working_directory launches from the process cwd.
     monkeypatch.chdir(_empty_home)
     return agents
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_ephemeral_store(monkeypatch, tmp_path_factory):
+    """Keep the ephemeral store and CAO's lock dir out of the startup CAO home.
+
+    Every in-process ``lifespan`` runs the ephemeral startup sweep (#1079), which
+    deletes rowless live files and prunes aged records. Against a developer's real
+    home, a test's replacement ``SessionLocal`` makes a running agent's files look
+    rowless. ``atomic_file`` locks would also leave permanent lock files there. The
+    directory sits outside ``tmp_path`` because some tests assert its exact contents.
+    Tests that build their own store still patch these paths themselves.
+    """
+    from cli_agent_orchestrator.services import ephemeral_service
+    from cli_agent_orchestrator.utils import agent_profiles, atomic_file
+
+    home = tmp_path_factory.getbasetemp() / "cao-homes" / uuid.uuid4().hex
+    home.mkdir(parents=True)
+    monkeypatch.setattr(ephemeral_service, "EPHEMERAL_DIR", home / "ephemeral")
+    monkeypatch.setattr(agent_profiles, "EPHEMERAL_LIVE_DIR", home / "ephemeral" / "live")
+    monkeypatch.setattr(atomic_file, "LOCK_DIR", home / "locks")
 
 
 @pytest.fixture

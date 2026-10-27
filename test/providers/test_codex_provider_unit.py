@@ -345,7 +345,7 @@ class TestCodexBuildCommand:
         mock_profile.codexProfile = None
         mock_load_profile.return_value = mock_profile
         # Simulate the resolver returning a PATH-independent absolute path.
-        mock_resolve.side_effect = lambda cfg: {
+        mock_resolve.side_effect = lambda cfg, **kwargs: {
             **cfg,
             "command": "/home/u/.local/bin/cao-mcp-server",
             "args": [],
@@ -373,7 +373,7 @@ class TestCodexBuildCommand:
         mock_profile.codexProfile = None
         mock_load_profile.return_value = mock_profile
         # Simulate a resolved path containing a backslash and a quote.
-        mock_resolve.side_effect = lambda cfg: {
+        mock_resolve.side_effect = lambda cfg, **kwargs: {
             **cfg,
             "command": r'/tmp/we"ird\path/cao-mcp-server',
             "args": [],
@@ -1546,6 +1546,36 @@ class TestMcpKeyValidation:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
         assert "mcp_servers.cao-mcp-server.env=" not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_uvx_launched_entry_named_cao_mcp_server_gets_the_address(self, mock_load, monkeypatch):
+        """#1075 P3-1: an entry started through ``uvx`` is still the CAO server
+        when its own entry name is ``cao-mcp-server``, even though ``command``
+        is ``uvx`` rather than the bare console script."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        mock_load.return_value = self._profile_with(
+            {
+                "cao-mcp-server": {
+                    "command": "uvx",
+                    "args": ["--from", "cli-agent-orchestrator", "cao-mcp-server"],
+                }
+            }
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_non_cao_server_never_gets_the_address(self, mock_load, monkeypatch):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        mock_load.return_value = self._profile_with(
+            {"my-server": {"command": "uvx", "args": ["--from", "pkg", "my-server"]}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert "mcp_servers.my-server.env=" not in command
 
 
 class TestCodexProviderCodexConfig:

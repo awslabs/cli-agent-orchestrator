@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_MCP_SERVER_MODULE,
     cao_server_env,
@@ -253,6 +255,16 @@ class TestResolveMcpServerConfig:
         assert out["command"] == "my-server"
         assert "args" not in out
 
+    def test_non_string_command_passes_through_without_crashing(self):
+        """P2-1: ``AgentProfile.mcpServers`` is ``Dict[str, Any]``, so ``command``
+        can reach here as a list (OpenCode's own format) or any other non-str
+        value. The basename check must not call ``Path()`` on it."""
+        out = resolve_mcp_server_config({"command": ["uvx", "x"]})
+        assert out["command"] == ["uvx", "x"]
+
+        out = resolve_mcp_server_config({"command": 123})
+        assert out["command"] == 123
+
 
 class TestServerEnv:
     """A runtime bundled server learns the address and home of the CAO that launched it."""
@@ -291,6 +303,17 @@ class TestServerEnv:
         monkeypatch.setattr(f"{MOD}.CAO_HOME_DIR", Path("/default/home"))
         assert "CAO_HOME_DIR" not in cao_server_env()
 
+    def test_wildcard_host_is_mapped_to_loopback(self, monkeypatch):
+        """#1075 note 4: an env-only CAO_API_HOST=0.0.0.0 must get the same
+        127.0.0.1 mapping main() applies to the --host flag, so the two paths
+        agree on what address a client can actually connect to."""
+        self._set(monkeypatch, CAO_API_HOST="0.0.0.0")
+        assert cao_server_env() == {"CAO_API_HOST": "127.0.0.1"}
+
+    def test_non_wildcard_host_passes_through(self, monkeypatch):
+        self._set(monkeypatch, CAO_API_HOST="10.0.0.5")
+        assert cao_server_env() == {"CAO_API_HOST": "10.0.0.5"}
+
     def test_the_entry_own_env_wins(self, monkeypatch):
         self._set(monkeypatch, CAO_API_PORT="9899")
         with patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"):
@@ -312,3 +335,63 @@ class TestServerEnv:
         with patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"):
             default = resolve_mcp_server_config({"command": "cao-mcp-server"})
         assert "env" not in default
+
+    def test_uvx_launched_entry_named_cao_mcp_server_gains_the_address(self, monkeypatch):
+        """#1075 P3-1: the entry's own name in the profile's ``mcpServers`` map
+        identifies it as the CAO server too, the same way Codex's own
+        ``is_cao_server`` check already does, so a ``uvx`` launch is covered."""
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        out = resolve_mcp_server_config(
+            {"command": "uvx", "args": ["--from", "pkg", "cao-mcp-server"]},
+            name="cao-mcp-server",
+        )
+        assert out["env"] == {"CAO_API_PORT": "9899"}
+        # Name-matching only adds the address; it does not touch the uvx command.
+        assert out["command"] == "uvx"
+
+    def test_absolute_path_entry_gains_the_address_by_final_segment(self, monkeypatch):
+        """An entry started by an absolute path is the CAO server when the
+        path's final segment is the bare console-script name."""
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        out = resolve_mcp_server_config({"command": "/opt/cao/bin/cao-mcp-server"})
+        assert out["env"] == {"CAO_API_PORT": "9899"}
+
+    def test_non_cao_server_never_gains_the_address(self, monkeypatch):
+        """Neither the command, its final path segment, nor the entry name is
+        ``cao-mcp-server``, so no address is added — even via uvx."""
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        out = resolve_mcp_server_config(
+            {"command": "uvx", "args": ["--from", "pkg", "my-server"]},
+            name="my-server",
+        )
+        assert "env" not in out
+
+    @pytest.mark.parametrize(
+        "config,name",
+        [
+            ({"command": "/usr/local/bin/my-cao-mcp-server"}, None),
+            ({"command": "cao-mcp-server-dev"}, None),
+            ({"command": "node"}, "cao-mcp-server-2"),
+        ],
+    )
+    def test_near_miss_entries_never_gain_the_address(self, monkeypatch, config, name):
+        """P3-1: these entries each contain ``cao-mcp-server`` as a substring
+        of the basename or the name, but neither equals it exactly. A
+        substring regression on either clause (``CAO_MCP_SERVER_COMMAND in
+        str(command)`` or `` in (name or "")``) would wrongly match them."""
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        kwargs = {"name": name} if name is not None else {}
+        out = resolve_mcp_server_config(config, **kwargs)
+        assert "env" not in out
+
+    def test_persisted_entry_never_gains_the_address_even_by_name(self, monkeypatch):
+        """``persisted=True`` is the off switch regardless of how the entry is
+        identified as the CAO server — a persisted config outlives this
+        process and may be read by another CAO."""
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        out = resolve_mcp_server_config(
+            {"command": "uvx", "args": ["--from", "pkg", "cao-mcp-server"]},
+            name="cao-mcp-server",
+            persisted=True,
+        )
+        assert "env" not in out

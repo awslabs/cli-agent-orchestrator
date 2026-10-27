@@ -299,8 +299,10 @@ and `RunStepRequest` (`POST /terminals/run-step`).
   equivalent of `delegation_kind` — this body has no `delegation_kind` field.
   `orchestration_type` and `delegation_message` must be supplied together or
   both omitted, or the request returns `422` ("orchestration_type and
-  delegation_message must travel together"). Either field combined with
-  `reuse_terminal_id` also returns `422` ("delegation fields cannot be combined
+  delegation_message must travel together"). That check runs first, so
+  supplying only one of the two fields alongside `reuse_terminal_id` returns
+  the "must travel together" `422`, not the one below. Both fields combined
+  with `reuse_terminal_id` return `422` ("delegation fields cannot be combined
   with reuse_terminal_id").
 
 ### Durable handoff results

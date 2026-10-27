@@ -60,16 +60,21 @@ def read_decider_status(
         with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as db:
             # One read transaction, so `last` and `counts` come from the same snapshot.
             db.execute("BEGIN")
-            for name, point, outcome, reason, created_at in db.execute(
-                "SELECT decider, point, outcome, reason, created_at FROM decision_records "
-                "WHERE id IN (SELECT MAX(id) FROM decision_records "
+            for name, point, outcome, reason, decision_status, created_at in db.execute(
+                "SELECT decider, point, outcome, reason, decision_status, created_at "
+                "FROM decision_records WHERE id IN (SELECT MAX(id) FROM decision_records "
                 "WHERE decider IS NOT NULL GROUP BY decider)"
             ):
                 try:
                     created_at = datetime.fromisoformat(created_at).isoformat()
                 except (TypeError, ValueError):
                     pass
-                last = {"point": point, "outcome": outcome, "reason": reason}
+                last = {
+                    "point": point,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "decision_status": decision_status,
+                }
                 deciders[name] = {"last": {**last, "created_at": created_at}, "counts": {}}
             # Compare in the stored format, as the ORM does for `cao decisions list --since`.
             for name, reason, decision_status, count in db.execute(

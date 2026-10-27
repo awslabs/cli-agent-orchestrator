@@ -114,6 +114,7 @@ def test_create_files_hashes_and_response(create_store):
         assert path.stat().st_mode & 0o777 == 0o700
     audit = json.loads(archive.read_bytes())
     assert set(audit) == {
+        "launch_values",
         "audit_version",
         "name",
         "spec",
@@ -193,46 +194,19 @@ def test_policy_rejections_leave_nothing(create_store, patch, rule, caplog):
 @pytest.mark.parametrize(
     "key,values",
     [
-        ("model_tier", ["small", "medium", "large", "auto"]),
-        ("effort", ["low", "medium", "high", "auto"]),
+        ("model_tier", ["auto"]),
+        ("effort", ["auto"]),
     ],
 )
-def test_tiers_and_effort_not_yet_supported(create_store, key, values):
+def test_auto_refuses_in_either_field(create_store, key, values):
     service = create_store[0]
     for value in values:
         with pytest.raises(service.EphemeralPolicyError) as err:
             create(create_store, {**SPEC, key: value})
-        assert err.value.rule == (
-            "auto_requires_decision_platform"
-            if value == "auto"
-            else "tier_not_supported" if key == "model_tier" else "effort_not_supported"
-        )
+        assert err.value.rule == "auto_requires_decision_platform"
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, {**SPEC, "model_tier": "small", "effort": "auto"})
-    assert err.value.rule == "tier_not_supported"
-
-
-@pytest.mark.parametrize(
-    "key,value",
-    [
-        ("max_tier", "small"),
-        ("default_tier", "small"),
-        ("max_effort", "low"),
-        ("default_effort", "low"),
-        ("model_tiers", {"claude_code": {"small": "mapped-model"}}),
-    ],
-)
-def test_ignored_policy_keys_warn_and_do_not_apply(create_store, key, value, caplog):
-    config = create_store[4]
-    if key == "model_tiers":
-        config[key] = value
-    else:
-        config["ephemeral"][key] = value
-    result = create(create_store)
-    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert len(warnings) == 1 and key in warnings[0].message
-    assert any(key in note for note in result["notes"])
-    assert result["model_tier"] is None and result["effort"] is None
+    assert err.value.rule == "auto_requires_decision_platform"
 
 
 @pytest.mark.parametrize("value", [None, 0, 2, "1", True])
@@ -451,9 +425,9 @@ def test_invalid_config_precedes_creator(create_store, key, value):
             {},
             "kiro_cli",
             False,
-            "tier_not_supported",
+            "auto_requires_decision_platform",
         ),
-        (["*"], {"effort": "low"}, {}, "kiro_cli", False, "effort_not_supported"),
+        (["*"], {"effort": "low"}, {}, "kiro_cli", False, "provider_unsupported"),
         (["*"], {}, {"allowed_providers": ["codex"]}, "kiro_cli", False, "provider_unsupported"),
         (
             ["@cao-mcp-server"],
@@ -783,63 +757,6 @@ def test_note_build_failure_precedes_all_writes(create_store, monkeypatch):
     assert not (home / "ephemeral").exists()
 
 
-def test_success_warning_failure_cannot_fail_committed_create(create_store, monkeypatch):
-    service = create_store[0]
-    create_store[4]["ephemeral"]["max_tier"] = "small"
-    monkeypatch.setattr(service.logger, "warning", Mock(side_effect=RuntimeError("warning failed")))
-    result = create(create_store)
-    assert database.get_ephemeral_agent(result["name"])["state"] == "pending"
-
-
-@pytest.mark.parametrize(
-    "block,top,model_note,effort_note,notice",
-    [
-        (
-            {"max_tier": "private-tier"},
-            {},
-            "model: provider default (tier omitted; ephemeral.max_tier is not applied yet)",
-            "effort: provider default (effort omitted, no default_effort)",
-            "ephemeral.max_tier is not applied yet; the provider default is used",
-        ),
-        (
-            {"max_effort": "private-effort"},
-            {},
-            "model: provider default (tier omitted, no default_tier)",
-            "effort: provider default (effort omitted; ephemeral.max_effort is not applied yet)",
-            "ephemeral.max_effort is not applied yet; the provider default is used",
-        ),
-        (
-            {
-                "max_tier": "private-tier",
-                "default_tier": "private-tier",
-                "max_effort": "private-effort",
-                "default_effort": "private-effort",
-            },
-            {"model_tiers": {"claude_code": {"small": "private-model-id"}}},
-            "model: provider default (tier omitted; ephemeral.max_tier, ephemeral.default_tier, model_tiers are not applied yet)",
-            "effort: provider default (effort omitted; ephemeral.max_effort, ephemeral.default_effort are not applied yet)",
-            "ephemeral.max_tier, ephemeral.default_tier, ephemeral.max_effort, ephemeral.default_effort, model_tiers are not applied yet; the provider default is used",
-        ),
-    ],
-)
-def test_ignored_notes_split_keys_without_values(
-    create_store, caplog, block, top, model_note, effort_note, notice
-):
-    config = create_store[4]
-    config["ephemeral"].update(block)
-    config.update(top)
-    result = create(create_store)
-    assert result["notes"] == [
-        model_note,
-        effort_note,
-    ]
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert warnings == ["ephemeral create " + result["name"] + ": " + notice]
-    assert "private-tier" not in str(result) + caplog.text
-    assert "private-effort" not in str(result) + caplog.text
-    assert "private-model-id" not in str(result) + caplog.text
-
-
 @pytest.mark.parametrize("declared", [True, False])
 @pytest.mark.parametrize(
     "provider", [p.value for p in ProviderType if p.value not in {"claude_code", "codex"}]
@@ -866,7 +783,7 @@ def test_declared_non_v1_provider_obeys_fixed_check_order(create_store):
     spec = {**SPEC, "provider": "kiro_cli", "model_tier": "small"}
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, spec)
-    assert err.value.rule == "tier_not_supported"
+    assert err.value.rule == "provider_unsupported"
     config["ephemeral"]["max_depth"] = 2
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, spec)
