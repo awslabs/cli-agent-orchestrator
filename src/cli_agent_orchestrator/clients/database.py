@@ -523,6 +523,17 @@ def find_bound_launch_record(
     direct creator, the same relation #912 applies to live rows). Grandparents
     and anyone else are not bound.
 
+    A self-report binds only the newest row for the id, and only while that
+    row is still open (``ended_at IS NULL``). Under a reused terminal id, an
+    older, already-finalized incarnation is a different launch; a self-report
+    must not reopen its verdict just because the id matches (#1088 tracks the
+    reuse itself). When the newest row is already closed, a self-report is
+    not a refusal either -- the reporter IS that terminal id, so it is never
+    "unbound" in the sense a grandparent or outsider is. It answers unlinked,
+    the same as an id with no record at all. A direct creator's report still
+    binds the newest matching row regardless of open/closed, which is the
+    post-teardown case the feature exists for.
+
     Returns ``(record_id, any_records)``: the newest bound record for that
     terminal id, or ``None`` with ``any_records`` saying whether records exist
     for the id at all (so a refusal can be told apart from "nothing recorded
@@ -532,15 +543,20 @@ def find_bound_launch_record(
     """
     with SessionLocal() as db:
         rows = (
-            db.query(LaunchRecordModel.id, LaunchRecordModel.caller_id)
+            db.query(LaunchRecordModel.id, LaunchRecordModel.caller_id, LaunchRecordModel.ended_at)
             .filter(LaunchRecordModel.terminal_id == launch_terminal_id)
             .order_by(LaunchRecordModel.id.desc())
             .all()
         )
     if source_terminal_id:
-        for record_id, caller_id in rows:
-            if launch_terminal_id == source_terminal_id or caller_id == source_terminal_id:
+        is_self_report = bool(rows) and launch_terminal_id == source_terminal_id
+        if is_self_report and rows[0][2] is None:
+            return rows[0][0], True
+        for record_id, caller_id, _ended_at in rows:
+            if caller_id == source_terminal_id:
                 return record_id, True
+        if is_self_report:
+            return None, False
     return None, bool(rows)
 
 
