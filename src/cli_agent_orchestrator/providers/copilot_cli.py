@@ -22,7 +22,10 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    forward_terminal_identity,
+    resolve_mcp_server_config,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
@@ -247,13 +250,17 @@ class CopilotCliProvider(BaseProvider):
         # resolver. This config is rebuilt fresh at every launch (persisted=False),
         # so the bundled server always learns the CAO that is about to start it.
         merged_servers: dict = {
-            "cao-mcp-server": resolve_mcp_server_config(
-                {
-                    "command": "cao-mcp-server",
-                    "args": [],
-                    "disabled": False,
-                    "env": {"CAO_TERMINAL_ID": self.terminal_id},
-                }
+            # forward_terminal_identity injects this terminal's own
+            # CAO_TERMINAL_ID (the key is deliberately NOT hand-written in the
+            # literal below -- the forwarder is the one writer of it), and
+            # resolve_mcp_server_config adds the launching CAO's coordinates for
+            # the bundled server (#1066).
+            "cao-mcp-server": forward_terminal_identity(
+                resolve_mcp_server_config(
+                    {"command": "cao-mcp-server", "args": [], "disabled": False}
+                ),
+                self.terminal_id,
+                server_name="cao-mcp-server",
             )
         }
 
@@ -282,9 +289,13 @@ class CopilotCliProvider(BaseProvider):
                 translated = COPILOT_TRANSPORTS.get(declared) if isinstance(declared, str) else None
                 if translated is not None:
                     entry["type"] = translated
-                env = dict(entry.get("env", {}))
-                env.setdefault("CAO_TERMINAL_ID", self.terminal_id)
-                entry["env"] = env
+                # This terminal's own id, never the profile's. `setdefault` here
+                # meant a profile/plugin entry could declare the value the CAO
+                # MCP gates authorize on -- and because the loop above protects
+                # only the entry literally NAMED `cao-mcp-server`, a differently
+                # named entry whose command IS our server reached this branch
+                # with its pinned identity intact (#1062, review 2).
+                entry = forward_terminal_identity(entry, self.terminal_id, server_name=name)
                 entry.setdefault("disabled", False)
                 merged_servers[name] = entry
 

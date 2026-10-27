@@ -94,7 +94,10 @@ from cli_agent_orchestrator.providers.kimi_runtime_home import (
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    forward_terminal_identity,
+    resolve_mcp_server_config,
+)
 
 # Portable Agent Plugins `type` -> FastMCP `transport`, applied by the legacy
 # `--mcp-config` builder below and by the Kimi Code runtime `mcp.json` builder.
@@ -1493,6 +1496,10 @@ class KimiCliProvider(BaseProvider):
         * ``CAO_TERMINAL_ID`` is exported for the Kimi process: Kimi Code's stdio
           MCP children inherit the parent environment, so one export reaches
           every server (including user-level ones) without per-server injection.
+          A server entry that *declares* the variable is a different matter and
+          is overridden with this terminal's own id in ``merge_mcp_servers`` --
+          a declared value is what Kimi passes for that key, and the MCP gates
+          authorize on it (#1062), so the builder is given the real id.
         * MCP timeouts travel as launch-scoped env bindings, never as a mutation
           of the user's ``config.toml``.
         * Auto-update is disabled for every CAO-managed worker, so N workers do
@@ -1554,7 +1561,7 @@ class KimiCliProvider(BaseProvider):
                 ) from exc
 
         mcp_servers = profile.mcpServers if profile is not None else None
-        builder = KimiCodeRuntimeHomeBuilder(source_home, terminal_dir)
+        builder = KimiCodeRuntimeHomeBuilder(source_home, terminal_dir, self.terminal_id)
         try:
             profile_tools = profile.tools if profile is not None else None
             runtime = builder.build(
@@ -1887,13 +1894,13 @@ class KimiCliProvider(BaseProvider):
                         mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
 
                         # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                        # can identify the current terminal for handoff/assign operations.
-                        # Kimi CLI does not automatically forward parent shell env vars
-                        # to MCP subprocesses, so we inject it explicitly via the env field.
-                        env = mcp_config[server_name].get("env", {})
-                        if "CAO_TERMINAL_ID" not in env:
-                            env["CAO_TERMINAL_ID"] = self.terminal_id
-                            mcp_config[server_name]["env"] = env
+                        # can identify the current terminal for handoff/assign
+                        # operations and authorize them (#1062). Kimi CLI does not
+                        # automatically forward parent shell env vars to MCP
+                        # subprocesses, so we inject it explicitly via the env field.
+                        mcp_config[server_name] = forward_terminal_identity(
+                            mcp_config[server_name], self.terminal_id, server_name=server_name
+                        )
 
                         # Select the declared protocol explicitly rather than
                         # letting FastMCP infer it from the URL path. `cwd` is

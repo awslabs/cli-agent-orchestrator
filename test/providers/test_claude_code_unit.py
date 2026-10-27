@@ -1528,8 +1528,17 @@ class TestClaudeCodeProviderMisc:
         assert server_env["CAO_TERMINAL_ID"] == "term-99"
 
     @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
-    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
-        """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
+    def test_build_command_mcp_overrides_a_profile_declared_terminal_id(self, mock_load):
+        """A profile does not get to declare the identity the gates authorize on.
+
+        This test used to assert the opposite -- "an existing CAO_TERMINAL_ID is
+        NOT overwritten" -- which was right when the value was a convenience for
+        handoff/assign, and wrong from #671/#972 on, when the MCP gates started
+        reading it to decide whether the caller is a gated bound terminal or an
+        ungated operator context. A profile declaring it picked its own
+        authorization posture. Found by independent review of #1062; the
+        cross-provider half is ``test/providers/test_terminal_identity_forwarding.py``.
+        """
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -1547,8 +1556,7 @@ class TestClaudeCodeProviderMisc:
 
         mcp_data = _extract_mcp_config(command)
         server_env = mcp_data["mcpServers"]["my-server"]["env"]
-        # Should keep the user-provided value, NOT overwrite with term-99
-        assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
+        assert server_env["CAO_TERMINAL_ID"] == "term-99"
 
     @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_mcp_forwards_this_cao_address_and_home(self, mock_load, monkeypatch):

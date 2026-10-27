@@ -69,7 +69,10 @@ try:  # Python 3.11+
 except ModuleNotFoundError:  # Python 3.10 — tomli is a declared dependency there
     import tomli as tomllib  # type: ignore[no-redef]
 
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    forward_terminal_identity,
+    resolve_mcp_server_config,
+)
 
 # Portable Agent Plugins `type` -> FastMCP `transport`. Kimi pins fastmcp and
 # hands each MCP document to `fastmcp.mcp_config.MCPConfig`; `RemoteMCPServer`
@@ -369,6 +372,8 @@ def _clamp_timeout(value: Any) -> Optional[int]:
 def merge_mcp_servers(
     user_servers: Mapping[str, Any],
     profile_servers: Optional[Mapping[str, Any]],
+    *,
+    terminal_id: str = "",
 ) -> Dict[str, Any]:
     """Merge user-level and CAO-profile MCP servers into one ``mcpServers`` map.
 
@@ -381,19 +386,42 @@ def merge_mcp_servers(
     :func:`resolve_mcp_server_config`, so a bundled ``cao-mcp-server`` becomes a
     PATH-independent invocation exactly as it does on the legacy path.
 
-    ``CAO_TERMINAL_ID`` is deliberately **not** injected here. Kimi Code's stdio
-    MCP children inherit the parent environment, so the launch line exports it
-    once for every server. An explicit ``env`` block on a profile server is
-    preserved verbatim, including an explicit ``CAO_TERMINAL_ID`` — an author who
-    pins one means it.
+    ``CAO_TERMINAL_ID`` is still not *injected* here: Kimi Code's stdio MCP
+    children inherit the parent environment, so the launch line exports it once
+    for every server and an entry with no ``env`` block needs nothing added.
+
+    What changed (#1062, review 2): an entry that **declares**
+    ``CAO_TERMINAL_ID`` no longer keeps its value. The old rule — "an author who
+    pins one means it" — predates the variable becoming an authorization input.
+    A profile server declaring ``env: {CAO_TERMINAL_ID: <another terminal's id>}``
+    was written into the real runtime ``mcp.json`` verbatim, so a profile could
+    start CAO's own MCP server as a VALID FOREIGN terminal and both MCP gates
+    then authorized against that terminal's allowlist. ``terminal_id`` is the
+    launching terminal's own id and always wins; the override is logged. Applied
+    to the user-level entries too, for the same reason and by the same rule: the
+    bypass does not care which file the pinned value came from.
     """
 
-    merged: Dict[str, Any] = {str(name): config for name, config in user_servers.items()}
+    # A user entry that is not an object passes through untouched: an unreadable
+    # user file degrades to "as written", never aborts a launch (the contract
+    # ``read_user_mcp_servers`` documents), and a non-object cannot carry an env.
+    merged: Dict[str, Any] = {
+        str(name): (
+            forward_terminal_identity(config, terminal_id, server_name=str(name), inherited=True)
+            if isinstance(config, dict)
+            else config
+        )
+        for name, config in user_servers.items()
+    }
 
     for name, raw in (profile_servers or {}).items():
         config = _normalise_profile_server(raw)
         if "command" in config:
             config = resolve_mcp_server_config(config)
+        # Inherited: absent is fine (the launch line exports it), declared is not.
+        config = forward_terminal_identity(
+            config, terminal_id, server_name=str(name), inherited=True
+        )
         # Select the declared protocol explicitly rather than letting Kimi infer
         # it from the URL path (see `KIMI_TRANSPORTS`). Applied on both launch
         # paths; without it this one emitted `type: sse` and Kimi started the
@@ -430,10 +458,17 @@ class KimiCodeRuntimeHomeBuilder:
     trusted still is, and the provider still fails closed on it.
     """
 
-    def __init__(self, source_home: Path, provider_temp: Path) -> None:
+    def __init__(self, source_home: Path, provider_temp: Path, terminal_id: str = "") -> None:
         self._source = Path(source_home)
         self._temp = Path(provider_temp)
         self._home = self._temp / RUNTIME_HOME_DIR_NAME
+        #: The launching terminal's own id, written over any ``CAO_TERMINAL_ID``
+        #: a profile or user ``mcp.json`` declared for an MCP server (#1062).
+        #: Empty means "no terminal identity to forward" -- a declared value is
+        #: then left alone because there is nothing truer to replace it with.
+        #: The real provider always passes one; ``test_mcp_identity_writers.py``
+        #: is the structural guard that a new writer cannot skip the forward.
+        self._terminal_id = str(terminal_id or "")
         self._result: Optional[RuntimeHomeResult] = None
 
     # -- introspection ----------------------------------------------------
@@ -512,7 +547,7 @@ class KimiCodeRuntimeHomeBuilder:
 
         user_servers = read_user_mcp_servers(self._home / "mcp.json")
         profile_names = {str(n) for n in (profile_mcp_servers or {})}
-        merged = merge_mcp_servers(user_servers, profile_mcp_servers)
+        merged = merge_mcp_servers(user_servers, profile_mcp_servers, terminal_id=self._terminal_id)
         self._write_mcp_json(self._home / "mcp.json", merged)
 
         result = RuntimeHomeResult(

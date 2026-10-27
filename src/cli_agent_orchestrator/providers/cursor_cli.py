@@ -78,7 +78,10 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    forward_terminal_identity,
+    resolve_mcp_server_config,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -515,11 +518,11 @@ class CursorCliProvider(BaseProvider):
         plugin_dir.mkdir(parents=True, exist_ok=True)
 
         # CAO_TERMINAL_ID is forwarded into every server's env so
-        # MCP tools (cao-mcp-server, ops-mcp-server) can resolve
-        # the current terminal for handoff / assign operations. We
-        # do not override an explicit preset — the same rule the
-        # --mcp <json> path used to follow (issue #300 is the v2026
-        # equivalent).
+        # MCP tools (cao-mcp-server, cao-ops-mcp-server) can resolve
+        # the current terminal for handoff / assign operations and
+        # authorize them. This terminal's own id always wins: the
+        # gates authorize on this value, so a profile that pins one
+        # is logged and overridden (#1062).
         servers: dict = {}
         for server_name, server_config in mcp_servers.items():
             if isinstance(server_config, dict):
@@ -529,10 +532,9 @@ class CursorCliProvider(BaseProvider):
             # Resolve the bundled cao-mcp-server console script to a
             # PATH-independent invocation.
             servers[server_name] = resolve_mcp_server_config(servers[server_name])
-            env = servers[server_name].get("env", {})
-            if "CAO_TERMINAL_ID" not in env:
-                env["CAO_TERMINAL_ID"] = self.terminal_id
-                servers[server_name]["env"] = env
+            servers[server_name] = forward_terminal_identity(
+                servers[server_name], self.terminal_id, server_name=server_name
+            )
 
         # Cursor v2026 plugin manifests are JSON files inside the
         # plugin dir. The exact schema is undocumented in the help

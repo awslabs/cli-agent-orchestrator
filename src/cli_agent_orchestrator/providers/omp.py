@@ -25,7 +25,10 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    forward_terminal_identity,
+    resolve_mcp_server_config,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -209,10 +212,9 @@ class OmpProvider(BaseProvider):
                 config = raw_config.model_dump(exclude_none=True)
             config = resolve_mcp_server_config(config, persisted=False)
             if "command" in config:
-                env = dict(config.get("env") or {})
-                if "CAO_TERMINAL_ID" not in env:
-                    env["CAO_TERMINAL_ID"] = self.terminal_id
-                    config["env"] = env
+                # This terminal's own id always wins: the CAO MCP gates authorize
+                # on it, so a profile does not get to declare it (#1062).
+                config = forward_terminal_identity(config, self.terminal_id, server_name=name)
             servers[name] = config
 
         self._write_private_file(

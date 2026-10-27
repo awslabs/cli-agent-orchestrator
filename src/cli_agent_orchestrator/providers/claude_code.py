@@ -23,7 +23,10 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils import agent_profiles
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    forward_terminal_identity,
+    resolve_mcp_server_config,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -606,9 +609,10 @@ class ClaudeCodeProvider(BaseProvider):
 
             # Add MCP config if present.
             # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-            # can identify the current terminal for handoff/assign operations.
-            # Claude Code does not automatically forward parent shell env vars
-            # to MCP subprocesses, so we inject it explicitly via the env field.
+            # can identify the current terminal for handoff/assign operations
+            # and authorize them (#1062). Claude Code does not automatically
+            # forward parent shell env vars to MCP subprocesses, so we inject it
+            # explicitly via the env field.
             if profile.mcpServers:
                 mcp_config = {}
                 for server_name, server_config in profile.mcpServers.items():
@@ -621,10 +625,9 @@ class ClaudeCodeProvider(BaseProvider):
                     # PATH-independent invocation.
                     mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
 
-                    env = mcp_config[server_name].get("env", {})
-                    if "CAO_TERMINAL_ID" not in env:
-                        env["CAO_TERMINAL_ID"] = self.terminal_id
-                        mcp_config[server_name]["env"] = env
+                    mcp_config[server_name] = forward_terminal_identity(
+                        mcp_config[server_name], self.terminal_id, server_name=server_name
+                    )
 
                 tmp_dir = CAO_HOME_DIR / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)

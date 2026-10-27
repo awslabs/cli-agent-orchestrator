@@ -33,6 +33,15 @@ from cli_agent_orchestrator.mcp_server.utils import _auth_headers_for
 from cli_agent_orchestrator.models.memory import mcp_recall_wire_dict
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
+from cli_agent_orchestrator.security.mcp_tool_gate import (
+    CAO_MCP_SERVER_SELECTOR,
+    allowlist_grants_mcp_server,
+    caller_allowed_or_denial,
+    caller_context_or_denial,
+    caller_is_bound,
+    install_allowlist_middleware,
+    missing_grant_denial,
+)
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
@@ -40,9 +49,7 @@ from cli_agent_orchestrator.services.memory_service import (
 )
 from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_CODE
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
-from cli_agent_orchestrator.utils.caller_tools import (
-    caller_effective_allowed_tools as _caller_effective_allowed_tools,
-)
+from cli_agent_orchestrator.utils.caller_tools import caller_terminal_context
 from cli_agent_orchestrator.utils.orchestration import (
     ENABLE_SENDER_ID_INJECTION,
     REMOTE_CONNECT_TIMEOUT,
@@ -1482,66 +1489,34 @@ def find_profiles(
 
 
 def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
-    """Build terminal context dict from the calling terminal's CAO_TERMINAL_ID."""
+    """The shared caller context (``utils.caller_tools``) plus the memory tools' ``cwd``.
+
+    Identity and the recorded allowlist are resolved by
+    ``caller_terminal_context``, which ``ops_mcp_server``'s gate asks too (#1062),
+    so the two authorization surfaces cannot disagree about who is calling. Its
+    error contract is unchanged and is relied on here: a 404 means "no context",
+    while transport and auth failures propagate.
+
+    ``cwd`` stays local to this module because only the memory tools' project
+    scope wants it, and it is deliberately best-effort -- a failure degrades
+    project scope rather than failing the call.
+    """
+    ctx = caller_terminal_context()
+    if ctx is None:
+        return None
+
     try:
-        terminal_id = _current_terminal_id()
-    except ValueError as e:
-        logger.warning(f"Failed to get terminal context for memory tools: {e}")
-        return None
+        wd_resp = requests.get(
+            f"{API_BASE_URL}/terminals/{ctx['terminal_id']}/working-directory",
+            headers=mcp_utils._auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
+        if wd_resp.status_code == 200:
+            ctx["cwd"] = wd_resp.json().get("working_directory")
+    except Exception:
+        pass
+    return ctx
 
-    if not terminal_id:
-        return None
-
-    try:
-        # Via mcp_utils, which attaches the internal Authorization header. The
-        # bare requests.get here did not, and GET /terminals/{id} IS scope-gated —
-        # so with auth enabled the call 401'd, this returned None, and every
-        # memory scope silently collapsed to global.
-        #
-        # A 404 (terminal genuinely not registered) is the only case that means
-        # "no context". Transport and auth failures PROPAGATE so the caller can
-        # say "cannot reach cao-server" rather than "could not resolve terminal
-        # context" — reporting a down server as a missing identity is the same
-        # class of misdirection as reporting an unreadable config as "disabled".
-        try:
-            meta = mcp_utils.get_json(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
-        except requests.HTTPError as e:
-            if getattr(e.response, "status_code", None) == 404:
-                return None
-            raise
-        ctx: Dict[str, Any] = {
-            "terminal_id": meta["id"],
-            "session_name": meta["session_name"],
-            "provider": meta["provider"],
-            "agent_profile": meta.get("agent_profile"),
-            "allowed_tools": meta.get("allowed_tools"),
-            "ephemeral": meta.get("ephemeral", False),
-        }
-        # Try to get working directory for project scope resolution. Same header
-        # reasoning as above — best-effort, so a failure degrades project scope
-        # rather than failing the call.
-        try:
-            wd_resp = requests.get(
-                f"{API_BASE_URL}/terminals/{terminal_id}/working-directory",
-                headers=mcp_utils._auth_headers() or None,
-                timeout=_mcp_timeout(),
-            )
-            if wd_resp.status_code == 200:
-                ctx["cwd"] = wd_resp.json().get("working_directory")
-        except Exception:
-            pass
-        return ctx
-    except requests.RequestException:
-        # Let the caller distinguish "unreachable / unauthorized" from "no
-        # context"; the memory tools still degrade to None via their own
-        # handlers, while the outcome tools report the real cause.
-        raise
-    except Exception as e:
-        logger.warning(f"Failed to get terminal context for memory tools: {e}")
-        return None
-
-
-CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
 
 #: ``list_siblings``/``update_metadata`` are gated by their own live
 #: ``discovery`` check (``_require_discovery_marker`` above), not by
@@ -1600,23 +1575,21 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
     operator context. That helper also returns ``None`` for a malformed
     ``CAO_TERMINAL_ID`` (which ``_current_terminal_id`` itself calls a hard
     error) and from its trailing ``except Exception``. So boundness is
-    established here from the environment rather than inferred from the
-    absence of an exception.
+    established from the environment rather than inferred from the absence of
+    an exception -- that is what ``caller_is_bound`` does.
+
+    Boundness, caller resolution, allowlist resolution, the ``@server`` spelling
+    rule and the refusal wording all come from
+    ``security.mcp_tool_gate``, which ``ops_mcp_server``'s policy asks too
+    (#1062). What stays here is what is specific to THIS surface: the ephemeral
+    rules, the delegation-tool checks and the ``discovery`` carve-out.
     """
-    if not os.environ.get("CAO_TERMINAL_ID"):
+    if not caller_is_bound():
         return None
 
-    try:
-        context = _get_terminal_context_from_env()
-    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
-        logger.warning(f"authorization lookup failed for '{tool_name}': {e}")
-        return f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})"
-
+    context, denial = caller_context_or_denial(tool_name, _get_terminal_context_from_env)
     if context is None:
-        return (
-            f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
-            "terminal could not be resolved"
-        )
+        return denial
 
     if tool_name == "create_ephemeral_agent" and context.get("ephemeral"):
         return "max_depth_exceeded: ephemeral agents cannot create ephemeral agents (ephemeral.max_depth=1)"
@@ -1638,28 +1611,17 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         except Exception as exc:
             return f"cannot authorize '{tool_name}': ephemeral delegation policy could not be resolved ({exc})"
 
-    try:
-        allowed = _caller_effective_allowed_tools(context)
-    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
-        logger.warning(f"allowlist resolution failed for '{tool_name}': {e}")
-        return (
-            f"cannot authorize '{tool_name}': the caller's allowed tools could not "
-            f"be resolved ({e})"
-        )
-
+    allowed, denial = caller_allowed_or_denial(tool_name, context)
     if allowed is None:
-        return f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved"
+        return denial
 
-    if "*" in allowed or CAO_MCP_SERVER_SELECTOR in allowed:
+    if allowlist_grants_mcp_server(allowed, CAO_MCP_SERVER_SELECTOR):
         return None
 
     if tool_name in DISCOVERY_GATED_TOOLS and has_discovery_grant(allowed):
         return None
 
-    return (
-        f"'{tool_name}' is not permitted: the calling terminal's allowed tools do not "
-        f"include '{CAO_MCP_SERVER_SELECTOR}'"
-    )
+    return missing_grant_denial(tool_name, CAO_MCP_SERVER_SELECTOR)
 
 
 #: CAO MCP tools a bound terminal must reach whatever its allowlist says.
@@ -1707,6 +1669,14 @@ def _install_allowlist_middleware(server: Any) -> None:
     (no ``CAO_TERMINAL_ID``) still allows, ``*`` or ``@cao-mcp-server`` still
     grants, and every failure to resolve a claimed identity still denies.
 
+    The middleware now lives in ``security.mcp_tool_gate`` so
+    ``cao-ops-mcp-server`` installs THIS gate rather than a parallel one (#1062).
+    What remains here is this surface's two inputs: ``_tool_denied_reason`` and
+    ``CALLBACK_EXEMPT_TOOLS``. ``_tool_denied_reason`` is reached through this
+    module's global, so it stays the patch point the suite already uses and takes
+    the tool name alone -- the ops policy is the surface that needs the call's
+    arguments.
+
     Registered AFTER the MCP Apps surface so an app-only tool is reported as
     unknown by its own filter rather than as unauthorized by this one — the
     existence of a hidden tool is not something to leak through an authz error.
@@ -1717,30 +1687,12 @@ def _install_allowlist_middleware(server: Any) -> None:
     agents handle better than a protocol error, and they keep working for any
     caller that reaches those functions without passing through FastMCP dispatch.
     """
-    add_middleware = getattr(server, "add_middleware", None)
-    if not callable(add_middleware):
-        # Fail closed: a FastMCP build that cannot install this gate must not
-        # start ungated and silent. Raising here aborts module import (the
-        # call site below is module-level), the loudest failure available.
-        raise RuntimeError(
-            "FastMCP build has no add_middleware; cannot install the CAO MCP "
-            "tool allowlist gate (#671)"
-        )
-
-    from fastmcp.exceptions import ToolError
-    from fastmcp.server.middleware import Middleware
-
-    class _AllowlistGate(Middleware):
-        async def on_call_tool(self, context: Any, call_next: Any) -> Any:
-            tool_name = context.message.name
-            if tool_name in CALLBACK_EXEMPT_TOOLS:
-                return await call_next(context)
-            denied = await asyncio.to_thread(_tool_denied_reason, tool_name)
-            if denied:
-                raise ToolError(denied)
-            return await call_next(context)
-
-    add_middleware(_AllowlistGate())
+    install_allowlist_middleware(
+        server,
+        denied_reason=lambda tool_name, _arguments: _tool_denied_reason(tool_name),
+        exempt_tools=CALLBACK_EXEMPT_TOOLS,
+        surface="CAO MCP",
+    )
 
 
 async def create_ephemeral_agent(

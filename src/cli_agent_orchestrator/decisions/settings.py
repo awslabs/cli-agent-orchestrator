@@ -4,6 +4,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Mapping
 
 from cli_agent_orchestrator.decisions.types import POINTS, PointState
@@ -22,7 +23,74 @@ RETENTION_DAYS_RANGE = (1, 36500)
 MAX_CONCURRENT_RANGE = (1, 1024)
 MAX_PENDING_RANGE = (0, 100000)
 SHADOW_TIMEOUT_MS_RANGE = (50, 60000)
-SAME_USER = "'Operator only' means not settable through MCP or any agent-facing API. It is a same-user local control, not a privilege boundary: settings.json can be edited by the same user, including an agent with shell access."
+SAME_USER = "'Operator only' means an operator context: over the operations MCP server a bound CAO terminal needs the '@cao-ops-mcp-server' grant, and lifting a halt is refused there even with it. It is a same-user local control, not a privilege boundary: settings.json can be edited by the same user, including an agent with shell access."
+
+#: The ``set_point`` states that CLEAR an active halt marker, named once so the
+#: mutation below and the MCP gate that refuses it (#1062 item 3,
+#: ``ops_mcp_server/gate.py``) cannot drift. Two hand-written ``("shadow", "on")``
+#: literals is how a guard stops guarding: the mutation gains a state and the
+#: gate keeps checking the old pair.
+HALT_LIFTING_STATES = frozenset({PointState.SHADOW.value, PointState.ON.value})
+
+
+class CallerPosture(Enum):
+    """Who is asking for a decision-settings mutation.
+
+    Only one rule depends on it -- a BOUND caller may not lift an active halt
+    (#1062 item 3) -- but that rule has to be evaluated INSIDE the mutation,
+    under the lock that protects the halt marker, so the mutation has to be told
+    the posture rather than deriving it. Deriving it here is not an option: this
+    module is also reached by ``cao decisions set`` from an agent's own shell,
+    which runs WITH ``CAO_TERMINAL_ID`` set and is documented (see
+    :data:`SAME_USER`) as a same-user local control, not a privilege boundary.
+
+    ``BOUND`` is the DEFAULT, so a caller that says nothing cannot lift a halt.
+    #671's lesson, applied here: a control that depends on every future call site
+    remembering to opt in is a control that lapses. The operator paths -- which
+    are two, ``cli/commands/decisions.py`` and whatever a human runs in process
+    -- state ``OPERATOR`` explicitly, and ``cao decisions set`` lifting a halt is
+    pinned by ``test_enabling_point_prints_effective_states``, so dropping that
+    argument fails loudly rather than quietly costing an operator the only way
+    to lift one.
+    """
+
+    OPERATOR = "operator"
+    BOUND = "bound"
+
+
+#: Refused to a bound caller that would lift an active halt, by the mutation and
+#: (as a faster, friendlier refusal) by the ops MCP middleware. One string, so
+#: the two layers cannot describe the same rule differently.
+#:
+#: It does NOT say "over MCP": ``posture`` defaults to ``BOUND``, so a non-MCP
+#: in-process caller of ``set_point`` that states no posture gets this refusal
+#: too (deliberately -- a control that every future caller must remember to opt
+#: into is a control that lapses). Naming MCP would have misdescribed that
+#: caller's situation and sent it looking for an MCP setting to change.
+HALT_LIFT_DENIAL = (
+    "'decisions_set_point' is not permitted: lifting an active decisions halt is "
+    "operator-only and is not available to a bound CAO terminal. An operator "
+    "context -- the CLI, or an MCP host with no CAO_TERMINAL_ID -- may lift it: "
+    "run `cao decisions set <point> <state>` locally."
+)
+
+#: Refused to a bound caller when the halt state could not be read exclusively.
+#: Fail closed: an unknown halt state must not be lifted.
+HALT_LOCK_BUSY_DENIAL = (
+    "'decisions_set_point' is not permitted: the decisions lock is held elsewhere, "
+    "so an active halt could not be ruled out. Retry, or run "
+    "`cao decisions set <point> <state>` locally."
+)
+
+
+class HaltLiftRefused(ValueError):
+    """A bound caller's mutation would have lifted an active operator halt.
+
+    A ``ValueError`` on purpose: both the ops MCP tools' ``_result`` and the
+    CLI's ``_run`` turn a ``ValueError`` into the message the caller is shown,
+    while any other exception becomes a generic "operation failed" -- and a
+    refusal the caller cannot read is a refusal it will retry forever.
+    """
 
 
 @dataclass(frozen=True)
@@ -142,19 +210,90 @@ def _object(data: dict[str, Any], *keys: str) -> dict[str, Any]:
     return block
 
 
-def set_point(point: str, state: str, decider: str | None = None) -> None:
-    _point(point)
-    PointState(state)
+def _write_point(point: str, state: str, decider: str | None) -> None:
     data = settings_service._load_or_raise()
     item = _object(data, "decisions", "points", point)
     item["state"] = state
     if decider is not None:
         item["decider"] = decider
     settings_service._save(data)
-    if state in ("shadow", "on"):
-        from cli_agent_orchestrator.decisions import egress
 
-        egress.HALT_FILE.unlink(missing_ok=True)
+
+def set_point(
+    point: str,
+    state: str,
+    decider: str | None = None,
+    *,
+    posture: CallerPosture = CallerPosture.BOUND,
+) -> None:
+    """Save a point's state, lifting an active halt when the state lifts one.
+
+    "A bound caller may not lift a halt" (#1062 item 3) is enforced HERE, not
+    only in the ops MCP middleware, because authorization has to be bound to the
+    mutation it authorizes. Independent review of #1062 showed the middleware
+    check alone was check-then-use: a granted bound caller whose
+    ``decisions_set_point(on)`` passed the middleware while no marker existed
+    raced ``operator.off()``, which published the marker -- and the mutation,
+    already allowed, removed it (``marker_after_off=True marker_after_set=False
+    final_state=on``).
+
+    Two things close it, both under the exclusive egress lock, the same one
+    ``egress_permit`` and ``operator.off()`` coordinate on:
+
+    * the posture rule is re-evaluated against the marker as it is RIGHT NOW,
+      and refuses before writing anything;
+    * the marker is only unlinked if it was observed under this lock. A halt
+      published after that read is not "the halt this call is lifting", so it
+      survives -- which is also what makes ``off()``'s own marker creation safe
+      without blocking on the lock (it must never be delayed by an outstanding
+      egress permit).
+
+    The lock is only taken for a state that lifts a halt; ``off`` touches no
+    marker and keeps the plain, uncontended path. Failing to take it is a
+    refusal for a bound caller (an unknown halt state must not be lifted) and a
+    logged warning for an operator, who must not lose the only way to lift one.
+    """
+    _point(point)
+    PointState(state)
+
+    if state not in HALT_LIFTING_STATES:
+        _write_point(point, state, decider)
+        return
+
+    from cli_agent_orchestrator.decisions import egress
+
+    with egress.exclusive(egress.HALT_CONTROL_TIMEOUT_S) as held:
+        if not held and posture is CallerPosture.BOUND:
+            raise HaltLiftRefused(HALT_LOCK_BUSY_DENIAL)
+        halted = egress.is_halted()
+        if halted and posture is CallerPosture.BOUND:
+            raise HaltLiftRefused(HALT_LIFT_DENIAL)
+        if not held:
+            logger.warning("Decisions lock unavailable; setting the point without it")
+        _write_point(point, state, decider)
+        if halted:
+            egress.HALT_FILE.unlink(missing_ok=True)
+
+
+def lifts_halt(state: Any) -> bool:
+    """Whether ``set_point(..., state)`` would clear an operator's active halt.
+
+    The predicate the ops MCP gate asks before letting a bound caller near
+    ``decisions_set_point`` (#1062 item 3). It reads the same
+    ``HALT_LIFTING_STATES`` that ``set_point`` acts on and the same live marker
+    ``egress.is_halted`` reads, so "would this lift the halt?" is answered once
+    rather than re-derived by the guard.
+
+    ``state`` is whatever arrived over the wire, so a non-string is simply not a
+    lifting state. With no halt in place there is nothing to lift and this is
+    False -- the gate's remaining selector check still applies.
+    """
+    if not isinstance(state, str) or state not in HALT_LIFTING_STATES:
+        return False
+
+    from cli_agent_orchestrator.decisions import egress
+
+    return egress.is_halted()
 
 
 def set_tier(provider: str, tier: str, model: str | None) -> None:

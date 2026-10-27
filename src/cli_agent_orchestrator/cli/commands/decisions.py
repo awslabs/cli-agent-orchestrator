@@ -42,8 +42,16 @@ def status() -> None:
 @click.argument("state", type=click.Choice(settings.STATES))
 @click.option("--decider", default=None)
 def set_point(point: str, state: str, decider: str | None) -> None:
-    """Set a point's state and optionally its installed decider name."""
-    _run(lambda: operator.set_point(point, state, decider))
+    """Set a point's state and optionally its installed decider name.
+
+    Setting shadow or on also lifts an active halt. Lifting one needs an operator
+    context: this command, or an MCP host running the operations server with no
+    CAO_TERMINAL_ID. The operations MCP tool refuses it for any bound CAO
+    terminal, even one holding @cao-ops-mcp-server.
+    """
+    # The posture is stated, not defaulted: ``set_point`` defaults to the
+    # restricted one so a caller that forgets cannot lift a halt (#1062).
+    _run(lambda: operator.set_point(point, state, decider, posture=settings.CallerPosture.OPERATOR))
 
 
 @decisions.command()

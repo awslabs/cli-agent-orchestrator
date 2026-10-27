@@ -108,6 +108,11 @@ _UNSCOPED_DOCS = [
     # PR #1000 (#827): "What an approval does not cover" names agent-plugin MCP
     # delivery as a launch input outside plan_id. CAO's own noun, qualified.
     "workflows.md",
+    # #1062: both gained one agent-plugin reference, naming `cao-ops` as the
+    # operator context the ops-MCP gate leaves unchanged. Each had ZERO plugin
+    # occurrences before, so the strict rule applies cleanly.
+    "decisions.md",
+    "tool-restrictions.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare

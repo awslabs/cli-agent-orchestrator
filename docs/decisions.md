@@ -168,11 +168,40 @@ The operations stdio MCP server offers `decisions_status`, `decisions_off`, `dec
 `decisions_set_tier`, `decisions_set_exclusions`, `decisions_list` and
 `decisions_purge`. These run locally in-process; there are no decision HTTP
 routes. The agent-facing MCP server has no tools to read, change or ask for
-decisions. A profile that grants operations MCP tools grants these controls too.
+decisions.
 
-“Operator only” means not settable through MCP or any agent-facing API. It is a
-same-user local control, not a privilege boundary: `settings.json` can be edited
-by the same user, including an agent with shell access.
+A profile that lists `cao-ops-mcp-server` does **not** by itself grant these
+controls (#1062). `CAO_TERMINAL_ID` is forwarded into every server in a profile's
+`mcpServers` map, so every tool on that surface is gated on the calling terminal's
+`tools:` allowlist, which must carry `@cao-ops-mcp-server` (or `*`, or a glob that
+covers it). A bound terminal without the grant is refused on every ops tool, with
+two deliberate rules:
+
+- `decisions_off` stays reachable without the grant. It is argument-free and
+  off-only — the operator's kill switch — and a fail-safe that needs a grant is
+  not a fail-safe. See [Tool Restrictions](tool-restrictions.md).
+- Lifting a halt is refused for any bound terminal, grant or not:
+  `decisions_set_point` to `shadow` or `on` removes the halt marker, so allowing it
+  over MCP would let a caller undo an operator's `cao decisions off`. It takes an
+  operator context — `cao decisions set <point> <state>` on the CLI, or an MCP host
+  running this server with no `CAO_TERMINAL_ID`. The refusal is enforced inside the
+  mutation, not only in the middleware: `set_point` takes the exclusive egress lock,
+  re-reads the marker under it, refuses before writing anything, and removes the
+  marker only if it observed it under that lock — so a halt published beside a call
+  already in flight survives. `decisions_off` publishes its marker *without* waiting
+  for that lock, because the shared side is held for the whole of an outstanding
+  decision request and a kill switch that waits on one is not a kill switch; an
+  operator setter that finds the lock busy proceeds with a logged warning rather
+  than losing the only way to lift a halt, while a bound caller is refused.
+
+An operator context — an MCP host with no `CAO_TERMINAL_ID`, including `cao-ops` in
+the operator agent-plugin — is unchanged and may do all of the above.
+
+“Operator only” therefore means an operator context: over the operations MCP server
+a bound CAO terminal needs the `@cao-ops-mcp-server` grant, and lifting a halt is
+refused there even with it. It is a same-user local control, not a privilege
+boundary: `settings.json` can be edited by the same user, including an agent with
+shell access.
 The same user can also install a decider package. Concurrent settings writers
 can lose updates because the existing settings writer is not atomic.
 
@@ -396,9 +425,17 @@ and verifies nothing about who granted consent; a package's record of who grante
 it is a provenance note, not an identity claim. Any process running as you,
 including an agent with shell access, can edit `settings.json` or a package's
 consent file and can read any key or endpoint the package stores. What keeps
-agents out is each profile's tool restrictions, and two rules a package must
-follow: no agent-facing tool may grant consent, and its consent command must
-need an interactive terminal. CAO's own agent-facing tools offer no consent.
+agents out of the *tool* surfaces is each profile's tool restrictions, now
+including the operations server: `@cao-mcp-server` gates every agent-facing CAO
+tool except the four callback-protocol exemptions (`send_message`,
+`complete_assignment`, `workflow_return`, `answer_user_prompt`) and the two
+`discovery`-granted tools, and `@cao-ops-mcp-server` gates every operations tool
+but `decisions_off` (#671, #972, #1062). See
+[Tool Restrictions](tool-restrictions.md) for both gates, the exemptions and the
+glob spellings that satisfy a grant. Two rules a package must follow do the rest: no agent-facing
+tool may grant consent, and its consent command must need an interactive terminal.
+CAO's own agent-facing tools offer no consent. None of this constrains an agent
+that already has a shell — it runs as you.
 
 ## Known limitations
 
