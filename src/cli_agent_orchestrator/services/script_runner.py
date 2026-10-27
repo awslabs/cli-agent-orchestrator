@@ -1417,7 +1417,10 @@ async def run_script_workflow(
         # Called inside the lambda, not passed to to_thread as a value, so the call-site lint
         # (test_callsite_lint_rules rule 4) can see the keyword.
         guard = await asyncio.to_thread(
-            lambda: launch_guard.capture(profile_set=frozen.profile_set)
+            lambda: launch_guard.capture(
+                profile_set=frozen.profile_set,
+                root_identity=frozen.root_identity,
+            )
         )
     except approval_gate.PlanIdentityUnavailableError as exc:
         capture_error = exc
@@ -1705,6 +1708,22 @@ async def resume_script_run(
             manifest_json=row.manifest_json,
             unavailable_reason="no_recorded_identity",
         )
+
+        # --- Gate 7: the working-directory root is still the one that was approved -> 409
+        # (issue #827 criterion 2, "a running OR RESUMED script run"; ask 3 on PR #1051) ---
+        # Gate 6 above answers "is this PLAN approved" from the plan_id already on the row, and is
+        # deliberately not recomputed. That is exactly why it cannot answer this: the root's identity
+        # is in the plan_id the resume REUSES, so a replaced root passes gate 6 unchanged. The per-run
+        # launch-guard record is the only thing that can see it, and until now the first thing to read
+        # that record was the next NEW agent launch -- so the script code before that step, and a
+        # resume whose remaining steps are all replays, ran in the replacement directory with nothing
+        # refusing them.
+        #
+        # Position: immediately after gate 6, for gate 6's own two reasons. BEFORE ``apply_decisions``,
+        # which WRITES, so a refused resume leaves nothing behind. BEFORE the generation bump, which
+        # fences out any still-live process for this run -- bumping and then refusing would kill a
+        # possibly-healthy run on behalf of a resume that was itself rejected.
+        launch_guard.ensure_root_unchanged(snapshot)
 
         # --- The human's recovery decisions (issue #583, FR-7). NOT a gate: admission
         # is over, this resume holds the drive claim, and nothing has been spawned yet.
