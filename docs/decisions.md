@@ -34,9 +34,10 @@ The fallback order is the installed profile default, the policy default, then
 the provider default. A required policy tier must map to a model; otherwise the
 launch is refused. Policy checks run before scope and decider calls. An explicit
 value above a policy ceiling is refused; a decider answer above it is capped.
-A policy may also carry a model tier floor. An explicit tier below it is refused,
-and a decider answer below it is raised to the floor and recorded as `capped`. With
-a floor and a ceiling, every tier from the floor to the ceiling must be mapped.
+A policy may also carry a model tier floor or an effort floor. An explicit value below
+it is refused, and a decider answer below it is raised to the floor and recorded as
+`capped`. A floor needs a default at or above it and must not exceed the ceiling. With
+a tier floor and a ceiling, every tier from the floor to the ceiling must be mapped.
 The launch-time policy check covers every checked provider in the envelope,
 including providers other than the target. A missing mapping anywhere in that
 set refuses the launch and names `model_tiers.<provider>.<tier>`.
@@ -197,8 +198,10 @@ capped candidate (`candidate_value`, `candidate_model`), `applied_value`, `outco
 step. Records written before the column existed keep `target_kind` null: the
 upgrade adds the column and does not backfill it. A policy model
 fallback records the tier as `fallback_value`; the mapped model appears in
-`launched_model` only when bound. Effort results are recorded but not carried in
-a launch plan in this version. A launch is recorded as launched when the
+`launched_model` only when bound. An on-mode effort answer, applied or capped, is
+carried in the launch plan, but no launch applies it in this version. A provider that
+declares no effort support records `effort.route` as `not_honored` without asking; only
+Claude Code (outside a native agent) and Codex declare it. A launch is recorded as launched when the
 provider has been built and its start has completed or been scheduled. A
 deferred startup failure updates the record to `launch_failed` without emitting
 a second decision span. A cancelled deferred start also moves a previously
@@ -428,7 +431,7 @@ need an interactive terminal. CAO's own agent-facing tools offer no consent.
 - Deferred assignment reports placement and the scheduled model before provider initialization finishes. A startup failure can occur afterward; after abrupt server loss, restart recovery can record a terminal-side failure while the decision record retains its last launch status as launched.
 - YAML workflow launches do not appear in decision records.
 - Elastic decision records stay on the remote node and are lost with it.
-- Effort routing has no normal delegation consumer and launch plans carry no effort.
+- Effort routing has no normal delegation consumer: a launch plan can carry an effort, but no launch applies it.
 - A decider that blocks the event loop cannot be preempted by an asynchronous timeout.
 - Terminal records expose the launched model and whether it was honored, independently of decision state; decision fields stay in operator records.
 - If a policy tightens between a launch and `create_terminal`'s own idempotent retry, the retry can be refused before replaying the existing terminal. This does not occur with an identity policy. Each replayed delegation create writes its own `not_launched` row; in shadow or on the decider is asked again.

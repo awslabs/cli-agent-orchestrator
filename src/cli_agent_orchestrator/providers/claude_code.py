@@ -402,6 +402,15 @@ class ClaudeCodeProvider(BaseProvider):
     ) -> bool:
         return not (profile and profile.native_agent)
 
+    @classmethod
+    def honors_effort(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+    ) -> bool:
+        # The --agent branch drops claudeConfig, and with it --effort.
+        return not (profile and profile.native_agent)
+
     _TAIL_HASH_LINES = 30
 
     def __init__(

@@ -1332,6 +1332,15 @@ class CodexProvider(BaseProvider):
     ) -> bool:
         return True
 
+    @classmethod
+    def honors_effort(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+    ) -> bool:
+        # codexConfig.model_reasoning_effort is emitted as a -c override.
+        return True
+
     # Codex redraws its inline TUI in place. The append-only pipe-pane stream
     # therefore retains transient progress frames (notably MCP startup) after
     # they have been erased from the visible terminal. Route status detection

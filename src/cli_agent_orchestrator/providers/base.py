@@ -115,6 +115,21 @@ class BaseProvider(ABC):
         """
         return False
 
+    @classmethod
+    def honors_effort(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+    ) -> bool:
+        """Return whether this provider applies a reasoning effort from the launch profile.
+
+        Unlike ``honors_model``, only providers that map an effort declare this (#1083,
+        provisional): effort routing reaches ephemeral agents only, so the conservative
+        default keeps ``effort.route`` from being asked for a provider that would ignore
+        the answer.
+        """
+        return False
+
     def __init__(
         self,
         terminal_id: str,
