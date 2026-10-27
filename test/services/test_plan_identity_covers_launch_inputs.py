@@ -45,6 +45,7 @@ raised separately rather than silently widened into here.
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List
 
 import pytest
@@ -321,4 +322,209 @@ def test_every_installed_provider_artifact_is_covered_by_plan_identity(roots, tm
     assert not uncovered, (
         "a provider launches these installed files for the profile and plan identity cannot see them, "
         f"so an edited tool policy executes under a stale approval: {uncovered}"
+    )
+
+
+# ===========================================================================
+# The working-directory ROOT is a launch input too (#827 criterion 2)
+# ===========================================================================
+#
+# THE SAME CLASS, one layer out. The tests above ask "is every file the launch path READS covered?".
+# This section asks the question the enumeration above cannot: is the DIRECTORY the run executes in
+# covered, or only the string naming it? Before this fix a non-Git root contributed its canonical path
+# and nothing else, so a directory moved away and replaced by another at the same path produced a
+# byte-identical ``plan_id`` and inherited the original's approval -- an input that was "covered" by a
+# value that does not identify it.
+#
+# Two sides, and both have to hold, because they fail independently:
+#   * the DIGEST side decides whether a FRESH run of a replaced root needs a new approval. Only
+#     ``plan_id`` is compared across runs, so nothing else can close this case.
+#   * the GUARD side decides whether a run already admitted keeps launching steps after its root is
+#     swapped underneath it. Only the per-run record can see that, so nothing else can close it.
+
+
+def _non_git_root(tmp_path) -> Path:
+    """A root that is determinately outside Git, so its identity really is path-only.
+
+    A developer whose temp directory sits inside a checkout would otherwise exercise the Git branch,
+    where no device/inode is recorded, and these tests would pass while testing nothing.
+    """
+    from cli_agent_orchestrator.utils import git_baseline
+
+    root = tmp_path / "work"
+    root.mkdir()
+    baseline = git_baseline.derive_baseline(str(root))
+    assert baseline.get("repository") is False, (
+        "fixture assumption broken: this root must be outside Git for its identity to be path-only "
+        f"(baseline={baseline})"
+    )
+    return root
+
+
+def test_a_root_replaced_at_the_same_path_is_a_different_plan(roots, tmp_path):
+    """THE DEFECT, on the digest side and through the real freeze.
+
+    The path, the script source, the inputs and the profile set are all unchanged; the only thing that
+    changed is which directory the path names. That has to be a different plan, because an approval is
+    an attestation about a directory someone looked at.
+    """
+    root = _non_git_root(tmp_path)
+    before = _plan_id(root)
+
+    root.rename(tmp_path / "moved-away")
+    (tmp_path / "work").mkdir()
+    after = _plan_id(root)
+
+    assert before != after, (
+        "a directory moved away and replaced by another at the same path produced the same plan_id, "
+        "so the replacement executes under an approval granted for a directory that is no longer "
+        "there (#827 criterion 2)"
+    )
+
+
+def test_an_unchanged_root_keeps_its_plan_id(roots, tmp_path):
+    """The false-positive direction, which matters as much as the defect.
+
+    An identifier that moved on every run would demand re-approval for a plan that executes
+    identically, and ``plan_identifier``'s own docstring names that as the failure mode with no remedy:
+    it trains an operator to approve without reading.
+    """
+    root = _non_git_root(tmp_path)
+    assert _plan_id(root) == _plan_id(root)
+
+
+def test_an_unbindable_root_is_recorded_in_the_identity_rather_than_skipped(roots, tmp_path):
+    """The fallback is a RECORDED state, so "bound" and "could not bind" are different plans.
+
+    On a filesystem with no usable inode the binding falls back to today's path-only identity. That
+    fallback must be visible: an operator approving a plan whose root identity is unbound is approving
+    something weaker than one whose root identity is bound, and a silent skip would make the two
+    indistinguishable.
+    """
+    from cli_agent_orchestrator.utils import git_baseline
+
+    root = _non_git_root(tmp_path)
+    bound = _plan_id(root)
+
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as patch:
+        # Patched on ``manifest_freeze``, not on ``git_baseline``: the freeze imports the function by
+        # name, and that is the binding the production call actually resolves (same idiom the
+        # ``derive_baseline`` patches in ``test_manifest_freeze.py`` use).
+        patch.setattr(
+            manifest_freeze,
+            "root_identity",
+            lambda path: {"bound": False, "reason": "root_identity_unsupported"},
+        )
+        unbound = _plan_id(root)
+
+    assert bound != unbound, (
+        "a root whose device and inode could not be bound hashes the same as one that was bound, so "
+        "the weaker identity is invisible in the identifier an operator approves"
+    )
+    frozen = manifest_freeze.freeze_manifest(source_hash="guard", inputs={}, cwd=str(root))
+    assert json.loads(frozen.manifest_json or "{}")["repo_baseline"]["root_identity"] == {
+        "bound": True,
+        "device": git_baseline.root_identity(str(root))["device"],
+        "inode": git_baseline.root_identity(str(root))["inode"],
+    }, "the manifest an operator reads must state which root identity the plan was frozen against"
+
+
+def _leaf_paths(value, prefix=()):
+    """Every (path, leaf) inside a guard-record value, so each can be changed on its own."""
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            yield from _leaf_paths(nested, (*prefix, key))
+    else:
+        yield prefix, value
+
+
+def _with_leaf_changed(record, key, path, leaf):
+    """A copy of ``record`` with exactly one leaf under ``key`` changed to a different value."""
+    import copy
+
+    mutated = copy.deepcopy(record)
+    target = mutated[key]
+    for step in path[:-1]:
+        target = target[step]
+    changed = (not leaf) if isinstance(leaf, bool) else f"{leaf}-changed"
+    if path:
+        target[path[-1]] = changed
+    else:
+        mutated[key] = changed
+    return mutated
+
+
+def test_every_value_the_admission_record_carries_is_compared_at_launch(roots, tmp_path):
+    """THE CLASS GUARD: a value recorded at admission that nothing compares at launch.
+
+    ``launch_guard.capture`` writes the launch state a run is admitted under and ``launch_guard.check``
+    is the only thing that reads it back. A field added to the record without a matching comparison is
+    not a half-finished feature -- it reads as a binding that exists, in a record an operator and a
+    reviewer both take at face value, while drifting freely for the whole run. Issue #827's root
+    identity is one instance; the profile set and the memory setting were the earlier ones.
+
+    Derived from the record ``capture`` actually produces, so a NEW key is covered the day it is added
+    and fails here until ``check`` compares it. For each key the requirement is that SOME single-leaf
+    change to it is refused -- not every change, because a leaf may legitimately mean "there is nothing
+    to compare" (``root_identity.bound: False`` is exactly that).
+    """
+    import pytest as _pytest
+
+    from cli_agent_orchestrator.services import launch_guard, settings_service
+
+    root = _non_git_root(tmp_path)
+    with _pytest.MonkeyPatch.context() as patch:
+        patch.setattr(settings_service, "is_workflow_approval_required", lambda: True)
+        patch.setattr(settings_service, "is_memory_enabled", lambda: False)
+        frozen = manifest_freeze.freeze_manifest(source_hash="guard", inputs={}, cwd=str(root))
+        record = launch_guard.capture(
+            profile_set=frozen.profile_set, root_identity=frozen.root_identity
+        )
+
+    assert "root_identity" in record, (
+        "the admission record no longer carries the working-directory root identity; #827 "
+        "criterion 2's binding has been removed, so update or delete this guard deliberately"
+    )
+    assert record["root_identity"] and record["root_identity"].get("bound"), (
+        "fixture assumption broken: a non-Git root must record a bound device/inode pair for this "
+        f"guard to exercise the comparison (record={record['root_identity']})"
+    )
+
+    uncompared = []
+    for key, value in record.items():
+        candidates = [
+            _with_leaf_changed(record, key, path, leaf) for path, leaf in _leaf_paths(value)
+        ]
+        refused = False
+        for candidate in candidates:
+            with _pytest.MonkeyPatch.context() as patch:
+                patch.setattr(
+                    launch_guard.settings_service,
+                    "resolve_workflow_approval_posture",
+                    lambda: settings_service.WorkflowApprovalPosture(
+                        True, settings_service.GATE_SOURCE_FILE
+                    ),
+                )
+                row = SimpleNamespace(
+                    tier="script",
+                    spec_snapshot=json.dumps(
+                        {"launch_guard": candidate, "working_directory": str(root)}
+                    ),
+                )
+                patch.setattr(launch_guard.workflow_journal, "get_run", lambda run_id: row)
+                patch.setattr(settings_service, "is_memory_enabled", lambda: False)
+                try:
+                    launch_guard.check("run-1", next(iter(record["profiles"]), "worker"))
+                except launch_guard.PlanInputsChangedError:
+                    refused = True
+                    break
+        if not refused:
+            uncompared.append(key)
+
+    assert not uncompared, (
+        "launch_guard.capture records these values and launch_guard.check compares none of them, so "
+        "they can change freely for the whole run while the record claims they were bound at "
+        f"approval: {uncompared}"
     )

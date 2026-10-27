@@ -1761,7 +1761,7 @@ class CodexProvider(BaseProvider):
                     )
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
-                    cfg = resolve_mcp_server_config(cfg)
+                    cfg = resolve_mcp_server_config(cfg, name=server_name)
                     if "command" in cfg:
                         command_parts.extend(
                             ["-c", f"{prefix}.command={_toml_scalar(cfg['command'])}"]

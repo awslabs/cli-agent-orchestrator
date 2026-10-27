@@ -26,7 +26,10 @@ Key characteristics (observed on ``agy`` 1.0.10, full-screen TUI):
   ``? for shortcuts``.
 - MCP config: written to ``~/.gemini/config/mcp_config.json`` under the
   top-level ``mcpServers`` key (``agy`` reads MCP servers from this fixed
-  path; there is no per-invocation override flag).
+  path; there is no per-invocation override flag). Every ``agy`` process
+  starts every server in that file, so entries must not pin a terminal
+  identity: ``cao-mcp-server`` takes ``CAO_TERMINAL_ID`` from the ``agy``
+  process environment instead (see ``_register_mcp_servers``, issue #940).
 - System prompt / role: ``agy`` honors a guarded ``-i`` instruction (verified:
   it adopts the role and waits without exploring when told to). The profile
   body, skill catalog, and (when tool-restricted) the security prompt are
@@ -40,6 +43,7 @@ counter, since the TUI looks identical in both states).
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -84,6 +88,63 @@ _MCP_CONFIG_WRITE_LOCK = threading.Lock()
 # change here would silently leave short.
 SHELL_WAIT_TIMEOUT_S = 10.0
 READY_TIMEOUT_FLOOR_S = 180.0
+
+# Field CAO adds to every entry it manages in agy's shared mcp_config.json:
+# the terminal ids currently using that entry. One entry serves every
+# terminal whose profile declares the same server config, so it is removed
+# only when its last user goes. agy ignores entry fields it does not know
+# (and its /mcp panel preserves them since 1.1.16), so the ownership record
+# travels with the entry it describes.
+_MCP_OWNERS_FIELD = "caoTerminalIds"
+
+
+def _shared_mcp_entry_key(server_name: str, entry: dict) -> str:
+    """Key for a shared entry: the server name plus a digest of its config.
+
+    Terminals whose profiles declare the same server config share one key (so
+    one entry, one server per ``agy`` process); a profile that declares the
+    same server name with a different config gets its own key instead of
+    overwriting another terminal's entry. The key is stable across terminals
+    and restarts, so the tool names ``agy`` shows the model stay stable too.
+    """
+    canonical = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
+    return f"{server_name}-{digest}"
+
+
+def _mcp_entry_owners(entry: object) -> Optional[List[str]]:
+    """Owning terminal ids of a CAO-managed entry, or None for any other entry."""
+    if not isinstance(entry, dict) or _MCP_OWNERS_FIELD not in entry:
+        return None
+    owners = entry[_MCP_OWNERS_FIELD]
+    if not isinstance(owners, list):
+        return []
+    return [owner for owner in owners if isinstance(owner, str) and owner]
+
+
+def _is_pinned_terminal_entry(key: str, entry: object) -> bool:
+    """True for an entry in the per-terminal shape CAO wrote before #940.
+
+    That shape is keyed ``{server_name}-{terminal_id}`` and pins
+    ``CAO_TERMINAL_ID`` in its env. Because every ``agy`` process starts every
+    server in the file, such an entry hands that terminal's identity to every
+    other worker that launches while it exists.
+    """
+    if not isinstance(entry, dict) or _MCP_OWNERS_FIELD in entry:
+        return False
+    env = entry.get("env")
+    terminal_id = env.get("CAO_TERMINAL_ID") if isinstance(env, dict) else None
+    return isinstance(terminal_id, str) and bool(terminal_id) and key.endswith(f"-{terminal_id}")
+
+
+def _write_mcp_config_atomically(path: Path, config: dict) -> None:
+    """Write ``config`` to ``path`` via a temp file + ``os.replace``, keeping its mode."""
+    tmp_path = path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(config, f, indent=2)
+    if path.exists():
+        os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
+    os.replace(tmp_path, path)
 
 
 def _log_cleanup_exception(fut: asyncio.Future) -> None:
@@ -232,8 +293,8 @@ class AntigravityCliProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
         self._model = model
-        # MCP server names registered into ~/.gemini/config/mcp_config.json,
-        # removed on cleanup().
+        # Keys of the shared ~/.gemini/config/mcp_config.json entries this
+        # terminal registered as an owner of; released on cleanup().
         self._mcp_server_names: list[str] = []
         # Turn counter. get_status() returns IDLE while _turns == 0 (fresh
         # spawn / post-init, no task delivered yet) and COMPLETED once at least
@@ -374,13 +435,26 @@ class AntigravityCliProvider(BaseProvider):
         """Register MCP servers into agy's ~/.gemini/config/mcp_config.json.
 
         agy reads MCP servers from this fixed file under the top-level
-        ``mcpServers`` key. We merge our entries in (preserving any existing,
-        non-CAO servers), forwarding ``CAO_TERMINAL_ID`` into each server's env
-        so cao-mcp-server can resolve the current terminal for handoff / assign.
+        ``mcpServers`` key, and every ``agy`` process starts every server listed
+        there. The entries therefore must not carry a terminal identity: an
+        entry that pinned ``CAO_TERMINAL_ID`` in its env was also started by
+        every other worker that launched while it existed, and whenever such a
+        worker's model picked that copy, its ``send_message`` / ``handoff`` /
+        ``assign`` calls went out under the pinning terminal's id (#940).
 
-        Each entry is keyed as ``{server_name}-{terminal_id}`` so concurrent
-        inits write to distinct keys and an earlier terminal's entry cannot be
-        overwritten before its agy process reads the config at startup.
+        Instead, ``CAO_TERMINAL_ID`` reaches ``cao-mcp-server`` from the ``agy``
+        process itself: the backend sets it in the terminal's pane environment,
+        ``agy`` inherits it, and agy's stdio MCP children inherit agy's
+        environment (an entry's ``env`` is merged on top). Each worker's ``agy``
+        then runs its own copy of one shared entry, and each copy reports its
+        own terminal. A ``CAO_TERMINAL_ID`` in a profile's server ``env`` is
+        dropped for the same reason.
+
+        Terminals whose profiles declare the same server config share one entry
+        (see ``_shared_mcp_entry_key``); the entry lists its users under
+        ``_MCP_OWNERS_FIELD`` and is removed when the last one is cleaned up.
+        Fields the user added to a shared entry (``disabled``,
+        ``disabledTools`` ...) are kept. Existing non-CAO servers are preserved.
 
         Concurrency: the file is shared across terminals. issue #494:
         ``_build_agy_command`` (the sole caller, via initialize()) now runs
@@ -388,9 +462,12 @@ class AntigravityCliProvider(BaseProvider):
         method in N threads at once -- ``_MCP_CONFIG_WRITE_LOCK`` (shared with
         ``_unregister_mcp_servers``) serializes the read-modify-write so one
         thread's write can never clobber another's concurrently-registered
-        entry. In-process only: a second cao-server process, or agy itself,
-        writing between our read and write is still a last-writer-wins lost
-        update.
+        entry. Because a shared entry's server config is identical for every
+        terminal that uses it, a terminal that registers while another's
+        ``agy`` is starting changes only the owner list, never what that
+        ``agy`` starts. In-process only: a second cao-server process, or agy
+        itself, writing between our read and write is still a last-writer-wins
+        lost update.
         """
         path = self._mcp_config_path()
         with _MCP_CONFIG_WRITE_LOCK:
@@ -426,9 +503,10 @@ class AntigravityCliProvider(BaseProvider):
                 servers = {}
                 config["mcpServers"] = servers
 
-            # GC: prune entries left by terminals that crashed/were killed
-            # without a graceful cleanup(). We're already holding the lock and
-            # about to write — cheap to check liveness now.
+            # GC: release entries held only by terminals that crashed/were
+            # killed without a graceful cleanup(), and drop per-terminal
+            # entries left by older CAO versions. We're already holding the
+            # lock and about to write — cheap to do now.
             self._prune_stale_mcp_entries(servers)
 
             for server_name, server_config in mcp_servers.items():
@@ -447,30 +525,46 @@ class AntigravityCliProvider(BaseProvider):
                     "command": command,
                     "args": args,
                 }
-                env = dict(cfg.get("env", {}))
-                env["CAO_TERMINAL_ID"] = self.terminal_id
-                entry["env"] = env
+                env = dict(cfg.get("env") or {})
+                # Never pin a terminal identity in the shared file (#940): the
+                # server inherits this terminal's id from the agy process.
+                if env.pop("CAO_TERMINAL_ID", None) is not None:
+                    logger.warning(
+                        "Ignoring CAO_TERMINAL_ID in the env of MCP server %r: every agy "
+                        "process starts every server in %s, so it is taken from each "
+                        "agy process's own environment instead",
+                        server_name,
+                        path,
+                    )
+                if env:
+                    entry["env"] = env
                 # Antigravity documents `cwd` ("Working directory for `stdio`
                 # servers."), so an agent plugin's directory is carried natively.
                 # Reported by review 5222539218 on #584 (item 4).
                 cwd = cfg.get("cwd")
                 if isinstance(cwd, str) and cwd:
                     entry["cwd"] = cwd
-                # Use a per-terminal key so concurrent inits don't overwrite
-                # each other's entry before agy reads the config at startup.
-                unique_key = f"{server_name}-{self.terminal_id}"
-                servers[unique_key] = entry
-                self._mcp_server_names.append(unique_key)
 
-            tmp_path = path.with_suffix(".json.tmp")
-            with open(tmp_path, "w") as f:
-                json.dump(config, f, indent=2)
-            if path.exists():
-                os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
-            os.replace(tmp_path, path)
+                key = _shared_mcp_entry_key(server_name, entry)
+                existing = servers.get(key)
+                owners = _mcp_entry_owners(existing) or []
+                if self.terminal_id not in owners:
+                    owners.append(self.terminal_id)
+                merged = dict(existing) if isinstance(existing, dict) else {}
+                merged.update(entry)
+                merged_env = merged.get("env")
+                if isinstance(merged_env, dict):
+                    # Hand-edited onto the shared entry: same rule as above.
+                    merged_env.pop("CAO_TERMINAL_ID", None)
+                merged[_MCP_OWNERS_FIELD] = owners
+                servers[key] = merged
+                if key not in self._mcp_server_names:
+                    self._mcp_server_names.append(key)
+
+            _write_mcp_config_atomically(path, config)
 
     def _unregister_mcp_servers(self) -> None:
-        """Remove the MCP servers this provider registered.
+        """Release the shared MCP entries this provider registered.
 
         Scheduled via ``loop.run_in_executor`` (fire-and-forget) from
         ``cleanup()`` when called on the event-loop thread, or run inline
@@ -479,11 +573,11 @@ class AntigravityCliProvider(BaseProvider):
         terminal's concurrent registration and corrupt the shared
         ``mcp_config.json`` read-modify-write.
 
-        An ownership check ensures only entries whose
-        ``env.CAO_TERMINAL_ID`` matches this instance's terminal_id are
-        removed — entries belonging to a newer terminal that re-registered
-        under the same server name are left intact, making fire-and-forget
-        scheduling safe regardless of executor ordering.
+        This terminal is removed from each entry's ``_MCP_OWNERS_FIELD``; the
+        entry itself is removed only once no terminal uses it any more, so a
+        teardown never takes a server away from another live terminal,
+        regardless of executor ordering. An entry that no longer carries the
+        owner field (the user replaced it) is left alone.
         """
         if not self._mcp_server_names:
             return
@@ -497,21 +591,20 @@ class AntigravityCliProvider(BaseProvider):
                     config = json.load(f)
                 servers = config.get("mcpServers") if isinstance(config, dict) else None
                 if isinstance(servers, dict):
+                    changed = False
                     for name in self._mcp_server_names:
                         entry = servers.get(name)
-                        env = entry.get("env", {}) if isinstance(entry, dict) else {}
-                        if (
-                            isinstance(entry, dict)
-                            and isinstance(env, dict)
-                            and env.get("CAO_TERMINAL_ID") != self.terminal_id
-                        ):
-                            continue  # belongs to a different terminal — leave it
-                        servers.pop(name, None)
-                    tmp_path = path.with_suffix(".json.tmp")
-                    with open(tmp_path, "w") as f:
-                        json.dump(config, f, indent=2)
-                    os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
-                    os.replace(tmp_path, path)
+                        owners = _mcp_entry_owners(entry)
+                        if not isinstance(entry, dict) or owners is None:
+                            continue  # gone, or no longer an entry CAO manages
+                        remaining = [owner for owner in owners if owner != self.terminal_id]
+                        if remaining:
+                            entry[_MCP_OWNERS_FIELD] = remaining
+                        else:
+                            servers.pop(name, None)
+                        changed = True
+                    if changed:
+                        _write_mcp_config_atomically(path, config)
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("Failed to unregister MCP servers from %s: %s", path, exc)
             finally:
@@ -520,25 +613,55 @@ class AntigravityCliProvider(BaseProvider):
                 self._mcp_server_names = []
 
     def _prune_stale_mcp_entries(self, servers: dict) -> None:
-        """Remove entries whose CAO_TERMINAL_ID no longer maps to a live terminal.
+        """Release entries held only by terminals that are no longer live.
 
         Called inside _register_mcp_servers while holding _MCP_CONFIG_WRITE_LOCK.
         Uses the database client directly (sync, safe — we're on a worker thread).
+
+        - A CAO-managed entry drops owners that no longer map to a live
+          terminal, and is removed when none are left.
+        - A per-terminal entry in the pre-#940 shape (``_is_pinned_terminal_entry``)
+          is removed whether or not its terminal is still live: every ``agy``
+          that starts while it exists would run it under that terminal's id.
+          An ``agy`` already running keeps the servers it started (agy reads
+          the file when it launches), so a live terminal from before the
+          upgrade keeps working.
+        - Any other entry is the user's and is left untouched.
         """
         from cli_agent_orchestrator.clients import database as _db
 
+        liveness: dict[str, bool] = {}
+
+        def is_live(terminal_id: str) -> bool:
+            if terminal_id not in liveness:
+                liveness[terminal_id] = _db.get_terminal_metadata(terminal_id) is not None
+            return liveness[terminal_id]
+
         stale_keys: list[str] = []
+        released_keys: list[str] = []
         for key, entry in servers.items():
-            env = entry.get("env", {}) if isinstance(entry, dict) else {}
-            tid = env.get("CAO_TERMINAL_ID") if isinstance(env, dict) else None
-            if tid is None:
-                continue  # not a CAO-managed entry — leave it
-            if _db.get_terminal_metadata(tid) is None:
+            if _is_pinned_terminal_entry(key, entry):
                 stale_keys.append(key)
+                continue
+            owners = _mcp_entry_owners(entry)
+            if owners is None:
+                continue  # not a CAO-managed entry — leave it
+            live = [owner for owner in owners if is_live(owner)]
+            if not live:
+                stale_keys.append(key)
+            elif live != entry[_MCP_OWNERS_FIELD]:
+                entry[_MCP_OWNERS_FIELD] = live
+                released_keys.append(key)
         for key in stale_keys:
             del servers[key]
         if stale_keys:
             logger.info("Pruned %d stale MCP config entries: %s", len(stale_keys), stale_keys)
+        if released_keys:
+            logger.info(
+                "Released dead terminals from %d shared MCP config entries: %s",
+                len(released_keys),
+                released_keys,
+            )
 
     async def _handle_startup_dialog(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None

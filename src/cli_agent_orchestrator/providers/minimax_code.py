@@ -321,7 +321,7 @@ class MiniMaxCodeProvider(BaseProvider):
             if isinstance(raw_config, dict)
             else raw_config.model_dump(exclude_none=True)
         )
-        config = resolve_mcp_server_config(config)
+        config = resolve_mcp_server_config(config, name=name)
         command = config.get("command")
         url = config.get("url")
         if not command and isinstance(url, str) and url:

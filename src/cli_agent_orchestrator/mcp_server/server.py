@@ -30,6 +30,7 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.mcp_server.utils import _auth_headers_for
+from cli_agent_orchestrator.models.memory import mcp_recall_wire_dict
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
 from cli_agent_orchestrator.services.memory_service import (
@@ -817,9 +818,9 @@ async def assign_elastic(
     denied = await asyncio.to_thread(_tool_denied_reason, "assign_elastic")
     if denied:
         return {"success": False, "terminal_id": None, "elastic": True, "message": denied}
-    from cli_agent_orchestrator.utils import agent_profiles
+    from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_store
 
-    if agent_profiles.routes_to_ephemeral_store(agent_profile):
+    if routes_to_ephemeral_store(agent_profile):
         from cli_agent_orchestrator.services.ephemeral_service import log_refusal
 
         text = f"remote_placement_not_allowed: ephemeral agent '{agent_profile}' can only launch on the node that created it; use assign or handoff"
@@ -1627,6 +1628,7 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         "workflow_run",
         "workflow_resume",
         "workflow_start",
+        "workflow_cancel",
     }:
         try:
             from cli_agent_orchestrator.services.settings_service import child_may_delegate
@@ -2087,38 +2089,11 @@ async def memory_recall(
         if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
             injectable_scopes = {"session", "project", "global"}
             memories = [memory for memory in memories if memory.scope in injectable_scopes]
+        # One serializer for both recall surfaces (this tool and
+        # POST /internal/memory/recall); see models/memory.py.
         return {
             "success": True,
-            "memories": [
-                {
-                    **(
-                        {"lifecycle_status": m.lifecycle_status}
-                        if m.lifecycle_status is not None
-                        else {}
-                    ),
-                    "key": m.key,
-                    "content": m.content,
-                    "memory_type": m.memory_type,
-                    "scope": m.scope,
-                    "tags": m.tags,
-                    "file_path": (
-                        getattr(m, "source_path", None)
-                        if getattr(m, "source_kind", "native") == "vault"
-                        else m.file_path
-                    ),
-                    "source_kind": getattr(m, "source_kind", "native"),
-                    "source_path": getattr(m, "source_path", None),
-                    "indexed_at": (
-                        m.indexed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-                        if getattr(m, "indexed_at", None)
-                        else None
-                    ),
-                    "index_freshness": getattr(m, "index_freshness", None),
-                    "content_truncated": bool(getattr(m, "content_truncated", False)),
-                    "updated_at": m.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                }
-                for m in memories
-            ],
+            "memories": [mcp_recall_wire_dict(m) for m in memories],
         }
     except MemoryDisabledError as e:
         return {"success": False, "disabled": True, "error": str(e)}
@@ -2756,6 +2731,10 @@ async def workflow_cancel(
     cancel is cooperative: the in-flight step runs to natural completion before the
     run settles to CANCELLED.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_cancel")
+    if denied:
+        return {"ok": False, "error": denied}
+
     try:
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",

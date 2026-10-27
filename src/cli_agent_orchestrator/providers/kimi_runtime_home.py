@@ -393,7 +393,7 @@ def merge_mcp_servers(
     for name, raw in (profile_servers or {}).items():
         config = _normalise_profile_server(raw)
         if "command" in config:
-            config = resolve_mcp_server_config(config)
+            config = resolve_mcp_server_config(config, name=name)
         # Select the declared protocol explicitly rather than letting Kimi infer
         # it from the URL path (see `KIMI_TRANSPORTS`). Applied on both launch
         # paths; without it this one emitted `type: sse` and Kimi started the
