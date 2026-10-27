@@ -223,18 +223,25 @@ class Memory(BaseModel):
 # The recalled-memory wire shape (#968, #1034)
 # ---------------------------------------------------------------------------
 #
-# Two client surfaces return recalled memories: the MCP ``memory_recall`` tool
-# and ``POST /internal/memory/recall``. Both used to decide the shape at their
-# own call site -- the route dumped the model, the tool hand-built a dict from a
+# This covers the two surfaces the memory gateway round-trips recalled
+# memories through: the MCP ``memory_recall`` tool and
+# ``POST /internal/memory/recall``. Both used to decide the shape at their own
+# call site -- the route dumped the model, the tool hand-built a dict from a
 # key allowlist -- so a field added to ``Memory`` widened one surface and not
 # the other. #1034 is that bug: ``redacted_patterns`` appeared on the route and
 # was invisible on the tool, and only the route's #968 pin caught it.
 #
-# Both surfaces now call into this section, so there is one place to edit. The
-# serialized field list itself stays where it belongs, on the model: adding a
-# field to ``Memory`` without ``exclude=True`` puts it on the wire, and
-# ``test/models/test_memory_wire_shape.py`` is the pin that makes that
-# deliberate.
+# Those two surfaces now call into this section, so there is one place to edit
+# between them. The serialized field list itself stays where it belongs, on
+# the model: adding a field to ``Memory`` without ``exclude=True`` puts it on
+# the wire, and ``test/models/test_memory_wire_shape.py`` is the pin that
+# makes that deliberate.
+#
+# ``GET /memory`` and ``GET /memory/{key}`` are a separate, operator-facing
+# REST projection: they build ``MemorySummary``/``MemoryDetail`` through
+# ``_to_memory_summary`` (``api/main.py``), its own hand-written field list
+# that deliberately excludes fields like ``file_path``. That surface is not
+# covered here.
 
 #: Keys the MCP ``memory_recall`` tool projects out of the full wire dict, in
 #: the order the tool emits them (#968 ``MCP_PIN``). A strict subset of

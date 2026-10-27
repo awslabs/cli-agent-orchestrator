@@ -1,9 +1,11 @@
 """Unit tests for cao-mcp-server command resolution."""
 
+from pathlib import Path
 from unittest.mock import patch
 
 from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_MCP_SERVER_MODULE,
+    cao_server_env,
     resolve_cao_mcp_command,
     resolve_mcp_server_config,
 )
@@ -167,7 +169,10 @@ class TestPersistedResolution:
 class TestResolveMcpServerConfig:
     """resolve_mcp_server_config wraps the resolver over a config dict."""
 
-    def test_resolves_command_and_preserves_other_keys(self):
+    def test_resolves_command_and_preserves_other_keys(self, monkeypatch):
+        # The default-server case must be independent of the CAO running pytest.
+        for name in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+            monkeypatch.delenv(name, raising=False)
         with (
             patch(f"{MOD}._sibling_script", return_value=""),
             patch(f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"),
@@ -247,3 +252,63 @@ class TestResolveMcpServerConfig:
         out = resolve_mcp_server_config({"type": "stdio", "command": "my-server"})
         assert out["command"] == "my-server"
         assert "args" not in out
+
+
+class TestServerEnv:
+    """A runtime bundled server learns the address and home of the CAO that launched it."""
+
+    @staticmethod
+    def _set(monkeypatch, **values):
+        for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        for key, value in values.items():
+            monkeypatch.setenv(key, value)
+
+    def test_runtime_bundled_entry_gains_the_set_variables(self, monkeypatch):
+        self._set(monkeypatch, CAO_API_PORT="9899", CAO_HOME_DIR="/srv/cao-b")
+        monkeypatch.setattr(f"{MOD}.CAO_HOME_DIR", Path("/srv/cao-b"))
+        with patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"):
+            out = resolve_mcp_server_config(
+                {"command": "cao-mcp-server", "env": {"CAO_TERMINAL_ID": "abc"}}
+            )
+        assert out["env"] == {
+            "CAO_API_PORT": "9899",
+            "CAO_HOME_DIR": "/srv/cao-b",
+            "CAO_TERMINAL_ID": "abc",
+        }
+
+    def test_relative_cao_home_dir_is_forwarded_as_the_resolved_absolute_path(self, monkeypatch):
+        """P2-1: a relative ``CAO_HOME_DIR`` must not re-resolve against a
+        child's (different) cwd. ``cao_server_env`` must forward the already-
+        resolved absolute path (``constants.CAO_HOME_DIR``), not the raw env
+        text, even though the raw text is what's set in ``os.environ``."""
+        self._set(monkeypatch, CAO_HOME_DIR="cao-home")
+        monkeypatch.setattr(f"{MOD}.CAO_HOME_DIR", Path("/srv/resolved/cao-home"))
+        assert cao_server_env() == {"CAO_HOME_DIR": "/srv/resolved/cao-home"}
+
+    def test_cao_home_dir_absent_when_env_unset(self, monkeypatch):
+        self._set(monkeypatch)
+        monkeypatch.setattr(f"{MOD}.CAO_HOME_DIR", Path("/default/home"))
+        assert "CAO_HOME_DIR" not in cao_server_env()
+
+    def test_the_entry_own_env_wins(self, monkeypatch):
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        with patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"):
+            out = resolve_mcp_server_config(
+                {"command": "cao-mcp-server", "env": {"CAO_API_PORT": "7000"}}
+            )
+        assert out["env"] == {"CAO_API_PORT": "7000"}
+
+    def test_persisted_custom_and_default_entries_gain_nothing(self, monkeypatch):
+        self._set(monkeypatch, CAO_API_PORT="9899")
+        with (
+            patch(f"{MOD}._sibling_script", return_value=""),
+            patch(f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"),
+        ):
+            persisted = resolve_mcp_server_config({"command": "cao-mcp-server"}, persisted=True)
+        custom = resolve_mcp_server_config({"command": "my-server"})
+        assert "env" not in persisted and "env" not in custom
+        self._set(monkeypatch)
+        with patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"):
+            default = resolve_mcp_server_config({"command": "cao-mcp-server"})
+        assert "env" not in default

@@ -8,10 +8,12 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, cast
 from urllib.parse import quote
 
 from cli_agent_orchestrator.constants import MODEL_ID_RE
+from cli_agent_orchestrator.decisions.fixed_table import FixedTableDecider
 from cli_agent_orchestrator.decisions.owner import DELEGATION, WORKFLOW_STEP
 from cli_agent_orchestrator.decisions.policy import (
     IDENTITY_POLICY,
@@ -60,6 +62,13 @@ FALLBACK_REASONS = frozenset(
         "decider_unavailable",
     )
 )
+# Reasons that mean the decider gave no usable answer. Other reasons are answers, such as
+# unsure or low_confidence, except not_honored, which never asked the decider.
+DECIDER_FAILURES = frozenset(
+    ("timeout", "error", "invalid_answer", "no_answer", "decider_unavailable")
+)
+_LOG_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_UNSEEN = object()
 
 
 @dataclass(frozen=True)
@@ -81,6 +90,34 @@ def _honors(provider: str, name: str | None, profile: AgentProfile | None) -> bo
     return bool(ProviderManager.provider_class(provider).honors_model(name, profile, None))
 
 
+def _label(value: str) -> str:
+    # Decider names come from settings; a malformed one must not write arbitrary log text.
+    return value if _LOG_LABEL.fullmatch(value) else "<invalid>"
+
+
+def _file_version(path: Path) -> tuple[int, int, int] | None:
+    try:
+        stat = path.lstat()
+    except OSError:
+        return None
+    return stat.st_ino, stat.st_mtime_ns, stat.st_size
+
+
+def _settings_version() -> object:
+    """A cheap change marker for settings.json and the halt marker."""
+    from cli_agent_orchestrator.decisions import egress
+    from cli_agent_orchestrator.services import settings_service
+
+    return _file_version(settings_service.SETTINGS_FILE), _file_version(egress.HALT_FILE)
+
+
+@dataclass
+class _FailureStreak:
+    reason: str
+    reason_warned: bool = False
+    warned: bool = False
+
+
 class DecisionEngine:
     def __init__(
         self,
@@ -91,14 +128,118 @@ class DecisionEngine:
         settings_loader: Callable[[], DecisionSettings] = load_settings,
         profile_loader: Callable[[str], AgentProfile | None] = load_agent_profile,
         honors_model: Callable[[str, str | None, AgentProfile | None], bool] = _honors,
+        clock: Callable[[], float] = time.monotonic,
+        warning_interval_s: float = 60.0,
+        settings_version: Callable[[], object] = _settings_version,
     ) -> None:
         self.registry, self.store, self.runner = registry, store, runner
         self.settings_loader = settings_loader
         self.profile_loader = profile_loader
         self.honors_model = honors_model
+        self._clock = clock
+        self._warning_interval_s = warning_interval_s
+        self._settings_version = settings_version
+        self._logged_settings: tuple[Any, ...] | None = None
+        self._streaks: dict[tuple[str, str], _FailureStreak] = {}
+        self._warned_at: dict[tuple[str, str, str], float] = {}
+
+    def log_settings(self, settings: DecisionSettings) -> None:
+        """Log the resolved settings, then again only when they change."""
+        try:
+            points = ",".join(
+                f"{point}={value.state.value}:{_label(value.decider)}"
+                for point, value in sorted(settings.points.items())
+            )
+            summary = (
+                settings.confidence_threshold,
+                settings.on_timeout_ms,
+                settings.shadow_timeout_ms,
+                points,
+            )
+            if summary != self._logged_settings:
+                logger.info(
+                    "Decision settings: threshold=%s on_timeout_ms=%s shadow_timeout_ms=%s "
+                    "points=%s",
+                    *summary,
+                )
+                self._logged_settings = summary
+        except Exception:
+            # Diagnostics never change a decision or a launch.
+            pass
+
+    async def watch_settings(self, *, interval_s: float = 2.0) -> None:
+        """Log settings changes as they are saved, without waiting for a launch."""
+        seen: object = _UNSEEN
+        while True:
+            try:
+                version = await asyncio.to_thread(self._settings_version)
+                if version != seen:
+                    if seen is not _UNSEEN:
+                        self.log_settings(await asyncio.to_thread(self.settings_loader))
+                    seen = version
+            except Exception:
+                logger.debug("Decision settings check failed")
+            await asyncio.sleep(interval_s)
+
+    def _observe(
+        self, decider: str, point: str, reason: str | None, asked: Decider | None = None
+    ) -> None:
+        try:
+            self._log_health(decider, point, reason, asked)
+        except Exception:
+            # Diagnostics never change a decision or a launch.
+            pass
+
+    def _log_health(
+        self, decider: str, point: str, reason: str | None, asked: Decider | None = None
+    ) -> None:
+        # Labels only: never the request, profile, purpose, brief or exception text.
+        if reason == "not_honored":
+            return
+        if reason == "no_answer" and type(asked) is FixedTableDecider:
+            # The built-in table returns nothing for a profile it has no entry for: an
+            # abstention, like unsure, not a failure. External deciders that return no
+            # answer still warn, since that reason also covers real outages. Keyed on the
+            # built-in's identity, not the configured name, so a package that registers
+            # itself under the name "fixed_table" still warns on its own outages.
+            reason = None
+        key = (decider, point)
+        streak = self._streaks.get(key)
+        if reason not in DECIDER_FAILURES:
+            self._streaks.pop(key, None)
+            if streak is not None and streak.warned:
+                logger.info(
+                    "Decision decider recovered: decider=%s point=%s", _label(decider), point
+                )
+            return
+        if streak is None:
+            streak = self._streaks[key] = _FailureStreak(reason)
+        elif streak.reason != reason:
+            streak.reason, streak.reason_warned = reason, False
+        if streak.reason_warned:
+            return
+        # A suppressed transition is warned about later if the failure persists.
+        now = self._clock()
+        last = self._warned_at.get((decider, point, reason))
+        if last is not None and now - last < self._warning_interval_s:
+            return
+        logger.warning(
+            "Decision decider failing: decider=%s point=%s reason=%s",
+            _label(decider),
+            point,
+            reason,
+        )
+        self._warned_at[(decider, point, reason)] = now
+        streak.reason_warned = streak.warned = True
+
+    async def _ask_observed(self, name: str, point: str, *args: Any) -> dict[str, Any]:
+        values = await self._ask(point, *args)
+        self._observe(name, point, values.get("reason"), args[0])
+        return values
 
     async def prepare_launch(self, req: DelegationRequest) -> LaunchPlan | None:
         settings = self.settings_loader()
+        self.log_settings(settings)
         target = req.target_kind or profile_source(req.agent_profile)
         fields = (
             dict(req.field_states)
@@ -162,6 +303,7 @@ class DecisionEngine:
                 kind="workflow_step" if req.owner == WORKFLOW_STEP else req.kind,
                 provider=req.provider,
                 agent_profile=req.agent_profile,
+                target_kind="workflow" if req.owner == WORKFLOW_STEP else target.value,
                 fallback_source=source,
                 fallback_value=value,
                 outcome="fallback",
@@ -304,6 +446,7 @@ class DecisionEngine:
                         settings.on_timeout_ms,
                     )
                 )
+                self._observe(active[point].decider, point, values["reason"], decider)
                 # A missing default tier was already refused above, before any decider call.
                 if point == "model.route" and values.get("candidate_model"):
                     plan_model = values["candidate_model"]
@@ -313,6 +456,7 @@ class DecisionEngine:
                     continue
                 decider, reason = self._resolve(point, req, profile, active[point].decider)
                 if reason:
+                    self._observe(active[point].decider, point, reason)
                     insert(
                         {**base(point, decider), "outcome": "shadow", "reason": reason}, message()
                     )
@@ -327,7 +471,8 @@ class DecisionEngine:
                         self.runner.submit(
                             record_id,
                             partial(
-                                self._ask,
+                                self._ask_observed,
+                                active[point].decider,
                                 point,
                                 decider,
                                 ask_request,
