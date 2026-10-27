@@ -1,5 +1,6 @@
 """Unit tests for cao-mcp-server command resolution."""
 
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -395,3 +396,166 @@ class TestServerEnv:
             persisted=True,
         )
         assert "env" not in out
+
+
+class TestCoordinatesAreShapeGated:
+    """The launching CAO's coordinates are gated on ``is_bundled_cao_server`` alone.
+
+    #1089 added a NAME clause to ``resolve_mcp_server_config`` so ``uvx`` and
+    absolute-path launches gained the address. Both already match by SHAPE, and the
+    name clause handed this CAO's coordinates to any entry merely *called*
+    ``cao-mcp-server``, whatever it launched -- which surfaced as
+    ``test_accepts_normal_names_and_env_keys`` being green in CI (no ``CAO_*``
+    exported) and red for every developer with ``CAO_HOME_DIR`` set. #1062's
+    identity forwarder had already refused name trust for the same reason. These
+    tests pin the convergence: shape in, name out, and the refusal is visible.
+    """
+
+    #: Every entry here is NOT the bundled server, whatever it is named. The first
+    #: row is the exact fixture of the test that was red on main.
+    NOT_BUNDLED = [
+        ({"command": "cmd", "args": [], "env": {"API_KEY": "v"}}, "cao-mcp-server"),
+        ({"command": "node", "args": ["server.js"]}, "cao-mcp-server"),
+        ({"command": "uvx", "args": ["--from", "pkg", "my-server"]}, "cao-mcp-server"),
+        ({"command": "uvx", "args": ["--from", "pkg", "my-server"]}, "my-server"),
+        ({"command": "python3", "args": ["-m", "some.other.module"]}, "cao-mcp-server"),
+        ({"command": "python3", "args": [CAO_MCP_SERVER_MODULE]}, "cao-mcp-server"),
+        ({"command": "/usr/local/bin/my-cao-mcp-server"}, None),
+        ({"command": "cao-mcp-server-dev"}, None),
+        ({"command": "node"}, "cao-mcp-server-2"),
+        ({"command": ["uvx", "x"]}, "cao-mcp-server"),
+        ({"command": 123}, "cao-mcp-server"),
+        ({"type": "http", "url": "https://example.com/mcp"}, "cao-mcp-server"),
+    ]
+
+    #: Every launch shape the resolver can emit or a profile can write for the
+    #: bundled server, mostly under names that are NOT ``cao-mcp-server``.
+    BUNDLED = [
+        ({"command": "cao-mcp-server"}, None),
+        ({"command": "cao-mcp-server", "args": []}, "orchestrator"),
+        ({"command": "/opt/cao/bin/cao-mcp-server"}, "orchestrator"),
+        ({"command": "C:\\cao\\Scripts\\cao-mcp-server.exe"}, None),
+        (
+            {"command": "uvx", "args": ["--from", "cli-agent-orchestrator", "cao-mcp-server"]},
+            "orchestrator",
+        ),
+        ({"command": "/venv/bin/python3", "args": ["-m", CAO_MCP_SERVER_MODULE]}, "orchestrator"),
+        ({"command": ["uvx", "cao-mcp-server"]}, None),
+    ]
+
+    COORDS = {"CAO_API_HOST": "10.0.0.5", "CAO_API_PORT": "9777", "CAO_HOME_DIR": "/srv/cao-gate"}
+
+    @staticmethod
+    def _resolve(config, name):
+        kwargs = {"name": name} if name is not None else {}
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            return resolve_mcp_server_config(config, **kwargs)
+
+    def test_coordinate_injection_is_shape_gated_under_every_env_combination(self, monkeypatch):
+        """ONE test over the whole table under all eight set/unset combinations of
+        the three coordinates, so the class "green in CI, red with ``CAO_*``
+        exported" cannot recur: CI runs the exported combinations too."""
+        import itertools
+
+        monkeypatch.setattr(f"{MOD}.CAO_HOME_DIR", Path(self.COORDS["CAO_HOME_DIR"]))
+        failures = []
+        for flags in itertools.product((False, True), repeat=len(self.COORDS)):
+            expected_env = {}
+            for (key, value), is_set in zip(self.COORDS.items(), flags):
+                monkeypatch.delenv(key, raising=False)
+                if is_set:
+                    monkeypatch.setenv(key, value)
+                    expected_env[key] = value
+            for config, name in self.NOT_BUNDLED:
+                out = self._resolve(config, name)
+                if out.get("env") != config.get("env"):
+                    failures.append(("not bundled", flags, name, config, out.get("env")))
+            for config, name in self.BUNDLED:
+                out = self._resolve(config, name)
+                got = out.get("env", {})
+                if got != expected_env:
+                    failures.append(("bundled", flags, name, config, got))
+        assert failures == []
+
+    def test_uvx_shape_gains_the_address_under_any_name(self, monkeypatch):
+        """The under-match #1089 left: a ``uvx --from ... cao-mcp-server`` entry
+        whose key is NOT ``cao-mcp-server`` is still the bundled server by shape
+        (#1062 ``is_bundled_cao_server``), so it gains the address."""
+        for key in ("CAO_API_HOST", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("CAO_API_PORT", "9777")
+        out = resolve_mcp_server_config(
+            {"command": "uvx", "args": ["--from", "cli-agent-orchestrator", "cao-mcp-server"]},
+            name="orchestrator",
+        )
+        assert out["env"] == {"CAO_API_PORT": "9777"}
+        assert out["command"] == "uvx"
+
+    def test_module_entrypoint_shape_gains_the_address_under_any_name(self, monkeypatch):
+        """Same for ``<python> -m cli_agent_orchestrator.mcp_server.server``, the
+        form :func:`resolve_cao_mcp_command` itself falls back to."""
+        for key in ("CAO_API_HOST", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("CAO_API_PORT", "9777")
+        out = resolve_mcp_server_config(
+            {"command": "/venv/bin/python3", "args": ["-m", CAO_MCP_SERVER_MODULE]},
+            name="orchestrator",
+        )
+        assert out["env"] == {"CAO_API_PORT": "9777"}
+
+    def test_name_only_match_gains_nothing_and_is_logged(self, monkeypatch, caplog):
+        """The pin for the decision: an entry NAMED ``cao-mcp-server`` that launches
+        something else gains no coordinate, and the refusal is one WARNING line
+        naming the entry, so the operator learns why the server reached no CAO."""
+        monkeypatch.setenv("CAO_API_PORT", "9777")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-gate")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.setattr(f"{MOD}.CAO_HOME_DIR", Path("/srv/cao-gate"))
+        caplog.set_level(logging.WARNING, logger=MOD)
+        out = resolve_mcp_server_config(
+            {"command": "cmd", "args": [], "env": {"API_KEY": "v"}}, name="cao-mcp-server"
+        )
+        assert out["env"] == {"API_KEY": "v"}
+        assert out["command"] == "cmd"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "'cao-mcp-server'" in warnings[0].getMessage()
+        assert "'cmd'" in warnings[0].getMessage()
+        assert "no CAO coordinates" in warnings[0].getMessage()
+
+    def test_no_warning_when_the_shape_matches_or_the_name_is_ordinary(self, monkeypatch, caplog):
+        monkeypatch.setenv("CAO_API_PORT", "9777")
+        caplog.set_level(logging.WARNING, logger=MOD)
+        self._resolve(
+            {"command": "uvx", "args": ["--from", "pkg", "cao-mcp-server"]}, "cao-mcp-server"
+        )
+        self._resolve({"command": "cmd"}, "my-server")
+        self._resolve({"command": "cmd"}, None)
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_cao_server_env_has_exactly_two_callers_in_the_package(self):
+        """Every injection of this CAO's coordinates goes through one of two known
+        writers: the shape-gated resolver and the herdr backend's launch
+        environment. A new direct caller of ``cao_server_env()`` is a third place
+        the gate can be bypassed, so it has to update this list on purpose."""
+        import ast
+
+        src = Path(__file__).resolve().parents[2] / "src" / "cli_agent_orchestrator"
+        callers = set()
+        for path in sorted(src.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                called = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr if isinstance(func, ast.Attribute) else None
+                )
+                if called == "cao_server_env":
+                    callers.add(path.relative_to(src).as_posix())
+        assert callers == {"utils/mcp_resolution.py", "backends/herdr_backend.py"}
