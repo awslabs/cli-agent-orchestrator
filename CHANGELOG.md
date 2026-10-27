@@ -1103,6 +1103,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator, and every provider that launches CAO's own MCP server now injects the launching
   terminal's own id, overriding (and logging) a profile that tries to pin one; antigravity drops the
   variable instead, because its config file is shared across that terminal's siblings (#940). The
+  launching CAO's coordinates (`CAO_API_HOST`/`CAO_API_PORT`/`CAO_HOME_DIR`, #1075/#1089) are now
+  gated on the same shape predicate as the identity: both are injected only into an entry that
+  launches the bundled server (bare script, absolute path, `.exe`, module entrypoint, or the script
+  named in a `uvx` entry's args), the entry's name in `mcpServers` is no longer trusted for either,
+  and an entry merely named `cao-mcp-server` that launches something else gains nothing and is
+  logged. The
   gate is #972's own
   middleware, moved to
   `security/mcp_tool_gate.py` and installed on both surfaces, and the `@server` spelling rule is now

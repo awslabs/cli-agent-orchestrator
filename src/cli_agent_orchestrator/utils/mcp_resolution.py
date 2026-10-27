@@ -161,25 +161,42 @@ def resolve_mcp_server_config(
     launched it. A persisted entry gains nothing: it outlives this process and
     may be read by another CAO.
 
-    ``name`` is the entry's own key in the profile's ``mcpServers`` map, for a
-    caller that iterates it by name (every provider using this function does).
-    A profile can start the bundled server through ``uvx`` or an absolute path
-    rather than the bare console-script command, same as Codex already
-    recognises in its own launch config (``codex.py``'s ``is_cao_server``). The
-    entry is still treated as the CAO server — and so still gains the address —
-    when its name is ``cao-mcp-server`` or its command's final path segment is,
-    even though ``command`` itself is not the bare string.
+    Whether an entry IS the bundled server is decided by :func:`is_bundled_cao_server`
+    ALONE -- by the shape of what it launches (the console script by bare name,
+    absolute path or ``.exe``; the module entrypoint; the script named in ``args``
+    as ``uvx --from ... cao-mcp-server`` does), never by the key it sits under in
+    ``mcpServers``. #1089 first made the ``uvx`` and absolute-path launches gain
+    the address by trusting the entry's NAME; the same predicate already covers
+    both by shape, and name trust had two costs: an entry merely *called*
+    ``cao-mcp-server`` that launches some other program was handed this CAO's
+    coordinates (visible as a test that is green in CI and red for any developer
+    with ``CAO_HOME_DIR`` exported), and the identity forwarder beside this
+    function (#1062) already refused to trust the name for the same reason -- the
+    name is the attacker's to choose. Coordinates and identity are now gated on
+    the one predicate.
+
+    ``name`` is therefore INFORMATIONAL: the entry's own key in the profile's
+    ``mcpServers`` map, passed by every provider that iterates the map. It is
+    used only to make a refused name-only match visible -- an entry named
+    ``cao-mcp-server`` whose shape does not launch the bundled server is logged
+    at WARNING, so the operator who wrote the profile learns that no coordinates
+    were injected rather than discovering it when the server talks to the wrong
+    CAO.
     """
     if "command" not in config:
         return dict(config)
     resolved = dict(config)
     command = resolved.get("command", "")
     args = resolved.get("args", []) or []
-    is_cao_server = (
-        command == CAO_MCP_SERVER_COMMAND
-        or name == CAO_MCP_SERVER_COMMAND
-        or (isinstance(command, str) and Path(command).name == CAO_MCP_SERVER_COMMAND)
-    )
+    is_cao_server = is_bundled_cao_server(resolved)
+    if not is_cao_server and name == CAO_MCP_SERVER_COMMAND:
+        logger.warning(
+            "MCP server %r is named like the bundled CAO server but does not launch it "
+            "(command=%r); the entry name is not trusted (#1062), so no CAO coordinates "
+            "were injected into its env",
+            name,
+            command,
+        )
     if is_cao_server and not persisted:
         server_env = cao_server_env()
         if server_env:
