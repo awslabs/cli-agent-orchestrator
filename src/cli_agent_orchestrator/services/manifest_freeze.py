@@ -60,7 +60,11 @@ from cli_agent_orchestrator.utils.agent_profiles import (
     profile_set_digest,
     read_profile_set,
 )
-from cli_agent_orchestrator.utils.git_baseline import derive_baseline, normalize_unavailable_reason
+from cli_agent_orchestrator.utils.git_baseline import (
+    derive_baseline,
+    normalize_unavailable_reason,
+    root_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +98,35 @@ class FrozenManifest:
     far as reading the set.
     """
 
+    root_identity: Optional[Mapping[str, Any]] = None
+    """The ONE ``st_dev``/``st_ino`` read of the working-directory root this freeze took. EITHER KIND.
+
+    The same seam as ``profile_set`` above, for the same reason: the start paths hand this to
+    ``launch_guard.capture(root_identity=...)`` so the per-run guard compares against the pair this
+    freeze read, not a second stat taken after the approval gate — a root replaced in that window would
+    otherwise be recorded as the approved one.
+
+    A GIT ROOT IS CARRIED HERE TOO, AND THAT IS NOT THE SAME AS BINDING IT INTO ``plan_id``. The two
+    consumers of this one stat want different things, and the asymmetry lives in exactly one of them:
+
+    * ``plan_id`` (through ``derive_baseline``, which folds the pair into the baseline for a NON-GIT
+      root only) must not bind a Git root's inode, because a Git root's identity is its commit plus
+      worktree digest — content, not location — and binding the inode would destroy "two checkouts in
+      the same state are ONE plan". See ``git_baseline``'s module docstring.
+    * the LAUNCH GUARD must bind both kinds, because the argument that protects a Git root holds across
+      runs only. Nothing recomputes ``plan_id`` inside a run or at resume: resume compares the stored
+      value and an agent launch compares only the guard record. So a Git worktree removed and re-added
+      at the same path, or a repository re-cloned there, mid-run left every later terminal starting by
+      path inside the replacement checkout under the original approval, and nothing refused it
+      (fanhongy's ask 2 on PR #1051). The guard's pair never reaches ``plan_id``, so Git identifiers do
+      not move.
+
+    ``None`` only when the freeze produced no available baseline or failed outright, in which case the
+    run is refused and there is nothing to guard. An unbindable root (no usable inode, unreadable) is
+    carried as ``{"bound": False, "reason": ...}`` rather than ``None``, which the guard records and
+    skips comparing — there is no pair to compare against.
+    """
+
 
 def freeze_manifest(
     *,
@@ -112,11 +145,27 @@ def freeze_manifest(
     is exactly where a credential appears in practice.
     """
     try:
-        baseline: Dict[str, Any] = derive_baseline(cwd or os.getcwd())
+        root = cwd or os.getcwd()
+        # issue #827 criterion 2: ONE stat of the root, taken here and threaded through both
+        # consumers. ``derive_baseline`` folds it into the non-Git baseline (and therefore into
+        # ``plan_id``), and the same value is handed to ``launch_guard.capture`` below the gate, so the
+        # identifier and the guard describe the same directory rather than two stats either side of the
+        # approval check.
+        identity = root_identity(root)
+        baseline: Dict[str, Any] = derive_baseline(root, identity=identity)
         if not baseline.get("available"):
             reason = normalize_unavailable_reason(baseline.get("reason"))
             logger.warning("manifest freeze unavailable repository baseline: reason=%s", reason)
             return FrozenManifest(None, reason)
+        bound_identity = baseline.get("root_identity")
+        if isinstance(bound_identity, dict) and not bound_identity.get("bound"):
+            # The fallback is to today's path-only identity, and it is REPORTED rather than silent:
+            # the unbound marker is in the baseline, so it is in ``plan_id`` and in the manifest an
+            # operator reads. Only the closed reason is logged, never the path.
+            logger.warning(
+                "manifest freeze could not bind the working-directory root identity: reason=%s",
+                bound_identity.get("reason"),
+            )
 
         # issue #827: the ONE thing neither the source hash nor the repository baseline can cover. A
         # step's behaviour and tool policy come from its agent profile's CONTENT, resolved from a file
@@ -178,7 +227,18 @@ def freeze_manifest(
             memory_content="",
             memory_source="",
         )
-        return FrozenManifest(execution_manifest.serialise(envelope), profile_set=profile_snapshot)
+        return FrozenManifest(
+            execution_manifest.serialise(envelope),
+            profile_set=profile_snapshot,
+            # ``identity`` ITSELF, not ``baseline.get("root_identity")``. The baseline carries the pair
+            # for a non-Git root only, deliberately (it is what reaches ``plan_id``), and reading the
+            # guard's value back off it made the guard inherit that asymmetry: a Git root arrived as
+            # ``None`` and ``_check_root_identity`` skipped it, so a Git worktree swapped mid-run or
+            # across a resume was never detected (fanhongy's ask 2 on PR #1051). This is still the ONE
+            # stat taken above, so the identifier and the guard describe the same directory and the
+            # P3-3 window between them stays closed.
+            root_identity=identity,
+        )
     except Exception:  # noqa: BLE001 - freeze failure refuses admission, never exposes inputs
         logger.warning("manifest freeze failed: reason=internal")
         return FrozenManifest(None, "internal")

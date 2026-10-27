@@ -172,8 +172,17 @@ pins this table to the workflow files.
   deliberately.
 - **A test that touches CAO's own state can pass only on your machine.** If a code path
   reaches the real database, config dir, or a live session, it will be green on a
-  developer box that has an initialised CAO install and red on a clean runner with
-  `sqlite3.OperationalError: no such table: terminals`. Mock the store/DB seam explicitly;
+  developer box that has an initialised CAO install and red on a clean runner — where the
+  tables exist but are *empty*, so the symptom is a missing row rather than
+  `sqlite3.OperationalError: no such table: terminals`. The schema itself is no longer the
+  variable: the root `test/conftest.py` runs `init_db()` once per session against the
+  configured home when that home has no schema at all (`_cao_home_schema`, guarded by
+  `test/test_isolated_home_has_schema.py`), so a throwaway `CAO_HOME_DIR` gets empty tables
+  instead of no tables. Under `-n` that is once per *worker process*, since each xdist
+  worker is a separate process with its own session — they all check and build the same
+  home, so the check and `init_db()` run under an exclusive `flock` on
+  `$CAO_HOME_DIR/db/.test-schema-init.lock` and the losers see the winner's finished schema
+  instead of `table ... already exists`. Mock the store/DB seam explicitly;
   when a test exercises a service function, check what that function calls *today* — a
   rebase can introduce a new unmocked DB write into a path your test already covered.
   Verify by running under a throwaway `HOME` **and** a throwaway `CAO_HOME_DIR` —

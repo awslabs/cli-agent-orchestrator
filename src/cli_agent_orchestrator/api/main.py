@@ -1658,9 +1658,9 @@ async def lifespan(app: FastAPI):
         decision_runner,
         settings_loader=decision_settings_loader,
     )
-    logger.info(
-        "Decision states: %s", {p: v.state.value for p, v in decision_settings.points.items()}
-    )
+    # Logs the resolved threshold, timeouts, point states and deciders, then each change.
+    app.state.decision_engine.log_settings(decision_settings)
+    decision_settings_task = asyncio.create_task(app.state.decision_engine.watch_settings())
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
@@ -1805,6 +1805,8 @@ async def lifespan(app: FastAPI):
     # asyncio.gather with the tasks above.
     fifo_manager.stop_watchdog()
 
+    decision_settings_task.cancel()
+    await asyncio.gather(decision_settings_task, return_exceptions=True)
     await decision_runner.close()
     await decision_registry.close()
     await registry.teardown()
@@ -6663,7 +6665,10 @@ async def submit_workflow_run_endpoint(
                 # Called inside the lambda, not passed to to_thread as a value, so the
                 # call-site lint (test_callsite_lint_rules rule 4) can see the keyword.
                 guard = await asyncio.to_thread(
-                    lambda: launch_guard.capture(profile_set=frozen.profile_set)
+                    lambda: launch_guard.capture(
+                        profile_set=frozen.profile_set,
+                        root_identity=frozen.root_identity,
+                    )
                 )
             except approval_gate.PlanIdentityUnavailableError as exc:
                 capture_error = exc
@@ -8197,6 +8202,7 @@ async def resume_workflow_run_endpoint(
     would re-execute the very step the operator asked to skip, silently.
     """
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+    from cli_agent_orchestrator.services.launch_guard import PlanInputsChangedError
 
     decisions = body.decisions if body is not None else None
 
@@ -8241,6 +8247,17 @@ async def resume_workflow_run_endpoint(
             # a fact about the plan, and the operator's next action is completely different.
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail=_approval_refusal_detail(e)
+            )
+        except PlanInputsChangedError as e:
+            # issue #827 criterion 2's resume gate (ask 3 on PR #1051). 409 with the SAME
+            # ``plan_inputs_changed`` kind the agent-step route uses at ``/terminals/run-step``,
+            # because it is the same refusal about the same record -- a client that already handles
+            # one needs no new branch for the other. This route had no arm for this error, so before
+            # this it would have fallen through: not to the 400 below (``PlanInputsChangedError`` is
+            # deliberately not a ``ValueError``) but out of the handler entirely, as a kind-less 500.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"message": str(e), "kind": "plan_inputs_changed"},
             )
         except workflow_service.ResumeNotAllowedError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
@@ -10174,6 +10191,19 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
+    # Mirror --agents-dir above: export the resolved values so cao_server_env()
+    # (read by the MCP-env forwarding in utils/mcp_resolution.py) sees this
+    # launch's actual address, not whatever CAO_API_HOST/PORT happened to be
+    # set to (or left at the 9889 default) before these flags were applied.
+    # An IPv4 wildcard bind is not a usable client address, so agents are
+    # pointed at loopback instead. "::" is left unmapped: asyncio binds an
+    # IPv6-only listener for it, loopback (127.0.0.1) can't reach that
+    # listener, and CAO_API_BASE_URL can't express an IPv6 host either, so
+    # there is no address this code could forward that would actually work.
+    if args.host:
+        os.environ["CAO_API_HOST"] = "127.0.0.1" if args.host == "0.0.0.0" else args.host
+    if args.port:
+        os.environ["CAO_API_PORT"] = str(port)
     # The lifespan records this port in the server lock's diagnostics (#406).
     app.state.server_port = port
     # Extend the CORS allowlist so a custom --host/--port still permits
