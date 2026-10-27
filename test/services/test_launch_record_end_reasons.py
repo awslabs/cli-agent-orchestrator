@@ -115,7 +115,7 @@ async def test_herdr_pane_closed_records_pane_closed(release_runtime, monkeypatc
 async def test_herdr_pane_closed_db_outage_confirmed_loss_records_pane_closed(
     release_runtime, monkeypatch
 ):
-    """D-P3-3 (E9): the DB-outage branch of ``_handle_lifecycle_event`` --
+    """The DB-outage branch of ``_handle_lifecycle_event`` --
     ``get_terminal_metadata`` raises, herdr's own snapshot confirms the pane
     is really gone, and there is no deferred-failure tombstone to retain --
     tears the terminal down with the same reason as the normal path."""

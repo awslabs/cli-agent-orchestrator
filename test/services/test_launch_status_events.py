@@ -178,11 +178,11 @@ class TestHerdrBusyTimeFromEvents:
         assert [r.status for r in _rows("h1")] == ["processing"]
 
     def test_status_write_runs_off_the_event_loop(self):
-        """D-P3-3 (H8): the write goes through ``asyncio.to_thread``, so it
-        never shares the event-loop thread every herdr caller runs on (P3-6).
-        Moving it back onto the loop (calling ``record_launch_status_event``
-        directly, synchronously) would leave every other test in this file
-        green, since none of them inspects which thread wrote the row."""
+        """The write goes through ``asyncio.to_thread``, so it never shares
+        the event-loop thread every herdr caller runs on. Moving it back
+        onto the loop (calling ``record_launch_status_event`` directly,
+        synchronously) would leave every other test in this file green,
+        since none of them inspects which thread wrote the row."""
         import threading
 
         main_thread = threading.current_thread()
