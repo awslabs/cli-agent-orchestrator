@@ -1596,6 +1596,58 @@ class TestClaudeCodeProviderMisc:
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env == {"CAO_TERMINAL_ID": "term-56"}
 
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_uvx_launched_entry_named_cao_mcp_server_gets_the_address(self, mock_load, monkeypatch):
+        """#1075 P3-1: an entry started through ``uvx`` is still the CAO server
+        when its own entry name is ``cao-mcp-server``, even though ``command``
+        is ``uvx`` rather than the bare console script. Claude Code does not
+        forward the parent env, so without this the server would fall back to
+        the default CAO."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {
+                "command": "uvx",
+                "args": ["--from", "cli-agent-orchestrator", "cao-mcp-server"],
+            }
+        }
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-57", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        mcp_data = _extract_mcp_config(command)
+        server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env["CAO_API_PORT"] == "9899"
+        # The uvx args are untouched: this is name-matching, not command resolution.
+        assert mcp_data["mcpServers"]["cao-mcp-server"]["command"] == "uvx"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_non_cao_server_never_gets_the_address(self, mock_load, monkeypatch):
+        """A server that is neither named nor commanded cao-mcp-server never
+        gains the address, even if it happens to be launched through uvx."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "my-server": {"command": "uvx", "args": ["--from", "pkg", "my-server"]}
+        }
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-58", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        mcp_data = _extract_mcp_config(command)
+        server_env = mcp_data["mcpServers"]["my-server"].get("env", {})
+        assert "CAO_API_PORT" not in server_env
+
 
 class TestClaudeCodeProviderContainerPathTranslation:
     """_build_claude_command must translate temp-file paths for container profiles.
@@ -3879,3 +3931,106 @@ class TestLiveCaptureFixtures:
             self._provider(mock_backend, dispatched=dispatched).get_status("\n".join(frame))
             == TerminalStatus.COMPLETED
         )
+
+
+class TestClaudeCode310PermissionFooterFixtures:
+    """Real ``tmux capture-pane -p -J`` frames from Claude Code 2.1.310 under
+    ``--permission-mode default``, where Bash ("Do you want to proceed?") and
+    Write ("Do you want to create hello.txt?") permission dialogs render the
+    footer ``Esc to cancel · Tab to amend`` instead of ``↑/↓ to navigate`` or
+    ``Enter to confirm ·``.
+    """
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    @classmethod
+    def _frame(cls, name: str) -> list:
+        return (
+            (cls.FIXTURES / f"claude_code_310_{name}.txt").read_text(encoding="utf-8").split("\n")
+        )
+
+    @staticmethod
+    def _provider(mock_backend, *, dispatched: bool) -> ClaudeCodeProvider:
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        if dispatched:
+            provider.mark_input_received()
+        return provider
+
+    @pytest.mark.parametrize("name", ["bash_permission_prompt", "write_permission_prompt"])
+    @pytest.mark.parametrize("dispatched", [False, True])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_permission_prompt_is_waiting_user_answer_on_raw_path(
+        self, mock_backend, name, dispatched
+    ):
+        frame = self._frame(name)
+        assert (
+            self._provider(mock_backend, dispatched=dispatched).get_status("\n".join(frame))
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @pytest.mark.parametrize("name", ["bash_permission_prompt", "write_permission_prompt"])
+    @pytest.mark.parametrize("dispatched", [False, True])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_permission_prompt_is_waiting_user_answer_on_screen_path(
+        self, mock_backend, name, dispatched
+    ):
+        frame = self._frame(name)
+        assert (
+            self._provider(mock_backend, dispatched=dispatched).get_status_from_screen(frame)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_permission_idle_after_is_completed(self, mock_backend):
+        frame = self._frame("permission_idle_after")
+        provider = self._provider(mock_backend, dispatched=False)
+        assert provider.get_status("\n".join(frame)) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_prose_containing_permission_words_does_not_false_match(self, mock_backend):
+        """Completed agent prose mentioning the prompt question or individual
+        footer phrases without the ``·`` chrome separator must not false-match
+        as WAITING_USER_ANSWER even when landing inside the bottom window.
+        """
+        prose_frame = [
+            "❯ Explain the permission prompt options",
+            "",
+            "⏺ When Claude asks Do you want to proceed? or Do you want to create hello.txt?,",
+            "  you can press Esc to cancel the dialog or press Tab to amend the command.",
+            "────────────────────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────────────────────",
+            "  ⏸ manual mode on",
+        ]
+        provider = self._provider(mock_backend, dispatched=False)
+        assert provider.get_status("\n".join(prose_frame)) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(prose_frame) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_footer_phrases_split_across_lines_do_not_false_match(self, mock_backend):
+        """Prose that wraps between ``Esc to cancel`` and ``· Tab to amend`` must
+        not match: the real footer is one line, so the arm allows only ``[ \\t]``
+        around the ``·``, never a newline.
+        """
+        prose_frame = [
+            "⏺ The 2.1.310 permission footer reads Esc to cancel",
+            "· Tab to amend, all on one line.",
+            "────────────────────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────────────────────",
+            "  ⏸ manual mode on",
+        ]
+        provider = self._provider(mock_backend, dispatched=False)
+        assert provider.get_status("\n".join(prose_frame)) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(prose_frame) == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize("name", ["bash_permission_prompt", "write_permission_prompt"])
+    def test_handoff_approval_classifies_310_permission_prompts(self, name):
+        from cli_agent_orchestrator.services.agui.handoff_approval import classify_reason
+
+        raw_prompt = "\n".join(self._frame(name))
+        assert classify_reason("claude_code", raw_prompt) == "claude-code:permission_request"

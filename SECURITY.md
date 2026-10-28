@@ -447,7 +447,7 @@ high-cost step that never substitutes for rotation. See
 
 ### Running Security Scans Locally
 
-Run the same full dependency gate as CI with Trivy 0.70.0 and Python 3.10+:
+Run the same full dependency gate as CI with Trivy 0.70.0 and Python 3.11+:
 
 ```bash
 scripts/security-scan.sh dependencies

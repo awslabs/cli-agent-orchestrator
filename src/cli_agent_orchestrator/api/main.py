@@ -50,6 +50,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationError,
     ValidationInfo,
     field_validator,
     model_validator,
@@ -150,6 +151,7 @@ from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
     approval_store,
+    ephemeral_service,
     flow_service,
     manifest_freeze,
     secret_gate,
@@ -269,6 +271,28 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
             await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
         except Exception:
             logger.exception("Inbox reconciliation daemon error")
+
+
+async def ephemeral_sweep_daemon() -> None:
+    """Background task that collects expired and abandoned ephemeral names (#1079).
+
+    The startup pass runs in the lifespan before requests are served; this loop runs
+    the periodic passes, which keep the bind-to-terminal-insert grace.
+    """
+    logger.info("Ephemeral sweep daemon started")
+    while True:
+        # Read inside the error handling: if this task died, the lifespan shutdown's
+        # await would re-raise and skip every later shutdown step.
+        try:
+            interval = await asyncio.to_thread(ephemeral_service.sweep_interval_seconds)
+        except Exception:
+            logger.exception("Ephemeral sweep daemon error")
+            interval = cast(int, ephemeral_service.EPHEMERAL_DEFAULTS["sweep_interval_seconds"])
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(ephemeral_service.sweep, False)
+        except Exception:
+            logger.exception("Ephemeral sweep daemon error")
 
 
 # Response Models
@@ -1666,6 +1690,13 @@ async def lifespan(app: FastAPI):
     await registry.load()
     app.state.plugin_registry = registry
 
+    # Ephemeral residue (#1079). Awaited, so this pass ends before any request is served
+    # and can collect a launched row whose terminal vanished without waiting the grace.
+    try:
+        await asyncio.to_thread(ephemeral_service.sweep, True)
+    except Exception:  # noqa: BLE001 — never block startup on a maintenance sweep
+        logger.warning("ephemeral startup sweep failed", exc_info=True)
+
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
     asyncio.create_task(cleanup_expired_memories())
@@ -1721,6 +1752,7 @@ async def lifespan(app: FastAPI):
     # Start provider-agnostic reconciliation sweep for orphaned PENDING messages
     # the immediate and event-driven status paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
+    ephemeral_sweep_task = asyncio.create_task(ephemeral_sweep_daemon())
 
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
@@ -1796,6 +1828,14 @@ async def lifespan(app: FastAPI):
     inbox_reconcile_task.cancel()
     try:
         await inbox_reconcile_task
+    except asyncio.CancelledError:
+        pass
+
+    # Cancel the periodic ephemeral sweep on shutdown. A pass already running in its
+    # worker thread finishes on its own; each row change is its own transaction.
+    ephemeral_sweep_task.cancel()
+    try:
+        await ephemeral_sweep_task
     except asyncio.CancelledError:
         pass
 
@@ -2619,9 +2659,16 @@ async def agui_run(
     When ``resume[]`` is non-empty, ``cao:write`` is required (the caller is
     mutating interrupt state). Otherwise ``cao:read`` is the floor.
 
+    After a ``resume[]`` run, ``RUN_FINISHED`` with outcome ``success`` means
+    the decision was delivered to the terminal, not that the agent finished
+    its work. A later permission prompt arrives as an interrupt on the next
+    run.
+
     Returns 501 when the ``ag-ui-protocol`` package is not installed (the
     [agui] optional extra was not included at install time).
     Returns 404 when the AG-UI surface is disabled.
+    Returns 404 when ``resume[]`` is non-empty and no approval bridge exists.
+    Returns 422 when the body is not a valid ``RunAgentInput``.
     """
     _require_agui_enabled()
 
@@ -2638,8 +2685,34 @@ async def agui_run(
             },
         )
 
-    # Parse the body
-    body = await request.json()
+    # Parse the body. An empty or non-JSON body raises JSONDecodeError (a
+    # ValueError); answer 422 json_invalid as FastAPI Body() routes do, not 500.
+    try:
+        body = await request.json()
+    except ValueError as e:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "json_invalid",
+                    "loc": ("body",),
+                    "msg": "invalid JSON body",
+                    "ctx": {"error": str(e)},
+                }
+            ]
+        )
+
+    # Validate before streaming. run_plane_stream builds RunAgentInput inside the
+    # generator, after the 200 has been sent, so an invalid body (for example a
+    # resume[] entry without `status`) would end the stream before RUN_STARTED with
+    # no RUN_ERROR and no 4xx. Reject it here with FastAPI's standard 422 shape.
+    from cli_agent_orchestrator.services.agui.run_plane import RunAgentInput
+
+    try:
+        RunAgentInput.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            [{**err, "loc": ("body", *err["loc"])} for err in e.errors(include_url=False)]
+        )
 
     # Scope escalation: if resume[] is non-empty, require cao:write
     resume_entries = body.get("resume") or []
@@ -2650,8 +2723,14 @@ async def agui_run(
                 detail="cao:write required when resume[] is non-empty",
             )
 
-    # Get approval construct from app state
+    # Get approval construct from app state. Without a bridge nothing can process
+    # resume[], so refuse it as the REST resume route does instead of reporting success.
     bridge = getattr(app.state, "approval_bridge", None)
+    if resume_entries and bridge is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval bridge not initialized",
+        )
     approval_construct = bridge.construct if bridge is not None else None
 
     # Build the snapshot function
@@ -2670,18 +2749,6 @@ async def agui_run(
                 pass
         return build_dashboard_snapshot(sessions, terminals, list(_scopes))
 
-    # Build the bus subscription function
-    async def _bus_events():
-        from cli_agent_orchestrator.services.sse_bus import get_bus
-
-        sse_bus = get_bus()
-        sub = sse_bus.register(overflow_close=True)
-        try:
-            async for event in sse_bus.drain(sub):
-                yield event
-        finally:
-            sse_bus.unregister(sub)
-
     from fastapi.responses import StreamingResponse
 
     from cli_agent_orchestrator.services.agui.run_plane import (
@@ -2692,12 +2759,13 @@ async def agui_run(
     accept_header = request.headers.get("accept")
     content_type = get_run_plane_content_type(accept_header)
 
+    # No bus: the fleet SseBus never ends, and a stock AG-UI client completes a
+    # run only when the body ends. Live fleet activity is GET /agui/v1/stream.
     return StreamingResponse(
         run_plane_stream(
             input_data=body,
             approval_construct=approval_construct,
             snapshot_fn=_fleet_snapshot,
-            bus_subscribe_fn=_bus_events,
             accept=accept_header,
         ),
         media_type=content_type,

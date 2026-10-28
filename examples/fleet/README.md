@@ -63,7 +63,7 @@ examples/fleet/
 
 ## Requirements
 
-- **Python 3.10+** on the coordinator (for `fleet` and `render-mcp-config.py`).
+- **Python 3.11+** on the coordinator (for `fleet` and `render-mcp-config.py`).
 - A CAO node reachable at `host:9889` for each machine (see step 1).
 - A private network connecting them (Tailscale, WireGuard, VPN, SSH tunnel, or LAN).
 - The web panel _(PR #366)_ additionally needs [`uv`](https://docs.astral.sh/uv/).

@@ -339,13 +339,28 @@ _DEFAULT_OPTIONS: Dict[str, List[str]] = {
     "unknown_prompt": ["approve", "deny"],
 }
 
+# Full-reason overrides, checked before the category defaults.
+#
+# Claude Code's tool-permission dialog is a selector (Yes / Yes, and ... / No)
+# with no free-text field, and amending the request needs a Tab first. An
+# ``edit`` answer is delivered as typed text followed by Enter, which this
+# dialog does not take as an amendment, so the operator's text never reaches
+# the agent. ``edit`` is therefore not offered here, and ``resume`` rejects it
+# (``decision not in interrupt.options``) before anything is typed.
+_REASON_OPTIONS: Dict[str, List[str]] = {
+    "claude-code:permission_request": ["approve", "deny"],
+}
+
 
 def _options_for_reason(reason: str) -> List[str]:
     """Determine available options based on the classified reason."""
+    override = _REASON_OPTIONS.get(reason)
+    if override is not None:
+        return list(override)
     # Extract local_name from "namespace:local_name"
     parts = reason.split(":", 1)
     local_name = parts[1] if len(parts) == 2 else reason
-    return _DEFAULT_OPTIONS.get(local_name, ["approve", "deny"])
+    return list(_DEFAULT_OPTIONS.get(local_name, ["approve", "deny"]))
 
 
 # ---------------------------------------------------------------------------

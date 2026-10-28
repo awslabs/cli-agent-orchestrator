@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
-from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, RETENTION_DAYS
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite, locked_atomic_write
 from cli_agent_orchestrator.utils.paths import normalized_path
 
@@ -111,23 +111,28 @@ EPHEMERAL_DEFAULTS = {
     "pending_ttl_seconds": 900,
     "claim_lease_seconds": 60,
     "max_depth": 1,
+    "max_tier": None,
+    "default_tier": None,
+    "max_effort": None,
+    "default_effort": None,
+    # Lifecycle cleanup (#1079); every default here awaits maintainer confirmation.
+    "max_live_per_session": 0,  # No cap; operators opt in.
+    "launch_grace_seconds": 600,
+    "sweep_interval_seconds": 300,
+    "retention_days": RETENTION_DAYS,
 }
 
 
 def get_ephemeral_settings() -> Dict[str, Any]:
     """Read the operator-only block strictly, without environment overrides."""
+    from cli_agent_orchestrator.services.model_tiers import load_model_tiers
+
     settings = _load_or_raise()
     block = settings.get("ephemeral", {})
     if not isinstance(block, dict):
         block = {}
     result = {**EPHEMERAL_DEFAULTS, **block}
-    result["_ignored_policy"] = [
-        "ephemeral." + key
-        for key in ("max_tier", "default_tier", "max_effort", "default_effort")
-        if block.get(key) is not None
-    ]
-    if settings.get("model_tiers") is not None:
-        result["_ignored_policy"].append("model_tiers")
+    result["_model_tiers"] = load_model_tiers(settings)
     return result
 
 

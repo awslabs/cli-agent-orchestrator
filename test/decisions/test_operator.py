@@ -214,6 +214,27 @@ def test_boundary_scan_rejects_changes_and_new_vocabulary(mutation):
         assert_agent_boundary(tools, base)
 
 
+def test_decisions_status_tool_docstring_mentions_last_outcome_and_counts():
+    """#1076 note 3: an agent sees only the tool's own docstring when it
+    selects a tool, so it must say that decisions_status also returns each
+    decider's last outcome and 24-hour counts, not just settings."""
+    from cli_agent_orchestrator.ops_mcp_server.decision_tools import register_decision_tools
+
+    class Surface:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self, fn):
+            self.tools[fn.__name__] = fn
+            return fn
+
+    surface = Surface()
+    register_decision_tools(surface)
+    doc = surface.tools["decisions_status"].__doc__ or ""
+    assert "last outcome" in doc
+    assert "24" in doc
+
+
 @pytest.mark.asyncio
 async def test_ops_controls_and_local_record_queries(tmp_path, monkeypatch):
     from sqlalchemy import create_engine

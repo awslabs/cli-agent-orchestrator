@@ -8,8 +8,6 @@ Child AI-DLC intent: `{{child_intent_id}}`
 AI-DLC space: `{{aidlc_space}}`
 Worktree: `{{absolute_worktree_path}}`
 Branch: `{{branch}}`
-Canonical project memory revision: `{{project_memory_revision}}`
-Canonical team memory revision: `{{team_memory_revision}}`
 Harness manifest revision: `{{harness_manifest_revision}}`
 
 ## Objective
@@ -19,6 +17,8 @@ Harness manifest revision: `{{harness_manifest_revision}}`
 ## Relevant Context
 
 {{business_component_and_dependency_slice}}
+
+{{promoted_learnings}}
 
 ## Contract Inputs
 
@@ -37,8 +37,11 @@ and concrete verification evidence. Report the stored result path to the
 portfolio supervisor.
 
 Do not operate outside the assigned worktree or edit AI-DLC state directly.
-Submit durable shared-memory learnings as portfolio proposals. Do not approve
-or directly merge `project.md` or `team.md` changes.
+Treat worktree-local `project.md`/`team.md` as scratch. Submit durable
+learnings as portfolio proposals (`learning propose`); only the supervisor
+reviews and promotes a proposal into CAO's native memory. Promoted portfolio
+learnings reach you in Relevant Context above, not through your own
+`memory_recall`, which reads your repository's project scope.
 
 For human decision questions, submit the unchanged unanswered Markdown as a
 portfolio question packet, report its ID and path, and wait. Never answer a

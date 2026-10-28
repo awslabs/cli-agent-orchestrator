@@ -6,7 +6,7 @@
 #   ./serve.sh start jevk5-4b     start llama-server and the /v1/systemone shim (loopback only)
 #   ./serve.sh stop
 #
-# Needs llama-server on PATH (for example `brew install llama.cpp`) and python3 >= 3.10.
+# Needs llama-server on PATH (for example `brew install llama.cpp`) and python3 >= 3.11.
 set -euo pipefail
 cd "$(dirname "$0")"
 
