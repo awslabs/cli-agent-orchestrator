@@ -4,7 +4,8 @@
 a Kiro terminal whose row does not record a passed identity check, whether its
 init is still running here or has ended. ``/terminals/{id}/ws`` forwards output
 but drops input for such a terminal, re-checking each input frame, and refuses
-the attach before accept only when CAO already reclaimed that runtime.
+the attach before accept only when CAO already reclaimed that runtime. AG-UI
+approve, deny and edit answers reach a pane only through the same gate.
 """
 
 import asyncio
@@ -17,6 +18,7 @@ import termios
 import time
 import tty
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,6 +35,14 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services.agui.approval_bridge import ApprovalBridge
+from cli_agent_orchestrator.services.agui.base import RecordingUiEmitter
+from cli_agent_orchestrator.services.agui.handoff_approval import (
+    AgentHandoffWithApproval,
+    ApprovalDecision,
+    DeliveryError,
+    TerminalServiceAnswerDelivery,
+)
 
 _TID = "1e293d67"
 _FAILURE = {"phase": "deferred_init", "kind": "provider_init_error", "untrusted_runtime": True}
@@ -378,3 +388,168 @@ class TestTheWebAttachIsOutputOnlyUntilVerified:
 
         ws.accept.assert_awaited_once()
         assert state.writes == []
+
+
+# A real Claude Code 2.1.310 Bash permission dialog (#1107), and a Kiro one.
+_CLAUDE_PERMISSION_SCREEN = (
+    Path(__file__).parents[1]
+    / "providers"
+    / "fixtures"
+    / "claude_code_310_bash_permission_prompt.txt"
+)
+_KIRO_PERMISSION_PROMPT = "Allow this action? [y/n/t]:"
+_PENDING_REFUSAL = "has not passed its Kiro identity check yet"
+_ENDED_REFUSAL = "(identity_unverified)"
+
+
+@pytest.fixture
+def approvals():
+    """The production AG-UI approval construct, answering through terminal_service."""
+    return AgentHandoffWithApproval(
+        emitter=RecordingUiEmitter(), answer_delivery=TerminalServiceAnswerDelivery()
+    )
+
+
+@pytest.fixture
+def agui_routes(monkeypatch, approvals):
+    monkeypatch.setenv("CAO_AGUI_ENABLED", "true")
+    monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
+    monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+    monkeypatch.setattr(
+        main_module.app.state, "approval_bridge", ApprovalBridge(construct=approvals), raising=False
+    )
+
+
+def _claude_permission_interrupt(approvals, terminal_id=_TID):
+    interrupt = approvals.on_provider_waiting(
+        terminal_id, "claude_code", _CLAUDE_PERMISSION_SCREEN.read_text(encoding="utf-8")
+    )
+    assert interrupt.reason == "claude-code:permission_request"
+    return interrupt
+
+
+class TestAgUiAnswersGoThroughTheGate:
+    """An AG-UI answer is typed by ``dispatch_input`` or ``send_special_key``, so it is gated."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("decision", "key"), [("approve", "Enter"), ("deny", "Escape")])
+    async def test_a_claude_code_permission_answer_on_a_trusted_terminal_is_delivered(
+        self, pane, approvals, decision, key
+    ):
+        _row(identity_verified=None, provider="claude_code")
+        interrupt = _claude_permission_interrupt(approvals)
+
+        result = await approvals.resume(interrupt.id, ApprovalDecision(decision))
+
+        assert (result.resolved, result.outcome) == (True, decision)
+        pane.backend.send_special_key.assert_called_once_with("cao-session", "developer-abcd", key)
+        pane.backend.send_keys.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_verified_kiro_terminal_takes_an_answer(self, pane, approvals):
+        _row(identity_verified=True)
+        interrupt = approvals.on_provider_waiting(_TID, "kiro_cli", _KIRO_PERMISSION_PROMPT)
+
+        result = await approvals.resume(interrupt.id, ApprovalDecision.APPROVE)
+
+        assert result.outcome == "approve"
+        assert pane.backend.send_keys.call_args.args[2] == "y"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("still_initializing", "refusal"),
+        [(True, _PENDING_REFUSAL), (False, _ENDED_REFUSAL)],
+        ids=["initializing", "init-ended"],
+    )
+    @pytest.mark.parametrize(
+        ("prompt_provider", "decision", "edited_text"),
+        [
+            ("kiro_cli", ApprovalDecision.APPROVE, None),
+            ("kiro_cli", ApprovalDecision.DENY, None),
+            ("kiro_cli", ApprovalDecision.EDIT, "AGUI-EDIT-CANARY"),
+            # The gate reads the terminal's row, not the prompt's classification.
+            ("claude_code", ApprovalDecision.APPROVE, None),
+        ],
+        ids=["kiro-approve", "kiro-deny", "kiro-edit", "claude-code-shaped-approve"],
+    )
+    async def test_an_answer_to_an_unverified_kiro_terminal_types_nothing(
+        self, pane, approvals, still_initializing, refusal, prompt_provider, decision, edited_text
+    ):
+        _row(identity_verified=False)
+        if prompt_provider == "claude_code":
+            interrupt = _claude_permission_interrupt(approvals)
+        else:
+            interrupt = approvals.on_provider_waiting(_TID, "kiro_cli", _KIRO_PERMISSION_PROMPT)
+        if still_initializing:
+            terminal_service._mark_identity_check_in_flight(_TID)
+        try:
+            with pytest.raises(DeliveryError, match=refusal):
+                await approvals.resume(interrupt.id, decision, edited_text=edited_text)
+        finally:
+            terminal_service._clear_identity_check_in_flight(_TID)
+
+        _nothing_typed(pane.backend)
+        assert not approvals.get_interrupt(interrupt.id).resolved
+        assert [i.id for i in approvals.pending()] == [interrupt.id]
+
+    @pytest.mark.parametrize(
+        ("provider", "identity_verified", "status_code"),
+        [("claude_code", None, 200), ("kiro_cli", False, 502)],
+        ids=["trusted-claude-code", "unverified-kiro"],
+    )
+    def test_the_resume_route(
+        self, client, pane, approvals, agui_routes, provider, identity_verified, status_code
+    ):
+        _row(identity_verified=identity_verified, provider=provider)
+        interrupt = _claude_permission_interrupt(approvals)
+
+        response = client.post(
+            f"/agui/v1/interrupts/{interrupt.id}/resume", json={"decision": "approve"}
+        )
+
+        assert response.status_code == status_code
+        if status_code == 200:
+            assert response.json()["outcome"] == "approve"
+            pane.backend.send_special_key.assert_called_once_with(
+                "cao-session", "developer-abcd", "Enter"
+            )
+        else:
+            detail = response.json()["detail"]
+            assert detail["retryable"] is True
+            assert _ENDED_REFUSAL in detail["message"] and "Traceback" not in detail["message"]
+            _nothing_typed(pane.backend)
+            assert not approvals.get_interrupt(interrupt.id).resolved
+
+    @pytest.mark.asyncio
+    async def test_a_run_plane_resume_to_an_unverified_kiro_terminal_is_a_run_error(
+        self, pane, approvals
+    ):
+        pytest.importorskip("ag_ui")
+        from cli_agent_orchestrator.services.agui.run_plane import run_plane_stream
+
+        _row(identity_verified=False)
+        interrupt = _claude_permission_interrupt(approvals)
+        body = {
+            "threadId": "th",
+            "runId": "r",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+            "resume": [
+                {"interruptId": interrupt.id, "status": "resolved", "payload": {"approved": True}}
+            ],
+        }
+
+        frames = []
+        async for raw in run_plane_stream(input_data=body, approval_construct=approvals):
+            for line in raw.strip().split("\n"):
+                if line.startswith("data: "):
+                    frames.append(json.loads(line[len("data: ") :]))
+
+        assert frames[0]["type"] == "RUN_STARTED"
+        assert frames[-1]["type"] == "RUN_ERROR"
+        assert _ENDED_REFUSAL in frames[-1]["message"]
+        _nothing_typed(pane.backend)
+        assert not approvals.get_interrupt(interrupt.id).resolved
