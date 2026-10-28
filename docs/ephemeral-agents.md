@@ -111,6 +111,22 @@ list (or `*`) and appended to every child. With tools omitted, creation requests
 and `fs_list`. Briefs are normalized to LF, with control characters removed except LF
 and TAB, then checked for byte size and secrets before anything is written.
 
+The create response's `enforcement` field says how the child's tool list is enforced on
+its provider:
+
+| Provider | `enforcement` | Meaning |
+| --- | --- | --- |
+| `claude_code` | `hard` | Claude Code refuses native tools outside the recorded list. |
+| `codex` | `advisory` | Codex is told the list but not prevented: it runs `--yolo` with a shell, and the MCP servers in the user's Codex config load. |
+| `kiro_cli` | — | Not offered: create refuses with `provider_unsupported`. |
+
+`sandboxed` is reserved for a planned contained Codex launch (#1074), so treat a value
+you don't recognize as `advisory`. A provider may also be unable to run a tool atom
+in an ephemeral agent. Create then refuses with `tool_unsupported_on_provider:<atom>`,
+naming the first such atom in the order `fs_read`, `fs_list`, `fs_write`, `execute_bash`,
+`web_fetch`; no current provider refuses one. The label values and this rule are
+provisional (#1074).
+
 Names have the form `<band>-<purpose>-<four-hex-digits>`. Reserved names refuse remote
 `assign`/`handoff` with `target_host` and `assign_elastic` before placement.
 
@@ -220,6 +236,11 @@ The claim lease covers claim to terminal creation. At claim, the server rechecks
 block before the stored provider, tier and effort. A broken block returns `policy_config_error:<key>` and
 reverts that claim to pending; fix the named setting and retry. A removed provider returns
 `policy_changed_since_create:provider_not_allowed` and collects the name; create a new one.
+If a CAO upgrade stops supporting a provider that `allowed_providers` still lists, every
+create and claim refuses with `policy_config_error:allowed_providers` until the operator
+removes it; a claim then returns `policy_changed_since_create:provider_unsupported` and
+collects the name. If an upgrade stops supporting one of the stored tool atoms, the claim
+returns `policy_changed_since_create:tool_unsupported_on_provider:<atom>` and collects the name.
 A stored tier or effort above a tightened ceiling, an unmapped stored tier, or a stored provider
 default under a newly added ceiling returns `policy_changed_since_create:tier_exceeds_policy`
 or `policy_changed_since_create:effort_exceeds_policy`, or
@@ -243,12 +264,15 @@ extraction failure tear down terminals owned by that call.
 | --- | --- |
 | 404 | `ephemeral_disabled`, `unknown_ephemeral` |
 | 409 | `already_claimed`, `claim_expired`, `ephemeral_expired`, `spec_unavailable` |
-| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy` |
+| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:provider_unsupported`, `policy_changed_since_create:tool_unsupported_on_provider:<atom>`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy` |
 | 422 | `invalid_request` for the claim body; invalid launch claim identifiers or claim-plus-reuse requests |
 | 500 | `unexpected_failure` |
 
-Create also refuses with `tier_unmapped`, `tier_exceeds_policy`, `effort_exceeds_policy` and
-`policy_config_error:<key>`, all HTTP 400.
+Create also refuses with `provider_unsupported`, `provider_not_allowed`,
+`tool_unsupported_on_provider:<atom>`, `tier_unmapped`, `tier_exceeds_policy`,
+`effort_exceeds_policy` and `policy_config_error:<key>`, all HTTP 400. The three provider
+refusals come before tier and effort refusals and before the creator tool-ceiling check
+(`tool_exceeds_creator:<atoms>`).
 
 Every ephemeral live-profile load verifies the exact bytes parsed against the registry's
 `profile_sha256`, including claim-less launches and provider reloads. Missing rows or hashes
@@ -269,7 +293,7 @@ marked ephemeral and the existing delegation denial stays effective.
 ## Honesty statement
 
 > An ephemeral child's CAO-recorded allowlist is a subset of its creator's effective allowlist at creation time. Its generated profile declares only the CAO MCP server, no hooks or native agents, and `skills: []` so no skill catalog is inherited; named skills remain callable through `load_skill`; installed agent plugins' MCP servers are not added at launch; and CAO will not launch it with a wider list. An ephemeral child cannot create ephemerals. It cannot delegate or start or cancel workflows through CAO's MCP tools unless the operator sets `child_may_delegate`. That is all this guarantees. It does not guarantee:
-> 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro is unsupported until the deferred Kiro slice lands.
+> 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro is unsupported until the deferred Kiro slice lands. The create response's `enforcement` field reports this class: `hard` or `advisory`.
 > 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. MCP `send_message`, `answer_user_prompt` and `delete_terminal` bind targets to the caller's permitted terminal tree (#912). State-changing memory and metadata tools and workflow authoring (`workflow_create`/`workflow_update`; a changed spec needs a new plan approval, on by default) still use the coarse server grant (#671). With `child_may_delegate=true`, workflow cancellation also uses that grant, without run ownership binding.
 > 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself, edit `settings.json`, or read `ephemeral/live/`.
 > 4. **Per-tool MCP enforcement for installed profiles** (#671). Installed profiles ARE now bounded by their creator's recorded delegation ceiling through the same comparison (see [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance)); the remaining gap is the server-level `@cao-mcp-server` grant above.

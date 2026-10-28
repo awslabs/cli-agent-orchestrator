@@ -13,7 +13,7 @@ from collections import Counter
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterator, NoReturn, Optional, cast
+from typing import Any, Iterator, NoReturn, Optional, Sequence, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -45,6 +45,11 @@ from cli_agent_orchestrator.utils.atomic_file import (
 )
 from cli_agent_orchestrator.utils.caller_tools import caller_effective_allowed_tools
 from cli_agent_orchestrator.utils.delegation import tools_exceeding
+from cli_agent_orchestrator.utils.ephemeral_capabilities import (
+    capability_for,
+    ephemeral_providers,
+    unsupported_atoms,
+)
 
 logger = logging.getLogger(__name__)
 EPHEMERAL_DIR = CAO_HOME_DIR / "ephemeral"
@@ -201,12 +206,43 @@ def policy_bounds(settings: dict[str, Any]) -> PolicyBounds:
     )
 
 
+def provider_refusal(
+    provider: str, settings: dict[str, Any], tools: Sequence[str], declared: bool = True
+) -> Optional[EphemeralPolicyError]:
+    """Rule 8 and the provider capability checks, in one order for create and claim (#1074).
+
+    ``declared`` is False when the provider came from the creator, not the spec.
+    ``tool_unsupported_on_provider:<atom>`` is a provisional rule (#1074 question 4).
+    """
+    if not capability_for(provider).supports_ephemeral:
+        return EphemeralPolicyError(
+            "provider_unsupported",
+            provider
+            + (
+                "; supported providers: " + ", ".join(ephemeral_providers())
+                if declared
+                else "; set provider explicitly"
+            ),
+        )
+    if provider not in settings["allowed_providers"]:
+        return EphemeralPolicyError("provider_not_allowed", provider)
+    unsupported = unsupported_atoms(provider, tools)
+    if unsupported:
+        return EphemeralPolicyError(
+            "tool_unsupported_on_provider:" + unsupported[0],
+            f"{provider} does not support {', '.join(unsupported)} in ephemeral agents; "
+            "remove them from tools or set another provider",
+        )
+    return None
+
+
 def validate_block(settings: dict[str, Any]) -> None:
     providers = settings["allowed_providers"]
+    # A tuple membership test, so an unhashable JSON entry refuses rather than raising.
     if (
         not isinstance(providers, list)
         or not providers
-        or any(p not in ("claude_code", "codex") for p in providers)
+        or any(p not in ephemeral_providers() for p in providers)
     ):
         raise EphemeralPolicyError(
             "policy_config_error:allowed_providers",
@@ -328,11 +364,10 @@ def render_profile(
             "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
         },
     }
-    if effort is not None:
-        if provider == "claude_code":
-            metadata["claudeConfig"] = {"effort": effort}
-        elif provider == "codex":
-            metadata["codexConfig"] = {"model_reasoning_effort": effort}
+    effort_config = capability_for(provider).effort_config
+    if effort is not None and effort_config is not None:
+        section, key = effort_config
+        metadata[section] = {key: effort}
     prefix, suffix = render_prompt_parts(name, caller_id, spec.purpose, tools)
     return cast(
         str,
@@ -545,15 +580,15 @@ def create_ephemeral_agent(
         provider = spec.provider.value if spec.provider is not None else creator["provider"]
         if provider not in {item.value for item in ProviderType}:
             raise EphemeralPolicyError("creator_unresolved")
-        if provider not in ("claude_code", "codex"):
-            detail = provider + (
-                "; supported providers: claude_code, codex"
-                if spec.provider is not None
-                else "; set provider explicitly"
-            )
-            raise EphemeralPolicyError("provider_unsupported", detail)
-        if provider not in config["allowed_providers"]:
-            raise EphemeralPolicyError("provider_not_allowed", provider)
+        requested = sorted(
+            set(spec.tools if spec.tools is not None else ("fs_read", "fs_list")),
+            key=TOOL_ATOMS.index,
+        )
+        # Provider limits precede the tier, effort and creator tool-ceiling checks: no grant
+        # lifts them (provisional order, #1074).
+        refusal = provider_refusal(provider, config, requested, declared=spec.provider is not None)
+        if refusal is not None:
+            raise refusal
         bounds = policy_bounds(config)
         tiers = config["_model_tiers"]
         if spec.model_tier is not None:
@@ -564,10 +599,6 @@ def create_ephemeral_agent(
             refusal = _value_refusal("effort.route", spec.effort, provider, bounds, tiers)
             if refusal is not None:
                 raise refusal
-        requested = sorted(
-            set(spec.tools if spec.tools is not None else ("fs_read", "fs_list")),
-            key=TOOL_ATOMS.index,
-        )
         # The same comparator the installed-profile path uses in
         # terminal_service.create_terminal (utils/delegation.py): ``*`` grants
         # everything and ``fs_*`` expands to the three filesystem atoms.
@@ -626,6 +657,8 @@ def create_ephemeral_agent(
             result = {
                 "name": name,
                 "provider": provider,
+                # The label wording is provisional (#1074 question 6).
+                "enforcement": capability_for(provider).enforcement,
                 "effective_tools": tools,
                 "model_tier": tier,
                 "effort": effort,
@@ -918,11 +951,11 @@ def _recheck_policy(
             + keypath
             + " in settings before any launch can succeed",
         ) from None
-    refusal = None
     bounds = policy_bounds(settings)
     tiers = settings["_model_tiers"]
-    if row["provider"] not in settings["allowed_providers"]:
-        refusal = EphemeralPolicyError("provider_not_allowed", row["provider"])
+    refusal = provider_refusal(row["provider"], settings, row["effective_tools"])
+    if refusal is not None:
+        refusal = EphemeralPolicyError(refusal.rule, refusal.detail.partition(";")[0])
     else:
         tier = row["model_tier"]
         if tier is not None:

@@ -1165,6 +1165,14 @@ On a remote host, such as a browser IDE, forward the port first: in VS Code or
 code-server use the **Ports** panel, or `ssh -L 8766:127.0.0.1:8766 <host>`. Do
 not publish it on a public interface.
 
+The controller accepts only `127.0.0.1`, `localhost`, and `::1` in the `Host`
+header of a request, and refuses a cross-site `Origin`. So a web page cannot
+use DNS rebinding to read the live view or reach the MCP endpoint. If a port
+forward sends its own name in the `Host` header (some browser IDEs do), the
+live view answers `Misdirected Request`. Then set that name before you start
+the controller, for example `export TRANSPORT_ALLOWED_HOSTS='*.cloudfront.net'`.
+Add only the name of your own forward.
+
 The rest of this section is the saved **picture** record, which complements the
 live view: `--record` writes PNGs you can keep and replay after the run.
 
