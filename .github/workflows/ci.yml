@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     steps:
       - name: Checkout code
@@ -151,8 +151,8 @@ jobs:
       #
       # WHY HERE and not in `Unit Tests`: the property under test is Python-version
       # independent (does hatchling's `[tool.hatch.build] artifacts` glob cover the whole
-      # web_ui/ build output), so running it on 3.10/3.11/3.12 would assert the same thing
-      # three times and build the web UI three times to do it. It also keeps the repo's
+      # web_ui/ build output), so running it on 3.11/3.12 would assert the same thing
+      # twice and build the web UI twice to do it. It also keeps the repo's
       # primary test gate free of an npm-registry dependency. Follows the `CAO MCP Apps`
       # job's existing in-file pattern: a Node build plus setup-uv/uv sync plus targeted
       # pytest files.
@@ -163,7 +163,7 @@ jobs:
       # in means naming it in this step too.
       #
       # test_hatch_artifacts_guard.py is listed alongside it, but is NOT dependent on this
-      # job: it never skips, so `Unit Tests` already runs it on 3.10/3.11/3.12. It is named
+      # job: it never skips, so `Unit Tests` already runs it on 3.11/3.12. It is named
       # here because this is the only job where `web_ui/` exists on disk, which is the only
       # place its whole-directory wheel assertion can cover THAT root rather than skipping it.
       # =================================================================================

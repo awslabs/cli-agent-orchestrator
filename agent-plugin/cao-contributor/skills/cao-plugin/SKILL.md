@@ -91,7 +91,7 @@ No CAO-side configuration is required to enable a plugin — installation plus e
 ### 5. Build system
 
 - Use `hatchling` as the build backend to match CAO's toolchain.
-- Target Python `>=3.10`.
+- Target Python `>=3.11`.
 - Declare `cli-agent-orchestrator` as a runtime dependency so `CaoPlugin`, `hook`, and the event dataclasses are importable.
 - Declare any external libraries (e.g. `httpx`, `aiohttp`, `python-dotenv`) your plugin uses.
 
@@ -105,7 +105,7 @@ build-backend = "hatchling.build"
 [project]
 name = "my-cao-plugin"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "cli-agent-orchestrator",
     # ... your plugin's deps

@@ -34,6 +34,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has started (`cao-server --agents-dir` instead fails early, as `agent_not_found`). See
   `docs/kiro-cli.md`, troubleshooting item 7.
 
+- **Breaking: CAO now requires Python 3.11 or later** (CVE-2026-114605). dnspython, which CAO pulls in
+  through fastmcp, pydantic and email-validator, fixes CVE-2026-114605 (HIGH) only in 2.9.0, and 2.9.0
+  requires Python 3.11. Python 3.10 reached end-of-life on 2026-10-01. `requires-python` is now `>=3.11`,
+  release wheels build on `cp311`, and CI no longer tests 3.10. On Python 3.10, keep using the current
+  release or upgrade the interpreter. The docusaurus lock also moves `qs` to 6.17.0 (CVE-2026-110816), and
+  its override floor is now `^6.16.1`.
+
+- **`POST /agui/v1/run` refuses a `resume[]` it cannot process** (#1107 follow-up). When the server
+  started with the AG-UI surface off and it was turned on later, no approval bridge exists, so the run
+  skipped every `resume[]` entry and still reported `RUN_FINISHED` `success`. The route now answers
+  HTTP 404 "Approval bridge not initialized", as `POST /agui/v1/interrupts/{id}/resume` does. A run
+  without `resume[]` is unchanged. The documented request bodies now include the required `messages`
+  and the AG-UI 1.0 resume entry shape, and the docs no longer say the run plane streams live frames.
+
+- **`POST /agui/v1/run` now ends its response after `RUN_FINISHED`** (#1106, ag-ui-protocol/ag-ui#2216). A
+  run with nothing pending, or one whose `resume[]` resolved the last pending interrupt, used to stay
+  open forever. The route handed the run plane the whole-fleet SSE bus, which never ends, and nothing
+  in that loop could finish the run. A stock AG-UI client completes a run only when the body ends, so
+  `runAgent()` never resolved. The route no longer passes the fleet bus. Every run now ends with
+  `RUN_STARTED`, `STATE_SNAPSHOT`, then `RUN_FINISHED` (`interrupt` while approvals are pending,
+  otherwise `success`) or `RUN_ERROR`. After `resume[]`, `success` means the decision was delivered,
+  not that the agent finished; a later prompt surfaces as an interrupt on the next run. Live fleet
+  activity stays on `GET /agui/v1/stream`. `RunAgentInput.messages` is still not read.
+
+- **Claude Code 2.1.310 tool-permission prompts are detected as `WAITING_USER_ANSWER`** (#1106; related:
+  #405). Bash "Do you want to proceed?" and Write "Do you want to create <file>?" dialogs now render
+  the footer `Esc to cancel · Tab to amend`, which no existing pattern matched, so the terminal stayed
+  `processing`: no AG-UI interrupt was raised and inbox delivery could type into the dialog. The new
+  pattern arm is anchored to the same-line `·` chrome, so completed prose that mentions the phrases does
+  not match. Fixtures are real `tmux capture-pane` frames from 2.1.310 under `--permission-mode default`.
+
 - **A plan approval now names the working directory it was granted for, not just its path** (#827,
   #1000). A path is not an identity. Move a non-Git working directory away, put a different directory
   at the same path, and every value the plan identifier recorded was byte-identical, so the

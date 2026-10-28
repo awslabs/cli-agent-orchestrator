@@ -432,7 +432,7 @@ share a dock. This example has one payload, so it uses only `handoff`.
 | CAO | 2.5.3 or later. The latest `main` is better. | `cao --version` |
 | tmux | 3.3 or later | `tmux -V` |
 | uv | A recent release | `uv --version` |
-| Python | 3.10 or later | Step 1 finds or installs it with `uv` |
+| Python | 3.11 or later | Step 1 finds or installs it with `uv` |
 | MuJoCo | The version in `uv.lock` | Step 1 installs it as the Python package `mujoco`. You do not install it separately. |
 | OpenGL | Only for the pictures of `--record`. No separate GPU is necessary. | On macOS, OpenGL is part of the system. On Linux without a display, see [See the robots move](#see-the-robots-move). |
 | Provider CLI | A CAO provider that `prepare` accepts. GitHub Copilot CLI is the default. See [Providers](#providers). | Start the CLI one time in this repository, sign in, and accept its first-run prompts |
@@ -1604,7 +1604,7 @@ of Step 2. The number of tests and the time can be different.
 
 - The tests use real headless MuJoCo and authenticated loopback MCP. They need
   no provider credentials.
-- CI runs them in the **Robotics transport example** workflow on Python 3.10
+- CI runs them in the **Robotics transport example** workflow on Python 3.11
   and 3.12.
 - They check measured arrival, early and stale handoffs, ownership, and
   capacity limits. They also check read-only credentials, duplicate and

@@ -994,7 +994,7 @@ class TestConfigurationInvariants:
 
     def test_cibuildwheel_builds_one_abi_independent_wheel_per_platform(self):
         cibw = self._pyproject()["tool"]["cibuildwheel"]
-        assert cibw["build"] == "cp310-*", (
+        assert cibw["build"] == "cp311-*", (
             "one build per platform; cibuildwheel reuses the py3-none wheel for the other "
             "interpreters via find_compatible_wheel()"
         )
