@@ -546,3 +546,54 @@ async def test_unregistered_raw_tool_is_inert(create_store, enabled, monkeypatch
     with pytest.raises(Exception):
         await target.call_tool("create_ephemeral_agent", {"prompt": "private text"})
     post.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault,rule",
+    [
+        ("unmapped", "tier_unmapped"),
+        ("above", "tier_exceeds_policy"),
+        ("block", "policy_config_error:model_tiers"),
+        ("effort", "effort_exceeds_policy"),
+    ],
+)
+async def test_A_M1_real_create_rule_relay(create_store, monkeypatch, fault, rule):
+    from test.services.test_ephemeral_tier_policy import mapped
+
+    mapped(create_store[4])
+    raw = create_store[4]
+    spec_tier = "large"
+    if fault == "unmapped":
+        del raw["model_tiers"]["claude_code"]["large"]
+    else:
+        raw["ephemeral"].update(max_tier="medium", default_tier="small")
+    if fault == "block":
+        del raw["model_tiers"]["claude_code"]["small"]
+    if fault == "effort":
+        spec_tier = "small"
+        raw["ephemeral"].update(default_effort="low", max_effort="medium")
+    monkeypatch.setattr(
+        server.mcp_utils,
+        "get_json",
+        lambda *a, **k: {
+            "id": CALLER,
+            "session_name": "cao-session",
+            "provider": "claude_code",
+            "allowed_tools": ["@cao-mcp-server"],
+        },
+    )
+    monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
+    monkeypatch.setattr(
+        server.requests, "post", lambda url, **kwargs: client().post("/ephemeral-agents", **kwargs)
+    )
+    result = await server.create_ephemeral_agent(
+        "log_triage",
+        "Inspect logs.",
+        model_tier=spec_tier,
+        effort="high" if fault == "effort" else None,
+    )
+    assert result["success"] is False and result["rule"] == rule
+    # The relayed refusal names no model id and no agent.
+    assert "private-" not in str(result) and "name" not in result
+    assert not (create_store[2] / "ephemeral").exists()

@@ -248,11 +248,22 @@ The **run plane** is the `POST /agui/v1/run` endpoint. It speaks the stock
 clients expect.
 
 A client POSTs a `RunAgentInput` (threadId, runId, optional resume[]) and
-receives a lifecycle-legal stream: `RUN_STARTED` then `STATE_SNAPSHOT` then live
-projection frames (`STATE_DELTA`, `STEP_STARTED/FINISHED`, `TOOL_CALL_START/END`,
-`CUSTOM`) then `RUN_FINISHED`. If open approval interrupts exist, the stream
-closes with a `RUN_FINISHED` whose outcome is `{type: "interrupt", interrupts: [...]}`,
-and the client re-POSTs with a `resume[]` array to resolve them.
+receives a lifecycle-legal stream: `RUN_STARTED`, then `STATE_SNAPSHOT`, then
+`RUN_FINISHED`. The response body ends right after `RUN_FINISHED` (or
+`RUN_ERROR`), because a stock AG-UI client completes a run only when the body
+ends. If open approval interrupts exist, the outcome is
+`{type: "interrupt", interrupts: [...]}`, and the client re-POSTs with a
+`resume[]` array to resolve them. Each entry is
+`{interruptId, status: "resolved" | "cancelled", payload: {approved: bool} | {editedArgs}}`;
+`status` is required, `cancelled` is treated as a deny, and a body that is not a
+valid `RunAgentInput` is rejected with HTTP 422 before the stream starts. Once `resume[]` is delivered and nothing is
+left pending, the outcome is `{type: "success"}`. That means the decision
+reached the agent, not that the agent finished. If the agent prompts again, the
+next run returns the new interrupt. `messages[]` is not read. Live fleet
+activity (`STATE_DELTA`, `STEP_STARTED/FINISHED`, `TOOL_CALL_START/END`,
+`CUSTOM`) is on the ambient plane, `GET /agui/v1/stream`. Embedders that call
+`run_plane_stream` directly can still inject an event source to project it
+inside a run.
 
 The run plane requires the `[agui]` optional extra (`ag-ui-protocol` package).
 Without it the endpoint returns HTTP 501.

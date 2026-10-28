@@ -1039,7 +1039,7 @@ class TestConfigurationInvariants:
             encoding="utf-8"
         )
         assert "pypa/gh-action-pypi-publish@release/v1" not in text
-        assert "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33" in text
+        assert "pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086" in text
 
     def test_wheel_jobs_carry_an_explicit_timeout(self):
         """No job in this repo had one; a hung pty/container build must not burn 6 hours."""

@@ -59,7 +59,7 @@ this override; see [upstream security releases](../SECURITY.md#additional-upstre
 
 | Layer | Technology |
 |-------|-----------|
-| UI Framework | React 18 |
+| UI Framework | React 19 |
 | State Management | Zustand |
 | Styling | Tailwind CSS |
 | Terminal Emulator | xterm.js |

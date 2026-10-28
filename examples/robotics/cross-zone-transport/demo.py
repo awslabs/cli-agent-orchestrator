@@ -290,6 +290,9 @@ def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> N
         "approved for this scene" if allow_motion else "DISABLED (no --allow-motion)",
     )
     server = make_server(world, tokens, run_dir / "last-state.json")
+    logging.getLogger("transport").warning(
+        "LIVE VIEW: open http://127.0.0.1:%d/ in a browser to watch the run", port
+    )
     recorder = Recorder(world, record) if record is not None else None
     if recorder is not None:
         recorder.start()

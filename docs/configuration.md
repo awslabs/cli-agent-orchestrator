@@ -138,13 +138,17 @@ Only JSON `true` enables the tool, and agent terminals must restart to see it.
 | `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched or swept. |
 | `claim_lease_seconds` | `60` | Lease from claim to terminal creation. |
 | `max_depth` | `1` | Only integer 1 is supported; ephemeral callers cannot create ephemerals. |
+| `max_tier` | `null` | Maximum model tier; a ceiling requires a default at or below it and mappings for every permitted tier and allowed provider. |
+| `default_tier` | `null` | Model tier used when the spec omits `model_tier`, resolved once at creation and required to be mapped for every allowed provider. |
+| `max_effort` | `null` | Maximum reasoning effort; a ceiling requires a default at or below it. |
+| `default_effort` | `null` | Reasoning effort used when the spec omits `effort`, resolved once at creation. |
 | `child_may_delegate` | `false` | Permit the existing ephemeral delegation/workflow tools; never permits ephemeral creation by an ephemeral caller. |
 | `max_live_per_session` | `0` | Opt-in cap on the pending, claimed and launched names one session may hold. `0` means no cap; for example, `32` suits a fleet-style supervisor. Collected and expired pending names don't count. |
 | `launch_grace_seconds` | `600` | How long periodic sweeps wait after a bind before collecting a launched name with no terminal row. The startup sweep doesn't wait. Rowless live files must also be this old before any sweep deletes them. |
 | `sweep_interval_seconds` | `300` | Seconds between periodic sweeps, at most one day. |
 | `retention_days` | `14` | Days a collected name's archive and registry row are kept, counted only once its terminal and live files are gone. |
 
-See [Ephemeral agents](ephemeral-agents.md) for policy limits, ignored tier/effort keys,
+See [Ephemeral agents](ephemeral-agents.md) for policy limits, model tier and effort policy,
 and lifecycle cleanup. Keep the feature disabled outside testing.
 
 ### Skills (`skills`)

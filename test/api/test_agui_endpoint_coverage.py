@@ -6,8 +6,8 @@ Covers:
 - Lifespan wiring: the ApprovalBridge is started under CAO_AGUI_ENABLED and
   cancelled on shutdown.
 - Resume route: the ``except ValueError`` → HTTP 422 branch.
-- Run route: ``snapshot_fn`` iterating real sessions/terminals and the
-  ``_bus_events`` drain, consumed end-to-end via a terminating bus.
+- Run route: ``snapshot_fn`` iterating real sessions/terminals, and the run
+  never reading the never-ending fleet bus (its body must end).
 """
 
 from __future__ import annotations
@@ -84,10 +84,13 @@ def test_resume_returns_422_on_edit_validation_error():
             del main.app.state.approval_bridge
 
 
-def test_run_endpoint_stream_builds_snapshot_and_drains_bus(monkeypatch):
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.sse_bus.get_bus", lambda: _TerminatingBus()
-    )
+class _UnusableBus(_TerminatingBus):
+    def register(self, overflow_close=False):  # noqa: ANN001
+        raise AssertionError("/agui/v1/run must not subscribe to the fleet SseBus")
+
+
+def test_run_endpoint_stream_builds_snapshot_without_the_fleet_bus(monkeypatch):
+    monkeypatch.setattr("cli_agent_orchestrator.services.sse_bus.get_bus", lambda: _UnusableBus())
     # Sessions + terminals so snapshot_fn's loop body executes.
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.session_service.list_sessions",
@@ -116,7 +119,8 @@ def test_run_endpoint_stream_builds_snapshot_and_drains_bus(monkeypatch):
             frames.append(line)
     joined = "\n".join(frames)
     assert "RUN_STARTED" in joined
-    assert "RUN_FINISHED" in joined
+    assert "STATE_SNAPSHOT" in joined
+    assert "RUN_FINISHED" in [f for f in frames if f.startswith("data:")][-1]
 
 
 def test_run_endpoint_snapshot_tolerates_terminal_lookup_failure(monkeypatch):

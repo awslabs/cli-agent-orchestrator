@@ -241,6 +241,9 @@ def test_lifespans_and_creates_under_test_leave_the_startup_cao_home_alone(tmp_p
         "CAO_HOME_DIR": str(cao_home),
         "TMPDIR": str(tmp_path),
         "PYTHONDONTWRITEBYTECODE": "1",
+        # Forward src first, so the probe always imports this checkout's code, never
+        # whatever cli_agent_orchestrator happens to be installed in the running env.
+        "PYTHONPATH": str(REPO / "src"),
     }
     result = subprocess.run(
         [

@@ -242,6 +242,91 @@ def test_recorded_profile_prompt_tools_and_cleanup(create_store, monkeypatch, pr
         assert not prompt_file.exists()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
+@pytest.mark.parametrize("tier", [None, "small"])
+@pytest.mark.parametrize("effort", [None, "high"])
+async def test_A_L1_A_L2_mapped_model_launch(
+    create_store, monkeypatch, provider_name, tier, effort
+):
+    import shlex
+    from test.services.test_ephemeral_service import CALLER, SPEC, create
+    from test.services.test_ephemeral_tier_policy import mapped
+
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import terminal_service as service
+
+    env = create_store
+    mapped(env[4])
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    spec = {**SPEC, "provider": provider_name, **({"model_tier": tier} if tier else {})}
+    if effort is not None:
+        spec["effort"] = effort
+    result = create(env, spec)
+    name = result["name"]
+    token = env[0].claim_ephemeral_agent(name, {}, CALLER)["claim_id"]
+    module = claude_code if provider_name == "claude_code" else codex
+    cls = module.ClaudeCodeProvider if provider_name == "claude_code" else module.CodexProvider
+    monkeypatch.setattr(module, "CAO_HOME_DIR", env[2])
+    backend = Mock()
+    backend.session_exists.return_value = True
+    backend.create_window.return_value = "child"
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    monkeypatch.setattr(service, "generate_terminal_id", lambda: "eeeeeeee")
+    monkeypatch.setattr(service, "_resolve_working_directory", lambda _: str(env[2]))
+    monkeypatch.setattr(service, "build_skill_catalog", lambda _: None)
+    monkeypatch.setattr(service, "get_herdr_inbox_service", lambda: None)
+    commands = []
+
+    def factory(*args, **kwargs):
+        provider = cls(
+            *args[1:5],
+            allowed_tools=args[5],
+            skill_prompt=kwargs["skill_prompt"],
+            model=kwargs["model"],
+        )
+
+        async def init():
+            command = (
+                provider._build_claude_command()
+                if provider_name == "claude_code"
+                else provider._build_codex_command()
+            )
+            commands.append(command)
+
+        provider.initialize = init
+        return provider
+
+    monkeypatch.setattr(service.provider_manager, "create_provider", factory)
+    terminal = await service.create_terminal(
+        provider_name, name, session_name="cao-session", caller_id=CALLER, claim_id=token
+    )
+    args = shlex.split(commands[0].split("; ")[-1])
+    model = env[4]["model_tiers"][provider_name][tier] if tier else None
+    assert args.count("--model") == (1 if tier else 0)
+    if tier:
+        assert args[args.index("--model") + 1] == model
+    if provider_name == "claude_code":
+        assert args.count("--effort") == (1 if effort else 0)
+        if effort:
+            assert args[args.index("--effort") + 1] == effort
+    else:
+        item = f'model_reasoning_effort="{effort}"'
+        assert args.count(item) == (1 if effort else 0)
+        if effort:
+            pos = args.index(item)
+            assert args[pos - 1] == "-c"
+            assert pos < args.index("check_for_update_on_startup=false")
+            assert pos > next(
+                i
+                for i, arg in enumerate(args)
+                if arg.startswith("mcp_servers.cao-mcp-server.command=")
+            )
+    row = database.get_terminal_metadata(terminal.id)
+    assert row["model"] == model and row["model_honored"] is True
+
+
 @pytest.mark.parametrize("load", ["claude", "codex_command", "codex_timeout"])
 @pytest.mark.parametrize("tampered", [False, True])
 def test_provider_reload_verifies_finalized_bytes(create_store, monkeypatch, load, tampered):

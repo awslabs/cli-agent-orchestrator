@@ -38,7 +38,7 @@ class CallCounter:
 
 
 @pytest.fixture
-def create_store(_create_store, request):
+def create_store(_create_store, request, monkeypatch):
     """Set the creator ceiling before claimed_store creates and records the spec."""
     tools = getattr(request.node, "callspec", None)
     if tools is not None and "creator_tools" in tools.params:
@@ -47,6 +47,29 @@ def create_store(_create_store, request):
                 tools.params["creator_tools"]
             )
             db.commit()
+    variant = tools.params.get("e2_variant") if tools is not None else None
+    if variant is not None:
+        from test.services.test_ephemeral_tier_policy import mapped
+
+        mapped(_create_store[4])
+        if variant == "default":
+            _create_store[4]["ephemeral"]["default_tier"] = "small"
+        elif variant == "explicit":
+            original = _create_store[0].create_ephemeral_agent
+
+            def explicit(raw, *args, **kwargs):
+                return original({**raw, "model_tier": "small"}, *args, **kwargs)
+
+            monkeypatch.setattr(_create_store[0], "create_ephemeral_agent", explicit)
+        elif variant == "effort_default":
+            _create_store[4]["ephemeral"]["default_effort"] = "low"
+        elif variant == "effort_explicit":
+            original = _create_store[0].create_ephemeral_agent
+
+            def explicit_effort(raw, *args, **kwargs):
+                return original({**raw, "effort": "low"}, *args, **kwargs)
+
+            monkeypatch.setattr(_create_store[0], "create_ephemeral_agent", explicit_effort)
     return _create_store
 
 
@@ -968,3 +991,45 @@ async def test_claimed_provider_error_preserves_handoff_and_releases(launch_http
     assert database.get_terminal_metadata(CHILD) is None
     assert_released(env, name, "terminal_deleted")
     assert database.get_ephemeral_agent(name)["state"] == "gc"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "e2_variant", ["omitted", "explicit", "default", "effort_explicit", "effort_default"]
+)
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+async def test_A_D1_tier_launch_asks_no_decider(launch_http, askable_decisions, path, e2_variant):
+    with record_decision_calls() as calls:
+        result = await invoke(path, launch_http[0][1])
+    assert result["success"], result
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+@pytest.mark.parametrize(
+    "fault,rule",
+    [
+        ("tightened", "policy_changed_since_create:tier_exceeds_policy"),
+        ("broken", "policy_config_error:model_tiers"),
+        ("effort", "policy_changed_since_create:effort_exceeds_policy"),
+    ],
+)
+async def test_A_M1_claim_rule_relay(launch_http, path, fault, rule):
+    from test.services.test_ephemeral_tier_policy import mapped
+
+    env, name, backend, factory = launch_http[0]
+    mapped(env[4])
+    row_update(env, name, model_tier="large")
+    env[4]["ephemeral"].update(default_tier="small", max_tier="medium")
+    if fault == "broken":
+        del env[4]["model_tiers"]["claude_code"]["small"]
+    elif fault == "effort":
+        row_update(env, name, model_tier="small", effort="high")
+        env[4]["ephemeral"].update(default_effort="low", max_effort="medium")
+    result = await invoke(path, name)
+    assert result["success"] is False and result["rule"] == rule
+    assert result["terminal_id"] is None
+    assert result["message"].startswith("ephemeral policy: " + rule)
+    backend.create_window.assert_not_called()
+    factory.assert_not_called()

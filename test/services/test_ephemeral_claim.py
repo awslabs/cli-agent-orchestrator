@@ -8,7 +8,8 @@ from test.services.test_ephemeral_service import CALLER, SPEC, create, create_st
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import update
+from sqlalchemy import create_engine, update
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database
 
@@ -85,17 +86,29 @@ def test_early_refusal_order_and_unchanged_row(claimed_store, caller, body, rule
 
 
 @pytest.mark.parametrize("field", ["idempotency_key", "claim_id"])
-def test_launched_retry_precedes_model_and_tightened_policy(claimed_store, monkeypatch, field):
+@pytest.mark.parametrize("policy", ["tightened", "broken"])
+def test_launched_retry_precedes_model_and_tightened_policy(
+    claimed_store, monkeypatch, field, policy
+):
     env, name = claimed_store
     row_update(
         env,
         name,
         state="launched",
+        model_tier="large",
+        effort="high",
         launched_terminal_id="eeeeeeee",
         claim_id="a" * 32,
         idempotency_key="retry",
     )
-    env[4]["ephemeral"]["allowed_providers"] = []
+    env[4]["ephemeral"].update(
+        default_tier="small", max_tier="medium", default_effort="low", max_effort="medium"
+    )
+    env[4]["model_tiers"] = {
+        "claude_code": {tier: "model-" + tier for tier in ("small", "medium", "large")}
+    }
+    if policy == "broken":
+        env[4]["ephemeral"]["allowed_providers"] = []
     result = claim(
         env, name, model="ignored", **{field: "a" * 32 if field == "claim_id" else "retry"}
     )
@@ -291,7 +304,7 @@ def test_unknown_claim_and_finalize_are_structured(claimed_store):
     env, _ = claimed_store
     for call in [
         lambda: claim(env, "Ramones-unknown_name-abcd"),
-        lambda: env[0].finalize("Ramones-unknown_name-abcd", "a" * 32),
+        lambda: env[0].finalize("Ramones-unknown_name-abcd", "a" * 32, {}),
     ]:
         with pytest.raises(env[0].EphemeralPolicyError) as exc:
             call()
@@ -304,7 +317,7 @@ def test_stale_finalize_guard_cannot_resurrect_claim(claimed_store):
     env[0].end_claim(name, token)
     before = database.get_ephemeral_agent(name)
     with pytest.raises(env[0].EphemeralPolicyError, match="claim_expired"):
-        env[0].finalize(name, token)
+        env[0].finalize(name, token, {})
     assert database.get_ephemeral_agent(name) == before
     assert not list((env[2] / "ephemeral/live").glob("*.tmp"))
 
@@ -338,7 +351,7 @@ def test_stale_claim_id_cannot_touch_a_newer_claim(claimed_store):
     )
     before = database.get_ephemeral_agent(name)
     with pytest.raises(env[0].EphemeralPolicyError, match="claim_expired"):
-        env[0].finalize(name, "a" * 32)
+        env[0].finalize(name, "a" * 32, {})
     config = env[0].read_settings()
     config["allowed_providers"] = ["codex"]
     with pytest.raises(env[0].EphemeralPolicyError, match="provider_not_allowed"):
@@ -415,12 +428,46 @@ def test_policy_messages_use_contract_parentheses(claimed_store):
     assert exc.value.detail == "(claude_code); re-create the ephemeral agent"
 
 
-def test_pending_legacy_profile_claim_renders_empty_skills_and_new_hash(claimed_store, monkeypatch):
+@pytest.fixture
+def file_claimed_store(create_store, monkeypatch, tmp_path):
+    """claimed_store over a SQLite file: each session gets its own connection.
+
+    The StaticPool fixture shares one connection, so a load inside finalize's
+    transaction would see its uncommitted hash; a concurrent launch never does.
+    """
+    engine = create_engine(
+        "sqlite:///" + str(tmp_path / "registry.sqlite"),
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    database.Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    database.create_terminal(
+        CALLER,
+        "cao-session",
+        "window",
+        "claude_code",
+        agent_profile="reviewer",
+        allowed_tools=["@cao-mcp-server", "fs_read", "fs_list"],
+    )
+    env = (create_store[0], factory, *create_store[2:])
+    service = env[0]
+    monkeypatch.setattr(database, "_utcnow", lambda: NOW)
+    name = create(env)["name"]
+    tokens = iter(range(1, 100))
+    monkeypatch.setattr(service.secrets, "token_hex", lambda n: f"{next(tokens):0{n * 2}x}")
+    yield env, name
+    engine.dispose()
+
+
+def test_pending_legacy_profile_claim_renders_empty_skills_and_new_hash(
+    file_claimed_store, monkeypatch
+):
     import frontmatter
 
     from cli_agent_orchestrator.utils import agent_profiles
 
-    env, name = claimed_store
+    env, name = file_claimed_store
     path = env[2] / "ephemeral/live" / (name + ".md")
     legacy = frontmatter.loads(path.read_text())
     legacy.metadata.pop("skills", None)
@@ -433,14 +480,23 @@ def test_pending_legacy_profile_claim_renders_empty_skills_and_new_hash(claimed_
     def replace_then_load(src, dst):
         original_replace(src, dst)
         if str(dst) == str(path):
-            with pytest.raises(agent_profiles.EphemeralProfileUnavailable):
+            # Recorded, not asserted: claim would turn an AssertionError here into
+            # unexpected_failure.
+            committed = database.get_ephemeral_agent(name)["profile_sha256"]
+            try:
                 agent_profiles.load_launch_profile(name)
-            observed.append(True)
+                loaded = True
+            except agent_profiles.EphemeralProfileUnavailable:
+                loaded = False
+            observed.append((committed, hashlib.sha256(path.read_bytes()).hexdigest(), loaded))
 
     monkeypatch.setattr(env[0].os, "replace", replace_then_load)
     claim(env, name)
-    assert observed == [True]
     after = path.read_bytes()
+    # Between the replace and the commit, another connection still reads the
+    # committed old hash next to the new bytes, so the load refuses.
+    old, new = hashlib.sha256(before).hexdigest(), hashlib.sha256(after).hexdigest()
+    assert observed == [(old, new, False)]
     assert frontmatter.loads(after.decode()).metadata["skills"] == []
     assert after != before
     assert database.get_ephemeral_agent(name)["profile_sha256"] == hashlib.sha256(after).hexdigest()
