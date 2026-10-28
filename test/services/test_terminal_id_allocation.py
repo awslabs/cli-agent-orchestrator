@@ -56,7 +56,7 @@ def _seed_stale_pending_message(receiver_id: str, message: str = "stale") -> Non
             )
         )
         db.commit()
-    assert db_delete_terminal(receiver_id) is True
+    assert db_delete_terminal(receiver_id, end_reason="deleted") is True
 
 
 @pytest.mark.usefixtures("isolated_memory_db")
@@ -80,7 +80,7 @@ class TestTerminalIdInUse:
             idempotency_key="key-1",
             request_fingerprint="fp-1",
         )
-        db_delete_terminal("gone1234")
+        db_delete_terminal("gone1234", end_reason="deleted")
 
         assert database.terminal_id_in_use("gone1234") is True
 
