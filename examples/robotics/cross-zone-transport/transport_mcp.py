@@ -17,6 +17,10 @@ from fastmcp.server.auth import require_scopes
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token
 from simulation import Identifier, World
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse
+
+VIEWER_HTML = Path(__file__).resolve().parent / "viewer.html"
 
 LOGGER = logging.getLogger("transport")
 
@@ -80,6 +84,19 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         auth=StaticTokenVerifier(tokens, required_scopes=["observe"]),
         lifespan=lifespan,
     )
+
+    # Read-only live view, served on the same 127.0.0.1 controller.
+    # It exposes only observe() - the measured poses, custody, and command
+    # history that any observe-scoped agent already sees - never a credential.
+    # Loopback-bound, so it is reachable only from this machine (in the
+    # workshop, through the Code Editor's own port forwarding).
+    @server.custom_route("/", methods=["GET"], include_in_schema=False)
+    async def viewer(_request: Request) -> HTMLResponse:
+        return HTMLResponse(VIEWER_HTML.read_text(encoding="utf-8"))
+
+    @server.custom_route("/state", methods=["GET"], include_in_schema=False)
+    async def state(_request: Request) -> JSONResponse:
+        return JSONResponse(world.observe())
 
     def zone() -> str:
         token = get_access_token()

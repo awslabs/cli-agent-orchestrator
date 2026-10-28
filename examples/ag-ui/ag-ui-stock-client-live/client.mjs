@@ -35,8 +35,8 @@ await new Promise((resolve) => {
       }
     },
     error: (err) => {
-      // The run plane keeps the SSE stream open for the live bus; a read
-      // abort after the initial lifecycle frames is expected, not a failure.
+      // The run ends after RUN_FINISHED and the body closes (complete below);
+      // a read abort after the lifecycle frames is reported, not a failure.
       console.log(`[stock-client] stream ended: ${err?.message ?? err}`);
       resolve();
     },

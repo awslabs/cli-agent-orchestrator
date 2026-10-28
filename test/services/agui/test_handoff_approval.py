@@ -239,7 +239,7 @@ class TestEditDecision:
 
     @pytest.mark.asyncio
     async def test_edit_with_valid_text(self, construct, delivery):
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         result = await construct.resume(
             interrupt.id, ApprovalDecision.EDIT, edited_text="custom response"
         )
@@ -269,7 +269,7 @@ class TestEditDecision:
 
     @pytest.mark.asyncio
     async def test_edit_without_text_rejects(self, construct):
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         with pytest.raises(ValueError, match="non-empty edited_text"):
             await construct.resume(interrupt.id, ApprovalDecision.EDIT, edited_text=None)
         # Interrupt should still be open
@@ -277,14 +277,14 @@ class TestEditDecision:
 
     @pytest.mark.asyncio
     async def test_edit_with_empty_text_rejects(self, construct):
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         with pytest.raises(ValueError, match="non-empty edited_text"):
             await construct.resume(interrupt.id, ApprovalDecision.EDIT, edited_text="   ")
         assert not interrupt.resolved
 
     @pytest.mark.asyncio
     async def test_edit_with_too_long_text_rejects(self, construct):
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         with pytest.raises(ValueError, match="too long"):
             await construct.resume(interrupt.id, ApprovalDecision.EDIT, edited_text="x" * 4001)
         assert not interrupt.resolved
@@ -1157,7 +1157,7 @@ class TestSanitizedEmptyEditRejection:
     async def test_leading_newline_edit_rejected(self, construct):
         """edited_text='\\nrm -rf ~' passes raw validation but sanitizes to
         empty — must raise ValueError, not deliver."""
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         with pytest.raises(ValueError, match="empty after sanitization"):
             await construct.resume(interrupt.id, ApprovalDecision.EDIT, edited_text="\nrm -rf ~")
         assert not interrupt.resolved
@@ -1165,7 +1165,7 @@ class TestSanitizedEmptyEditRejection:
     @pytest.mark.asyncio
     async def test_control_only_edit_rejected(self, construct):
         """edited_text containing only control chars sanitizes to empty."""
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         with pytest.raises(ValueError, match="empty after sanitization"):
             await construct.resume(interrupt.id, ApprovalDecision.EDIT, edited_text="\x01\x02\x03")
         assert not interrupt.resolved
@@ -1173,7 +1173,7 @@ class TestSanitizedEmptyEditRejection:
     @pytest.mark.asyncio
     async def test_valid_edit_after_sanitization_succeeds(self, construct):
         """An edit with valid content after sanitization delivers normally."""
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         result = await construct.resume(
             interrupt.id, ApprovalDecision.EDIT, edited_text="valid command"
         )

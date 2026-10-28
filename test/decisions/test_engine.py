@@ -310,3 +310,334 @@ async def test_missing_profile_metadata_uses_existing_default(setup_engine, monk
     row = store.list()[0]
     assert plan.model is None and row["fallback_source"] == "none" and row["fallback_value"] is None
     assert row["reason"] == "unsure"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["installed", "ephemeral"])
+@pytest.mark.parametrize("failure", ["cancelled", "cancelled_future", "error"])
+async def test_decider_failure_returns_recorded_fallback(
+    setup_engine, monkeypatch, target, failure
+):
+    from cli_agent_orchestrator.decisions.policy import PolicyBounds
+    from cli_agent_orchestrator.decisions.targets import TargetKind
+
+    engine, req, decider, store, events, settings = setup_engine
+
+    async def fail(request, config):
+        if failure == "cancelled_future":
+            future = asyncio.get_running_loop().create_future()
+            future.cancel()
+            await future
+        if failure == "error":
+            raise RuntimeError("synthetic decider failure")
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(decider, "decide", fail)
+    plan = await engine.prepare_launch(
+        replace(
+            req,
+            target_kind=TargetKind(target),
+            field_states={"model.route": "auto"},
+            policy=PolicyBounds(default_tier="small") if target == "ephemeral" else req.policy,
+        )
+    )
+    assert plan is not None and len(plan.record_ids) == 1
+    assert plan.model == ("model-x" if target == "ephemeral" else None)
+    row = store.get(plan.record_ids[0])
+    assert (row["outcome"], row["reason"], row["decision_status"]) == ("fallback", "error", "done")
+    engine.bind_launch(plan, terminal_id="worker", model=plan.model or "model-y", honored=True)
+    assert store.get(plan.record_ids[0])["launch_status"] == "launched"
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_shadow_decider_cancellation_is_done_with_error(setup_engine, monkeypatch):
+    from cli_agent_orchestrator.decisions.settings import PointSettings
+    from cli_agent_orchestrator.decisions.types import PointState
+
+    engine, req, decider, store, events, settings = setup_engine
+
+    async def fail(request, config):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(decider, "decide", fail)
+    engine.settings_loader = lambda: replace(
+        settings, points={"model.route": PointSettings(PointState.SHADOW, decider.name)}
+    )
+    plan = await engine.prepare_launch(req)
+    await engine.runner.drain()
+    row = store.get(plan.record_ids[0])
+    assert (row["outcome"], row["reason"], row["decision_status"]) == ("shadow", "error", "done")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_from_decider", [False, True])
+async def test_launch_cancellation_cleans_decider_and_binds_prior_record(
+    setup_engine, monkeypatch, cancel_from_decider
+):
+    engine, req, decider, store, events, settings = setup_engine
+    started, cleaned = asyncio.Event(), asyncio.Event()
+    decide = decider.decide
+
+    async def block(request, config):
+        if request.points == ("effort.route",):
+            return await decide(request, config)
+        started.set()
+        try:
+            if cancel_from_decider:
+                launch.cancel()
+                raise asyncio.CancelledError()
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(decider, "decide", block)
+    launch = asyncio.create_task(
+        engine.prepare_launch(
+            replace(req, field_states={"effort.route": "auto", "model.route": "auto"})
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        if not cancel_from_decider:
+            launch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+    finally:
+        if not launch.done():
+            launch.cancel()
+        await asyncio.gather(launch, return_exceptions=True)
+    assert cleaned.is_set()
+    rows = store.list()
+    assert len(rows) == 1
+    assert (rows[0]["point"], rows[0]["launch_status"]) == ("effort.route", "not_launched")
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shadow", [False, True])
+async def test_decider_timeout_cleans_up_before_recording(setup_engine, monkeypatch, shadow):
+    from cli_agent_orchestrator.decisions.settings import PointSettings
+    from cli_agent_orchestrator.decisions.types import PointState
+
+    engine, req, decider, store, events, settings = setup_engine
+    cleaned = asyncio.Event()
+
+    async def block(request, config):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(decider, "decide", block)
+    engine.settings_loader = lambda: replace(
+        settings,
+        points={
+            "model.route": PointSettings(
+                PointState.SHADOW if shadow else PointState.ON, decider.name
+            )
+        },
+        on_timeout_ms=10,
+        shadow_timeout_ms=10,
+    )
+    plan = await engine.prepare_launch(req)
+    await engine.runner.drain()
+    assert cleaned.is_set()
+    row = store.get(plan.record_ids[0])
+    assert row["reason"] == "timeout" and row["decision_status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_shadow_close_cleans_decider_and_stays_interrupted(setup_engine, monkeypatch):
+    from cli_agent_orchestrator.decisions.settings import PointSettings
+    from cli_agent_orchestrator.decisions.types import PointState
+
+    engine, req, decider, store, events, settings = setup_engine
+    started, cleaned = asyncio.Event(), asyncio.Event()
+
+    async def block(request, config):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(decider, "decide", block)
+    engine.settings_loader = lambda: replace(
+        settings, points={"model.route": PointSettings(PointState.SHADOW, decider.name)}
+    )
+    plan = await engine.prepare_launch(req)
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+    finally:
+        await engine.runner.close()
+    row = store.get(plan.record_ids[0])
+    assert cleaned.is_set()
+    assert row["decision_status"] == "interrupted" and row["reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_owner_cancellation_consumes_completed_decider_error(setup_engine, monkeypatch):
+    import gc
+
+    engine, req, decider, store, events, settings = setup_engine
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    unhandled = []
+    loop.set_exception_handler(lambda loop, context: unhandled.append(context))
+
+    async def fail(request, config):
+        launch.cancel()
+        raise RuntimeError("synthetic-private-decider-error")
+
+    monkeypatch.setattr(decider, "decide", fail)
+    try:
+        launch = asyncio.create_task(engine.prepare_launch(req))
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        launch = None
+        gc.collect()
+        await asyncio.sleep(0)
+        assert unhandled == []
+        assert store.list() == []
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", ["answer", "error"])
+async def test_timeout_keeps_decider_cancellation_cleanup_result(
+    setup_engine, monkeypatch, cleanup
+):
+    engine, req, decider, store, events, settings = setup_engine
+    decide = decider.decide
+
+    async def block(request, config):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if cleanup == "error":
+                raise RuntimeError("synthetic cleanup failure")
+            return await decide(request, config)
+
+    monkeypatch.setattr(decider, "decide", block)
+    engine.settings_loader = lambda: replace(settings, on_timeout_ms=50)
+    plan = await engine.prepare_launch(req)
+    row = store.get(plan.record_ids[0])
+    if cleanup == "answer":
+        assert plan.model == "model-x"
+        assert (row["outcome"], row["reason"]) == ("applied", None)
+    else:
+        assert plan.model is None
+        assert (row["outcome"], row["reason"]) == ("fallback", "error")
+
+
+@pytest.mark.parametrize("fatal", [SystemExit, KeyboardInterrupt])
+@pytest.mark.parametrize("when", ["decide", "cleanup", "cleanup_twice", "owner_cancel"])
+def test_fatal_decider_exception_reaches_owner_without_stopping_loop(
+    setup_engine, monkeypatch, fatal, when
+):
+    engine, req, decider, store, events, settings = setup_engine
+    observed = []
+    decide = decider.decide
+
+    async def exercise():
+        started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+
+        async def fail(request, config):
+            if request.points == ("effort.route",):
+                return await decide(request, config)
+            started.set()
+            if when in {"cleanup", "cleanup_twice"}:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup_started.set()
+                    try:
+                        if when == "cleanup_twice":
+                            await asyncio.Event().wait()
+                        else:
+                            await asyncio.sleep(0)
+                    finally:
+                        raise fatal("synthetic decider exit")
+            if when == "owner_cancel":
+                launch.cancel()
+            raise fatal("synthetic decider exit")
+
+        async def request_task():
+            try:
+                await engine.prepare_launch(
+                    replace(req, field_states={"effort.route": "auto", "model.route": "auto"})
+                )
+            except BaseException as exc:
+                observed.append(exc)
+
+        monkeypatch.setattr(decider, "decide", fail)
+        launch = asyncio.create_task(request_task())
+        if when in {"cleanup", "cleanup_twice"}:
+            await asyncio.wait_for(started.wait(), 1)
+            launch.cancel()
+            if when == "cleanup_twice":
+                await asyncio.wait_for(cleanup_started.wait(), 1)
+                launch.cancel()
+        await launch
+        await asyncio.sleep(0)
+
+    escaped = None
+    try:
+        asyncio.run(exercise())
+    except BaseException as exc:
+        escaped = exc
+    assert escaped is None, f"fatal decider exception escaped the request: {type(escaped)}"
+    assert len(observed) == 1 and type(observed[0]) is fatal
+    rows = store.list()
+    assert len(rows) == 1
+    assert (rows[0]["point"], rows[0]["launch_status"]) == ("effort.route", "not_launched")
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_error", [False, True])
+async def test_owner_cancel_waits_for_multiturn_cleanup_without_error_leak(
+    setup_engine, monkeypatch, cleanup_error
+):
+    import gc
+
+    engine, req, decider, store, events, settings = setup_engine
+    started, cleaned = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    unhandled = []
+    loop.set_exception_handler(lambda loop, context: unhandled.append(context))
+
+    async def block(request, config):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            for _ in range(3):
+                await asyncio.sleep(0)
+            cleaned.set()
+            if cleanup_error:
+                raise RuntimeError("synthetic-private-cleanup-error")
+
+    monkeypatch.setattr(decider, "decide", block)
+    launch = asyncio.create_task(engine.prepare_launch(req))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        launch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert cleaned.is_set()
+        launch = None
+        gc.collect()
+        await asyncio.sleep(0)
+        assert unhandled == []
+        assert store.list() == []
+    finally:
+        if launch is not None and not launch.done():
+            launch.cancel()
+        if launch is not None:
+            await asyncio.gather(launch, return_exceptions=True)
+        loop.set_exception_handler(previous_handler)
