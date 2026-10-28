@@ -34,8 +34,11 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     build_kiro_command,
 )
 from cli_agent_orchestrator.providers.kiro_identity import (
+    PLAN_MODE_AGENT,
     KiroAgentIdentityError,
     header_agents,
+    identity_readable,
+    in_plan_mode,
     require_header_identity,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -188,9 +191,9 @@ TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
 STARTUP_PROMPT_BOTTOM_LINES = 15
 
 # Reads of the screen for the TUI header after the prompt is ready (see
-# KiroCliProvider._verify_agent_identity). Only a screen with no header row is
-# read again; a screen whose header rows name any other agent is refused on the
-# first read.
+# KiroCliProvider._verify_agent_identity). A screen with no header row, only a
+# partial (elided or wrapped) name, or Kiro's plan mode is read again; a screen
+# whose header rows name any other agent is refused on the first read.
 # Provisional (#1074): about 2 s, after which a screen without a header (a
 # kiro-cli TUI change, say) is refused rather than trusted.
 IDENTITY_HEADER_READS = 5
@@ -463,13 +466,17 @@ class KiroCliProvider(BaseProvider):
         Reads the rendered screen, not the scrollback, so the requested name in
         the echoed launch command is never what is matched (see
         ``kiro_identity.header_agents``). A screen without a header row is read
-        again a few times, because the header can trail the prompt by a frame.
+        again a few times, because the header can trail the prompt by a frame,
+        and so is one whose header name is only partial or that shows plan mode;
+        if that persists it is refused (``header_not_found``, or for plan mode
+        ``identity_mismatch``).
 
         Raises:
             KiroAgentIdentityError: ``identity_mismatch`` or ``header_not_found``.
         """
         backend = get_backend()
         observed: List[str] = []
+        plan_mode = False
         for attempt in range(IDENTITY_HEADER_READS):
             if attempt:
                 await asyncio.sleep(IDENTITY_HEADER_READ_INTERVAL_S)
@@ -485,10 +492,16 @@ class KiroCliProvider(BaseProvider):
                 logger.debug("kiro_cli: screen read for the identity check failed: %s", exc)
                 continue
             observed = header_agents(screen) if isinstance(screen, str) else []
-            if observed:
+            plan_mode = (
+                bool(observed)
+                and self._agent_profile != PLAN_MODE_AGENT
+                and isinstance(screen, str)
+                and in_plan_mode(screen)
+            )
+            if identity_readable(observed) and not plan_mode:
                 break
         try:
-            require_header_identity(self._agent_profile, observed)
+            require_header_identity(self._agent_profile, observed, plan_mode=plan_mode)
         except KiroAgentIdentityError as exc:
             logger.error(
                 "kiro_cli: terminal %s refused before any input: %s", self.terminal_id, exc

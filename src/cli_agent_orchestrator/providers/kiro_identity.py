@@ -49,6 +49,20 @@ KIRO_FALLBACK_AGENTS = frozenset({"kiro_default", "cao-null"})
 # fallback warning, so searching the pane for it would accept the fallback.
 _HEADER_ROW = re.compile(r"^(?P<agent>[^\s·]+)\s+·\s+(?P<model>[^\s·]+)\s+·\s+\S\s*\d{1,3}%")
 
+# A header name kiro-cli could not draw whole: elided with an ellipsis, or cut by
+# a wrap (``header_agents`` marks a fragment whose start is on the row above with
+# a leading ``…``). Such a name identifies no agent. Provisional (#1074).
+ELLIPSIS = "…"
+
+# Kiro's plan mode replaces the agent's name in the header with ``Plan``, and
+# shows how to leave it. Provisional (#1074): measured by a reviewer on
+# kiro-cli 2.35.1; not yet in a captured fixture.
+PLAN_MODE_AGENT = "Plan"
+_PLAN_MODE_HINT = re.compile(r"exit plan mode", re.IGNORECASE)
+
+# Rows the TUI draws as rules (``────``). The row above every captured header is one.
+_RULE_ROW = re.compile(r"^[\u2500-\u257f\-=_]+$")
+
 # Agent files above this size are not parsed while looking for a ``name``.
 _MAX_AGENT_FILE_BYTES = 1024 * 1024
 
@@ -204,16 +218,51 @@ def header_agents(pane: str) -> List[str]:
     right-hand cwd column all render below it, so the last row of header shape
     is not necessarily kiro-cli's. ``require_header_identity`` therefore
     accepts only a screen whose header rows all name the expected agent.
+
+    A name is returned as drawn, so an elided one keeps its ellipsis. A header
+    row directly under a bare word that is not a rule is a name cut by a wrap:
+    its fragment is returned with a leading ``…``. Either is a partial name
+    (``is_partial_agent_name``), never an identity.
     """
     agents: List[str] = []
+    previous = ""
     for row in strip_terminal_escapes(pane).splitlines():
         match = _HEADER_ROW.match(row)
-        if match and match.group("agent") not in agents:
-            agents.append(match.group("agent"))
+        if match:
+            agent = match.group("agent")
+            if _ends_a_wrapped_name(previous):
+                agent = ELLIPSIS + agent
+            if agent not in agents:
+                agents.append(agent)
+        previous = row
     return agents
 
 
-def require_header_identity(expected: str, observed: Sequence[str]) -> None:
+def _ends_a_wrapped_name(row: str) -> bool:
+    """True when ``row`` could be the start of a header name wrapped onto the next row."""
+    text = row.rstrip()
+    return bool(text) and not any(c.isspace() for c in text) and not _RULE_ROW.match(text)
+
+
+def is_partial_agent_name(name: str) -> bool:
+    """True for a header name kiro-cli could not draw whole: elided or wrapped."""
+    return ELLIPSIS in name or name.endswith("...")
+
+
+def in_plan_mode(pane: str) -> bool:
+    """True when ``pane`` shows Kiro's plan mode: a ``Plan`` header and its exit hint."""
+    text = strip_terminal_escapes(pane)
+    return PLAN_MODE_AGENT in header_agents(text) and bool(_PLAN_MODE_HINT.search(text))
+
+
+def identity_readable(observed: Sequence[str]) -> bool:
+    """True when at least one header row names an agent in full."""
+    return any(not is_partial_agent_name(name) for name in observed)
+
+
+def require_header_identity(
+    expected: str, observed: Sequence[str], *, plan_mode: bool = False
+) -> None:
     """Refuse a started Kiro session unless every header row named ``expected``.
 
     ``observed`` is ``header_agents`` of the pane. Called before any task is
@@ -222,12 +271,21 @@ def require_header_identity(expected: str, observed: Sequence[str]) -> None:
     screen whose header rows name more than one agent fails closed, wherever
     the rows are. Provisional (#1074): unanimity, rather than any one row.
 
+    A partial name (elided or wrapped) identifies no agent. With no full name
+    that disagrees it is ``header_not_found``, the class a TUI change gives,
+    not ``identity_mismatch``. ``plan_mode`` says the screen stayed in Kiro's
+    plan mode, whose ``Plan`` header hides the agent's name: a mismatch, unless
+    ``Plan`` is the agent asked for.
+
     Raises:
-        KiroAgentIdentityError: ``header_not_found`` when no header row was
-            read, ``identity_mismatch`` when any names another agent, or the
-            only one names a fallback.
+        KiroAgentIdentityError: ``header_not_found`` when no header row names an
+            agent in full, or a partial name sits beside the expected one;
+            ``identity_mismatch`` when a full name is another agent's (plan
+            mode's ``Plan`` included), or the only one names a fallback.
     """
     names = list(dict.fromkeys(observed))
+    full = [name for name in names if not is_partial_agent_name(name)]
+    listed = ", ".join(f"'{name}'" for name in names)
     if not names:
         raise KiroAgentIdentityError(
             "header_not_found",
@@ -237,8 +295,17 @@ def require_header_identity(expected: str, observed: Sequence[str]) -> None:
             f"cannot tell which agent is running. No task was sent. A kiro-cli TUI "
             f"change can cause this; check the kiro-cli version.",
         )
-    if len(names) > 1:
-        listed = ", ".join(f"'{name}'" for name in names)
+    if plan_mode and expected != PLAN_MODE_AGENT and full == [PLAN_MODE_AGENT]:
+        raise KiroAgentIdentityError(
+            "identity_mismatch",
+            expected,
+            f"Kiro agent identity not confirmed for '{expected}': the pane stayed in "
+            f"Kiro's plan mode, whose header shows '{PLAN_MODE_AGENT}' instead of the "
+            f"agent's name, so CAO cannot tell which agent is running. No task was "
+            f"sent. Launch the agent so that it does not start in plan mode, then retry.",
+            observed=", ".join(names),
+        )
+    if any(name != expected for name in full) and len(names) > 1:
         raise KiroAgentIdentityError(
             "identity_mismatch",
             expected,
@@ -249,7 +316,18 @@ def require_header_identity(expected: str, observed: Sequence[str]) -> None:
             f"directory for a name that renders like a Kiro header, then retry.",
             observed=", ".join(names),
         )
-    (observed_agent,) = names
+    if len(full) < len(names):
+        beside = " beside a full one" if full else ""
+        raise KiroAgentIdentityError(
+            "header_not_found",
+            expected,
+            f"Kiro agent identity not confirmed for '{expected}': the TUI header shows a "
+            f"partial agent name{beside} ({listed}), elided or wrapped by a narrow pane "
+            f"or a long name, so CAO cannot tell which agent is running. No task was "
+            f"sent. Widen the pane or use a shorter agent name, then retry.",
+            observed=", ".join(names),
+        )
+    (observed_agent,) = full
     if observed_agent != expected or observed_agent in KIRO_FALLBACK_AGENTS:
         raise KiroAgentIdentityError(
             "identity_mismatch",

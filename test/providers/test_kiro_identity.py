@@ -8,6 +8,10 @@ plus real captures from ``fixtures/``.
 ``kiro_cli_tui_2_34_2_fallback_launch.txt`` is the rendered screen (220x50,
 ``capture-pane -p``) of a CAO launch on kiro-cli 2.34.2 whose agent file did
 not load: requested ``sk1-broken``, header ``kiro_default · auto · ◔ 4%``.
+``kiro_cli_tui_2_34_2_plan_mode_reconstructed.txt`` is NOT a capture: it is that
+screen with the agent loaded and in Kiro's plan mode, as a reviewer described it
+on kiro-cli 2.35.1 (header ``Plan · <model>``, hint ``exit plan mode:
+shift+tab``). Replace it with a capture when one is taken.
 """
 
 import json
@@ -21,8 +25,11 @@ from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.kiro_identity import (
     _HEADER_ROW,
     KIRO_FALLBACK_AGENTS,
+    PLAN_MODE_AGENT,
     KiroAgentIdentityError,
     header_agents,
+    in_plan_mode,
+    is_partial_agent_name,
     kiro_agent_defined,
     kiro_agent_dirs,
     require_header_identity,
@@ -55,7 +62,8 @@ def _screen(header: str, requested: str = "developer", *, fallback: bool = False
 
 
 def _kiro_captures():
-    return sorted(FIXTURES_DIR.glob("kiro_cli_*.txt"))
+    """Real Kiro captures only; a reconstructed screen says so in its name."""
+    return sorted(p for p in FIXTURES_DIR.glob("kiro_cli_*.txt") if "reconstructed" not in p.name)
 
 
 def _rows_of_header_shape(text: str):
@@ -222,6 +230,14 @@ def _newline_in_cwd():
     return _header_replaced_by(_header_line("/tmp/x\n" + _PAYLOAD).split("\n"))
 
 
+def _bare_word_above_header():
+    """A bare word replaces the rule above the real header, so its name reads as the
+    tail of a wrapped one; a column-0 requested-agent row follows it."""
+    rows, at = _fallback_rows()
+    rows = rows[: at - 1] + ["x"] + rows[at:]
+    return "\n".join(rows[: at + 1] + [_PAYLOAD] + rows[at + 1 :])
+
+
 def _header_lost_its_shape():
     """The real header wraps before its gauge; the payload gets its own indented row."""
     return _header_replaced_by(
@@ -266,6 +282,7 @@ _SPOOFED_SCREENS = {
         "identity_mismatch",
     ),
     "real header lost its shape": (_header_lost_its_shape, "header_not_found"),
+    "a bare word above the real header": (_bare_word_above_header, "header_not_found"),
 }
 
 
@@ -320,6 +337,187 @@ class TestARequestedAgentRowOnTheRealFallbackScreen:
         with patch("cli_agent_orchestrator.providers.kiro_cli.get_backend", return_value=backend):
             await provider._verify_agent_identity()
         assert provider.identity_verified is True
+        assert backend.get_history.call_count == 1
+
+
+_LONG_AGENT = "kiro-rev-correctness-and-concurrency-and-error-handling-review"  # 61 chars
+_RULE = "─" * 60
+
+
+def _with_header(header_rows):
+    """The 2.34.2 screen with the agent loaded, its header replaced by ``header_rows``."""
+    rows, at = _fallback_rows()
+    return "\n".join(rows[1:at] + header_rows + rows[at + 1 :])
+
+
+class TestAPartialNameIsNotAnIdentity:
+    """An elided or wrapped header name maps to header_not_found, not identity_mismatch."""
+
+    @pytest.mark.parametrize(
+        "drawn",
+        [
+            "kiro-rev-correctness-and-concurr…",  # elided at the end
+            "kiro-rev-correctness-and-concurr...",  # ASCII ellipsis
+            "kiro-rev-corr…error-handling-review",  # elided in the middle
+        ],
+    )
+    def test_an_elided_name_is_header_not_found(self, drawn):
+        screen = _with_header([f"{drawn} · auto · ◔ 1%"])
+        assert header_agents(screen) == [drawn] and is_partial_agent_name(drawn)
+
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            require_header_identity(_LONG_AGENT, header_agents(screen))
+
+        assert excinfo.value.kind == "header_not_found"
+        assert excinfo.value.observed == drawn
+        assert "partial agent name" in str(excinfo.value) and "No task was sent" in str(
+            excinfo.value
+        )
+
+    def test_a_name_wrapped_at_the_pane_edge_is_header_not_found(self):
+        """A 30-column pane cuts the 61-character name: its tail opens the next row."""
+        head, tail = _LONG_AGENT[:30], _LONG_AGENT[30:]
+        screen = "\n".join([_RULE[:30], head, f"{tail} · auto · ◔ 1%", "", "› "])
+        assert header_agents(screen) == [f"…{tail}"]
+
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            require_header_identity(_LONG_AGENT, header_agents(screen))
+
+        assert excinfo.value.kind == "header_not_found"
+
+    def test_a_header_wrapped_before_its_gauge_is_header_not_found(self):
+        screen = _with_header([f"{_LONG_AGENT} · auto ·", "◔ 1%"])
+        assert header_agents(screen) == []
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            require_header_identity(_LONG_AGENT, header_agents(screen))
+        assert excinfo.value.kind == "header_not_found"
+
+    def test_a_full_name_of_another_agent_still_wins(self):
+        """The fallback's full name beside a partial one is a mismatch, as before."""
+        screen = _inserted_after_header(["sk1-bro… · auto · ◔ 1%"])
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            require_header_identity(_REQUESTED, header_agents(screen))
+        assert excinfo.value.kind == "identity_mismatch"
+        assert "kiro_default" in excinfo.value.observed
+
+    def test_the_requested_name_beside_a_partial_one_is_header_not_found(self):
+        screen = _with_header([f"{_REQUESTED} · auto · ◔ 1%", "", "sk1-bro… · auto · ◔ 1%"])
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            require_header_identity(_REQUESTED, header_agents(screen))
+        assert excinfo.value.kind == "header_not_found"
+
+    def test_every_real_capture_has_only_full_names(self):
+        for path in _kiro_captures():
+            assert not any(
+                is_partial_agent_name(n) for n in header_agents(path.read_text(encoding="utf-8"))
+            ), path.name
+
+    @pytest.mark.asyncio
+    async def test_the_provider_reads_again_then_refuses(self):
+        from cli_agent_orchestrator.providers.kiro_cli import IDENTITY_HEADER_READS
+
+        backend = MagicMock()
+        backend.get_history.return_value = _with_header(["kiro-rev-correctness-a… · auto · ◔ 1%"])
+        provider = KiroCliProvider("rv000001", "rv-session", "rv-window", _LONG_AGENT)
+        with (
+            patch("cli_agent_orchestrator.providers.kiro_cli.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.providers.kiro_cli.IDENTITY_HEADER_READ_INTERVAL_S", 0),
+            pytest.raises(KiroAgentIdentityError) as excinfo,
+        ):
+            await provider._verify_agent_identity()
+        assert excinfo.value.kind == "header_not_found"
+        assert backend.get_history.call_count == IDENTITY_HEADER_READS
+        assert provider.identity_verified is False
+        backend.send_keys.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_name_drawn_whole_on_a_later_read_passes(self):
+        backend = MagicMock()
+        backend.get_history.side_effect = [
+            _with_header(["kiro-rev-correctness-a… · auto · ◔ 1%"]),
+            _with_header([f"{_LONG_AGENT} · auto · ◔ 1%"]),
+        ]
+        provider = KiroCliProvider("rv000001", "rv-session", "rv-window", _LONG_AGENT)
+        with (
+            patch("cli_agent_orchestrator.providers.kiro_cli.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.providers.kiro_cli.IDENTITY_HEADER_READ_INTERVAL_S", 0),
+        ):
+            await provider._verify_agent_identity()
+        assert provider.identity_verified is True
+
+
+_PLAN_SCREEN = "kiro_cli_tui_2_34_2_plan_mode_reconstructed.txt"
+
+
+class TestPlanMode:
+    """Plan mode's ``Plan`` header hides the agent's name; it is never an identity."""
+
+    def test_the_screen_reads_as_plan_mode(self):
+        screen = _fixture(_PLAN_SCREEN)
+        assert header_agents(screen) == [PLAN_MODE_AGENT]
+        assert in_plan_mode(screen)
+
+    def test_a_plan_header_without_the_hint_is_not_plan_mode(self):
+        screen = _fixture(_PLAN_SCREEN).replace("exit plan mode: shift+tab", "/copy to clipboard")
+        assert header_agents(screen) == [PLAN_MODE_AGENT]
+        assert not in_plan_mode(screen)
+
+    def test_plan_mode_is_a_mismatch_for_any_other_agent(self):
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            require_header_identity("developer", [PLAN_MODE_AGENT], plan_mode=True)
+        assert excinfo.value.kind == "identity_mismatch"
+        assert "plan mode" in str(excinfo.value)
+
+    def test_an_agent_literally_named_plan_passes_in_plan_mode(self):
+        require_header_identity(PLAN_MODE_AGENT, [PLAN_MODE_AGENT], plan_mode=True)
+
+    @pytest.mark.asyncio
+    async def test_persistent_plan_mode_is_read_again_then_refused(self):
+        from cli_agent_orchestrator.providers.kiro_cli import IDENTITY_HEADER_READS
+
+        backend = MagicMock()
+        backend.get_history.return_value = _fixture(_PLAN_SCREEN)
+        provider = KiroCliProvider("rv000001", "rv-session", "rv-window", "developer")
+        with (
+            patch("cli_agent_orchestrator.providers.kiro_cli.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.providers.kiro_cli.IDENTITY_HEADER_READ_INTERVAL_S", 0),
+            pytest.raises(KiroAgentIdentityError) as excinfo,
+        ):
+            await provider._verify_agent_identity()
+        assert excinfo.value.kind == "identity_mismatch"
+        assert "plan mode" in str(excinfo.value)
+        assert backend.get_history.call_count == IDENTITY_HEADER_READS
+        assert provider.identity_verified is False
+        backend.send_keys.assert_not_called()
+        backend.send_special_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_plan_mode_that_clears_is_verified_from_the_agent_header(self):
+        loaded = _fixture(_PLAN_SCREEN).replace("Plan · auto", "developer · auto", 1)
+        backend = MagicMock()
+        backend.get_history.side_effect = [_fixture(_PLAN_SCREEN), loaded]
+        provider = KiroCliProvider("rv000001", "rv-session", "rv-window", "developer")
+        with (
+            patch("cli_agent_orchestrator.providers.kiro_cli.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.providers.kiro_cli.IDENTITY_HEADER_READ_INTERVAL_S", 0),
+        ):
+            await provider._verify_agent_identity()
+        assert provider.identity_verified is True
+        assert backend.get_history.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_plan_header_without_the_hint_is_refused_on_the_first_read(self):
+        backend = MagicMock()
+        backend.get_history.return_value = _fixture(_PLAN_SCREEN).replace(
+            "exit plan mode: shift+tab", "/copy to clipboard"
+        )
+        provider = KiroCliProvider("rv000001", "rv-session", "rv-window", "developer")
+        with (
+            patch("cli_agent_orchestrator.providers.kiro_cli.get_backend", return_value=backend),
+            pytest.raises(KiroAgentIdentityError) as excinfo,
+        ):
+            await provider._verify_agent_identity()
+        assert (excinfo.value.kind, excinfo.value.observed) == ("identity_mismatch", "Plan")
         assert backend.get_history.call_count == 1
 
 
