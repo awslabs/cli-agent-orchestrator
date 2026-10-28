@@ -7,9 +7,17 @@ description: "A team of four CLI agents in two layers runs a simulated factory l
 
 A factory line is a chain of teams. One team makes parts, the next team assembles them, and the last team ships them. Each team works at its own speed, so the line is only as fast as its slowest team. When a fast team runs in front of a slow team, it fills the buffer between them and then waits. Somebody must see that, find the slow team, and change the plan. On a real site, a planner and the team leads do this coordination, every shift.
 
-In the [first post of this series](/blog/2026/10/11/physical-ai-needs-orchestration), four CLI agents moved one parcel across two zones, one leg after the other. This post goes one step further. A **digital team** of agents runs a whole line: three robot teams that work at the same time, and a supervisor that balances them. CLI Agent Orchestrator (CAO) is an open-source tool for multi-agent orchestration. It runs a team of CLI agents, for example Claude Code, Kiro CLI, or Codex, and gives each agent its own role, its own tools, and its own credential.
+In the [first post of this series](https://awslabs.github.io/cli-agent-orchestrator/blog/2026/10/11/physical-ai-needs-orchestration), four CLI agents moved one parcel across two zones, one leg after the other. In this post, a **digital team** of agents runs a whole line: three robot teams that work at the same time, and a supervisor that balances them. CLI Agent Orchestrator (CAO) is an open-source tool for multi-agent orchestration. It runs a team of CLI agents, for example Claude Code, Kiro CLI, or Codex, and gives each agent its own role, its own tools, and its own credential.
 
-In this post, you learn how a team of agents can work like an organization: a supervisor that plans and balances, and one manager for each robot team. The second physical AI example of CAO, [hierarchical factory](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/hierarchical-factory), applies it to a simulated line in MuJoCo with nine [Open Duck Mini](https://github.com/apirrone/Open_Duck_Mini) robots. Four agents in two layers run it: one supervisor agent and three team manager agents. The robots are not agents. In the live runs, every order that was possible ended with all its units at the dock. In each run where the first team blocked, the supervisor found the slow team and set the pace of the first team to it. The requests that were not possible ended with no command to any robot. You also see why the example has one agent for each team and not one for each robot, how CAO keeps each manager inside its own team, and how the example maps to a real site.
+The second physical AI example of CAO, [hierarchical factory](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/hierarchical-factory), runs a simulated line in MuJoCo with nine [Open Duck Mini](https://github.com/apirrone/Open_Duck_Mini) robots. Four agents in two layers run it: one supervisor agent and three team manager agents. The robots are not agents.
+
+We ran the example nine times with live agents. These are the results:
+
+- Each order that the floor could do, and that the operator did not stop, ended with all its units at the dock.
+- In each run where the first team blocked, the supervisor found the slow team, and set the first team to the pace of the slow team.
+- The orders that the floor could not do ended with no command to any robot, after one fix that these runs found.
+
+In this post, you also see why the example has one agent for each team and not one for each robot, how CAO keeps each manager inside its own team, and how the example maps to a real site.
 
 ![The factory floor, with the robots in their formations. In the blue west zone, the three robots of Team A stand in one queue between the raw store and the amber buffer west_middle. In the green middle zone, the two robots of Team B stand in a vertical column, as two parallel assembly lines. In the orange east zone, the four robots of Team C stand in a diamond between the amber buffer middle_east and the dock. Cards above the zones give each team, its formation, and its speed, and an arrow along the front shows how the parts go from raw to machined to assembled to shipped.](../../../examples/robotics/hierarchical-factory/images/floor-layout.png)
 
@@ -24,21 +32,21 @@ In this post, you learn how a team of agents can work like an organization: a su
 
 {/* truncate */}
 
-The runs in this post used CAO from `main`, version `2.5.4` and later commits, with the `claude_code` provider, and one run with `copilot_cli`. The managers of the example need two changes that are on `main` but not in the 2.5.4 release yet: [#972](https://github.com/awslabs/cli-agent-orchestrator/pull/972) and [#948](https://github.com/awslabs/cli-agent-orchestrator/pull/948). [Architecture overview](#architecture-overview) explains why.
+The runs in this post used CAO from `main` with the `claude_code` provider, and one run with `copilot_cli`. The first runs used CAO 2.5.3 (commit `88f3af0c`). The later runs, and every scenario run of the final example, used commit `f63fffec` (version string 2.5.4). The managers of the final example need two changes that are on `main` but not yet in a release: [#972](https://github.com/awslabs/cli-agent-orchestrator/pull/972) and [#948](https://github.com/awslabs/cli-agent-orchestrator/pull/948). So you need CAO from `main` until the next release. [Architecture overview](#architecture-overview) explains why.
 
 ## Background
 
 ### From one handoff to a line of teams
 
-The [first post](/blog/2026/10/11/physical-ai-needs-orchestration) explains what physical AI is, why it needs agentic AI, and what MuJoCo and CAO are. In short: a robot moves with a policy, the program or trained model that turns what it senses into its next action. A policy is good at one skill. Agentic AI adds reasoning at the level of the goal: an agent reads a goal in natural language, plans the steps, and calls the robot skills in the correct order.
+The [first post](https://awslabs.github.io/cli-agent-orchestrator/blog/2026/10/11/physical-ai-needs-orchestration) explains what physical AI is, why it needs agentic AI, and what MuJoCo and CAO are. Here is the short version. A robot moves with a policy, the program or trained model that turns what it senses into its next action. A policy is good at one skill. Agentic AI adds reasoning at the level of the goal: an agent reads a goal in natural language, plans the steps, and calls the robot skills in the correct order.
 
 That post had one job with a fixed order: the west leg, the custody handoff at the dock, the east leg, and a check. Each step needed the result of the step before it, so the supervisor used the CAO tool `handoff`, which waits for a worker to finish.
 
-A line is different. All the teams work at the same time, and they depend on each other through the buffers between them. The work is not a sequence of steps. It is a flow, and the problem is to keep the flow balanced.
+A line is different. All the teams work at the same time, and they depend on each other through the buffers between them. So the problem is to keep the flow of parts balanced.
 
 ### What is a digital team
 
-A digital team is a group of AI agents that is organized like a team of people: each agent has one role, a manager gives it work, and it reports back. Real factories already use layers like this. The [ISA-95](https://www.isa.org/standards-and-publications/isa-standards/isa-95-standard) standard for the integration of enterprise and control systems describes the levels of a plant: business planning at the top, then the management of manufacturing operations, then the control of each process, and the machines at the bottom.
+A digital team is a group of AI agents that is organized like a team of people: each agent has one role, a manager gives it work, and it reports back. Real factories already use layers like this. The [ISA-95](https://www.isa.org/standards-and-publications/isa-standards/isa-95-standard) standard for the integration of enterprise and control systems describes the levels of a plant. Business planning is at the top. Below it are the management of manufacturing operations and the control of each process. The machines are at the bottom.
 
 The example uses the same idea at a small scale:
 
@@ -50,13 +58,13 @@ The supervisor and the managers are the two layers of the digital team. The robo
 
 ### What is takt time
 
-[Takt time](https://www.lean.org/lexicon-terms/takt-time/) is a lean manufacturing term: the pace at which a line must make each unit. A line can go only as fast as its slowest step, the **bottleneck**. A team that works faster than the bottleneck does not make the line faster. It only fills the buffer in front of the bottleneck, and then it is **blocked**: its parts cannot move on. To balance the line, a planner sets the pace of the teams before the bottleneck to the pace of the bottleneck.
+[Takt time](https://www.lean.org/lexicon-terms/takt-time/) is a lean manufacturing term: the available production time divided by the customer demand. It is the pace at which a line must finish each unit to meet the demand. A line can go only as fast as its slowest step, the **bottleneck**. A team that works faster than the bottleneck does not make the line faster. It only fills the buffer in front of the bottleneck, and then it is **blocked**: its parts cannot move on. To balance the line, a planner sets the pace of the teams before the bottleneck to the pace of the bottleneck. In this example, the order sets the paces, so the supervisor balances the line to its bottleneck.
 
 ### The robots: Open Duck Mini
 
-[Open Duck Mini](https://github.com/apirrone/Open_Duck_Mini) is a small, open-source biped robot, under the Apache-2.0 license. [Strands Robots](https://github.com/strands-labs/robots) drives it in its demos. The example downloads its MuJoCo model from one pinned commit, and checks the SHA-256 hash of each file. In the example, the team color is on the battery lid of each robot, and a lamp above the head shows the state: green when the robot works or moves, amber when it waits, and red when it is blocked. The legs walk on the real hip, knee, and ankle joints of the model.
+[Open Duck Mini](https://github.com/apirrone/Open_Duck_Mini) is a small, open-source biped robot, under the Apache-2.0 license. [Strands Robots](https://github.com/strands-labs/robots) drives it in its demos. The example downloads its MuJoCo model from one pinned commit, and checks the SHA-256 hash of each file. In the example, the battery lid of each robot has the color of its team. A lamp above the head shows the state of the robot: green when it works or moves, amber when it waits, and red when it is blocked. The legs walk on the real hip, knee, and ankle joints of the model.
 
-The example uses MuJoCo in a simple way, as the first example does. The root of each robot is a mocap body, which the controller moves at a set speed, and the controller sets the joint angles from that motion. Nothing has contact or gravity, and the simulator measures the positions. Without the download, simple bipeds stand in, and the example works the same.
+The example uses only a small part of MuJoCo, as the first example does. The root of each robot is a mocap body, which the controller moves at a set speed, and the controller sets the joint angles from that motion. Nothing has contact or gravity, and the simulator measures the positions. Without the download, plain bipeds made of basic shapes stand in, and the example works the same.
 
 ## Understanding the challenge
 
@@ -78,7 +86,7 @@ Running a line with a team of agents looks like one task. On a real site, it is 
 4. **Balance on measured state.** A team that blocks must report it, and the supervisor must find the bottleneck from the measured state of the floor, not from the text of a manager.
 5. **Fail safe.** A request that is not possible must end with no command to any robot. A stop by the operator must stop all motion, and a lost report must not leave the order in doubt.
 
-These criteria are not new either. On real sites, the cell controllers or fleet managers of each area run the machines, standards such as [VDA 5050](https://github.com/VDA5050/VDA5050) connect a fleet control to its robots, and people balance the line between the areas. A team of AI agents can take on that coordination, but only if it meets the same five criteria.
+These criteria are not new either. On real sites, the cell controller or fleet manager of each area runs its machines, and standards such as [VDA 5050](https://github.com/VDA5050/VDA5050) connect a fleet control to its robots. People balance the line between the areas. A team of AI agents can take on that coordination, but only if it meets the same five criteria.
 
 ### How many agents: one for each team, not one for each robot
 
@@ -90,9 +98,9 @@ A digital team can have one agent for each robot, or one agent for each team. Th
 - **One report for each problem.** When the buffer in front of Team B is full, the three robots of Team A are blocked for the same reason. One manager sends one report.
 - **The cost grows with the agents.** One agent for each robot would add nine agents, for robots that have no decision of their own to make.
 
-One agent for each robot is the better design when each robot has its own judgment to make: for example, an inspection robot that interprets camera images, or a fleet of different robots with no cell controller. Then a third agent layer, below the managers, makes sense.
+One agent for each robot is the better design when each robot must make its own decisions. Examples are an inspection robot that interprets camera images, or a fleet of different robots with no cell controller. Then a third agent layer, below the managers, makes sense.
 
-The benefits of a multi-agent architecture from the first post still apply. Each agent specializes in its own task, and each agent has its own identity: the Open Worldwide Application Security Project (OWASP) recommends "using per-agent identities and short-lived credentials (e.g., mTLS certificates or scoped tokens) - to limit blast radius". In its [multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system), Anthropic reports that "Subagents facilitate compression by operating in parallel with their own context windows". In the example, each manager reads only the state and the tools of its own team, and the three managers work in parallel.
+The benefits of a multi-agent architecture from the first post still apply. Each agent specializes in its own task, and each agent has its own identity. The Open Worldwide Application Security Project (OWASP) recommends "using per-agent identities and short-lived credentials (e.g., mTLS certificates or scoped tokens) - to limit blast radius". In its [multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system), Anthropic reports that "Subagents facilitate compression by operating in parallel with their own context windows". In the example, each manager reads only the state and the tools of its own team, and the three managers work in parallel.
 
 ## Solution overview
 
@@ -157,15 +165,19 @@ allowedTools:
   - "@cao-mcp-server/send_message"
 ```
 
-CAO always lets an assigned worker reach `send_message`, so that it can report ([#972](https://github.com/awslabs/cli-agent-orchestrator/pull/972)). It refuses `assign`, `handoff`, and the other tools that can start or find another agent, unless the allowlist holds the whole server. A manager that tries `assign` gets this result:
+CAO lets an assigned worker reach `send_message` whatever its allowlist, so that it can report ([#972](https://github.com/awslabs/cli-agent-orchestrator/pull/972)). It refuses `assign`, `handoff`, and the other tools that can start or find another agent, unless the allowlist holds the whole server. A manager that tries `assign` gets this result:
 
 ```bash
 'assign' is not permitted: the calling terminal's allowed tools do not include '@cao-mcp-server'
 ```
 
-The supervisor holds the whole server, and its delegation ceiling still covers the per-tool grant of the managers ([#948](https://github.com/awslabs/cli-agent-orchestrator/pull/948)), so it can start each manager. A test in the CAO repository pins this rule against the real gate of CAO.
+The supervisor holds the whole server. It can still start each manager, because CAO compares the per-tool grant of a manager with the grant of the supervisor correctly ([#948](https://github.com/awslabs/cli-agent-orchestrator/pull/948)). A test in the CAO repository checks this rule against the permission check of CAO itself.
 
-The supervisor uses `assign`, not `handoff`. `handoff` waits until a worker finishes, and the three teams must work at the same time. CAO delivers a message to a terminal only when that terminal is idle, so the protocol uses turns. After the three assigns, the supervisor ends its turn, and each report of a manager starts a new turn. A manager watches its team with `wait_team`, which waits up to 45 s in one tool call. When its team blocks, the manager reports once and ends its turn. Now it is idle, so the answer of the supervisor reaches it.
+The supervisor uses `assign`, not `handoff`, because `handoff` waits until a worker finishes, and the three teams must work at the same time. CAO delivers a message to an agent only when the agent is idle. So the agents work in turns:
+
+- After the three assigns, the supervisor ends its turn. Each report from a manager then starts a new turn of the supervisor.
+- A manager watches its team with `wait_team`, which waits up to 45 s in one tool call.
+- When its team blocks, the manager reports once and ends its turn. The manager is then idle, so the answer of the supervisor can reach it.
 
 ![Sequence diagram of a successful run. The supervisor observes, then assigns the Team C manager to form the diamond and ship 16 units, the Team B manager to form columns and assemble 16 units at 8 s, and the Team A manager to form the queue and make 16 parts at 2 s. Each manager calls form_team, starts its program, and calls wait_team. The controller reports to the Team A manager that its team is blocked, because the buffer west_middle is full. The Team A manager sends a blocked report to the supervisor. The supervisor observes that Team B is the bottleneck, and sends the Team A manager a pace of 8 s. The Team A manager calls set_pace and waits until done. The three managers report done, and the supervisor observes 16 assembled units at the dock.](./sequence.svg)
 
@@ -188,7 +200,7 @@ factory actor=middle command=line-1 operation=start_line status=finished reason=
 factory actor=east command=ship-1 operation=start_shipping status=finished reason=None
 ```
 
-While the controller runs, it serves a read-only **live view** at `http://127.0.0.1:8767/`. The map draws the floor and each robot in the color of its team, with its state lamp. The panel shows the supervisor, each manager with the status of its team, and the action log. The page shows only simulation state, never a credential. The controller accepts only loopback host names, so a web page cannot use DNS rebinding to read it.
+While the controller runs, it serves a read-only **live view** at `http://127.0.0.1:8767/`. The map draws the floor and each robot in the color of its team, with its state lamp. The panel shows the supervisor, each manager with the status of its team, and the action log. The page shows only simulation state, and no credential. The controller accepts only loopback host names, so a web page cannot use DNS rebinding to read it.
 
 ![The live view at the moment Team A is blocked. On the left, a top-down map of the three zones: the three Open Duck Mini robots of Team A are red in their queue, the buffer west_middle is full with 2 parts, the two robots of Team B carry parts, and the four robots of Team C wait in their diamond. On the right, the organization: the supervisor shows that a team is blocked and that it balances the line, the Team A manager is red and blocked for 5 s because its output buffer is full, and the Team B and Team C managers run.](../../../examples/robotics/hierarchical-factory/images/live-view.png)
 
@@ -219,7 +231,7 @@ This is an assisted kinematic MuJoCo simulation, not real robot work.
 
 ## Results
 
-The controller only runs the programs and checks the rules. The agents decide what to do. We ran the example live, with different orders:
+The controller only runs the programs and checks the rules. The agents decide what to do. We ran the example nine times with live agents, with these orders:
 
 | Order | Runs | What the agents did |
 | --- | --- | --- |
@@ -237,9 +249,9 @@ The runs also showed four things that we fixed in the example:
 - **A status after a stop.** After the operator stop, the status of each team still showed its last value, for example `running`. A program that the stop interrupts now shows `stopped`.
 - **An order delivered twice.** In some runs, CAO delivered the order to the supervisor a second time. The supervisor profile now says to run the order once, and in each of those runs the supervisor said so in its report and did not assign the managers again.
 
-These fixes are the reason to run a team of agents live and not only in tests: each one came from a run where the agents did something reasonable that the rules did not cover yet.
+The tests of the example did not find these four problems. Each one came from a live run, where an agent did something reasonable that the rules did not cover yet.
 
-The balance matters even though the line is not faster. Team B sets the pace of the line, so the order takes the same time with or without the new pace. But in the simulation, with the same commands and no new pace, the robots of Team A are blocked for 56 s. With the pace of the supervisor, they were blocked for 26 s in one live run. In another run, the new pace took about a minute to arrive, and they were blocked for 50 s. The sooner the supervisor answers, the less Team A waits.
+The new pace does not make the line faster. Team B sets the pace of the line, so the order takes the same time with or without the new pace. The new pace reduces the time that Team A waits. In the simulation, with the same commands and no new pace, the robots of Team A are blocked for 56 s. With the pace of the supervisor, they were blocked for 26 s in one live run. In another run, the new pace took about a minute to arrive, and they were blocked for 50 s. The sooner the supervisor answers, the less Team A waits.
 
 ## From the simulation to real robots
 
@@ -252,7 +264,7 @@ This example does not control real robots. It has no robot driver and no connect
 | The supervisor agent | A plant or shift planner that sets the order and the targets of each area |
 | A manager agent | The team lead or the cell controller of one line or one area |
 | A team program (`start_line`, `start_shipping`) | A job that the cell controller sends to its machines, for example a VDA 5050 order to a fleet of mobile robots |
-| `set_pace` after a block | Line balancing to the takt time of the bottleneck |
+| `set_pace` after a block | Line balancing: the teams before the bottleneck work at its pace |
 | A buffer with a capacity | A conveyor or a staging area between two cells |
 | `observe` and `wait_team` | The state that the cell controllers report |
 | The credential of each manager | A separate access key for the cell controller of each area |
@@ -302,7 +314,7 @@ Then follow the [README of the example](https://github.com/awslabs/cli-agent-orc
 
 ## Conclusion
 
-A line of robot teams needs more than a plan: it needs teams that work at the same time, managers that stay inside their own teams, decisions at the speed that agents can give, and a supervisor that balances the line from measured state. The hierarchical factory example shows how CAO gives a digital team that structure: a supervisor and one manager for each team, on a laptop, with real open-source robots in simulation and no robot hardware.
+To run a line, a team of agents must let the teams work at the same time, keep each manager inside its own team, decide only what can wait some seconds, and balance the line from measured state. The hierarchical factory example shows how CAO sets up such a digital team: one supervisor, and one manager for each robot team. It runs on a laptop, with open-source robots in simulation and no robot hardware.
 
 To get started:
 
@@ -317,7 +329,7 @@ Try the example, and tell us what you build in [GitHub Discussions](https://gith
 For more information:
 
 - [The README of the hierarchical factory example](https://github.com/awslabs/cli-agent-orchestrator/blob/main/examples/robotics/hierarchical-factory/README.md)
-- [Why physical AI needs multi-agent orchestration](/blog/2026/10/11/physical-ai-needs-orchestration), the first post of this series
+- [Why physical AI needs multi-agent orchestration](https://awslabs.github.io/cli-agent-orchestrator/blog/2026/10/11/physical-ai-needs-orchestration), the first post of this series
 - [`assign`](/docs/patterns/assign), [`send_message`](/docs/patterns/send-message), and [agent profiles](/docs/features/profiles) in the CAO documentation
 - [Open Duck Mini](https://github.com/apirrone/Open_Duck_Mini) and [the MuJoCo documentation](https://mujoco.readthedocs.io/en/stable/overview.html)
 
