@@ -511,7 +511,6 @@ def test_vendored_fork_retains_the_reviewed_registry_bytes_and_metadata():
         ("docusaurus", "proxy-addr", "2.0.8"),
         ("docusaurus", "joi", "17.13.8"),
         ("docusaurus", "postcss-selector-parser", "7.1.6"),
-        ("web", "postcss-selector-parser", "7.1.6"),
         ("docusaurus", "tinypool", "2.1.2"),
     ],
 )

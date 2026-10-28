@@ -223,6 +223,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ephemeral agents (#1074): one provider-capability table now drives the `allowed_providers` rule, the create and claim provider checks, the effort mapping and the MCP tool's provider list. A create response carries `enforcement` (`hard` on Claude Code, `advisory` on Codex), and a provider that cannot run a requested tool atom refuses with `tool_unsupported_on_provider:<atom>`, which no current provider does. Accepted providers, refusals and stored files are unchanged. The label values and the new rule are provisional.
+
 - Ephemeral agents (#801) accept an explicit `effort` and apply `ephemeral.default_effort` and `ephemeral.max_effort` (Claude Code `--effort`, Codex `model_reasoning_effort`).
 
 - Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim. `auto` still refuses.
