@@ -161,7 +161,7 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
 
         Positions are metres in this shared simulation; observed_at is UTC.
         For each team: status (idle, forming, ready, running, blocked,
-        starved, done), cycle_seconds, the robots with their measured poses
+        starved, done, stopped), cycle_seconds, the robots with their measured poses
         and states, and the program counters (output, target,
         avg_output_interval_seconds, blocked_seconds, starved_seconds).
         """

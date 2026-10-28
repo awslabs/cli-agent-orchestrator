@@ -276,6 +276,12 @@ def test_stop_interrupts_programs_and_locks_the_run():
     run(world, 2)
     assert {name: (robot.x, robot.y) for name, robot in world.robots.items()} == poses
     assert world.form_team("west", "form-9", "queue")["reason"] == "stopped"
+    # A program that the stop interrupted reports stopped, not its last status.
+    assert {zone: world.team_status(zone)["status"] for zone in FORMATIONS} == {
+        "west": "stopped",
+        "middle": "stopped",
+        "east": "stopped",
+    }
     assert world.set_pace("west", "pace-9", 4)["reason"] == "stopped"
 
 

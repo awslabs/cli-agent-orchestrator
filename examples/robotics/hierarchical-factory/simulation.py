@@ -1229,7 +1229,10 @@ class World:
         with self.lock:
             team, state = self.scene.teams[zone], self.teams[zone]
             program = state.program
-            if state.forming is not None:
+            if self.stopped and (state.forming is not None or (program and not program.done)):
+                # The operator stopped the run: the program is interrupted for good.
+                status = "stopped"
+            elif state.forming is not None:
                 status = "forming"
             elif program is None:
                 status = "ready" if state.formed else "idle"
