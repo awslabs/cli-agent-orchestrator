@@ -60,16 +60,7 @@ flowchart TB
 The floor has three zones. Parts flow from west to east. A **buffer** with a
 small capacity joins two zones:
 
-```text
- ┌──────── WEST: Team A ────────┬───── MIDDLE: Team B ─────┬───── EAST: Team C ──────┐
- │                              ║                          ║            ◆ c2         │
- │  raw   a1 ──▶ a2 ──▶ a3 ──▶  ║ ▢▢   b1 ▲  fetch,        ║  c3 ◆           ◆ c1 ─▶ dock
- │  store                       ║      b2 ▲  assemble,     ║            ◆ c4         │
- │                    west_middle (2)       deliver   middle_east (4)               │
- │  serial: one queue,          ║  parallel: two lines     ║  formation: spin, turn, │
- │  one pace for every robot    ║  at their own pace       ║  run to the dock        │
- └──────────────────────────────┴──────────────────────────┴─────────────────────────┘
-```
+![The factory floor, with the robots in their formations. In the blue west zone, the three robots of Team A stand in one queue between the raw store with 16 grey parts and the amber buffer west_middle, which holds 2 parts. In the green middle zone, the two robots of Team B stand in a vertical column, one above the other, as two parallel assembly lines. In the orange east zone, the four robots of Team C stand in a diamond between the amber buffer middle_east, which holds 4 units, and the dock. Cards above the zones give each team, its formation, and its speed, and an arrow along the front shows the parts go from raw to machined (pink) to assembled (purple) to shipped.](images/floor-layout.png)
 
 | Team | Zone | Robots | Kind | What the robots do |
 | --- | --- | --- | --- | --- |
@@ -300,7 +291,7 @@ team manager delegate to its robot agents with `assign`: a fourth layer.
 | CAO | `main` from 2026-10-23 or later, or the first release after 2.5.4. The managers need #972 (a worker can always reach `send_message`) and #948 (per-tool grants such as `@cao-mcp-server/send_message` in the delegation ceiling). | `cao --version`, and the date of the installed commit |
 | tmux | 3.3 or later | `tmux -V` |
 | uv | A recent release | `uv --version` |
-| Python | 3.10 or later | Step 1 finds or installs it with `uv` |
+| Python | 3.11 or later | Step 1 finds or installs it with `uv`. The example needs 3.11 because the fixed `dnspython` (2.9.0, GHSA-45c3-73f7-pv4m) needs it. |
 | MuJoCo | The version in `uv.lock` | Step 1 installs it as the Python package `mujoco`. You do not install it separately. |
 | OpenGL | Only for the pictures of `--record`. No separate GPU is necessary. | On macOS, OpenGL is part of the system. On Linux without a display, see [See the robots move](#see-the-robots-move). |
 | Provider CLI | A CAO provider that `prepare` accepts. GitHub Copilot CLI is the default. See [Providers](#providers). | Start the CLI one time in this repository, sign in, and accept its first-run prompts |
@@ -329,8 +320,8 @@ reasons that `demo.py` prints:
 | `hermes` | It reads MCP servers only from its own Hermes profile. |
 | `opencode_cli` | It keeps the MCP servers of all agents in one shared configuration. |
 
-With `claude_code`, `copilot_cli`, `grok_cli`, or `kiro_cli`, the provider
-refuses the tools that a profile does not allow. CAO shows this in the
+With `claude_code`, `copilot_cli`, or `kiro_cli`, the provider refuses the
+tools that a profile does not allow. CAO shows this in the
 `Enforcement:` line of `cao launch`. With the other providers, the allowlist is
 only an instruction, and `prepare` prints a warning. Use those providers only
 for a trusted local demo. See [Tool restrictions](../../../docs/tool-restrictions.md).
@@ -378,18 +369,18 @@ changed file. To keep the model in another directory, set
 The first time:
 
 ```text
-Using CPython 3.10.18
+Using CPython 3.12.4 interpreter at: /opt/homebrew/opt/python@3.12/bin/python3.12
 Creating virtual environment at: .venv
-Resolved 105 packages in 1.07s
-Installed 81 packages in 9.30s
+Resolved 87 packages in 9ms
+Installed 77 packages in 8.89s
  ...
 ```
 
 Later times:
 
 ```text
-Resolved 105 packages in 7ms
-Audited 81 packages in 28ms
+Resolved 87 packages in 9ms
+Audited 77 packages in 41ms
 ```
 
 Then `fetch-robot`, the first time and later times:
@@ -931,6 +922,14 @@ such as a browser IDE, forward the port first: in VS Code or code-server use the
 **Ports** panel, or `ssh -L 8767:127.0.0.1:8767 <host>`. Do not publish it on a
 public interface.
 
+The controller accepts only `127.0.0.1`, `localhost`, and `::1` in the `Host`
+header of a request, and refuses a cross-site `Origin`. So a web page cannot
+use DNS rebinding to read the live view or reach the MCP endpoint. If a port
+forward sends its own name in the `Host` header (some browser IDEs do), the
+live view answers `Misdirected Request`. Then set that name in Terminal 2
+before Step 3, for example `export FACTORY_ALLOWED_HOSTS=ide.example.com`.
+Add only the name of your own forward.
+
 ### Saved pictures with `--record`
 
 `demo.py serve --record DIR` saves pictures of the MuJoCo world from a fixed
@@ -1045,7 +1044,8 @@ each cell controller, and tests on the site with people who monitor the robots.
   endpoint, and the read-only live view (`GET /` and `GET /state`) without a
   credential, as in the cross-zone transport example: the live view shows only
   simulation state and accepts no command. It uses the FastMCP static-token
-  verifier. Use it only for this
+  verifier. It checks the `Host` and `Origin` headers of every request, so DNS
+  rebinding cannot reach it (see [Watch it live in a browser](#watch-it-live-in-a-browser)). Use it only for this
   short local demo. The MCP connections ignore proxy settings and HTTP
   redirects.
 
@@ -1111,16 +1111,16 @@ uv run --locked pytest
 The number of tests and the time can be different.
 
 ```text
-........................................................................ [ 65%]
-......................................                                   [100%]
-116 passed in 43.30s
+........................................................................ [ 58%]
+...................................................                      [100%]
+123 passed in 43.61s
 ```
 
 </details>
 
 - The tests use real headless MuJoCo and authenticated loopback MCP. They need
   no provider credentials.
-- CI runs them in the **Robotics factory example** workflow on Python 3.10
+- CI runs them in the **Robotics factory example** workflow on Python 3.11
   and 3.12.
 - Without `fetch-robot`, the tests use the simple bipeds and need no download.
   After `fetch-robot`, one more test loads the Open Duck Mini model.

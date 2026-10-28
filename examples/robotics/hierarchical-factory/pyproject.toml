@@ -2,7 +2,7 @@
 name = "cao-hierarchical-factory"
 version = "0.1.0"
 description = "Simulation-only 3-layer CAO organization: a supervisor, three team managers, and their robot teams"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
     "fastmcp==4.1.2",

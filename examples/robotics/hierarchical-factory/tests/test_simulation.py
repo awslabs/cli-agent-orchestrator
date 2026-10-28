@@ -72,6 +72,7 @@ def test_the_committed_scene_has_three_teams_of_the_planned_kinds_and_sizes():
         (lambda d: d["teams"]["west"].update(input="west_middle"), "raw store"),
         (lambda d: d["teams"]["middle"].update(min_cycle_seconds=20), "must not exceed"),
         (lambda d: d["teams"]["east"].update(max_batch=5), "max_batch"),
+        (lambda d: d["places"]["middle_east"].update(capacity=2), "capacity of the input buffer"),
         (lambda d: d["teams"]["east"].update(run_to=[4.3, 0]), "stay inside its zone"),
         (lambda d: d["teams"]["middle"]["slots"].pop("b2"), "exactly one team"),
         (lambda d: d.update(raw_store="west_middle"), "raw_store must be"),

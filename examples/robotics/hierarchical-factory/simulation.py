@@ -177,6 +177,10 @@ class Scene(Model):
                 raise ValueError("a formation team takes units from a buffer to a dock")
             if team.max_batch is None or team.max_batch > len(team.slots):
                 raise ValueError("max_batch must be set and must not exceed the team size")
+            # The formation waits for a full batch in its input buffer, and the
+            # team before it never fills the buffer past its capacity.
+            if team.max_batch > source.capacity:
+                raise ValueError("max_batch must not exceed the capacity of the input buffer")
             if team.run_to is None or team.run_speed_m_s is None:
                 raise ValueError("a formation team needs run_to and run_speed_m_s")
             # The formation turns about its centre, so every slot must stay in

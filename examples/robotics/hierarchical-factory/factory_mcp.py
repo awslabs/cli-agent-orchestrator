@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -30,6 +31,18 @@ VIEWER_HTML = Path(__file__).resolve().parent / "viewer.html"
 # Pictures of the Open Duck Mini for the live view, rendered from its model:
 # one for each team color, and one for a blocked robot.
 SPRITES = Path(__file__).resolve().parent / "sprites"
+
+
+def allowed_hosts() -> list[str] | None:
+    """Extra Host names the controller accepts, from FACTORY_ALLOWED_HOSTS.
+
+    The controller accepts only the loopback names (127.0.0.1, localhost, ::1)
+    in the Host header, so that a web page cannot use DNS rebinding to read the
+    live view. A port forward that rewrites Host to its own name needs that name
+    here, for example FACTORY_ALLOWED_HOSTS=ide.example.com.
+    """
+    names = [name.strip() for name in os.environ.get("FACTORY_ALLOWED_HOSTS", "").split(",")]
+    return [name for name in names if name] or None
 
 
 def viewer_page() -> str:
