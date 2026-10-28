@@ -8,7 +8,7 @@ CAO includes a web dashboard for managing agents, terminals, and flows from the 
 
 The pre-built Web UI is bundled inside the CAO wheel (at `src/cli_agent_orchestrator/web_ui/`), so a regular `uv tool install` ships everything you need. **You do not need Node.js or `npm install` to use the Web UI.**
 
-Node.js 18+ is only required if you want to:
+Node.js 22.22.2 or later is only required if you want to:
 
 - Run the frontend dev server for hot-reload development (Option A below), or
 - Rebuild the bundle from source.
@@ -20,14 +20,14 @@ Install Node only if one of those applies:
 brew install node
 
 # Ubuntu/Debian
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
 sudo apt-get install -y nodejs
 
 # Amazon Linux 2023 / Fedora
-sudo dnf install nodejs20
+sudo dnf install nodejs22
 
 # Verify
-node --version   # 18 or higher
+node --version   # 22.22.2 or higher
 ```
 
 ## Starting the Web UI
