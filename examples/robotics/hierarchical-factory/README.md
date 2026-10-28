@@ -280,7 +280,7 @@ judgment to make: for example, an inspection robot that interprets camera
 images, a mobile manipulator with open-ended tasks, or a fleet of different
 robots with no cell controller. To do that with this example, give each robot
 its own profile and credential (a `robot` claim next to `zone`), and let the
-team manager delegate to its robot agents with `assign`: a fourth layer.
+team manager delegate to its robot agents with `assign`: a third layer of agents.
 
 ## Requirements
 
