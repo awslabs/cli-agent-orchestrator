@@ -153,6 +153,7 @@ name = "cao-hierarchical-factory"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "dnspython" },
     { name = "fastmcp" },
     { name = "httpx2" },
     { name = "mujoco" },
@@ -169,6 +170,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "dnspython", specifier = ">=2.9.0" },
     { name = "fastmcp", specifier = "==4.1.2" },
     { name = "httpx2", specifier = "==2.14.0" },
     { name = "mujoco", specifier = "==3.16.0" },
