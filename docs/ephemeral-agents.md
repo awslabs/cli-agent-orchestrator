@@ -236,9 +236,11 @@ The claim lease covers claim to terminal creation. At claim, the server rechecks
 block before the stored provider, tier and effort. A broken block returns `policy_config_error:<key>` and
 reverts that claim to pending; fix the named setting and retry. A removed provider returns
 `policy_changed_since_create:provider_not_allowed` and collects the name; create a new one.
-If a CAO upgrade stops supporting the stored provider, or one of the stored tool atoms on it,
-the claim returns `policy_changed_since_create:provider_unsupported` or
-`policy_changed_since_create:tool_unsupported_on_provider:<atom>` and collects the name.
+If a CAO upgrade stops supporting a provider that `allowed_providers` still lists, every
+create and claim refuses with `policy_config_error:allowed_providers` until the operator
+removes it; a claim then returns `policy_changed_since_create:provider_unsupported` and
+collects the name. If an upgrade stops supporting one of the stored tool atoms, the claim
+returns `policy_changed_since_create:tool_unsupported_on_provider:<atom>` and collects the name.
 A stored tier or effort above a tightened ceiling, an unmapped stored tier, or a stored provider
 default under a newly added ceiling returns `policy_changed_since_create:tier_exceeds_policy`
 or `policy_changed_since_create:effort_exceeds_policy`, or
@@ -269,7 +271,8 @@ extraction failure tear down terminals owned by that call.
 Create also refuses with `provider_unsupported`, `provider_not_allowed`,
 `tool_unsupported_on_provider:<atom>`, `tier_unmapped`, `tier_exceeds_policy`,
 `effort_exceeds_policy` and `policy_config_error:<key>`, all HTTP 400. The three provider
-refusals come before tier, effort and creator-tool refusals.
+refusals come before tier and effort refusals and before the creator tool-ceiling check
+(`tool_exceeds_creator:<atoms>`).
 
 Every ephemeral live-profile load verifies the exact bytes parsed against the registry's
 `profile_sha256`, including claim-less launches and provider reloads. Missing rows or hashes

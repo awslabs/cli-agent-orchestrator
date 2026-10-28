@@ -177,7 +177,7 @@ def test_default_tools_are_checked_too(create_store, monkeypatch):
     [
         # A provider the operator did not allow is reported before its atoms.
         ({"provider": "codex"}, {}, ["*"], "provider_not_allowed"),
-        # Provider limits precede tier, effort and creator checks (provisional order).
+        # Provider limits precede tier, effort and creator tool-ceiling checks (provisional order).
         (
             {"model_tier": "large"},
             {"default_tier": "small", "max_tier": "small"},
@@ -226,7 +226,9 @@ def test_claim_collects_a_name_whose_atom_the_provider_dropped(pending_name, mon
     with pytest.raises(env[0].EphemeralPolicyError) as err:
         env[0].claim_ephemeral_agent(name, {}, CALLER)
     assert err.value.rule == "policy_changed_since_create:tool_unsupported_on_provider:web_fetch"
-    assert "re-create" in err.value.detail and "web_fetch" in err.value.detail
+    assert err.value.detail == (
+        "(codex does not support web_fetch in ephemeral agents); re-create the ephemeral agent"
+    )
     row = database.get_ephemeral_agent(name)
     assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
     assert not list((env[2] / "ephemeral" / "live").iterdir())
@@ -239,6 +241,7 @@ def test_claim_collects_a_name_whose_provider_was_dropped(pending_name, monkeypa
     with pytest.raises(env[0].EphemeralPolicyError) as err:
         env[0].claim_ephemeral_agent(name, {}, CALLER)
     assert err.value.rule == "policy_changed_since_create:provider_unsupported"
+    assert err.value.detail == "(codex); re-create the ephemeral agent"
     assert database.get_ephemeral_agent(name)["state"] == "gc"
 
 

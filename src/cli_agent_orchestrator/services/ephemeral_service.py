@@ -584,8 +584,8 @@ def create_ephemeral_agent(
             set(spec.tools if spec.tools is not None else ("fs_read", "fs_list")),
             key=TOOL_ATOMS.index,
         )
-        # Provider limits precede tier, effort and creator checks: no grant lifts them
-        # (provisional order, #1074).
+        # Provider limits precede the tier, effort and creator tool-ceiling checks: no grant
+        # lifts them (provisional order, #1074).
         refusal = provider_refusal(provider, config, requested, declared=spec.provider is not None)
         if refusal is not None:
             raise refusal
