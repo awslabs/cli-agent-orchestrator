@@ -2871,7 +2871,7 @@ def _identity_verified_now(terminal_id: str) -> bool:
             "Terminal %s: could not re-read its row before refusing input: %s", terminal_id, exc
         )
         return False
-    return bool(fresh) and fresh.get("identity_verified") is True
+    return fresh is not None and fresh.get("identity_verified") is True
 
 
 def _delete_deferred_failure_fallback(terminal_id: str) -> None:
