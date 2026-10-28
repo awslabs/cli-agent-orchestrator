@@ -5516,20 +5516,34 @@ async def run_step(
         # running for answer_user_prompt) apart from "generic failure, worker
         # dead" (tear down) -- see terminal_service.py's own
         # _schedule_deferred_init. run_step never goes through that deferred
-        # path, though: run_agent_step calls terminal_service.send_input with
-        # no orchestration_type, so the WAITING_USER_ANSWER guard can never
-        # fire here -- the only producer reachable from run_step is
-        # send_input's ERROR-state guard (a terminal whose provider process
-        # has already exited, or flips to ERROR between the readiness wait
-        # and the send). Since run_step is the SYNCHRONOUS caller (handoff
-        # MCP client's step call, and the future run engine), there is no
-        # deferred worker to keep alive either way -- the call has simply
-        # failed to complete, so this maps to the same kind="timeout" / 504
-        # outcome as a plain TimeoutError. This preserves the pre-PR-#539 504
-        # status code for this exact failure instead of silently falling
-        # through to the generic kind-less 500 below.
+        # path: run_agent_step calls terminal_service.send_input with no
+        # orchestration_type, so the WAITING_USER_ANSWER guard can never fire
+        # here. Three producers can: send_input's ERROR-state and bare-shell
+        # guards (the provider process has exited), and the Kiro identity gate
+        # (#1074) for a reused terminal (reuse_terminal_id) whose identity check
+        # is still running (identity_pending) or whose init ended without it
+        # (init_failed). Nothing was typed in any of them.
+        #
+        # identity_pending is transient: the same call can succeed once the
+        # terminal is ready, so it gets its own retryable 409 rather than a
+        # timeout. Provisional (#1074): the kind is not yet a settled string.
+        # The others keep the pre-PR-#539 kind="timeout" / 504 for a call that
+        # failed to complete, instead of the generic kind-less 500 below.
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
+        if (
+            isinstance(e, TerminalInputBlockedError)
+            and e.reason == TerminalInputBlockedReason.IDENTITY_PENDING
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": str(e),
+                    "kind": "identity_pending",
+                    "terminal_id": None,
+                    "retryable": True,
+                },
+            )
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},

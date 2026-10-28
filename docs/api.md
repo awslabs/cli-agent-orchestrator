@@ -313,7 +313,10 @@ and `RunStepRequest` (`POST /terminals/run-step`).
   behaves exactly as before, with no persistence overhead.
 - A step-level `detail.kind` distinguishes worker failures (`error` -> 502),
   in-band provider refusals (`provider_error` -> 502), and timeouts (`timeout` ->
-  504); callers branch on `kind`, not the numeric status alone.
+  504); callers branch on `kind`, not the numeric status alone. A reused Kiro
+  terminal (`reuse_terminal_id`) whose identity check is still running answers
+  `identity_pending` -> 409 with `retryable: true`: nothing was typed, so retry
+  the same call once it is ready.
 - `GET /handoff-results/{job_id}` retrieves the persisted record for that
   `job_id`. `state` is one of `running` (step still in progress), `completed`
   (result in `last_message`), or `error` (failure in `error_message`). `404`
