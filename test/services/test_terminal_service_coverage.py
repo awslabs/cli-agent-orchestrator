@@ -10,7 +10,7 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
-pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+pytestmark = pytest.mark.usefixtures("isolated_memory_db", "kiro_agent_store_not_under_test")
 
 
 class TestCreateTerminalCleanup:
@@ -367,6 +367,7 @@ class TestCreateTerminalCleanup:
         mock_provider = MagicMock()
         # initialize is awaited on the success path; AsyncMock returns cleanly
         mock_provider.initialize = AsyncMock(return_value=True)
+        mock_provider.identity_verified = True  # a healthy Kiro launch (#1074)
         mock_pm.create_provider.return_value = mock_provider
         mock_log_dir.__truediv__ = MagicMock(return_value=MagicMock())
 

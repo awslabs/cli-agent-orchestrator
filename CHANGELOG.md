@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro launches refuse an agent that kiro-cli would not run** (#1074). kiro-cli does not fail on
+  an unknown `--agent`. It prints `agent "<name>" not found, using "kiro_default"` and starts its
+  built-in default agent, which has every built-in tool, so launching a profile that was not
+  installed for Kiro, or whose agent file did not load, ran unrestricted. If a Kiro launch is now
+  refused, the remedy is `cao install <name> --provider kiro_cli`, then retry. Every `kiro_cli`
+  launch refuses an agent that none of the agent directories CAO searches defines, before any
+  terminal exists (`400`; the directories searched go to the server log, not the response). It also
+  refuses a pane whose TUI header rows do not all name the requested agent, before any task is
+  typed; an elided or wrapped header name, or a pane left in plan mode, never counts as the agent. A
+  Kiro terminal now takes typed input (`/input`, `/key`, `/exit`, `cao session send`, inbox delivery,
+  MCP `answer_user_prompt` and AG-UI) only once CAO has recorded that its header check passed. While
+  it is still starting, input is refused and queued inbox messages wait; `/terminals/run-step` on
+  such a reused terminal answers `409` `identity_pending`, retryable. A Kiro launch whose startup
+  ended without that record -- a refused identity, a timeout before the header was read, a server
+  restart mid-start -- has its window closed, even a deferred launch with no caller whose failure
+  record is kept (if the close cannot be confirmed, input to it stays refused). A Kiro terminal
+  verified before a server restart still accepts a re-sent task, and other providers are unchanged.
+  Kiro terminals launched before this change are not re-verified and keep their windows: they keep
+  accepting input unless they carry a startup failure. A correctly installed profile launches
+  exactly as before. **Behaviour change:** Kiro launches of a profile not installed for `kiro_cli`,
+  or of a Kiro built-in agent, are now refused; `cao launch --memory` on Kiro reports the
+  `memory_manager` sidecar as `refused` unless it is installed for Kiro; and with `CAO_AGENTS_DIR`
+  set in the server's environment outside `~/.kiro/agents` and `$KIRO_HOME/agents`, a launch now
+  fails at the header check, after kiro-cli has started (`cao-server --agents-dir` instead fails
+  early, as `agent_not_found`). **Not closed by this change:** the `/ws` web terminal drops the
+  attached pane's own keystrokes the same way, and refuses attaching to a pane whose runtime was
+  already reclaimed, but `/ws` is a full tmux (or herdr) client of the whole session, so its prefix
+  keys, mouse and command prompt can still reach another pane in that session, including an
+  unverified one. That gap predates this change and is tracked as a follow-up. See
+  `docs/kiro-cli.md`, troubleshooting item 7.
 - **Hierarchical robot factory example** (`examples/robotics/hierarchical-factory/`): a
   simulation-only factory floor in MuJoCo, run by four CAO agents in two layers. A supervisor assigns
   three team managers with `assign`; each manager runs its own team of Open Duck Mini robots (a serial

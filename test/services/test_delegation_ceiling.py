@@ -57,6 +57,7 @@ def launch(monkeypatch):
     monkeypatch.setattr(f"{_TS}.FIFO_DIR", fifo_dir)
     provider = AsyncMock()
     provider.initialize.return_value = True
+    provider.identity_verified = True  # a healthy Kiro launch (#1074)
     pm = MagicMock()
     pm.create_provider.return_value = provider
     monkeypatch.setattr(f"{_TS}.provider_manager", pm)
@@ -781,8 +782,26 @@ async def test_kiro_bounded_launch_with_an_unreadable_agent_file_is_refused(
 
 
 @pytest.mark.asyncio
-async def test_kiro_operator_launch_without_an_installed_file_is_not_refused(launch, kiro_install):
-    """The operator path is untouched: no caller, no ceiling comparison to fail closed on."""
+async def test_kiro_operator_launch_without_an_installed_file_is_refused_as_unresolvable(
+    launch, kiro_install
+):
+    """No caller, so no ceiling comparison; but kiro-cli would not fail on the missing
+    agent, it would start its built-in kiro_default with every built-in tool (#1074).
+    The agent check refuses it, and the same launch goes ahead once installed."""
+    from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
+    with pytest.raises(KiroAgentIdentityError) as excinfo:
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            allowed_tools=["fs_read"],
+        )
+    assert excinfo.value.kind == "agent_not_found"
+    assert not isinstance(excinfo.value, DelegationCeilingError)
+
+    kiro_install("developer", ["fs_read"])
     child = await create_terminal(
         "kiro_cli",
         "developer",
@@ -794,11 +813,26 @@ async def test_kiro_operator_launch_without_an_installed_file_is_not_refused(lau
 
 
 @pytest.mark.asyncio
-async def test_kiro_unrestricted_delegator_without_an_installed_file_is_not_refused(
+async def test_kiro_unrestricted_delegator_without_an_installed_file_is_refused_as_unresolvable(
     launch, kiro_install
 ):
-    """A ``*`` ceiling has nothing the installed file could exceed; the warning path stays."""
+    """A ``*`` ceiling has nothing the installed file could exceed, so no delegation
+    refusal; the missing agent is still refused by the agent check (#1074)."""
+    from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
     _seed("0000beef", "sup", SUPERVISOR, ["*"])
+    with pytest.raises(KiroAgentIdentityError) as excinfo:
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    assert not isinstance(excinfo.value, DelegationCeilingError)
+
+    kiro_install("developer", ["fs_read"])
     child = await create_terminal(
         "kiro_cli",
         "developer",
