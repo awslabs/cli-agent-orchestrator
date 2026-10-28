@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys, mouse and command prompt can still reach another pane in that session, including an
   unverified one. That gap predates this change and is tracked as a follow-up. See
   `docs/kiro-cli.md`, troubleshooting item 7.
+- **Hierarchical robot factory example** (`examples/robotics/hierarchical-factory/`): a
+  simulation-only factory floor in MuJoCo, run by four CAO agents in two layers. A supervisor assigns
+  three team managers with `assign`; each manager runs its own team of Open Duck Mini robots (a serial
+  queue of 3, two parallel assembly lines, and a 4-robot formation that spins, turns, and runs to the
+  dock) through scoped MCP tools and reports with `send_message`; the supervisor balances the line when
+  a team blocks. Per-team credentials; managers hold only `@cao-mcp-server/send_message`, so CAO
+  refuses them `assign` and `handoff`. A loopback-only controller with a read-only live view, operator
+  stop, recorded frames and a GIF, a pinned and hash-checked download of the Open Duck Mini model, and
+  a `Robotics factory example` CI workflow. No CAO core change.
 
 - **Breaking: CAO now requires Python 3.11 or later** (CVE-2026-114605). dnspython, which CAO pulls in
   through fastmcp, pydantic and email-validator, fixes CVE-2026-114605 (HIGH) only in 2.9.0, and 2.9.0
