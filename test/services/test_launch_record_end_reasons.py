@@ -20,7 +20,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.clients import database
-from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services import ephemeral_service, terminal_service
+from cli_agent_orchestrator.utils import atomic_file
 
 
 def _ended(reason):
@@ -258,3 +259,54 @@ async def test_sync_init_failure_writes_no_record(release_runtime):
             "claude_code", name, session_name="cao-session", caller_id=CALLER, claim_id=token
         )
     assert database.get_launch_record(CHILD) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("startup", [True, False])
+async def test_ephemeral_sweep_leaves_a_live_launch_open(release_runtime, monkeypatch, startup):
+    """The sweep never collects a launched name whose terminal still exists."""
+    env, name, _, _ = release_runtime
+    monkeypatch.setattr(atomic_file, "LOCK_DIR", env[2] / "locks")
+    await launch_runtime(release_runtime)
+
+    assert ephemeral_service.sweep(startup=startup) == {}
+
+    assert database.get_ephemeral_agent(name)["state"] == "launched"
+    assert database.get_launch_record(CHILD)["ended_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_after_a_lost_release_keeps_the_teardown_end_reason(
+    release_runtime, monkeypatch
+):
+    """Teardown ends the launch; when its best-effort release is lost, the
+    sweep collects the name as terminal_gone without relabelling the launch."""
+    env, name, _, _ = release_runtime
+    monkeypatch.setattr(atomic_file, "LOCK_DIR", env[2] / "locks")
+    await launch_runtime(release_runtime)
+    with monkeypatch.context() as lost:
+        lost.setattr(ephemeral_service, "release", lambda *args: None)
+        assert terminal_service.delete_terminal(CHILD, end_reason="deleted")
+    ended_at = _ended("deleted")["ended_at"]
+    assert database.get_ephemeral_agent(name)["state"] == "launched"
+
+    assert ephemeral_service.sweep(startup=True).get("terminal_gone") == 1
+
+    assert database.get_ephemeral_agent(name)["gc_reason"] == "terminal_gone"
+    assert _ended("deleted")["ended_at"] == ended_at
+
+
+@pytest.mark.asyncio
+async def test_policy_changed_collection_writes_no_launch_record(release_runtime):
+    """A name collected as policy_changed is refused before any terminal exists."""
+    env, name, backend, factory = release_runtime
+    env[4]["ephemeral"]["allowed_providers"] = ["codex"]
+
+    with pytest.raises(env[0].EphemeralPolicyError) as refused:
+        await launch_runtime(release_runtime)
+
+    assert refused.value.rule == "policy_changed_since_create:provider_not_allowed"
+    assert database.get_ephemeral_agent(name)["gc_reason"] == "policy_changed"
+    assert database.get_launch_record(CHILD) is None
+    backend.create_window.assert_not_called()
+    factory.assert_not_called()
