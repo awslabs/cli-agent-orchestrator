@@ -116,6 +116,7 @@ def test_server_cannot_restart_with_lost_command_history_and_old_credentials(tmp
     monkeypatch.setattr(demo, "make_server", lambda *args: Server())
     demo.serve(run_dir, allow_motion=False)
     assert calls[0]["host"] == "127.0.0.1"
+    assert calls[0]["host_origin_protection"] is True
     with pytest.raises(FileExistsError):
         demo.serve(run_dir, allow_motion=True)
     assert len(calls) == 1

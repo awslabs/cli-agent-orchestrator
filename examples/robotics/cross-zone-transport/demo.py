@@ -22,7 +22,7 @@ import yaml
 from fastmcp.server import create_proxy
 from recorder import Recorder, RecordingError, ensure_empty_directory
 from simulation import Scene, World
-from transport_mcp import controller_client, make_server
+from transport_mcp import allowed_hosts, controller_client, make_server
 
 HERE = Path(__file__).resolve().parent
 # The committed agent profile of each role. prepare() writes run copies of them.
@@ -312,6 +312,10 @@ def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> N
             port=port,
             stateless_http=True,
             show_banner=False,
+            # Check Host and Origin on every request, the MCP endpoint and the live
+            # view alike, so that DNS rebinding cannot reach the controller.
+            host_origin_protection=True,
+            allowed_hosts=allowed_hosts(),
         )
     except (KeyboardInterrupt, asyncio.CancelledError):
         # Uvicorn has already shut down cleanly and re-raises the signal; under
