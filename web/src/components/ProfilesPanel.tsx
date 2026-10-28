@@ -36,7 +36,7 @@ function sourceBadgeClass(source: string): string {
 
 function SourceBadge({ source }: { source: string }) {
   return (
-    <span className={`px-1.5 py-0.5 text-[10px] font-medium rounded border ${sourceBadgeClass(source)}`}>
+    <span className={`px-1.5 py-0.5 text-[10px] font-medium rounded-sm border ${sourceBadgeClass(source)}`}>
       {source}
     </span>
   )
@@ -422,7 +422,7 @@ export function ProfilesPanel() {
           placeholder="Search by capability, e.g. 'monitor sqs'…"
           value={query}
           onChange={e => { navGen.invalidate(); setQuery(e.target.value) }}
-          className="w-full pl-9 pr-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-emerald-600"
+          className="w-full pl-9 pr-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600"
         />
         {searching && <Loader2 size={14} className="animate-spin absolute right-3 top-1/2 -translate-y-1/2 text-gray-500" data-testid="search-spinner" />}
       </div>

@@ -91,7 +91,7 @@ function FieldLabel({ name, required, description }: { name: string; required?: 
 }
 
 const inputClass =
-  'w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-emerald-600'
+  'w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600'
 
 /**
  * One schema-driven field. Strings with enums render as selects; booleans as
@@ -134,7 +134,7 @@ function SchemaField({
   // error is nested inside it.
   // border-2 + !important red + ring: visibly thick and immune to losing the
   // border-color specificity contest against inputClass's border-gray-700.
-  const errClass = hasError ? ' border-2 !border-red-500 ring-2 ring-red-500/30' : ''
+  const errClass = hasError ? ' border-2 border-red-500! ring-2 ring-red-500/30' : ''
   if (selectOptions) {
     return (
       <div>
@@ -172,7 +172,7 @@ function SchemaField({
           type="checkbox"
           checked={Boolean(value)}
           onChange={e => onChange(name, e.target.checked ? true : undefined)}
-          className="rounded bg-gray-900 border-gray-700"
+          className="rounded-sm bg-gray-900 border-gray-700"
         />
         <FieldLabel name={name} required={required} description={schema.description} />
       </div>
@@ -230,7 +230,7 @@ function SchemaField({
           // pretty-printed once; edits then flow through as strings.
           value={typeof value === 'string' ? value : value ? JSON.stringify(value, null, 2) : ''}
           onChange={e => onChange(name, e.target.value)}
-          className={`${inputClass} font-mono text-xs ${err || hasError ? 'border-2 !border-red-500 ring-2 ring-red-500/30' : ''}`}
+          className={`${inputClass} font-mono text-xs ${err || hasError ? 'border-2 border-red-500! ring-2 ring-red-500/30' : ''}`}
           placeholder="{ }"
         />
         {err && <div className="text-xs text-red-400 mt-1" role="alert">{err}</div>}
@@ -646,12 +646,12 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     }`
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center" role="dialog" aria-label="Create profile">
+    <div className="fixed inset-0 z-60 flex items-center justify-center" role="dialog" aria-label="Create profile">
       {/* Backdrop close is gated on !saving: Cancel is already disabled
           during a save, and an overlay click mid-flight would unmount the
           modal while the request resolves — success snackbar with no modal,
           setState on an unmounted tree. */}
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={saving ? undefined : onClose} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-xs" onClick={saving ? undefined : onClose} />
       <div className="relative bg-gray-900 border border-gray-700/50 rounded-2xl shadow-2xl w-full max-w-3xl mx-4 max-h-[85vh] flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center gap-3 p-5 pb-3 border-b border-gray-800">
@@ -674,7 +674,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
           {/* Gated like Cancel and the backdrop: closing mid-save leaves the
               modal rendering null, so a late 400's saveError is invisible and
               then wiped by the next open's reset (#692 review). */}
-          <button onClick={saving ? undefined : onClose} disabled={saving} aria-label="Close" className="p-1 text-gray-500 hover:text-white rounded transition-colors disabled:opacity-50">
+          <button onClick={saving ? undefined : onClose} disabled={saving} aria-label="Close" className="p-1 text-gray-500 hover:text-white rounded-sm transition-colors disabled:opacity-50">
             <X size={16} />
           </button>
         </div>
@@ -690,7 +690,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
               type="text"
               value={profileName}
               onChange={e => { nameTouched.current = true; clearBlockedSave(); setProfileName(e.target.value) }}
-              className={inputClass + (errorFields.has('name') ? ' border-2 !border-red-500 ring-2 ring-red-500/30' : '')}
+              className={inputClass + (errorFields.has('name') ? ' border-2 border-red-500! ring-2 ring-red-500/30' : '')}
               placeholder="my-agent"
             />
           </div>

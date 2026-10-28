@@ -45,7 +45,7 @@ export function PlaybackTransport({
 
   const disabled = eventCount === 0
   const btn =
-    'p-2 rounded-lg text-gray-300 bg-gray-800 hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed'
+    'p-2 rounded-lg text-gray-300 bg-gray-800 hover:bg-gray-700 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed'
 
   return (
     <div className="flex items-center gap-2" role="group" aria-label="Playback transport">

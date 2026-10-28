@@ -167,7 +167,7 @@ export function SyncedTerminalPane({ event }: SyncedTerminalPaneProps) {
           </span>
         )}
       </header>
-      <div className="p-3 min-h-[6rem]">
+      <div className="p-3 min-h-24">
         {loading && (
           <div className="flex items-center gap-2 text-xs text-gray-500" role="status">
             <Loader2 size={14} className="animate-spin" aria-hidden="true" />
@@ -181,7 +181,7 @@ export function SyncedTerminalPane({ event }: SyncedTerminalPaneProps) {
           </div>
         )}
         {!loading && !error && (
-          <pre className="text-xs font-mono text-gray-300 whitespace-pre-wrap break-words max-h-64 overflow-auto">
+          <pre className="text-xs font-mono text-gray-300 whitespace-pre-wrap wrap-break-word max-h-64 overflow-auto">
             {output || (
               <span className="text-gray-600 italic">
                 {offsetsPresent ? 'No output in this range.' : 'No terminal output yet.'}
