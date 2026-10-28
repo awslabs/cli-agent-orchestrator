@@ -3931,3 +3931,88 @@ class TestLiveCaptureFixtures:
             self._provider(mock_backend, dispatched=dispatched).get_status("\n".join(frame))
             == TerminalStatus.COMPLETED
         )
+
+
+class TestClaudeCode310PermissionFooterFixtures:
+    """Real ``tmux capture-pane -p -J`` frames from Claude Code 2.1.310 under
+    ``--permission-mode default``, where Bash ("Do you want to proceed?") and
+    Write ("Do you want to create hello.txt?") permission dialogs render the
+    footer ``Esc to cancel · Tab to amend`` instead of ``↑/↓ to navigate`` or
+    ``Enter to confirm ·``.
+    """
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    @classmethod
+    def _frame(cls, name: str) -> list:
+        return (
+            (cls.FIXTURES / f"claude_code_310_{name}.txt").read_text(encoding="utf-8").split("\n")
+        )
+
+    @staticmethod
+    def _provider(mock_backend, *, dispatched: bool) -> ClaudeCodeProvider:
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        if dispatched:
+            provider.mark_input_received()
+        return provider
+
+    @pytest.mark.parametrize("name", ["bash_permission_prompt", "write_permission_prompt"])
+    @pytest.mark.parametrize("dispatched", [False, True])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_permission_prompt_is_waiting_user_answer_on_raw_path(
+        self, mock_backend, name, dispatched
+    ):
+        frame = self._frame(name)
+        assert (
+            self._provider(mock_backend, dispatched=dispatched).get_status("\n".join(frame))
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @pytest.mark.parametrize("name", ["bash_permission_prompt", "write_permission_prompt"])
+    @pytest.mark.parametrize("dispatched", [False, True])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_permission_prompt_is_waiting_user_answer_on_screen_path(
+        self, mock_backend, name, dispatched
+    ):
+        frame = self._frame(name)
+        assert (
+            self._provider(mock_backend, dispatched=dispatched).get_status_from_screen(frame)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_permission_idle_after_is_completed(self, mock_backend):
+        frame = self._frame("permission_idle_after")
+        provider = self._provider(mock_backend, dispatched=False)
+        assert provider.get_status("\n".join(frame)) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_prose_containing_permission_words_does_not_false_match(self, mock_backend):
+        """Completed agent prose mentioning the prompt question or individual
+        footer phrases without the ``·`` chrome separator must not false-match
+        as WAITING_USER_ANSWER even when landing inside the bottom window.
+        """
+        prose_frame = [
+            "❯ Explain the permission prompt options",
+            "",
+            "⏺ When Claude asks Do you want to proceed? or Do you want to create hello.txt?,",
+            "  you can press Esc to cancel the dialog or press Tab to amend the command.",
+            "────────────────────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────────────────────",
+            "  ⏸ manual mode on",
+        ]
+        provider = self._provider(mock_backend, dispatched=False)
+        assert provider.get_status("\n".join(prose_frame)) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(prose_frame) == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize("name", ["bash_permission_prompt", "write_permission_prompt"])
+    def test_handoff_approval_classifies_310_permission_prompts(self, name):
+        from cli_agent_orchestrator.services.agui.handoff_approval import classify_reason
+
+        raw_prompt = "\n".join(self._frame(name))
+        assert classify_reason("claude_code", raw_prompt) == "claude-code:permission_request"

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **`POST /agui/v1/run` now ends its response after `RUN_FINISHED`** (#1106, ag-ui-protocol/ag-ui#2216). A
+  run with nothing pending, or one whose `resume[]` resolved the last pending interrupt, used to stay
+  open forever. The route handed the run plane the whole-fleet SSE bus, which never ends, and nothing
+  in that loop could finish the run. A stock AG-UI client completes a run only when the body ends, so
+  `runAgent()` never resolved. The route no longer passes the fleet bus. Every run now ends with
+  `RUN_STARTED`, `STATE_SNAPSHOT`, then `RUN_FINISHED` (`interrupt` while approvals are pending,
+  otherwise `success`) or `RUN_ERROR`. After `resume[]`, `success` means the decision was delivered,
+  not that the agent finished; a later prompt surfaces as an interrupt on the next run. Live fleet
+  activity stays on `GET /agui/v1/stream`. `RunAgentInput.messages` is still not read.
+
+- **Claude Code 2.1.310 tool-permission prompts are detected as `WAITING_USER_ANSWER`** (#1106; related:
+  #405). Bash "Do you want to proceed?" and Write "Do you want to create <file>?" dialogs now render
+  the footer `Esc to cancel · Tab to amend`, which no existing pattern matched, so the terminal stayed
+  `processing`: no AG-UI interrupt was raised and inbox delivery could type into the dialog. The new
+  pattern arm is anchored to the same-line `·` chrome, so completed prose that mentions the phrases does
+  not match. Fixtures are real `tmux capture-pane` frames from 2.1.310 under `--permission-mode default`.
+
 - **A plan approval now names the working directory it was granted for, not just its path** (#827,
   #1000). A path is not an identity. Move a non-Git working directory away, put a different directory
   at the same path, and every value the plan identifier recorded was byte-identical, so the

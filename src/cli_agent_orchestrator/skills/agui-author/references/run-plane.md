@@ -21,16 +21,21 @@ Content-Type: application/json
 
 ## Lifecycle Frames
 
-The SSE stream emits frames in this order:
+Every run ends, and the response body closes right after its last frame (a
+stock AG-UI client completes a run only when the body ends):
 
-```
-RUN_STARTED
-  → STATE_SNAPSHOT (full fleet state)
-  → [live frames: STATE_DELTA, TOOL_CALL_START, TOOL_CALL_END, GENERATIVE_UI, ...]
-  → [optional: Interrupt (approval prompt, pauses stream)]
-  → [on resume: remaining lifecycle frames]
-RUN_FINISHED | RUN_ERROR
-```
+| Situation | Frames |
+|---|---|
+| Interrupts pending | `RUN_STARTED`, `STATE_SNAPSHOT`, `RUN_FINISHED` (`outcome: interrupt`) |
+| Nothing pending | `RUN_STARTED`, `STATE_SNAPSHOT`, `RUN_FINISHED` (`outcome: success`) |
+| `resume[]` delivered, nothing left pending | `RUN_STARTED`, `STATE_SNAPSHOT`, `RUN_FINISHED` (`outcome: success`) |
+| `resume[]` delivered, other interrupts still pending | `RUN_STARTED`, `STATE_SNAPSHOT`, `RUN_FINISHED` (`outcome: interrupt`, the remaining ones) |
+| Resume failed (unknown id, bad payload, delivery failure) | `RUN_STARTED`, `RUN_ERROR` |
+
+A `success` after `resume[]` means the decision was delivered, not that the
+agent finished its work. If the agent prompts again, the next run returns that
+prompt as an interrupt. Live fleet activity is the ambient plane,
+`GET /agui/v1/stream`.
 
 ### Frame Types
 
@@ -49,13 +54,16 @@ RUN_FINISHED | RUN_ERROR
 
 ### Heartbeat
 
-The run plane emits `:keep-alive` SSE comments at a configurable interval
-(default 15s, env `CAO_AGUI_HEARTBEAT_SECONDS`) to prevent proxy timeouts.
+While projecting live events, the run plane emits `:keep-alive` SSE comments
+at a configurable interval (default 15s, env `CAO_AGUI_HEARTBEAT_SECONDS`) to
+prevent proxy timeouts. Live projection is available to embedders that inject
+an event source into `run_plane_stream`; `POST /agui/v1/run` does not.
 
 ## Interrupts
 
-When a terminal enters `WAITING_USER_ANSWER`, the run plane emits an `Interrupt`
-frame and pauses. The interrupt carries:
+When a terminal enters `WAITING_USER_ANSWER`, CAO records an interrupt. The
+next run ends with `RUN_FINISHED` whose `outcome.interrupts` lists it. Each
+interrupt carries:
 
 ```json
 {
