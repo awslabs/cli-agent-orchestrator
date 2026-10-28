@@ -5,6 +5,7 @@ process are mocked, as in test_ephemeral_launch_handlers.
 """
 
 import asyncio
+from dataclasses import replace
 from datetime import timedelta
 from test.mcp_server.test_ephemeral_launch_handlers import (  # noqa: F401
     CHILD,
@@ -34,6 +35,7 @@ from cli_agent_orchestrator.decisions.store import DecisionStore
 from cli_agent_orchestrator.decisions.targets import TargetKind
 from cli_agent_orchestrator.decisions.types import DecisionAnswer, PointState
 from cli_agent_orchestrator.services.secret_gate import redact_secrets
+from cli_agent_orchestrator.utils import ephemeral_capabilities as caps
 from cli_agent_orchestrator.utils import orchestration
 
 TIERS = {"claude_code": {t: "model-" + t for t in ("small", "medium", "large")}}
@@ -982,6 +984,76 @@ def test_a_policy_tightened_after_the_claim_collects_without_asking(e5, site):
     assert response.status_code == 400, response.text
     detail = response.json()["detail"]
     assert detail["rule"] == "policy_changed_since_create:tier_exceeds_policy"
+    row = database.get_ephemeral_agent(e5.name)
+    assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
+    assert e5.decider.requests == [] and e5.store.list() == []
+    e5.factory.assert_not_called()
+
+
+# #1074: the provider-capability rules apply at both decision rechecks, as at claim.
+
+PROVIDER_RULES = [
+    "policy_changed_since_create:provider_unsupported",
+    "policy_changed_since_create:tool_unsupported_on_provider:fs_read",
+]
+
+
+def drop_provider_support(rt, monkeypatch, rule):
+    """Make the table refuse the stored claude_code launch, as a CAO upgrade could."""
+    row = caps.CAPABILITIES["claude_code"]
+    if rule.endswith(":provider_unsupported"):
+        # validate_block reads the same table: the operator has already removed the provider.
+        tiers = {**TIERS, "codex": {t: "codex-" + t for t in ("small", "medium", "large")}}
+        operator_edit(rt, {"allowed_providers": ["codex"], "model_tiers": tiers})
+        monkeypatch.setitem(caps.CAPABILITIES, "claude_code", caps.capability_for("kiro_cli"))
+    else:
+        narrowed = replace(row, tool_atoms=row.tool_atoms - {"fs_read"})
+        monkeypatch.setitem(caps.CAPABILITIES, "claude_code", narrowed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "early", "default"])
+@pytest.mark.parametrize("rule", PROVIDER_RULES)
+@pytest.mark.parametrize(
+    "case,outcome",
+    [
+        ({"tier": "auto", "answer": "large"}, "applied"),
+        ({"tier": "auto", "answer": "unsure"}, "fallback"),
+    ],
+    indirect=["case"],
+)
+async def test_a_provider_dropped_during_the_decision_collects_before_the_bind(
+    e5, path, rule, outcome, monkeypatch
+):
+    e5.decider.during = lambda: drop_provider_support(e5, monkeypatch, rule)
+    result = await invoke(path, e5.name)
+    assert not result["success"] and result["rule"] == rule
+    e5.backend.create_window.assert_not_called()
+    e5.factory.assert_not_called()
+    (record,) = e5.store.list()
+    assert record["outcome"] == outcome and record["launch_status"] == "not_launched"
+    row = database.get_ephemeral_agent(e5.name)
+    assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
+    assert decided_events(e5.name) == []
+
+
+@pytest.mark.parametrize("site", ["claim", "terminal", "step"])
+@pytest.mark.parametrize("rule", PROVIDER_RULES)
+@pytest.mark.parametrize("case", [{"tier": "auto"}], indirect=True)
+def test_a_provider_dropped_before_the_decision_collects_without_asking(
+    e5, site, rule, monkeypatch
+):
+    if site == "claim":
+        drop_provider_support(e5, monkeypatch, rule)
+        with pytest.raises(e5.env[0].EphemeralPolicyError) as err:
+            claim(e5.env, e5.name)
+        assert err.value.rule == rule
+    else:
+        token = claim(e5.env, e5.name)["claim_id"]
+        drop_provider_support(e5, monkeypatch, rule)
+        response = raw_launch(e5, site, token)
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"]["rule"] == rule
     row = database.get_ephemeral_agent(e5.name)
     assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
     assert e5.decider.requests == [] and e5.store.list() == []

@@ -333,6 +333,8 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 
 **Soft enforcement** = a system prompt tells the agent not to use certain tools. The agent may still attempt them. Use hard-enforcement providers for security-critical work.
 
+**Ephemeral agents** have their own provider table, because not every provider runs them. A create response's `enforcement` field reports `hard` on Claude Code and `advisory` on Codex, and Kiro ephemerals are refused. See [Ephemeral agents](ephemeral-agents.md#create-surface-and-stored-files).
+
 ### What "hard" looks like per provider
 
 **Claude Code** — Adds `--disallowedTools` flags to the launch command:

@@ -1,6 +1,7 @@
 """#1068 at create and claim: model_tier auto needs both bounds and a long enough lease."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from test.services.test_ephemeral_service import CALLER, SPEC, create, create_store  # noqa: F401
 from test.services.test_ephemeral_tier_policy import assert_no_create, mapped
@@ -10,6 +11,7 @@ import pytest
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.ephemeral import EphemeralSpec
+from cli_agent_orchestrator.utils import ephemeral_capabilities as caps
 
 AUTO = {**SPEC, "model_tier": "auto"}
 BOUNDS = {"min_tier": "small", "default_tier": "medium", "max_tier": "large"}
@@ -35,6 +37,25 @@ def test_MF4_auto_needs_both_bounds_at_create(auto_store, missing):
 def test_MF4_bounds_refusal_precedes_the_provider_checks(auto_store):
     auto_store[4]["ephemeral"]["max_tier"] = None
     assert_no_create(auto_store, {**AUTO, "provider": "kiro_cli"}, "auto_requires_bounds")
+
+
+# #1074: an auto spec runs the same provider checks and reports the provider's label.
+
+
+@pytest.mark.parametrize("provider", ["claude_code", "codex"])
+def test_an_auto_create_reports_the_providers_enforcement_label(auto_store, provider):
+    auto_store[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    result = create(auto_store, {**AUTO, "provider": provider})
+    assert result["provider"] == provider and result["model_tier"] == "medium"
+    assert result["enforcement"] == caps.capability_for(provider).enforcement
+
+
+def test_an_auto_create_refuses_an_atom_the_provider_cannot_run(auto_store, monkeypatch):
+    row = caps.CAPABILITIES["claude_code"]
+    monkeypatch.setitem(
+        caps.CAPABILITIES, "claude_code", replace(row, tool_atoms=row.tool_atoms - {"fs_read"})
+    )
+    assert_no_create(auto_store, AUTO, "tool_unsupported_on_provider:fs_read")
 
 
 def test_D1_effort_auto_still_refuses(auto_store):

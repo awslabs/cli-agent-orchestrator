@@ -69,6 +69,7 @@ def test_create_files_hashes_and_response(create_store):
     assert set(result) == {
         "name",
         "provider",
+        "enforcement",
         "effective_tools",
         "model_tier",
         "effort",
@@ -78,7 +79,7 @@ def test_create_files_hashes_and_response(create_store):
     }
     assert result["effective_tools"] == ["fs_read", "@cao-mcp-server"]
     assert result["model_tier"] is None and result["effort"] is None
-    assert result["provider"] == "claude_code"
+    assert result["provider"] == "claude_code" and result["enforcement"] == "hard"
     assert datetime.fromisoformat(result["expires_at"]).utcoffset().total_seconds() == 0
     assert result["notes"] == [
         "model: provider default (tier omitted, no default_tier)",
