@@ -22,7 +22,6 @@ from cli_agent_orchestrator.providers.base import BaseProvider, ProviderExitedEr
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.mcp_resolution import (
-    CAO_MCP_SERVER_COMMAND,
     forward_terminal_identity,
     is_bundled_cao_server,
     resolve_mcp_server_config,
@@ -1755,12 +1754,13 @@ class CodexProvider(BaseProvider):
                         cfg = dict(server_config)
                     else:
                         cfg = server_config.model_dump(exclude_none=True)
-                    # The CAO server, by its usual name or by SHAPE -- its
-                    # bundled command, an absolute path to it, the module
-                    # entrypoint, or a `uvx --from ... cao-mcp-server`.
-                    is_cao_server = server_name == CAO_MCP_SERVER_COMMAND or is_bundled_cao_server(
-                        cfg
-                    )
+                    # The CAO server, by SHAPE only -- its bundled command, an
+                    # absolute path to it, the module entrypoint, or a
+                    # `uvx --from ... cao-mcp-server`. The entry's name is not
+                    # consulted here either (#1062): this flag only keeps the
+                    # CAO tools out of Codex's deferred tool search, but one
+                    # predicate for "is this our server" beats two.
+                    is_cao_server = is_bundled_cao_server(cfg)
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
                     cfg = resolve_mcp_server_config(cfg, name=server_name)

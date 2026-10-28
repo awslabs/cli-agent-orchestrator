@@ -177,11 +177,13 @@ def resolve_mcp_server_config(
 
     ``name`` is therefore INFORMATIONAL: the entry's own key in the profile's
     ``mcpServers`` map, passed by every provider that iterates the map. It is
-    used only to make a refused name-only match visible -- an entry named
-    ``cao-mcp-server`` whose shape does not launch the bundled server is logged
-    at WARNING, so the operator who wrote the profile learns that no coordinates
-    were injected rather than discovering it when the server talks to the wrong
-    CAO.
+    used only to make a refused name-only match visible -- a command-launched
+    entry named ``cao-mcp-server`` whose command does not launch the bundled
+    server is logged at WARNING, so the operator who wrote the profile learns
+    that no coordinates were injected rather than discovering it when the server
+    talks to the wrong CAO. A command-less entry (a url/transport server) under
+    that name is a legitimate remote CAO server; it returns above, untouched and
+    unlogged.
     """
     if "command" not in config:
         return dict(config)

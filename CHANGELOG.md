@@ -1108,10 +1108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launches the bundled server (bare script, absolute path, `.exe`, module entrypoint, or the script
   named in a `uvx` entry's args), the entry's name in `mcpServers` is no longer trusted for either,
   and an entry merely named `cao-mcp-server` that launches something else gains nothing and is
-  logged. The
-  gate is #972's own
-  middleware, moved to
-  `security/mcp_tool_gate.py` and installed on both surfaces, and the `@server` spelling rule is now
+  logged. The gate is #972's own middleware, moved to `security/mcp_tool_gate.py` and installed on
+  both surfaces, and the `@server` spelling rule is now
   `tool_mapping.mcp_reference_covers` — the same matcher the provider layer uses — so a documented
   glob grant such as `@cao-*` authorizes here what it already authorized there.
   **How this slipped through:** the surface was recorded as ungated on purpose. #972's own guard
