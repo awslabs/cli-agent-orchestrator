@@ -406,6 +406,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the mode on: the `cao` CLI and the bundled Web UI send no bearer yet, and the
   token is inherited by every agent pane's environment.
 
+- Operator ergonomics on the HTTP API: `working_directory` on `POST /sessions`,
+  `POST /sessions/{name}/terminals` and `POST /sessions/{name}/terminals:operator`
+  accepts the spellings an operator pastes from a browser on WSL (quoted, `~`,
+  Windows drive paths mapped to the `/mnt` interop mount); `GET /fs/dirs` lists
+  server-side subdirectories for a folder picker; `POST /sessions/{name}/label`
+  gives a session a display alias surfaced on the session listings; every
+  handled response carries an `X-Server-Time` header, exposed through CORS, so
+  a browser can correct for clock skew
+
+- New request parameter `create_working_directory` (default `false`) on
+  `POST /sessions`, `POST /sessions/{name}/terminals` and
+  `POST /sessions/{name}/terminals:operator`: opt in to CREATING a missing
+  `working_directory`. The default is the must-exist behaviour every caller has
+  always had, so the MCP `handoff`/`assign` tools keep the fail-fast contract
+  their descriptions state -- an agent's typo'd path stays a correctable error
+  instead of an empty tree a worker silently starts in. The Web UI sends it
+  whenever the operator typed a path. When a request opts in, the folder is
+  judged under the same path policy as the MCP tools (a missing target by its
+  nearest existing ancestor) and created at the point of use, after every check
+  that can refuse the request, so a rejected request leaves nothing behind
+
 - Profiles tab in the Web UI: browse, search, create (from template with live
   preview, or from scratch via a schema-driven form), edit, clone, and delete
   agent profiles over the profile management APIs, with validate-before-save
@@ -883,6 +904,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the runtime status path; and the post-readiness check re-reads a mid-redraw
   frame a few times instead of failing an otherwise-valid login start on a
   single capture (#731)
+
+- **`GET /fs/dirs` froze the whole server while it listed a folder (#724).**
+  The handler ran its `realpath`, `exists`, `is_dir`, `iterdir` and per-entry
+  `stat` calls inline on the event loop, so a large directory on a slow mount
+  (a WSL `/mnt/c` path, an NFS or SMB mount) stalled every other request for
+  the duration -- `/health`, the SSE streams, and the MCP calls of running
+  agents. Measured at 7.6s for `C:\Windows\System32`, with a concurrent
+  `/health` waiting 7.3s. The listing now runs on a worker thread; no response
+  changed.
+
+- **a new session could show an old session's display label (#724).** Labels
+  are keyed by session name and outlive the server, but only `DELETE
+  /sessions/{name}` and an explicit empty-label `POST` removed one. A session
+  that ended any other way -- its last terminal deleted, a flow run recycling
+  it, the herdr reconcile, a tmux or host restart -- left its label behind for
+  the next session created with that name. Creating a session now clears any
+  stale label for the name, alongside the stale forwarded-env mapping it
+  already cleared.
+
+- **a session label that fit was refused for being too long (#724).** `POST
+  /sessions/{name}/label` measured its 60-character cap on the raw request body
+  while storing the trimmed value, so a 58-character label pasted with
+  surrounding spaces was a `422`. The cap is now measured after trimming.
+
+- **a settings write over an unreadable `settings.json` deleted every other
+  setting (#737, fixed in #997).** Each writer loaded the file leniently, so one
+  that existed but did not parse loaded as `{}`, and the write then persisted
+  that empty fallback with only the section being written. The `settings_service`
+  writers (`POST /settings/*`, the session label endpoint) and the
+  `config_service` writers behind `cao config set` now share one locked,
+  atomically published read-modify-write that refuses to run when the file is
+  present but cannot be read or parsed (`500` over HTTP, file untouched); two
+  concurrent writers can no longer lose each other's update either.
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as

@@ -50,6 +50,11 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+from cli_agent_orchestrator.services.settings_service import (
+    SettingsUnreadableError,
+    get_session_labels,
+    set_session_label,
+)
 from cli_agent_orchestrator.services.terminal_service import (
     TerminalRecordCorruptError,
     create_terminal,
@@ -86,6 +91,7 @@ async def create_session(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     description: Any = _DESCRIPTION_UNSET,
+    create_working_directory: bool = False,
     launch_plan: "LaunchPlan | None" = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
@@ -116,6 +122,10 @@ async def create_session(
     mechanics. A caller supplying the same key on a retry gets back the
     SAME terminal this function already created for it, without a second
     tmux window or provider process.
+
+    ``create_working_directory`` (#724): forwarded as-is to ``create_terminal``,
+    which validates the directory against the path policy and creates it only
+    once every check that can refuse the request has passed.
     """
     if initial_message == "":
         raise ValueError("initial_message must not be empty")
@@ -151,6 +161,7 @@ async def create_session(
         group=group,
         metadata=metadata,
         description=description,
+        create_working_directory=create_working_directory,
         **launch_options,
         caller_ceiling=caller_ceiling,
     )
@@ -296,7 +307,14 @@ def list_sessions() -> List[Dict]:
         if not cao_sessions:
             return []
         terminals_by_session = _terminals_grouped_by_session([s["id"] for s in cao_sessions])
-        return [_enrich_session_ownership(backend, s, terminals_by_session) for s in cao_sessions]
+        labels = get_session_labels()
+        sessions = [
+            _enrich_session_ownership(backend, s, terminals_by_session) for s in cao_sessions
+        ]
+        for session in sessions:
+            # Operator-assigned display alias (settings_service); None when unset.
+            session["label"] = labels.get(session["id"])
+        return sessions
     except Exception:
         # Swallowed to keep a caller's listing from raising, so exc_info for the
         # same reason as the two handlers above -- more so, in fact: this one
@@ -479,10 +497,13 @@ def get_session(session_name: str) -> Dict:
     try:
         terminals = list_terminals_by_session(session_name)
         backend_exists = get_backend().session_exists(session_name)
-        session_data = None
+        session_data: Optional[Dict[str, Any]] = None
         if backend_exists:
             tmux_sessions = get_backend().list_sessions()
-            session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
+            found = next((s for s in tmux_sessions if s["id"] == session_name), None)
+            # A copy: ``label`` is attached below, and that must not mutate
+            # the backend's own dict in place (plauzy, #724 review).
+            session_data = dict(found) if found is not None else None
 
         # A deferred-init failure tombstone deliberately outlives its provider
         # session so an external lifecycle owner can observe the real failure
@@ -507,6 +528,8 @@ def get_session(session_name: str) -> Dict:
                 "name": session_name,
                 "status": "terminated",
             }
+        # Operator-assigned display alias (settings_service); None when unset.
+        session_data["label"] = get_session_labels().get(session_name)
 
         # Enrich each terminal with its live status. list_terminals_by_session
         # reads only the DB row (no status column), but callers monitoring an
@@ -846,6 +869,36 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 logger.warning(f"Failed to clear forwarded env for {session_name}: {e}")
                 result["errors"].append(
                     {"session": session_name, "step": "clear_session_env", "error": str(e)}
+                )
+
+            # Drop the session's display alias. This is the tidy half of the
+            # guarantee, not the whole of it: plenty of ways to end a session
+            # never reach this function (delete_terminal killing the last
+            # window, a flow run recycling its session, the herdr reconcile, a
+            # tmux server or host restart), so a later same-name session is
+            # kept from inheriting a label by ``_clear_stale_session_state`` in
+            # the locked create branch (haofeif, PR #1036 review, P3-2).
+            # Clearing here as well keeps settings.json from accumulating
+            # entries for names nothing will ever create again.
+            # Same guard shape as the env cleanup above: a settings write
+            # failure is reported, never allowed to misreport the completed
+            # teardown.
+            try:
+                set_session_label(session_name, "")
+            except SettingsUnreadableError as e:
+                # settings.json exists but cannot be read (a directory, EACCES,
+                # a syntax error). Nothing was written and nothing was lost --
+                # the label, if any, is inside the file nobody can read -- and
+                # the teardown itself is complete, so this is a warning, not an
+                # entry in errors[]: an entry there makes DELETE /sessions/{name}
+                # answer 409 "cleanup deferred ... retry after residual Grok
+                # processes exit" on every retry, pointing the operator at Grok
+                # instead of at the file (plauzy, #724 review, item 4).
+                logger.warning(f"Not clearing label for {session_name}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to clear label for {session_name}: {e}")
+                result["errors"].append(
+                    {"session": session_name, "step": "clear_session_label", "error": str(e)}
                 )
 
             if cleanup_complete:

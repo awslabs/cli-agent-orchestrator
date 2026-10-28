@@ -165,14 +165,26 @@ class TestAddAgentButton:
         # The UI is the operator: it names no caller and the server records the
         # profile's declared ceiling, exactly as POST /sessions does.
         assert not {"caller_id", "delegating_terminal_id", "caller_ceiling"} & set(kwargs)
+        # #724, contract ruled on PR #1036: creation is per request and the
+        # dashboard opts in, but only when the operator actually typed a path.
+        assert kwargs["create_working_directory"] is bool(working_directory)
+        assert ("create_working_directory=true" in url) is bool(working_directory)
 
 
 class TestNewSessionForm:
     """``api.createSession`` -> ``POST /sessions`` (the operator launch)."""
 
-    def test_the_shipped_request_is_accepted_by_the_real_route(self, client):
+    @pytest.mark.parametrize("working_directory", [None, "/home/user/project"])
+    def test_the_shipped_request_is_accepted_by_the_real_route(self, client, working_directory):
         method, template = client_request("createSession")
-        url = render(template, {"provider": "claude_code", "agentProfile": "developer"})
+        url = render(
+            template,
+            {
+                "provider": "claude_code",
+                "agentProfile": "developer",
+                **({"workingDirectory": working_directory} if working_directory else {}),
+            },
+        )
         assert method == "POST"
         with patch(
             "cli_agent_orchestrator.api.main.session_service.create_session",
@@ -180,7 +192,27 @@ class TestNewSessionForm:
         ) as create:
             response = client.request(method, url)
         assert response.status_code == 201, (url, response.text)
-        assert create.call_args.kwargs["agent_profile"] == "developer"
+        kwargs = create.call_args.kwargs
+        assert kwargs["agent_profile"] == "developer"
+        assert kwargs["working_directory"] == working_directory
+        # #724, contract ruled on PR #1036: see TestAddAgentButton above.
+        assert kwargs["create_working_directory"] is bool(working_directory)
+        assert ("create_working_directory=true" in url) is bool(working_directory)
+
+
+def test_the_two_create_calls_are_the_only_opt_ins_to_directory_creation():
+    """#724: the flag defaults to false server-side, and the fail-fast contract
+    the MCP tools document depends on nobody else sending it. Pinned over the
+    whole client, so a third opt-in has to be a deliberate decision recorded
+    here rather than a silent widening."""
+    sending = [
+        name
+        for name in ("createSession", "addTerminalToSession")
+        if "create_working_directory=true" in client_request(name)[1]
+    ]
+    assert sending == ["createSession", "addTerminalToSession"]
+    # The ampersand form appears only in a query string, never in a comment.
+    assert API_TS.read_text(encoding="utf-8").count("&create_working_directory=true") == 2
 
 
 def test_the_parser_fails_loudly_on_an_unknown_client_function():

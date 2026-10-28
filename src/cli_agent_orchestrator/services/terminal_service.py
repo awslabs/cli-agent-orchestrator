@@ -139,7 +139,11 @@ from cli_agent_orchestrator.services.session_env import (
     set_session_env,
 )
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
-from cli_agent_orchestrator.services.settings_service import get_max_terminals
+from cli_agent_orchestrator.services.settings_service import (
+    SettingsUnreadableError,
+    get_max_terminals,
+    set_session_label,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils import agent_profiles, delegation
@@ -154,6 +158,10 @@ from cli_agent_orchestrator.utils.enforcement import (
     native_providers,
 )
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+from cli_agent_orchestrator.utils.paths import (
+    ensure_working_directory,
+    validate_working_directory,
+)
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
@@ -627,6 +635,44 @@ def _roll_back_backend_create_locked(
                 )
         except Exception:
             logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
+
+
+def _clear_stale_session_state(session_name: str) -> None:
+    """Drop every piece of name-keyed state a prior incarnation may have left behind.
+
+    Called from the locked ``new_session`` branch of the create, once the
+    duplicate-session check has proved the name is free. tmux session names are
+    reusable labels, and CAO keeps state outside tmux keyed by exactly that
+    label, so anything not wiped here is silently inherited by the new session.
+
+    Two stores today:
+
+    - the forwarded-env mapping (issue #248), so a no-env relaunch cannot
+      inherit a prior ``cao launch --env``;
+    - the display label (#724; haofeif, PR #1036 review, P3-2). Only
+      ``delete_session`` and an explicit ``POST /sessions/{name}/label`` with an
+      empty label used to remove it, and plenty of ways to end a session skip
+      ``delete_session`` entirely: ``delete_terminal`` killing the last window,
+      a flow run recycling its session, the herdr reconcile killing an empty
+      workspace, or the tmux server / host restarting. The label then sat in
+      settings.json and the next same-name session showed it in the dashboard
+      and in ``GET /sessions``.
+
+    Deliberately one function rather than two call sites: the defect was that a
+    name-keyed store got added without this branch learning about it, so the
+    next one goes here and is cleared for free.
+
+    An unreadable settings.json is a warning, not a failed create: nothing was
+    written, nothing was lost (the label is inside the file nobody can read),
+    and refusing to launch a session over it would be a worse outcome than
+    showing a stale alias. Same judgement ``delete_session`` makes (plauzy,
+    #724 review, item 4).
+    """
+    clear_session_env(session_name)
+    try:
+        set_session_label(session_name, "")
+    except SettingsUnreadableError as e:
+        logger.warning(f"Not clearing a stale label for {session_name}: {e}")
 
 
 def _still_owns_incarnation(session_name: str, terminal_id: Optional[str]) -> bool:
@@ -1220,6 +1266,7 @@ async def create_terminal(
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    create_working_directory: bool = False,
     launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
@@ -1469,6 +1516,8 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        WorkingDirectoryError: If ``create_working_directory`` is set and the
+            directory is refused by the path policy or cannot be created.
         IdempotencyKeyConflict: If ``idempotency_key`` was already used for a
             different request (surfaced as HTTP 409 by both create endpoints)
         TerminalRecordCorruptError: If the terminal a key maps to has a stored
@@ -1502,6 +1551,7 @@ async def create_terminal(
             description=description,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
+            create_working_directory=create_working_directory,
             launch_plan=launch_plan,
             delegating_terminal_id=delegating_terminal_id,
             caller_ceiling=caller_ceiling,
@@ -1539,6 +1589,7 @@ async def _create_terminal_unguarded(
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    create_working_directory: bool = False,
     launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
@@ -2051,7 +2102,33 @@ async def _create_terminal_unguarded(
         # so resolving earlier would both launch tmux in the pre-worktree directory
         # (defeating the isolation #100 provides) and persist that stale path as the
         # terminal's working_directory. This is the effective launch cwd either way.
-        resolved_working_directory = _resolve_working_directory(working_directory)
+        try:
+            # The must-exist resolution every caller has always had, and the
+            # one seam test harnesses stub (release_runtime maps a fictional
+            # /workspace onto a tmp dir here).
+            #
+            # Who gets past a refusal here, exactly: only a caller that asked
+            # for creation. ``create_working_directory`` is false by default
+            # and false for every caller that does not set it, which includes
+            # the MCP ``handoff`` and ``assign`` tools -- they POST to the two
+            # create routes without the flag, so a path with a typo is still
+            # refused here and the agent can correct it. The Web UI sets it.
+            resolved_working_directory = _resolve_working_directory(working_directory)
+        except ValueError:
+            if not (create_working_directory and working_directory is not None):
+                raise
+            # Refused as must-exist by an HTTP create endpoint (#724): the
+            # operator may be pointing at a directory that does not exist yet.
+            # Re-judge it with the SAME policy but allow_create: a missing
+            # target is judged by its nearest existing ancestor (#345 D5), with
+            # no side effects. A target that is blocked, or exists and is not a
+            # directory, is refused again right here with the policy's own
+            # wording, now as WorkingDirectoryError (a 400 on the terminal
+            # endpoint, not its ValueError-means-404). The mkdir itself waits
+            # until the locked section below has passed the duplicate-session /
+            # session-not-found checks, so a rejected request leaves no
+            # directory behind.
+            resolved_working_directory = validate_working_directory(working_directory)
 
         # Step 1c: a Kiro launch must name an agent kiro-cli will load. kiro-cli
         # does not refuse an unknown --agent; it starts its built-in kiro_default
@@ -2202,12 +2279,15 @@ async def _create_terminal_unguarded(
                     if get_backend().session_exists(session_name):
                         raise ValueError(f"Session '{session_name}' already exists")
 
-                    # Wipe any stale mapping a prior aborted lifecycle for this
-                    # name may have left behind, so a no-env relaunch can't
-                    # inherit them.
-                    clear_session_env(session_name)
+                    _clear_stale_session_state(session_name)
 
                     session_incarnation_id = uuid.uuid4().hex
+
+                    if create_working_directory:
+                        # Point of use (#724): every check that can refuse this
+                        # request has passed, so creating the operator's
+                        # directory now cannot leave an orphan behind.
+                        ensure_working_directory(resolved_working_directory)
 
                     # Create new tmux session with initial window
                     effective_env = dict(env_vars or {})
@@ -2239,6 +2319,9 @@ async def _create_terminal_unguarded(
                     # CAO_WORKFLOW_RUN_ID must reach the window even when it
                     # joins an existing session (issue #408).
                     effective_env = {**get_session_env(session_name), **(env_vars or {})}
+                    if create_working_directory:
+                        # Point of use, as in the new-session branch above.
+                        ensure_working_directory(resolved_working_directory)
                     created_window_name = get_backend().create_window(
                         session_name,
                         window_name,

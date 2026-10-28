@@ -194,6 +194,10 @@ from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
 )
 from cli_agent_orchestrator.services.provider_error_classifier import KIND_PROVIDER_ERROR
+from cli_agent_orchestrator.services.settings_service import (
+    SESSION_LABEL_MAX_LENGTH,
+    SettingsUnreadableError,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
@@ -214,13 +218,17 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, reso
 from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
-from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+from cli_agent_orchestrator.utils.path_validation import (
+    resolve_and_validate_path,
+    resolve_listable_path,
+)
+from cli_agent_orchestrator.utils.paths import WorkingDirectoryError, normalize_working_directory
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
     validate_skill_name,
 )
-from cli_agent_orchestrator.utils.terminal import validate_tmux_name
+from cli_agent_orchestrator.utils.terminal import ensure_session_prefix, validate_tmux_name
 
 logger = logging.getLogger(__name__)
 
@@ -1969,7 +1977,49 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # X-Server-Time is not CORS-safelisted, so a browser on another origin
+    # (the Vite dev server, a configured deployment) cannot read it unless it
+    # is exposed here; without this the clock-skew correction it exists for
+    # silently never happens for exactly those clients.
+    expose_headers=["X-Server-Time"],
 )
+
+
+@app.middleware("http")
+async def add_server_time_header(request: Request, call_next):
+    """Stamp handled responses with the server's wall clock as ``X-Server-Time``.
+
+    Browser clients render relative times ("2 minutes ago") from server
+    timestamps, and the two clocks are not the same clock: WSL2 hosts have been
+    observed hours adrift from the Windows browser next to them. One header on
+    a response lets a client measure the skew once and correct for it. It
+    rides the middleware stack, so an unhandled exception that never returns
+    through it (Starlette's own 500) goes out without the header; that is
+    harmless for an informational value and not worth a second code path.
+    Offset-aware ISO-8601 so a browser in a different timezone parses it
+    unambiguously (a naive string is read as browser-local time, which is the
+    skew this header exists to remove). Purely informational; clients that
+    ignore it are unaffected.
+    """
+    response = await call_next(request)
+    response.headers["X-Server-Time"] = datetime.now().astimezone().isoformat()
+    return response
+
+
+@app.exception_handler(SettingsUnreadableError)
+async def _settings_unreadable(request: Request, exc: SettingsUnreadableError) -> JSONResponse:
+    """A settings write was refused because settings.json is present but unreadable.
+
+    The writers fail closed rather than replace state they could not read
+    (#737), so the honest answer is a server-side fault the operator has to
+    fix on disk, not a client error. The path stays out of the body, as
+    everywhere else; it is in the server log.
+    """
+    logger.error(f"Refused a settings write: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": exc.redacted_detail()},
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -3406,6 +3456,106 @@ async def get_agent_dirs_endpoint(
     }
 
 
+@app.get("/fs/dirs")
+async def list_directories(
+    path: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List the subdirectories of one server-side folder, for a folder picker.
+
+    Directory names only: never file names, sizes, or contents. Accepts the
+    same operator-typed spellings ``POST /sessions`` accepts for
+    ``working_directory`` (``~``, quoted, Windows drive paths translated to the
+    WSL mount) but never creates anything. Defaults to the server user's home.
+    Hidden folders are listed after the visible ones rather than dropped,
+    because provider homes (``~/.kiro``, ``~/.aws``) are exactly what an
+    operator browsing for a profile directory is after.
+
+    Read-scope gated when auth is enabled, like ``GET /settings/agent-dirs``.
+    Be clear about what that gate protects: this endpoint ENUMERATES child
+    directory names for any path the server user can read, which is a
+    materially stronger disclosure than the existence-and-creatability oracle
+    a caller already has through ``working_directory``. The one confinement
+    is the path policy's blocked SUBTREES (``/etc``, ``/proc``, ``/sys``,
+    ``/dev``, ``/root``, the system binary and library trees): nothing there
+    can ever be a working directory, so nothing there is listed, at any depth.
+    ``/`` and ``/tmp`` themselves stay listable so a picker can descend
+    through them. Under the default localhost-only posture the rest is the
+    operator reading their own filesystem; once auth is enabled it means a
+    read-scope token can walk the allowed tree. Confining it to a configurable
+    root is the obvious further hardening if that ever becomes the deployment
+    shape.
+
+    Off the event loop (haofeif, PR #1036 review, P2-1; +1 plauzy): every
+    filesystem call this endpoint makes -- the ``realpath`` inside
+    ``resolve_listable_path``, ``exists()``, ``is_dir()``, ``iterdir()`` and
+    one stat per entry -- used to run inline on this ``async def``. A large
+    directory on a slow mount then froze every other request for the whole
+    listing (measured by the reviewer on a WSL host: 7.6 s for
+    ``/mnt/c/Windows/System32``, with a concurrent ``/health`` waiting 7.3 s;
+    42 s for ``WinSxS``). This PR translates ``C:\\...`` spellings for WSL
+    operators, so a slow mount is an expected input, not a corner case.
+    ``asyncio.to_thread``, exactly as ``POST /sessions/{name}/label`` and the
+    ``/settings/*`` writers below already do for the same hazard (#382). The
+    helper raises the same exceptions it always did, so the ``except`` arms
+    are unchanged.
+    """
+    try:
+        return await asyncio.to_thread(_list_directories_blocking, path)
+    except PermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No permission to read that folder",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OSError as e:
+        # ENOTDIR, EIO, a stale network mount: the per-entry loop already
+        # tolerates these, so the directory-level read should not 500 either.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not read that folder: {e}",
+        )
+
+
+def _list_directories_blocking(path: Optional[str]) -> Dict[str, Any]:
+    """Worker-thread half of ``GET /fs/dirs``: resolve the folder and read its child names.
+
+    Raises what the endpoint's ``except`` arms already handle -- ``ValueError``
+    from the path policy and from the two probes, ``PermissionError`` and
+    ``OSError`` from the reads -- so moving this body off the event loop did
+    not change a single response.
+    """
+    # ``normalize_working_directory`` returns None for a blank or
+    # quotes-only value, which must fall back to the documented home
+    # default -- ``Path("")`` would silently resolve to the server's CWD.
+    # Only the policy helper's canonical output reaches a filesystem call
+    # below (realpath + containment + blocked-subtree check; CodeQL
+    # py/path-injection): the normalized request string never does.
+    normalized = normalize_working_directory(path) if path else None
+    if normalized is None:
+        resolved = Path.home().resolve()
+    else:
+        resolved = Path(resolve_listable_path(normalized, description="Folder"))
+    # Both probes raise for the caller's try: a component over NAME_MAX makes
+    # exists()/is_dir() raise OSError, which the endpoint turns into a 400.
+    if not resolved.exists():
+        raise ValueError(f"Folder does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"{str(resolved)!r} is not a folder")
+    visible: List[str] = []
+    hidden: List[str] = []
+    for entry in sorted(resolved.iterdir(), key=lambda e: e.name.lower()):
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
+            continue  # unreadable entry (dangling symlink, EACCES): skip, not fail
+        (hidden if entry.name.startswith(".") else visible).append(entry.name)
+    parent = str(resolved.parent) if resolved.parent != resolved else None
+    return {"path": str(resolved), "parent": parent, "dirs": visible + hidden}
+
+
 class AgentDirsUpdate(BaseModel):
     agent_dirs: Optional[Dict[str, str]] = None
     extra_dirs: Optional[List[str]] = None
@@ -3449,14 +3599,17 @@ async def set_agent_dirs_endpoint(
         set_extra_agent_dirs,
     )
 
+    # Each writer is a locked read-modify-write of settings.json that polls
+    # the file lock for up to 10 s when another writer holds it; inline on the
+    # event loop that wait froze every other request (plauzy, #724 review).
     if body.agent_dirs:
-        set_agent_dirs(body.agent_dirs)
+        await asyncio.to_thread(set_agent_dirs, body.agent_dirs)
     if body.extra_dirs is not None:
-        set_extra_agent_dirs(body.extra_dirs)
+        await asyncio.to_thread(set_extra_agent_dirs, body.extra_dirs)
     # After extras are persisted, so a just-added extra can be disabled in the
     # same request; set_disabled validates against the current known dirs.
     if body.disabled_dirs is not None:
-        set_disabled_agent_dirs(body.disabled_dirs)
+        await asyncio.to_thread(set_disabled_agent_dirs, body.disabled_dirs)
     return {
         "agent_dirs": get_agent_dirs(),
         "extra_dirs": get_extra_agent_dirs(),
@@ -3493,7 +3646,8 @@ async def set_skill_dirs_endpoint(
 
     result_extra: List[str] = []
     if body.extra_dirs is not None:
-        result_extra = set_extra_skill_dirs(body.extra_dirs)
+        # Off the loop for the same reason as POST /settings/agent-dirs.
+        result_extra = await asyncio.to_thread(set_extra_skill_dirs, body.extra_dirs)
     return {
         "skills_dir": str(SKILLS_DIR),
         "extra_dirs": result_extra or get_extra_skill_dirs(),
@@ -3825,6 +3979,7 @@ async def create_session(
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
     resume_session_id: Optional[str] = None,
+    create_working_directory: bool = False,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3879,6 +4034,20 @@ async def create_session(
     **409 CONFLICT** rather than that other request's terminal. A key whose
     terminal has since been torn down is stale, not conflicting, and simply
     creates fresh.
+
+    ``create_working_directory`` (#724, contract ruled by @plauzy and
+    @call-me-ram on PR #1036): opt in to CREATING ``working_directory`` when it
+    does not exist yet. Default false, which is the must-exist behavior every
+    caller has always had, so the fail-fast contract the MCP ``handoff`` and
+    ``assign`` tools document ("must exist and be accessible") stays true for
+    them: they send nothing and a typo'd path is still a correctable error
+    rather than an empty tree the worker silently starts in. The Web UI sends
+    true, because an operator typing a path into a folder field is asking for
+    it. Creation is not a bypass of the path policy: a missing target is still
+    judged under #345 D5 by its nearest existing ancestor, and the ``mkdir``
+    happens at the point of use inside ``create_terminal``'s locked section,
+    after every check that can refuse the request, so a refused create leaves
+    nothing on disk.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -3894,14 +4063,7 @@ async def create_session(
             # would become 68 chars and fail downstream validation. Check
             # the *effective* prefixed value here so the rejection happens
             # at the boundary with a clear message.
-            from cli_agent_orchestrator.constants import SESSION_PREFIX
-
-            effective = (
-                session_name
-                if session_name.startswith(SESSION_PREFIX)
-                else f"{SESSION_PREFIX}{session_name}"
-            )
-            validate_tmux_name(effective, "session_name")
+            validate_tmux_name(ensure_session_prefix(session_name), "session_name")
         if model is not None:
             _validate_model_id(model)
         if resume_session_id is not None:
@@ -3920,6 +4082,19 @@ async def create_session(
                     "invalid initial_message_orchestration_type: "
                     f"{body.initial_message_orchestration_type!r}"
                 )
+        # Accept the spellings an operator actually types into a browser field
+        # (``~``, Explorer-quoted, Windows drive paths on WSL) and reject an
+        # unusable one as a clear 400 here, instead of a 500 deep in tmux. The
+        # normalization is purely lexical: whether the directory is ALLOWED
+        # (blocked system directories, judged on the nearest existing ancestor
+        # for a missing target -- #345 D5) and whether it EXISTS are decided by
+        # terminal_service at the point of use, after the duplicate-session and
+        # terminal-cap checks, where the directory is also created, so a request
+        # rejected anywhere along the way leaves nothing behind (plauzy, #724).
+        # No policy call here: callers that mock the service (the MCP handler
+        # tests pass a fictional /workspace) must see the service's answer.
+        working_directory = normalize_working_directory(working_directory)
+
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
@@ -3963,6 +4138,7 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            create_working_directory=create_working_directory,
             **description_options,
             **_launch_options(launch_plan),
             caller_ceiling=body.caller_ceiling if body else None,
@@ -4095,13 +4271,100 @@ async def list_sessions(
         )
 
 
+class SessionLabelUpdate(BaseModel):
+    # Strip BEFORE the cap is applied (haofeif, PR #1036 review, label-length
+    # note): pydantic's str core schema strips first and length-checks the
+    # stripped value, so a 58-character label pasted with a trailing newline's
+    # worth of spaces is accepted and stored, instead of a 422 for a value that
+    # fits. ``set_session_label`` strips too -- it is the guard for non-HTTP
+    # callers -- and the two now agree on what counts as 60 characters.
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    # One cap, shared with the service: a longer label is a 422 here rather
+    # than a silent truncation to 60 on the way to disk (#724 review, twice).
+    label: str = Field(..., max_length=SESSION_LABEL_MAX_LENGTH)
+
+
+@app.post("/sessions/{session_name}/label")
+async def set_session_label_endpoint(
+    session_name: str,
+    body: SessionLabelUpdate,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Set, or clear with an empty string, a friendly display name for a session.
+
+    Stored separately from the tmux session name so nothing that references
+    the real name (terminals, DB rows, the backend) is disturbed: a pure
+    display alias, surfaced as ``label`` on ``GET /sessions`` and
+    ``GET /sessions/{name}``. Trimmed and capped server-side; the response
+    carries the label as stored (``None`` once cleared).
+
+    The name is prefix-normalized exactly as ``POST /sessions`` normalizes it
+    at creation (``demo`` -> ``cao-demo``), so an operator who labels using
+    the name they created with reaches the same session the listing and the
+    teardown key off. Without that, the write would succeed and store an entry
+    that never surfaces and is never cleared (gutosantos82, #724 review).
+
+    Setting a label requires the session to exist (404 otherwise), so
+    settings.json never accumulates entries nothing will ever read or clear.
+    Clearing is allowed regardless: a session killed outside ``delete_session``
+    leaves its label behind, and this is the only way to remove it.
+
+    A settings.json that exists but cannot be read makes the set a 500 with
+    the file untouched, rather than the label-only file it used to become.
+
+    Off the event loop (plauzy, #724 review, blocking item 2): the existence
+    probe is a tmux subprocess and the write polls the settings file lock for
+    up to ``DEFAULT_LOCK_TIMEOUT_SECONDS`` (10 s). Run inline on this
+    ``async def`` they froze every other request -- ``/health``, every SSE
+    stream -- for as long as another writer held the lock (reproduced: one
+    heartbeat tick in 1.8 s). ``asyncio.to_thread``, as ``GET`` and ``DELETE
+    /sessions/{name}`` already do for the identical hazard (#382). Both steps
+    also run under the session's lifecycle lock (haofeif, #724 review, P3):
+    a teardown that completes between an unlocked existence check and the
+    write would otherwise clear the label and then watch this request persist
+    an orphan one, inherited by the next same-name session.
+    """
+    effective = ensure_session_prefix(session_name)
+    try:
+        validate_tmux_name(effective, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    try:
+        labels = await asyncio.to_thread(_set_session_label_locked, effective, body.label)
+    except ValueError as e:
+        # The service refuses a label with control characters (ANSI escapes,
+        # line breaks): stored verbatim it would be echoed into every listing.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"session_name": effective, "label": labels.get(effective)}
+
+
+def _set_session_label_locked(session_name: str, label: str) -> Dict[str, str]:
+    """Worker-thread half of ``POST /sessions/{name}/label``: probe and write under the lifecycle lock."""
+    from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+    from cli_agent_orchestrator.services.settings_service import set_session_label
+
+    with session_lifecycle_lock(session_name):
+        if label.strip() and not get_backend().session_exists(session_name):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session '{session_name}' not found",
+            )
+        return set_session_label(session_name, label)
+
+
 @app.get("/sessions/{session_name}")
 async def get_session(
     session_name: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    # Validate before entering the try block so a malformed name surfaces
-    # as 400 instead of being mapped to 404 by the not-found handler below.
+    # Same naming contract as POST /sessions and DELETE: a bare name is the
+    # caller's alias for the prefixed CAO session, so GET /sessions/demo reads
+    # cao-demo instead of 404ing right after POST /sessions/demo/label
+    # succeeded (plauzy, #724 review). Validate the EFFECTIVE name, before the
+    # try block, so a malformed name surfaces as 400 instead of being mapped
+    # to 404 by the not-found handler below.
+    session_name = ensure_session_prefix(session_name)
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -4129,18 +4392,15 @@ async def delete_session(
     session_name: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
-    try:
-        validate_tmux_name(session_name, "session_name")
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     # Same naming contract as POST /sessions: a bare name is the caller's alias
     # for the prefixed CAO session, never a reference to a personal tmux session
     # of that name. Canonicalise here so DELETE /sessions/dev tears down
     # cao-dev and can never reach an operator's own "dev".
-    from cli_agent_orchestrator.constants import SESSION_PREFIX
-
-    if not session_name.startswith(SESSION_PREFIX):
-        session_name = f"{SESSION_PREFIX}{session_name}"
+    session_name = ensure_session_prefix(session_name)
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         # Off the event loop: teardown is fully synchronous (tmux kills, FIFO
         # cleanup, DB writes) and has wedged the whole server — /health
@@ -4195,6 +4455,7 @@ async def create_terminal_in_session(
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
+    create_working_directory: bool = False,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4240,6 +4501,14 @@ async def create_terminal_in_session(
     **409 CONFLICT** rather than that other request's terminal. A key whose
     terminal has since been torn down is stale, not conflicting, and simply
     creates fresh.
+
+    ``create_working_directory`` (#724, contract ruled by @plauzy and
+    @call-me-ram on PR #1036): opt in to CREATING ``working_directory`` when it
+    does not exist yet. Default false, so the fail-fast contract the MCP
+    ``handoff`` and ``assign`` tools document ("must exist and be accessible")
+    stays true -- they reach this route and send nothing, and a typo'd path
+    remains a correctable error instead of an empty tree the worker silently
+    starts in. See ``POST /sessions`` for the policy and point-of-use details.
     """
     launch_plan: LaunchPlan | None = None
     try:
@@ -4309,6 +4578,17 @@ async def create_terminal_in_session(
                     ),
                 )
 
+        # Same operator-typed spellings POST /sessions accepts (see there);
+        # lexical only. The path policy and the creation both happen inside
+        # terminal_service once the session-not-found and terminal-cap checks
+        # have passed, so a rejected request never leaves a tree behind.
+        # Runs BEFORE the decision call below so a malformed path is a cheap
+        # 400 rather than a wasted route decision.
+        try:
+            working_directory = normalize_working_directory(working_directory)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
         if (
             body
             and body.delegation_message is not None
@@ -4344,6 +4624,7 @@ async def create_terminal_in_session(
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
+            create_working_directory=create_working_directory,
             **_launch_options(launch_plan),
         )
         _set_launch_note(response, launch_plan)
@@ -4368,6 +4649,11 @@ async def create_terminal_in_session(
         # These subclass ValueError, so they must precede the generic arm below —
         # a rejected configuration is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WorkingDirectoryError as e:
+        # Also a ValueError subclass, also ahead of the generic arm: a working
+        # directory the policy refuses or the OS cannot create at the point of
+        # use (#724) is a bad request, not a missing session.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
@@ -4416,6 +4702,7 @@ async def create_terminal_in_session_as_operator(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    create_working_directory: bool = False,
     body: Optional[OperatorTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4446,6 +4733,10 @@ async def create_terminal_in_session_as_operator(
     and cannot know"); binding caller identity to an authenticated terminal is
     the tracked follow-up. Synchronous only: no ``defer_init``, no initial
     message; a message is sent to the created terminal afterwards.
+
+    ``create_working_directory`` (#724, contract ruled by @plauzy and
+    @call-me-ram on PR #1036): as on ``POST /sessions``. The Web UI's "Add
+    Agent" sends true; the default is the must-exist behavior.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -4471,6 +4762,16 @@ async def create_terminal_in_session_as_operator(
             resolved_provider = provider
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        # Same operator-typed spellings the sibling route and POST /sessions
+        # accept (see there); lexical only. This route IS the Web UI's "Add
+        # Agent", so it is an operator-facing create and gets the operator path
+        # handling: a typed ``~/src/app`` or ``"C:\\src\\app"`` would otherwise
+        # reach the backend verbatim.
+        try:
+            working_directory = normalize_working_directory(working_directory)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
         # No caller_id, delegating_terminal_id or caller_ceiling: the operator
         # branch of create_terminal, which records the profile's declared
         # ceiling (test_launch_path_invariant.py classifies this site).
@@ -4487,6 +4788,7 @@ async def create_terminal_in_session_as_operator(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            create_working_directory=create_working_directory,
         )
     except HTTPException:
         raise
@@ -4498,6 +4800,12 @@ async def create_terminal_in_session_as_operator(
         KiroAgentPathError,
         KiroAgentIdentityError,
     ) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WorkingDirectoryError as e:
+        # A ValueError subclass, so it must precede the generic arm below, whose
+        # 404 means "session not found": a directory the policy refuses or the
+        # OS cannot create at the point of use (#724) is a bad request. Same
+        # ordering as the sibling route.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except TerminalLimitError as e:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
