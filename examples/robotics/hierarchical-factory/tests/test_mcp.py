@@ -287,12 +287,34 @@ def test_missing_or_wrong_credential_is_not_read_access(controller):
         )
 
 
-def test_the_controller_serves_no_other_route(controller):
-    url, _, _, _ = controller
+def test_the_live_view_serves_only_the_page_and_the_measured_state(controller):
+    url, credentials, world, _ = controller
     base = url[: -len("/mcp")]
+    call(url, credentials["west"], "form_team", {"command_id": "form-1", "formation": "queue"})
     with httpx2.Client(trust_env=False) as client:
-        for path in ("/", "/state", "/observe"):
+        page = client.get(base + "/")
+        assert page.status_code == 200
+        assert page.headers["content-type"].startswith("text/html")
+        # Page-relative, so the page also works behind the path prefix of a port forward.
+        assert 'fetch("state"' in page.text and 'fetch("/state"' not in page.text
+        # The robot pictures are inlined: one for each team color, and a blocked one.
+        assert "__ROBOT_SPRITES__" not in page.text
+        assert page.text.count("data:image/png;base64,") == 5
+        # No external assets: the only URL in the page is the SVG namespace.
+        assert set(re.findall(r"https?://[^\s\"')]+", page.text)) == {"http://www.w3.org/2000/svg"}
+        state = client.get(base + "/state")
+        assert state.status_code == 200
+        data = state.json()
+        assert data["run_id"] == world.run_id
+        assert data["commands"][0]["command_id"] == "form-1"
+        assert set(data["teams"]) == {"west", "middle", "east"}
+        assert all("xy" in part for part in data["parts"].values())
+        for credential in credentials.values():
+            assert credential.get_secret_value() not in state.text
+        for path in ("/observe", "/credentials", "/run.json", "/viewer.html"):
             assert client.get(base + path).status_code == 404
+        # The live view is read-only: it accepts no command.
+        assert client.post(base + "/state", json={}).status_code == 405
 
 
 @pytest.mark.parametrize(

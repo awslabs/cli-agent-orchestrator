@@ -113,21 +113,25 @@ it as a Python package. No robot hardware is necessary.
 
 This exercise uses MuJoCo in a simple way, like the
 [cross-zone transport example](../cross-zone-transport/README.md). Each robot
-is a small walking duck robot, built from MuJoCo shapes in the style of the
-[Open Duck Mini](https://github.com/apirrone/Open_Duck_Mini) robot that
-[Strands Robots](https://github.com/strands-labs/robots) uses in its demos:
+is an [Open Duck Mini v2](https://github.com/apirrone/Open_Duck_Mini), the
+small open-source biped that [Strands Robots](https://github.com/strands-labs/robots)
+drives in its demos. Step 1 downloads its MuJoCo model (Apache-2.0, about
+18 MB) from one pinned commit, and checks the SHA-256 of each file. In the
+simulator:
 
-- a white shell with wings and a tail in the color of its team,
-- a head with eyes and a beak that show where it faces,
-- a lamp on an antenna that shows its state: green when it works or moves,
-  amber when it waits, and red when it is blocked,
-- two legs with hips and knees that step when the robot walks, turns, spins,
-  or runs. A working robot nods over its part.
+- the battery lid and the top panel of a robot have the color of its team,
+- a lamp above the head shows the state of the robot: green when it works or
+  moves, amber when it waits, and red when it is blocked. The shell of a
+  blocked robot also turns red,
+- the legs step when the robot walks, turns, spins, or runs. A working robot
+  nods over its part and moves its antennas.
 
 The robots and the parts are kinematic: the root of each robot is a mocap body
-that moves at a set speed, and the controller sets the leg and neck angles from
-that motion. Nothing has contact or gravity. The simulator measures the
-positions. The example needs no robot model download and no mesh files.
+that moves at a set speed, and the controller sets the leg, neck, and antenna
+angles from that motion. Nothing has contact or gravity. The simulator measures
+the positions. The robots stand 1.6 times the size of the real robot, so that
+they show in the overview camera. Without the download, the controller uses
+simple bipeds of the same size, and the example works the same.
 
 A local process, the **controller** (`demo.py serve`), runs the MuJoCo world.
 The agents use the world only through the MCP tools of the controller.
@@ -241,6 +245,43 @@ sequenceDiagram
     S->>F: observe: 16 units at the dock
 ```
 
+### Why one agent for each zone, not one for each robot
+
+The example has four LLM agents: the supervisor, and one manager for each zone.
+The west manager drives all three robots of Team A. The robots are not agents.
+These are the reasons:
+
+- **The time scales are different.** An LLM turn takes seconds, and often tens of
+  seconds. The robots of Team A pass a part every 2 s, and the controller moves
+  the robots every 20 ms. An agent for each robot could not react in time. So
+  the agents decide what is slow to change (the formation, the pace, the batch,
+  the routine), and the team program does the fast work. Real sites use the same
+  layers: a planning system, a cell controller or fleet manager for each area
+  (for example, a VDA 5050 master control), and the robot controllers.
+- **The work is coupled inside a team.** The robots of Team A hand each part to
+  the next robot in the queue, and the four robots of Team C must move as one
+  formation. With one manager, one decision changes the whole team at the same
+  time. With one agent for each robot, the agents must agree with messages
+  before each move, and a late or lost message breaks the queue or the
+  formation.
+- **The authority follows the boundary of the area.** A zone owns its robots,
+  its side of each buffer, and its safety. One credential for each zone gives
+  each manager exactly the robots of its area, and no tool takes a robot
+  argument. The supervisor needs to talk only to three managers.
+- **One report for each problem.** When the buffer in front of Team B is full,
+  the three robots of Team A are blocked for the same reason. One manager sends
+  one report. Three robot agents would send three reports of one problem.
+- **The cost grows with the agents.** Four agents use four CAO terminals and four
+  model sessions. One agent for each robot would add nine more, for robots that
+  have no decision of their own to make.
+
+One agent for each robot is the better design when each robot has its own
+judgment to make: for example, an inspection robot that interprets camera
+images, a mobile manipulator with open-ended tasks, or a fleet of different
+robots with no cell controller. To do that with this example, give each robot
+its own profile and credential (a `robot` claim next to `zone`), and let the
+team manager delegate to its robot agents with `assign`: a fourth layer.
+
 ## Requirements
 
 ### Software
@@ -306,7 +347,14 @@ In Terminal 1, from the repository root:
 ```bash
 cd examples/robotics/hierarchical-factory
 uv sync --locked
+uv run --locked python demo.py fetch-robot
 ```
+
+`fetch-robot` downloads the robot model to `.robot-models/` in the example
+directory, which git ignores. A later `fetch-robot` downloads only a missing or
+changed file. To keep the model in another directory, set
+`FACTORY_ROBOT_MODEL_DIR` in every terminal of the run. You can skip
+`fetch-robot`: the robots are then simple bipeds.
 
 <details>
 <summary>Expected output</summary>
@@ -326,6 +374,12 @@ Later times:
 ```text
 Resolved 105 packages in 7ms
 Audited 81 packages in 28ms
+```
+
+Then `fetch-robot`, the first time and later times:
+
+```text
+Open Duck Mini v2 from apirrone/Open_Duck_Mini at b23317a485b3 (Apache-2.0): 47 files checked in <repo>/examples/robotics/hierarchical-factory/.robot-models/open_duck_mini_v2
 ```
 
 </details>
@@ -392,6 +446,8 @@ When the controller starts:
 
 ```text
 <time> factory SIMULATION ONLY: kinematic robot proxies; motion approved for this scene
+<time> factory Robots: Open Duck Mini v2
+<time> factory LIVE VIEW: open http://127.0.0.1:8767/ in a browser to watch the run
 <time> factory Recording frames of the world to /tmp/cao-factory-frames
 [<time>] INFO     Starting MCP server 'CAO hierarchical factory simulator' with transport 'http' (stateless) on http://127.0.0.1:8767/mcp
 INFO:     Started server process [<pid>]
@@ -612,6 +668,8 @@ Message delivered to factory_supervisor_<id>-<id>. Running in background.
   other windows are the managers. To detach, press Ctrl+b, then d. Do not type
   in an agent window.
 - **Controller log.** Look at Terminal 2.
+- **Live view.** Open `http://127.0.0.1:8767/` in a browser. See
+  [Watch it live in a browser](#watch-it-live-in-a-browser).
 - **Simulator picture.** Open `/tmp/cao-factory-frames/latest.png`. The
   controller replaces it at each change.
 
@@ -822,6 +880,42 @@ to an issue or a pull request.
 
 ## See the robots move
 
+### Watch it live in a browser
+
+While the controller runs, it serves a read-only **live view** on the same
+`127.0.0.1` address, as in the cross-zone transport example. Open its base URL
+in a browser:
+
+```text
+http://127.0.0.1:8767/
+```
+
+Use the `--port` that you prepared with if it is not `8767`. The controller
+prints the exact URL (`LIVE VIEW: ...`) when it starts.
+
+![The live view during the run. On the left, a top-down map of the three zones with the Open Duck Mini robots of Team A blocked in red in their queue, the full buffer west_middle, the two robots of Team B, and the diamond of Team C. On the right, the organization: the supervisor at layer 1 balancing the line, and the three managers at layer 2 with their team status, output, and robots.](images/live-view.png)
+
+- **The map** draws the zones, the buffers with their fill, the raw store, the
+  dock, and every part in the color of its stage. Each robot is a picture of the
+  Open Duck Mini in its team color (red when blocked), with its state lamp above
+  it, a short line for its heading, and the part that it carries.
+- **The organization** panel shows the three layers. The supervisor shows what
+  it does now, for example `a team is blocked: balancing the line`. Each
+  manager shows the status of its team, its output and target, its pace, its
+  blocked and starved time, and the state of each robot. A blocked team has a
+  red frame. A command that just finished is amber.
+- **The action log** lists every command and its result.
+
+The page polls the controller's `observe()` a few times a second. It serves only
+simulation state (positions, team states, parts, and command history, never a
+credential), and it needs no GPU or display. It loads its state from an address
+relative to its own, so it also works behind a forwarded port. On a remote host,
+such as a browser IDE, forward the port first: in VS Code or code-server use the
+**Ports** panel, or `ssh -L 8767:127.0.0.1:8767 <host>`. Do not publish it on a
+public interface.
+
+### Saved pictures with `--record`
+
 `demo.py serve --record DIR` saves pictures of the MuJoCo world from a fixed
 overview camera. Step 3 uses this option. The pictures do not change the
 simulation.
@@ -836,8 +930,8 @@ simulation.
 | In the picture | Item |
 | --- | --- |
 | Light blue, light green, and light orange areas | Zones `west`, `middle`, and `east` |
-| Duck robots with blue, green, and orange wings | The robots of Team A, Team B, and Team C. The head and the beak show the heading. |
-| A green, amber, or red lamp on the antenna | The robot works or moves, waits (for example for a part), or is blocked |
+| Open Duck Mini robots with a blue, green, or orange battery lid | The robots of Team A, Team B, and Team C. The head faces where the robot goes. |
+| A green, amber, or red lamp above the head | The robot works or moves, waits (for example for a part), or is blocked |
 | A red shell | The robot is blocked: it holds a finished part that cannot move on |
 | A cube on the back of a robot | The part that the robot carries |
 | Grey, pink, and purple cubes | A raw part, a machined part, and an assembled unit |
@@ -928,8 +1022,11 @@ each cell controller, and tests on the site with people who monitor the robots.
   run. See [Providers](#providers).
 - The tokens do not appear in output, profile text, or process arguments. Each
   stdio connection reads only its own credential file.
-- The controller binds only `127.0.0.1`, serves only the authenticated MCP
-  endpoint, and uses the FastMCP static-token verifier. Use it only for this
+- The controller binds only `127.0.0.1`. It serves the authenticated MCP
+  endpoint, and the read-only live view (`GET /` and `GET /state`) without a
+  credential, as in the cross-zone transport example: the live view shows only
+  simulation state and accepts no command. It uses the FastMCP static-token
+  verifier. Use it only for this
   short local demo. The MCP connections ignore proxy settings and HTTP
   redirects.
 
@@ -970,6 +1067,10 @@ scene. The scene is checked before a run starts:
 | `demo.py` | The operator commands `prepare`, `serve`, `status`, and `stop`, and the `connect` stdio relay that the profiles start |
 | `simulation.py` | The shared MuJoCo floor: the scene checks, the team programs, the buffers, and the command history |
 | `factory_mcp.py` | The authenticated FastMCP server and its scoped tools. It writes one log line for each tool call, with the agent that made the call. It does no planning. |
+| `viewer.html` | The live view that the controller serves at `/` |
+| `sprites/` | The pictures of the Open Duck Mini in the live view: one for each team color, and one for a blocked robot. They are renders of the Open Duck Mini v2 model (Apache-2.0). |
+| `robot_model.py` | Downloads, checks, and loads the Open Duck Mini v2 model, and sets its walking pose |
+| `open_duck_mini.json` | The pinned commit and the SHA-256 of each file of the Open Duck Mini v2 model |
 | `recorder.py` | The optional pictures of `serve --record`: PNG frames, the animated PNG, `frames.json`, and `index.html` |
 | `factory_supervisor.md` | Agent profile of the supervisor |
 | `factory_line_manager.md` | Agent profile of the manager of a `serial` team (Team A) |
@@ -993,7 +1094,7 @@ The number of tests and the time can be different.
 ```text
 ........................................................................ [ 65%]
 ......................................                                   [100%]
-110 passed in 77.85s (0:01:17)
+116 passed in 43.30s
 ```
 
 </details>
@@ -1002,6 +1103,8 @@ The number of tests and the time can be different.
   no provider credentials.
 - CI runs them in the **Robotics factory example** workflow on Python 3.10
   and 3.12.
+- Without `fetch-robot`, the tests use the simple bipeds and need no download.
+  After `fetch-robot`, one more test loads the Open Duck Mini model.
 - They check the scene rules, the queue order of Team A, the parallel lines of
   Team B, the spin, turn, and run of Team C, the block and the new pace, a full
   order, the scoped credentials of each layer, `wait_team`, the stop, the

@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import robot_model
 import yaml
 from factory_mcp import controller_client, make_server
 from fastmcp.server import create_proxy
@@ -302,7 +303,16 @@ def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> N
         "SIMULATION ONLY: kinematic robot proxies; motion %s",
         "approved for this scene" if allow_motion else "DISABLED (no --allow-motion)",
     )
+    if world.robot_look == "open_duck_mini_v2":
+        logging.getLogger("factory").info("Robots: Open Duck Mini v2")
+    else:
+        logging.getLogger("factory").warning(
+            "Robots: simple bipeds. Run 'python demo.py fetch-robot' to show Open Duck Mini robots."
+        )
     server = make_server(world, tokens, run_dir / "last-state.json")
+    logging.getLogger("factory").warning(
+        "LIVE VIEW: open http://127.0.0.1:%d/ in a browser to watch the run", port
+    )
     recorder = Recorder(world, record) if record is not None else None
     if recorder is not None:
         recorder.start()
@@ -388,6 +398,9 @@ def main() -> None:
     )
     for command in ("status", "stop"):
         sub.add_parser(command).add_argument("--run-dir", type=Path, required=True)
+    sub.add_parser(
+        "fetch-robot", help="download the pinned Open Duck Mini v2 robot model (about 18 MB)"
+    )
     sub.add_parser("connect", help="stdio MCP relay; used by generated profiles").add_argument(
         "credential", type=Path
     )
@@ -437,6 +450,13 @@ def main() -> None:
             args.run_dir.resolve(),
             allow_motion=args.allow_motion,
             record=args.record.resolve() if args.record else None,
+        )
+    elif args.command == "fetch-robot":
+        spec = robot_model.manifest()
+        target = robot_model.fetch()
+        print(
+            f"Open Duck Mini v2 from {spec['repository']} at {spec['commit'][:12]} "
+            f"({spec['license']}): {len(spec['files'])} files checked in {target}"
         )
     elif args.command == "connect":
         credentials = json.loads(args.credential.read_text(encoding="utf-8"))

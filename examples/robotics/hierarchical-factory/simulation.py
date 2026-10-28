@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Callable, Literal
 
 import mujoco
+import robot_model
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 Identifier = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]*$", max_length=64)]
@@ -200,12 +201,14 @@ ROBOT_COLORS = (
 BLOCKED_COLOR = (0.86, 0.08, 0.1, 1)
 BUFFER_COLOR = "1 0.72 0.1 1"
 PLACE_COLOR = "0.3 0.3 0.34 1"
-# The robots look like small walking duck robots: a white shell with a band in
-# the color of the team, dark joints, and a lamp on an antenna for the state.
-SHELL_COLOR = (0.94, 0.94, 0.96, 1)
+# The robots are Open Duck Mini v2 robots (see robot_model.py): the battery lid
+# and the top panel have the color of the team, and a lamp above the head shows
+# the state. Without the downloaded model, a simple biped of the same size
+# stands in for it, so that the tests and CI need no download.
+SHELL_COLOR = (0.92, 0.92, 0.93, 1)
 JOINT_COLOR = "0.22 0.22 0.25 1"
-EYE_COLOR = "0.05 0.05 0.06 1"
-BEAK_COLOR = "0.98 0.62 0.16 1"
+VISOR_COLOR = "0.08 0.09 0.11 1"
+FOOT_COLOR = "0.93 0.66 0.12 1"
 LAMP_COLORS = {
     "working": (0.15, 0.85, 0.3, 1),
     "waiting": (1.0, 0.72, 0.1, 1),
@@ -220,26 +223,103 @@ STAGE_COLORS = {
 CAMERA_TILT_DEGREES = 50.0
 CAMERA_FOVY_DEGREES = 45.0
 CAMERA_ASPECT = 16 / 9
-# The top of the shell, where a robot carries a part.
-ROBOT_TOP = 0.42
-PART_HALF = 0.06
-HIP_HEIGHT = 0.24
-STRIDE_M = 0.22
+PART_HALF = 0.05
+STRIDE_M = 0.2
 STEP_DEGREES = 30.0
 WAITING_LABELS = ("idle", "waiting", "starved")
+# The lamp and the carried part of the simple biped, relative to its root.
+SIMPLE_LAMP = (0.03, 0.0, 0.47)
+SIMPLE_BACK = (-0.03, 0.0, 0.33)
 
 
 def _rgba(color) -> str:
     return " ".join(str(value) for value in color)
 
 
-def _add_robot(parent: ET.Element, name: str, robot: Robot, color: tuple) -> None:
-    """Add one duck robot: a mocap root, two jointed legs, and a jointed neck.
-
-    The legs and the neck only animate the robot: the controller sets their
-    joint angles from the motion of the robot. No geom has contact.
-    """
+def _add_simple_robot(root: ET.Element, name: str, color: tuple) -> None:
+    """A simple biped with the joints of the Open Duck Mini that the world animates."""
     no_contact = {"contype": "0", "conaffinity": "0"}
+
+    def geom(body: ET.Element, part: str, **attributes) -> None:
+        ET.SubElement(body, "geom", name=f"robot/{name}/{part}", **attributes, **no_contact)
+
+    def joint(body: ET.Element, joint_name: str, axis: str = "0 1 0") -> None:
+        ET.SubElement(body, "joint", name=f"robot/{name}/{joint_name}", type="hinge", axis=axis)
+
+    geom(
+        root, "shell", type="box", size="0.09 0.075 0.065", pos="0 0 0.27", rgba=_rgba(SHELL_COLOR)
+    )
+    for side, y in (("left", 0.078), ("right", -0.078)):
+        geom(
+            root,
+            f"panel_{side}",
+            type="box",
+            size="0.07 0.005 0.045",
+            pos=f"0 {y} 0.27",
+            rgba=_rgba(color),
+        )
+    geom(root, "lid", type="box", size="0.07 0.06 0.006", pos="-0.01 0 0.337", rgba=_rgba(color))
+    neck = ET.SubElement(root, "body", name=f"robot/{name}/neck", pos="0.03 0 0.335")
+    joint(neck, "neck_pitch")
+    geom(neck, "neck", type="capsule", fromto="0 0 0 0 0 0.04", size="0.015", rgba=JOINT_COLOR)
+    head = ET.SubElement(neck, "body", name=f"robot/{name}/head", pos="0 0 0.06")
+    joint(head, "head_pitch")
+    geom(head, "head", type="box", size="0.05 0.07 0.035", pos="0 0 0.0", rgba=_rgba(SHELL_COLOR))
+    geom(head, "visor", type="box", size="0.006 0.055 0.018", pos="0.05 0 0.003", rgba=VISOR_COLOR)
+    for side, y in (("left", 1), ("right", -1)):
+        antenna = ET.SubElement(
+            head, "body", name=f"robot/{name}/{side}_antenna_body", pos=f"-0.01 {0.05 * y} 0.035"
+        )
+        joint(antenna, f"{side}_antenna", axis="1 0 0")
+        geom(
+            antenna,
+            f"antenna_{side}",
+            type="capsule",
+            fromto="0 0 0 0 0 0.05",
+            size="0.004",
+            rgba=JOINT_COLOR,
+        )
+    for side, y, axis in (("left", 0.045, "0 1 0"), ("right", -0.045, "0 -1 0")):
+        hip = ET.SubElement(root, "body", name=f"robot/{name}/{side}_hip", pos=f"0 {y} 0.2")
+        joint(hip, f"{side}_hip_pitch", axis)
+        geom(
+            hip,
+            f"thigh_{side}",
+            type="capsule",
+            fromto="0 0 0 0 0 -0.1",
+            size="0.02",
+            rgba=_rgba(SHELL_COLOR),
+        )
+        knee = ET.SubElement(hip, "body", name=f"robot/{name}/{side}_shin", pos="0 0 -0.1")
+        joint(knee, f"{side}_knee")
+        geom(
+            knee,
+            f"shin_{side}",
+            type="capsule",
+            fromto="0 0 0 0 0 -0.09",
+            size="0.016",
+            rgba=JOINT_COLOR,
+        )
+        foot = ET.SubElement(knee, "body", name=f"robot/{name}/{side}_foot", pos="0 0 -0.09")
+        joint(foot, f"{side}_ankle")
+        geom(
+            foot,
+            f"foot_{side}",
+            type="box",
+            size="0.05 0.025 0.01",
+            pos="0.015 0 -0.01",
+            rgba=FOOT_COLOR,
+        )
+
+
+def _add_robot(
+    parent: ET.Element, name: str, robot: Robot, color: tuple, duck: robot_model.DuckModel | None
+) -> None:
+    """Add one robot: a mocap root, the Open Duck Mini (or the simple biped), and a lamp.
+
+    The joints only animate the robot: the world sets their angles from the
+    motion of the robot. No geom has contact.
+    """
     root = ET.SubElement(
         parent,
         "body",
@@ -248,108 +328,23 @@ def _add_robot(parent: ET.Element, name: str, robot: Robot, color: tuple) -> Non
         pos=f"{robot.xy[0]} {robot.xy[1]} 0",
         quat=_rgba(_quat(robot.heading_deg)),
     )
-
-    def geom(body: ET.Element, part: str, **attributes) -> None:
-        ET.SubElement(body, "geom", name=f"robot/{name}/{part}", **attributes, **no_contact)
-
-    geom(
+    if duck is not None:
+        duck.add_robot(root, f"robot/{name}", _rgba(color))
+        lamp = duck.lamp
+    else:
+        _add_simple_robot(root, name, color)
+        lamp = SIMPLE_LAMP
+    ET.SubElement(
         root,
-        "shell",
-        type="ellipsoid",
-        size="0.16 0.12 0.1",
-        pos="0 0 0.32",
-        rgba=_rgba(SHELL_COLOR),
-    )
-    geom(root, "band", type="ellipsoid", size="0.165 0.125 0.035", pos="0 0 0.3", rgba=_rgba(color))
-    geom(
-        root,
-        "tail",
-        type="ellipsoid",
-        size="0.05 0.06 0.03",
-        pos="-0.15 0 0.36",
-        euler="0 -25 0",
-        rgba=_rgba(color),
-    )
-    for side, y in (("left", 0.115), ("right", -0.115)):
-        geom(
-            root,
-            f"wing_{side}",
-            type="ellipsoid",
-            size="0.1 0.025 0.055",
-            pos=f"-0.01 {y} 0.33",
-            euler="0 -10 0",
-            rgba=_rgba(color),
-        )
-    neck = ET.SubElement(root, "body", name=f"robot/{name}/neck", pos="0.1 0 0.38")
-    ET.SubElement(neck, "joint", name=f"robot/{name}/neck", type="hinge", axis="0 1 0")
-    geom(neck, "neck", type="capsule", fromto="0 0 0 0.05 0 0.1", size="0.025", rgba=JOINT_COLOR)
-    geom(
-        neck,
-        "head",
-        type="ellipsoid",
-        size="0.075 0.065 0.055",
-        pos="0.06 0 0.13",
-        rgba=_rgba(SHELL_COLOR),
-    )
-    geom(
-        neck,
-        "beak",
-        type="ellipsoid",
-        size="0.045 0.03 0.014",
-        pos="0.135 0 0.115",
-        rgba=BEAK_COLOR,
-    )
-    for side, y in (("left", 0.03), ("right", -0.03)):
-        geom(
-            neck, f"eye_{side}", type="sphere", size="0.015", pos=f"0.115 {y} 0.145", rgba=EYE_COLOR
-        )
-    geom(
-        neck,
-        "antenna",
-        type="capsule",
-        fromto="0.04 0 0.18 0.03 0 0.25",
-        size="0.007",
-        rgba=JOINT_COLOR,
-    )
-    geom(
-        neck,
-        "lamp",
+        "geom",
+        name=f"robot/{name}/lamp",
         type="sphere",
         size="0.022",
-        pos="0.03 0 0.26",
+        pos=_rgba(lamp),
         rgba=_rgba(LAMP_COLORS["waiting"]),
+        contype="0",
+        conaffinity="0",
     )
-    for side, y in (("left", 0.07), ("right", -0.07)):
-        hip = ET.SubElement(
-            root, "body", name=f"robot/{name}/hip_{side}", pos=f"0 {y} {HIP_HEIGHT}"
-        )
-        ET.SubElement(hip, "joint", name=f"robot/{name}/hip_{side}", type="hinge", axis="0 1 0")
-        geom(
-            hip,
-            f"thigh_{side}",
-            type="capsule",
-            fromto="0 0 0 0 0 -0.11",
-            size="0.024",
-            rgba=JOINT_COLOR,
-        )
-        knee = ET.SubElement(hip, "body", name=f"robot/{name}/knee_{side}", pos="0 0 -0.11")
-        ET.SubElement(knee, "joint", name=f"robot/{name}/knee_{side}", type="hinge", axis="0 1 0")
-        geom(
-            knee,
-            f"shin_{side}",
-            type="capsule",
-            fromto="0 0 0 0 0 -0.105",
-            size="0.021",
-            rgba=_rgba(SHELL_COLOR),
-        )
-        geom(
-            knee,
-            f"foot_{side}",
-            type="box",
-            size="0.055 0.032 0.012",
-            pos="0.025 0 -0.115",
-            rgba=JOINT_COLOR,
-        )
 
 
 def _add_scene_visuals(root: ET.Element, world: ET.Element, scene: Scene) -> None:
@@ -577,15 +572,21 @@ class World:
         }
         zone_index = {zone: index for index, zone in enumerate(scene.zones)}
 
+        duck = robot_model.load() if robot_model.available() else None
+        self.robot_look = "open_duck_mini_v2" if duck else "simple"
+        self.robot_back = duck.back if duck else SIMPLE_BACK
+
         root = ET.Element("mujoco", model="cao-hierarchical-factory")
+        ET.SubElement(root, "compiler", angle="radian")
         ET.SubElement(root, "option", timestep=str(scene.step_seconds), gravity="0 0 0")
         bodies = ET.SubElement(root, "worldbody")
         _add_scene_visuals(root, bodies, scene)
+        if duck is not None:
+            duck.add_assets(root.find("asset"))
         no_contact = {"contype": "0", "conaffinity": "0"}
         for name, robot in scene.robots.items():
-            _add_robot(
-                bodies, name, robot, ROBOT_COLORS[zone_index[robot.zone] % len(ROBOT_COLORS)]
-            )
+            color = ROBOT_COLORS[zone_index[robot.zone] % len(ROBOT_COLORS)]
+            _add_robot(bodies, name, robot, color, duck)
         for name in self.part_names:
             body = ET.SubElement(bodies, "body", name=f"part/{name}", mocap="true", pos="0 0 0")
             ET.SubElement(
@@ -603,19 +604,18 @@ class World:
             name: self.model.body(f"robot/{name}").mocapid[0] for name in scene.robots
         }
         self.part_mocap = {name: self.model.body(f"part/{name}").mocapid[0] for name in self.parts}
-        self.robot_geom = {
-            name: (
-                self.model.geom(f"robot/{name}/shell").id,
-                self.model.geom(f"robot/{name}/lamp").id,
-            )
-            for name in scene.robots
-        }
+        self.robot_lamp = {name: self.model.geom(f"robot/{name}/lamp").id for name in scene.robots}
+        # The shell geoms turn red when the robot is blocked; keep their colors.
+        self.robot_shell = {name: [] for name in scene.robots}
+        for index in range(self.model.ngeom):
+            parts = self.model.geom(index).name.split("/")
+            if parts[0] == "robot" and (
+                parts[2:3] == ["shell"]
+                or (parts[2:3] == ["mesh"] and parts[3] in robot_model.SHELL_MESHES)
+            ):
+                self.robot_shell[parts[1]].append((index, tuple(self.model.geom_rgba[index])))
         self.robot_joints = {
-            name: {
-                joint: self.model.joint(f"robot/{name}/{joint}").qposadr[0]
-                for joint in ("neck", "hip_left", "knee_left", "hip_right", "knee_right")
-            }
-            for name in scene.robots
+            name: robot_model.joint_addresses(self.model, f"robot/{name}") for name in scene.robots
         }
         self.part_geom = {name: self.model.geom(f"part/{name}/geom").id for name in self.parts}
         self._restack(scene.raw_store)
@@ -650,8 +650,7 @@ class World:
             self._animate(name, robot)
         for name, part in self.parts.items():
             if part.at is not None and part.at.startswith("robot:"):
-                carrier = self.robots[part.at.split(":", 1)[1]]
-                part.xyz = [carrier.x, carrier.y, ROBOT_TOP + PART_HALF]
+                part.xyz = self._carry_xyz(part.at.split(":", 1)[1])
             self.data.mocap_pos[self.part_mocap[name]] = part.xyz
             self.model.geom_rgba[self.part_geom[name]] = STAGE_COLORS[part.stage]
 
@@ -663,33 +662,37 @@ class World:
             # A robot steps when it walks, and steps in place when it turns.
             robot.gait += 2 * math.pi * (moved / STRIDE_M + turned / (4 * STEP_DEGREES * 3))
         robot.shown = (robot.x, robot.y, robot.heading)
-        swing = math.sin(robot.gait)
         stepping = robot.label not in WAITING_LABELS + ("blocked", "working")
-        amplitude = 0.5 if stepping else 0.0
-        joints, qpos = self.robot_joints[name], self.data.qpos
-        qpos[joints["hip_left"]] = amplitude * swing
-        qpos[joints["hip_right"]] = -amplitude * swing
-        qpos[joints["knee_left"]] = amplitude * max(0.0, -swing) * 1.4
-        qpos[joints["knee_right"]] = amplitude * max(0.0, swing) * 1.4
-        # A working robot nods over its part.
-        nod = 0.35 * math.sin(self.now() * 7) if robot.label == "working" else 0.0
-        qpos[joints["neck"]] = nod
-        bob = 0.012 * abs(swing) if stepping else 0.0
+        working = robot.label == "working"
+        # A working robot nods over its part and moves its antennas.
+        nod = 0.3 * math.sin(self.now() * 7) if working else 0.0
+        wiggle = 0.6 * math.sin(self.now() * 9) if working else 0.0
+        robot_model.pose(
+            self.data.qpos,
+            self.robot_joints[name],
+            robot.gait,
+            1.0 if stepping else 0.0,
+            nod,
+            wiggle,
+        )
         mocap = self.robot_mocap[name]
-        self.data.mocap_pos[mocap] = [robot.x, robot.y, bob]
+        self.data.mocap_pos[mocap] = [robot.x, robot.y, 0.0]
         self.data.mocap_quat[mocap] = _quat(robot.heading)
-        shell, lamp = self.robot_geom[name]
-        self.model.geom_rgba[shell] = BLOCKED_COLOR if robot.label == "blocked" else SHELL_COLOR
+        for index, color in self.robot_shell[name]:
+            self.model.geom_rgba[index] = BLOCKED_COLOR if robot.label == "blocked" else color
         if robot.label == "blocked":
             light = LAMP_COLORS["blocked"]
         elif robot.label in WAITING_LABELS:
             light = LAMP_COLORS["waiting"]
         else:
             light = LAMP_COLORS["working"]
-        self.model.geom_rgba[lamp] = light
+        self.model.geom_rgba[self.robot_lamp[name]] = light
 
-    def carry_height(self, robot: str) -> float:
-        return float(self.data.mocap_pos[self.robot_mocap[robot]][2]) + ROBOT_TOP + PART_HALF
+    def _carry_xyz(self, robot: str) -> list[float]:
+        """Where a robot carries a part: on its back, behind the head."""
+        state = self.robots[robot]
+        dx, dy = _rotate(self.robot_back[:2], state.heading)
+        return [state.x + dx, state.y + dy, self.robot_back[2] + PART_HALF]
 
     def _xy(self, robot: str) -> XY:
         pose = self.data.body(f"robot/{robot}").xpos
@@ -926,8 +929,7 @@ class World:
                 continue
             kind, target = part.goal
             if kind == "robot":
-                robot = self.robots[target]
-                goal = [robot.x, robot.y, ROBOT_TOP + PART_HALF]
+                goal = self._carry_xyz(target)
             else:
                 goal = self._slot_xyz(target, len(self.contents[target]))
             distance = math.dist(part.xyz, goal)
@@ -1295,7 +1297,11 @@ class World:
                     for name, place in self.scene.places.items()
                 },
                 "parts": {
-                    name: {"stage": part.stage, "at": part.at or "moving"}
+                    name: {
+                        "stage": part.stage,
+                        "at": part.at or "moving",
+                        "xy": [round(value, 3) for value in part.xyz[:2]],
+                    }
                     for name, part in self.parts.items()
                 },
                 "commands": [command.report() for command in self._commands.values()],

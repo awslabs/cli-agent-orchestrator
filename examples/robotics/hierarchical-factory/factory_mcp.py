@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -21,8 +22,26 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token
 from pydantic import Field
 from simulation import Identifier, World
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse
 
 LOGGER = logging.getLogger("factory")
+VIEWER_HTML = Path(__file__).resolve().parent / "viewer.html"
+# Pictures of the Open Duck Mini for the live view, rendered from its model:
+# one for each team color, and one for a blocked robot.
+SPRITES = Path(__file__).resolve().parent / "sprites"
+
+
+def viewer_page() -> str:
+    """The live view, with the robot pictures inlined, so that it loads nothing else."""
+    sprites = {
+        path.stem.removeprefix("robot-"): "data:image/png;base64,"
+        + base64.b64encode(path.read_bytes()).decode("ascii")
+        for path in sorted(SPRITES.glob("robot-*.png"))
+    }
+    return VIEWER_HTML.read_text(encoding="utf-8").replace("__ROBOT_SPRITES__", json.dumps(sprites))
+
+
 # wait_team holds a tool call open for up to this time. The MCP client of a
 # connect relay must wait longer than that.
 MAX_WAIT_SECONDS = 45
@@ -92,6 +111,18 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         auth=StaticTokenVerifier(tokens, required_scopes=["observe"]),
         lifespan=lifespan,
     )
+
+    # Read-only live view, served on the same 127.0.0.1 controller, as in the
+    # cross-zone transport example. It exposes only observe(): the measured
+    # poses, team states, parts, and command history that any observe-scoped
+    # agent already sees, never a credential.
+    @server.custom_route("/", methods=["GET"], include_in_schema=False)
+    async def viewer(_request: Request) -> HTMLResponse:
+        return HTMLResponse(viewer_page())
+
+    @server.custom_route("/state", methods=["GET"], include_in_schema=False)
+    async def state(_request: Request) -> JSONResponse:
+        return JSONResponse(world.observe())
 
     def zone() -> str:
         token = get_access_token()

@@ -221,6 +221,8 @@ def test_serve_without_frames_does_not_point_to_a_viewer(tmp_path, monkeypatch, 
         demo.serve(run_dir, allow_motion=False, record=tmp_path / "frames")
     assert "Recorded no frames" in caplog.text
     assert "index.html" not in caplog.text
+    port = json.loads((run_dir / "run.json").read_text())["url"].split(":")[2].split("/")[0]
+    assert f"LIVE VIEW: open http://127.0.0.1:{port}/ in a browser" in caplog.text
 
 
 def test_serve_refuses_a_busy_port_without_consuming_the_run(tmp_path, monkeypatch):
