@@ -59,9 +59,10 @@ From a supervisor, delegate the last step of a flow with `handoff` to
 | `publish_site` | Publishes a `files` map and returns `url`, `slug`, `version`, and an owner `token` on the first publish; `ttl_seconds` sets an expiry |
 | `update_site` | Replaces the files of a page published earlier, using its `slug` and `token` |
 | `get_site` | Reports whether a slug is live (no token needed) |
+| `delete_site` | Deletes a page published earlier, with its `slug` and `token`; earlier versions go with it |
 
 The server exposes other tools (custom domains, webhooks, analytics, token
-rotation, billing). The profile's instructions keep the agent to the three
+rotation, billing). The profile's instructions keep the agent to the four
 above. Full reference: [deed.page/docs](https://deed.page/docs).
 
 ## Expiry and the owner token
@@ -72,9 +73,19 @@ so pages expire after seven days unless you ask for a permanent one.
 The first publish returns an owner `token`, which is the only way to update or
 delete that page. It arrives in the tool result, so it is in the agent's
 context and the provider's transcript. The profile tells the agent not to
-pass it on or repeat it unless you ask for it directly. If you need to delete
-a page before it expires, ask the agent for the token in the same session,
-then run `curl -X DELETE https://deed.page/v1/sites/<slug> -H "Authorization: Bearer <token>"`.
+pass it on or repeat it unless you ask for it directly. To delete a page
+before it expires, ask the agent to delete it in the same session (it calls
+`delete_site`). Outside the session, ask for the token and run
+`curl -X DELETE https://deed.page/v1/sites/<slug> -H "Authorization: Bearer <token>"`.
+
+## Versions
+
+Each publish or update stays public as a version at
+`https://v{n}--<slug>.deed.page/` until retention drops it (the free plan keeps
+the last 10). An update does not remove earlier content. To remove it, delete
+the site: deleting a site removes all of its versions. The profile tells the
+agent to warn you and offer a delete when a revision removes content that must
+not stay public.
 
 ## Data flow
 
@@ -83,6 +94,14 @@ and served at a public URL that anyone with the link can open. Do not publish
 secrets, credentials or private repository content. The profile tells the
 agent to stop and ask when the content looks private, but that is prompt-level
 guidance and not a filter.
+
+The profile tells the agent to escape the content and to add a
+`script-src 'none'` Content-Security-Policy meta tag, so raw HTML or script in
+the content is shown as text and does not run for readers of the page.
+
+Pages on the free plan carry a small "Published with deed.page" badge. The
+server's instructions may mention paid plans or other offers; the profile tells
+the agent not to pass them on unless you ask.
 
 ## Notes
 
