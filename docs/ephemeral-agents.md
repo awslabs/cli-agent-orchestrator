@@ -19,7 +19,15 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "max_brief_bytes": 8192,
     "pending_ttl_seconds": 900,
     "claim_lease_seconds": 60,
-    "max_depth": 1
+    "max_tier": null,
+    "default_tier": null,
+    "max_effort": null,
+    "default_effort": null,
+    "max_depth": 1,
+    "max_live_per_session": 0,
+    "launch_grace_seconds": 600,
+    "sweep_interval_seconds": 300,
+    "retention_days": 14
   }
 }
 ```
@@ -31,12 +39,63 @@ recheck whether the feature is enabled before touching a name. Unreadable
 settings fail closed. `max_depth` accepts only integer 1. Ephemeral callers cannot create
 other ephemerals, even when `child_may_delegate` allows the existing delegation tools.
 
-`ephemeral.max_tier`, `default_tier`, `max_effort`, `default_effort`, and top-level
-`model_tiers` are **not applied yet**. In particular, `max_tier` sets no ceiling. Each
-successful create with any such key set warns and names the ignored keys in its notes.
-Explicit `model_tier` and `effort` requests temporarily refuse with `tier_not_supported`
-and `effort_not_supported`; `auto` refuses with `auto_requires_decision_platform`.
-Omit both fields to use the provider default.
+The last four keys control lifecycle cleanup. Their defaults are proposals that await
+maintainer confirmation (#1079). `max_live_per_session` is an opt-in cap on the pending,
+claimed and launched names one session holds. The default, `0`, means no cap, so current users
+see no change. To opt in, set a positive integer; `32` leaves room for a fleet-style
+supervisor. Collected names and expired pending names don't count. A create past the cap is
+refused with `max_live_exceeded` (409) before anything is written. If the value isn't a
+non-negative integer, every create is refused with `policy_config_error:max_live_per_session`.
+The other three keys tune the sweep described below. An unusable `launch_grace_seconds` skips
+the two steps that need it: periodic collection of launched names with no terminal row, and
+deletion of rowless live files. An unusable `retention_days` skips retention. An unusable
+interval falls back to the default.
+
+Creates take an inter-process `flock` lock under `CAO_HOME/locks/`. A create that can't take
+the lock within 10 seconds is refused with `store_busy` (503) and can be retried. If the lock
+is unavailable — for example, no `flock` support, as on an NFS mount without locking, or the
+lock file can't be created, as on a read-only home — every create is refused with
+`store_lock_unavailable` (503), and each sweep skips its rowless-file step with a warning.
+
+## Model tier and effort
+
+`model_tier` accepts `small`, `medium`, or `large`; `effort` accepts `low`, `medium`,
+or `high`. Either can be omitted. `auto` in either field still refuses with
+`auto_requires_decision_platform`.
+
+Tier and effort resolve once at create: the explicit value, else
+`ephemeral.default_tier` or `ephemeral.default_effort`, else none. The registry row and response hold that resolved
+value; the stored spec keeps what was requested. Changing a default later never
+changes a pending name. No decider is asked for an ephemeral agent in any field state.
+
+Configure the top-level tier table with model ids for each allowed provider:
+
+```json
+{"model_tiers": {"claude_code": {"small": "<small model id>", "medium": "<medium model id>", "large": "<large model id>"}}}
+```
+
+See [Launch decisions](decisions.md) and `cao decisions tier` to manage mappings.
+A ceiling needs a default at or below it. Every tier at or below `ephemeral.max_tier`,
+and the default tier, must be mapped for every allowed provider. An invalid model id
+counts as unmapped. A broken block refuses every create and claim with
+`policy_config_error:<key>` until the operator fixes it. Unknown ephemeral keys, such
+as `min_tier`, remain silently ignored.
+
+An explicit tier or effort above its ceiling gives `tier_exceeds_policy` or
+`effort_exceeds_policy`; an unmapped explicit tier with no ceiling gives `tier_unmapped`.
+A resolved tier becomes `model:` in the
+live profile. At claim the id is looked up again in the current table, so a remap
+reaches pending names. A launch without a claim identifier runs the live file as it
+stands: normally the create-time id, or the id from an earlier finalized claim that lapsed.
+
+Effort becomes Claude Code's `claudeConfig.effort` (`--effort`) or Codex's
+`codexConfig.model_reasoning_effort`. Values pass through verbatim. A CLI rejection
+for a particular model is a launch failure, not a policy refusal. With effort omitted
+and no default, no provider config or effort flag is emitted.
+
+**Upgrade note:** earlier releases ignored the tier and effort keys and table with a warning,
+whatever their values. All four tier and effort keys are now validated. A previously accepted block, such as a
+ceiling without a default, can therefore refuse every ephemeral create and claim.
 
 ## Create surface and stored files
 
@@ -62,12 +121,44 @@ archive, canonical spec, and deterministic profile are written and fsynced in th
 then the pending row is inserted. The spec file holds exactly the bytes hashed by
 `spec_sha256`; `profile_sha256` hashes the Markdown bytes.
 
-Pending names expire lazily when touched by claim or bind. A lapsed, unbound claim
-returns to pending, or is collected if the name has expired. Collection removes the two
-live files and keeps the registry row and archive. There is no background or startup sweep
-in this release. A creation crash can leave rowless files; a crash between bind and terminal
-insertion can leave a launched row whose terminal vanished without a delete. That row and
-its live files persist until the later orphan sweep. Keep the feature disabled outside tests.
+Pending names expire when a claim or bind touches them, or when a sweep reaches them.
+A lapsed, unbound claim returns to pending, or is collected if the name has expired.
+Collection removes the two live files and keeps the registry row and archive.
+
+cao-server sweeps once at startup, before it serves any request, and then every
+`sweep_interval_seconds`. Sweeps run whether or not `enabled` is true, so turning creation
+off does not strand files. Each pass applies these rules:
+
+- A pending name past its TTL is collected as `ephemeral_expired`. A pending name whose
+  creator's terminal row is gone is collected as `owner_gone`.
+- A claim inside its lease is never touched. A lapsed claim follows the rule above.
+- A launched name whose terminal row exists is never touched, whatever its TTL, even if a
+  live file is missing.
+- A launched name with no terminal row is collected as `terminal_gone`. A crash between
+  bind and terminal insertion leaves one. The startup pass collects it at once; later
+  passes wait until `launch_grace_seconds` have passed since the bind.
+- If deleting a collected name's live files failed, the pass deletes them again.
+- Live files with no registry row, left by a crashed create, are deleted by exact name once
+  they are older than `launch_grace_seconds`, on startup passes too. Creates and this step
+  share an inter-process lock, held from a create's cap check until its row is inserted. A
+  pass that finds the lock held skips this step until the next pass.
+
+A pass deletes only these exact regular files under `ephemeral/live/` and the archives
+that retention allows. Each change to a row is rechecked in its own transaction, so a
+concurrent claim or bind always wins, and a terminal insertion wins unless it comes more
+than `launch_grace_seconds` after the bind. A pass that changes anything
+logs one line of counts by reason. The line names no brief or other creator text.
+
+Retention keeps a collected name's archive for `retention_days`. The archive is deleted once
+it is older than that, and only after the name's terminal row and both live files are gone.
+The registry row is deleted after its archive, once every timestamp on it is also older than
+the window. If the archive is already gone, for example removed by hand, only those
+timestamps count, so a name that ran longer than the window is pruned on the first pass
+after its collection. Archives and rows of pending, claimed and launched names are never
+deleted.
+Neither is any row whose terminal still exists, so a surviving terminal stays marked
+ephemeral. A later create can reuse a deleted name. It still checks installed stores and
+creates the exact archive and live paths exclusively.
 
 The prompt surrounds the normalized brief with constant ASCII markers
 `[[BEGIN CREATOR BRIEF]]` and `[[END CREATOR BRIEF]]`. The markers are prompt structure,
@@ -111,7 +202,7 @@ The HTTP contract remains available for clients implementing their own launch pa
 
 Claim with `POST /ephemeral-agents/{name}/claim?caller_id=<creator-terminal-id>` and a JSON
 body containing optional `idempotency_key`, `claim_id`, and `model`. A per-call model is
-refused; omit it to use the provider default. The server checks creator identity and
+refused; set model tier in the spec instead. The server checks creator identity and
 ownership, answers a matching launched retry, then atomically claims a pending name.
 A successful response contains `claim_id`, `provider`, `effective_tools`, and `replayed: false`.
 A matching launched retry returns `terminal_id` and `replayed: true`, without rechecking policy.
@@ -126,12 +217,17 @@ get structured `ephemeral_expired` (409); never-created names get structured `un
 (404), including on `POST /sessions`.
 
 The claim lease covers claim to terminal creation. At claim, the server rechecks the operator
-block before the stored provider. A broken block returns `policy_config_error:<key>` and
+block before the stored provider, tier and effort. A broken block returns `policy_config_error:<key>` and
 reverts that claim to pending; fix the named setting and retry. A removed provider returns
 `policy_changed_since_create:provider_not_allowed` and collects the name; create a new one.
+A stored tier or effort above a tightened ceiling, an unmapped stored tier, or a stored provider
+default under a newly added ceiling returns `policy_changed_since_create:tier_exceeds_policy`
+or `policy_changed_since_create:effort_exceeds_policy`, or
+`policy_changed_since_create:tier_unmapped`, and collects the name; re-create it.
+A broken table names `model_tiers`, never `ephemeral.model_tiers`.
 The stored spec is verified and the profile is finalized before the claim response.
 An owner may also launch a pending name without a claim identifier; that bind applies the
-same enabled and policy checks and loads the create-time profile. Posted tools must be a
+same enabled and policy checks and loads the live file as it stands. Posted tools must be a
 literal subset of the stored list; omitting tools uses the stored list.
 
 The lifecycle is `pending -> claimed -> launched -> gc`. The bind precedes backend
@@ -139,7 +235,7 @@ allocation and terminal insertion. An unbound failed launch ends its own claim; 
 or a completed rollback after bind collects the live files. A deleted terminal or session releases the name, as do herdr pane closes, including
 those reconciled at startup or on reconnect.
 A release that fails is logged as a warning naming the terminal id, and its live files
-stay until a later sweep. Retention cleanup and stale-session row purges also release it.
+stay until the next sweep deletes them. Retention cleanup and stale-session row purges also release it.
 A run-step timeout retains its live terminal and files; success, cancellation and output
 extraction failure tear down terminals owned by that call.
 
@@ -147,9 +243,23 @@ extraction failure tear down terminals owned by that call.
 | --- | --- |
 | 404 | `ephemeral_disabled`, `unknown_ephemeral` |
 | 409 | `already_claimed`, `claim_expired`, `ephemeral_expired`, `spec_unavailable` |
-| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed` |
+| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy` |
 | 422 | `invalid_request` for the claim body; invalid launch claim identifiers or claim-plus-reuse requests |
 | 500 | `unexpected_failure` |
+
+Create also refuses with `tier_unmapped`, `tier_exceeds_policy`, `effort_exceeds_policy` and
+`policy_config_error:<key>`, all HTTP 400.
+
+Every ephemeral live-profile load verifies the exact bytes parsed against the registry's
+`profile_sha256`, including claim-less launches and provider reloads. Missing rows or hashes
+and modified files fail closed. Finalize updates the hash under the claim guard and replaces
+the profile inside the same transaction; between the replace and the commit, a concurrent
+load sees the new bytes with the old hash and refuses. If the commit fails after the replace,
+loads of that name fail closed until the next finalize rewrites both. Claim-less launches do not
+re-render profiles; pending names receive the empty skill catalog on their next claimed launch.
+A pending name created before this change and launched without a claim keeps its old
+profile, including the inherited skill catalog; that launch consumes the name. Only
+a claimed launch re-renders the pending profile with `skills: []`.
 
 Policy errors carry `{kind: "ephemeral_policy", rule, message}` and never echo creator text.
 Archives record claimed, finalized, bound and released events, plus refusal counts. Archive updates
@@ -158,9 +268,9 @@ marked ephemeral and the existing delegation denial stays effective.
 
 ## Honesty statement
 
-> An ephemeral child's CAO-recorded allowlist is a subset of its creator's effective allowlist at creation time. Its profile cannot declare MCP servers, hooks, skills or native agents; installed agent plugins' MCP servers are not added at launch; and CAO will not launch it with a wider list. An ephemeral child cannot delegate, create ephemerals or start workflows through CAO's MCP tools unless the operator sets `child_may_delegate`. That is all this guarantees. It does not guarantee:
+> An ephemeral child's CAO-recorded allowlist is a subset of its creator's effective allowlist at creation time. Its generated profile declares only the CAO MCP server, no hooks or native agents, and `skills: []` so no skill catalog is inherited; named skills remain callable through `load_skill`; installed agent plugins' MCP servers are not added at launch; and CAO will not launch it with a wider list. An ephemeral child cannot create ephemerals. It cannot delegate or start or cancel workflows through CAO's MCP tools unless the operator sets `child_may_delegate`. That is all this guarantees. It does not guarantee:
 > 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro is unsupported until the deferred Kiro slice lands.
-> 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. A child can still message, answer or delete other terminals, and use every CAO tool that is not a delegation (#671).
+> 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. MCP `send_message`, `answer_user_prompt` and `delete_terminal` bind targets to the caller's permitted terminal tree (#912). State-changing memory and metadata tools and workflow authoring (`workflow_create`/`workflow_update`; a changed spec needs a new plan approval, on by default) still use the coarse server grant (#671). With `child_may_delegate=true`, workflow cancellation also uses that grant, without run ownership binding.
 > 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself, edit `settings.json`, or read `ephemeral/live/`.
 > 4. **Per-tool MCP enforcement for installed profiles** (#671). Installed profiles ARE now bounded by their creator's recorded delegation ceiling through the same comparison (see [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance)); the remaining gap is the server-level `@cao-mcp-server` grant above.
 

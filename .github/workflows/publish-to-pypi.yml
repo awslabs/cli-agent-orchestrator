@@ -246,7 +246,7 @@ jobs:
       # (`[tool.cibuildwheel] test-command`) installs the wheel and RUNS `cao tui`, so a
       # wheel whose binary is missing, non-executable, or built for the wrong architecture
       # fails HERE rather than on an operator's machine (SR-1).
-      - uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1
+      - uses: pypa/cibuildwheel@f11181315571b24e4a3c67f1a828532793f2df55  # v4.3.2
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
           # See `macos-target` in the matrix: this is what keeps delocate from rejecting a
@@ -350,7 +350,7 @@ jobs:
       - name: Assert the full platform set is present and none is tagged 'any'
         run: python scripts/assert_wheel_matrix.py --dist dist/
 
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
           repository-url: https://test.pypi.org/legacy/
 
@@ -477,9 +477,9 @@ jobs:
 
       # SHA-pinned (SR-2, interview Q10). `release/v1` is a mutable BRANCH, and this action
       # holds the OIDC credential path to PyPI — the highest-consequence supply-chain
-      # exposure in this workflow. dc37677b is the commit that `release/v1` and the v1.14.2
+      # exposure in this workflow. 7245906f is the commit that `release/v1` and the v1.14.3
       # tag both pointed at when this was pinned; verified by dereferencing the annotated tag.
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
 
   # Closes review 5222539218 item 8 on #584. The committed `agent-plugin/cao/mcp.json`
   # pins an exact published version, so the pin can only ever name a release that already

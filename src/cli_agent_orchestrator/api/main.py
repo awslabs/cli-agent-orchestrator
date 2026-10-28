@@ -50,6 +50,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationError,
     ValidationInfo,
     field_validator,
     model_validator,
@@ -74,6 +75,7 @@ from cli_agent_orchestrator.constants import (
     CALLBACK_TERMINAL_ID_ENV,
     CAO_HOME_DIR,
     CORS_ORIGINS,
+    DECISION_RESPONSE_HEADER,
     DEFAULT_PROVIDER,
     HANDOFF_RESULTS_ROUTE,
     INBOX_IMMEDIATE_DELIVERY_WAIT,
@@ -97,6 +99,16 @@ from cli_agent_orchestrator.constants import (
     is_http_origin_allowed,
     is_ws_origin_allowed,
 )
+from cli_agent_orchestrator.decisions.engine import (
+    DelegationRequest,
+    bind_launch,
+    launch_note,
+    prepare_launch,
+)
+from cli_agent_orchestrator.decisions.owner import WORKFLOW_STEP, launch_owner
+from cli_agent_orchestrator.decisions.policy import DecisionInputError
+from cli_agent_orchestrator.decisions.targets import TargetKind, profile_source
+from cli_agent_orchestrator.decisions.types import LaunchPlan
 from cli_agent_orchestrator.ext_apps import mount_widget_static
 from cli_agent_orchestrator.graph.models import GraphView
 from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
@@ -113,6 +125,7 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScope,
     MemoryScopeId,
     MemoryType,
+    recall_wire_dict,
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
@@ -138,6 +151,7 @@ from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
     approval_store,
+    ephemeral_service,
     flow_service,
     manifest_freeze,
     secret_gate,
@@ -261,6 +275,28 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
             logger.exception("Inbox reconciliation daemon error")
 
 
+async def ephemeral_sweep_daemon() -> None:
+    """Background task that collects expired and abandoned ephemeral names (#1079).
+
+    The startup pass runs in the lifespan before requests are served; this loop runs
+    the periodic passes, which keep the bind-to-terminal-insert grace.
+    """
+    logger.info("Ephemeral sweep daemon started")
+    while True:
+        # Read inside the error handling: if this task died, the lifespan shutdown's
+        # await would re-raise and skip every later shutdown step.
+        try:
+            interval = await asyncio.to_thread(ephemeral_service.sweep_interval_seconds)
+        except Exception:
+            logger.exception("Ephemeral sweep daemon error")
+            interval = cast(int, ephemeral_service.EPHEMERAL_DEFAULTS["sweep_interval_seconds"])
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(ephemeral_service.sweep, False)
+        except Exception:
+            logger.exception("Ephemeral sweep daemon error")
+
+
 # Response Models
 class TerminalOutputResponse(BaseModel):
     output: str
@@ -281,7 +317,22 @@ class TerminalOutputRange(BaseModel):
     data: str
 
 
-class CreateTerminalBody(BaseModel):
+def _check_create_delegation(
+    kind: Optional[str], message: Optional[str], initial: Optional[str], initial_type: Optional[str]
+) -> None:
+    if kind is not None:
+        if message is None or initial is not None:
+            raise ValueError("delegation_kind requires delegation_message and no initial_message")
+    elif message is not None and not (initial is not None and initial_type == "assign"):
+        raise ValueError("delegation_message requires delegation_kind or an ASSIGN initial_message")
+
+
+class _CreateMessageBody(BaseModel):
+    initial_message: Optional[str] = None
+    initial_message_orchestration_type: Optional[str] = None
+
+
+class CreateTerminalBody(_CreateMessageBody):
     """Optional JSON body for POST /sessions/{name}/terminals.
 
     Carries the deferred-init message payload OUT of the query string:
@@ -292,8 +343,18 @@ class CreateTerminalBody(BaseModel):
     """
 
     description: Optional[str] = None
-    initial_message: Optional[str] = None
-    initial_message_orchestration_type: Optional[str] = None
+    delegation_message: Optional[str] = Field(default=None, min_length=1)
+    delegation_kind: Optional[Literal["handoff"]] = None
+
+    @model_validator(mode="after")
+    def validate_delegation(self) -> "CreateTerminalBody":
+        _check_create_delegation(
+            self.delegation_kind,
+            self.delegation_message,
+            self.initial_message,
+            self.initial_message_orchestration_type,
+        )
+        return self
 
 
 #: Request keys that name a caller on the create routes. The operator form of
@@ -382,7 +443,7 @@ def _check_metadata_size(metadata: Optional[Dict]) -> Optional[Dict]:
     return metadata
 
 
-class CreateSessionBody(CreateTerminalBody):
+class CreateSessionBody(_CreateMessageBody):
     """Optional JSON body for POST /sessions.
 
     Reuses the terminal-creation message payload and keeps operator-forwarded
@@ -399,6 +460,7 @@ class CreateSessionBody(CreateTerminalBody):
     level, e.g. ``ops_mcp_server/server.py``'s ``_launch_session_impl``).
     """
 
+    description: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
     group: Optional[List[str]] = None
     metadata: Optional[Dict] = None
@@ -436,6 +498,19 @@ class CreateSessionBody(CreateTerminalBody):
     @classmethod
     def validate_metadata(cls, v: Optional[Dict]) -> Optional[Dict]:
         return _check_metadata_size(v)
+
+    delegation_message: Optional[str] = Field(default=None, min_length=1)
+    delegation_kind: Optional[Literal["handoff"]] = None
+
+    @model_validator(mode="after")
+    def validate_delegation(self) -> "CreateSessionBody":
+        _check_create_delegation(
+            self.delegation_kind,
+            self.delegation_message,
+            self.initial_message,
+            self.initial_message_orchestration_type,
+        )
+        return self
 
 
 RESUME_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}\Z")
@@ -719,6 +794,17 @@ class RunStepRequest(BaseModel):
                 f"{info.field_name} must be a 32-character lowercase hex string (e.g. uuid4().hex)"
             )
         return v
+
+    delegation_message: Optional[str] = Field(default=None, min_length=1)
+    orchestration_type: Optional[Literal["handoff"]] = None
+
+    @model_validator(mode="after")
+    def validate_delegation(self) -> "RunStepRequest":
+        if (self.orchestration_type is None) != (self.delegation_message is None):
+            raise ValueError("orchestration_type and delegation_message must travel together")
+        if self.orchestration_type is not None and self.reuse_terminal_id is not None:
+            raise ValueError("delegation fields cannot be combined with reuse_terminal_id")
+        return self
 
 
 class RunStepResponse(BaseModel):
@@ -1569,14 +1655,20 @@ async def lifespan(app: FastAPI):
         deferred_init_recovery_task = asyncio.create_task(
             terminal_service.retry_interrupted_deferred_init_external_owners()
         )
+    from cli_agent_orchestrator.decisions.egress import set_settings_loader
     from cli_agent_orchestrator.decisions.engine import DecisionEngine
     from cli_agent_orchestrator.decisions.registry import DeciderRegistry
-    from cli_agent_orchestrator.decisions.settings import load_settings
+    from cli_agent_orchestrator.decisions.settings import DecisionSettings, load_settings
     from cli_agent_orchestrator.decisions.shadow import ShadowRunner
     from cli_agent_orchestrator.decisions.store import DecisionStore
 
     decision_settings = load_settings(environment=dict(os.environ))
     decision_environment = dict(os.environ)
+
+    def decision_settings_loader() -> DecisionSettings:
+        return load_settings(environment=decision_environment)
+
+    set_settings_loader(decision_settings_loader)
     decision_store = DecisionStore()
     decision_store.sweep()
     decision_registry = DeciderRegistry()
@@ -1589,16 +1681,23 @@ async def lifespan(app: FastAPI):
         decision_registry,
         decision_store,
         decision_runner,
-        settings_loader=lambda: load_settings(environment=decision_environment),
+        settings_loader=decision_settings_loader,
     )
-    logger.info(
-        "Decision states: %s", {p: v.state.value for p, v in decision_settings.points.items()}
-    )
+    # Logs the resolved threshold, timeouts, point states and deciders, then each change.
+    app.state.decision_engine.log_settings(decision_settings)
+    decision_settings_task = asyncio.create_task(app.state.decision_engine.watch_settings())
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry
+
+    # Ephemeral residue (#1079). Awaited, so this pass ends before any request is served
+    # and can collect a launched row whose terminal vanished without waiting the grace.
+    try:
+        await asyncio.to_thread(ephemeral_service.sweep, True)
+    except Exception:  # noqa: BLE001 — never block startup on a maintenance sweep
+        logger.warning("ephemeral startup sweep failed", exc_info=True)
 
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
@@ -1655,6 +1754,7 @@ async def lifespan(app: FastAPI):
     # Start provider-agnostic reconciliation sweep for orphaned PENDING messages
     # the immediate and event-driven status paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
+    ephemeral_sweep_task = asyncio.create_task(ephemeral_sweep_daemon())
 
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
@@ -1733,11 +1833,21 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    # Cancel the periodic ephemeral sweep on shutdown. A pass already running in its
+    # worker thread finishes on its own; each row change is its own transaction.
+    ephemeral_sweep_task.cancel()
+    try:
+        await ephemeral_sweep_task
+    except asyncio.CancelledError:
+        pass
+
     # Stop the pipe-pane liveness watchdog thread (issue #388). It is a plain
     # threading.Thread (not asyncio), so join it directly rather than via
     # asyncio.gather with the tasks above.
     fifo_manager.stop_watchdog()
 
+    decision_settings_task.cancel()
+    await asyncio.gather(decision_settings_task, return_exceptions=True)
     await decision_runner.close()
     await decision_registry.close()
     await registry.teardown()
@@ -2551,9 +2661,16 @@ async def agui_run(
     When ``resume[]`` is non-empty, ``cao:write`` is required (the caller is
     mutating interrupt state). Otherwise ``cao:read`` is the floor.
 
+    After a ``resume[]`` run, ``RUN_FINISHED`` with outcome ``success`` means
+    the decision was delivered to the terminal, not that the agent finished
+    its work. A later permission prompt arrives as an interrupt on the next
+    run.
+
     Returns 501 when the ``ag-ui-protocol`` package is not installed (the
     [agui] optional extra was not included at install time).
     Returns 404 when the AG-UI surface is disabled.
+    Returns 404 when ``resume[]`` is non-empty and no approval bridge exists.
+    Returns 422 when the body is not a valid ``RunAgentInput``.
     """
     _require_agui_enabled()
 
@@ -2570,8 +2687,34 @@ async def agui_run(
             },
         )
 
-    # Parse the body
-    body = await request.json()
+    # Parse the body. An empty or non-JSON body raises JSONDecodeError (a
+    # ValueError); answer 422 json_invalid as FastAPI Body() routes do, not 500.
+    try:
+        body = await request.json()
+    except ValueError as e:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "json_invalid",
+                    "loc": ("body",),
+                    "msg": "invalid JSON body",
+                    "ctx": {"error": str(e)},
+                }
+            ]
+        )
+
+    # Validate before streaming. run_plane_stream builds RunAgentInput inside the
+    # generator, after the 200 has been sent, so an invalid body (for example a
+    # resume[] entry without `status`) would end the stream before RUN_STARTED with
+    # no RUN_ERROR and no 4xx. Reject it here with FastAPI's standard 422 shape.
+    from cli_agent_orchestrator.services.agui.run_plane import RunAgentInput
+
+    try:
+        RunAgentInput.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            [{**err, "loc": ("body", *err["loc"])} for err in e.errors(include_url=False)]
+        )
 
     # Scope escalation: if resume[] is non-empty, require cao:write
     resume_entries = body.get("resume") or []
@@ -2582,8 +2725,14 @@ async def agui_run(
                 detail="cao:write required when resume[] is non-empty",
             )
 
-    # Get approval construct from app state
+    # Get approval construct from app state. Without a bridge nothing can process
+    # resume[], so refuse it as the REST resume route does instead of reporting success.
     bridge = getattr(app.state, "approval_bridge", None)
+    if resume_entries and bridge is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval bridge not initialized",
+        )
     approval_construct = bridge.construct if bridge is not None else None
 
     # Build the snapshot function
@@ -2602,18 +2751,6 @@ async def agui_run(
                 pass
         return build_dashboard_snapshot(sessions, terminals, list(_scopes))
 
-    # Build the bus subscription function
-    async def _bus_events():
-        from cli_agent_orchestrator.services.sse_bus import get_bus
-
-        sse_bus = get_bus()
-        sub = sse_bus.register(overflow_close=True)
-        try:
-            async for event in sse_bus.drain(sub):
-                yield event
-        finally:
-            sse_bus.unregister(sub)
-
     from fastapi.responses import StreamingResponse
 
     from cli_agent_orchestrator.services.agui.run_plane import (
@@ -2624,12 +2761,13 @@ async def agui_run(
     accept_header = request.headers.get("accept")
     content_type = get_run_plane_content_type(accept_header)
 
+    # No bus: the fleet SseBus never ends, and a stock AG-UI client completes a
+    # run only when the body ends. Live fleet activity is GET /agui/v1/stream.
     return StreamingResponse(
         run_plane_stream(
             input_data=body,
             approval_construct=approval_construct,
             snapshot_fn=_fleet_snapshot,
-            bus_subscribe_fn=_bus_events,
             accept=accept_header,
         ),
         media_type=content_type,
@@ -3638,9 +3776,38 @@ async def uninstall_agent_plugin(
     return outcome.to_dict()
 
 
+def _launch_options(plan: LaunchPlan | None) -> dict[str, Any]:
+    return {"launch_plan": plan} if plan is not None else {}
+
+
+def _claimed_ephemeral(agent_profile: str | None, claim_id: str | None) -> bool:
+    # A claimed ephemeral launch has its own decision path, so delegation sites skip it.
+    # A claim on an installed profile claims nothing, so that launch is routed as usual.
+    return claim_id is not None and profile_source(agent_profile) is TargetKind.EPHEMERAL
+
+
+def _bind_unlaunched(plan: LaunchPlan | None) -> None:
+    if plan is not None:
+        try:
+            bind_launch(plan, launch_status="not_launched")
+        except Exception:
+            logger.warning("Decision launch cleanup bind failed", exc_info=True)
+
+
+def _set_launch_note(response: Response, plan: LaunchPlan | None) -> None:
+    if plan is not None:
+        try:
+            note = launch_note(plan)
+            if note:
+                response.headers[DECISION_RESPONSE_HEADER] = note
+        except Exception:
+            logger.warning("Decision response header could not be built", exc_info=True)
+
+
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     request: Request,
+    response: Response,
     background_tasks: BackgroundTasks,
     agent_profile: str,
     provider: Optional[str] = None,
@@ -3715,6 +3882,7 @@ async def create_session(
     # enforced by CreateSessionBody's own field_validators above — invalid
     # values fail Pydantic body parsing and FastAPI returns 422 automatically,
     # before this function body ever runs.
+    launch_plan: LaunchPlan | None = None
     try:
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
@@ -3753,13 +3921,34 @@ async def create_session(
 
         if lookup_only and not idempotency_key:
             raise ValueError("lookup_only requires an idempotency_key")
-        # Optional arguments are passed only when set, so the ordinary create
-        # call stays byte-identical for every existing caller (review on PR #773).
+        # Passed only when set, so the ordinary create call stays
+        # byte-identical for every existing caller (review on PR #773).
         optional_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
-        if body and "description" in body.model_fields_set:
-            optional_kwargs["description"] = body.description
+        launch_provider = provider
+        if body and body.delegation_message is not None and not lookup_only:
+            decision_provider = provider
+            if decision_provider is None:
+                decision_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+            launch_provider = decision_provider
+            launch_plan = await prepare_launch(
+                DelegationRequest(
+                    kind="handoff" if body.delegation_kind else "assign",
+                    provider=decision_provider,
+                    agent_profile=agent_profile,
+                    model=model,
+                    message=body.delegation_message,
+                    use_worktree=use_worktree,
+                    owner=launch_owner("create_session", body),
+                    target_kind=profile_source(agent_profile),
+                )
+            )
+        description_options: Dict[str, Any] = (
+            {"description": body.description}
+            if body and "description" in body.model_fields_set
+            else {}
+        )
         result = await session_service.create_session(
-            provider=provider,
+            provider=launch_provider,
             agent_profile=agent_profile,
             session_name=session_name,
             working_directory=working_directory,
@@ -3775,6 +3964,8 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            **description_options,
+            **_launch_options(launch_plan),
             caller_ceiling=body.caller_ceiling if body else None,
             **optional_kwargs,
         )
@@ -3849,6 +4040,7 @@ async def create_session(
 
             background_tasks.add_task(_spawn_sidecar)
 
+        _set_launch_note(response, launch_plan)
         return result
 
     except IdempotencyKeyNotFound as e:
@@ -3873,6 +4065,8 @@ async def create_session(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except EphemeralPolicyError as e:
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DecisionInputError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except DelegationCeilingError as e:
         # The created terminal would hold tools its caller may not delegate; an
         # authorization refusal, not a bad request or a missing resource.
@@ -3889,6 +4083,9 @@ async def create_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create session: {str(e)}",
         )
+
+    finally:
+        _bind_unlaunched(launch_plan)
 
 
 @app.get("/sessions")
@@ -3991,6 +4188,7 @@ async def delete_session(
 )
 async def create_terminal_in_session(
     request: Request,
+    response: Response,
     session_name: str,
     agent_profile: str,
     provider: Optional[str] = None,
@@ -4050,6 +4248,7 @@ async def create_terminal_in_session(
     terminal has since been torn down is stale, not conflicting, and simply
     creates fresh.
     """
+    launch_plan: LaunchPlan | None = None
     try:
         validate_tmux_name(session_name, "session_name")
         if model is not None:
@@ -4127,6 +4326,24 @@ async def create_terminal_in_session(
         # Passed only when set, so the ordinary create call stays
         # byte-identical for every existing caller (review on PR #773).
         lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
+        if (
+            body
+            and not lookup_only
+            and body.delegation_message is not None
+            and not _claimed_ephemeral(agent_profile, claim_id)
+        ):
+            launch_plan = await prepare_launch(
+                DelegationRequest(
+                    kind="handoff" if body.delegation_kind else "assign",
+                    provider=resolved_provider,
+                    agent_profile=agent_profile,
+                    model=model,
+                    message=body.delegation_message,
+                    use_worktree=use_worktree,
+                    owner=launch_owner("create_terminal_in_session", body),
+                    target_kind=profile_source(agent_profile),
+                )
+            )
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -4146,7 +4363,9 @@ async def create_terminal_in_session(
             idempotency_key=idempotency_key,
             **lookup_kwargs,
             claim_id=claim_id,
+            **_launch_options(launch_plan),
         )
+        _set_launch_note(response, launch_plan)
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
@@ -4179,6 +4398,8 @@ async def create_terminal_in_session(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except EphemeralPolicyError as e:
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DecisionInputError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except DelegationCeilingError as e:
         # The requested allowed_tools (client string or profile resolution)
         # exceed what the caller_id row may delegate: 403, before the generic
@@ -4196,6 +4417,9 @@ async def create_terminal_in_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create terminal: {str(e)}",
         )
+
+    finally:
+        _bind_unlaunched(launch_plan)
 
 
 @app.post(
@@ -4825,6 +5049,7 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
 )
 async def run_step(
     request: Request,
+    response: Response,
     background_tasks: BackgroundTasks,
     body: RunStepRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -5055,6 +5280,7 @@ async def run_step(
             ),
         )
 
+    launch_plan: LaunchPlan | None = None
     try:
         # The branch sits AFTER the generation fence and BEFORE ``run_agent_step``,
         # and both directions are load-bearing (BR-1). After the fence: a
@@ -5146,6 +5372,28 @@ async def run_step(
                 )
             # EXECUTE falls through — the step runs normally.
 
+        owner = launch_owner("run_step", body)
+        if (
+            body.reuse_terminal_id is None
+            and not _claimed_ephemeral(body.agent, body.claim_id)
+            and (body.orchestration_type is not None or owner == WORKFLOW_STEP)
+        ):
+            launch_plan = await prepare_launch(
+                DelegationRequest(
+                    kind="handoff",
+                    provider=body.provider,
+                    agent_profile=body.agent,
+                    model=body.model,
+                    message=(
+                        body.delegation_message
+                        if body.delegation_message is not None
+                        else body.prompt
+                    ),
+                    use_worktree=body.use_worktree,
+                    owner=owner,
+                    target_kind=profile_source(body.agent),
+                )
+            )
         result = await run_agent_step(
             provider=body.provider,
             agent=body.agent,
@@ -5171,6 +5419,7 @@ async def run_step(
             use_worktree=body.use_worktree,
             job_id=job_id,
             claim_id=body.claim_id,
+            **_launch_options(launch_plan),
             caller_ceiling=body.caller_ceiling,
             # Script-tier step: bounded by the ceiling of the terminal that started
             # the run, read from the live ScriptRunRecord the generation-fenced run
@@ -5198,6 +5447,7 @@ async def run_step(
         # Persisting only after this call returns would run after the terminal
         # (the only other copy of the result) has already been torn down,
         # contradicting the "persist result, then tear down" requirement.
+        _set_launch_note(response, launch_plan)
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
@@ -5323,6 +5573,10 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DecisionInputError as e:
+        _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except DelegationCeilingError as e:
         # The step's worker would hold tools the caller may not delegate.
         # Nothing ran; 403 with the message naming parent, child and tools.
@@ -5347,6 +5601,9 @@ async def run_step(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to run step: {str(e)}",
         )
+
+    finally:
+        _bind_unlaunched(launch_plan)
 
 
 # =============================================================================
@@ -6483,7 +6740,10 @@ async def submit_workflow_run_endpoint(
                 # Called inside the lambda, not passed to to_thread as a value, so the
                 # call-site lint (test_callsite_lint_rules rule 4) can see the keyword.
                 guard = await asyncio.to_thread(
-                    lambda: launch_guard.capture(profile_set=frozen.profile_set)
+                    lambda: launch_guard.capture(
+                        profile_set=frozen.profile_set,
+                        root_identity=frozen.root_identity,
+                    )
                 )
             except approval_gate.PlanIdentityUnavailableError as exc:
                 capture_error = exc
@@ -8017,6 +8277,7 @@ async def resume_workflow_run_endpoint(
     would re-execute the very step the operator asked to skip, silently.
     """
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+    from cli_agent_orchestrator.services.launch_guard import PlanInputsChangedError
 
     decisions = body.decisions if body is not None else None
 
@@ -8061,6 +8322,17 @@ async def resume_workflow_run_endpoint(
             # a fact about the plan, and the operator's next action is completely different.
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail=_approval_refusal_detail(e)
+            )
+        except PlanInputsChangedError as e:
+            # issue #827 criterion 2's resume gate (ask 3 on PR #1051). 409 with the SAME
+            # ``plan_inputs_changed`` kind the agent-step route uses at ``/terminals/run-step``,
+            # because it is the same refusal about the same record -- a client that already handles
+            # one needs no new branch for the other. This route had no arm for this error, so before
+            # this it would have fallen through: not to the 400 below (``PlanInputsChangedError`` is
+            # deliberately not a ``ValueError``) but out of the handler entirely, as a kind-less 500.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"message": str(e), "kind": "plan_inputs_changed"},
             )
         except workflow_service.ResumeNotAllowedError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
@@ -9114,19 +9386,9 @@ async def internal_memory_recall(
         sort_by=body.sort_by,
         include_related=body.include_related,
     )
-    return {
-        "memories": [
-            {
-                **memory.model_dump(mode="json"),
-                **(
-                    {"lifecycle_status": memory.lifecycle_status}
-                    if memory.lifecycle_status is not None
-                    else {}
-                ),
-            }
-            for memory in memories
-        ]
-    }
+    # One serializer for both recall surfaces (this route and the MCP
+    # memory_recall tool); see models/memory.py.
+    return {"memories": [recall_wire_dict(memory) for memory in memories]}
 
 
 @app.post("/internal/memory/forget")
@@ -10004,6 +10266,19 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
+    # Mirror --agents-dir above: export the resolved values so cao_server_env()
+    # (read by the MCP-env forwarding in utils/mcp_resolution.py) sees this
+    # launch's actual address, not whatever CAO_API_HOST/PORT happened to be
+    # set to (or left at the 9889 default) before these flags were applied.
+    # An IPv4 wildcard bind is not a usable client address, so agents are
+    # pointed at loopback instead. "::" is left unmapped: asyncio binds an
+    # IPv6-only listener for it, loopback (127.0.0.1) can't reach that
+    # listener, and CAO_API_BASE_URL can't express an IPv6 host either, so
+    # there is no address this code could forward that would actually work.
+    if args.host:
+        os.environ["CAO_API_HOST"] = "127.0.0.1" if args.host == "0.0.0.0" else args.host
+    if args.port:
+        os.environ["CAO_API_PORT"] = str(port)
     # The lifespan records this port in the server lock's diagnostics (#406).
     app.state.server_port = port
     # Extend the CORS allowlist so a custom --host/--port still permits

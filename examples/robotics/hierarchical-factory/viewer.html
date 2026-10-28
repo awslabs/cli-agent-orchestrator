@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<!--
+  Live view of the hierarchical factory simulation.
+  Served read-only by the controller (demo.py serve) on 127.0.0.1 only.
+  It polls state (the controller's observe() output) and draws a top-down
+  map of the floor with the Open Duck Mini robots, and the agent team: the
+  supervisor, the three team managers, and their robot teams.
+  No external assets: it works offline, with no CDN and no build step.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hierarchical factory - live view</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --edge: #2b333d; --ink: #e6edf3;
+    --muted: #9aa7b2; --amber: #d29922; --green: #2ea043; --red: #da3633;
+    --accent: #388bfd; --violet: #a371f7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 18px; border-bottom: 1px solid var(--edge); background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  .badges { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+  .badge {
+    font-size: 12px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--edge); color: var(--muted); white-space: nowrap;
+  }
+  .badge.on  { color: #0d1117; background: var(--green); border-color: transparent; }
+  .badge.off { color: #0d1117; background: var(--amber); border-color: transparent; }
+  .badge.stop{ color: #fff;     background: var(--red);   border-color: transparent; }
+  main { display: grid; grid-template-columns: 1fr 380px; height: calc(100vh - 54px); }
+  #stage { position: relative; min-width: 0; display: flex; flex-direction: column; }
+  svg { width: 100%; flex: 1; display: block; min-height: 0; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; padding: 8px 18px 12px; color: var(--muted); font-size: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+  aside {
+    border-left: 1px solid var(--edge); background: var(--panel);
+    overflow-y: auto; padding: 14px 14px 24px;
+  }
+  aside h2 {
+    font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--muted); margin: 18px 0 8px; font-weight: 650;
+  }
+  aside h2:first-child { margin-top: 0; }
+  .layer { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 10px 0 4px; }
+  .agent {
+    display: flex; gap: 10px; align-items: flex-start; padding: 9px 10px;
+    border: 1px solid var(--edge); border-radius: 8px; margin-bottom: 8px;
+    background: #0e141b; transition: border-color .15s, box-shadow .15s;
+  }
+  .agent.manager { margin-left: 18px; }
+  .agent.acting {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent), 0 0 14px -2px var(--accent);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 1px var(--accent), 0 0 10px -3px var(--accent);} 50% { box-shadow: 0 0 0 1px var(--accent), 0 0 20px 0 var(--accent);} }
+  .agent.recent { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
+  .agent.blocked { border-color: var(--red); box-shadow: 0 0 0 1px var(--red); }
+  .dot { width: 12px; height: 12px; border-radius: 3px; margin-top: 3px; flex: none; }
+  .agent .body { flex: 1; min-width: 0; }
+  .agent .who { font-weight: 600; display: flex; gap: 8px; align-items: center; }
+  .agent .role { color: var(--muted); font-size: 12px; }
+  .agent .act { font-size: 12.5px; margin-top: 2px; }
+  .agent .act.live { color: var(--accent); font-weight: 600; }
+  .agent .act.recent { color: var(--amber); font-weight: 600; }
+  .agent .act.blocked { color: #ff7b72; font-weight: 600; }
+  .bar { height: 6px; border-radius: 3px; background: #222a33; margin-top: 6px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--green); }
+  .robots { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+  .st { margin-left: auto; font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; }
+  .st.running, .st.forming, .st.accepted { color:#0d1117; background: var(--accent); }
+  .st.starved, .st.ready { color:#0d1117; background: var(--amber); }
+  .st.done, .st.finished { color:#0d1117; background: var(--green); }
+  .st.blocked, .st.rejected, .st.failed, .st.interrupted { color:#fff; background: var(--red); }
+  .st.idle { color: var(--muted); border: 1px solid var(--edge); }
+  .log { font-size: 12.5px; }
+  .log .row { display: flex; gap: 8px; padding: 4px 0; border-bottom: 1px dashed var(--edge); }
+  .log .op { font-weight: 600; white-space: nowrap; }
+  .muted { color: var(--muted); }
+  .conn { font-size: 12px; }
+  text { font-family: ui-sans-serif, system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hierarchical factory <span class="muted" style="font-weight:400">· live view</span></h1>
+  <div class="badges" id="badges"></div>
+</header>
+<main>
+  <div id="stage">
+    <svg id="svg" preserveAspectRatio="xMidYMid meet"></svg>
+    <div class="legend">
+      <span><span class="sw" style="background:#9e9ea8"></span>raw part</span>
+      <span><span class="sw" style="background:#e61f80"></span>machined part</span>
+      <span><span class="sw" style="background:#802edb"></span>assembled unit</span>
+      <span><span class="sw" style="background:#26d94d;border-radius:50%"></span>robot works</span>
+      <span><span class="sw" style="background:#ffb81a;border-radius:50%"></span>robot waits</span>
+      <span><span class="sw" style="background:#f21a1a;border-radius:50%"></span>robot blocked</span>
+    </div>
+  </div>
+  <aside>
+    <h2>The organization</h2>
+    <div id="agents"></div>
+    <h2>Action log <span class="muted" id="logcount"></span></h2>
+    <div class="log" id="log"></div>
+    <h2>Connection</h2>
+    <div class="conn muted" id="conn">connecting to the controller&hellip;</div>
+  </aside>
+</main>
+<script>
+const SVGNS = "http://www.w3.org/2000/svg";
+// The colors of the MuJoCo render: one strong color for each team, in scene order.
+const TEAM = ["#1f52e6", "#148c33", "#e06b14", "#8040d9"];
+const STAGE = { raw: "#9e9ea8", machined: "#e61f80", assembled: "#802edb" };
+const LAMP = { working: "#26d94d", waiting: "#ffb81a", blocked: "#f21a1a" };
+const WAITING = ["idle", "waiting", "starved"];
+const ROLE = {
+  serial: "runs a queue: one part at a time, one pace",
+  parallel: "runs two parallel assembly lines",
+  formation: "runs a formation: spin, turn, run to the dock",
+};
+const RECENT_MS = 4000;
+
+function el(tag, attrs = {}, parent = null) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// Describe, in plain words, what a command does.
+function describe(cmd) {
+  const a = cmd.arguments || [];
+  if (cmd.operation === "form_team") return `form the ${a[0]}`;
+  if (cmd.operation === "start_line") return `run ${a[0]} parts at ${a[1]} s`;
+  if (cmd.operation === "start_shipping") return `ship ${a[0]} units, batch ${a[1]}: ${a.slice(2).join(", ")}`;
+  if (cmd.operation === "set_pace") return `set the pace to ${a[0]} s`;
+  return cmd.operation;
+}
+
+// Pictures of the Open Duck Mini, inlined by the controller: one for each team
+// color ("team0", "team1", ...) and "blocked". They face left.
+const SPRITES = __ROBOT_SPRITES__;
+const SPRITE_ASPECT = 66 / 120;
+
+// One robot: its picture standing on its position, the state lamp on its head,
+// the part on its back, and a short arrow for its heading.
+function robotIcon(parent, teamIndex, robot, carrying, x, y, unit) {
+  const g = el("g", {}, parent);
+  const blocked = robot.state === "blocked";
+  const lamp = blocked ? LAMP.blocked : WAITING.includes(robot.state) ? LAMP.waiting : LAMP.working;
+  const h = 0.62 * unit, w = h * SPRITE_ASPECT;
+  const heading = robot.heading_deg * Math.PI / 180;
+  const right = Math.cos(heading) > 0;
+  el("ellipse", { cx: x, cy: y, rx: w * 0.55, ry: w * 0.18, fill: "#000", "fill-opacity": .35 }, g);
+  const ax = x + Math.cos(heading) * w * 0.9, ay = y - Math.sin(heading) * w * 0.9;
+  el("line", { x1: x, y1: y, x2: ax, y2: ay, stroke: lamp, "stroke-width": 2.5, "stroke-linecap": "round" }, g);
+  const href = SPRITES[blocked ? "blocked" : `team${teamIndex}`] || SPRITES.team0;
+  if (href) {
+    const img = el("image", { href, x: x - w / 2, y: y - h, width: w, height: h }, g);
+    if (right) img.setAttribute("transform", `translate(${2 * x} 0) scale(-1 1)`);
+  } else {
+    el("rect", { x: x - w / 2, y: y - h, width: w, height: h, rx: 4, fill: blocked ? "#db1419" : "#ececee" }, g);
+  }
+  el("circle", { cx: x, cy: y - h - 4, r: 5, fill: lamp, stroke: "#0d1117", "stroke-width": 1.2 }, g);
+  if (carrying) {
+    const c = 0.11 * unit;
+    el("rect", { x: x + (right ? -0.3 : 0.3) * w - c / 2, y: y - h * 0.66, width: c, height: c, rx: 2,
+                 fill: STAGE[carrying] || "#ccc", stroke: "#0d1117", "stroke-width": 1 }, g);
+  }
+  return g;
+}
+
+function render(state) {
+  // ---- badges ----
+  const badges = document.getElementById("badges");
+  badges.innerHTML = "";
+  const mk = (txt, cls) => { const b = document.createElement("span"); b.className = "badge " + (cls || ""); b.textContent = txt; badges.appendChild(b); };
+  const places = state.places || {};
+  const scene = state.scene || {};
+  const teams = state.teams || {};
+  const dock = Object.entries(places).find(([n, p]) => !p.capacity && n !== scene.raw_store);
+  mk("run " + (state.run_id || "").slice(0, 8));
+  mk("sim " + (state.simulation_seconds ?? 0).toFixed(1) + "s");
+  if (dock) mk(`${dock[1].parts.length}/${Object.keys(state.parts || {}).length} units at the ${dock[0]}`);
+  if (state.stopped) mk("STOPPED", "stop");
+  else mk(state.motion_approved ? "motion approved" : "motion disabled", state.motion_approved ? "on" : "off");
+
+  const zones = scene.zones || {};
+  const zoneNames = Object.keys(zones);
+  const color = {};
+  zoneNames.forEach((z, i) => { color[z] = TEAM[i % TEAM.length]; });
+
+  // ---- world bounds -> svg transform (flip Y so +y points up) ----
+  let xs = [], ys = [];
+  for (const z of Object.values(zones)) { xs.push(z.bounds[0], z.bounds[2]); ys.push(z.bounds[1], z.bounds[3]); }
+  const pad = 0.5;
+  const minX = Math.min(...xs) - pad, maxX = Math.max(...xs) + pad;
+  const minY = Math.min(...ys) - pad, maxY = Math.max(...ys) + pad;
+  const W = 1000, H = Math.max(360, Math.round(1000 * (maxY - minY) / (maxX - minX || 1)));
+  const sx = x => (x - minX) / (maxX - minX) * W;
+  const sy = y => H - (y - minY) / (maxY - minY) * H;
+  const unit = W / (maxX - minX); // pixels per metre
+
+  const svg = document.getElementById("svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = "";
+
+  for (const [name, z] of Object.entries(zones)) {
+    const [x0, y0, x1, y1] = z.bounds, c = color[name];
+    el("rect", { x: sx(x0) + 3, y: sy(y1) + 3, width: (x1 - x0) * unit - 6, height: (y1 - y0) * unit - 6,
+                 fill: c, "fill-opacity": .1, stroke: c, "stroke-opacity": .55, "stroke-width": 2, rx: 8 }, svg);
+    const label = (scene.teams && scene.teams[name]) ? `${scene.teams[name].label} · ${name}` : name;
+    const t = el("text", { x: sx(x0) + 12, y: sy(y1) + 24, fill: c, "font-size": 16, "font-weight": 700 }, svg);
+    t.textContent = label;
+  }
+  for (const [name, place] of Object.entries(places)) {
+    const xy = scene.places[name].xy, cx = sx(xy[0]), cy = sy(xy[1]);
+    const buffer = !!place.capacity;
+    el("circle", { cx, cy, r: buffer ? 0.18 * unit : 0.3 * unit, fill: buffer ? "#ffb81a" : "#4d4d57", "fill-opacity": buffer ? .35 : .6,
+                   stroke: buffer ? "#ffb81a" : "#8b98a5", "stroke-width": 1.5 }, svg);
+    const t = el("text", { x: cx, y: cy + (buffer ? 0.36 : 0.5) * unit, fill: "#c7d0d9", "font-size": 12.5, "text-anchor": "middle" }, svg);
+    t.textContent = buffer ? `${name} ${place.parts.length}/${place.capacity}` : `${name} ${place.parts.length}`;
+  }
+  // Parts that are not on a robot: in a place, or moving between places.
+  const carried = {};
+  for (const [name, part] of Object.entries(state.parts || {})) {
+    if (part.at && part.at.startsWith("robot:")) { carried[part.at.slice(6)] = part.stage; continue; }
+    if (!part.xy) continue;
+    const half = 0.06 * unit;
+    el("rect", { x: sx(part.xy[0]) - half, y: sy(part.xy[1]) - half, width: 2 * half, height: 2 * half, rx: 2,
+                 fill: STAGE[part.stage] || "#ccc", stroke: "#0d1117", "stroke-width": 1 }, svg);
+  }
+  // Draw the robots from back to front, so that a nearer robot covers a farther one.
+  const robots = [];
+  for (const [zone, team] of Object.entries(teams)) {
+    for (const [name, robot] of Object.entries(team.robots || {})) robots.push([zone, name, robot]);
+  }
+  robots.sort((a, b) => b[2].xy[1] - a[2].xy[1]);
+  for (const [zone, name, robot] of robots) {
+    const x = sx(robot.xy[0]), y = sy(robot.xy[1]);
+    robotIcon(svg, zoneNames.indexOf(zone), robot, carried[name], x, y, unit);
+    const t = el("text", { x, y: y + 0.2 * unit, fill: color[zone], "font-size": 11.5, "text-anchor": "middle", "font-weight": 600 }, svg);
+    t.textContent = name;
+  }
+
+  // ---- the organization: who acts now ----
+  const cmds = (state.commands || []).slice();
+  const nowMs = state.observed_at ? Date.parse(state.observed_at) : Date.now();
+  const recent = {};
+  for (const c of cmds) {
+    if (!c.updated_at) continue;
+    const age = nowMs - Date.parse(c.updated_at);
+    if (age < 0 || age > RECENT_MS) continue;
+    if (!recent[c.actor] || Date.parse(c.updated_at) > Date.parse(recent[c.actor].updated_at)) recent[c.actor] = c;
+  }
+  const statuses = Object.values(teams).map(t => t.status);
+  const paces = cmds.filter(c => c.operation === "set_pace" && c.status === "finished");
+  let supAct, supCls = "";
+  if (state.stopped) supAct = "the operator stopped the run";
+  else if (statuses.length && statuses.every(s => s === "done")) { supAct = "order complete: checking the floor"; supCls = "recent"; }
+  else if (statuses.includes("blocked")) { supAct = "a team is blocked: balancing the line"; supCls = "live"; }
+  else if (paces.length) {
+    const p = paces[paces.length - 1];
+    const label = scene.teams && scene.teams[p.actor] ? scene.teams[p.actor].label : p.actor;
+    supAct = `balanced the line: ${label} at ${p.arguments[0]} s`;
+  } else if (statuses.some(s => s !== "idle")) supAct = "managers assigned: waiting for reports";
+  else supAct = "planning the order";
+
+  const box = document.getElementById("agents");
+  box.innerHTML = `<div class="layer">Agents · layer 1 · strategy</div>`;
+  const card = (cls, dot, who, role, act, actCls, extra) => {
+    const div = document.createElement("div");
+    div.className = "agent " + cls;
+    div.innerHTML = `<span class="dot" style="background:${dot}"></span><div class="body"><div class="who">${who}</div>` +
+      `<div class="role">${role}</div><div class="act ${actCls}">${act}</div>${extra || ""}</div>`;
+    box.appendChild(div);
+  };
+  card(supCls === "live" ? "acting" : supCls, "var(--violet)", "Factory supervisor",
+       "reads the floor, assigns the managers, balances the line", esc(supAct), supCls, "");
+  box.insertAdjacentHTML("beforeend", `<div class="layer">Agents · layer 2 · tactics &nbsp;→&nbsp; their robots (not agents)</div>`);
+  for (const zone of zoneNames) {
+    const team = teams[zone];
+    if (!team) continue;
+    const label = scene.teams[zone].label;
+    const program = team.program;
+    let act, actCls = "", cls = "manager";
+    if (team.status === "blocked") { act = `blocked for ${program.blocked_for_seconds.toFixed(0)} s: output buffer ${team.output} is full`; actCls = "blocked"; cls += " blocked"; }
+    else if (recent[zone]) { act = `${team.status === "forming" || recent[zone].status !== "finished" ? "▶ " : "just "}${esc(describe(recent[zone]))}`; actCls = recent[zone].status === "finished" ? "recent" : "live"; cls += actCls === "live" ? " acting" : " recent"; }
+    else if (team.status === "starved") act = `waiting for parts from ${team.input}`;
+    else if (team.status === "running") act = team.cycle_seconds ? `working at ${team.cycle_seconds} s` : "shipping";
+    else if (team.status === "done") act = "done: report sent to the supervisor";
+    else if (team.status === "ready") act = `in ${team.formation} formation`;
+    else act = team.status;
+    const done = program ? program.output : 0, target = program ? program.target : 0;
+    const states = Object.entries(team.robots).map(([n, r]) => `${n} ${r.state}`).join(" · ");
+    const extra = (program ? `<div class="bar"><div style="width:${target ? 100 * done / target : 0}%"></div></div>` +
+      `<div class="robots">${done}/${target} out` + (program.avg_output_interval_seconds ? ` · every ${program.avg_output_interval_seconds} s` : "") +
+      ` · blocked ${program.blocked_seconds.toFixed(0)} s · starved ${program.starved_seconds.toFixed(0)} s</div>` : "") +
+      `<div class="robots">${esc(states)}</div>`;
+    card(cls, color[zone], `${esc(label)} manager <span class="st ${team.status}">${team.status}</span>`,
+         `${zone} zone · ${ROLE[team.kind] || team.kind}`, act, actCls, extra);
+  }
+
+  // ---- action log (newest first) ----
+  cmds.sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
+  const log = document.getElementById("log");
+  log.innerHTML = "";
+  for (const c of cmds.slice(0, 40)) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const who = scene.teams && scene.teams[c.actor] ? `${scene.teams[c.actor].label} manager` : c.actor;
+    row.innerHTML = `<span class="op">${esc(who)}</span>` +
+      `<span class="muted">${esc(describe(c))}${c.reason ? " · " + esc(c.reason) : ""}</span>` +
+      `<span class="st ${c.status}">${c.status}</span>`;
+    log.appendChild(row);
+  }
+  document.getElementById("logcount").textContent = cmds.length ? `(${cmds.length})` : "";
+}
+
+let fails = 0;
+async function poll() {
+  const conn = document.getElementById("conn");
+  try {
+    const r = await fetch("state", { cache: "no-store" });  // page-relative: keeps a proxy path prefix
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+    fails = 0;
+    conn.textContent = "live · updated " + new Date().toLocaleTimeString();
+    conn.classList.remove("muted");
+  } catch (e) {
+    fails++;
+    conn.classList.add("muted");
+    conn.textContent = `waiting for the controller (${e.message})` + (fails > 1 ? ` ×${fails}` : "");
+  }
+}
+poll();
+setInterval(poll, 350);
+</script>
+</body>
+</html>

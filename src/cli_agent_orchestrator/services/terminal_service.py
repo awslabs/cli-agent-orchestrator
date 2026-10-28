@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from pydantic import ValidationError
@@ -60,6 +60,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    terminal_id_in_use,
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
@@ -105,6 +106,7 @@ from cli_agent_orchestrator.providers.base import (
 )
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
+    KiroCapabilityError,
     KiroPhase0KASError,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
@@ -154,6 +156,10 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_terminal_id,
     generate_window_name,
 )
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
 
 logger = logging.getLogger(__name__)
 
@@ -288,9 +294,25 @@ TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
 CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 
 
-def resolve_launch_model(model: Optional[str], profile: Optional[AgentProfile]) -> Optional[str]:
+def _bind_decision_launch(plan: "LaunchPlan | None", **values: Any) -> None:
+    if plan is not None:
+        try:
+            from cli_agent_orchestrator.decisions.engine import bind_launch
+
+            bind_launch(plan, **values)
+        except Exception:
+            logger.warning("Decision launch bind failed", exc_info=True)
+
+
+def resolve_launch_model(
+    model: Optional[str], profile: Optional[AgentProfile], launch_plan: "LaunchPlan | None" = None
+) -> Optional[str]:
     """Resolve the model CAO passes to a provider for this launch."""
-    return model or (profile.model if profile else None)
+    return (
+        model
+        or (launch_plan.model if launch_plan else None)
+        or (profile.model if profile else None)
+    )
 
 
 # Track terminals that have already received memory injection (first message only).
@@ -428,9 +450,10 @@ class _SyncInitWaiter:
 
 
 # terminal_id -> waiter, only for keyed synchronous creates whose row is
-# committed but whose initialization has not settled yet. Entries remove
-# themselves on settle; a replay that arrives afterwards sees either a ready
-# terminal (success) or no row at all (failed create, rolled back).
+# committed but whose initialization has not settled yet. create_terminal's
+# finally block removes the entry once the create call exits; a replay that
+# arrives afterwards sees either a ready terminal (success) or no row at all
+# (failed create, rolled back).
 _pending_sync_inits: Dict[str, _SyncInitWaiter] = {}
 
 # True when the most recent create_terminal call in this context returned a
@@ -500,6 +523,10 @@ def inject_memory_context(
 
     try:
         if remote_memory_url():
+            # The operator's local kill switch (#1071) is enforced inside
+            # memory_context_for_terminal itself, which is the single choke
+            # point shared by this call, the frozen-replay path, and the
+            # three provider memory plugins — so there is nothing to check here.
             context = memory_context_for_terminal(
                 terminal_id,
                 task_description=first_message[:200],
@@ -1160,6 +1187,37 @@ def _request_fingerprint(
     ).hexdigest()
 
 
+# A single 32-bit draw is already unlikely to repeat; ten fresh draws after a
+# collision are effectively conclusive. The cap matters for a broken generator
+# (or a test double pinned to one value): fail with a clear error instead of
+# spinning, and before any backend resource is allocated against the id.
+_TERMINAL_ID_ALLOCATION_ATTEMPTS = 10
+
+
+def _allocate_terminal_id() -> str:
+    """Draw a terminal id no live terminal or retained record still references.
+
+    ``generate_terminal_id`` alone is not enough (issue #1088): an id is only
+    unique among CURRENT registry rows, and both idempotency mappings and
+    inbox messages outlive a deleted terminal by ``RETENTION_DAYS``. Reusing
+    one of those ids misroutes a retry or a queued message into the new
+    terminal, so redraw before any resource is keyed off it.
+    """
+    for _ in range(_TERMINAL_ID_ALLOCATION_ATTEMPTS):
+        candidate = generate_terminal_id()
+        if not terminal_id_in_use(candidate):
+            return candidate
+        logger.warning(
+            "Terminal id %s is still referenced by a live or retained record; redrawing",
+            candidate,
+        )
+    raise RuntimeError(
+        "Could not allocate a terminal id after "
+        f"{_TERMINAL_ID_ALLOCATION_ATTEMPTS} attempts; the generator keeps returning "
+        "ids that live terminals, idempotency mappings, or inbox messages still reference"
+    )
+
+
 @dataclass
 class _EphemeralLaunchState:
     """What the create body bound, for the caller's compensation."""
@@ -1191,6 +1249,7 @@ async def create_terminal(
     lookup_only: bool = False,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
 ) -> Terminal:
@@ -1294,7 +1353,7 @@ async def create_terminal(
             THE FIELD SET IS CLOSED BY ENUMERATION, not by however many review
             rounds happened to run. Every caller-reachable parameter of BOTH
             create endpoints -- ``POST /sessions`` (including everything
-            ``CreateSessionBody`` and its ``CreateTerminalBody`` base carry)
+            ``CreateSessionBody`` and the shared ``_CreateMessageBody`` carry)
             and ``POST /sessions/{name}/terminals`` -- is classified below,
             hashed or excluded-with-a-reason. Adding a parameter to either
             endpoint means classifying it here.
@@ -1319,6 +1378,11 @@ async def create_terminal(
               The delivered payload and its routing, not the terminal: neither
               is persisted on the row, and a genuine retry re-sends the same
               message. These create endpoints do not own the prompt.
+            - ``delegation_message`` and ``delegation_kind``. These never reach
+              this function: the handler converts them into a launch plan that
+              selects a decision, not the terminal's identity. A genuine retry
+              re-sends them. The plan stays outside the fingerprint; a key hit
+              binds its decision rows ``not_launched``, as documented for replay.
             - ``defer_init``. Excluded, and this one was decided against the
               instinct that it looks like identity, because three things check
               out against the code:
@@ -1476,6 +1540,7 @@ async def create_terminal(
             idempotency_key=idempotency_key,
             lookup_only=lookup_only,
             claim_id=claim_id,
+            launch_plan=launch_plan,
             delegating_terminal_id=delegating_terminal_id,
             caller_ceiling=caller_ceiling,
             ephemeral_state=state,
@@ -1513,6 +1578,7 @@ async def _create_terminal_unguarded(
     lookup_only: bool = False,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
     *,
@@ -1650,6 +1716,7 @@ async def _create_terminal_unguarded(
                         ) from waiter.error
                     row = get_terminal(existing_terminal_id)
                 try:
+                    _bind_decision_launch(launch_plan, launch_status="not_launched")
                     terminal = Terminal(**row)
                 except ValidationError as exc:
                     # Re-raised as a non-ValueError so a corrupt STORED row is
@@ -1730,7 +1797,8 @@ async def _create_terminal_unguarded(
         # accepting arbitrary attributes as configuration.
         if profile is not None and not isinstance(profile, AgentProfile):
             profile = None
-        launch_model = resolve_launch_model(model, profile)
+        decision_not_honored = False
+        launch_model = resolve_launch_model(model, profile, launch_plan)
         model_honored = ProviderManager.provider_class(provider).honors_model(
             agent_profile=agent_profile,
             profile=profile,
@@ -1762,7 +1830,20 @@ async def _create_terminal_unguarded(
                 yolo=True,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
-            await asyncio.to_thread(probe, resolved_engine, requested)
+            try:
+                await asyncio.to_thread(probe, resolved_engine, requested)
+            except KiroCapabilityError:
+                if model or launch_plan is None or launch_plan.model is None:
+                    raise
+                launch_model = resolve_launch_model(model, profile)
+                requested = requested_kiro_capabilities(
+                    resolved_engine, model=launch_model, yolo=True
+                )
+                await asyncio.to_thread(probe, resolved_engine, requested)
+                decision_not_honored = True
+                model_honored = ProviderManager.provider_class(provider).honors_model(
+                    agent_profile=agent_profile, profile=profile, requested_model=launch_model
+                )
             if resolved_engine == KiroEngine.KAS:
                 raise KiroPhase0KASError(
                     bool(profile and (profile.allowedTools or profile.toolsSettings))
@@ -2008,7 +2089,7 @@ async def _create_terminal_unguarded(
                     )
 
         # Step 1: Generate unique identifiers
-        terminal_id = generate_terminal_id()
+        terminal_id = _allocate_terminal_id()
         # Registered BEFORE the row (and this key's mapping) can be committed,
         # so there is no window in which a replay finds the row but no waiter.
         if idempotency_key and not defer_init:
@@ -2414,6 +2495,9 @@ async def _create_terminal_unguarded(
         # keeps the tool call under 2s.
         if defer_init:
             shell_command = None  # unknown until initialize() runs
+            launch_options: dict[str, Any] = (
+                {"launch_plan": launch_plan} if launch_plan is not None else {}
+            )
             # Freeze lifecycle ownership while creation inputs are still in
             # hand. A deferred failure may coincide with a database outage, so
             # deciding who owns teardown by re-reading the terminal row later
@@ -2428,6 +2512,7 @@ async def _create_terminal_unguarded(
                 registry,
                 initial_caller_id=caller_id,
                 delete_on_failure=deferred_delete_on_failure,
+                **launch_options,
             )
             # A handful of unit/integration seams patch the private scheduler
             # with a non-Task mock. Production always returns an asyncio.Task;
@@ -2504,6 +2589,14 @@ async def _create_terminal_unguarded(
                 svc.register_terminal(terminal_id, pane_id, is_kiro)
             except Exception as e:
                 logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
+        _bind_decision_launch(
+            launch_plan,
+            terminal_id=terminal.id,
+            model=launch_model,
+            honored=model_honored,
+            launch_status="launched",
+            not_honored=decision_not_honored,
+        )
         if sync_init_waiter is not None:
             sync_init_waiter.settle()
         return terminal
@@ -2511,6 +2604,14 @@ async def _create_terminal_unguarded(
     except Exception as e:
         if sync_init_waiter is not None:
             sync_init_waiter.settle(e)
+        # A delegation-ceiling refusal (#948, Steps 0c/0d) is raised before
+        # anything is allocated: the launch was refused, not attempted.
+        _bind_decision_launch(
+            launch_plan,
+            launch_status=(
+                "not_launched" if isinstance(e, DelegationCeilingError) else "launch_failed"
+            ),
+        )
         if not isinstance(e, ephemeral_service.EphemeralPolicyError):
             logger.error(f"Failed to create terminal: {e}")
         # Everything this call built is torn down by ONE owned operation
@@ -3892,6 +3993,7 @@ def _schedule_deferred_init(
     *,
     initial_caller_id: Optional[str] = None,
     delete_on_failure: bool | None = None,
+    launch_plan: "LaunchPlan | None" = None,
 ) -> asyncio.Task | None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via dispatch_input.
@@ -4068,6 +4170,7 @@ def _schedule_deferred_init(
                             "Deferred init for %s: provider entered ERROR after task delivery.",
                             terminal_id,
                         )
+                        _bind_decision_launch(launch_plan, launch_status="launch_failed")
                         await _surface_deferred_init_failure(
                             terminal_id,
                             kind="provider_error_after_delivery",
@@ -4082,6 +4185,7 @@ def _schedule_deferred_init(
                         )
                         return
                 if not started:
+                    _bind_decision_launch(launch_plan, launch_status="launch_failed")
                     logger.error(
                         "Deferred init for %s: worker never started after "
                         "resubmits; task not delivered.",
@@ -4186,7 +4290,11 @@ def _schedule_deferred_init(
                 registry,
                 delete_worker=False,
             )
+        except asyncio.CancelledError:
+            _bind_decision_launch(launch_plan, launch_status="launch_failed")
+            raise
         except Exception as e:
+            _bind_decision_launch(launch_plan, launch_status="launch_failed")
             # exc_info=True preserves the traceback for debugging; {e!r} avoids
             # newline/control-character injection into logs and the inbox message
             # (the exception text can contain provider-supplied content).

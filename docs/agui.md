@@ -247,12 +247,27 @@ The **run plane** is the `POST /agui/v1/run` endpoint. It speaks the stock
 `EventEncoder`. This is what CopilotKit, the AG-UI Dojo, and other stock AG-UI
 clients expect.
 
-A client POSTs a `RunAgentInput` (threadId, runId, optional resume[]) and
-receives a lifecycle-legal stream: `RUN_STARTED` then `STATE_SNAPSHOT` then live
-projection frames (`STATE_DELTA`, `STEP_STARTED/FINISHED`, `TOOL_CALL_START/END`,
-`CUSTOM`) then `RUN_FINISHED`. If open approval interrupts exist, the stream
-closes with a `RUN_FINISHED` whose outcome is `{type: "interrupt", interrupts: [...]}`,
-and the client re-POSTs with a `resume[]` array to resolve them.
+A client POSTs a `RunAgentInput` (required: `threadId`, `runId` and `messages`,
+where an empty array is valid; optional: `resume[]`) and
+receives a lifecycle-legal stream: `RUN_STARTED`, then `STATE_SNAPSHOT`, then
+`RUN_FINISHED`. The response body ends right after `RUN_FINISHED` (or
+`RUN_ERROR`), because a stock AG-UI client completes a run only when the body
+ends. If open approval interrupts exist, the outcome is
+`{type: "interrupt", interrupts: [...]}`, and the client re-POSTs with a
+`resume[]` array to resolve them. Each entry is
+`{interruptId, status: "resolved" | "cancelled", payload: {approved: bool} | {editedArgs}}`;
+`status` is required, `cancelled` is treated as a deny, and a body that is not a
+valid `RunAgentInput` is rejected with HTTP 422 before the stream starts. A
+non-empty `resume[]` gets HTTP 404 when the server has no approval bridge (the
+AG-UI surface was off when it started), as `POST /agui/v1/interrupts/{id}/resume`
+does. Once `resume[]` is delivered and nothing is
+left pending, the outcome is `{type: "success"}`. That means the decision
+reached the agent, not that the agent finished. If the agent prompts again, the
+next run returns the new interrupt. `messages[]` is not read. Live fleet
+activity (`STATE_DELTA`, `STEP_STARTED/FINISHED`, `TOOL_CALL_START/END`,
+`CUSTOM`) is on the ambient plane, `GET /agui/v1/stream`. Embedders that call
+`run_plane_stream` directly can still inject an event source to project it
+inside a run.
 
 The run plane requires the `[agui]` optional extra (`ag-ui-protocol` package).
 Without it the endpoint returns HTTP 501.
@@ -336,7 +351,14 @@ Human-in-the-loop approval lifecycle:
 - `pending()`: list of unresolved interrupts
 
 **Interrupt options** derive from the classified reason (permission_request gets
-approve/deny/edit; trust_prompt gets approve/deny).
+approve/deny/edit; trust_prompt gets approve/deny). `claude-code:permission_request`
+gets approve/deny only: Claude Code's permission dialog is a selector with no text
+field, so typed edit text cannot reach the agent. An `edit` decision on it is
+refused (422 on the REST route, `RUN_ERROR` on the run plane) before anything is
+typed, and the interrupt stays pending. If an approve or deny delivery for the
+same interrupt is already in flight, a later `edit` joins it instead and returns
+that decision's outcome, which names the delivered decision; nothing is typed for
+the edit.
 
 ### Subclass extension points
 

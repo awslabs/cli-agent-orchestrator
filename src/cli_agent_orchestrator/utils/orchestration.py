@@ -36,6 +36,7 @@ from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     CALLBACK_TERMINAL_ID_ENV,
     CALLBACK_URL_ENV,
+    DECISION_RESPONSE_HEADER,
     DEFAULT_PROVIDER,
     DISCOVERY_TOOL_MARKER,
 )
@@ -904,6 +905,22 @@ def _require_claim(name: str, claim: Optional[EphemeralClaim]) -> None:
         raise ValueError("Ephemeral targets cannot be launched without a claim.")
 
 
+def _decision_response_sink(notes: list[str]) -> Callable[[requests.Response], None]:
+    def capture(response: requests.Response) -> None:
+        try:
+            value = response.headers.get(DECISION_RESPONSE_HEADER)
+            if isinstance(value, str) and value:
+                notes.append(value)
+        except Exception:
+            logger.warning("Decision response header could not be read")
+
+    return capture
+
+
+def _append_decision_note(message: str, notes: list[str]) -> str:
+    return message + "; " + notes[-1] if notes else message
+
+
 def _create_terminal(
     agent_profile: str,
     working_directory: Optional[str] = None,
@@ -918,6 +935,10 @@ def _create_terminal(
     lookup_only: bool = False,
     claim: Optional[EphemeralClaim] = None,
     description: Optional[str] = None,
+    *,
+    delegation_message: Optional[str] = None,
+    delegation_kind: Optional[str] = None,
+    response_sink: Optional[Callable[[requests.Response], None]] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -1090,6 +1111,12 @@ def _create_terminal(
                     else str(initial_message_orchestration_type)
                 )
 
+        if delegation_message:
+            json_body = json_body or {}
+            json_body["delegation_message"] = delegation_message
+            if delegation_kind is not None:
+                json_body["delegation_kind"] = delegation_kind
+
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
             params=params,
@@ -1169,6 +1196,12 @@ def _create_terminal(
                     else str(initial_message_orchestration_type)
                 )
 
+        if delegation_message:
+            json_body = json_body or {}
+            json_body["delegation_message"] = delegation_message
+            if delegation_kind is not None:
+                json_body["delegation_kind"] = delegation_kind
+
         response = requests.post(
             f"{API_BASE_URL}/sessions",
             params=params,
@@ -1179,6 +1212,8 @@ def _create_terminal(
         response.raise_for_status()
         terminal = response.json()
 
+    if response_sink is not None:
+        response_sink(response)
     return terminal["id"], provider
 
 
@@ -1553,6 +1588,8 @@ async def _run_step_and_build_result(
     start_time: float,
     base_url: str = API_BASE_URL,
     target_host: Optional[str] = None,
+    *,
+    response_sink: Optional[Callable[[requests.Response], None]] = None,
 ) -> HandoffResult:
     """POST ``payload`` to ``/terminals/run-step`` and map the response to a HandoffResult.
 
@@ -1704,6 +1741,8 @@ async def _run_step_and_build_result(
             success=False, message=msg, rule=rule, output=None, terminal_id=resolved_tid
         )
 
+    if response_sink is not None:
+        response_sink(response)
     data = response.json()
     terminal_id = data.get("terminal_id", known_terminal_id)
     # A 200 must carry last_message; surface a malformed body as a failure
@@ -1763,6 +1802,9 @@ def _create_handoff_terminal(
     idempotency_key: str,
     description: Optional[str] = None,
     claim: Optional[EphemeralClaim] = None,
+    delegation_message: Optional[str] = None,
+    delegation_kind: Optional[str] = None,
+    response_sink: Optional[Callable[[requests.Response], None]] = None,
 ) -> Tuple[str, str]:
     """Synchronously create handoff's worker, retrying a client timeout.
 
@@ -1793,6 +1835,9 @@ def _create_handoff_terminal(
                 create_timeout=synchronous_create_timeout(agent_profile),
                 idempotency_key=idempotency_key,
                 description=description,
+                delegation_message=delegation_message,
+                delegation_kind=delegation_kind,
+                response_sink=response_sink,
                 **claim_kwargs,
             )
         except requests.exceptions.Timeout as exc:
@@ -2034,6 +2079,7 @@ async def _handoff_impl(
             terminal_id=None,
         )
 
+    notes: list[str] = []
     claim: Optional[EphemeralClaim] = None
     try:
         claim = _claim_ephemeral(
@@ -2112,6 +2158,9 @@ async def _handoff_impl(
                 "job_id": job_id,
                 "description": normalize_description(description, truncate=True),
             }
+            if message:
+                payload["orchestration_type"] = "handoff"
+                payload["delegation_message"] = message
             if ctx.session_name:
                 payload["session_name"] = ctx.session_name
             if ctx.caller_id:
@@ -2128,7 +2177,7 @@ async def _handoff_impl(
                 payload["engine"] = engine
             if model and model.strip():
                 payload["model"] = model
-            return await _run_step_and_build_result(
+            result = await _run_step_and_build_result(
                 payload,
                 agent_profile,
                 provider,
@@ -2136,7 +2185,11 @@ async def _handoff_impl(
                 start_time,
                 base_url=base_url,
                 target_host=target_host,
+                response_sink=_decision_response_sink(notes),
             )
+            if result.success:
+                result.message = _append_decision_note(result.message, notes)
+            return result
 
         # Early-terminal-id path: create SYNCHRONOUSLY first (waits out
         # provider-ready server-side, same wait the default path's own create
@@ -2172,6 +2225,9 @@ async def _handoff_impl(
                 use_worktree=use_worktree,
                 idempotency_key=create_key,
                 description=description,
+                delegation_message=message,
+                delegation_kind="handoff",
+                response_sink=_decision_response_sink(notes),
                 **claim_kwargs,
             )
         except _HandoffCreateUnresolved as unresolved:
@@ -2216,11 +2272,14 @@ async def _handoff_impl(
             _send_direct_input_handoff(terminal_id, provider, message)
             return HandoffResult(
                 success=True,
-                message=(
-                    f"Handed off to {agent_profile} ({provider}); not waiting for completion "
-                    f"(--no-wait). Check on it with `cao agent status {terminal_id}`, read its "
-                    f"result with `cao agent result {terminal_id}`, or free it with "
-                    f"`cao agent cancel --delete {terminal_id}`."
+                message=_append_decision_note(
+                    (
+                        f"Handed off to {agent_profile} ({provider}); not waiting for completion "
+                        f"(--no-wait). Check on it with `cao agent status {terminal_id}`, read its "
+                        f"result with `cao agent result {terminal_id}`, or free it with "
+                        f"`cao agent cancel --delete {terminal_id}`."
+                    ),
+                    notes,
                 ),
                 output=None,
                 terminal_id=terminal_id,
@@ -2275,6 +2334,8 @@ async def _handoff_impl(
                     terminal_id,
                     cleanup.get("message"),
                 )
+        if result.success:
+            result.message = _append_decision_note(result.message, notes)
         return result
 
     except _ClaimRefused as exc:
@@ -2323,6 +2384,7 @@ def _assign_remote(
     callback_url: Optional[str] = None,
     remote_session_name: Optional[str] = None,
     description: Optional[str] = None,
+    delegation_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create an assign worker on a REMOTE CAO node (one-agent-per-pod topology).
 
@@ -2419,19 +2481,24 @@ def _assign_remote(
     if model is not None:
         params["model"] = model
 
+    notes: list[str] = []
+    payload: Dict[str, Any] = {
+        "description": normalize_description(description, truncate=True),
+        "initial_message": worker_message,
+        "initial_message_orchestration_type": OrchestrationType.ASSIGN.value,
+        "env_vars": {
+            CALLBACK_URL_ENV: advertised_url.rstrip("/"),
+            CALLBACK_TERMINAL_ID_ENV: current_terminal_id,
+        },
+        "caller_ceiling": caller_ceiling,
+    }
+    if delegation_message:
+        payload["delegation_message"] = delegation_message
+
     response = requests.post(
         f"{base_url}/sessions",
         params=params,
-        json={
-            "description": normalize_description(description, truncate=True),
-            "initial_message": worker_message,
-            "initial_message_orchestration_type": OrchestrationType.ASSIGN.value,
-            "env_vars": {
-                CALLBACK_URL_ENV: advertised_url.rstrip("/"),
-                CALLBACK_TERMINAL_ID_ENV: current_terminal_id,
-            },
-            "caller_ceiling": caller_ceiling,
-        },
+        json=payload,
         headers=_auth_headers_for(base_url) or None,
         timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
     )
@@ -2446,6 +2513,7 @@ def _assign_remote(
             "target_host": target_host,
             "message": f"Assignment failed on node {target_host}: {detail}",
         }
+    _decision_response_sink(notes)(response)
     data = response.json()
     terminal_id = data["id"]
     session_name = data.get("session_name")
@@ -2483,7 +2551,7 @@ def _assign_remote(
         "success": True,
         "terminal_id": terminal_id,
         "target_host": target_host,
-        "message": message_text,
+        "message": _append_decision_note(message_text, notes),
     }
     if session_name:
         result["session_name"] = session_name
@@ -2519,6 +2587,8 @@ def _assign_impl(
     callback_url: Optional[str] = None,
     remote_session_name: Optional[str] = None,
     description: Optional[str] = None,
+    *,
+    delegation_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -2544,6 +2614,8 @@ def _assign_impl(
     if refusal:
         return {"success": False, "terminal_id": None, "message": refusal}
 
+    canonical_message = message if delegation_message is None else delegation_message
+    notes: list[str] = []
     terminal_id: Optional[str] = None
     claim: Optional[EphemeralClaim] = None
     try:
@@ -2586,6 +2658,7 @@ def _assign_impl(
                 callback_url=callback_url,
                 remote_session_name=remote_session_name,
                 description=description,
+                delegation_message=canonical_message,
             )
 
         # Compose the message the worker will see once it is ready. We do
@@ -2621,18 +2694,23 @@ def _assign_impl(
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,
             use_worktree=use_worktree,
+            delegation_message=canonical_message,
+            response_sink=_decision_response_sink(notes),
             **claim_kwargs,
         )
 
         return {
             "success": True,
             "terminal_id": terminal_id,
-            "message": (
-                f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
-                f"Worker is initializing in the background; your task will be "
-                f"delivered once it is ready. "
-                f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
-                + _get_cleanup_nudge()
+            "message": _append_decision_note(
+                (
+                    f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
+                    f"Worker is initializing in the background; your task will be "
+                    f"delivered once it is ready. "
+                    f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
+                    + _get_cleanup_nudge()
+                ),
+                notes,
             ),
         }
 

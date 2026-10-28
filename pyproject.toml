@@ -3,7 +3,7 @@ name = "cli-agent-orchestrator"
 version = "2.5.4"
 description = "CLI Agent Orchestrator"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [
     { name = "AWS Labs" },
@@ -14,7 +14,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -34,6 +33,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
+    # CVE-2026-114605: dnspython comes in via fastmcp -> pydantic[email] -> email-validator,
+    # and only 2.9.0 is fixed. The lock pins it; this floor holds for pip installs too.
+    "dnspython>=2.9.0",
     "fastapi>=0.104.0",
     # Upper bound: ext_apps/sep2133.advertise_capability monkey-patches a FastMCP
     # internal (create_initialization_options); cap the major to avoid silent
@@ -197,12 +199,12 @@ path = "scripts/hatch_build_tui_tag.py"
 # ---------------------------------------------------------------------------------------
 [tool.cibuildwheel]
 # ONE wheel per platform, not one per Python version. The wheel contains a Rust binary and
-# pure Python — no CPython C extension — so it is ABI-independent and a single cp310 build
-# per platform serves 3.10 through 3.14. cibuildwheel then reuses that wheel for the other
+# pure Python — no CPython C extension — so it is ABI-independent and a single cp311 build
+# per platform serves 3.11 through 3.14. cibuildwheel then reuses that wheel for the other
 # interpreters via find_compatible_wheel() (util/packaging.py:145), which matches on the
 # `py3` interpreter tag and the platform, so the reused wheel is still TESTED on each.
 # Building 5 identical wheels per platform would just be 5x the CI minutes.
-build = "cp310-*"
+build = "cp311-*"
 
 # Trim the build set to the architectures we actually ship and test. Left at the default
 # `auto`, Linux would also attempt i686 and macOS could produce universal2 — platforms no
@@ -397,7 +399,7 @@ dev = [
 
 [tool.black]
 line-length = 100
-target-version = ['py310']
+target-version = ['py311']
 
 [tool.isort]
 profile = "black"
@@ -448,7 +450,7 @@ line_length = 100
 # ---------------------------------------------------------------------------------------
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 # F821 (undefined name) and F822 (undefined name in __all__) are the inverse of F401.
@@ -482,7 +484,7 @@ target-version = "py310"
 select = ["F401", "F821", "F822", "F841"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

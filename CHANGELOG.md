@@ -7,6 +7,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Hierarchical robot factory example** (`examples/robotics/hierarchical-factory/`): a
+  simulation-only factory floor in MuJoCo, run by four CAO agents in two layers. A supervisor assigns
+  three team managers with `assign`; each manager runs its own team of Open Duck Mini robots (a serial
+  queue of 3, two parallel assembly lines, and a 4-robot formation that spins, turns, and runs to the
+  dock) through scoped MCP tools and reports with `send_message`; the supervisor balances the line when
+  a team blocks. Per-team credentials; managers hold only `@cao-mcp-server/send_message`, so CAO
+  refuses them `assign` and `handoff`. A loopback-only controller with a read-only live view, operator
+  stop, recorded frames and a GIF, a pinned and hash-checked download of the Open Duck Mini model, and
+  a `Robotics factory example` CI workflow. No CAO core change.
+
+- **Breaking: CAO now requires Python 3.11 or later** (CVE-2026-114605). dnspython, which CAO pulls in
+  through fastmcp, pydantic and email-validator, fixes CVE-2026-114605 (HIGH) only in 2.9.0, and 2.9.0
+  requires Python 3.11. Python 3.10 reached end-of-life on 2026-10-01. `requires-python` is now `>=3.11`,
+  release wheels build on `cp311`, and CI no longer tests 3.10. On Python 3.10, keep using the current
+  release or upgrade the interpreter. The docusaurus lock also moves `qs` to 6.17.0 (CVE-2026-110816), and
+  its override floor is now `^6.16.1`.
+
+- **`POST /agui/v1/run` refuses a `resume[]` it cannot process** (#1107 follow-up). When the server
+  started with the AG-UI surface off and it was turned on later, no approval bridge exists, so the run
+  skipped every `resume[]` entry and still reported `RUN_FINISHED` `success`. The route now answers
+  HTTP 404 "Approval bridge not initialized", as `POST /agui/v1/interrupts/{id}/resume` does. A run
+  without `resume[]` is unchanged. The documented request bodies now include the required `messages`
+  and the AG-UI 1.0 resume entry shape, and the docs no longer say the run plane streams live frames.
+
+- **`POST /agui/v1/run` now ends its response after `RUN_FINISHED`** (#1106, ag-ui-protocol/ag-ui#2216). A
+  run with nothing pending, or one whose `resume[]` resolved the last pending interrupt, used to stay
+  open forever. The route handed the run plane the whole-fleet SSE bus, which never ends, and nothing
+  in that loop could finish the run. A stock AG-UI client completes a run only when the body ends, so
+  `runAgent()` never resolved. The route no longer passes the fleet bus. Every run now ends with
+  `RUN_STARTED`, `STATE_SNAPSHOT`, then `RUN_FINISHED` (`interrupt` while approvals are pending,
+  otherwise `success`) or `RUN_ERROR`. After `resume[]`, `success` means the decision was delivered,
+  not that the agent finished; a later prompt surfaces as an interrupt on the next run. Live fleet
+  activity stays on `GET /agui/v1/stream`. `RunAgentInput.messages` is still not read.
+
+- **Claude Code 2.1.310 tool-permission prompts are detected as `WAITING_USER_ANSWER`** (#1106; related:
+  #405). Bash "Do you want to proceed?" and Write "Do you want to create <file>?" dialogs now render
+  the footer `Esc to cancel · Tab to amend`, which no existing pattern matched, so the terminal stayed
+  `processing`: no AG-UI interrupt was raised and inbox delivery could type into the dialog. The new
+  pattern arm is anchored to the same-line `·` chrome, so completed prose that mentions the phrases does
+  not match. Fixtures are real `tmux capture-pane` frames from 2.1.310 under `--permission-mode default`.
+
+- **A plan approval now names the working directory it was granted for, not just its path** (#827,
+  #1000). A path is not an identity. Move a non-Git working directory away, put a different directory
+  at the same path, and every value the plan identifier recorded was byte-identical, so the
+  replacement ran under the first directory's approval. A non-Git root now contributes its device and
+  inode (`st_dev`, `st_ino`) to the `plan_id` and to the per-run launch guard: the next run of a root
+  that was moved or renamed away and replaced, or whose path now carries a different mount, is refused
+  until re-approved, and a root swapped that way while a run is in flight stops that run's next agent
+  step with `plan_inputs_changed`. This does NOT catch a directory deleted and created again at the
+  same path: ext4 and XFS reuse the inode number just freed, so the recreated directory can get the
+  same pair back and keeps the approval, the same as a rewrite of its contents does — recorded under
+  "What an approval does not cover" in `docs/workflows.md`, with a stronger identity tracked in #1050.
+  A Git root's `plan_id` is deliberately unchanged, because its
+  identity is the commit plus the worktree digest, so two checkouts in the same state still share one
+  approval. Where the filesystem supplies no usable inode (some network mounts, container overlays,
+  Windows volumes with no file index), CAO falls back to the previous path-only identity rather than
+  refusing the run, and records the fallback instead of skipping it: the manifest carries
+  `repo_baseline.root_identity.bound: false` with a closed reason, the server logs that reason with no
+  path, and the unbound marker is part of the `plan_id`, so the weaker binding is visible in the
+  identifier an operator approves.
+
+- **A Git working directory replaced under a live run is now caught too, with no change to any Git
+  `plan_id`** (#827, #1051). A Git root's identity is its commit plus worktree digest, which settles
+  the case across runs — a different checkout at the same path is a different plan. It does not settle
+  it *within* a run: nothing recomputes the `plan_id` once a run is admitted, so `git worktree remove`
+  followed by `git worktree add <same path> <other branch>` during a long step, or a re-clone at the
+  path, left the script running in the old directory while every later terminal started by path inside
+  the replacement checkout, under the original approval, with nothing refusing it. The per-run launch
+  guard now records the device and inode for either kind of root, from the same single `stat` the
+  identifier used. That pair never reaches `plan_id`, so **Git identifiers do not move and existing
+  Git approvals stay valid.** A run admitted before this change carries no pair for a Git root and
+  keeps launching its remaining steps unchecked.
+
+- **A resume verifies the working directory before it re-drives anything** (#827, #1051). The root
+  comparison lived at agent launch, so a resumed run reached it only when it started a *new* agent
+  step: the script code before that step ran in the replacement directory, and a resume whose
+  remaining agent steps were all replays ran to completion there. Resume admission now does the same
+  comparison, after the approval gate and **before** the generation bump and before any recovery
+  decision is written, so a refused resume changes nothing and leaves a still-live process for that
+  run alone. `POST /workflows/runs/{run_id}/resume` answers `409` with
+  `{"kind": "plan_inputs_changed"}`, the same shape the agent-step route already returns; it
+  previously had no arm for this refusal. A resume whose directory never moved is unaffected, and so
+  is a run admitted before the root binding existed.
+
+- **A removed working directory gets its own refusal instead of being called a replacement** (#1051).
+  A bound root that is deleted, or whose `stat` fails with `EACCES`/`ESTALE`, could not be shown to be
+  the approved directory, so the guard refused — correctly — but under the "the directory at that path
+  has been replaced; start a new run" text. Starting a new run in a path that does not exist then
+  fails with `422`. The two states now say different things, and the refusal for a missing root tells
+  the operator to restore it.
+
+- **Breaking / migration:** every plan whose working directory is outside Git gets a new identifier
+  and is refused once, until re-approved under it (#827). The `plan-v2` scheme is not bumped: the
+  field set is unchanged and the root identity is new content inside the existing repository-baseline
+  field. Plans in a Git working directory keep their existing identifiers. A run already admitted and
+  left resumable keeps launching its steps, because a `launch-guard-v2` record written before the
+  binding carries no root identity and is checked without it rather than refused.
+- **Decision points say when a decider keeps failing, and records carry their target kind**
+  (#1067). The server logs one warning when a decider starts failing at a point (`timeout`,
+  `error`, `invalid_answer`, `no_answer` or `decider_unavailable`), at most once a minute for
+  each decider, point and reason, and one line when it answers again. These lines name only
+  the decider, point and reason. The server also logs its resolved threshold, timeouts, point
+  states and deciders at startup and when they change. `cao decisions status` adds
+  `decider_status`: each decider's last outcome, reason and time, and its counts by reason over
+  the last 24 hours, read from the database read-only. `decision_records` gains a nullable
+  `target_kind` column (`installed`, `ephemeral` or `workflow`); existing rows stay null.
+
+- **Ephemeral agents: startup and periodic sweeps, a live-name cap and retention** (#1079).
+  cao-server now collects expired and abandoned ephemeral names. It sweeps once at startup,
+  before serving requests, then every `ephemeral.sweep_interval_seconds` (default 300).
+  A sweep collects pending names past their TTL or whose creator terminal is gone, lapsed
+  claims past their TTL, and launched names with no terminal row. For those, periodic sweeps
+  wait `ephemeral.launch_grace_seconds` (default 600) after the bind; the startup sweep
+  doesn't wait. Claims inside their lease and launched names whose terminal exists are never
+  touched. Failed file deletions are retried. Live files left by a crashed create are deleted
+  under a lock shared with creation, once older than the launch grace. The live-name cap is
+  opt-in: `ephemeral.max_live_per_session` defaults to 0 (no cap), so existing users see no
+  behaviour change. Set it, for example to 32, to cap pending, claimed and launched names per
+  session; a create over the cap is refused with `max_live_exceeded` before anything is
+  written. A create that can't take the store lock is refused with `store_busy` (503), or
+  with `store_lock_unavailable` (503) when the lock is unavailable — for example, no `flock`
+  support, or the lock file can't be created, as on a read-only home. After
+  `ephemeral.retention_days` (default 14), a collected name's archive and then its registry
+  row are deleted, but only once its terminal and live files are gone. Earlier releases kept
+  them forever. All four defaults are provisional, and the feature stays off by default.
+
 - **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
   paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
   terminal still read IDLE, so the sender waited forever and the next message was pasted on top
@@ -67,6 +193,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ephemeral agents (#801) accept an explicit `effort` and apply `ephemeral.default_effort` and `ephemeral.max_effort` (Claude Code `--effort`, Codex `model_reasoning_effort`).
+
+- Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim. `auto` still refuses.
+
 - `POST /sessions` and `POST /sessions/{session_name}/terminals` accept
   `lookup_only=true` with an `idempotency_key`: the request returns the terminal
   that key already committed, without waiting for it to initialize and without
@@ -84,6 +214,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
   run-step transport does not yet receive that credential; subprocess credential delivery
   remains a separate security-boundary decision.
+
+### Changed
+
+- `examples/aidlc-portfolio`: `question answer` now requires a packet-bound, single-use
+  `--approval-id` instead of `--answered-by`; removed `learning approve` / `learning reconcile`
+  and `memory refresh` / `inspect` / `clean` in favor of `learning propose` / `list` /
+  `promote` / `reject`, with promotion recorded against a CAO memory entry. `dispatch check`
+  no longer returns memory baseline revisions, and learning proposals now record promotion
+  metadata instead of `baseRevision`. CAO resolves project memory per terminal, so runners
+  cannot recall the supervisor's scope: the new `dispatch message` renders the runner
+  assignment with the promoted learnings that apply to it, from the supervisor's own
+  `memory_recall`, and `learning promote` now requires the `--memory-key` that `memory_store`
+  returned (#936).
 
 - Opt-in non-accessing inspection for CLI memory list/show and HTTP GET
   memory views. Agent recall still reinforces access counts; repeated
@@ -157,10 +300,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained. There is no background sweep, so keep the feature disabled outside testing.
   The live files and archive can be deleted by exact path while no ephemeral
   terminal exists. Reserved names also refuse remote placement with
-  `remote_placement_not_allowed`. Explicit tiers and efforts temporarily refuse
-  with `tier_not_supported` / `effort_not_supported`; `auto` requires the decision
-  platform. Tier and effort policy keys are not applied yet, so `max_tier` sets
-  no ceiling.
+  `remote_placement_not_allowed`. `auto` still requires the decision platform.
 - Advanced CodeQL analysis for same-repository and fork pull requests, with
   Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
   weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
@@ -176,7 +316,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cao session status`, and the ops MCP `get_terminal_status` and
   `get_session_info` return both fields; `list_siblings` and the delegation
   tool results are unchanged (#810)
-- launch-decision platform, not yet wired: `model.route` (`small`/`medium`/
+- launch-decision platform: `model.route` (`small`/`medium`/
   `large`) and `effort.route` (`low`/`medium`/`high`), each `off`, `shadow` or
   `on`, all off by default. Deciders register under the `cao.deciders`
   entry-point group; the built-in `fixed_table` looks a tier up by profile,
@@ -185,7 +325,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table (a keyed message hash, never the task text), kept 90 days. Operators
   control it through `cao decisions`, `cao-server --decision`, the
   `CAO_DECISION_*` variables and the ops MCP decision tools; the agent-facing
-  MCP server has none. No delegation calls it yet, so launches are unchanged.
+  MCP server has none. Assign, handoff, elastic assign and CLI handoff that
+  omit a model ask `model.route`; an explicit model always wins. In on mode
+  their result notes the model that ran, carried in the optional
+  `X-CAO-Decision` response header, and agent tool definitions are unchanged.
+  With every point off, launches are unchanged. See `docs/decisions.md` (#810)
+- `cao decisions off` turns every decision point off, including a running
+  server's environment and startup-flag overrides, and waits up to the shadow
+  timeout plus five seconds for in-flight external decider requests to finish;
+  if they don't, it exits non-zero and the halt stays. An installed external
+  decider must send only while holding `decisions.egress.egress_permit`, which
+  refuses during the halt. `cao decisions enable|disable|show <name>` run the
+  decider package's own consent, revoke and status commands, and `cao
+  decisions status` shows the halt and each installed decider's version and
+  kind without importing it. Ops MCP gains `decisions_off` and cannot grant
+  consent. Core still bundles only `fixed_table` and makes no external call.
   See `docs/decisions.md` (#810)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
@@ -231,6 +385,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Ephemeral profiles explicitly omit the inherited skill catalog while keeping named skill
+  loading available. Every live-profile load verifies the parsed bytes against the registry
+  hash and fails closed on missing or modified data, including claim-less launches and provider
+  reloads. `workflow_cancel` now requires `ephemeral.child_may_delegate` for ephemeral callers;
+  the guide also reflects terminal-target binding for MCP messaging, answers and deletion (#801).
+
+- Antigravity CLI workers no longer report under another worker's terminal id.
+  Every `agy` process starts every server in the shared
+  `~/.gemini/config/mcp_config.json`, and each worker's entry pinned its
+  `CAO_TERMINAL_ID`. So a reviewer assigned while its developer was alive also
+  ran the developer's `cao-mcp-server`, and its `send_message` could reach the
+  supervisor labelled with the developer's id. Entries now carry no identity:
+  `cao-mcp-server` takes `CAO_TERMINAL_ID` from the `agy` process environment,
+  workers with the same server config share one entry (owners listed under
+  `caoTerminalIds`), and leftover per-terminal entries are removed at the next
+  launch (#940).
+- Script-run frozen memory now uses the memory gateway, so a configured remote memory owner
+  supplies the same context as live terminals instead of freezing stale local memory. A journal
+  read failure for a known script run now withholds memory with a warning instead of falling back
+  to live, unfrozen memory; non-script runs keep their existing fallback. A memory resolution error
+  now gives the step no memory with a warning, as on the live path, instead of failing it. This
+  includes a local read error and a remote owner that is unreachable, errors, or has memory
+  disabled (#828).
+- Context injection with a configured remote memory owner now honours the operator's local
+  memory switch. The switch was only checked on the local curated path and on the
+  frozen-replay path (#828); with a remote owner configured and the switch off, a live
+  terminal's first message, and the Claude Code/Codex/Kiro CLI provider-config-file memory
+  plugins, still called out to the owner and injected its block. The check now sits in
+  `memory_gateway.memory_context_for_terminal`, the single choke point all five callers
+  (the first-message path, the frozen-replay path, and the three provider plugins) go
+  through, so the owner is no longer called at all for context injection when the switch is
+  off; it is unreachable, not merely unused (#1071).
 - Every client call that creates a session or terminal synchronously (`cao launch` without
   `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
   `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
@@ -346,7 +532,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so `handoff` and workflow steps tore the worker down about 2s after sending the
   task. A `●` line whose ellipsis is followed by the spinner's status in
   parentheses (a running hook, the elapsed time, the token count or `thinking`)
-  is now treated as a live spinner, whatever the message before it (#908).
+  is now treated as a live spinner, whatever the message before it (#908). A
+  finished response that reports its own timing — `● Done. The fix is in place…
+  (3m 12s)` with the end-of-turn summary under it — is the same text, so both
+  detectors now look for a spinner only on the newest conversation row above the
+  input box, instead of holding the worker at processing until the step timed
+  out (#974). Blank rows, box chrome, the rows a wrapped chrome line continues
+  onto, and the status area Claude Code draws under the spinner — the task
+  list's indented checkbox rows and queued messages — are not conversation: one
+  shared walker skips them on the way up, so a `⎿ Tip:` line that wrapped in a
+  narrow pane, a task list or a queued message under the spinner cannot hide it
+  and report a working agent as completed either. The same scope stops a
+  response bullet in the bottom rows from reading as a spinner.
 
 - `store_lesson` no longer decides the learning gate, authorizes itself, or opens
   SQLite inside the agent's process. It writes through a new `POST /lessons`
@@ -876,6 +1073,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of spinning on a cancelled task and never exiting (#823)
 
 ### Changed
+
+- Ephemeral settings (#801): `ephemeral.max_tier`, `default_tier`, `max_effort`, `default_effort` and the `model_tiers` table are now validated, not ignored with a warning. A ceiling without a default, an invalid value, or a table missing a required mapping refuses every ephemeral create and claim with `policy_config_error:<key>`. Explicit `model_tier` and `effort` no longer refuse with `tier_not_supported`/`effort_not_supported`, and the 'not applied yet' notes and create warning are removed.
 
 - A plain (non-Git) directory is now an approvable plan, keyed by its canonical path.
 

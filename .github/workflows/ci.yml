@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     steps:
       - name: Checkout code
@@ -151,8 +151,8 @@ jobs:
       #
       # WHY HERE and not in `Unit Tests`: the property under test is Python-version
       # independent (does hatchling's `[tool.hatch.build] artifacts` glob cover the whole
-      # web_ui/ build output), so running it on 3.10/3.11/3.12 would assert the same thing
-      # three times and build the web UI three times to do it. It also keeps the repo's
+      # web_ui/ build output), so running it on 3.11/3.12 would assert the same thing
+      # twice and build the web UI twice to do it. It also keeps the repo's
       # primary test gate free of an npm-registry dependency. Follows the `CAO MCP Apps`
       # job's existing in-file pattern: a Node build plus setup-uv/uv sync plus targeted
       # pytest files.
@@ -163,12 +163,12 @@ jobs:
       # in means naming it in this step too.
       #
       # test_hatch_artifacts_guard.py is listed alongside it, but is NOT dependent on this
-      # job: it never skips, so `Unit Tests` already runs it on 3.10/3.11/3.12. It is named
+      # job: it never skips, so `Unit Tests` already runs it on 3.11/3.12. It is named
       # here because this is the only job where `web_ui/` exists on disk, which is the only
       # place its whole-directory wheel assertion can cover THAT root rather than skipping it.
       # =================================================================================
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -367,10 +367,10 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Check code formatting with black
-        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
+        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/ examples/robotics/hierarchical-factory/ examples/skills/
 
       - name: Check import sorting with isort
-        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
+        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/robotics/hierarchical-factory/ examples/skills/
 
       # The dead-code gate (#1005). BLOCKING, like the mypy ratchet step below:
       # the selected rules (F401 unused import, F841 unused local, F821/F822
@@ -891,7 +891,7 @@ jobs:
           exit-code: '0'
 
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v3
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v3
         # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL finding
         # would fail the scan step and SKIP the upload, hiding the very finding that failed
         # the build from the Security tab.

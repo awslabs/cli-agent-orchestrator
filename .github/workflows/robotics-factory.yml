@@ -1,0 +1,45 @@
+name: Robotics factory example
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'examples/robotics/hierarchical-factory/**'
+      - 'src/cli_agent_orchestrator/schemas/agent_profile.schema.json'
+      # The setup tests read these CAO sources to check the provider lists.
+      - 'src/cli_agent_orchestrator/models/provider.py'
+      - 'src/cli_agent_orchestrator/utils/enforcement.py'
+      - '.github/workflows/robotics-factory.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'examples/robotics/hierarchical-factory/**'
+      - 'src/cli_agent_orchestrator/schemas/agent_profile.schema.json'
+      # The setup tests read these CAO sources to check the provider lists.
+      - 'src/cli_agent_orchestrator/models/provider.py'
+      - 'src/cli_agent_orchestrator/utils/enforcement.py'
+      - '.github/workflows/robotics-factory.yml'
+
+permissions:
+  contents: read
+
+env:
+  UV_LOCKED: "1"
+
+jobs:
+  simulator:
+    name: Factory simulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "examples/robotics/hierarchical-factory/uv.lock"
+      - name: Run the factory simulation, MCP boundary, and setup tests
+        working-directory: examples/robotics/hierarchical-factory
+        run: uv run --locked --python "${{ matrix.python-version }}" pytest

@@ -352,7 +352,7 @@ def test_extension_root_merges_mcp_without_overriding_explicit_terminal_id(tmp_p
         patch("cli_agent_orchestrator.providers.omp.load_agent_profile", return_value=profile),
         patch(
             "cli_agent_orchestrator.providers.omp.resolve_mcp_server_config",
-            side_effect=lambda config, persisted: config,
+            side_effect=lambda config, persisted, name=None: config,
         ) as resolve,
     ):
         parts = shlex.split(provider._build_omp_command())
@@ -526,13 +526,43 @@ def test_extension_serializes_model_config_and_status_unknown_paths(tmp_path, mo
 
     with patch(
         "cli_agent_orchestrator.providers.omp.resolve_mcp_server_config",
-        side_effect=lambda config, persisted: config,
+        side_effect=lambda config, persisted, name=None: config,
     ):
         provider._write_extension_root({"model": mcp_model})
 
     assert mcp_model.model_dump.called
     assert provider.get_status("unrecognized OMP text") == TerminalStatus.UNKNOWN
     assert provider.get_idle_pattern_for_log().startswith("^\\s*in:")
+
+
+def test_write_extension_root_bundled_server_gains_this_cao_address(tmp_path, monkeypatch):
+    """P3-2: OMP is resolver-routed (``_write_extension_root`` calls
+    ``resolve_mcp_server_config``) but was only covered through the resolver's
+    own unit tests, not at the provider level."""
+    monkeypatch.setattr("cli_agent_orchestrator.providers.omp.CAO_HOME_DIR", tmp_path)
+    monkeypatch.setenv("CAO_API_PORT", "9899")
+    monkeypatch.delenv("CAO_API_HOST", raising=False)
+    monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+    provider = make_provider()
+    extension_dir = provider._write_extension_root(
+        {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+    )
+    manifest = json.loads((Path(extension_dir) / ".mcp.json").read_text())
+    assert manifest["mcpServers"]["cao-mcp-server"]["env"]["CAO_API_PORT"] == "9899"
+
+
+def test_write_extension_root_default_cao_is_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr("cli_agent_orchestrator.providers.omp.CAO_HOME_DIR", tmp_path)
+    for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    provider = make_provider()
+    extension_dir = provider._write_extension_root(
+        {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+    )
+    manifest = json.loads((Path(extension_dir) / ".mcp.json").read_text())
+    assert manifest["mcpServers"]["cao-mcp-server"]["env"] == {
+        "CAO_TERMINAL_ID": provider.terminal_id
+    }
 
 
 def test_extracts_unterminated_final_block_and_cleanup_tolerates_removal_errors(tmp_path):

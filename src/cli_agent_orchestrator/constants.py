@@ -1236,3 +1236,6 @@ WORKFLOW_SCRIPT_SCRATCH_DIR = CAO_HOME_DIR / "workflow-script-scratch"  # 0o700 
 TERMINAL_METADATA_MAX_BYTES = 16 * 1024  # encoded (json.dumps) size cap
 TERMINAL_GROUP_MAX_ELEMENTS = 16
 TERMINAL_GROUP_ELEMENT_MAX_LEN = 128
+
+# Optional launch evidence carried in delegation responses.
+DECISION_RESPONSE_HEADER = "X-CAO-Decision"

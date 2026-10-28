@@ -70,7 +70,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 
 | Job | Runs | Blocking? |
 |-----|------|-----------|
-| **Unit Tests** (3.10 / 3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-report=term-missing` | **Yes** |
+| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-report=term-missing` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
 | **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check src/ test/ examples/`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all four; the mypy step's `continue-on-error` was removed in issue #1005) |
 | **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |
@@ -152,6 +152,7 @@ pins this table to the workflow files.
 | **Test Codex CLI Provider** (`test-codex-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, **any** of its `test/providers/test_<provider>_*.py` tests (globbed since #1005 — it used to be one hardcoded filename) or fixtures, `pyproject.toml`, or the workflow | **Yes** |
 | **Test Kiro CLI Provider** (`test-kiro-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, **any** of its `test/providers/test_<provider>_*.py` tests (globbed since #1005 — it used to be one hardcoded filename) or fixtures, `pyproject.toml`, or the workflow | **Yes** |
 | **Robotics transport example** (`robotics-transport.yml`) | `Transport simulator` | only PRs touching the cross-zone transport example, agent-profile schema, CAO provider list, or the workflow | **Yes** — real MuJoCo and authenticated MCP tests; locally, `uv --directory examples/robotics/cross-zone-transport run --locked pytest` |
+| **Robotics factory example** (`robotics-factory.yml`) | `Factory simulator` | only PRs touching the hierarchical factory example, agent-profile schema, CAO provider list, or the workflow | **Yes** — real MuJoCo and authenticated MCP tests; locally, `uv --directory examples/robotics/hierarchical-factory run --locked pytest` |
 | **Docs site** (`gh-pages.yml`) | `build` | only PRs touching `docusaurus/**`, `patches/**`, `vendor/**`, `scripts/test-braces-security.cjs`, `examples/robotics/cross-zone-transport/images/**`, or the workflow | **Yes** — `deploy` is push-only and never runs on a PR |
 | **Actions Security** (`zizmor.yml`) | `zizmor` | every PR to `main` | **Yes** — zizmor 1.30.1 over `.github/` at Medium or higher; locally, `uvx zizmor==1.30.1 --collect=all --min-severity medium --offline --config .github/zizmor.yml .github/`. Accepted findings and their reasons live in `.github/zizmor.yml`; fix the workflow or add a reasoned entry there, never an inline ignore |
 
@@ -172,8 +173,17 @@ pins this table to the workflow files.
   deliberately.
 - **A test that touches CAO's own state can pass only on your machine.** If a code path
   reaches the real database, config dir, or a live session, it will be green on a
-  developer box that has an initialised CAO install and red on a clean runner with
-  `sqlite3.OperationalError: no such table: terminals`. Mock the store/DB seam explicitly;
+  developer box that has an initialised CAO install and red on a clean runner — where the
+  tables exist but are *empty*, so the symptom is a missing row rather than
+  `sqlite3.OperationalError: no such table: terminals`. The schema itself is no longer the
+  variable: the root `test/conftest.py` runs `init_db()` once per session against the
+  configured home when that home has no schema at all (`_cao_home_schema`, guarded by
+  `test/test_isolated_home_has_schema.py`), so a throwaway `CAO_HOME_DIR` gets empty tables
+  instead of no tables. Under `-n` that is once per *worker process*, since each xdist
+  worker is a separate process with its own session — they all check and build the same
+  home, so the check and `init_db()` run under an exclusive `flock` on
+  `$CAO_HOME_DIR/db/.test-schema-init.lock` and the losers see the winner's finished schema
+  instead of `table ... already exists`. Mock the store/DB seam explicitly;
   when a test exercises a service function, check what that function calls *today* — a
   rebase can introduce a new unmocked DB write into a path your test already covered.
   Verify by running under a throwaway `HOME` **and** a throwaway `CAO_HOME_DIR` —
