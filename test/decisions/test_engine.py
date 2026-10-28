@@ -530,3 +530,114 @@ async def test_timeout_keeps_decider_cancellation_cleanup_result(
     else:
         assert plan.model is None
         assert (row["outcome"], row["reason"]) == ("fallback", "error")
+
+
+@pytest.mark.parametrize("fatal", [SystemExit, KeyboardInterrupt])
+@pytest.mark.parametrize("when", ["decide", "cleanup", "cleanup_twice", "owner_cancel"])
+def test_fatal_decider_exception_reaches_owner_without_stopping_loop(
+    setup_engine, monkeypatch, fatal, when
+):
+    engine, req, decider, store, events, settings = setup_engine
+    observed = []
+    decide = decider.decide
+
+    async def exercise():
+        started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+
+        async def fail(request, config):
+            if request.points == ("effort.route",):
+                return await decide(request, config)
+            started.set()
+            if when in {"cleanup", "cleanup_twice"}:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup_started.set()
+                    try:
+                        if when == "cleanup_twice":
+                            await asyncio.Event().wait()
+                        else:
+                            await asyncio.sleep(0)
+                    finally:
+                        raise fatal("synthetic decider exit")
+            if when == "owner_cancel":
+                launch.cancel()
+            raise fatal("synthetic decider exit")
+
+        async def request_task():
+            try:
+                await engine.prepare_launch(
+                    replace(req, field_states={"effort.route": "auto", "model.route": "auto"})
+                )
+            except BaseException as exc:
+                observed.append(exc)
+
+        monkeypatch.setattr(decider, "decide", fail)
+        launch = asyncio.create_task(request_task())
+        if when in {"cleanup", "cleanup_twice"}:
+            await asyncio.wait_for(started.wait(), 1)
+            launch.cancel()
+            if when == "cleanup_twice":
+                await asyncio.wait_for(cleanup_started.wait(), 1)
+                launch.cancel()
+        await launch
+        await asyncio.sleep(0)
+
+    escaped = None
+    try:
+        asyncio.run(exercise())
+    except BaseException as exc:
+        escaped = exc
+    assert escaped is None, f"fatal decider exception escaped the request: {type(escaped)}"
+    assert len(observed) == 1 and type(observed[0]) is fatal
+    rows = store.list()
+    assert len(rows) == 1
+    assert (rows[0]["point"], rows[0]["launch_status"]) == ("effort.route", "not_launched")
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_error", [False, True])
+async def test_owner_cancel_waits_for_multiturn_cleanup_without_error_leak(
+    setup_engine, monkeypatch, cleanup_error
+):
+    import gc
+
+    engine, req, decider, store, events, settings = setup_engine
+    started, cleaned = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    unhandled = []
+    loop.set_exception_handler(lambda loop, context: unhandled.append(context))
+
+    async def block(request, config):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            for _ in range(3):
+                await asyncio.sleep(0)
+            cleaned.set()
+            if cleanup_error:
+                raise RuntimeError("synthetic-private-cleanup-error")
+
+    monkeypatch.setattr(decider, "decide", block)
+    launch = asyncio.create_task(engine.prepare_launch(req))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        launch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert cleaned.is_set()
+        launch = None
+        gc.collect()
+        await asyncio.sleep(0)
+        assert unhandled == []
+        assert store.list() == []
+    finally:
+        if launch is not None and not launch.done():
+            launch.cancel()
+        if launch is not None:
+            await asyncio.gather(launch, return_exceptions=True)
+        loop.set_exception_handler(previous_handler)
