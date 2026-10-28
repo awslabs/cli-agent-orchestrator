@@ -293,3 +293,27 @@ def test_the_controller_thread_runs_the_world_and_closes():
         state = world.close()
     assert state["stopped"] is True
     assert not any(t.name == "factory-simulation" for t in threading.enumerate())
+
+
+def test_parts_in_flight_to_one_place_go_to_different_slots():
+    world = World(scene(), allow_motion=True)
+    for name in ("part-01", "part-02", "part-03"):
+        world._send(name, "place", "dock")
+    goals = [
+        world._slot_xyz("dock", world.parts[name].slot)
+        for name in ("part-01", "part-02", "part-03")
+    ]
+    assert len({tuple(goal) for goal in goals}) == 3
+    run(world, 10)
+    positions = {tuple(world.parts[name].xyz) for name in ("part-01", "part-02", "part-03")}
+    assert len(positions) == 3
+    assert world.contents["dock"] == ["part-01", "part-02", "part-03"]
+
+
+def test_a_robot_within_the_arrival_tolerance_is_at_its_goal():
+    world = World(scene(), allow_motion=True)
+    robot = world.robots["a1"]
+    tolerance = world.scene.arrival_tolerance_m
+    robot.goal = (robot.x + 0.5 * tolerance, robot.y, robot.heading)
+    assert world._drive(robot, 1e-6, 0.8)
+    assert robot.goal is None

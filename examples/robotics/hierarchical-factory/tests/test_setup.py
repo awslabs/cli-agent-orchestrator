@@ -91,7 +91,8 @@ def test_profiles_bind_only_their_own_credential_and_no_builtin_tools(tmp_path, 
         validate(profile, json.loads(SCHEMA.read_text()))
         assert profile["provider"] == provider
         assert profile["skills"] == []
-        assert set(profile["allowedTools"]) == {"@factory-sim", "@cao-mcp-server"}
+        cao = "@cao-mcp-server" if actor == "supervisor" else "@cao-mcp-server/send_message"
+        assert set(profile["allowedTools"]) == {"@factory-sim", cao}
         assert not any(tool in profile["allowedTools"] for tool in ("*", "@builtin", "fs_*"))
         connection = profile["mcpServers"]["factory-sim"]
         assert connection["type"] == "stdio"
@@ -125,6 +126,8 @@ def test_each_manager_gets_the_profile_of_its_team_kind_and_its_own_scope(tmp_pa
         bindings = json.loads(text.rsplit("```json\n", 1)[1].split("\n```", 1)[0])
         assert bindings["your_zone"] == zone
         assert bindings["your_team"] == team["label"]
+        # A manager's bindings name only its own team, not another manager.
+        assert set(bindings["teams"]) == {zone}
         assert bindings["teams"][zone]["manager_profile"] == name
     supervisor = (run_dir / "profiles" / f"{manifest['profiles']['supervisor']}.md").read_text()
     bindings = json.loads(supervisor.rsplit("```json\n", 1)[1].split("\n```", 1)[0])
@@ -337,12 +340,15 @@ def test_committed_profiles_are_valid_cao_profiles(role):
     assert "provider" not in profile
     assert instructions
     assert set(profile["mcpServers"]) == {"factory-sim", "cao-mcp-server"}
-    assert profile["allowedTools"] == ["@factory-sim", "@cao-mcp-server"]
+    # Only the supervisor holds the whole CAO server. A manager holds only
+    # send_message, so CAO refuses it assign and handoff (review of #1108, P2-1).
+    cao = "@cao-mcp-server" if role == "supervisor" else "@cao-mcp-server/send_message"
+    assert profile["allowedTools"] == ["@factory-sim", cao]
     # Only the supervisor delegates; a manager uses CAO only to report back.
     delegates = "**assign**(" in instructions
     assert delegates == (role == "supervisor")
     if role != "supervisor":
-        assert "Do not use `assign`, `handoff`" in instructions
+        assert "CAO refuses\n`assign`, `handoff`" in instructions
 
 
 @pytest.mark.parametrize("provider", sorted(demo.SUPPORTED_PROVIDERS))
@@ -392,13 +398,16 @@ def test_prepare_refuses_an_unknown_provider_before_creating_a_run(tmp_path):
     assert not run_dir.exists()
 
 
-@pytest.mark.parametrize("provider", ["antigravity_cli", "cursor_cli", "hermes", "opencode_cli"])
+@pytest.mark.parametrize(
+    "provider", ["antigravity_cli", "cursor_cli", "grok_cli", "hermes", "opencode_cli"]
+)
 def test_a_provider_without_per_agent_mcp_servers_is_refused(
     tmp_path, monkeypatch, capsys, provider
 ):
     assert demo.SUPPORTED_PROVIDERS == demo.CAO_PROVIDERS - {
         "antigravity_cli",
         "cursor_cli",
+        "grok_cli",
         "hermes",
         "opencode_cli",
     }

@@ -3,8 +3,8 @@
   Live view of the hierarchical factory simulation.
   Served read-only by the controller (demo.py serve) on 127.0.0.1 only.
   It polls state (the controller's observe() output) and draws a top-down
-  map of the floor with the Open Duck Mini robots, and the 3-layer organization:
-  the supervisor, the three team managers, and their robot teams.
+  map of the floor with the Open Duck Mini robots, and the agent team: the
+  supervisor, the three team managers, and their robot teams.
   No external assets: it works offline, with no CDN and no build step.
 -->
 <html lang="en">
@@ -281,7 +281,7 @@ function render(state) {
   else supAct = "planning the order";
 
   const box = document.getElementById("agents");
-  box.innerHTML = `<div class="layer">Layer 1 · strategy</div>`;
+  box.innerHTML = `<div class="layer">Agents · layer 1 · strategy</div>`;
   const card = (cls, dot, who, role, act, actCls, extra) => {
     const div = document.createElement("div");
     div.className = "agent " + cls;
@@ -291,7 +291,7 @@ function render(state) {
   };
   card(supCls === "live" ? "acting" : supCls, "var(--violet)", "Factory supervisor",
        "reads the floor, assigns the managers, balances the line", esc(supAct), supCls, "");
-  box.insertAdjacentHTML("beforeend", `<div class="layer">Layer 2 · tactics &nbsp;→&nbsp; layer 3 · execution</div>`);
+  box.insertAdjacentHTML("beforeend", `<div class="layer">Agents · layer 2 · tactics &nbsp;→&nbsp; their robots (not agents)</div>`);
   for (const zone of zoneNames) {
     const team = teams[zone];
     if (!team) continue;

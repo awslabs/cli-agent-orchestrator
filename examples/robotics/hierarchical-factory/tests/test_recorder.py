@@ -336,3 +336,18 @@ def test_serve_refuses_a_used_frames_directory_without_consuming_the_run(tmp_pat
     with pytest.raises(FileExistsError):
         demo.serve(run_dir, allow_motion=True, record=frames)
     assert not (run_dir / "started.json").exists()
+
+
+def test_the_animation_uses_the_size_of_the_rendered_frames(tmp_path):
+    # A renderer can return another size than the requested one. The animation
+    # header must match the frames, and a frame of another size is refused.
+    w = world()
+    recorder = Recorder(w, tmp_path, width=4, height=2)
+    state = w.observe()
+    recorder._write_frame(np.zeros((3, 5, 3), dtype=np.uint8), state, None)
+    recorder._write_frame(np.ones((3, 5, 3), dtype=np.uint8), state, None)
+    recorder._write_outputs()
+    header = png_chunks((tmp_path / "animation.png").read_bytes())[b"IHDR"][0]
+    assert struct.unpack(">II", header[:8]) == (5, 3)
+    with pytest.raises(RecordingError, match="first frame is 5 x 3"):
+        recorder._write_frame(np.zeros((2, 4, 3), dtype=np.uint8), state, None)

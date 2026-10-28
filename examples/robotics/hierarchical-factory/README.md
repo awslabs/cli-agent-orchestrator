@@ -1,9 +1,9 @@
-# A 3-layer robot factory
+# A robot factory run by a team of agents
 
-In this exercise, a 3-layer organization of AI agents runs a simulated
+In this exercise, a team of four AI agents in two layers runs a simulated
 factory floor. A supervisor agent takes the order. Three team manager agents
-run three robot teams. Nine simulated robots make, assemble, and ship the
-parts. You start the simulator and the agents on your laptop. Then you watch
+run three robot teams. Nine simulated robots, which are not agents, make,
+assemble, and ship the parts. You start the simulator and the agents on your laptop. Then you watch
 the parts flow from west to east, a team block, and the supervisor balance the
 line.
 
@@ -23,21 +23,22 @@ that the agents use between the steps.
 
 ## What the exercise is about
 
-### Three layers
+### Two agent layers and the robots
 
 Real factories are organizations in layers. A plant manager plans the order
 and the targets. A team lead runs one line or one area. The machines do the
-work. This example builds the same three layers with CAO:
+work. This example builds the same layers: two layers of CAO agents, and the
+robots below them:
 
 ```mermaid
 flowchart TB
-    S["Layer 1: strategy<br/>Factory supervisor agent<br/>plans the order, balances the line"]
-    A["Layer 2: tactics<br/>Team A manager agent<br/>manufacturing, zone west"]
-    B["Layer 2: tactics<br/>Team B manager agent<br/>assembly, zone middle"]
-    C["Layer 2: tactics<br/>Team C manager agent<br/>shipping, zone east"]
-    RA["Layer 3: execution<br/>robots a1, a2, a3<br/>one queue"]
-    RB["Layer 3: execution<br/>robots b1, b2<br/>two parallel lines"]
-    RC["Layer 3: execution<br/>robots c1, c2, c3, c4<br/>one diamond formation"]
+    S["Agents, layer 1: strategy<br/>Factory supervisor agent<br/>plans the order, balances the line"]
+    A["Agents, layer 2: tactics<br/>Team A manager agent<br/>manufacturing, zone west"]
+    B["Agents, layer 2: tactics<br/>Team B manager agent<br/>assembly, zone middle"]
+    C["Agents, layer 2: tactics<br/>Team C manager agent<br/>shipping, zone east"]
+    RA["Robots (not agents): execution<br/>robots a1, a2, a3<br/>one queue"]
+    RB["Robots (not agents): execution<br/>robots b1, b2<br/>two parallel lines"]
+    RC["Robots (not agents): execution<br/>robots c1, c2, c3, c4<br/>one diamond formation"]
     S -->|"CAO assign"| A & B & C
     A & B & C -.->|"CAO send_message: done, or blocked"| S
     A -->|"MCP: form_team, start_line, set_pace"| RA
@@ -45,13 +46,13 @@ flowchart TB
     C -->|"MCP: form_team, start_shipping"| RC
 ```
 
-- **Layer 1, the supervisor.** One CAO agent. It reads the order, plans the
+- **Agent layer 1, the supervisor.** One CAO agent. It reads the order, plans the
   pace of each team, and assigns one task to each manager. It can only read
   the floor. It talks only to the managers.
-- **Layer 2, the managers.** Three CAO agents, one for each team. A manager
+- **Agent layer 2, the managers.** Three CAO agents, one for each team. A manager
   forms its team, starts the program of its team, and watches it. It reports
   to the supervisor. Its credential reaches only its own robots.
-- **Layer 3, the robots.** Nine simulated robots. They are not agents. Each
+- **The robots.** Nine simulated robots. They are not agents. Each
   team runs the program that its manager started, without an LLM in the loop.
 
 ### The floor and the teams
@@ -138,7 +139,7 @@ The agents use the world only through the MCP tools of the controller.
 
 ### What you get from the exercise
 
-- You see a 3-layer digital organization drive a physical-AI floor: a CAO
+- You see a team of agents in two layers drive a physical-AI floor: a CAO
   supervisor delegates to CAO managers, and each manager drives a robot team.
 - You see `assign` and `send_message` work together: parallel work, and
   reports that come back up the hierarchy.
@@ -182,9 +183,10 @@ for each agent to `profiles/` in the run directory:
 - The `factory-sim` server starts the Python of `.venv` with
   `demo.py connect <credential file>`. Each agent gets its own credential file.
 - `provider` is the `--provider` of `prepare`.
-- The end of the instructions gets the **run bindings**: the `run_id`, the
-  zone and team of the agent, and the manager profile of each team. They are
-  identifiers, not instructions.
+- The end of the instructions gets the **run bindings**: the `run_id`, and the
+  zone and team of the agent. The supervisor also gets the manager profile of
+  each team. A manager gets only its own team, so its bindings do not name the
+  profile of another manager. They are identifiers, not instructions.
 
 ### Credentials and scopes
 
@@ -197,6 +199,13 @@ prompt, sets what an agent can do:
 | `manager_west`, `manager_middle` | `observe`, `act`, `line` | `observe`, `form_team`, `wait_team`, `start_line`, `set_pace` |
 | `manager_east` | `observe`, `act`, `ship` | `observe`, `form_team`, `wait_team`, `start_shipping` |
 | `operator` | `observe`, `operate` | `observe`, `stop_simulation` |
+
+The CAO allowlist of each profile limits the CAO tools in the same way:
+
+| Profile | CAO grant | CAO tools |
+| --- | --- | --- |
+| Supervisor | `@cao-mcp-server` | `assign`, `send_message`, and the other CAO tools |
+| Managers | `@cao-mcp-server/send_message` | `send_message` only. CAO refuses `assign`, `handoff`, `find_profiles`, and `delete_terminal`, so a manager cannot start another agent, for example the manager of another team with that team's credential. |
 
 A manager credential also holds its zone. The controller takes the team of a
 call from the credential, not from a tool argument. No tool has a team or a
@@ -288,7 +297,7 @@ team manager delegate to its robot agents with `assign`: a fourth layer.
 
 | Requirement | Version | How to check |
 | --- | --- | --- |
-| CAO | 2.5.3 or later. The latest `main` is better. | `cao --version` |
+| CAO | `main` from 2026-10-23 or later, or the first release after 2.5.4. The managers need #972 (a worker can always reach `send_message`) and #948 (per-tool grants such as `@cao-mcp-server/send_message` in the delegation ceiling). | `cao --version`, and the date of the installed commit |
 | tmux | 3.3 or later | `tmux -V` |
 | uv | A recent release | `uv --version` |
 | Python | 3.10 or later | Step 1 finds or installs it with `uv` |
@@ -296,7 +305,13 @@ team manager delegate to its robot agents with `assign`: a fourth layer.
 | OpenGL | Only for the pictures of `--record`. No separate GPU is necessary. | On macOS, OpenGL is part of the system. On Linux without a display, see [See the robots move](#see-the-robots-move). |
 | Provider CLI | A CAO provider that `prepare` accepts. GitHub Copilot CLI is the default. See [Providers](#providers). | Start the CLI one time in this repository, sign in, and accept its first-run prompts |
 
-To install or update CAO, see [Install CAO](../../../README.md#install-cao).
+To install or update CAO from the latest `main`:
+
+```bash
+uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
+```
+
+For other installation methods, see [Install CAO](../../../README.md#install-cao).
 The example has its own Python project and lockfile. It does not change the
 CAO installation.
 
@@ -310,6 +325,7 @@ reasons that `demo.py` prints:
 | --- | --- |
 | `antigravity_cli` | It reads the MCP servers of all CAO terminals from one shared file. An agent could use the simulator credential of another agent. |
 | `cursor_cli` | CAO launches it without the instructions of the agent profile. |
+| `grok_cli` | It grants MCP servers only as a whole. A manager that can call `send_message` could then also call `assign`, and start the manager of another team with that team's credential. |
 | `hermes` | It reads MCP servers only from its own Hermes profile. |
 | `opencode_cli` | It keeps the MCP servers of all agents in one shared configuration. |
 
@@ -899,7 +915,8 @@ prints the exact URL (`LIVE VIEW: ...`) when it starts.
   dock, and every part in the color of its stage. Each robot is a picture of the
   Open Duck Mini in its team color (red when blocked), with its state lamp above
   it, a short line for its heading, and the part that it carries.
-- **The organization** panel shows the three layers. The supervisor shows what
+- **The organization** panel shows the supervisor, the managers, and their
+  robot teams. The supervisor shows what
   it does now, for example `a team is blocked: balancing the line`. Each
   manager shows the status of its team, its output and target, its pace, its
   blocked and starved time, and the state of each robot. A blocked team has a
@@ -1013,10 +1030,12 @@ each cell controller, and tests on the site with people who monitor the robots.
   It is not an OS sandbox.
 - The credential sets the access of each agent. A tool argument or a prompt
   cannot give an agent more access. The supervisor has a read-only credential.
-- The managers hold `@cao-mcp-server` for `send_message`. CAO grants MCP tools
-  for a whole server, so a manager can technically reach `assign` too. The
-  profiles of the managers forbid it, and the delegation ceiling of a manager
-  is its own allowlist, so it can launch only agents with the same tools.
+- Only the supervisor can delegate. A manager holds only
+  `@cao-mcp-server/send_message`, and CAO refuses `assign`, `handoff`, and the
+  other identity and discovery tools to an allowlist without
+  `@cao-mcp-server`. So a manager cannot start the manager of another team,
+  whose run copy has the credential of that team. The run bindings of a manager
+  also name only its own team.
 - If the provider does not enforce the allowlist, only the instructions forbid
   the shell and file tools. An agent can then read every credential file of the
   run. See [Providers](#providers).

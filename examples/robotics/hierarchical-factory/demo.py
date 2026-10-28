@@ -71,6 +71,11 @@ NATIVE_ENFORCEMENT = frozenset(
 # each agy process reads the whole file (providers/antigravity_cli.py). A worker
 # would also start the servers of the supervisor and of other zones.
 UNSUPPORTED_PROVIDERS = {
+    "grok_cli": (
+        "Grok CLI grants MCP servers only as a whole, so a manager that may call "
+        "send_message could also assign the manager profile, and so the credential, "
+        "of another team"
+    ),
     "antigravity_cli": (
         "Antigravity CLI reads the MCP servers of all CAO terminals from one shared "
         "file, so an agent could use the simulator credential and the CAO terminal "
@@ -194,7 +199,11 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
             "run_id": run_id,
             "your_zone": metadata.get("zone"),
             "your_team": metadata.get("team"),
-            "teams": teams,
+            # Only the supervisor delegates, so only it gets the profile of every
+            # manager. A manager sees its own team, not another team's profile.
+            "teams": (
+                teams if "zone" not in metadata else {metadata["zone"]: teams[metadata["zone"]]}
+            ),
         }
         text = (
             "---\n"

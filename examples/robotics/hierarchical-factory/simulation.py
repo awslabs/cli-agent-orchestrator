@@ -507,6 +507,8 @@ class PartState:
     xyz: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     goal: tuple[str, str] | None = None
     on_arrival: Callable[[], None] | None = None
+    # The slot of a place that a part in flight goes to.
+    slot: int = 0
 
 
 @dataclass
@@ -881,7 +883,8 @@ class World:
         gx, gy, gh = robot.goal
         distance = math.dist((robot.x, robot.y), (gx, gy))
         step = speed * dt
-        if distance <= step:
+        # Within the arrival tolerance of the scene, the robot is at its goal.
+        if distance <= max(step, self.scene.arrival_tolerance_m):
             robot.x, robot.y = gx, gy
         else:
             robot.x += (gx - robot.x) * step / distance
@@ -919,6 +922,9 @@ class World:
             self.robots[state.at.split(":", 1)[1]].carrying = None
         state.at, state.goal, state.on_arrival = None, (kind, target), on_arrival
         if kind == "place":
+            # Each part in flight to a place gets its own slot, after the parts
+            # there and the parts already on their way.
+            state.slot = len(self.contents[target]) + self.incoming[target]
             self.incoming[target] += 1
         else:
             self.robots[target].carrying = part
@@ -931,7 +937,7 @@ class World:
             if kind == "robot":
                 goal = self._carry_xyz(target)
             else:
-                goal = self._slot_xyz(target, len(self.contents[target]))
+                goal = self._slot_xyz(target, part.slot)
             distance = math.dist(part.xyz, goal)
             step = self.scene.part_speed_m_s * dt
             if distance > step:
@@ -944,6 +950,9 @@ class World:
                 self.incoming[target] -= 1
                 self.contents[target].append(name)
                 part.at = target
+                # A part can leave the place while another is in flight, so the
+                # parts there close up into the first slots.
+                self._restack(target)
             callback, part.on_arrival = part.on_arrival, None
             if callback:
                 callback()

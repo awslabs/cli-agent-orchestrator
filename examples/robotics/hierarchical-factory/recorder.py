@@ -165,6 +165,8 @@ class Recorder:
         self.error: str | None = None
         self._rendering = False
         self._animation: list[tuple[bytes, int]] = []
+        # The size of the first frame. Every frame of the animation must have it.
+        self._size: tuple[int, int] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -252,6 +254,15 @@ class Recorder:
         name = f"frame-{number:04d}.png"
         data = compress_pixels(pixels)
         height, width, _ = pixels.shape
+        if self._size is None:
+            self._size = (width, height)
+        elif self._size != (width, height):
+            # The animation has one header size, so a frame of another size would
+            # make the animated PNG invalid.
+            raise RecordingError(
+                f"frame {number} is {width} x {height}, but the first frame is "
+                f"{self._size[0]} x {self._size[1]}"
+            )
         png = PNG_SIGNATURE + _header(width, height) + _chunk(b"IDAT", data) + _chunk(b"IEND", b"")
         (self.directory / name).write_bytes(png)
         (self.directory / "latest.png").write_bytes(png)
@@ -287,7 +298,7 @@ class Recorder:
             last, _ = self._animation[-1]
             self._animation[-1] = (last, 3 * EVENT_FRAME_MS)
             (self.directory / "animation.png").write_bytes(
-                encode_apng(self.width, self.height, self._animation)
+                encode_apng(*self._size, self._animation)
             )
         (self.directory / "frames.json").write_text(
             json.dumps({"run_id": self.world.run_id, "frames": self.frames}, indent=2) + "\n",
