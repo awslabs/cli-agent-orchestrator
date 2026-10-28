@@ -306,8 +306,8 @@ class MiniMaxCodeProvider(BaseProvider):
             if loaded.get("defaultModel"):
                 return
             selected = MINIMAX_CODE_DEFAULT_MODEL
-        elif selected == "MiniMax-M3":
-            selected = MINIMAX_CODE_DEFAULT_MODEL
+        elif "/" not in selected:
+            selected = f"minimax/{selected}"
         loaded["defaultModel"] = selected
         config_path.write_text(
             yaml.safe_dump(loaded, sort_keys=False, allow_unicode=True),

@@ -52,9 +52,10 @@ Selection precedence is an explicit session/terminal API `model` parameter,
 then the profile's `model:`, then the user's saved `defaultModel`. If none is
 set, CAO uses `minimax/MiniMax-M3`. The user's normal configuration is not modified.
 Saved legacy and custom selections, already-qualified model keys, and provider
-settings are preserved. An explicit bare `MiniMax-M3` is normalized to
-`minimax/MiniMax-M3`; this key follows MiniMax Code's configured managed or
-API-key model source.
+settings are preserved. Any explicit bare model ID is normalized to a
+`minimax/<model-id>` key; for example, `MiniMax-M3` becomes
+`minimax/MiniMax-M3`. The qualified key follows MiniMax Code's configured
+managed or API-key model source.
 
 For example, add this frontmatter to an `mcode` agent profile and launch it with
 `cao launch --agents <profile-name> --provider mcode`:

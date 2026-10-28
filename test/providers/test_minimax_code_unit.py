@@ -188,6 +188,8 @@ def test_prepare_runtime_applies_model_to_terminal_local_config(
     [
         (None, None, None, "minimax/MiniMax-M3"),
         (None, "MiniMax-M3", None, "minimax/MiniMax-M3"),
+        (None, "MiniMax-M2.7", None, "minimax/MiniMax-M2.7"),
+        (None, None, "MiniMax-M2.7-highspeed", "minimax/MiniMax-M2.7-highspeed"),
         ("minimax/MiniMax-M2.7", None, None, "minimax/MiniMax-M2.7"),
         ("MiniMax-M2.7", None, None, "MiniMax-M2.7"),
         ("custom_provider:local/custom-model", None, None, "custom_provider:local/custom-model"),
