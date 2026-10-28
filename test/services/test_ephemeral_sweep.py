@@ -202,7 +202,7 @@ def test_periodic_sweep_collects_an_untouched_expired_pending_name(store):
 @pytest.mark.parametrize("startup", [True, False])
 def test_pending_name_whose_owner_is_gone_is_collected(store, startup):
     name = make(store)
-    database.delete_terminal(CALLER)
+    database.delete_terminal(CALLER, end_reason="deleted")
     assert sweep(store, startup).get("owner_gone") == 1
     collected = row(name)
     assert collected["state"] == "gc" and collected["gc_reason"] == "owner_gone"
@@ -262,7 +262,7 @@ def test_claim_inside_its_lease_survives_every_sweep(store, startup, owner_gone)
     store.clock.at(seconds=TTL - 10)
     claim(store, name)
     if owner_gone:
-        database.delete_terminal(CALLER)
+        database.delete_terminal(CALLER, end_reason="deleted")
     paths = (*live(store, name), archive(name))
     before = row(name), [path.read_bytes() for path in paths]
     store.clock.at(seconds=TTL - 10 + LEASE - 1)  # Past the TTL, inside the lease.
@@ -890,7 +890,7 @@ def test_sweeps_touch_only_live_files_and_eligible_archives(store, tmp_path):
     tools = ["@cao-mcp-server", "fs_read", "fs_list"]
     database.create_terminal(OTHER, "other-session", "w", "claude_code", allowed_tools=tools)
     orphan = make(s, purpose="orphan", caller=OTHER)
-    database.delete_terminal(OTHER)
+    database.delete_terminal(OTHER, end_reason="deleted")
     pending, claimed, running = (make(s, purpose=p) for p in ("pending", "claimed", "running"))
     claim(s, claimed)
     launch(s, running)
