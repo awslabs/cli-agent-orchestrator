@@ -125,15 +125,23 @@ async def _create(agent_dirs, agent="developer", **kwargs):
 
 class TestBeforeLaunch:
     @pytest.mark.asyncio
-    async def test_a_missing_agent_is_refused_before_any_allocation(self, agent_dirs, allocation):
-        with pytest.raises(KiroAgentIdentityError) as excinfo:
+    async def test_a_missing_agent_is_refused_before_any_allocation(
+        self, agent_dirs, allocation, caplog
+    ):
+        with (
+            caplog.at_level("WARNING", logger="cli_agent_orchestrator.providers.kiro_identity"),
+            pytest.raises(KiroAgentIdentityError) as excinfo,
+        ):
             await _create(agent_dirs)
 
         assert excinfo.value.kind == "agent_not_found"
         message = str(excinfo.value)
         assert "kiro_default" in message
         assert "cao install developer --provider kiro_cli" in message
-        assert str(agent_dirs.installed) in message
+        # The searched directories are in the server log, never in the message.
+        assert str(agent_dirs.root) not in message
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert str(agent_dirs.installed) in logged and str(agent_dirs.cwd) in logged
         _assert_nothing_allocated(allocation)
 
     @pytest.mark.asyncio

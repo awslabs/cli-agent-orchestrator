@@ -11,6 +11,7 @@ not load: requested ``sk1-broken``, header ``kiro_default · auto · ◔ 4%``.
 """
 
 import json
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -471,8 +472,22 @@ class TestRequireKiroAgentDefined:
             require_kiro_agent_defined("developer", [tmp_path])
         message = str(excinfo.value)
         assert excinfo.value.kind == "agent_not_found"
-        assert "kiro_default" in message and str(tmp_path) in message
+        assert "kiro_default" in message
         assert "cao install developer --provider kiro_cli" in message
+
+    def test_the_searched_directories_go_to_the_server_log_not_the_message(self, tmp_path, caplog):
+        """The message is the API's 400 body; a shared server's paths stay in its log."""
+        workspace, installed = tmp_path / "repo" / ".kiro" / "agents", tmp_path / "installed"
+        with (
+            caplog.at_level("WARNING", logger="cli_agent_orchestrator.providers.kiro_identity"),
+            pytest.raises(KiroAgentIdentityError) as excinfo,
+        ):
+            require_kiro_agent_defined("developer", [workspace, installed])
+        message = str(excinfo.value)
+        assert str(tmp_path) not in message
+        assert not re.search(r"(^|[\s(,])/", message), message  # no absolute path at all
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert str(workspace) in logged and str(installed) in logged
 
     @pytest.mark.parametrize("agent", sorted(KIRO_FALLBACK_AGENTS))
     def test_a_fallback_name_is_refused_even_with_a_file(self, tmp_path, agent):

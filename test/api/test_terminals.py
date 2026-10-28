@@ -355,6 +355,36 @@ class TestTerminalCreationWithWorkingDirectory:
         assert response.status_code == 400, response.text
         assert "cao install analyst" in response.json()["detail"]
 
+    def test_an_agent_not_found_body_names_no_server_path(self, client, tmp_path):
+        """The real refusal's text is the 400 body: the remedy, not the directories
+        searched, which only the server log gets (#1074; shared-server mode)."""
+        from cli_agent_orchestrator.providers.kiro_identity import (
+            KiroAgentIdentityError,
+            require_kiro_agent_defined,
+        )
+
+        searched = [tmp_path / "repo" / ".kiro" / "agents", tmp_path / "home" / ".kiro" / "agents"]
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            require_kiro_agent_defined("analyst", searched)
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.create_session",
+                new=AsyncMock(side_effect=excinfo.value),
+            ),
+        ):
+            response = client.post(
+                "/sessions", params={"provider": "kiro_cli", "agent_profile": "analyst"}
+            )
+
+        assert response.status_code == 400, response.text
+        detail = response.json()["detail"]
+        assert "cao install analyst --provider kiro_cli" in detail
+        assert str(tmp_path) not in detail
+
     @pytest.mark.parametrize("kind", ["agent_not_found", "identity_mismatch"])
     def test_kiro_agent_identity_refusal_is_a_bad_request_on_run_step(self, client, kind):
         """run-step maps the refusal ahead of its generic ValueError arm too (#1074)."""

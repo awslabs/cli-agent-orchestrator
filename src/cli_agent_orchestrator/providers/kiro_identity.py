@@ -24,6 +24,7 @@ does not load still ends at check 2, which reads what kiro-cli actually started.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -31,6 +32,8 @@ from typing import Iterable, List, Mapping, Optional, Sequence
 
 from cli_agent_orchestrator.utils.path_validation import flatten_path_separators
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+logger = logging.getLogger(__name__)
 
 # Agents a launch may never be identified as, whatever was requested: kiro-cli's
 # built-in fallback, and the tool-less default agent proposed for CAO-owned Kiro
@@ -155,6 +158,10 @@ def kiro_agent_defined(agent: str, directories: Iterable[Path]) -> bool:
 def require_kiro_agent_defined(agent: str, directories: List[Path]) -> None:
     """Refuse a Kiro launch, before it starts, whose agent kiro-cli would not load.
 
+    The directories searched are logged on the server, not put in the message:
+    the API returns it as the 400 body, and in shared-server mode the caller is
+    not the server's user, so absolute home and workspace paths stay out of it.
+
     Raises:
         KiroAgentIdentityError: ``fallback_agent`` for a name in
             ``KIRO_FALLBACK_AGENTS``, ``agent_not_found`` when no directory
@@ -169,14 +176,20 @@ def require_kiro_agent_defined(agent: str, directories: List[Path]) -> None:
             f"the request was honored. Launch an installed CAO profile instead.",
         )
     if not kiro_agent_defined(agent, directories):
-        searched = ", ".join(str(d) for d in directories)
+        logger.warning(
+            "Kiro agent %r not found; searched: %s",
+            agent,
+            ", ".join(str(d) for d in directories),
+        )
         raise KiroAgentIdentityError(
             "agent_not_found",
             agent,
-            f"Kiro agent '{agent}' was not found in any agent directory CAO searched "
-            f"({searched}). kiro-cli would not refuse it: it would start its built-in "
-            f"'kiro_default' agent, with every built-in tool, instead. Nothing was "
-            f"launched. Remedy: `cao install {agent} --provider kiro_cli`, then retry.",
+            f"Kiro agent '{agent}' was not found in any agent directory CAO searches "
+            f"(the launch directory's .kiro/agents, the directory `cao install` writes, "
+            f"~/.kiro/agents and $KIRO_HOME/agents; the server log lists them). kiro-cli "
+            f"would not refuse it: it would start its built-in 'kiro_default' agent, "
+            f"with every built-in tool, instead. Nothing was launched. Remedy: "
+            f"`cao install {agent} --provider kiro_cli`, then retry.",
         )
 
 
