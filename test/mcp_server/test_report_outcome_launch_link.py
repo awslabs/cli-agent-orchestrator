@@ -348,8 +348,8 @@ class TestRouteBinding:
         )
 
         # A self-report under the same reused id binds only the newest,
-        # still-open row (mutant S6: iterating oldest-first would bind this
-        # to old_id instead).
+        # still-open row (iterating oldest-first would bind this to old_id
+        # instead).
         assert _post(api, launch="reused01", source="reused01", success=True).status_code == 200
         assert (_record(new_id)["outcome"], _record(new_id)["outcome_reporter_id"]) == (
             "success",
