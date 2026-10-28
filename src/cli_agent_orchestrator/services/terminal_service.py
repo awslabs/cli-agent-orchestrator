@@ -3418,13 +3418,16 @@ def _persist_deferred_init_failure(
 def _runtime_untrusted_from_row(metadata: dict[str, Any]) -> bool:
     """The reclaim decision for a failure on this row (#1074).
 
-    True for a ``kiro_cli`` runtime whose row does not record a passed identity
-    check, a row from before the column included: CAO did not verify which
-    agent that pane is running.
+    True for a ``kiro_cli`` runtime whose row records that its identity check
+    has not passed (``identity_verified`` False): CAO wrote that row, and did
+    not verify which agent the pane is running. A row from before the column
+    (``identity_verified`` None) keeps its window, as live legacy rows are
+    grandfathered; once it carries a failure, input to it is still refused.
+    Provisional (#1074).
     """
     return (
         metadata.get("provider") == ProviderType.KIRO_CLI.value
-        and metadata.get("identity_verified") is not True
+        and metadata.get("identity_verified") is False
     )
 
 

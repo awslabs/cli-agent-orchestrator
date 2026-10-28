@@ -780,6 +780,36 @@ class TestRestartsAroundTheRecord:
         assert terminal_service.get_terminal_metadata(tid) is not None  # never deleted
         _refused(tid)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("external_owner", [True, False], ids=["no-caller", "caller"])
+    async def test_a_legacy_row_keeps_its_window_at_upgrade(self, pane, external_owner):
+        """Provisional (#1074): a Kiro pane launched before the column, whose initial
+        delivery had not settled at the upgrade restart, is grandfathered like any
+        live legacy row. Its window stays open; the sweep's failure is still
+        recorded, so input to it is refused."""
+        kw = {} if external_owner else {"caller_id": "0000aaaa"}
+        tid = _row(
+            identity_verified=None,
+            external_owner=external_owner,
+            initial_delivery={"state": "pending"},
+            **kw,
+        )
+
+        assert await terminal_service.recover_interrupted_initial_deliveries()
+
+        failure = _failure(tid)
+        assert (failure["kind"], failure["untrusted_runtime"]) == ("interrupted_init", False)
+        pane.backend.cleanup_terminal_exact.assert_not_called()
+        assert "(interrupted_init)" in str(_refused(tid))
+        assert _typed(pane.backend) == []
+
+    def test_only_a_row_this_version_wrote_false_is_untrusted(self):
+        decide = terminal_service._runtime_untrusted_from_row
+        assert decide({"provider": "kiro_cli", "identity_verified": False}) is True
+        assert decide({"provider": "kiro_cli", "identity_verified": None}) is False
+        assert decide({"provider": "kiro_cli", "identity_verified": True}) is False
+        assert decide({"provider": "claude_code", "identity_verified": False}) is False
+
 
 class TestInputBeforeOrWithoutTheRecord:
     @pytest.mark.asyncio
