@@ -60,6 +60,17 @@ ALLOWLIST: Dict[str, str] = {
         "write when that read fails. _stored_spec returns None, not a default, and "
         "the spec file is write-once."
     ),
+    "cli_agent_orchestrator/api/main.py::_prepare_delegation": (
+        "_recorded_tier() degrades an unreadable decision record to None by design "
+        "(#1068), the same as an unwritten one: recheck_decided then reverse-maps the "
+        "plan's model through the settings snapshot it validates, or launches the stored "
+        "fallback it has just bounded. The record is a SQLite row (the guard also "
+        "resolves store.get to the plugin store's JSON reader), and None is never "
+        "written: every JSON write it reaches is an archive update through _audit_update "
+        "(the refusal count, the released event when a tightened policy or end_claim "
+        "collects the name, the decided event's record ids), which re-reads the archive "
+        "itself and skips the write when that read fails."
+    ),
     # --- Live instances of the #737 class, found by this guard. Each rewrites the
     # --- same file it read leniently. Recorded, not fixed here: they are separate
     # --- issues (see .sweep/out/guard.md for GH#737).

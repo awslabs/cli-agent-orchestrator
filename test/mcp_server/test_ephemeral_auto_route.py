@@ -5,6 +5,7 @@ process are mocked, as in test_ephemeral_launch_handlers.
 """
 
 import asyncio
+import logging
 from dataclasses import replace
 from datetime import timedelta
 from test.mcp_server.test_ephemeral_launch_handlers import (  # noqa: F401
@@ -23,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 from anyio.from_thread import start_blocking_portal
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database
@@ -648,6 +650,62 @@ async def test_a_block_broken_during_an_unrecorded_decision_returns_the_name(
     drain(e5)
     assert e5.store.list() == []
     assert_returned_to_pending(e5)
+
+
+# A record that was written but can't be read back takes the unwritten record's path: the
+# recheck reverse-maps the plan's model, and the warning carries no record content.
+
+
+def make_records_unreadable(rt, monkeypatch):
+    def get(record_id):
+        raise OperationalError("SELECT decision_records", {"id": record_id}, Exception("locked"))
+
+    monkeypatch.setattr(rt.store, "get", get)
+
+
+def assert_read_failure_logged_without_content(caplog, record):
+    (warning,) = [r for r in caplog.records if "record read failed" in r.getMessage()]
+    assert warning.levelno == logging.WARNING and warning.exc_info is None
+    text = logging.Formatter().format(warning)
+    assert str(record["id"]) not in text
+    for value in record.values():
+        if isinstance(value, str) and len(value) >= 4:
+            assert value not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+@pytest.mark.parametrize("case", [{"tier": "auto", "answer": "large"}], indirect=True)
+async def test_an_applied_answer_launches_when_its_record_cannot_be_read(
+    e5, path, monkeypatch, caplog
+):
+    make_records_unreadable(e5, monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        result = await invoke(path, e5.name)
+    assert result["success"], result
+    assert launched_model(e5) == "model-large"
+    drain(e5)
+    (record,) = e5.store.list()
+    assert record["outcome"] == "applied" and record["launch_status"] == "launched"
+    assert_read_failure_logged_without_content(caplog, record)
+    delete_child()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+@pytest.mark.parametrize("case", [{"tier": "auto", "answer": "large"}], indirect=True)
+async def test_an_unreadable_record_still_rechecks_the_launched_tier(e5, path, monkeypatch, caplog):
+    make_records_unreadable(e5, monkeypatch)
+    e5.decider.during = lambda: operator_edit(e5, {"max_tier": "medium", "default_tier": "medium"})
+    with caplog.at_level(logging.WARNING):
+        result = await invoke(path, e5.name)
+    assert not result["success"]
+    assert result["rule"] == "policy_changed_since_create:tier_exceeds_policy"
+    e5.factory.assert_not_called()
+    row = database.get_ephemeral_agent(e5.name)
+    assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
+    (record,) = e5.store.list()
+    assert_read_failure_logged_without_content(caplog, record)
 
 
 @pytest.mark.parametrize("site", ["terminal", "step"])

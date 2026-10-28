@@ -149,10 +149,11 @@ decider ran still applies. The stored policy is checked as above, so a fallback 
 now outside `[min_tier, max_tier]` collects the name. An applied answer whose tier is now
 outside the bounds gives `policy_changed_since_create:<rule>` and collects the name. A remap
 of the launched tier to a new model id changes no bound: the child runs on the tier's current
-model. An answer applies even when its decision record can't be written, the same as for
-installed targets: the recheck reverse-maps the launched model through the snapshot it has
-just checked to recover its tier, so a block broken during the decision refuses as above. The
-store's own warning is the signal that a record went unwritten. A decision that outlives the
+model. An answer applies even when its decision record can't be written or read back, the
+same as for installed targets: the recheck reverse-maps the launched model through the
+snapshot it has just checked to recover its tier, so a block broken during the decision
+refuses as above. The store's own warning is the signal that a record went unwritten, and
+`Decision record read failed` that it could not be read. A decision that outlives the
 claim lease cannot bind: the launch refuses with `claim_expired`, and no terminal is created.
 
 **Upgrade note:** earlier releases ignored the tier and effort keys and table with a warning,

@@ -3836,14 +3836,19 @@ async def _prepare_delegation(
 def _recorded_tier(plan: LaunchPlan) -> str | None:
     """The tier an on-mode answer's record says it applied to this plan, if there is one."""
     for record_id in plan.record_ids:
-        row = app.state.decision_engine.store.get(record_id)
+        try:
+            row = app.state.decision_engine.store.get(record_id)
+        except Exception:
+            # No record content and no traceback: the error can carry the row's values.
+            logger.warning("Decision record read failed")
+            return None
         if row and row["point"] == "model.route" and row["outcome"] in ("applied", "capped"):
             value = row["applied_value"]
             return value if isinstance(value, str) else None
-    # No applied/capped record: either nothing was applied, or the store couldn't write one
-    # (its warning is the signal). Either way, recheck_decided reverse-maps the plan's own
-    # model through the settings snapshot it validates: an installed target already applies
-    # this way regardless of the record.
+    # No applied/capped record: either nothing was applied, or the store couldn't write or
+    # read one (its warning is the signal). Either way, recheck_decided reverse-maps the
+    # plan's own model through the settings snapshot it validates: an installed target
+    # already applies this way regardless of the record.
     return None
 
 
