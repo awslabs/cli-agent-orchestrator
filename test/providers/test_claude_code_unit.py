@@ -4018,6 +4018,24 @@ class TestClaudeCode310PermissionFooterFixtures:
         assert provider.get_status("\n".join(prose_frame)) == TerminalStatus.COMPLETED
         assert provider.get_status_from_screen(prose_frame) == TerminalStatus.COMPLETED
 
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_footer_phrases_split_across_lines_do_not_false_match(self, mock_backend):
+        """Prose that wraps between ``Esc to cancel`` and ``· Tab to amend`` must
+        not match: the real footer is one line, so the arm allows only ``[ \\t]``
+        around the ``·``, never a newline.
+        """
+        prose_frame = [
+            "⏺ The 2.1.310 permission footer reads Esc to cancel",
+            "· Tab to amend, all on one line.",
+            "────────────────────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────────────────────",
+            "  ⏸ manual mode on",
+        ]
+        provider = self._provider(mock_backend, dispatched=False)
+        assert provider.get_status("\n".join(prose_frame)) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(prose_frame) == TerminalStatus.COMPLETED
+
     @pytest.mark.parametrize("name", ["bash_permission_prompt", "write_permission_prompt"])
     def test_handoff_approval_classifies_310_permission_prompts(self, name):
         from cli_agent_orchestrator.services.agui.handoff_approval import classify_reason

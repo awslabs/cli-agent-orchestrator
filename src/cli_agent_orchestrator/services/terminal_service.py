@@ -59,6 +59,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    terminal_id_in_use,
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
@@ -1126,6 +1127,37 @@ def _request_fingerprint(
     ).hexdigest()
 
 
+# A single 32-bit draw is already unlikely to repeat; ten fresh draws after a
+# collision are effectively conclusive. The cap matters for a broken generator
+# (or a test double pinned to one value): fail with a clear error instead of
+# spinning, and before any backend resource is allocated against the id.
+_TERMINAL_ID_ALLOCATION_ATTEMPTS = 10
+
+
+def _allocate_terminal_id() -> str:
+    """Draw a terminal id no live terminal or retained record still references.
+
+    ``generate_terminal_id`` alone is not enough (issue #1088): an id is only
+    unique among CURRENT registry rows, and both idempotency mappings and
+    inbox messages outlive a deleted terminal by ``RETENTION_DAYS``. Reusing
+    one of those ids misroutes a retry or a queued message into the new
+    terminal, so redraw before any resource is keyed off it.
+    """
+    for _ in range(_TERMINAL_ID_ALLOCATION_ATTEMPTS):
+        candidate = generate_terminal_id()
+        if not terminal_id_in_use(candidate):
+            return candidate
+        logger.warning(
+            "Terminal id %s is still referenced by a live or retained record; redrawing",
+            candidate,
+        )
+    raise RuntimeError(
+        "Could not allocate a terminal id after "
+        f"{_TERMINAL_ID_ALLOCATION_ATTEMPTS} attempts; the generator keeps returning "
+        "ids that live terminals, idempotency mappings, or inbox messages still reference"
+    )
+
+
 @dataclass
 class _EphemeralLaunchState:
     """What the create body bound, for the caller's compensation."""
@@ -1940,7 +1972,7 @@ async def _create_terminal_unguarded(
                     )
 
         # Step 1: Generate unique identifiers
-        terminal_id = generate_terminal_id()
+        terminal_id = _allocate_terminal_id()
         if source is agent_profiles.ProfileSource.EPHEMERAL:
             ephemeral_service.bind_ephemeral_agent(
                 agent_profile,

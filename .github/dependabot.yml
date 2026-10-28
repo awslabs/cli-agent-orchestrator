@@ -33,6 +33,7 @@ updates:
       - "/"
       - "/examples/fleet/panel"
       - "/examples/robotics/cross-zone-transport"
+      - "/examples/robotics/hierarchical-factory"
     schedule:
       interval: "weekly"
     cooldown:
@@ -49,6 +50,7 @@ updates:
       - "/examples/ag-ui/ag-ui-construct-demos/tools"
       - "/examples/ag-ui/ag-ui-eventsource-viewer/tools"
       - "/examples/ag-ui/ag-ui-stock-client-live"
+      - "/examples/ag-ui/cao-dojo/tools"
       - "/examples/agent-plugins/agent-plugins-dogfood/tools"
     schedule:
       interval: "weekly"

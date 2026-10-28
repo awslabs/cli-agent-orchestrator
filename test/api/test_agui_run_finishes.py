@@ -177,3 +177,42 @@ async def test_empty_or_non_json_body_is_rejected_with_422(construct, raw):
             "ctx": {"error": str(decode_error.value)},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_resume_with_unknown_interrupt_id_ends_with_run_error(construct):
+    frames = await _post_run(_body(resume=[_approve("nonexistent-id")]))
+
+    assert [f["type"] for f in frames] == ["RUN_STARTED", "RUN_ERROR"]
+    assert "nonexistent-id" in frames[-1]["message"]
+
+
+@pytest.fixture
+def no_bridge():
+    saved = getattr(app.state, "approval_bridge", None)
+    if saved is not None:
+        del app.state.approval_bridge
+    yield
+    if saved is not None:
+        app.state.approval_bridge = saved
+
+
+@pytest.mark.asyncio
+async def test_resume_without_approval_bridge_is_rejected_with_404(no_bridge):
+    # With no bridge nothing can process resume[]; the run must not report success.
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as http:
+        resp = await asyncio.wait_for(
+            http.post("/agui/v1/run", json=_body(resume=[_approve("stale-id")])),
+            timeout=RUN_DEADLINE_SECONDS,
+        )
+
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Approval bridge not initialized"}
+
+
+@pytest.mark.asyncio
+async def test_run_without_resume_still_finishes_without_approval_bridge(no_bridge):
+    frames = await _post_run(_body())
+
+    assert [f["type"] for f in frames] == ["RUN_STARTED", "STATE_SNAPSHOT", "RUN_FINISHED"]

@@ -308,12 +308,12 @@ async def test_run_plane_resume_edit():
     emitter = RecordingUiEmitter()
     construct = AgentHandoffWithApproval(emitter=emitter, answer_delivery=None)
 
-    # Use a prompt that results in options including "edit"
-    # (permission_request includes ["approve", "deny", "edit"])
+    # Use a prompt whose options include "edit" (kiro permission_request).
+    # Claude Code permission prompts do not offer edit.
     interrupt = construct.on_provider_waiting(
         terminal_id="t-1",
-        provider="claude_code",
-        raw_prompt="\u2191/\u2193 to navigate",
+        provider="kiro_cli",
+        raw_prompt="Allow this action? [y/n/t]:",
         session_name="s-1",
     )
 

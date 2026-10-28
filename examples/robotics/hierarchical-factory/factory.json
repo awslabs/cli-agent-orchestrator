@@ -1,0 +1,72 @@
+{
+  "zones": {
+    "west": {"bounds": [-4.5, -1.5, -1.5, 1.5]},
+    "middle": {"bounds": [-1.5, -1.5, 1.5, 1.5]},
+    "east": {"bounds": [1.5, -1.5, 4.5, 1.5]}
+  },
+  "places": {
+    "raw": {"xy": [-4.0, 0], "zones": ["west"]},
+    "west_middle": {"xy": [-1.5, 0], "zones": ["west", "middle"], "capacity": 2},
+    "middle_east": {"xy": [1.5, 0], "zones": ["middle", "east"], "capacity": 4},
+    "dock": {"xy": [4.1, 0], "zones": ["east"]}
+  },
+  "robots": {
+    "a1": {"zone": "west", "xy": [-3.6, 1.0], "heading_deg": 90, "speed_m_s": 0.8},
+    "a2": {"zone": "west", "xy": [-2.3, -1.0], "heading_deg": 180, "speed_m_s": 0.8},
+    "a3": {"zone": "west", "xy": [-3.1, -0.9], "heading_deg": 270, "speed_m_s": 0.8},
+    "b1": {"zone": "middle", "xy": [0.7, 1.1], "heading_deg": 180, "speed_m_s": 0.8},
+    "b2": {"zone": "middle", "xy": [-0.6, -1.1], "heading_deg": 90, "speed_m_s": 0.8},
+    "c1": {"zone": "east", "xy": [3.8, 1.0], "heading_deg": 270, "speed_m_s": 0.8},
+    "c2": {"zone": "east", "xy": [2.0, 1.1], "heading_deg": 0, "speed_m_s": 0.8},
+    "c3": {"zone": "east", "xy": [3.9, -1.0], "heading_deg": 90, "speed_m_s": 0.8},
+    "c4": {"zone": "east", "xy": [2.2, -1.1], "heading_deg": 180, "speed_m_s": 0.8}
+  },
+  "teams": {
+    "west": {
+      "label": "Team A",
+      "kind": "serial",
+      "formation": "queue",
+      "slots": {"a1": [-3.4, 0, 0], "a2": [-2.7, 0, 0], "a3": [-2.0, 0, 0]},
+      "input": "raw",
+      "output": "west_middle",
+      "min_cycle_seconds": 2,
+      "max_cycle_seconds": 12
+    },
+    "middle": {
+      "label": "Team B",
+      "kind": "parallel",
+      "formation": "columns",
+      "slots": {"b1": [0, 0.75, 0], "b2": [0, -0.75, 0]},
+      "input": "west_middle",
+      "output": "middle_east",
+      "min_cycle_seconds": 4,
+      "max_cycle_seconds": 12
+    },
+    "east": {
+      "label": "Team C",
+      "kind": "formation",
+      "formation": "diamond",
+      "slots": {
+        "c1": [2.95, 0, 0],
+        "c2": [2.4, 0.55, 0],
+        "c3": [1.85, 0, 0],
+        "c4": [2.4, -0.55, 0]
+      },
+      "input": "middle_east",
+      "output": "dock",
+      "max_batch": 4,
+      "run_to": [3.3, 0],
+      "run_speed_m_s": 1.6,
+      "turn_deg_s": 90,
+      "spin_deg_s": 360
+    }
+  },
+  "raw_store": "raw",
+  "parts": 16,
+  "step_seconds": 0.02,
+  "part_speed_m_s": 1.5,
+  "robot_turn_deg_s": 270,
+  "arrival_tolerance_m": 0.01,
+  "blocked_report_seconds": 3,
+  "action_timeout_seconds": 30
+}

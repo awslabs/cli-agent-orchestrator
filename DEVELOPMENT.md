@@ -4,7 +4,7 @@ This guide covers setting up your development environment and running tests for 
 
 ## Prerequisites
 
-- Python 3.10 or higher
+- Python 3.11 or higher
 - [uv](https://docs.astral.sh/uv/) - Fast Python package installer and resolver
 - Git
 - tmux 3.2+ (for running the orchestrator and integration tests)
@@ -303,7 +303,7 @@ Create a pull request on GitHub. CI will automatically run tests and code qualit
 ### Comprehensive Workflow (`ci.yml`)
 
 Runs on all pushes to `main` and all PRs targeting `main`:
-- **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
+- **Unit tests**: Python 3.11, 3.12 matrix with coverage
 - **Code quality**: black, isort, ruff, mypy — all blocking; mypy via a per-file ratchet (see [SKILL.md](skills/cao-contributing/SKILL.md))
 - **Security scan**: Trivy filesystem scan — fails on a finding of **any** severity (see [SECURITY.md](SECURITY.md#running-security-scans-locally) for why the workflow's `CRITICAL,HIGH` input is ignored)
 - **Dependency Security**: Full locked npm, Bun, uv, and Cargo graphs, including dev dependencies and unfixed advisories; every HIGH/CRITICAL finding or scan error blocks. Also verifies the installed dependency mitigations. The Python 3.12 unit job runs a real-Trivy dev-inventory regression; see [SECURITY.md](SECURITY.md#full-dependency-gate).
@@ -319,7 +319,7 @@ Each provider has a dedicated workflow that runs only when its files change:
 | `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
 | `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
 
-Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
+Each includes unit tests (Python 3.11/3.12) and code quality checks (black, isort, mypy).
 
 ### Docs Site Workflow (`gh-pages.yml`)
 

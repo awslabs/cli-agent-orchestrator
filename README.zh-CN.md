@@ -63,11 +63,11 @@ CAO 实现的是分层多 Agent 系统：一个 supervisor Agent 把任务委派
 ### 环境要求
 
 - **curl** 和 **git**：用于下载安装脚本和克隆仓库。
-- **Python 3.10 或更高版本**：详见 [pyproject.toml](pyproject.toml)。
+- **Python 3.11 或更高版本**：详见 [pyproject.toml](pyproject.toml)。
 - **tmux 3.3+**：用于 Agent 会话隔离。
 - **[uv](https://docs.astral.sh/uv/)**：快速的 Python 包安装器和虚拟环境管理器。
 
-### 1. 安装 Python 3.10+
+### 1. 安装 Python 3.11+
 
 ```bash
 # macOS (Homebrew)
@@ -83,7 +83,7 @@ sudo dnf install python3.12
 验证：
 
 ```bash
-python3 --version   # 3.10 or higher
+python3 --version   # 3.11 or higher
 ```
 
 > 建议使用 [uv](https://docs.astral.sh/uv/)，而不是 Anaconda 这类系统级 Python 安装。`uv` 会按项目处理虚拟环境和 Python 版本解析。

@@ -91,7 +91,12 @@ def generate_session_name_for_key(idempotency_key: str) -> str:
 
 
 def generate_terminal_id() -> str:
-    """Generate terminal ID without prefix."""
+    """Generate a CANDIDATE terminal ID (8 hex chars, no prefix).
+
+    Not unique on its own. Anything that persists an id must redraw on a
+    collision with a live or retained reference -- see
+    ``terminal_service._allocate_terminal_id`` (issue #1088).
+    """
     return uuid.uuid4().hex[:8]
 
 

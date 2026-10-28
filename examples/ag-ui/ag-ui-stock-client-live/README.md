@@ -26,14 +26,18 @@ verifies, then everything is cleaned up.
 
 ## What the run plane returns
 
-A successful connection produces this frame sequence:
+A successful run produces this frame sequence, and the body ends after the
+last frame:
 
 ```
 RUN_STARTED        -> echo threadId/runId
 STATE_SNAPSHOT     -> current fleet state
-[live frames...]   -> STATE_DELTA, STEP_STARTED/FINISHED, TOOL_CALL_*, CUSTOM
 RUN_FINISHED       -> outcome: {type: "success"} or {type: "interrupt", ...}
 ```
+
+The run plane does not stream live fleet frames (`STATE_DELTA`,
+`STEP_STARTED/FINISHED`, `TOOL_CALL_*`, `CUSTOM`). Those are on the ambient
+plane, `GET /agui/v1/stream`.
 
 ## Stock client code (minimal — `client.mjs`)
 

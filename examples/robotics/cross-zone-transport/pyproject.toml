@@ -2,9 +2,12 @@
 name = "cao-cross-zone-transport"
 version = "0.1.0"
 description = "Simulation-only ownership-zone transport with existing CAO CLI agents"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
+    # CVE-2026-114605: dnspython comes in via fastmcp -> pydantic[email] -> email-validator,
+    # and only 2.9.0 is fixed. The lock pins it; this floor holds for pip installs too.
+    "dnspython>=2.9.0",
     "fastmcp==4.1.2",
     "httpx2==2.14.0",
     "mujoco==3.16.0",

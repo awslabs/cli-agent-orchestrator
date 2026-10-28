@@ -529,12 +529,51 @@ class DecisionEngine:
             if decider is None:
                 values["reason"] = "decider_unavailable"
                 return values
-            response = await asyncio.wait_for(
-                decider.decide(
-                    replace(request, points=(point,)), settings.deciders.get(decider.name, {})
-                ),
-                timeout_ms / 1000,
-            )
+            selected_decider = decider
+
+            async def contained() -> tuple[Any, BaseException | None]:
+                try:
+                    return (
+                        await selected_decider.decide(
+                            replace(request, points=(point,)),
+                            settings.deciders.get(selected_decider.name, {}),
+                        ),
+                        None,
+                    )
+                except (SystemExit, KeyboardInterrupt) as exc:
+                    # These must propagate through the owner, not escape a child
+                    # task callback and stop the server's event loop.
+                    return None, exc
+
+            task = asyncio.ensure_future(contained())
+            try:
+                # wait does not raise the decider's own cancellation. Cancellation
+                # of this launch still propagates from the await, including on 3.10.
+                done, _ = await asyncio.wait({task}, timeout=timeout_ms / 1000)
+                if not done:
+                    # Match wait_for: wait for cancellation cleanup, including a
+                    # decider that returns an answer or raises another error there.
+                    task.cancel()
+                    await asyncio.wait({task})
+                    if task.cancelled():
+                        raise asyncio.TimeoutError()
+                try:
+                    response, _ = task.result()
+                except asyncio.CancelledError:
+                    values["reason"] = "error"
+                    return values
+            finally:
+                try:
+                    if not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                finally:
+                    # Inspect completed cleanup even if another owner cancellation
+                    # interrupts gather; transported fatal exceptions must not vanish.
+                    if task.done() and not task.cancelled() and task.exception() is None:
+                        _, escaped = task.result()
+                        if escaped is not None:
+                            raise escaped
             answer = response.get(point) if isinstance(response, Mapping) else None
             if answer is None:
                 values["reason"] = "no_answer"

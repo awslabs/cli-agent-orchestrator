@@ -43,7 +43,7 @@ See [CODEBASE.md](CODEBASE.md) for the runtime architecture and package layout.
 
 Install:
 
-- Python 3.10 or later
+- Python 3.11 or later
 - tmux 3.3 or later
 - [uv](https://docs.astral.sh/uv/)
 - At least one supported provider CLI, authenticated before you launch CAO:
@@ -141,6 +141,9 @@ provider override while keeping the same sequence.
   parallel AI-DLC intents across repositories and isolated worktrees.
 - [Cross-zone robot transport](examples/robotics/cross-zone-transport/README.md):
   coordinate simulated transport, measured custody handoffs, and independent checks.
+- [Hierarchical robot factory](examples/robotics/hierarchical-factory/README.md):
+  a supervisor and three team-manager agents run nine Open Duck Mini robots on a
+  simulated make, assemble, and ship line, and balance its bottleneck.
 - [Self-hosted decision model](examples/decision-model-host/README.md): run the open
   JevK5-4B decision model locally or on AWS (CDK), behind a loopback-only `/v1/systemone` API.
 - [Tool restrictions](docs/tool-restrictions.md): roles, allowlists, and

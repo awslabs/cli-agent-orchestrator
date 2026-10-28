@@ -54,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -197,7 +197,7 @@ jobs:
       # explicit keeps one convention instead of two, and does not depend on which image
       # happens to ship a `python` shim. It cannot affect the wheels — cibuildwheel ignores
       # the host interpreter when selecting build Pythons. (#321)
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -246,7 +246,7 @@ jobs:
       # (`[tool.cibuildwheel] test-command`) installs the wheel and RUNS `cao tui`, so a
       # wheel whose binary is missing, non-executable, or built for the wrong architecture
       # fails HERE rather than on an operator's machine (SR-1).
-      - uses: pypa/cibuildwheel@f11181315571b24e4a3c67f1a828532793f2df55  # v4.3.2
+      - uses: pypa/cibuildwheel@8c2dcd2e96041a619f5ff03c9638d7941e2553a4  # v4.3.3
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
           # See `macos-target` in the matrix: this is what keeps delocate from rejecting a
@@ -303,7 +303,7 @@ jobs:
           npm ci
           npm run build
 
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa  # v10.3.1
 
       - name: Build sdist
         run: uv build --sdist
@@ -375,7 +375,7 @@ jobs:
           # matrix in step with that one is what makes "every wheel we ship is installed and
           # executed by CI" true rather than aspirational.
     steps:
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -516,7 +516,7 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa  # v10.3.1
 
       - name: Install the project
         run: uv sync --locked --all-extras --dev

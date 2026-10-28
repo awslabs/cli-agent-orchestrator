@@ -65,7 +65,7 @@ This is what `serve.sh` does, step by step, if you want to run it yourself or pu
 
 - **llama.cpp:** new enough to load Qwen3.5's hybrid layers. This sample is tested with build `b11669`
   (Homebrew `llama.cpp` 0.7.0). A much older build fails to load the model.
-- **Tools:** Python 3.10 or newer, `git` and `curl`.
+- **Tools:** Python 3.11 or newer, `git` and `curl`.
 - **Disk and memory:** about 5 GB free for the model, and about 5 GB of memory (unified memory on a Mac,
   or GPU memory) at the 8192-token context used below.
 

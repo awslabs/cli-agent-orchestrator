@@ -25,7 +25,7 @@
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "sigma": "^4.0.3",
-    "zustand": "^4.4.0"
+    "zustand": "^5.0.15"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^7.0.1",

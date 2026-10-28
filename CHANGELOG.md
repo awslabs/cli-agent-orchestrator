@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Hierarchical robot factory example** (`examples/robotics/hierarchical-factory/`): a
+  simulation-only factory floor in MuJoCo, run by four CAO agents in two layers. A supervisor assigns
+  three team managers with `assign`; each manager runs its own team of Open Duck Mini robots (a serial
+  queue of 3, two parallel assembly lines, and a 4-robot formation that spins, turns, and runs to the
+  dock) through scoped MCP tools and reports with `send_message`; the supervisor balances the line when
+  a team blocks. Per-team credentials; managers hold only `@cao-mcp-server/send_message`, so CAO
+  refuses them `assign` and `handoff`. A loopback-only controller with a read-only live view, operator
+  stop, recorded frames and a GIF, a pinned and hash-checked download of the Open Duck Mini model, and
+  a `Robotics factory example` CI workflow. No CAO core change.
+
+- **Breaking: CAO now requires Python 3.11 or later** (CVE-2026-114605). dnspython, which CAO pulls in
+  through fastmcp, pydantic and email-validator, fixes CVE-2026-114605 (HIGH) only in 2.9.0, and 2.9.0
+  requires Python 3.11. Python 3.10 reached end-of-life on 2026-10-01. `requires-python` is now `>=3.11`,
+  release wheels build on `cp311`, and CI no longer tests 3.10. On Python 3.10, keep using the current
+  release or upgrade the interpreter. The docusaurus lock also moves `qs` to 6.17.0 (CVE-2026-110816), and
+  its override floor is now `^6.16.1`.
+
+- **`POST /agui/v1/run` refuses a `resume[]` it cannot process** (#1107 follow-up). When the server
+  started with the AG-UI surface off and it was turned on later, no approval bridge exists, so the run
+  skipped every `resume[]` entry and still reported `RUN_FINISHED` `success`. The route now answers
+  HTTP 404 "Approval bridge not initialized", as `POST /agui/v1/interrupts/{id}/resume` does. A run
+  without `resume[]` is unchanged. The documented request bodies now include the required `messages`
+  and the AG-UI 1.0 resume entry shape, and the docs no longer say the run plane streams live frames.
+
 - **`POST /agui/v1/run` now ends its response after `RUN_FINISHED`** (#1106, ag-ui-protocol/ag-ui#2216). A
   run with nothing pending, or one whose `resume[]` resolved the last pending interrupt, used to stay
   open forever. The route handed the run plane the whole-fleet SSE bus, which never ends, and nothing
@@ -168,6 +192,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Binding the project root by device and inode (#827, second criterion) is not part of this change.
 
 ### Added
+
+- Ephemeral agents (#1074): one provider-capability table now drives the `allowed_providers` rule, the create and claim provider checks, the effort mapping and the MCP tool's provider list. A create response carries `enforcement` (`hard` on Claude Code, `advisory` on Codex), and a provider that cannot run a requested tool atom refuses with `tool_unsupported_on_provider:<atom>`, which no current provider does. Accepted providers, refusals and stored files are unchanged. The label values and the new rule are provisional.
 
 - Ephemeral agents (#801) accept an explicit `effort` and apply `ephemeral.default_effort` and `ephemeral.max_effort` (Claude Code `--effort`, Codex `model_reasoning_effort`).
 

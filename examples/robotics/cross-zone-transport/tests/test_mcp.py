@@ -47,7 +47,10 @@ def controller(tmp_path):
         "scopes": ["observe", "operate"],
     }
     snapshot = tmp_path / "last-state.json"
-    app = make_server(world, tokens, snapshot).http_app(stateless_http=True)
+    # As demo.py serve runs it: Host and Origin are checked on every request.
+    app = make_server(world, tokens, snapshot).http_app(
+        stateless_http=True, host_origin_protection=True
+    )
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -324,3 +327,42 @@ def test_failed_snapshot_preserves_previous_state_and_removes_temporary_file(tmp
         save_snapshot(snapshot, {"stopped": False})
     assert json.loads(snapshot.read_text()) == original
     assert list(tmp_path.iterdir()) == [snapshot]
+
+
+@pytest.mark.parametrize("path", ["/", "/state", "/mcp"])
+def test_a_rebound_host_name_cannot_reach_the_controller(controller, path):
+    # DNS rebinding: a web page resolves its own name to 127.0.0.1. The browser
+    # then sends that name in the Host header, and the controller refuses it.
+    url, credentials, _, _ = controller
+    base = url[: -len("/mcp")]
+    headers = {"Host": "evil.example:8766"}
+    if path == "/mcp":
+        headers["Authorization"] = f"Bearer {credentials['observer'].get_secret_value()}"
+    with httpx2.Client(trust_env=False) as client:
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        response = (
+            client.post(base + path, json=request, headers=headers)
+            if path == "/mcp"
+            else client.get(base + path, headers=headers)
+        )
+        assert response.status_code == 421
+        port = base.rsplit(":", 1)[1]
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            assert client.get(base + "/state", headers={"Host": host}).status_code == 200
+
+
+def test_a_cross_site_page_cannot_read_the_live_view(controller):
+    url, _, _, _ = controller
+    base = url[: -len("/mcp")]
+    with httpx2.Client(trust_env=False) as client:
+        response = client.get(base + "/state", headers={"Origin": "https://evil.example"})
+        assert response.status_code == 403
+
+
+def test_extra_host_names_come_only_from_the_environment(monkeypatch):
+    import transport_mcp
+
+    monkeypatch.delenv("TRANSPORT_ALLOWED_HOSTS", raising=False)
+    assert transport_mcp.allowed_hosts() is None
+    monkeypatch.setenv("TRANSPORT_ALLOWED_HOSTS", " *.cloudfront.net , ,ide.example ")
+    assert transport_mcp.allowed_hosts() == ["*.cloudfront.net", "ide.example"]

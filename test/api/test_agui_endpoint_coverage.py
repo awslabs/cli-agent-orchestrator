@@ -70,7 +70,7 @@ def test_resume_returns_422_on_edit_validation_error():
     construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
     main.app.state.approval_bridge = ApprovalBridge(construct=construct)
     try:
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         client = TestClient(main.app, base_url="http://localhost")
         # Valid decision ("edit") but empty edited_text → construct.resume raises
         # ValueError → the endpoint's `except ValueError` → 422.

@@ -2072,6 +2072,42 @@ def _migrate_terminals_schema() -> None:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
+def terminal_id_in_use(terminal_id: str) -> bool:
+    """Whether ``terminal_id`` must not be issued to a new terminal (#1088).
+
+    ``terminals.id`` proves the id is live. The other two reads are what make a
+    DELETED id still dangerous: both tables join on this string and outlive the
+    terminal row (they are purged only by ``cleanup_service`` at
+    ``RETENTION_DAYS``), even though ``delete_terminal`` removes the row that
+    used to prove the id was taken.
+
+    - ``idempotency_keys.terminal_id``: a retry resolves its key to this id and
+      then looks the row up. If a new terminal reused it, ``get_terminal``
+      succeeds against the wrong terminal -- a fingerprint mismatch raises a
+      spurious conflict, and a coincidentally equal one hands the caller
+      somebody else's running worker.
+    - ``inbox.receiver_id``: reconciliation joins a PENDING message's receiver
+      id to ``terminals``, so a reused id types the deleted receiver's stale
+      message into the new terminal's live session.
+
+    Checking every status, not just PENDING: a delivered row still makes the
+    new terminal look like the receiver of history it never received. Once the
+    row ages out of retention, reuse is harmless and this returns False.
+    """
+    with SessionLocal() as db:
+        if db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first():
+            return True
+        if (
+            db.query(IdempotencyKeyModel.key)
+            .filter(IdempotencyKeyModel.terminal_id == terminal_id)
+            .first()
+        ):
+            return True
+        if db.query(InboxModel.id).filter(InboxModel.receiver_id == terminal_id).first():
+            return True
+        return False
+
+
 def create_terminal(
     terminal_id: str,
     tmux_session: str,

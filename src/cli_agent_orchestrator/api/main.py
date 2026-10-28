@@ -2667,6 +2667,7 @@ async def agui_run(
     Returns 501 when the ``ag-ui-protocol`` package is not installed (the
     [agui] optional extra was not included at install time).
     Returns 404 when the AG-UI surface is disabled.
+    Returns 404 when ``resume[]`` is non-empty and no approval bridge exists.
     Returns 422 when the body is not a valid ``RunAgentInput``.
     """
     _require_agui_enabled()
@@ -2722,8 +2723,14 @@ async def agui_run(
                 detail="cao:write required when resume[] is non-empty",
             )
 
-    # Get approval construct from app state
+    # Get approval construct from app state. Without a bridge nothing can process
+    # resume[], so refuse it as the REST resume route does instead of reporting success.
     bridge = getattr(app.state, "approval_bridge", None)
+    if resume_entries and bridge is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval bridge not initialized",
+        )
     approval_construct = bridge.construct if bridge is not None else None
 
     # Build the snapshot function
