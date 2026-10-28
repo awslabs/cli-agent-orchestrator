@@ -1564,6 +1564,24 @@ class TestMcpKeyValidation:
             assert coord not in command
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_entry_merely_named_cao_mcp_server_is_not_deferred_exempt(self, mock_load):
+        """The launch config's own ``is_cao_server`` flag (it keeps the CAO tools
+        out of Codex's deferred tool search) is decided by shape, like the
+        coordinates and the identity. An entry NAMED ``cao-mcp-server`` whose
+        command is a foreign program gets no ``omit_tools_from``; the real
+        bundled server, under any name, does."""
+        mock_load.return_value = self._profile_with(
+            {
+                "cao-mcp-server": {"command": "cmd", "args": []},
+                "orchestrator": {"command": "cao-mcp-server", "args": []},
+            }
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert 'mcp_servers.cao-mcp-server.omit_tools_from=["deferred"]' not in command
+        assert 'mcp_servers.orchestrator.omit_tools_from=["deferred"]' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_bundled_server_is_told_this_cao_address(self, mock_load, monkeypatch):
         """Codex inherits only the names in env_vars, so the port must travel in env."""
         monkeypatch.setenv("CAO_API_PORT", "9899")

@@ -338,16 +338,17 @@ class TestServerEnv:
         assert "env" not in default
 
     def test_uvx_launched_entry_named_cao_mcp_server_gains_the_address(self, monkeypatch):
-        """#1075 P3-1: the entry's own name in the profile's ``mcpServers`` map
-        identifies it as the CAO server too, the same way Codex's own
-        ``is_cao_server`` check already does, so a ``uvx`` launch is covered."""
+        """#1075 P3-1 asked for ``uvx`` launches to be covered. They are, by
+        SHAPE: ``is_bundled_cao_server`` sees the console-script name in
+        ``args``. The entry name passed here is incidental; the same entry gains
+        the address under any name (see ``TestCoordinatesAreShapeGated``)."""
         self._set(monkeypatch, CAO_API_PORT="9899")
         out = resolve_mcp_server_config(
             {"command": "uvx", "args": ["--from", "pkg", "cao-mcp-server"]},
             name="cao-mcp-server",
         )
         assert out["env"] == {"CAO_API_PORT": "9899"}
-        # Name-matching only adds the address; it does not touch the uvx command.
+        # Shape-matching only adds the address; it does not touch the uvx command.
         assert out["command"] == "uvx"
 
     def test_absolute_path_entry_gains_the_address_by_final_segment(self, monkeypatch):
@@ -358,8 +359,9 @@ class TestServerEnv:
         assert out["env"] == {"CAO_API_PORT": "9899"}
 
     def test_non_cao_server_never_gains_the_address(self, monkeypatch):
-        """Neither the command, its final path segment, nor the entry name is
-        ``cao-mcp-server``, so no address is added — even via uvx."""
+        """Nothing this entry launches is the bundled server (no token with the
+        console-script basename, no module entrypoint), so no address is added —
+        even via uvx, and whatever the entry is named."""
         self._set(monkeypatch, CAO_API_PORT="9899")
         out = resolve_mcp_server_config(
             {"command": "uvx", "args": ["--from", "pkg", "my-server"]},
@@ -377,18 +379,19 @@ class TestServerEnv:
     )
     def test_near_miss_entries_never_gain_the_address(self, monkeypatch, config, name):
         """P3-1: these entries each contain ``cao-mcp-server`` as a substring
-        of the basename or the name, but neither equals it exactly. A
-        substring regression on either clause (``CAO_MCP_SERVER_COMMAND in
-        str(command)`` or `` in (name or "")``) would wrongly match them."""
+        of a basename or of the entry name, but no launched token equals the
+        console-script name exactly. A substring regression in
+        ``is_bundled_cao_server`` (``CAO_MCP_SERVER_COMMAND in token``) would
+        wrongly match them; the name is never consulted."""
         self._set(monkeypatch, CAO_API_PORT="9899")
         kwargs = {"name": name} if name is not None else {}
         out = resolve_mcp_server_config(config, **kwargs)
         assert "env" not in out
 
     def test_persisted_entry_never_gains_the_address_even_by_name(self, monkeypatch):
-        """``persisted=True`` is the off switch regardless of how the entry is
-        identified as the CAO server — a persisted config outlives this
-        process and may be read by another CAO."""
+        """``persisted=True`` is the off switch even for an entry whose shape IS
+        the bundled server — a persisted config outlives this process and may
+        be read by another CAO."""
         self._set(monkeypatch, CAO_API_PORT="9899")
         out = resolve_mcp_server_config(
             {"command": "uvx", "args": ["--from", "pkg", "cao-mcp-server"]},
@@ -544,18 +547,27 @@ class TestCoordinatesAreShapeGated:
         import ast
 
         src = Path(__file__).resolve().parents[2] / "src" / "cli_agent_orchestrator"
-        callers = set()
+        calls_per_file: dict = {}
         for path in sorted(src.rglob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            # Names this module binds to the function, including ``import ... as``.
+            local_names = {"cao_server_env"}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name == "cao_server_env" and alias.asname:
+                            local_names.add(alias.asname)
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
                 func = node.func
-                called = (
-                    func.id
-                    if isinstance(func, ast.Name)
-                    else func.attr if isinstance(func, ast.Attribute) else None
+                is_call = (isinstance(func, ast.Name) and func.id in local_names) or (
+                    isinstance(func, ast.Attribute) and func.attr == "cao_server_env"
                 )
-                if called == "cao_server_env":
-                    callers.add(path.relative_to(src).as_posix())
-        assert callers == {"utils/mcp_resolution.py", "backends/herdr_backend.py"}
+                if is_call:
+                    rel = path.relative_to(src).as_posix()
+                    calls_per_file[rel] = calls_per_file.get(rel, 0) + 1
+        # Exactly one call in each of the two known writers. A second call inside
+        # either file (say, on the persisted branch) is as much a new injection
+        # site as a third file, so the count is pinned, not just the membership.
+        assert calls_per_file == {"utils/mcp_resolution.py": 1, "backends/herdr_backend.py": 1}
