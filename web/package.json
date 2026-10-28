@@ -20,7 +20,7 @@
     "braces": "file:braces-compat",
     "graphology": "^0.26.0",
     "graphology-layout": "^0.6.1",
-    "lucide-react": "^0.562.0",
+    "lucide-react": "^1.61.0",
     "patch-package": "8.0.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
