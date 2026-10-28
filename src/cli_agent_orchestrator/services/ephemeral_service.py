@@ -1156,15 +1156,38 @@ def decision_inputs(
     return EphemeralDecisionInputs({"model.route": "auto"}, policy, spec.purpose, spec.description)
 
 
+def _recovered_tier(
+    model: str, provider: str, bounds: PolicyBounds, tiers: dict[str, dict[str, str]]
+) -> Optional[str]:
+    """The tier an unrecorded launch's model maps to in one validated snapshot's table."""
+    matches = [tier for tier, mapped in tiers.get(provider, {}).items() if mapped == model]
+    # Two tiers can share a model id (e.g. during a migration): table order shouldn't decide
+    # the outcome, so prefer whichever match is within the current bounds. If none is, any
+    # of them refuses the same way, so the first still collects as before.
+    for tier in matches:
+        try:
+            bounds.check_explicit("model.route", tier, provider, tiers)
+            return tier
+        except DecisionInputError:
+            continue
+    return matches[0] if matches else None
+
+
 def recheck_decided(
-    name: str, claim_id: str, caller_id: Optional[str], tier: Optional[str]
+    name: str,
+    claim_id: str,
+    caller_id: Optional[str],
+    tier: Optional[str],
+    launched_model: Optional[str] = None,
 ) -> Optional[str]:
     """#1068: re-apply the operator's current policy to a claimed auto launch before the bind.
 
     The operator may change the bounds or the table while the decider runs. ``tier`` is the
-    tier an on-mode answer applied, or None when the launch runs the fallback. Returns the
-    model the current table maps the launched tier to, or None when the claim is no longer
-    live, so the bind refuses with its own rule.
+    tier an on-mode answer's record says it applied. Without one, ``launched_model`` (the
+    plan's model) is reverse-mapped through the snapshot this recheck has just validated, so
+    a block broken during the decision refuses as at claim; with no match the launch runs the
+    fallback. Returns the model the current table maps the launched tier to, or None when the
+    claim is no longer live, so the bind refuses with its own rule.
     """
     row = database.get_ephemeral_agent(name)
     if (
@@ -1180,12 +1203,13 @@ def recheck_decided(
         # The stored fallback tier, with the claim's rules: a block error reverts, a tier
         # now outside the bounds collects.
         values = _recheck_policy(row, settings, claim_id)
+        tiers = settings["_model_tiers"]
+        bounds = policy_bounds(settings)
+        if tier is None and launched_model is not None:
+            tier = _recovered_tier(launched_model, row["provider"], bounds, tiers)
         if tier is None:
             return cast(Optional[str], values["model"])
-        tiers = settings["_model_tiers"]
-        refusal = _value_refusal(
-            "model.route", tier, row["provider"], policy_bounds(settings), tiers
-        )
+        refusal = _value_refusal("model.route", tier, row["provider"], bounds, tiers)
         if refusal is not None:
             # With a valid block every tier within both bounds is mapped, so the applied tier
             # is outside them: tightened during the decision, as in decision_refusal.

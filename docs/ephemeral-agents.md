@@ -150,14 +150,15 @@ now outside `[min_tier, max_tier]` collects the name. An applied answer whose ti
 outside the bounds gives `policy_changed_since_create:<rule>` and collects the name. A remap
 of the launched tier to a new model id changes no bound: the child runs on the tier's current
 model. An answer applies even when its decision record can't be written, the same as for
-installed targets: the recheck reverse-maps the launched model through the current table to
-recover its tier. The store's own warning is the signal that a record went unwritten. A
-decision that outlives the claim lease cannot bind: the launch refuses with `claim_expired`,
-and no terminal is created.
+installed targets: the recheck reverse-maps the launched model through the snapshot it has
+just checked to recover its tier, so a block broken during the decision refuses as above. The
+store's own warning is the signal that a record went unwritten. A decision that outlives the
+claim lease cannot bind: the launch refuses with `claim_expired`, and no terminal is created.
 
 **Upgrade note:** earlier releases ignored the tier and effort keys and table with a warning,
-whatever their values. All four tier and effort keys are now validated. A previously accepted block, such as a
-ceiling without a default, can therefore refuse every ephemeral create and claim.
+whatever their values. All five tier and effort keys, including the new `min_tier`, are now
+validated. A previously accepted block, such as a ceiling without a default, can therefore
+refuse every ephemeral create and claim.
 
 ## Create surface and stored files
 

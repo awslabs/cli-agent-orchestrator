@@ -591,6 +591,113 @@ async def test_a_policy_changed_during_the_decision_applies_before_the_bind(
     assert decided_events(e5.name) == []
 
 
+# A block broken while the decider runs refuses as at claim, even when the launch has no
+# applied record and its tier must be recovered from the plan's model.
+
+BROKEN_BLOCKS = [
+    ({"min_tier": "bogus"}, "min_tier"),
+    ({"min_tier": 3}, "min_tier"),
+    ({"max_tier": "bogus"}, "max_tier"),
+    ({"default_tier": "bogus"}, "default_tier"),
+    ({"allowed_providers": 5}, "allowed_providers"),
+    ({"allowed_providers": None}, "allowed_providers"),
+    ({"allowed_providers": "claude_code"}, "allowed_providers"),
+    ({"max_effort": "bogus"}, "max_effort"),
+]
+
+
+def assert_returned_to_pending(rt):
+    row = database.get_ephemeral_agent(rt.name)
+    assert row["state"] == "pending" and row["claim_id"] is None
+    assert decided_events(rt.name) == []
+    rt.backend.create_window.assert_not_called()
+    rt.factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "early", "default"])
+@pytest.mark.parametrize("change,key", BROKEN_BLOCKS)
+@pytest.mark.parametrize(
+    "case",
+    [{"tier": "auto", "answer": "unsure"}, {"tier": "auto", "failure": "timeout"}],
+    indirect=True,
+)
+async def test_a_block_broken_during_a_fallback_decision_returns_the_name(e5, path, change, key):
+    e5.decider.during = lambda: operator_edit(e5, change)
+    result = await invoke(path, e5.name)
+    assert not result["success"] and result["rule"] == "policy_config_error:" + key
+    assert "ephemeral." + key in result["message"]
+    (record,) = e5.store.list()
+    assert record["outcome"] == "fallback" and record["launch_status"] == "not_launched"
+    assert_returned_to_pending(e5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+@pytest.mark.parametrize("change,key", BROKEN_BLOCKS)
+@pytest.mark.parametrize("case", [{"tier": "auto", "answer": "large"}], indirect=True)
+async def test_a_block_broken_during_an_unrecorded_decision_returns_the_name(
+    e5, path, monkeypatch, change, key
+):
+    monkeypatch.setattr(e5.store, "insert", lambda *a, **kw: None)
+    e5.decider.during = lambda: operator_edit(e5, change)
+    result = await invoke(path, e5.name)
+    assert not result["success"] and result["rule"] == "policy_config_error:" + key
+    drain(e5)
+    assert e5.store.list() == []
+    assert_returned_to_pending(e5)
+
+
+@pytest.mark.parametrize("site", ["terminal", "step"])
+@pytest.mark.parametrize("change,key", BROKEN_BLOCKS)
+@pytest.mark.parametrize("case", [{"tier": "auto", "answer": "unsure"}], indirect=True)
+def test_a_block_broken_during_the_decision_is_a_logged_policy_refusal(
+    e5, site, change, key, caplog
+):
+    rule = "policy_config_error:" + key
+    token = claim(e5.env, e5.name)["claim_id"]
+    e5.decider.during = lambda: operator_edit(e5, change)
+    with caplog.at_level("WARNING"):
+        response = raw_launch(e5, site, token)
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert detail["kind"] == "ephemeral_policy" and detail["rule"] == rule
+    assert "ephemeral." + key in detail["message"]
+    assert audit(e5.name)["refusals"][rule]["count"] == 1
+    assert any("ephemeral refusal rule=" + rule + " " in r.getMessage() for r in caplog.records)
+    assert_returned_to_pending(e5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+@pytest.mark.parametrize("unrecorded", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    [{"tier": "auto", "answer": "unsure"}, {"tier": "auto", "answer": "large"}],
+    indirect=True,
+)
+async def test_the_bind_recheck_reads_one_settings_snapshot(e5, path, monkeypatch, unrecorded):
+    # The tier recovered for an unrecorded launch and the policy it is checked against come
+    # from one snapshot, so no second read can disagree with the one the recheck validated.
+    service = e5.env[0]
+    real, reads = service.read_settings, []
+
+    def read_settings():
+        reads.append(1)
+        return real()
+
+    monkeypatch.setattr(service, "read_settings", read_settings)
+    if unrecorded:
+        monkeypatch.setattr(e5.store, "insert", lambda *a, **kw: None)
+    # The edit lands after decision_inputs' read, so only the pre-bind reads are counted.
+    e5.decider.during = lambda: (reads.clear(), operator_edit(e5, {"min_tier": "bogus"}))
+    result = await invoke(path, e5.name)
+    assert not result["success"] and result["rule"] == "policy_config_error:min_tier"
+    assert len(reads) == 1
+    drain(e5)
+    assert_returned_to_pending(e5)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["assign", "early", "default"])
 @pytest.mark.parametrize("case", [{"tier": "auto", "answer": "large"}], indirect=True)

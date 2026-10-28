@@ -3816,7 +3816,7 @@ async def _prepare_delegation(
             # launched tier before the bind, whatever the outcome.
             try:
                 model = ephemeral_service.recheck_decided(
-                    name, claim_id, caller_id, _applied_tier(plan, req.provider)
+                    name, claim_id, caller_id, _recorded_tier(plan), plan.model
                 )
             except BaseException:
                 _bind_unlaunched(plan)
@@ -3833,40 +3833,18 @@ async def _prepare_delegation(
     return plan
 
 
-def _applied_tier(plan: LaunchPlan, provider: str) -> str | None:
-    """The tier an on-mode answer applied to this plan, or None when it runs its fallback."""
+def _recorded_tier(plan: LaunchPlan) -> str | None:
+    """The tier an on-mode answer's record says it applied to this plan, if there is one."""
     for record_id in plan.record_ids:
         row = app.state.decision_engine.store.get(record_id)
         if row and row["point"] == "model.route" and row["outcome"] in ("applied", "capped"):
             value = row["applied_value"]
             return value if isinstance(value, str) else None
     # No applied/capped record: either nothing was applied, or the store couldn't write one
-    # (its warning is the signal). Either way, reverse-map the plan's own model through the
-    # current table: an installed target already applies this way regardless of the record.
-    if plan.model is None:
-        return None
-    from cli_agent_orchestrator.services import ephemeral_service
-
-    try:
-        settings = ephemeral_service.read_settings()
-    except EphemeralPolicyError:
-        return None  # recheck_decided's own read raises the authoritative error.
-    all_tiers: dict[str, dict[str, str]] = settings.get("_model_tiers", {})
-    tiers = all_tiers.get(provider, {})
-    matches: list[str] = [tier for tier, model in tiers.items() if model == plan.model]
-    if not matches:
-        return None
-    # Two tiers can share a model id (e.g. during a migration): table order shouldn't decide
-    # the outcome, so prefer whichever match is within the current bounds. If none is, any
-    # of them refuses the same way, so the first still collects as before.
-    bounds = ephemeral_service.policy_bounds(settings)
-    for tier in matches:
-        try:
-            bounds.check_explicit("model.route", tier, provider, all_tiers)
-            return cast(str, tier)
-        except DecisionInputError:
-            continue
-    return cast(str, matches[0])
+    # (its warning is the signal). Either way, recheck_decided reverse-maps the plan's own
+    # model through the settings snapshot it validates: an installed target already applies
+    # this way regardless of the record.
+    return None
 
 
 def _bind_unlaunched(plan: LaunchPlan | None) -> None:
