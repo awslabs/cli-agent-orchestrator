@@ -264,15 +264,40 @@ async def test_sync_init_failure_writes_no_record(release_runtime):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("startup", [True, False])
 async def test_ephemeral_sweep_leaves_a_live_launch_open(release_runtime, monkeypatch, startup):
-    """The sweep never collects a launched name whose terminal still exists."""
+    """The sweep never collects a launched name whose terminal still exists,
+    on a startup pass or past the launch grace on a periodic pass."""
     env, name, _, _ = release_runtime
     monkeypatch.setattr(atomic_file, "LOCK_DIR", env[2] / "locks")
     await launch_runtime(release_runtime)
+    if not startup:
+        monkeypatch.setattr(database, "_utcnow", lambda: NOW + timedelta(seconds=601))
 
     assert ephemeral_service.sweep(startup=startup) == {}
 
     assert database.get_ephemeral_agent(name)["state"] == "launched"
     assert database.get_launch_record(CHILD)["ended_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_sweep_periodic_past_grace_collects_a_gone_terminal(
+    release_runtime, monkeypatch
+):
+    """Companion control for the test above: past the grace, a periodic
+    pass does collect a name whose terminal is actually gone, and ending the
+    launch earlier keeps that end_reason (first reason wins)."""
+    env, name, _, _ = release_runtime
+    monkeypatch.setattr(atomic_file, "LOCK_DIR", env[2] / "locks")
+    await launch_runtime(release_runtime)
+    with monkeypatch.context() as lost:
+        lost.setattr(ephemeral_service, "release", lambda *args: None)
+        assert terminal_service.delete_terminal(CHILD, end_reason="deleted")
+    ended_at = _ended("deleted")["ended_at"]
+    monkeypatch.setattr(database, "_utcnow", lambda: NOW + timedelta(seconds=601))
+
+    assert ephemeral_service.sweep(startup=False).get("terminal_gone") == 1
+
+    assert database.get_ephemeral_agent(name)["gc_reason"] == "terminal_gone"
+    assert _ended("deleted")["ended_at"] == ended_at
 
 
 @pytest.mark.asyncio
