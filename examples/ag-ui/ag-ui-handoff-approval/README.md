@@ -73,12 +73,11 @@ For a full human-in-the-loop demo with a real Claude Code provider:
 
 5. **Resolve via REST**:
    ```sh
-   # List pending interrupts
-   curl http://localhost:9889/agui/v1/approvals | jq .pending
-
-   # Approve the first one
-   INTERRUPT_ID=$(curl -s http://localhost:9889/agui/v1/approvals | jq -r '.pending[0].id')
-   curl -X POST "http://localhost:9889/agui/v1/approvals/${INTERRUPT_ID}/resume" \
+   # No route lists pending approvals. Take the interrupt id from the
+   # approval_card frame on GET /agui/v1/stream, or from the RUN_FINISHED
+   # outcome.interrupts[] of a POST /agui/v1/run.
+   INTERRUPT_ID=...
+   curl -X POST "http://localhost:9889/agui/v1/interrupts/${INTERRUPT_ID}/resume" \
        -H 'content-type: application/json' \
        -d '{"decision": "approve"}'
    ```
@@ -90,6 +89,7 @@ For a full human-in-the-loop demo with a real Claude Code provider:
        -d '{
          "threadId": "t1",
          "runId": "r1",
+         "messages": [],
          "resume": [{"interruptId": "...", "status": "resolved", "payload": {"approved": true}}]
        }'
    ```
@@ -113,7 +113,7 @@ AgentHandoffWithApproval.on_provider_waiting()
     |  -> Interrupt record
     |  -> emit("approval_card", {...})
     v
-REST: POST /agui/v1/approvals/{id}/resume
+REST: POST /agui/v1/interrupts/{id}/resume
     |
     v
 AgentHandoffWithApproval.resume(id, decision)

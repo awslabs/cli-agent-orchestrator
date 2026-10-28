@@ -123,7 +123,7 @@ The project includes multiple GitHub Actions workflows that run on pull requests
 
 ### Comprehensive Workflow (`ci.yml`)
 Runs **all tests** in `test/` (excluding provider integration tests), plus security scanning:
-- **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
+- **Unit tests**: Python 3.11, 3.12 matrix with coverage
 - **Code quality**: black, isort, mypy
 - **Security scan**: Trivy vulnerability scanner (CRITICAL/HIGH)
 - **Dependency review**: License and vulnerability checks on PRs
@@ -137,7 +137,7 @@ Each provider has a dedicated workflow that runs only when its files change:
 | `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
 | `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
 
-Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
+Each includes unit tests (Python 3.11/3.12) and code quality checks (black, isort, mypy).
 
 ## Writing New Tests
 

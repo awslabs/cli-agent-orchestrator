@@ -159,7 +159,15 @@ IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" pro
 # The "↑/↓ to navigate" arm has the same class of false-positive risk from agent prose (see the
 # existing xfail test_agent_prose_with_nav_text_in_footer_false_waiting) but is left as-is here --
 # out of scope for this fix, which only addresses the "Enter to confirm" case flagged in review.
-WAITING_USER_ANSWER_PATTERN = r"↑/↓ to navigate|Enter to confirm[ \t]*·"
+#
+# Claude Code 2.1.310 tool-permission dialogs (e.g. Bash "Do you want to proceed?" and Write
+# "Do you want to create <file>?") render the footer "Esc to cancel · Tab to amend" instead of
+# "↑/↓ to navigate" or "Enter to confirm ·". Anchored to the same-line "[ \t]*·[ \t]*Tab to amend"
+# chrome structure so completed prose mentioning "Esc to cancel" or "Tab to amend" without the
+# "·" separator does not false-match.
+WAITING_USER_ANSWER_PATTERN = (
+    r"↑/↓ to navigate|Enter to confirm[ \t]*·|Esc to cancel[ \t]*·[ \t]*Tab to amend"
+)
 PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog

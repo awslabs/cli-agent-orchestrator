@@ -43,7 +43,7 @@ See [CODEBASE.md](CODEBASE.md) for the runtime architecture and package layout.
 
 Install:
 
-- Python 3.10 or later
+- Python 3.11 or later
 - tmux 3.3 or later
 - [uv](https://docs.astral.sh/uv/)
 - At least one supported provider CLI, authenticated before you launch CAO:
