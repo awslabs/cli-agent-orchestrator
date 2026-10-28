@@ -22,7 +22,12 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome, TerminalCleanupResult
-from cli_agent_orchestrator.clients.database import update_terminal_deferred_init_failure
+from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
+from cli_agent_orchestrator.clients.database import (
+    terminal_id_in_use,
+    update_terminal_deferred_init_failure,
+)
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import (
@@ -623,6 +628,119 @@ class TestHealthyLaunchesRecordTheCheckBeforeAnyTask:
         kiro, other = allocation.db_create.call_args_list
         assert kiro.kwargs["identity_verified"] is False
         assert other.kwargs["identity_verified"] is None
+
+
+class TestTheIdIsAllocatedBeforeItIsMarkedInFlight:
+    """A Kiro create marks its identity check in flight only on the id the
+    allocator accepted (#1088, #1074). A candidate it rejects is still another
+    terminal's, live or retained, so marking it would leave a stale mark on that
+    id, and releasing one would end the other terminal's pending check early."""
+
+    @staticmethod
+    @contextmanager
+    def _marks_recorded():
+        marked = []
+        real_mark = terminal_service._mark_identity_check_in_flight
+
+        def _spy(terminal_id):
+            # Recorded with whether the row was already visible at the mark.
+            marked.append((terminal_id, terminal_service.get_terminal_metadata(terminal_id)))
+            real_mark(terminal_id)
+
+        with patch.object(terminal_service, "_mark_identity_check_in_flight", _spy):
+            yield marked
+
+    @pytest.mark.asyncio
+    async def test_a_first_id_still_referenced_is_redrawn_and_never_marked(self, kiro_create, pane):
+        # A deleted terminal whose idempotency mapping is retained still holds its id.
+        db_create_terminal(
+            "aaaaaaaa",
+            "cao-old",
+            "developer-old",
+            "kiro_cli",
+            "developer",
+            idempotency_key="retained-key",
+            request_fingerprint="retained-fp",
+        )
+        assert db_delete_terminal("aaaaaaaa") is True
+        assert terminal_id_in_use("aaaaaaaa") is True
+        pane.backend.get_history.return_value = _HEALTHY_SCREEN
+
+        with (
+            patch(f"{_MODULE}.generate_terminal_id", side_effect=["aaaaaaaa", "bbbbbbbb"]),
+            self._marks_recorded() as marked,
+        ):
+            terminal = await kiro_create.create()
+
+        assert terminal.id == "bbbbbbbb"
+        assert marked == [("bbbbbbbb", None)]
+        assert not terminal_service._is_identity_check_in_flight("aaaaaaaa")
+        assert not terminal_service._is_identity_check_in_flight("bbbbbbbb")
+        assert terminal_service.get_terminal_metadata("aaaaaaaa") is None
+        assert terminal_service.get_terminal_metadata("bbbbbbbb")["identity_verified"] is True
+        assert pane.backend.create_session.call_args.args[2] == "bbbbbbbb"
+
+    @pytest.mark.asyncio
+    async def test_a_first_id_held_by_a_terminal_mid_check_keeps_that_terminals_mark(
+        self, kiro_create, pane
+    ):
+        held = _row("aaaaaaaa", identity_verified=False)
+        terminal_service._mark_identity_check_in_flight(held)
+        pane.backend.get_history.return_value = _HEALTHY_SCREEN
+        try:
+            with patch(f"{_MODULE}.generate_terminal_id", side_effect=[held, "bbbbbbbb"]):
+                terminal = await kiro_create.create()
+
+            assert terminal.id == "bbbbbbbb"
+            assert terminal_service._is_identity_check_in_flight(held)
+            assert terminal_service.get_terminal_metadata(held)["identity_verified"] is False
+            _refused(held, TerminalInputBlockedReason.IDENTITY_PENDING)
+        finally:
+            terminal_service._clear_identity_check_in_flight(held)
+
+    @pytest.mark.asyncio
+    async def test_running_out_of_ids_fails_before_any_mark_or_window(self, kiro_create, pane):
+        held = _row("aaaaaaaa", identity_verified=True)
+
+        with (
+            patch(f"{_MODULE}.generate_terminal_id", return_value=held),
+            self._marks_recorded() as marked,
+            pytest.raises(RuntimeError, match="Could not allocate a terminal id"),
+        ):
+            await kiro_create.create()
+
+        assert marked == []
+        assert not terminal_service._is_identity_check_in_flight(held)
+        pane.backend.create_session.assert_not_called()
+        pane.backend.create_window.assert_not_called()
+        # The failed create rolls back nothing of the terminal that holds the id.
+        assert terminal_service.get_terminal_metadata(held)["identity_verified"] is True
+
+    @pytest.mark.asyncio
+    async def test_running_out_of_ids_answers_500_on_the_create_route(self, kiro_create, pane):
+        from fastapi.testclient import TestClient
+
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.plugins import PluginRegistry
+
+        held = _row("aaaaaaaa", identity_verified=True)
+        app.state.plugin_registry = PluginRegistry()
+
+        with (
+            patch(f"{_MODULE}.generate_terminal_id", return_value=held),
+            self._marks_recorded() as marked,
+        ):
+            response = TestClient(app).post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                headers={"Host": "localhost"},
+            )
+
+        assert response.status_code == 500
+        assert "Could not allocate a terminal id" in response.json()["detail"]
+        assert marked == []
+        assert not terminal_service._is_identity_check_in_flight(held)
+        pane.backend.create_session.assert_not_called()
 
 
 class TestAKiroInitThatEndsBeforeItsCheckIsUntrusted:
