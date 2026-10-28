@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,6 +24,18 @@ from starlette.responses import HTMLResponse, JSONResponse
 VIEWER_HTML = Path(__file__).resolve().parent / "viewer.html"
 
 LOGGER = logging.getLogger("transport")
+
+
+def allowed_hosts() -> list[str] | None:
+    """Extra Host names the controller accepts, from TRANSPORT_ALLOWED_HOSTS.
+
+    The controller accepts only the loopback names (127.0.0.1, localhost, ::1)
+    in the Host header, so that a web page cannot use DNS rebinding to read the
+    live view. A port forward that rewrites Host to its own name needs that name
+    here, for example TRANSPORT_ALLOWED_HOSTS='*.cloudfront.net'.
+    """
+    names = [name.strip() for name in os.environ.get("TRANSPORT_ALLOWED_HOSTS", "").split(",")]
+    return [name for name in names if name] or None
 
 
 def save_snapshot(path: Path, state: dict) -> None:
