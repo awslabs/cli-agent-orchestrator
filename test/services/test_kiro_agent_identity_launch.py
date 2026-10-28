@@ -850,6 +850,109 @@ class TestInputBeforeOrWithoutTheRecord:
         assert _typed(pane.backend) == [_LAUNCH]
 
 
+class TestARecordThatLandsBetweenTheRowReadAndTheGate:
+    """The caller reads the row, then the record commits True and releases the
+    in-flight mark, then the gate runs on the caller's stale row. The pane is
+    verified and healthy, so the refusal must not be the permanent one."""
+
+    @staticmethod
+    def _verified_provider():
+        return Mock(identity_verified=True)
+
+    @pytest.mark.asyncio
+    async def test_the_gate_accepts_the_stale_row(self, pane):
+        tid = _row(identity_verified=False)
+        terminal_service._mark_identity_check_in_flight(tid)
+        stale = terminal_service.get_terminal_metadata(tid)
+
+        await terminal_service._record_kiro_identity_verified(tid, self._verified_provider())
+
+        assert not terminal_service._is_identity_check_in_flight(tid)
+        assert stale["identity_verified"] is False
+        assert terminal_service.terminal_input_refusal(tid, stale) is None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_input_and_send_special_key_type_into_the_pane(self, pane):
+        tid = _row(identity_verified=False)
+        terminal_service._mark_identity_check_in_flight(tid)
+        stale = terminal_service.get_terminal_metadata(tid)
+        await terminal_service._record_kiro_identity_verified(tid, self._verified_provider())
+        real = terminal_service.get_terminal_metadata
+        reads = []
+
+        def _stale_first(terminal_id):
+            reads.append(terminal_id)
+            return dict(stale) if len(reads) in (1, 3) else real(terminal_id)
+
+        with (
+            _a_typing_provider(),
+            patch.object(terminal_service, "get_terminal_metadata", _stale_first),
+        ):
+            terminal_service.dispatch_input(tid, "SEND-CANARY", frozen_memory="")
+            terminal_service.send_special_key(tid, "Enter")
+
+        assert "SEND-CANARY" in _typed(pane.backend)
+        pane.backend.send_special_key.assert_called_once_with(
+            "cao-session", "developer-abcd", "Enter"
+        )
+
+    def test_a_row_still_unverified_when_read_again_stays_refused(self, pane):
+        """The re-read only accepts a recorded check: init ended without one."""
+        tid = _row(identity_verified=False)
+        stale = terminal_service.get_terminal_metadata(tid)
+
+        refusal = terminal_service.terminal_input_refusal(tid, stale)
+
+        assert isinstance(refusal, ProviderExitedInputBlockedError)
+        assert "(identity_unverified)" in str(refusal)
+
+    def test_a_re_read_that_fails_keeps_the_refusal(self, pane):
+        tid = _row(identity_verified=False)
+        stale = terminal_service.get_terminal_metadata(tid)
+
+        with patch.object(
+            terminal_service, "get_terminal_metadata", side_effect=RuntimeError("database is down")
+        ):
+            refusal = terminal_service.terminal_input_refusal(tid, stale)
+
+        assert isinstance(refusal, ProviderExitedInputBlockedError)
+
+    @pytest.mark.asyncio
+    async def test_a_reader_racing_the_real_record_is_never_refused_for_good(self, pane):
+        """A thread repeats dispatch_input's order (read the row, then the gate)
+        while the event loop runs the real record, once per trial."""
+        trials, permanent, unfinished = 100, [], []
+        for n in range(trials):
+            tid = _row(f"{0xA0000000 + n:08x}", identity_verified=False)
+            terminal_service._mark_identity_check_in_flight(tid)
+            stop = threading.Event()
+
+            def _reader(tid=tid, stop=stop):
+                while not stop.is_set():
+                    row = terminal_service.get_terminal_metadata(tid)
+                    refusal = terminal_service.terminal_input_refusal(tid, row)
+                    if refusal is None:
+                        return
+                    if isinstance(refusal, ProviderExitedInputBlockedError):
+                        permanent.append(tid)
+                        return
+
+            reader = threading.Thread(target=_reader, daemon=True)
+            reader.start()
+            try:
+                await terminal_service._record_kiro_identity_verified(
+                    tid, self._verified_provider()
+                )
+                await asyncio.to_thread(reader.join, 5)
+            finally:
+                stop.set()
+                terminal_service._clear_identity_check_in_flight(tid)
+            if reader.is_alive():
+                unfinished.append(tid)
+
+        assert (len(permanent), unfinished) == (0, [])
+
+
 class TestLegacyAndOtherProvidersRows:
     def test_a_legacy_kiro_row_without_a_failure_is_grandfathered(self, pane):
         """Provisional (#1074): a Kiro pane launched before the column keeps taking

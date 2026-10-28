@@ -2824,10 +2824,16 @@ def terminal_input_refusal(
     Provisional (#1074): main never verified a Kiro pane, so refusing these
     would break every Kiro worker running across an upgrade.
 
+    ``metadata`` is the caller's read of the row, which can be older than the
+    record: ``_record_kiro_identity_verified`` commits True and only then
+    releases the in-flight mark. So before a permanent refusal the row is read
+    again, and a row that now records a passed check is accepted, as any
+    verified row is; otherwise a delivery racing the record would fail for good.
+
     Never decides on the failure's ``exception_type``, ``kind`` or
     ``untrusted_runtime``; ``kind`` only names the failure in the message.
-    Other providers are not gated here. Reads the fallback sidecar, so it is
-    blocking file I/O: async callers to_thread it.
+    Other providers are not gated here. Reads the fallback sidecar and, on the
+    permanent path, the row, so it is blocking I/O: async callers to_thread it.
     """
     if metadata.get("provider") != ProviderType.KIRO_CLI.value:
         return None
@@ -2847,11 +2853,25 @@ def terminal_input_refusal(
         kind = "identity_unverified"
     else:
         kind = failure.get("kind") or "unknown"
+    if _identity_verified_now(terminal_id):
+        return None
     return ProviderExitedInputBlockedError(
         f"Terminal {terminal_id} failed deferred initialization ({kind}). "
         "Refusing to deliver input.",
         reason=TerminalInputBlockedReason.INIT_FAILED,
     )
+
+
+def _identity_verified_now(terminal_id: str) -> bool:
+    """True when a fresh read of the row records a passed Kiro identity check (#1074)."""
+    try:
+        fresh = get_terminal_metadata(terminal_id)
+    except Exception as exc:  # noqa: BLE001 - an unread row is not trust
+        logger.warning(
+            "Terminal %s: could not re-read its row before refusing input: %s", terminal_id, exc
+        )
+        return False
+    return bool(fresh) and fresh.get("identity_verified") is True
 
 
 def _delete_deferred_failure_fallback(terminal_id: str) -> None:
