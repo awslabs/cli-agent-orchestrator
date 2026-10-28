@@ -22,7 +22,7 @@ import logging
 import re
 import shlex
 import time
-from typing import Optional
+from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -35,7 +35,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
 )
 from cli_agent_orchestrator.providers.kiro_identity import (
     KiroAgentIdentityError,
-    header_agent,
+    header_agents,
     require_header_identity,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -189,7 +189,8 @@ STARTUP_PROMPT_BOTTOM_LINES = 15
 
 # Reads of the screen for the TUI header after the prompt is ready (see
 # KiroCliProvider._verify_agent_identity). Only a screen with no header row is
-# read again; a header naming the wrong agent is refused on the first read.
+# read again; a screen whose header rows name any other agent is refused on the
+# first read.
 # Provisional (#1074): about 2 s, after which a screen without a header (a
 # kiro-cli TUI change, say) is refused rather than trusted.
 IDENTITY_HEADER_READS = 5
@@ -448,7 +449,7 @@ class KiroCliProvider(BaseProvider):
         return True
 
     async def _verify_agent_identity(self) -> None:
-        """Raise unless the TUI header names this provider's agent (#1074).
+        """Raise unless every TUI header row names this provider's agent (#1074).
 
         kiro-cli answers an ``--agent`` it cannot load by starting its built-in
         ``kiro_default`` agent, which has every built-in tool, and reaches the
@@ -461,14 +462,14 @@ class KiroCliProvider(BaseProvider):
 
         Reads the rendered screen, not the scrollback, so the requested name in
         the echoed launch command is never what is matched (see
-        ``kiro_identity.header_agent``). A screen without a header row is read
+        ``kiro_identity.header_agents``). A screen without a header row is read
         again a few times, because the header can trail the prompt by a frame.
 
         Raises:
             KiroAgentIdentityError: ``identity_mismatch`` or ``header_not_found``.
         """
         backend = get_backend()
-        observed: Optional[str] = None
+        observed: List[str] = []
         for attempt in range(IDENTITY_HEADER_READS):
             if attempt:
                 await asyncio.sleep(IDENTITY_HEADER_READ_INTERVAL_S)
@@ -483,8 +484,8 @@ class KiroCliProvider(BaseProvider):
             except Exception as exc:  # noqa: BLE001 - an unread screen is not identity
                 logger.debug("kiro_cli: screen read for the identity check failed: %s", exc)
                 continue
-            observed = header_agent(screen) if isinstance(screen, str) else None
-            if observed is not None:
+            observed = header_agents(screen) if isinstance(screen, str) else []
+            if observed:
                 break
         try:
             require_header_identity(self._agent_profile, observed)

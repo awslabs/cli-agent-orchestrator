@@ -12,8 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   built-in default agent, which has every built-in tool, so launching a profile that was not
   installed for Kiro, or whose agent file did not load, ran unrestricted. Every `kiro_cli` launch now
   refuses an agent that none of the agent directories CAO searches defines, before any terminal
-  exists (`400`, with the `cao install` remedy). It also refuses a pane whose TUI header names a
-  different agent, before any task is typed. A Kiro terminal now takes typed input (`/input`,
+  exists (`400`, with the `cao install` remedy). It also refuses a pane whose TUI header rows do not
+  all name the requested agent, before any task is typed. A Kiro terminal now takes typed input (`/input`,
   `/key`, `/exit`, `cao send`, inbox delivery, MCP `answer_user_prompt` and AG-UI) only once CAO has
   recorded that its header check passed. While it is still starting, input is refused and queued
   inbox messages wait. The `/ws` web terminal drops the attached pane's own keystrokes the same way,
