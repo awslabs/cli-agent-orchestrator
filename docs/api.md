@@ -383,6 +383,14 @@ The spec-route scope checks apply when authentication is enabled.
   assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
   run — not only a finished one. No run-level `output` field is returned (run-level output
   is not journaled); per-step outputs are on `steps[].output`.
+- `GET /workflows/runs/{run_id}/artifacts` lists the run's string inputs that name a report
+  file the web UI can show: `{run_id, artifacts: [{input, path, available, size}]}`.
+  `GET /workflows/runs/{run_id}/artifacts/{input_name}` returns that file as
+  `{run_id, input, path, size, content}`. The caller names an **input**, never a path:
+  the recorded value must resolve (symlinks followed) to a regular `.md` file directly in
+  the system temp dir and be at most 256 KiB. Unknown run 404; undeclared or non-string
+  input 400; a path outside that directory or not `.md` 403; no such file 404; too large
+  413 (refused, never truncated).
 - `POST /workflows/runs/{run_id}/cancel` cooperatively cancels a run;
   `POST /workflows/runs/{run_id}/resume` re-drives a crashed/failed one.
 - `POST /workflows/runs/{run_id}/steps/{step_id}:replay` re-executes **one** recorded step

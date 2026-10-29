@@ -8,6 +8,7 @@ import os
 import pty
 import re
 import signal
+import stat
 import struct
 import subprocess
 import termios
@@ -8240,6 +8241,171 @@ async def get_workflow_run_result_endpoint(
     if envelope is not None:
         body["failure_envelope"] = envelope
     return body
+
+
+# --- Run artifacts: read a report file a run was TOLD to write ------------------------
+#
+# A workflow commonly takes an input such as ``report=/tmp/report.md`` and writes its
+# deliverable there. These two routes let the web UI show that file without a shell.
+#
+# THREAT MODEL. This must not become an arbitrary file-read primitive, so a caller never
+# supplies a path. It names an INPUT of an existing run; the path is whatever that run's
+# durable ``inputs_json`` recorded at admission. The value is then only readable when its
+# fully resolved target (``os.path.realpath``, so every symlink is followed) is a regular
+# ``.md`` file DIRECTLY inside the artifact root (the system temp dir by default), and no
+# larger than ``WORKFLOW_ARTIFACT_MAX_BYTES``. A symlink placed in the root that points
+# elsewhere resolves outside it and is refused; ``O_NOFOLLOW`` on the open plus an
+# ``fstat`` regular-file check close the swap-after-check window.
+#
+# What remains readable: a ``.md`` file in the temp dir whose path some caller with
+# workflow-run scope chose as a run input. Starting a run already needs a scope at least
+# as wide as reading one, and a run's agents can read the temp dir themselves, so the
+# route grants no reach those callers lacked. Run-level outputs are not journaled (see
+# the ``/result`` docstring), so only declared inputs are eligible.
+
+WORKFLOW_ARTIFACT_MAX_BYTES = 256 * 1024
+WORKFLOW_ARTIFACT_SUFFIX = ".md"
+
+
+def _workflow_artifact_root() -> str:
+    """The one directory artifact reads are confined to (resolved; tests monkeypatch it)."""
+    import tempfile
+
+    return os.path.realpath(tempfile.gettempdir())
+
+
+def _run_input_values(run_id: str) -> Dict[str, Any]:
+    """The run's recorded inputs as a dict; 404 for an unknown run, ``{}`` if unparseable."""
+    from cli_agent_orchestrator.services import workflow_journal
+
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    try:
+        inputs = json.loads(row.inputs_json or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return inputs if isinstance(inputs, dict) else {}
+
+
+def _confined_artifact_path(value: str) -> Optional[str]:
+    """Resolved path when ``value`` names a ``.md`` directly in the artifact root, else None.
+
+    Pure path arithmetic - no existence check, no read. An absent file is still a confined
+    path (the caller reports 404 for it); a relative value is never confined, so a run
+    started from some working directory cannot make this resolve against the server's.
+    """
+    if not os.path.isabs(value):
+        return None
+    resolved = os.path.realpath(value)
+    if os.path.dirname(resolved) != _workflow_artifact_root():
+        return None
+    if not resolved.lower().endswith(WORKFLOW_ARTIFACT_SUFFIX):
+        return None
+    return resolved
+
+
+@app.get("/workflows/runs/{run_id}/artifacts")
+async def list_workflow_run_artifacts_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List the run inputs that name a readable report file (for the web UI's View report).
+
+    Returns ``{"run_id", "artifacts": [{"input", "path", "available", "size"}]}``: one row per
+    string input whose value passes the confinement rule of the artifact read (see the
+    threat model above). ``path`` echoes the recorded input value, not the resolved
+    target. ``available`` is true when the target exists as a regular file within the size
+    cap, and ``size`` is its byte size (``None`` when absent). Unknown run -> 404.
+    """
+    inputs = await asyncio.to_thread(_run_input_values, run_id)
+    artifacts: List[Dict[str, Any]] = []
+    for name, value in inputs.items():
+        if not isinstance(value, str):
+            continue
+        resolved = _confined_artifact_path(value)
+        if resolved is None:
+            continue
+        size: Optional[int] = None
+        available = False
+        try:
+            st = os.stat(resolved)
+            if stat.S_ISREG(st.st_mode):
+                size = st.st_size
+                available = size <= WORKFLOW_ARTIFACT_MAX_BYTES
+        except OSError:
+            pass
+        artifacts.append({"input": name, "path": value, "available": available, "size": size})
+    return {"run_id": run_id, "artifacts": artifacts}
+
+
+@app.get("/workflows/runs/{run_id}/artifacts/{input_name}")
+async def get_workflow_run_artifact_endpoint(
+    run_id: str,
+    input_name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the text of the report file a run input names (see the threat model above).
+
+    ``{"run_id", "input", "path", "size", "content"}``; ``content`` is UTF-8 with invalid
+    bytes replaced. Errors: unknown run 404; ``input_name`` not a string input of the run
+    400; value not a ``.md`` directly in the artifact root (after resolving symlinks) 403;
+    no such regular file 404; larger than ``WORKFLOW_ARTIFACT_MAX_BYTES`` 413 - refused
+    rather than truncated, so a reader never mistakes a prefix for the whole report.
+    """
+    inputs = await asyncio.to_thread(_run_input_values, run_id)
+    value = inputs.get(input_name)
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{input_name}' is not a string input of run '{run_id}'",
+        )
+    resolved = _confined_artifact_path(value)
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"input '{input_name}' does not name a {WORKFLOW_ARTIFACT_SUFFIX} file directly "
+                "in the workflow artifact directory"
+            ),
+        )
+
+    def _read() -> Dict[str, Any]:
+        try:
+            fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such report file")
+        except OSError:
+            # O_NOFOLLOW refuses a symlink swapped in after the realpath check (ELOOP).
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="report file refused")
+        # Check the descriptor before wrapping it: os.fdopen refuses a directory with
+        # IsADirectoryError, which would surface as a 500 instead of a 404.
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such report file")
+        with os.fdopen(fd, "rb") as fh:
+            if st.st_size > WORKFLOW_ARTIFACT_MAX_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"report is {st.st_size} bytes; the limit is {WORKFLOW_ARTIFACT_MAX_BYTES}",
+                )
+            data = fh.read(WORKFLOW_ARTIFACT_MAX_BYTES + 1)
+        if len(data) > WORKFLOW_ARTIFACT_MAX_BYTES:
+            # Grew between fstat and read: same refusal, never a silent prefix.
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"report exceeds the {WORKFLOW_ARTIFACT_MAX_BYTES}-byte limit",
+            )
+        return {
+            "run_id": run_id,
+            "input": input_name,
+            "path": value,
+            "size": len(data),
+            "content": data.decode("utf-8", errors="replace"),
+        }
+
+    return await asyncio.to_thread(_read)
 
 
 @app.post("/workflows/runs/{run_id}/cancel")

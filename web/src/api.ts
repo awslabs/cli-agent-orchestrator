@@ -648,6 +648,119 @@ export interface RunSummaryRow {
   current_step_id: string | null
 }
 
+/**
+ * One indexed workflow DEFINITION from `GET /workflows` (server WorkflowIndexRow,
+ * models/workflow_runtime.py). Distinct from a run (RunSummaryRow). Consumed by
+ * the web UI's workflow launcher, which runs a stored workflow from the UI —
+ * the `cao workflow run` equivalent.
+ */
+export interface WorkflowDefRow {
+  name: string
+  source_path: string
+  mode: string
+  step_count: number | null
+  description: string
+  indexed_at: string
+}
+
+/**
+ * The 202 ack from `POST /workflows/runs:submit` — the run is durably journaled
+ * and driven in the background; poll the run list / inspect for progress.
+ */
+export interface WorkflowRunAck {
+  run_id: string
+  state: string
+  links?: Record<string, string>
+}
+
+/**
+ * Result of `POST /workflows/plans/approve` (issue #583). Idempotent: `changed`
+ * is false when the plan was already approved, with the ORIGINAL approval time.
+ */
+export interface PlanApproval {
+  plan_id: string
+  approved: boolean
+  changed: boolean
+  approved_at?: string
+  approved_by?: string
+}
+
+/** One script-lint finding (server LintFinding). `line` is 1-based. */
+export interface WorkflowLintFinding {
+  rule_id: string
+  severity: 'error' | 'warning'
+  line: number
+  message: string
+}
+
+/** `POST /workflows/validate` result (server ValidationResult / ScriptValidationResult). */
+export interface WorkflowValidation {
+  status: 'pass' | 'pass_reserved' | 'fail'
+  errors: string[]
+  reserved_notes?: string[]
+  findings?: WorkflowLintFinding[]
+}
+
+/** One step of a run's retained result (server StepResult). */
+export interface WorkflowStepResult {
+  id: string
+  state: string
+  attempts: number
+  output?: Record<string, unknown> | null
+  error?: string | null
+  error_kind?: string | null
+}
+
+/**
+ * `GET /workflows/runs/{id}/result` (server WorkflowRunResult). Journal-built, so
+ * there is no run-level output; per-step outputs carry what a run emitted. A
+ * failed/cancelled run adds `failure_envelope`.
+ */
+export interface WorkflowRunResult {
+  run_id: string
+  workflow_name: string
+  state: string
+  steps: WorkflowStepResult[]
+  started_at: string
+  finished_at?: string | null
+  kind?: string | null
+  warnings?: string[]
+  failure_envelope?: Record<string, unknown>
+}
+
+/** `GET /workflows/{name}` for a script workflow (server ScriptSpec). YAML specs carry other fields. */
+export interface WorkflowSpec {
+  name: string
+  path?: string
+  source?: string
+  content_hash?: string
+  findings?: WorkflowLintFinding[]
+  inputs?: Record<string, unknown>
+  [key: string]: unknown
+}
+
+/** A run input that names a report file (`GET /workflows/runs/{id}/artifacts`). */
+export interface WorkflowArtifactRef {
+  input: string
+  path: string
+  available: boolean
+  size: number | null
+}
+
+export interface WorkflowArtifactList {
+  run_id: string
+  artifacts: WorkflowArtifactRef[]
+}
+
+/** `GET /workflows/runs/{id}/artifacts/{input}`: the report text. */
+export interface WorkflowArtifact {
+  run_id: string
+  input: string
+  path: string
+  size: number
+  content: string
+}
+
 // ── Agent Plugins (Agent Plugins 1.0.0) ──────────────────────────────────────
 // Distinct from CAO's event-plugin system, which has no web surface.
 
@@ -982,6 +1095,75 @@ export const api = {
   // (fetchJSON returns undefined). Idempotent server-side (unknown id -> 204).
   deleteWorkflowRun: (runId: string) =>
     fetchJSON<void>(`/workflows/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' }),
+
+  // ── Workflow run controls — the write side over the existing run-control
+  // endpoints: the UI equivalents of `cao workflow run/cancel/resume`.
+
+  // Indexed workflow definitions, for the launcher's workflow picker.
+  listWorkflows: () => fetchJSON<WorkflowDefRow[]>('/workflows'),
+
+  // Async start (202) — durably journaled, then driven in the background. We use
+  // the :submit twin (not the blocking POST /workflows/runs) because a run that
+  // drives real agents can take minutes; the run list/detail poll shows progress.
+  // `inputs` maps the workflow's declared input names to values.
+  submitWorkflowRun: (body: { name_or_path: string; inputs?: Record<string, unknown>; run_id?: string }) =>
+    fetchJSON<WorkflowRunAck>('/workflows/runs:submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
+  // Approve a script-workflow plan so its runs may start (issue #583). A first
+  // run of a new plan is refused 403 with detail {kind: 'approval_required',
+  // plan_id, message}; this is the human act that clears it. plan_id travels in
+  // the body verbatim (it contains a ':'), never as a path segment.
+  approveWorkflowPlan: (planId: string) =>
+    fetchJSON<PlanApproval>('/workflows/plans/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plan_id: planId }),
+    }),
+
+  // Lint a stored workflow file without running it (the `cao workflow validate`
+  // equivalent). `path` is the definition's source_path from GET /workflows.
+  validateWorkflow: (path: string) =>
+    fetchJSON<WorkflowValidation>('/workflows/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    }),
+
+  // Cooperative cancel of a running run (no body). Returns {success, run_id}.
+  cancelWorkflowRun: (runId: string) =>
+    fetchJSON<{ success: boolean; run_id: string }>(
+      `/workflows/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: 'POST' },
+    ),
+
+  // Resume a crashed/failed/cancelled run from its durable journal (optional
+  // body omitted — default resume-from-last-completed). Drives in the background.
+  resumeWorkflowRun: (runId: string) =>
+    fetchJSON<WorkflowRunAck>(
+      `/workflows/runs/${encodeURIComponent(runId)}/resume`,
+      { method: 'POST', timeoutMs: 30000 },
+    ),
+
+  // A run's retained result (the `cao workflow result` equivalent).
+  getWorkflowRunResult: (runId: string) =>
+    fetchJSON<WorkflowRunResult>(`/workflows/runs/${encodeURIComponent(runId)}/result`),
+
+  // A stored workflow's spec (the `cao workflow get` equivalent): source, hash, findings.
+  getWorkflowSpec: (name: string) =>
+    fetchJSON<WorkflowSpec>(`/workflows/${encodeURIComponent(name)}`),
+
+  // Report files a run was given as inputs (e.g. report=/tmp/report.md). The
+  // server only lists/reads a .md directly in its temp dir; see docs/api.md.
+  listWorkflowArtifacts: (runId: string) =>
+    fetchJSON<WorkflowArtifactList>(`/workflows/runs/${encodeURIComponent(runId)}/artifacts`),
+  getWorkflowArtifact: (runId: string, input: string) =>
+    fetchJSON<WorkflowArtifact>(
+      `/workflows/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(input)}`,
+    ),
 
   // U5 terminal offset-range read — the bytes produced around a selected event
   // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null

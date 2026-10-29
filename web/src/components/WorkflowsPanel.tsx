@@ -7,6 +7,8 @@ import { useEffect, useState } from 'react'
 import { useStore } from '../store'
 import { RunList } from './workflow/RunList'
 import { RunDetail } from './workflow/RunDetail'
+import { WorkflowLauncher } from './workflow/WorkflowLauncher'
+import { PlanApprovalForm } from './workflow/PlanApprovalForm'
 import { ErrorBoundary } from './ErrorBoundary'
 
 export function WorkflowsPanel() {
@@ -43,7 +45,10 @@ export function WorkflowsPanel() {
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[20rem_1fr] gap-4">
       {/* Run list */}
-      <aside className="rounded-xl border border-gray-800 bg-gray-900/40 p-3 h-fit">
+      <aside className="h-fit">
+        <WorkflowLauncher />
+        <PlanApprovalForm />
+        <div className="rounded-xl border border-gray-800 bg-gray-900/40 p-3">
         <h2 className="text-sm font-semibold text-gray-300 mb-2">Workflow Runs</h2>
         <RunList
           runs={runs}
@@ -52,6 +57,7 @@ export function WorkflowsPanel() {
           error={error}
           onSelect={selectWorkflowRun}
         />
+        </div>
       </aside>
 
       {/* Detail */}
