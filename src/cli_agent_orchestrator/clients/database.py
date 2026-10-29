@@ -3471,21 +3471,25 @@ def delete_terminals_by_ids(terminal_ids: List[str], *, end_reason: str) -> int:
     so a concurrent same-name recreate — whose rows carry freshly generated ids
     — is never swept (#498).
 
-    Finalizes each requested terminal's launch record (issue #1082), which is
-    a safe no-op for any id that had none (never created, or already
-    finalized) -- see ``delete_terminal`` for why that runs after commit.
+    Finalizes the launch record (issue #1082) of each id whose row THIS call
+    deleted, the same rule as ``delete_terminal``: an id whose row another
+    teardown already removed has been finalized by that teardown, and stamping
+    it again could close an older launch left open under the same id. Each id
+    is deleted on its own so its row count says who deleted it; see
+    ``delete_terminal`` for why the finalize runs after commit.
     """
     if not terminal_ids:
         return 0
     with SessionLocal() as db:
-        deleted = (
-            db.query(TerminalModel)
-            .filter(TerminalModel.id.in_(terminal_ids))
-            .delete(synchronize_session=False)
-        )
+        deleted_ids = [
+            terminal_id
+            for terminal_id in dict.fromkeys(terminal_ids)
+            if db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
+        ]
         db.commit()
-    _finalize_launch_records_best_effort(terminal_ids, end_reason)
-    return deleted
+    if deleted_ids:
+        _finalize_launch_records_best_effort(deleted_ids, end_reason)
+    return len(deleted_ids)
 
 
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:

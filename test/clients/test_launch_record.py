@@ -287,6 +287,31 @@ def test_delete_terminals_by_ids_finalizes(fresh_db):
         assert db_mod.get_launch_record(tid)["end_reason"] == "session_teardown"
 
 
+def test_delete_terminals_by_ids_finalizes_only_the_rows_it_deleted(fresh_db):
+    """An id whose row another teardown already removed is not finalized
+    again: with the newest-open-row rule, a second stamp would close an older
+    launch left open under the same id."""
+    from cli_agent_orchestrator.clients.database import TerminalModel
+
+    with db_mod.SessionLocal() as db:
+        db.add(TerminalModel(id="ids00003", tmux_session="s", tmux_window="w", provider="kiro_cli"))
+        db.commit()
+    _launch("ids00003")
+    _launch("ids00004", caller_id="older")  # an older launch left open
+    _launch("ids00004", caller_id="newer")
+    db_mod.finalize_launch_records(["ids00004"], "deleted")  # its row's own teardown
+
+    deleted = db_mod.delete_terminals_by_ids(
+        ["ids00003", "ids00004", "ids00003"], end_reason="session_teardown"
+    )
+
+    assert deleted == 1
+    assert db_mod.get_launch_record("ids00003")["end_reason"] == "session_teardown"
+    older, newer = _rows("ids00004")
+    assert older["ended_at"] is None and older["end_reason"] is None
+    assert newer["end_reason"] == "deleted"
+
+
 def test_find_bound_launch_record(fresh_db):
     _launch("t5", caller_id="creator")
     record_id = db_mod.get_launch_record("t5")["id"]
