@@ -44,31 +44,50 @@ an email task to it, and it works standalone too.
 
 ## Setup
 
-Cooper's sign-up is one HTTP request with no browser step. It returns an API
-key once, along with the new inbox. The commands below write the key straight
-into CAO's managed env file (`~/.aws/cli-agent-orchestrator/.env`, or
-`$CAO_HOME_DIR/.env`), so it never appears in your terminal, your shell
-history or a command line. Replace `my-cao-agent` with the username you want
-and `you@example.com` with your own address (optional; you get one
-confirmation email and can approve the agent's drafts).
+Cooper's sign-up is one HTTP request with no browser step. It returns the
+account's API key once, along with the new inbox. That key has full access to
+the account, so the agent never gets it. The block below keeps it in a header
+file for you and uses it one time to mint a second key that is scoped to this
+inbox and can only read mail and send. Only the scoped key goes into CAO's
+managed env file (`~/.aws/cli-agent-orchestrator/.env`, or
+`$CAO_HOME_DIR/.env`). Neither key appears in your terminal, your shell
+history or a command line. Set `USERNAME` to the name you want and `OWNER` to
+your own address (optional; you get one confirmation email, and it lets you
+turn on send approval below).
 
 ```bash
-# 1. Create the inbox and store the key (requires curl and jq)
+# 1. Create the inbox and store an inbox-scoped key (requires curl and jq)
+USERNAME=my-cao-agent
+OWNER=you@example.com
 ENV_FILE="${CAO_HOME_DIR:-$HOME/.aws/cli-agent-orchestrator}/.env"
-mkdir -p "$(dirname "$ENV_FILE")"
+ACCOUNT_HDR="${XDG_CONFIG_HOME:-$HOME/.config}/cooper-email/$USERNAME.account.hdr"
+mkdir -p "$(dirname "$ENV_FILE")" "$(dirname "$ACCOUNT_HDR")"
 (
   umask 077
-  TMP="$(mktemp)"
-  curl -s https://cooperemail.com/api/v1/onboard \
-    -H 'content-type: application/json' \
-    -d '{"username":"my-cao-agent","owner_email":"you@example.com"}' -o "$TMP"
-  if jq -e '.api_key | strings' "$TMP" > /dev/null; then
-    jq -r '"COOPER_API_KEY=\(.api_key)"' "$TMP" >> "$ENV_FILE"
-    jq -r '.inbox.email' "$TMP"   # prints only the new address
+  ON="$(mktemp)"; KEY="$(mktemp)"
+  jq -n --arg u "$USERNAME" --arg o "$OWNER" \
+    '{username: $u} + (if $o == "" then {} else {owner_email: $o} end)' |
+    curl -sS https://cooperemail.com/api/v1/onboard \
+      -H 'content-type: application/json' -d @- -o "$ON"
+  if jq -e '.api_key | strings' "$ON" > /dev/null; then
+    # Full-access account key: a header file for you, never given to the agent
+    jq -r '"Authorization: Bearer \(.api_key)"' "$ON" > "$ACCOUNT_HDR"
+    # Mint a key that can only list this inbox, read its mail and send from it
+    curl -sS "https://cooperemail.com/api/v1/inboxes/$(jq -r '.inbox.id' "$ON")/keys" \
+      -H @"$ACCOUNT_HDR" -H 'content-type: application/json' \
+      -d '{"name":"cao-mail-agent","permissions":["inbox_read","message_read","message_send"]}' \
+      -o "$KEY"
+    if jq -e '.key | strings' "$KEY" > /dev/null; then
+      # Leading newline: safe even if the file's last line has no newline
+      jq -r '"\nCOOPER_API_KEY=\(.key)"' "$KEY" >> "$ENV_FILE"
+      jq -r '.inbox.email' "$ON"   # prints only the new address
+    else
+      jq -c '.error // .' "$KEY"   # no scoped key; nothing written to .env
+    fi
   else
-    jq -c '.error // .' "$TMP"    # no key in the response; nothing written
+    jq -c '.error // .' "$ON"      # no key in the response; nothing written
   fi
-  rm -f "$TMP"
+  rm -f "$ON" "$KEY"
 )
 
 # 2. Install the profile
@@ -79,9 +98,35 @@ cao launch --agents mail_agent
 ```
 
 If the username is taken the response is HTTP 409, the error is printed and
-no key is written; pick another name and run step 1 again. `cao env list` shows that `COOPER_API_KEY`
-is set. If you already have a key, add the `COOPER_API_KEY=` line to that file
-with an editor instead.
+no key is written; pick another name and run step 1 again.
+`cao env list | cut -d= -f1` shows that `COOPER_API_KEY` is set without
+printing its value. If you already have a Cooper account, mint an
+inbox-scoped key with `POST /api/v1/inboxes/{id}/keys` and the permissions
+above, and add the `COOPER_API_KEY=` line to that file with an editor. Do not
+put a full-access key there.
+
+The account key in `$ACCOUNT_HDR` (mode 600) is what you use for admin work:
+minting or revoking keys (`DELETE /api/v1/keys/{id}`), deleting the inbox, or
+the approval step below. You can move it to a password manager and delete the
+file. The profile tells the agent not to read it, but its `reviewer` role has
+`fs_read`, so a file outside the agent's reach is the safer choice.
+
+### Optional: hold every send for your approval
+
+After you click the confirmation link that Cooper emails to `OWNER`, turn on
+approval mode. Cooper then holds each message the agent sends until you
+approve it, and holds suspicious inbound mail for review instead of
+delivering it:
+
+```bash
+curl -sS -X PATCH "https://cooperemail.com/api/v1/inboxes/$USERNAME@cooperemail.com" \
+  -H @"$ACCOUNT_HDR" -H 'content-type: application/json' \
+  -d '{"send_mode":"approval","screening":"hold"}' -o /dev/null -w '%{http_code}\n'
+```
+
+`200` means it is on. `409` means the owner address is not confirmed yet.
+The scoped key has no `inbox_update` permission, so the agent cannot turn
+approval mode off.
 
 Then give it something to do:
 
@@ -105,8 +150,13 @@ before anything is sent.
 | `cooper_wait_for_message` | Waits for the next message |
 | `cooper_send_message`, `cooper_reply_message` | Sends a new message or replies in a thread |
 
-The server exposes other tools (domains, webhooks, phone numbers, billing,
-workspaces). The profile's instructions keep the agent to the ones above.
+The server lists other tools (rules, webhooks, owners, domains, workspaces,
+keys, billing). CAO cannot hide single MCP tools, so the limit is the key: the
+scoped key from step 1 gets `permission_denied` from the server for rules,
+webhooks, owners, inbox changes, deleting the inbox and minting keys, and an
+inbox-scoped key cannot call workspace routes at all. It can still send,
+reply and forward from this inbox, so the "confirm each new recipient" rule
+is prompt-level unless you turn on approval mode above.
 Full reference: [cooperemail.com/docs](https://cooperemail.com/docs).
 
 ## If the key is missing or wrong
@@ -115,7 +165,7 @@ CAO resolves `${VAR}` with `Template.safe_substitute`, so an unset
 `COOPER_API_KEY` leaves the placeholder text in place rather than failing at
 load time. The server is still registered and answers authenticated calls
 with `401`. The profile tells the agent to stop and report that instead of
-creating a new account. Check `cao env list` first.
+creating a new account. Check `cao env list | cut -d= -f1` first.
 
 ## Data flow
 
@@ -123,8 +173,8 @@ Mail the agent sends goes through `cooperemail.com`, a third-party service,
 and reaches real recipients. Mail sent to the inbox is stored there and read
 through your key. Do not have the agent send secrets, credentials or private
 repository content. The profile tells it to confirm each new recipient with
-you and to treat incoming mail as data, but that is prompt-level guidance and
-not a filter.
+you and to treat incoming mail as data. That is prompt-level guidance; the
+enforced limits are the scoped key and, if you turn it on, approval mode.
 
 ## Notes
 
@@ -134,5 +184,4 @@ not a filter.
   make this agent network-sandboxed.
 - Incoming email is external content. The profile instructs the agent to
   treat it as untrusted, never as instructions.
-- The free plan covers 5 inboxes and 5,000 emails a month. See
-  [cooperemail.com/pricing](https://cooperemail.com/pricing).
+- Plans and limits: [cooperemail.com/pricing](https://cooperemail.com/pricing).
