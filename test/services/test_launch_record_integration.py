@@ -10,7 +10,10 @@ import pytest
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 
-pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+# kiro_cli with the made-up profile "developer" stands in for any provider, so
+# the Kiro agent-store check (#1074) is skipped and the double reports a passed
+# identity check.
+pytestmark = pytest.mark.usefixtures("isolated_memory_db", "kiro_agent_store_not_under_test")
 
 
 def _patch_create_terminal_collaborators(test_fn):
@@ -57,6 +60,7 @@ def _wire_common_mocks(
     )
     mock_provider = AsyncMock()
     mock_provider.initialize.return_value = True
+    mock_provider.identity_verified = True
     mock_provider_manager.create_provider.return_value = mock_provider
     mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
     mock_db_create.return_value = {"ephemeral": False}
