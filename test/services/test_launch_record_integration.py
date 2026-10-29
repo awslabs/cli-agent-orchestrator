@@ -555,6 +555,7 @@ class TestLaunchRecordPrivacy:
         description and system prompt. Then both tables are dumped whole."""
         from cli_agent_orchestrator.clients import database
         from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.services import status_monitor
         from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
         canary = "synthetic-canary-7b4e02"
@@ -586,6 +587,9 @@ class TestLaunchRecordPrivacy:
         with patch("cli_agent_orchestrator.backends.registry.get_backend") as mock_get_backend:
             mock_get_backend.return_value.supports_event_inbox.return_value = False
             StatusMonitor()._apply_detection(result.id, TerminalStatus.PROCESSING)
+        # On the event loop the transition is only queued: wait for the
+        # writer thread (one FIFO worker) to finish everything queued so far.
+        status_monitor._status_event_executor().submit(lambda: None).result(timeout=10)
         database.finalize_launch_records([result.id], "deleted")
 
         with database.SessionLocal() as db:
@@ -595,7 +599,9 @@ class TestLaunchRecordPrivacy:
                 {c.name: getattr(row, c.name) for c in row.__table__.columns}
                 for row in [*records, *events]
             ]
-        assert len(records) == 1 and len(events) == 1
+        # Count only this launch's event: another test's queued write can land late.
+        assert len(records) == 1
+        assert [e.terminal_id for e in events if e.terminal_id == result.id] == [result.id]
         for row in dumped:
             for column, value in row.items():
                 assert canary not in str(value), f"canary leaked into {column!r}"
