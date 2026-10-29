@@ -15,7 +15,7 @@ This post is for developers who know CLI coding agents. You do not need a backgr
 
 The second physical AI example of CAO, [hierarchical factory](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/hierarchical-factory), runs a simulated line in MuJoCo with nine [Open Duck Mini](https://github.com/apirrone/Open_Duck_Mini) robots. Four agents in two layers run it: one supervisor agent and three team manager agents. The robots are not agents.
 
-We ran the example nine times with live agents. These are the results:
+We ran the example ten times with live agents. These are the results:
 
 - Each order that the floor could do ended with all its units at the dock. The only exception was the run that the operator stopped.
 - In each run where the team that makes the parts blocked, the supervisor found the slowest team from the state of the floor. Then it slowed the first team to the pace of the slowest team.
@@ -240,7 +240,7 @@ The supervisor profile asks for that last sentence in every report. Kinematic me
 
 ## Results
 
-The controller only runs the programs and checks the rules. The agents decide what to do. We ran the example nine times with live agents, with these orders:
+The controller only runs the programs and checks the rules. The agents decide what to do. We ran the example ten times with live agents, with these orders:
 
 | Order | Runs | What the agents did |
 | --- | --- | --- |
@@ -249,13 +249,14 @@ The controller only runs the programs and checks the rules. The agents decide wh
 | `Make, assemble, and ship 30 units.` | 1 | Refused: the raw store has only 16 parts. The supervisor assigned no manager. No command to any robot. |
 | `Make, assemble, and ship all the parts.`, with no pace in the order | 1 | The supervisor used the defaults of its profile: Team A at 2 s, Team B at 4 s, and batches of 2. Team B measured 5.84 s for each unit, so after the block the supervisor set Team A to 6 s. 16 of 16 units at the dock. |
 | A routine with no `run`: `spin, turn` | 2 | In the first run, the supervisor assigned the managers. The controller rejected `start_shipping` with `routine_needs_one_run`, but Teams A and B had started, so units stayed in the buffers, and the supervisor stopped and reported. We added the routine check to the supervisor profile, before any assign. In the second run, the supervisor refused, assigned no manager, and sent no command to any robot. |
+| A routine of seven moves: `spin, turn, spin, turn, spin, turn, run` | 1 | Refused: the routine is longer than the `max_routine_moves` of Team C, 6. The supervisor assigned no manager, and the controller logged no command. The supervisor suggested routines of 5 and 6 moves. |
 | A stop by the operator while the teams work | 1 | The three programs became `interrupted`, reason `operator_stop`. The robots stopped where they were, and the controller rejected all later actions. The supervisor reported the stop. |
 
-Across the nine runs, the supervisor changed the pace of a team only after a block report. Each order that the floor could not do ended with no command to any robot, except the first run with no `run`, before the fix below.
+Across the ten runs, the supervisor changed the pace of a team only after a block report. Each order that the floor could not do ended with no command to any robot, except the first run with no `run`, before the fix below.
 
 The runs also showed four things that we fixed in the example:
 
-- **A check after the start.** With the routine that had no `run`, the controller rejected the shipping program, but the other teams had already started. The supervisor profile now tells the supervisor to check the whole order, the routine too, before it assigns any manager.
+- **A check after the start.** With the routine that had no `run`, the controller rejected the shipping program, but the other teams had already started. The supervisor profile now tells the supervisor to check the whole order, the routine and its length too, before it assigns any manager. The scene holds the length limit, so the supervisor reads it with `observe`.
 - **An average of two outputs.** In an early run, the supervisor balanced on an average of only two outputs, while the two lines of Team B had just delivered their first units close together. The controller now reports the average only after three outputs.
 - **A status after a stop.** After the operator stop, the status of each team still showed its last value, for example `running`. Now the command of an interrupted program shows `interrupted`, and its team shows `stopped`.
 - **An order delivered twice.** In some runs, CAO delivered the order to the supervisor a second time. The supervisor profile now says to run the order once, and in each of those runs the supervisor said so in its report and did not assign the managers again.
@@ -302,7 +303,7 @@ The agents decide in seconds what to do next. The robots and their controllers k
 ## Prerequisites
 
 - CAO from `main`, from 2026-10-23 or later, or the first release after 2.5.4. Install it with `uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade`. The managers need two changes that are on `main` but not yet in a release: [#972](https://github.com/awslabs/cli-agent-orchestrator/pull/972) and [#948](https://github.com/awslabs/cli-agent-orchestrator/pull/948). [Architecture overview](#architecture-overview) explains why.
-- **The versions of our runs.** Three of the nine runs in [Results](#results) used CAO 2.5.3 (commit `88f3af0c`): two runs of the demo order, and the run with Copilot CLI. They came before the manager allowlist of this post. The other six runs used `main` with that allowlist. The five scenario runs used commit `f63fffec` (version string 2.5.4).
+- **The versions of our runs.** Three of the ten runs in [Results](#results) used CAO 2.5.3 (commit `88f3af0c`): two runs of the demo order, and the run with Copilot CLI. They came before the manager allowlist of this post. The other seven runs used `main` with that allowlist. The six scenario runs used commit `f63fffec` (version string 2.5.4).
 - tmux 3.3 or later, and [uv](https://docs.astral.sh/uv/), a Python package manager, on macOS or Linux. Python 3.11 or later.
 - A provider CLI that you have signed in to, for example Claude Code, Copilot CLI, or Kiro CLI. These three enforce the tool allowlist of each agent.
 - No GPU, no display, and no robot hardware. The robot model is an 18 MB download.

@@ -989,6 +989,7 @@ the default provider, `copilot_cli`, and the others with
 | Another routine | `Make, assemble, and ship 8 units. Start Team A at 6 s and Team B at 4 s. Ship in batches of 4 with the routine turn, run, spin.` | Team C loads four units, turns, runs, and spins after it runs back. Team B is faster, so the block is less likely. |
 | Impossible request | `Make, assemble, and ship 30 units.` | The supervisor finds only 16 raw parts. It reports that the order is not possible, and it assigns no manager. |
 | Not a valid routine | `Make, assemble, and ship 8 units. Ship in batches of 2 with the routine spin, turn.` | The routine has no `run`. The supervisor refuses before it assigns any manager, and no robot moves. If a manager still calls `start_shipping`, the controller rejects it with `routine_needs_one_run`. |
+| A routine that is too long | `Make, assemble, and ship 16 units. Start Team A at 2 s and Team B at 8 s. Ship in batches of 2 with the routine spin, turn, spin, turn, spin, turn, run.` | The routine has seven moves, and `max_routine_moves` of Team C is 6. The supervisor refuses before it assigns any manager, and no robot moves. |
 | Operator stop | The request of Step 2 | While the teams work, run `demo.py stop` in Terminal 1. The programs become `interrupted`, reason `operator_stop`, and each team shows `stopped`. The robots stop where they are, and the controller rejects all later actions. |
 
 ## From the simulation to real robots
