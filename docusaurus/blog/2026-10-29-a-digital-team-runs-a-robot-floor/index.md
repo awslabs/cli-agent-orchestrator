@@ -310,6 +310,8 @@ The agents decide in seconds what to do next. The robots and their controllers k
 From the repository root, install the example, download the robot model, and prepare a run:
 
 ```bash
+git clone https://github.com/awslabs/cli-agent-orchestrator.git
+cd cli-agent-orchestrator
 cd examples/robotics/hierarchical-factory
 uv sync --locked
 uv run --locked python demo.py fetch-robot
@@ -318,7 +320,7 @@ REQUEST="Make, assemble, and ship 16 units. Start Team A at 2 s and Team B at 8 
 uv run --locked python demo.py prepare --run-dir "$RUN_DIR" --request "$REQUEST" --provider claude_code
 ```
 
-Then follow the [README of the example](https://github.com/awslabs/cli-agent-orchestrator/blob/main/examples/robotics/hierarchical-factory/README.md). It starts the controller, installs one run copy of a profile for each agent, launches the supervisor, and shows what to watch, with the live view. When you finish, follow its [Stop and clean up](https://github.com/awslabs/cli-agent-orchestrator/blob/main/examples/robotics/hierarchical-factory/README.md#stop-and-clean-up) steps. They stop the simulation and the CAO session, and they remove the profiles and the run directory.
+Then continue at [Step 3 of the README](https://github.com/awslabs/cli-agent-orchestrator/blob/main/examples/robotics/hierarchical-factory/README.md#step-3-start-the-mujoco-controller). The README uses three terminals: this one, one for the MuJoCo controller, and one for `cao-server`. It starts the controller, installs one run copy of a profile for each agent, launches the supervisor, and shows what to watch, with the live view. When you finish, follow its [Stop and clean up](https://github.com/awslabs/cli-agent-orchestrator/blob/main/examples/robotics/hierarchical-factory/README.md#stop-and-clean-up) steps. They stop the simulation and the CAO session, and they remove the profiles and the run directory.
 
 ## Conclusion
 
