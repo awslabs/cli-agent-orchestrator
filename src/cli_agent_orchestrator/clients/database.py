@@ -467,7 +467,7 @@ def create_launch_record(
             )
             db.add(record)
             db.flush()
-            record_id = record.id
+            record_id = cast(int, record.id)
             db.commit()
         return record_id
     except Exception as e:
