@@ -662,7 +662,7 @@ class TestTheIdIsAllocatedBeforeItIsMarkedInFlight:
             idempotency_key="retained-key",
             request_fingerprint="retained-fp",
         )
-        assert db_delete_terminal("aaaaaaaa") is True
+        assert db_delete_terminal("aaaaaaaa", end_reason="deleted") is True
         assert terminal_id_in_use("aaaaaaaa") is True
         pane.backend.get_history.return_value = _HEALTHY_SCREEN
 
