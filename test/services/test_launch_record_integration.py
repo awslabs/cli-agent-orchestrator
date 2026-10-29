@@ -20,7 +20,8 @@ def _patch_create_terminal_collaborators(test_fn):
     """Shared decorator stack for a successful create_terminal call, mirroring
     TestCreateTerminal in test_terminal_service_full.py. ``db_create_launch_record``
     is deliberately NOT mocked here -- these tests assert against the real
-    in-memory DB via ``isolated_memory_db``."""
+    in-memory DB via ``isolated_memory_db`` -- and the ``db_create_terminal``
+    mock writes the real terminal row (``_wire_common_mocks``)."""
     decorators = [
         patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session"),
         patch("cli_agent_orchestrator.services.terminal_service.status_monitor"),
@@ -63,7 +64,15 @@ def _wire_common_mocks(
     mock_provider.identity_verified = True
     mock_provider_manager.create_provider.return_value = mock_provider
     mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
-    mock_db_create.return_value = {"ephemeral": False}
+    # The real row: the create re-reads it after writing the launch record and
+    # closes the record if a teardown already removed it.
+    mock_db_create.side_effect = _real_db_create_terminal
+
+
+def _real_db_create_terminal(*args, **kwargs):
+    from cli_agent_orchestrator.clients import database
+
+    return database.create_terminal(*args, **kwargs)
 
 
 class TestLaunchRecordOnCreate:
@@ -297,20 +306,6 @@ class TestLaunchRecordOnTeardown:
         )
         result = await create_terminal("kiro_cli", "developer", new_session=True)
 
-        # db_create_terminal is mocked above (as in TestCreateTerminal), so no
-        # real TerminalModel row exists yet for delete_terminal to remove;
-        # insert one with the same id to exercise the real teardown path.
-        with database.SessionLocal() as db:
-            db.add(
-                database.TerminalModel(
-                    id=result.id,
-                    tmux_session=result.session_name,
-                    tmux_window="developer-abcd",
-                    provider="kiro_cli",
-                )
-            )
-            db.commit()
-
         assert database.delete_terminal(result.id, end_reason="deleted") is True
 
         record = database.get_launch_record(result.id)
@@ -357,21 +352,115 @@ class TestLaunchRecordOnTeardown:
             database._finalize_launch_records_best_effort(["x"], "deleted")  # must not raise
 
 
-def _insert_terminal_row(terminal_id, session_name):
-    """db_create_terminal is mocked (as in TestCreateTerminal), so add the row
-    teardown needs by hand."""
-    from cli_agent_orchestrator.clients import database
+class TestTeardownDuringCreate:
+    """A teardown runs on a worker thread and does not wait for a create. One
+    that removes the row before the launch record exists has nothing to
+    stamp; the create re-reads the row after the write and closes the
+    record. A teardown after that re-read stamps its own reason."""
 
-    with database.SessionLocal() as db:
-        db.add(
-            database.TerminalModel(
-                id=terminal_id,
-                tmux_session=session_name,
-                tmux_window="developer-abcd",
-                provider="kiro_cli",
-            )
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider", ["claude_code", "codex"])
+    @_patch_create_terminal_collaborators
+    async def test_teardown_during_sync_init_finalizes_the_record(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_delete_terminals_by_session,
+        provider,
+    ):
+        """The window closes during ``initialize()``, which still returns True
+        (e.g. Claude Code's input-ready check gives up on a failed capture)."""
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import terminal_service
+
+        _wire_common_mocks(
+            mock_load_profile,
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_db_create,
+            mock_provider_manager,
+            mock_fifo_dir,
         )
-        db.commit()
+        provider_double = mock_provider_manager.create_provider.return_value
+        torn_down = []
+
+        async def initialize_while_torn_down():
+            torn_down.append(database.delete_terminal("test1234", end_reason="deleted"))
+            torn_down.append(database.get_launch_record("test1234"))
+            return True
+
+        provider_double.initialize.side_effect = initialize_while_torn_down
+
+        result = await create_terminal(provider, "developer", new_session=True)
+
+        assert torn_down == [True, None]  # the row was gone before any record existed
+        assert database.get_terminal_metadata(result.id) is None
+        record = database.get_launch_record(result.id)
+        assert record["provider"] == provider
+        assert record["ended_at"] is not None
+        assert record["end_reason"] == terminal_service._UNSTAMPED_TEARDOWN_END_REASON
+        assert record["end_reason"] in database.LAUNCH_END_REASONS
+
+    @pytest.mark.asyncio
+    @_patch_create_terminal_collaborators
+    async def test_teardown_after_the_recheck_stamps_its_own_reason(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_delete_terminals_by_session,
+        monkeypatch,
+    ):
+        """The re-read finds the row, so it leaves the record open; the
+        teardown that lands right after it stamps its own reason."""
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import terminal_service
+
+        _wire_common_mocks(
+            mock_load_profile,
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_db_create,
+            mock_provider_manager,
+            mock_fifo_dir,
+        )
+        real_recheck = terminal_service.db_finalize_launch_record_if_terminal_gone
+        rechecks = []
+
+        def recheck_then_teardown(record_id, *, end_reason):
+            rechecks.append(real_recheck(record_id, end_reason=end_reason))
+            assert database.delete_terminal("test1234", end_reason="pane_closed") is True
+            return rechecks[-1]
+
+        monkeypatch.setattr(
+            terminal_service, "db_finalize_launch_record_if_terminal_gone", recheck_then_teardown
+        )
+
+        result = await create_terminal("codex", "developer", new_session=True)
+
+        assert rechecks == [False]
+        record = database.get_launch_record(result.id)
+        assert record["ended_at"] is not None
+        assert record["end_reason"] == "pane_closed"
 
 
 class TestReusedTerminalId:
@@ -414,14 +503,12 @@ class TestReusedTerminalId:
         monkeypatch.setattr(database, "_utcnow", lambda: clock["now"])
 
         first = await create_terminal("kiro_cli", "developer", new_session=True, model="m-first")
-        _insert_terminal_row(first.id, first.session_name)
         clock["now"] = t0 + timedelta(seconds=100)
         assert database.delete_terminal(first.id, end_reason="deleted") is True
 
         clock["now"] = t0 + timedelta(seconds=200)
         second = await create_terminal("kiro_cli", "developer", new_session=True, model="m-second")
         assert second.id == first.id  # the repeated id
-        _insert_terminal_row(second.id, second.session_name)
         clock["now"] = t0 + timedelta(seconds=300)
         assert database.delete_terminal(second.id, end_reason="pane_closed") is True
 

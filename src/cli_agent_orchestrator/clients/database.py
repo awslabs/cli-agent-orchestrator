@@ -19,6 +19,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    exists,
     func,
     literal_column,
     text,
@@ -351,7 +352,8 @@ LAUNCH_TARGET_KINDS = ("installed", "ephemeral", "workflow")
 # cause, not the DB function that ran: ``launch_failed`` (create rollback or a
 # failed deferred init), ``deleted`` (an explicit delete, or handoff/workflow
 # step teardown), ``pane_closed`` (herdr reported the pane or workspace gone),
-# ``stale_cleanup`` (a sweep of rows nobody owns any more) and
+# ``stale_cleanup`` (a sweep of rows nobody owns any more, or a record whose
+# row a teardown removed before the record was written) and
 # ``session_teardown`` (session delete or flow recycle). Every teardown
 # function that finalizes takes one as a required keyword, so a new call site
 # has to choose.
@@ -441,32 +443,36 @@ def create_launch_record(
     provider_session_id: Optional[str] = None,
     record_ids: tuple[int, ...] = (),
     caller_id: Optional[str] = None,
-) -> None:
+) -> Optional[int]:
     """Write the one content-free launch row for a freshly created terminal.
 
-    Best-effort: never raises. A failure here must never fail or alter the
-    launch it describes (issue #1082 acceptance criteria).
+    Returns the new row's id, or None if the write failed. Best-effort: never
+    raises. A failure here must never fail or alter the launch it describes
+    (issue #1082 acceptance criteria).
     """
     try:
         with SessionLocal() as db:
-            db.add(
-                LaunchRecordModel(
-                    terminal_id=terminal_id,
-                    session_name=session_name,
-                    provider=provider,
-                    target_name=target_name,
-                    target_kind=target_kind,
-                    launched_model=launched_model,
-                    model_honored=model_honored,
-                    provider_session_id=provider_session_id,
-                    record_ids=_json.dumps(list(record_ids)) if record_ids else None,
-                    caller_id=caller_id,
-                    created_at=_utcnow(),
-                )
+            record = LaunchRecordModel(
+                terminal_id=terminal_id,
+                session_name=session_name,
+                provider=provider,
+                target_name=target_name,
+                target_kind=target_kind,
+                launched_model=launched_model,
+                model_honored=model_honored,
+                provider_session_id=provider_session_id,
+                record_ids=_json.dumps(list(record_ids)) if record_ids else None,
+                caller_id=caller_id,
+                created_at=_utcnow(),
             )
+            db.add(record)
+            db.flush()
+            record_id = record.id
             db.commit()
+        return record_id
     except Exception as e:
         logger.warning(f"Launch record create failed for {terminal_id}: {e}")
+        return None
 
 
 def finalize_launch_records(terminal_ids: List[str], end_reason: str) -> None:
@@ -501,6 +507,39 @@ def finalize_launch_records(terminal_ids: List[str], end_reason: str) -> None:
                 db.commit()
     except Exception as e:
         logger.warning(f"Launch record finalize failed for {terminal_ids}: {e}")
+
+
+def finalize_launch_record_if_terminal_gone(record_id: int, *, end_reason: str) -> bool:
+    """Close a just-written launch record whose terminal row is already gone.
+
+    A teardown runs on a worker thread and does not wait for a create, so it
+    can delete the terminal row before the create writes the launch record
+    (issue #1082). Its finalize then has nothing to stamp, and the record
+    would stay open for good. The create calls this right after the write.
+    The UPDATE stamps the record only while it is still open AND no terminal
+    row exists for its id, so a teardown that runs after this check still
+    finds the record open and stamps its own reason (first reason wins).
+    The read first keeps the common case, a live row, free of a write lock.
+    Best-effort: never raises. Returns True if it stamped the record.
+    """
+    try:
+        with SessionLocal() as db:
+            open_and_gone = db.query(LaunchRecordModel).filter(
+                LaunchRecordModel.id == record_id,
+                LaunchRecordModel.ended_at.is_(None),
+                ~exists().where(TerminalModel.id == LaunchRecordModel.terminal_id),
+            )
+            if open_and_gone.first() is None:
+                return False
+            stamped = open_and_gone.update(
+                {"ended_at": _utcnow(), "end_reason": end_reason},
+                synchronize_session=False,
+            )
+            db.commit()
+        return stamped > 0
+    except Exception as e:
+        logger.warning(f"Launch record finalize failed for record {record_id}: {e}")
+        return False
 
 
 def record_launch_status_event(

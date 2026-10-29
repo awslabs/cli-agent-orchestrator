@@ -225,6 +225,49 @@ async def test_deferred_init_failure_records_launch_failed(release_runtime, monk
 
 
 @pytest.mark.asyncio
+async def test_teardown_before_the_record_write_on_the_deferred_path_finalizes_the_record(
+    release_runtime, monkeypatch
+):
+    """The row commits, a teardown removes it before the launch record is
+    written, then the init fails. The failure path skips a missing row, so
+    the create's re-read of the row is what closes the record."""
+    _, name, _, factory = release_runtime
+    factory.return_value.initialize.side_effect = RuntimeError("launch failed")
+    schedule = terminal_service._schedule_deferred_init
+    owned = []
+
+    def capture(*args, **kwargs):
+        task = schedule(*args, **kwargs)
+        owned.append(task)
+        return task
+
+    bind = terminal_service._bind_decision_launch
+    torn_down = []
+
+    def teardown_then_bind(launch_plan, **kwargs):
+        if kwargs.get("launch_status") == "launched":
+            torn_down.append(database.delete_terminal(CHILD, end_reason="deleted"))
+            torn_down.append(database.get_launch_record(CHILD))
+        return bind(launch_plan, **kwargs)
+
+    monkeypatch.setattr(terminal_service, "_schedule_deferred_init", capture)
+    monkeypatch.setattr(terminal_service, "_bind_decision_launch", teardown_then_bind)
+    await terminal_service.create_terminal(
+        "claude_code",
+        name,
+        session_name="cao-session",
+        caller_id=CALLER,
+        initial_message="inspect",
+        defer_init=True,
+    )
+    assert torn_down == [True, None]  # the row was gone before any record existed
+    await asyncio.wait_for(owned[0], timeout=10)
+
+    assert database.get_terminal_metadata(CHILD) is None
+    _ended(terminal_service._UNSTAMPED_TEARDOWN_END_REASON)
+
+
+@pytest.mark.asyncio
 async def test_deferred_failure_retained_for_external_owner_records_launch_failed(
     release_runtime,
 ):

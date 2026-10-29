@@ -57,7 +57,7 @@ def _launch(terminal_id, **overrides):
         model_honored=None,
     )
     values.update(overrides)
-    db_mod.create_launch_record(**values)
+    return db_mod.create_launch_record(**values)
 
 
 def _rows(terminal_id):
@@ -233,6 +233,59 @@ def test_finalize_closes_only_the_newest_open_launch(fresh_db, clock):
     old, new = _rows("t4")
     assert old["ended_at"] is None and old["end_reason"] is None
     assert new["end_reason"] == "pane_closed"
+
+
+def test_create_launch_record_returns_the_new_row_id(fresh_db):
+    first = _launch("t-ids")
+    second = _launch("t-ids")
+    assert [r["id"] for r in _rows("t-ids")] == [first, second]
+    assert _launch("t-bad-id", model_honored=object()) is None  # write failed
+
+
+def test_finalize_if_terminal_gone_stamps_only_an_open_record_without_a_row(fresh_db, clock):
+    """The create's re-read: a live row keeps its record open, a gone row's
+    open record is stamped, and an already-closed record keeps its reason."""
+    from cli_agent_orchestrator.clients.database import TerminalModel
+
+    with db_mod.SessionLocal() as db:
+        db.add(TerminalModel(id="live0001", tmux_session="s", tmux_window="w", provider="codex"))
+        db.commit()
+    live = _launch("live0001")
+    gone = _launch("gone0001")
+    closed = _launch("gone0002")
+    db_mod.finalize_launch_records(["gone0002"], "pane_closed")
+    clock.at(5)
+
+    assert db_mod.finalize_launch_record_if_terminal_gone(live, end_reason="deleted") is False
+    assert db_mod.finalize_launch_record_if_terminal_gone(gone, end_reason="deleted") is True
+    assert db_mod.finalize_launch_record_if_terminal_gone(closed, end_reason="deleted") is False
+
+    assert db_mod.get_launch_record("live0001")["ended_at"] is None
+    assert db_mod.get_launch_record("gone0001")["end_reason"] == "deleted"
+    assert db_mod.get_launch_record("gone0001")["ended_at"] == T0 + timedelta(seconds=5)
+    assert db_mod.get_launch_record("gone0002")["end_reason"] == "pane_closed"
+
+
+def test_finalize_if_terminal_gone_stamps_only_the_given_record(fresh_db):
+    """An older launch left open under the same id is not this create's."""
+    older = _launch("gone0003", caller_id="older")
+    newer = _launch("gone0003", caller_id="newer")
+    assert db_mod.finalize_launch_record_if_terminal_gone(newer, end_reason="deleted") is True
+    rows = _rows("gone0003")
+    assert [(r["id"], r["end_reason"]) for r in rows] == [(older, None), (newer, "deleted")]
+
+
+def test_finalize_if_terminal_gone_never_raises(fresh_db, monkeypatch):
+    def broken_session():
+        raise RuntimeError("db is down")
+
+    monkeypatch.setattr(db_mod, "SessionLocal", broken_session)
+    assert db_mod.finalize_launch_record_if_terminal_gone(1, end_reason="deleted") is False
+
+
+def test_finalize_if_terminal_gone_requires_an_end_reason(fresh_db):
+    with pytest.raises(TypeError, match="end_reason"):
+        db_mod.finalize_launch_record_if_terminal_gone(1)
 
 
 def test_finalize_unknown_terminal_is_a_noop(fresh_db):

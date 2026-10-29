@@ -54,6 +54,9 @@ from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import delete_idempotency_key
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
+    finalize_launch_record_if_terminal_gone as db_finalize_launch_record_if_terminal_gone,
+)
+from cli_agent_orchestrator.clients.database import (
     finalize_launch_records as db_finalize_launch_records,
 )
 from cli_agent_orchestrator.clients.database import (
@@ -328,10 +331,18 @@ def _classify_launch_target_kind(
     return "installed"
 
 
-def _record_launch_best_effort(**values: Any) -> None:
+# Issue #1082, provisional: the end reason of a launch whose terminal row a
+# teardown removed before the launch record existed. That teardown had nothing
+# to stamp and its own reason is no longer known, so CAO closes the record as
+# its own cleanup of state nobody owns any more.
+_UNSTAMPED_TEARDOWN_END_REASON = "stale_cleanup"
+
+
+def _record_launch_best_effort(**values: Any) -> Optional[int]:
     """Write issue #1082's content-free launch record. Never raises or blocks.
 
-    A failure here must never fail or alter the launch it describes.
+    Returns the new record's id, or None if nothing was written. A failure
+    here must never fail or alter the launch it describes.
     ``db_create_launch_record`` already swallows its own exceptions; this
     wrapper additionally protects against a bad caller-side value (e.g. a
     non-JSON-serializable ``record_ids``) blowing up before that function's
@@ -350,9 +361,11 @@ def _record_launch_best_effort(**values: Any) -> None:
         )
         values["target_kind"] = None
     try:
-        db_create_launch_record(**values)
+        record_id = db_create_launch_record(**values)
     except Exception:
         logger.warning("Launch record create failed", exc_info=True)
+        return None
+    return record_id if isinstance(record_id, int) else None
 
 
 def resolve_launch_model(
@@ -2642,7 +2655,7 @@ async def _create_terminal_unguarded(
         # offloaded with ``to_thread``: no await may separate scheduling the
         # deferred init from this write, or a fast init failure could finalize
         # before the record exists and leave it open for good.
-        _record_launch_best_effort(
+        launch_record_id = _record_launch_best_effort(
             terminal_id=terminal.id,
             session_name=session_name,
             provider=provider,
@@ -2654,6 +2667,15 @@ async def _create_terminal_unguarded(
             record_ids=launch_plan.record_ids if launch_plan is not None else (),
             caller_id=caller_id,
         )
+        # A teardown does not wait for a create: one that deleted the row
+        # before the record existed (during init, or between the row commit
+        # and this write) had nothing to stamp. Re-read the row once the
+        # record exists and close the record if the row is gone. A teardown
+        # after this check finds the record and stamps its own reason.
+        if launch_record_id is not None:
+            db_finalize_launch_record_if_terminal_gone(
+                launch_record_id, end_reason=_UNSTAMPED_TEARDOWN_END_REASON
+            )
         return terminal
 
     except Exception as e:
