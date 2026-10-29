@@ -8399,12 +8399,13 @@ async def get_workflow_run_artifact_endpoint(
         except OSError:
             # O_NOFOLLOW refuses a symlink swapped in after the realpath check (ELOOP).
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="report file refused")
+        # Check the descriptor before wrapping it: os.fdopen refuses a directory with
+        # IsADirectoryError, which would surface as a 500 instead of a 404.
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such report file")
         with os.fdopen(fd, "rb") as fh:
-            st = os.fstat(fh.fileno())
-            if not stat.S_ISREG(st.st_mode):
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND, detail="no such report file"
-                )
             if st.st_size > WORKFLOW_ARTIFACT_MAX_BYTES:
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
