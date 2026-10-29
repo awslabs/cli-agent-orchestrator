@@ -110,6 +110,8 @@ export interface HealthInfo {
   /** The init budget the SERVER applies, in seconds (#1002 P3-1). Absent on an older server. */
   provider_init_timeout?: number
   components?: Record<string, string>
+  /** The server's installed package version. Absent on an older server. */
+  version?: string
 }
 
 // ── Create budgets, sized from the server's provider_init_timeout ───────────
@@ -648,6 +650,29 @@ export interface RunSummaryRow {
   current_step_id: string | null
 }
 
+/**
+ * Optional, deployment-supplied UI presets, read from `ui-presets.json` next to
+ * the built UI (a provisioning step drops it into web/public before the build).
+ * Absent on a plain install, which is the common case: every field is optional
+ * and a missing or malformed file means "no presets".
+ */
+export interface UiPresets {
+  prompts?: { label: string; text: string }[]
+  installs?: { label: string; source: string; provider?: string }[]
+}
+
+/** Result of `POST /agents/profiles/install` (server InstallResult). */
+export interface InstallResult {
+  success: boolean
+  message: string
+  agent_name?: string | null
+  context_file?: string | null
+  agent_file?: string | null
+  unresolved_vars?: string[] | null
+  source_kind?: 'url' | 'file' | 'name' | null
+  provider?: string | null
+}
+
 // ── Agent Plugins (Agent Plugins 1.0.0) ──────────────────────────────────────
 // Distinct from CAO's event-plugin system, which has no web surface.
 
@@ -982,6 +1007,60 @@ export const api = {
   // (fetchJSON returns undefined). Idempotent server-side (unknown id -> 204).
   deleteWorkflowRun: (runId: string) =>
     fetchJSON<void>(`/workflows/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' }),
+
+  // Deployment presets (see UiPresets). Never rejects: any failure is "none".
+  getUiPresets: async (): Promise<UiPresets> => {
+    try {
+      const data = await fetchJSON<unknown>('/ui-presets.json')
+      if (!data || typeof data !== 'object') return {}
+      const d = data as Record<string, unknown>
+      const prompts = Array.isArray(d.prompts)
+        ? d.prompts.filter((p: any) => p && typeof p.label === 'string' && typeof p.text === 'string')
+        : undefined
+      const installs = Array.isArray(d.installs)
+        ? d.installs.filter((p: any) => p && typeof p.label === 'string' && typeof p.source === 'string')
+        : undefined
+      return { prompts, installs }
+    } catch {
+      return {}
+    }
+  },
+
+  // Install an agent profile (POST /agents/profiles/install) — the `cao install`
+  // equivalent. `source` is a built-in profile name or an https:// URL (the
+  // server refuses local paths); `provider` defaults to the profile's
+  // frontmatter when omitted (same flag > frontmatter > default order as the CLI).
+  installProfile: (source: string, provider?: string) =>
+    fetchJSON<InstallResult>('/agents/profiles/install', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(provider ? { source, provider } : { source }),
+      timeoutMs: 30000,
+    }),
+
+  // GET /health, for the Home tab's server card (backend, components, version).
+  getHealth: () => fetchJSON<HealthInfo>('/health'),
+
+  // Download one memory scope as an OKF tarball (GET /memory/export). The server
+  // refuses private scopes and needs scope_id for project. Returns the blob and
+  // a filename so the caller can hand it to the browser; errors surface as
+  // ApiError like fetchJSON's.
+  exportMemory: async (opts: { scope: string; scopeId?: string; redact?: boolean }) => {
+    const q = new URLSearchParams({ scope: opts.scope })
+    if (opts.scopeId) q.set('scope_id', opts.scopeId)
+    if (opts.redact) q.set('redact', 'true')
+    const res = await fetch(`${BASE}/memory/export?${q}`, { headers: withAuth() })
+    if (!res.ok) {
+      const err: ApiError = new Error(`${res.status} ${res.statusText}`)
+      err.status = res.status
+      try {
+        const body = await res.json()
+        if (body && typeof body.detail === 'string') err.detail = body.detail
+      } catch { /* non-JSON error body */ }
+      throw err
+    }
+    return { blob: await res.blob(), filename: `cao-memory-${opts.scope}.tar.gz` }
+  },
 
   // U5 terminal offset-range read — the bytes produced around a selected event
   // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null

@@ -5,6 +5,7 @@ import { ConfirmModal } from './ConfirmModal'
 import { Brain, Search, Trash2, ChevronDown, ChevronRight, List, Share2 } from 'lucide-react'
 import { CustomSelect } from './CustomSelect'
 import { MemoryGraphView } from './MemoryGraphView'
+import { MemoryExport } from './MemoryExport'
 
 type ViewMode = 'list' | 'graph'
 
@@ -217,6 +218,10 @@ export function MemoryPanel() {
             className="bg-gray-900 border border-gray-700 text-gray-200 text-xs rounded-lg px-3 py-2 w-72 focus:border-emerald-500 focus:outline-hidden font-mono"
           />
         )}
+
+        <div className="ml-auto">
+          <MemoryExport memories={memories} />
+        </div>
       </div>
 
       {viewMode === 'graph' ? (

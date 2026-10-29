@@ -2053,9 +2053,19 @@ async def health_check():
     backend = get_backend()
     backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
 
+    # The installed package version, so a client (the web UI's server card) can
+    # show what it is talking to without a shell. Same source as `cao --version`.
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        server_version = version("cli-agent-orchestrator")
+    except PackageNotFoundError:
+        server_version = "unknown"
+
     return {
         "status": "ok",
         "service": "cli-agent-orchestrator",
+        "version": server_version,
         "terminal_backend": backend_name,
         # Capabilities a peer node can rely on. ``delegation_ceiling``: this
         # node bounds created terminals by the caller's delegation ceiling and

@@ -55,6 +55,21 @@ class TestHealthCheck:
         assert components["herdr"] in ("ok", "unavailable")
         assert components["claude"] in ("ok", "unavailable")
 
+    def test_health_reports_the_package_version(self, client):
+        """GET /health carries the installed version (shown by the web UI's server card)."""
+        with patch("importlib.metadata.version", return_value="9.9.9"):
+            data = client.get("/health").json()
+        assert data["version"] == "9.9.9"
+
+    def test_health_version_falls_back_when_not_installed(self, client):
+        """An uninstalled source tree reports 'unknown' rather than failing the health check."""
+        from importlib.metadata import PackageNotFoundError
+
+        with patch("importlib.metadata.version", side_effect=PackageNotFoundError):
+            response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["version"] == "unknown"
+
     def test_health_reports_terminal_backend_tmux(self, client):
         """GET /health reports terminal_backend matching the active backend (tmux)."""
         with patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend:

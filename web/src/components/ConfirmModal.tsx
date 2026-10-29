@@ -66,17 +66,23 @@ export function ConfirmModal({
       <div className="absolute inset-0 bg-black/60 backdrop-blur-xs" onClick={onCancel} />
 
       {/* Modal */}
-      <div className="relative bg-gray-900 border border-gray-700/50 rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden animate-in fade-in zoom-in-95">
+      <div
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="confirm-modal-title"
+        aria-describedby="confirm-modal-message"
+        className="relative bg-gray-900 border border-gray-700/50 rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden animate-in fade-in zoom-in-95"
+      >
         {/* Header */}
         <div className="flex items-start gap-4 p-6 pb-4">
           <div className={`shrink-0 w-10 h-10 rounded-xl flex items-center justify-center ${colors.icon}`}>
-            <AlertTriangle size={20} />
+            <AlertTriangle size={20} aria-hidden="true" />
           </div>
           <div className="flex-1 min-w-0">
-            <h3 className="text-base font-semibold text-white">{title}</h3>
-            <p className="text-sm text-gray-400 mt-1">{message}</p>
+            <h3 id="confirm-modal-title" className="text-base font-semibold text-white">{title}</h3>
+            <p id="confirm-modal-message" className="text-sm text-gray-400 mt-1">{message}</p>
           </div>
-          <button onClick={onCancel} className="shrink-0 p-1 text-gray-500 hover:text-white rounded-sm transition-colors">
+          <button onClick={onCancel} aria-label="Close" className="shrink-0 p-1 text-gray-500 hover:text-white rounded-sm transition-colors">
             <X size={16} />
           </button>
         </div>

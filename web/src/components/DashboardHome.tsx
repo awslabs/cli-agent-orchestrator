@@ -8,6 +8,7 @@ import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 import { AgentDescription } from './AgentDescription'
+import { HealthCard } from './HealthCard'
 import { parseServerTime } from '../time'
 
 const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
@@ -287,6 +288,11 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
             </div>
           </div>
         </button>
+      </div>
+
+      {/* Server */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <HealthCard />
       </div>
 
       {/* Quick Actions */}

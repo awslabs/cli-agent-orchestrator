@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, AgentProfileInfo, AgentProfileDetail, ProfileSearchResult, ProfileValidationMessage } from '../api'
-import { Package, Plus, Search, AlertTriangle, Copy, CopyPlus, FilePen, Tag, Trash2, Wrench, Loader2 } from 'lucide-react'
+import { Package, Plus, Search, AlertTriangle, Copy, CopyPlus, FilePen, Tag, Trash2, Wrench, Loader2, Download } from 'lucide-react'
 import { ProfileCreateModal } from './ProfileCreateModal'
 import { ProfileEditorModal } from './ProfileEditorModal'
 import { ConfirmModal } from './ConfirmModal'
@@ -215,6 +215,11 @@ export function ProfilesPanel() {
 
   const [selected, setSelected] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
+  // Install a profile by name or https:// URL (POST /agents/profiles/install) —
+  // the `cao install` equivalent, without leaving the UI.
+  const [installOpen, setInstallOpen] = useState(false)
+  const [installName, setInstallName] = useState('')
+  const [installing, setInstalling] = useState(false)
   const [editor, setEditor] = useState<{ mode: 'edit' | 'clone'; name: string } | null>(null)
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
@@ -268,6 +273,41 @@ export function ProfilesPanel() {
     setResults(null)
     setSearchError(null)
     setSearching(false)
+  }
+
+  // Deployment-supplied one-click installs (ui-presets.json), shown as chips in
+  // the Install row — e.g. a team's shared profiles by https:// URL, since the
+  // server installs names and URLs but not local file paths.
+  const [quickInstalls, setQuickInstalls] = useState<{ label: string; source: string; provider?: string }[]>([])
+  useEffect(() => {
+    if (!installOpen) return
+    let cancelled = false
+    api.getUiPresets().then(p => { if (!cancelled) setQuickInstalls(p.installs ?? []) })
+    return () => { cancelled = true }
+  }, [installOpen])
+
+  const handleInstall = async (preset?: { source: string; provider?: string }) => {
+    const source = preset ? preset.source : installName.trim()
+    if (!source || installing) return
+    setInstalling(true)
+    try {
+      const res = await api.installProfile(source, preset?.provider)
+      if (res.success) {
+        showSnackbar({ type: 'success', message: res.message || `Installed '${source}'` })
+        // Keep the row open after a chip so a set (e.g. three profiles) is three clicks.
+        if (!preset) {
+          setInstallOpen(false)
+          setInstallName('')
+        }
+        await refreshCatalog()
+      } else {
+        showSnackbar({ type: 'error', message: res.message || `Failed to install '${source}'` })
+      }
+    } catch (e: any) {
+      showSnackbar({ type: 'error', message: e?.detail || e?.message || `Failed to install '${source}'` })
+    } finally {
+      setInstalling(false)
+    }
   }
 
   useEffect(() => { refreshCatalog() }, [])
@@ -404,13 +444,62 @@ export function ProfilesPanel() {
             {results !== null ? `${results.length} match${results.length !== 1 ? 'es' : ''}` : `${catalog.length} profile${catalog.length !== 1 ? 's' : ''}`}
           </span>
         </div>
-        <button
-          onClick={() => setCreateOpen(true)}
-          className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium px-3 py-2 rounded-lg transition-colors"
-        >
-          <Plus size={14} /> New profile
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setInstallOpen(o => !o)}
+            aria-expanded={installOpen}
+            className="flex items-center gap-2 border border-gray-700 hover:bg-gray-800 text-gray-200 text-sm font-medium px-3 py-2 rounded-lg transition-colors"
+          >
+            <Download size={14} /> Install
+          </button>
+          <button
+            onClick={() => setCreateOpen(true)}
+            className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium px-3 py-2 rounded-lg transition-colors"
+          >
+            <Plus size={14} /> New profile
+          </button>
+        </div>
       </div>
+
+      {installOpen && quickInstalls.length > 0 && (
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          {quickInstalls.map(q => (
+            <button
+              key={q.label}
+              type="button"
+              onClick={() => handleInstall(q)}
+              disabled={installing}
+              title={q.source}
+              className="flex items-center gap-1.5 rounded-lg border border-emerald-800/60 px-2.5 py-1 text-xs text-emerald-200 hover:bg-emerald-900/30 disabled:opacity-40"
+            >
+              <Download size={12} aria-hidden="true" /> {q.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {installOpen && (
+        <div className="mb-4 flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/40 p-3">
+          <input
+            type="text"
+            value={installName}
+            onChange={e => setInstallName(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleInstall() }}
+            placeholder="Profile name to install (e.g. reviewer)"
+            aria-label="Profile name to install"
+            className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-1.5 focus:border-emerald-500 focus:outline-none"
+            autoFocus
+          />
+          <button
+            onClick={() => handleInstall()}
+            disabled={installing || !installName.trim()}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-colors"
+          >
+            {installing ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+            {installing ? 'Installing…' : 'Install'}
+          </button>
+        </div>
+      )}
 
       {/* Search */}
       <div className="relative max-w-md">

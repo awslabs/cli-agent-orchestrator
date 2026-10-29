@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useStore } from '../store'
 import { api, AgentProfileInfo, ProviderInfo } from '../api'
 import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Tag, Search, Mail, Plus, LogOut, Send, FileText, X } from 'lucide-react'
+import { PromptPresets } from './PromptPresets'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
@@ -64,6 +65,29 @@ export function AgentPanel() {
   const [sendingInput, setSendingInput] = useState<string | null>(null)
   const { showSnackbar } = useStore()
   const [outputTerminalId, setOutputTerminalId] = useState<string | null>(null)
+  // "Shut down all sessions" (the `cao shutdown --all` equivalent): one confirm,
+  // then each session is deleted in turn and a single summary is shown.
+  const [confirmShutdownAll, setConfirmShutdownAll] = useState(false)
+  const [shuttingDownAll, setShuttingDownAll] = useState(false)
+  const handleShutdownAll = async () => {
+    setShuttingDownAll(true)
+    const failed: string[] = []
+    for (const s of sessions) {
+      try {
+        await api.deleteSession(s.name)
+      } catch {
+        failed.push(s.name)
+      }
+    }
+    if (activeSession && !failed.includes(activeSession)) selectSession(null)
+    await fetchSessions()
+    setShuttingDownAll(false)
+    setConfirmShutdownAll(false)
+    const done = sessions.length - failed.length
+    showSnackbar(failed.length
+      ? { type: 'error', message: `Shut down ${done} session(s); failed: ${failed.join(', ')} (retry after cleanup finishes)` }
+      : { type: 'success', message: `Shut down ${done} session(s)` })
+  }
   const [showSpawnModal, setShowSpawnModal] = useState(false)
 
   const handleDeleteTerminal = async () => {
@@ -220,6 +244,15 @@ export function AgentPanel() {
                   className="bg-gray-900 border border-gray-700 text-gray-200 text-xs rounded-lg pl-8 pr-3 py-1.5 w-48 focus:border-emerald-500 focus:outline-hidden"
                 />
               </div>
+            )}
+            {sessions.length > 0 && (
+              <button
+                onClick={() => setConfirmShutdownAll(true)}
+                className="flex items-center gap-2 border border-red-800/70 text-red-300 hover:bg-red-900/30 text-sm font-medium px-3 py-2 rounded-lg transition-colors"
+              >
+                <Trash2 size={14} />
+                Shut down all
+              </button>
             )}
             <button
               onClick={() => setShowSpawnModal(true)}
@@ -452,6 +485,10 @@ export function AgentPanel() {
                       className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm font-mono rounded-lg px-3 py-1.5 focus:border-emerald-500 focus:outline-hidden"
                       autoFocus
                     />
+                    <PromptPresets
+                      current={sendInputValues[t.id] || ''}
+                      onInsert={text => setSendInputValues(prev => ({ ...prev, [t.id]: text }))}
+                    />
                     <button
                       onClick={() => handleSendInput(t.id)}
                       disabled={sendingInput === t.id || !(sendInputValues[t.id] || '').trim()}
@@ -509,6 +546,19 @@ export function AgentPanel() {
         onCancel={() => setPendingClose(null)}
       />
 
+      {/* Shut Down All Sessions Confirmation Modal */}
+      <ConfirmModal
+        open={confirmShutdownAll}
+        title="Shut down all sessions"
+        message="This closes every agent terminal in every session and deletes the sessions. This action cannot be undone."
+        details={[{ label: 'Sessions', value: sessions.map(s => s.name).join(', ') || 'none' }]}
+        confirmLabel="Shut down all"
+        variant="danger"
+        loading={shuttingDownAll}
+        onConfirm={handleShutdownAll}
+        onCancel={() => setConfirmShutdownAll(false)}
+      />
+
       {/* Graceful Exit Confirmation Modal */}
       <ConfirmModal
         open={!!pendingExit}
@@ -537,7 +587,7 @@ export function AgentPanel() {
               <div>
                 <h3 className="text-base font-semibold text-gray-200">Spawn Agent</h3>
                 <p className="text-xs text-gray-500 mt-1">
-                  Launch a new AI agent in its own isolated tmux session.
+                  Launch a new AI agent in its own isolated terminal session.
                 </p>
               </div>
               <button
