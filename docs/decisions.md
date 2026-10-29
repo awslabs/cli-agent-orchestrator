@@ -132,7 +132,7 @@ the launch check still refuses an unmapped required default on the target.
 
 `exclude_profiles` pins installed profiles to their existing model resolution:
 no `model.route` question and no `model.route` record for launches that pass
-policy. Other points, such as `effort.route`, are still asked and recorded.
+policy. It changes no other point; no installed launch asks `effort.route` in this version.
 Refused launches still write a rejected record in shadow or on. Names not
 installed are retained but have no effect. There is no profile-frontmatter
 switch for decisions.
@@ -143,7 +143,9 @@ refused; it does not mean unlimited. Values outside these ranges in
 `settings.json` or in the scalar overrides `CAO_DECISION_ON_TIMEOUT_MS` and
 `CAO_DECISION_CONFIDENCE_THRESHOLD` are clamped, with a warning. The fixed table
 looks up profile first, then role, and returns probability 1.0; a miss gives no
-answer. It is a decider, never part of fallback resolution. Shadow defaults to
+answer. It is a decider, never part of fallback resolution. `effort.route` table
+entries are stored but not read yet, because no launch asks `effort.route` in this
+version. Shadow defaults to
 four concurrent and 64 pending tasks, with a 10000 ms decider timeout. These have
 no CLI setter; values in `settings.json` are clamped, with a warning, to 1–1024
 concurrent, 0–100000 pending and 50–60000 ms. Overflow is recorded as `shadow_dropped`;
@@ -185,9 +187,12 @@ can lose updates because the existing settings writer is not atomic.
 ## Records and telemetry
 
 The node's SQLite `decision_records` table holds one record per point per
-launch in shadow or on. Records include state, decider name/version, fallback
-value/source, answer and probabilities, capped candidate, applied value, latency,
-reason, terminal ID, launched model and whether it was honored. `target_kind` is
+launch in shadow or on. Records include `state`, `decider` and `decider_version`,
+`fallback_value` and `fallback_source`, `answer`, `probabilities` and `confidence`, the
+capped candidate (`candidate_value`, `candidate_model`), `applied_value`, `outcome`,
+`latency_ms`, `reason`, `terminal_id`, `launched_model` and whether it was honored
+(`model_honored`). They also hold `message_hash`, `hash_key_id` and `message_bytes`.
+`cao decisions list` prints every column as JSON. `target_kind` is
 `installed`, `ephemeral` or `workflow`; `workflow` marks a script workflow's own
 step. Records written before the column existed keep `target_kind` null: the
 upgrade adds the column and does not backfill it. A policy model
@@ -218,10 +223,12 @@ an unavailable ephemeral profile, a KAS request, an engine given for a
 provider other than Kiro, or a `caller_ceiling` conflict — is bound
 `launch_failed`, even though nothing was actually allocated yet.
 
-Records never hold task messages, descriptions, purposes, prompts or working directories.
+Records never hold task messages, descriptions, prompts or working directories. They hold
+no purpose either, except inside an ephemeral agent's name: `agent_profile` records that
+name, and ephemeral names include the purpose.
 Messages, descriptions and purposes are redacted before every decider call, including the
 fixed table. Installed profile names and roles are bounded and redacted facts;
-ephemeral targets send neither. An ephemeral target sends its redacted purpose and,
+ephemeral targets send no profile name or role. Instead, an ephemeral target sends its redacted purpose and,
 when the creator wrote one, its redacted description in `profile_description`; it
 never sends the creator brief. A decider whose consent binds the fields it receives
 needs fresh operator consent before it sees an ephemeral description. The message hash is a keyed HMAC of the redacted

@@ -85,11 +85,28 @@ Every derived path resolves from this value, so one override moves everything â€
   },
   "logging": {
     "level": "INFO"
-  }
+  },
+  "ephemeral": {
+    "enabled": false,
+    "allowed_providers": ["claude_code"]
+  },
+  "decisions": {
+    "points": {
+      "model.route": {"state": "off", "decider": "fixed_table"},
+      "effort.route": {"state": "off", "decider": "fixed_table"}
+    },
+    "on_timeout_ms": 1000,
+    "confidence_threshold": 0.7,
+    "retention_days": 90
+  },
+  "model_tiers": {}
 }
 ```
 
 Every top-level key is optional â€” omit any section/key you don't want to override; `ConfigService` fills in built-in defaults.
+The `ephemeral`, `decisions` and `model_tiers` blocks are read outside `ConfigService`. See
+[Ephemeral agents (`ephemeral`)](#ephemeral-agents-ephemeral) below for every `ephemeral` key,
+and [Launch decisions](decisions.md#settings) for `decisions` and `model_tiers`.
 
 ## `cao config` CLI
 
