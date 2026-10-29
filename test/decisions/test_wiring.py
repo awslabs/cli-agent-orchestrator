@@ -119,6 +119,23 @@ def test_handlers_route_and_bind_before_note(handler_path, path, monkeypatch):
         assert set(response.json()) == set(Terminal.model_fields)
 
 
+@pytest.mark.parametrize("path", ["session", "terminal", "step"])
+def test_decider_cancellation_launches_on_the_fallback(handler_path, path, monkeypatch):
+    """#1085: a decider that raises CancelledError itself must not fail the launch."""
+    api, client, engine, decider, store, events, calls = handler_path
+
+    async def cancelled(request, config):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(decider, "decide", cancelled)
+    response = post_delegation(client, path)
+    assert response.status_code in (200, 201), response.text
+    assert len(calls) == 1 and calls[0]["launch_plan"].model is None
+    (record,) = store.list()
+    assert (record["outcome"], record["reason"]) == ("fallback", "error")
+    assert record["launch_status"] == "launched"
+
+
 @pytest.mark.parametrize(
     "body",
     [
