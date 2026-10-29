@@ -12,6 +12,7 @@ ModelTiers = Mapping[str, Mapping[str, str]]
 POLICY_REJECTION_REASONS: frozenset[str] = frozenset(
     {
         "above_ceiling",
+        "below_floor",
         "explicit_unmapped",
         "provider_not_allowed",
         "model_override_not_allowed",
@@ -39,6 +40,15 @@ class PolicyViolation(DecisionInputError):
     def __init__(self, point: str, value: str, ceiling: str) -> None:
         super().__init__(
             f"{'tier' if point == 'model.route' else 'effort'} '{value}' is above the policy ceiling '{ceiling}' for {point}"
+        )
+
+
+class BelowFloorError(PolicyViolation):
+    reason = "below_floor"
+
+    def __init__(self, value: str, floor: str) -> None:
+        DecisionInputError.__init__(
+            self, f"tier '{value}' is below the policy floor '{floor}' for model.route"
         )
 
 
@@ -95,9 +105,14 @@ class PolicyBounds:
     default_effort: Effort | None = None
     max_effort: Effort | None = None
     allowed_providers: frozenset[str] | None = None
+    # #1068 MF5 (provisional): an optional tier floor; there is no effort floor.
+    min_tier: Tier | None = None
 
     def ceiling_for(self, point: str) -> str | None:
         return self.max_tier if point == "model.route" else self.max_effort
+
+    def floor_for(self, point: str) -> str | None:
+        return self.min_tier if point == "model.route" else None
 
     def default_for(self, point: str) -> str | None:
         return self.default_tier if point == "model.route" else self.default_effort
@@ -115,6 +130,18 @@ class PolicyBounds:
                 and spec.options.index(default) > spec.options.index(ceiling)
             ):
                 raise PolicyConfigError(f"{point} default exceeds ceiling")
+        tiers = POINTS["model.route"].options
+        if self.min_tier is not None:
+            if self.min_tier not in tiers:
+                raise PolicyConfigError("invalid policy value for model.route")
+            if self.max_tier is not None and tiers.index(self.min_tier) > tiers.index(
+                self.max_tier
+            ):
+                raise PolicyConfigError("model.route floor exceeds ceiling")
+            if self.default_tier is None or tiers.index(self.min_tier) > tiers.index(
+                self.default_tier
+            ):
+                raise PolicyConfigError("model.route floor requires a default at or above it")
         if self.allowed_providers is not None and not self.allowed_providers <= {
             p.value for p in ProviderType
         }:
@@ -127,11 +154,9 @@ class PolicyBounds:
                 continue
             required: list[str] = []
             if self.max_tier is not None:
-                required.extend(
-                    POINTS["model.route"].options[
-                        : POINTS["model.route"].options.index(self.max_tier) + 1
-                    ]
-                )
+                # Every tier a capped answer or explicit value can reach, floor to ceiling.
+                start = tiers.index(self.min_tier) if self.min_tier is not None else 0
+                required.extend(tiers[start : tiers.index(self.max_tier) + 1])
             if self.default_tier is not None:
                 required.append(self.default_tier)
             for tier in required:
@@ -146,6 +171,9 @@ class PolicyBounds:
         options = POINTS[point].options
         if value not in options:
             raise DecisionInputError(f"invalid explicit value for {point}")
+        floor = self.floor_for(point)
+        if floor is not None and options.index(value) < options.index(floor):
+            raise BelowFloorError(value, floor)
         ceiling = self.ceiling_for(point)
         if ceiling is not None and options.index(value) > options.index(ceiling):
             raise PolicyViolation(point, value, ceiling)
@@ -153,8 +181,10 @@ class PolicyBounds:
             raise UnmappedTierError(point, provider, value, "explicit_unmapped")
 
     def cap(self, point: str, option: str) -> tuple[str, bool]:
-        ceiling = self.ceiling_for(point)
+        ceiling, floor = self.ceiling_for(point), self.floor_for(point)
         options = POINTS[point].options
+        if floor is not None and options.index(option) < options.index(floor):
+            return floor, True
         if ceiling is not None and options.index(option) > options.index(ceiling):
             return ceiling, True
         return option, False

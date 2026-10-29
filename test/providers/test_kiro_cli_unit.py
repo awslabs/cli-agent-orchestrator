@@ -8,6 +8,7 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.kiro_cli import TUI_CREDITS_PATTERN, KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
 
 # Test fixtures directory
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -22,6 +23,17 @@ def load_fixture(filename: str) -> str:
 # Real active trust-all-tools consent dialog (body + '❯ No, exit' + footer),
 # used to satisfy the provider's verify-before-answer check.
 _TRUST_DIALOG_PANE = load_fixture("kiro_trust_all_tools_dialog_active.txt")
+
+# Real kiro-cli 2.25 idle capture whose TUI header names the launched agent
+# ("developer · auto · ◔ 11% · auth ok"): the screen a correct launch shows when
+# initialize() checks the agent identity (#1074).
+_DEVELOPER_SCREEN = load_fixture("kiro_cli_tui_2_25_idle_output.txt")
+
+
+def _screens(pane: str, screen: str = _DEVELOPER_SCREEN):
+    """get_history side effect: ``screen`` for the identity check's viewport read
+    (visible_only=True), ``pane`` for every other read (the consent-dialog check)."""
+    return lambda *args, **kwargs: screen if kwargs.get("visible_only") else pane
 
 
 class TestKiroCliProviderInitialization:
@@ -38,6 +50,7 @@ class TestKiroCliProviderInitialization:
         """Test successful initialization."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = _DEVELOPER_SCREEN
         mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
@@ -143,6 +156,7 @@ class TestKiroCliProviderInitialization:
         """
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = _DEVELOPER_SCREEN
         mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider(
@@ -167,6 +181,7 @@ class TestKiroCliProviderInitialization:
         """profile.model must be forwarded to kiro-cli via --model."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = _DEVELOPER_SCREEN
         profile = Mock()
         profile.model = "claude-opus-4-6"
         mock_load_profile.return_value = profile
@@ -217,6 +232,7 @@ class TestKiroCliProviderInitialization:
         """--yolo + profile.model: --trust-all-tools + --model, all in one launch."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = _DEVELOPER_SCREEN
         profile = Mock()
         profile.model = "claude-opus-4.6"
         mock_load_profile.return_value = profile
@@ -313,7 +329,7 @@ class TestKiroCliProviderInitialization:
         mock_wait_status.side_effect = [True, True]
         mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
         # The dialog must be VERIFIED from pane content before answering.
-        mock_tmux.return_value.get_history.return_value = _TRUST_DIALOG_PANE
+        mock_tmux.return_value.get_history.side_effect = _screens(_TRUST_DIALOG_PANE)
         mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
@@ -410,6 +426,7 @@ class TestKiroCliProviderInitialization:
         """When the terminal reaches IDLE directly, no dialog keys are sent."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = _DEVELOPER_SCREEN
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_load_profile.side_effect = FileNotFoundError("no profile")
 
@@ -428,6 +445,168 @@ class TestKiroCliProviderInitialization:
             assert provider._agent_profile == profile
             # Verify dynamic prompt pattern includes the profile
             assert re.escape(profile) in provider._idle_prompt_pattern
+
+
+_LAUNCH_COMMAND = "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer"
+
+
+def _launch_screen(header: str) -> str:
+    """A screen in the layout measured on kiro-cli 2.32.0 after a ``--agent developer``
+    launch. The fallback warning and the echoed command both name the requested agent;
+    only the header row says which agent is running."""
+    rule = "─" * 60
+    rows = [
+        f"bash-3.2$ {_LAUNCH_COMMAND}",
+        '● agent "developer" not found, using "kiro_default"',
+        rule,
+        " Trust All Tools active, confirmations are off · /quit to exit",
+        rule,
+    ]
+    if header:
+        rows.append(f"{header}                                  /private/tmp/repo")
+    rows += ["", "›  ask a question or describe a task ↵"]
+    return "\n".join(rows) + "\n"
+
+
+class TestKiroCliAgentIdentityGuard:
+    """#1074: initialize() refuses a pane running another agent, before any task.
+
+    kiro-cli starts its built-in ``kiro_default`` (every built-in tool) when the
+    requested agent cannot be loaded, and that agent reaches the same ready prompt.
+    """
+
+    @pytest.fixture
+    def launch(self, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.kiro_cli.IDENTITY_HEADER_READ_INTERVAL_S", 0
+        )
+        with (
+            patch("cli_agent_orchestrator.providers.kiro_cli.get_backend") as backend,
+            patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell", return_value=True),
+            patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status", return_value=True),
+            patch(
+                "cli_agent_orchestrator.providers.kiro_cli.load_agent_profile",
+                side_effect=FileNotFoundError("no profile"),
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor") as monitor,
+        ):
+            monitor.get_status.return_value = TerminalStatus.IDLE
+            yield backend.return_value
+
+    @staticmethod
+    def _identity_reads(backend):
+        return [
+            c for c in backend.get_history.call_args_list if c.kwargs.get("visible_only") is True
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_requested_agent_launches_exactly_as_before(self, launch):
+        """Back-compat: a correctly installed agent gets the same one command and no keys."""
+        launch.get_history.return_value = _launch_screen("developer · auto · ◔ 3% · auth ok")
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        assert await provider.initialize() is True
+
+        launch.send_keys.assert_called_once_with("test-session", "window-0", _LAUNCH_COMMAND)
+        launch.send_special_key.assert_not_called()
+        reads = self._identity_reads(launch)
+        assert len(reads) == 1
+        assert reads[0].kwargs["strip_escapes"] is True
+        assert provider._initialized is True
+        # The evidence terminal_service records on the row (#1074).
+        assert provider.identity_verified is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("running", ["kiro_default", "cao-null", "reviewer"])
+    async def test_another_agent_is_refused_and_nothing_is_typed(self, launch, running):
+        launch.get_history.return_value = _launch_screen(f"{running} · auto · ◔ 4% · Midway: 1h")
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            await provider.initialize()
+
+        assert excinfo.value.kind == "identity_mismatch"
+        assert excinfo.value.observed == running
+        # The launch command is the only text the pane ever received.
+        launch.send_keys.assert_called_once_with("test-session", "window-0", _LAUNCH_COMMAND)
+        launch.send_special_key.assert_not_called()
+        # A wrong header is final: it is not read again.
+        assert len(self._identity_reads(launch)) == 1
+        assert provider._initialized is False
+        assert provider.identity_verified is False
+
+    @pytest.mark.asyncio
+    async def test_a_screen_without_a_header_is_reread_then_refused(self, launch):
+        from cli_agent_orchestrator.providers.kiro_cli import IDENTITY_HEADER_READS
+
+        launch.get_history.return_value = _launch_screen("")
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            await provider.initialize()
+
+        assert excinfo.value.kind == "header_not_found"
+        assert len(self._identity_reads(launch)) == IDENTITY_HEADER_READS > 1
+        launch.send_keys.assert_called_once()
+        launch.send_special_key.assert_not_called()
+        assert provider.identity_verified is False
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_before_the_header_check_reports_no_evidence(self, launch):
+        """Only the passed header check sets the evidence, not reaching any step."""
+        launch.get_history.return_value = _launch_screen("developer · auto · ◔ 3% · auth ok")
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.identity_verified is False
+
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.kiro_cli.wait_until_status", return_value=False
+            ),
+            pytest.raises(TimeoutError),
+        ):
+            await provider.initialize()
+
+        assert provider.identity_verified is False
+        assert self._identity_reads(launch) == []
+
+    @pytest.mark.asyncio
+    async def test_a_header_drawn_after_the_prompt_is_accepted(self, launch):
+        launch.get_history.side_effect = [
+            _launch_screen(""),
+            _launch_screen("developer · auto · ◔ 3% · auth ok"),
+        ]
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        assert await provider.initialize() is True
+        assert len(self._identity_reads(launch)) == 2
+        assert provider.identity_verified is True
+
+    @pytest.mark.asyncio
+    async def test_unreadable_screens_fail_closed(self, launch):
+        launch.get_history.side_effect = RuntimeError("capture failed")
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        with pytest.raises(KiroAgentIdentityError, match="identity not confirmed"):
+            await provider.initialize()
+        launch.send_keys.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_consent_dialog_answer_is_the_only_input_before_a_refusal(self, launch):
+        """The trust dialog's Down+Enter still happens; nothing follows a wrong header."""
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        launch.get_history.side_effect = _screens(
+            _TRUST_DIALOG_PANE, _launch_screen("kiro_default · auto · ◔ 4% · auth ok")
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        with pytest.raises(KiroAgentIdentityError):
+            await provider.initialize()
+
+        launch.send_keys.assert_called_once_with("test-session", "window-0", _LAUNCH_COMMAND)
+        keys = [c.args[2] for c in launch.send_special_key.call_args_list]
+        assert keys == ["Down", "Enter"]
 
 
 class TestKiroCliProviderStatusDetection:

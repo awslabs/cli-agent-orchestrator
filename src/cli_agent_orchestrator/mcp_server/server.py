@@ -43,6 +43,7 @@ from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.utils.caller_tools import (
     caller_effective_allowed_tools as _caller_effective_allowed_tools,
 )
+from cli_agent_orchestrator.utils.ephemeral_capabilities import ephemeral_providers
 from cli_agent_orchestrator.utils.orchestration import (
     ENABLE_SENDER_ID_INJECTION,
     REMOTE_CONNECT_TIMEOUT,
@@ -1766,7 +1767,12 @@ async def create_ephemeral_agent(
     provider: Annotated[
         Any,
         WithJsonSchema(
-            {"anyOf": [{"type": "string", "enum": ["claude_code", "codex"]}, {"type": "null"}]}
+            {
+                "anyOf": [
+                    {"type": "string", "enum": list(ephemeral_providers())},
+                    {"type": "null"},
+                ]
+            }
         ),
     ] = None,
     model_tier: Annotated[
@@ -1799,8 +1805,9 @@ async def create_ephemeral_agent(
 
     The CAO-recorded tool list is bounded by the creator's effective list.
     This is not an OS privilege boundary or a per-tool MCP restriction.
-    Codex tools are advisory when the operator enables Codex. The feature
-    defaults off; see docs/ephemeral-agents.md for the full honesty statement.
+    Codex tools are advisory when the operator enables Codex, and the response's
+    ``enforcement`` field reports ``hard`` or ``advisory``. The feature defaults
+    off; see docs/ephemeral-agents.md for the full honesty statement.
     """
     return await _create_ephemeral_from_arguments(
         {
@@ -1955,6 +1962,12 @@ async def memory_store(
     """
     from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, store_memory
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    # Checked before the remote branch, as in memory_recall: the owner applies
+    # its own switch, never this caller's (#1087).
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
 
     try:
         terminal_context = _get_terminal_context_from_env()
@@ -2119,6 +2132,12 @@ async def memory_forget(
     """
     from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    # Checked before the remote branch, as in memory_recall: the owner applies
+    # its own switch, never this caller's (#1087).
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
 
     try:
         terminal_context = _get_terminal_context_from_env()

@@ -134,7 +134,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#0f0f14] text-gray-200">
       {/* Header */}
-      <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-40">
+      <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-xs sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <CaoMark size={32} />
@@ -169,7 +169,7 @@ export default function App() {
                 onClick={() => requestTabChange(t.key)}
                 className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 ${
                   tab === t.key
-                    ? 'bg-gradient-to-r from-emerald-600 to-emerald-500 text-white shadow-lg shadow-emerald-500/20'
+                    ? 'bg-linear-to-r from-emerald-600 to-emerald-500 text-white shadow-lg shadow-emerald-500/20'
                     : navLocked
                       ? 'text-gray-600 cursor-not-allowed'
                       : 'text-gray-400 hover:text-white hover:bg-gray-800/50'

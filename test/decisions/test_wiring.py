@@ -330,10 +330,16 @@ async def test_cancellation_binds_pending_plan(handler_path, path):
         ("developer", None),
     ],
 )
-async def test_claimed_launch_skips_the_decision_site(handler_path, path, agent, model):
+async def test_claimed_launch_skips_the_decision_site(
+    handler_path, path, agent, model, monkeypatch
+):
     from fastapi import BackgroundTasks
 
+    from cli_agent_orchestrator.clients import database
+
     api, client, engine, decider, store, events, calls = handler_path
+    # No stored spec declares auto for this name (#1068), so the opt-in finds nothing to ask.
+    monkeypatch.setattr(database, "get_ephemeral_agent", lambda name: None)
     request = Request({"type": "http", "app": api.app})
     claim = "0" * 32
     target = api.run_agent_step if path == "step" else api.terminal_service.create_terminal
@@ -378,7 +384,7 @@ async def test_claimed_launch_skips_the_decision_site(handler_path, path, agent,
         # A claim on an installed profile claims nothing, so the launch is routed as usual.
         assert decider.calls == 1 and "launch_plan" in target.call_args.kwargs
         return
-    # A claimed ephemeral launch keeps its own decision path: no decider call, no record, no plan.
+    # A claimed ephemeral launch without a declared auto: no decider call, no record, no plan.
     assert decider.calls == 0 and store.list() == [] and events == []
     assert "launch_plan" not in target.call_args.kwargs
 

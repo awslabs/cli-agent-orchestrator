@@ -216,14 +216,20 @@ def test_A_C3_A_C4_A_C5_A_C9_refusals(create_store, fault, rule, caplog):
     assert "private-" not in err.message + caplog.text
 
 
-@pytest.mark.parametrize("field", ["model_tier", "effort"])
-def test_A_C6_auto_before_provider(create_store, field):
-    err = assert_no_create(
-        create_store,
-        {**SPEC, "provider": "kiro_cli", field: "auto"},
-        "auto_requires_decision_platform",
-    )
-    assert err.detail == field
+@pytest.mark.parametrize(
+    "field,rule,named",
+    [
+        (
+            "model_tier",
+            "auto_requires_bounds",
+            ("model_tier=auto", "ephemeral.min_tier", "ephemeral.max_tier"),
+        ),
+        ("effort", "auto_requires_decision_platform", ("effort",)),
+    ],
+)
+def test_A_C6_auto_before_provider(create_store, field, rule, named):
+    err = assert_no_create(create_store, {**SPEC, "provider": "kiro_cli", field: "auto"}, rule)
+    assert all(word in err.detail for word in named)
 
 
 @pytest.mark.parametrize("claimless", [False, True])
@@ -485,8 +491,9 @@ def test_B_R1_stored_effort_and_A5_3(create_store, claimless, null):
     assert json.loads(Path(row["audit_path"]).read_text())["events"][-1]["event"] == "released"
 
 
-def test_unknown_keys_ignored(create_store, caplog):
-    create_store[4]["ephemeral"]["min_tier"] = "private-setting"
+def test_unknown_keys_ignored(create_store, monkeypatch, caplog):
+    monkeypatch.setattr(create_store[0], "_warned_keys", set())
+    create_store[4]["ephemeral"]["min_tierr"] = "private-setting"
     result = create(create_store)
     assert "private-setting" not in str(result) + caplog.text
-    assert not caplog.records
+    assert "ephemeral.min_tierr" in caplog.text

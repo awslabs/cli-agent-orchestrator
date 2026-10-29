@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro launches refuse an agent that kiro-cli would not run** (#1074). kiro-cli does not fail on
+  an unknown `--agent`. It prints `agent "<name>" not found, using "kiro_default"` and starts its
+  built-in default agent, which has every built-in tool, so launching a profile that was not
+  installed for Kiro, or whose agent file did not load, ran unrestricted. If a Kiro launch is now
+  refused, the remedy is `cao install <name> --provider kiro_cli`, then retry. Every `kiro_cli`
+  launch refuses an agent that none of the agent directories CAO searches defines, before any
+  terminal exists (`400`; the directories searched go to the server log, not the response). It also
+  refuses a pane whose TUI header rows do not all name the requested agent, before any task is
+  typed; an elided or wrapped header name, or a pane left in plan mode, never counts as the agent. A
+  Kiro terminal now takes typed input (`/input`, `/key`, `/exit`, `cao session send`, inbox delivery,
+  MCP `answer_user_prompt` and AG-UI) only once CAO has recorded that its header check passed. While
+  it is still starting, input is refused and queued inbox messages wait; `/terminals/run-step` on
+  such a reused terminal answers `409` `identity_pending`, retryable. A Kiro launch whose startup
+  ended without that record -- a refused identity, a timeout before the header was read, a server
+  restart mid-start -- has its window closed, even a deferred launch with no caller whose failure
+  record is kept (if the close cannot be confirmed, input to it stays refused). A Kiro terminal
+  verified before a server restart still accepts a re-sent task, and other providers are unchanged.
+  Kiro terminals launched before this change are not re-verified and keep their windows: they keep
+  accepting input unless they carry a startup failure. A correctly installed profile launches
+  exactly as before. **Behaviour change:** Kiro launches of a profile not installed for `kiro_cli`,
+  or of a Kiro built-in agent, are now refused; `cao launch --memory` on Kiro reports the
+  `memory_manager` sidecar as `refused` unless it is installed for Kiro; and with `CAO_AGENTS_DIR`
+  set in the server's environment outside `~/.kiro/agents` and `$KIRO_HOME/agents`, a launch now
+  fails at the header check, after kiro-cli has started (`cao-server --agents-dir` instead fails
+  early, as `agent_not_found`). **Not closed by this change:** the `/ws` web terminal drops the
+  attached pane's own keystrokes the same way, and refuses attaching to a pane whose runtime was
+  already reclaimed, but `/ws` is a full tmux (or herdr) client of the whole session, so its prefix
+  keys, mouse and command prompt can still reach another pane in that session, including an
+  unverified one. That gap predates this change and is tracked as a follow-up. See
+  `docs/kiro-cli.md`, troubleshooting item 7.
 - **Hierarchical robot factory example** (`examples/robotics/hierarchical-factory/`): a
   simulation-only factory floor in MuJoCo, run by four CAO agents in two layers. A supervisor assigns
   three team managers with `assign`; each manager runs its own team of Open Duck Mini robots (a serial
@@ -193,9 +223,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ephemeral agents accept `model_tier: "auto"` (#1068). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `model.route` for that name only; explicit and omitted tiers never ask. Off and shadow launch on `ephemeral.default_tier`; on applies a confident answer capped into `[min_tier, max_tier]`, and falls back on any unusable answer. `auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier` (`auto_requires_bounds`) and a `claim_lease_seconds` of at least `decisions.on_timeout_ms / 1000 + 30`. The ephemeral archive records the decision record ids. `effort: "auto"` still refuses.
+
+- Decision policy bounds take an optional model tier floor (#1068, #810): an explicit tier below it is refused as `below_floor`, a decider answer below it is capped up to it, and mappings are required from the floor to the ceiling. A delegation to an ephemeral target can carry the creator's description, redacted, in `profile_description`.
+
+- Ephemeral agents (#801) accept an optional `ephemeral.min_tier` floor. An explicit tier below it refuses with `tier_below_policy`, and a stored tier or provider default below a floor raised since create refuses at claim with `policy_changed_since_create:tier_below_policy`. Unknown `ephemeral.*` keys now log one warning per server process naming the keys, never their values.
+
+- Ephemeral agents (#1074): one provider-capability table now drives the `allowed_providers` rule, the create and claim provider checks, the effort mapping and the MCP tool's provider list. A create response carries `enforcement` (`hard` on Claude Code, `advisory` on Codex), and a provider that cannot run a requested tool atom refuses with `tool_unsupported_on_provider:<atom>`, which no current provider does. Accepted providers, refusals and stored files are unchanged. The label values and the new rule are provisional.
+
 - Ephemeral agents (#801) accept an explicit `effort` and apply `ephemeral.default_effort` and `ephemeral.max_effort` (Claude Code `--effort`, Codex `model_reasoning_effort`).
 
-- Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim. `auto` still refuses.
+- Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim.
 
 - `examples/decision-model-host`: hosts the open-weight JevK5-4B decision model behind
   a loopback-only `/v1/systemone` API. Locally, it uses llama.cpp, with Metal or the CPU.
@@ -296,7 +334,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained. There is no background sweep, so keep the feature disabled outside testing.
   The live files and archive can be deleted by exact path while no ephemeral
   terminal exists. Reserved names also refuse remote placement with
-  `remote_placement_not_allowed`. `auto` still requires the decision platform.
+  `remote_placement_not_allowed`. `effort: "auto"` still requires the decision platform.
 - Advanced CodeQL analysis for same-repository and fork pull requests, with
   Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
   weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
@@ -381,6 +419,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `memory_store` and `memory_forget` MCP tools now honor the caller's local memory switch
+  when a remote memory owner is configured (#1087). `memory_recall` checked the switch before
+  branching to the owner, but the write and delete tools did not, so a caller with memory off
+  was refused a read yet could still write or delete on the owner, which applied only its own
+  switch. Both tools now return `disabled: true`, as `memory_recall` does, without calling the
+  owner.
 - Ephemeral profiles explicitly omit the inherited skill catalog while keeping named skill
   loading available. Every live-profile load verifies the parsed bytes against the registry
   hash and fails closed on missing or modified data, including claim-less launches and provider

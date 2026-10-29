@@ -572,9 +572,9 @@ and the Claude Code/Codex/Kiro CLI provider-config-file event plugins — becaus
 the same gateway function (`memory_gateway.memory_context_for_terminal`), which checks the
 switch before reaching the owner. The frozen-replay path applies the same switch itself,
 before resolving through the gateway (`frozen_run_memory.py:144`) and again before injecting
-a recorded block (`terminal_service.py:455`). The switch does not bind `memory_store` or
-`memory_forget`'s remote arms; those still reach a configured owner regardless of the
-switch.
+a recorded block (`terminal_service.py:455`). The `memory_store`, `memory_recall` and
+`memory_forget` MCP tools check the same switch before they branch to a remote owner, so with
+the switch off a write or delete is refused locally and never reaches the owner either.
 
 ## Saving Memories
 

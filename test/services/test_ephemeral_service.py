@@ -69,6 +69,7 @@ def test_create_files_hashes_and_response(create_store):
     assert set(result) == {
         "name",
         "provider",
+        "enforcement",
         "effective_tools",
         "model_tier",
         "effort",
@@ -78,7 +79,7 @@ def test_create_files_hashes_and_response(create_store):
     }
     assert result["effective_tools"] == ["fs_read", "@cao-mcp-server"]
     assert result["model_tier"] is None and result["effort"] is None
-    assert result["provider"] == "claude_code"
+    assert result["provider"] == "claude_code" and result["enforcement"] == "hard"
     assert datetime.fromisoformat(result["expires_at"]).utcoffset().total_seconds() == 0
     assert result["notes"] == [
         "model: provider default (tier omitted, no default_tier)",
@@ -192,18 +193,19 @@ def test_policy_rejections_leave_nothing(create_store, patch, rule, caplog):
 
 
 @pytest.mark.parametrize(
-    "key,values",
+    "key,values,rule",
     [
-        ("model_tier", ["auto"]),
-        ("effort", ["auto"]),
+        # #1068 MF4: a tier auto now needs both bounds; effort auto still refuses.
+        ("model_tier", ["auto"], "auto_requires_bounds"),
+        ("effort", ["auto"], "auto_requires_decision_platform"),
     ],
 )
-def test_auto_refuses_in_either_field(create_store, key, values):
+def test_auto_refuses_in_either_field(create_store, key, values, rule):
     service = create_store[0]
     for value in values:
         with pytest.raises(service.EphemeralPolicyError) as err:
             create(create_store, {**SPEC, key: value})
-        assert err.value.rule == "auto_requires_decision_platform"
+        assert err.value.rule == rule
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, {**SPEC, "model_tier": "small", "effort": "auto"})
     assert err.value.rule == "auto_requires_decision_platform"

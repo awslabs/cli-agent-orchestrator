@@ -66,6 +66,21 @@ def _number(value: Any, default: float, lower: float, upper: float) -> float:
         return default
 
 
+def resolve_on_timeout_ms(
+    raw: Mapping[str, Any], *, environment: Mapping[str, str] | None = None
+) -> int:
+    """The on-mode timeout from one raw settings snapshot, as load_settings resolves it."""
+    env = os.environ if environment is None else environment
+    block = _block(raw.get("decisions"))
+    return int(
+        _number(
+            env.get("CAO_DECISION_ON_TIMEOUT_MS", block.get("on_timeout_ms", 1000)),
+            1000,
+            *ON_TIMEOUT_MS_RANGE,
+        )
+    )
+
+
 def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSettings:
     try:
         raw = settings_service._load_or_raise()
@@ -103,13 +118,7 @@ def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSe
     shadow = _block(block.get("shadow"))
     return DecisionSettings(
         points=points,
-        on_timeout_ms=int(
-            _number(
-                env.get("CAO_DECISION_ON_TIMEOUT_MS", block.get("on_timeout_ms", 1000)),
-                1000,
-                *ON_TIMEOUT_MS_RANGE,
-            )
-        ),
+        on_timeout_ms=resolve_on_timeout_ms(raw, environment=env),
         confidence_threshold=_number(
             env.get("CAO_DECISION_CONFIDENCE_THRESHOLD", block.get("confidence_threshold", 0.70)),
             0.70,

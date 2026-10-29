@@ -217,6 +217,12 @@ class TerminalModel(Base):
     # distinguish the old rows from failures that belong to the CURRENT live
     # session. NULL is reserved for rows created before this column existed.
     session_incarnation_id = Column(String, nullable=True)
+    # Whether CAO recorded that this Kiro runtime passed its identity check (#1074).
+    # False is written with every kiro_cli row and True only once the provider's
+    # header check has passed; it never goes back. NULL means a non-Kiro row, or a
+    # row that predates the column. A kiro_cli terminal takes typed input only when
+    # this is True (terminal_service.terminal_input_refusal).
+    identity_verified = Column(Boolean, nullable=True)
     last_active = Column(UTCDateTime, default=_utcnow)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
@@ -2067,6 +2073,13 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN delegate_tools TEXT")
             conn.commit()
             logger.info("Migration: added delegate_tools column to terminals table")
+        if "identity_verified" not in columns:
+            # Nullable with no default (#1074): existing rows read back NULL, a
+            # legacy row, never False, so a Kiro pane running across the upgrade
+            # is not mistaken for one this version created and failed to verify.
+            conn.execute("ALTER TABLE terminals ADD COLUMN identity_verified BOOLEAN")
+            conn.commit()
+            logger.info("Migration: added identity_verified column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -2132,12 +2145,17 @@ def create_terminal(
     initial_delivery: Optional[Dict[str, Any]] = None,
     description: Optional[str] = None,
     delegate_tools: Optional[List[str]] = None,
+    identity_verified: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
     ``delegate_tools`` is the terminal's delegation ceiling as resolved and
     capped by ``terminal_service.create_terminal``; it is persisted so children
     of this terminal are bounded by the stored value rather than by a profile.
+
+    ``identity_verified`` is stored as given (#1074). ``terminal_service`` passes
+    False for every kiro_cli row; the default None is the value a row from before
+    the column reads, so a caller that leaves it out writes such a row.
 
     ``idempotency_key``, when given, is persisted in the SAME ``SessionLocal``
     session as the terminal row -- one ``commit()``, so SQLite's single-writer
@@ -2195,6 +2213,7 @@ def create_terminal(
             deferred_init_external_owner=bool(deferred_init_external_owner),
             session_incarnation_id=session_incarnation_id,
             initial_delivery_json=_json.dumps(initial_delivery) if initial_delivery else None,
+            identity_verified=identity_verified,
         )
         db.add(terminal)
         if idempotency_key:
@@ -2241,6 +2260,7 @@ def create_terminal(
             "initial_delivery": initial_delivery if initial_delivery else None,
             "deferred_init_runtime_reclaimed": False,
             "session_incarnation_id": session_incarnation_id,
+            "identity_verified": identity_verified,
         }
 
 
@@ -2366,6 +2386,9 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
                 getattr(terminal, "deferred_init_runtime_reclaimed", False)
             ),
             "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
+            # As stored, None included (#1074): None is a non-Kiro or legacy row,
+            # which the Kiro input gate treats differently from False.
+            "identity_verified": getattr(terminal, "identity_verified", None),
             "last_active": terminal.last_active,
         }
 
@@ -2501,6 +2524,23 @@ def update_terminal_deferred_init_runtime_reclaimed(terminal_id: str, reclaimed:
         if not terminal:
             return False
         terminal.deferred_init_runtime_reclaimed = bool(reclaimed)
+        db.commit()
+        return True
+
+
+def mark_terminal_identity_verified(terminal_id: str) -> bool:
+    """Record that this terminal's Kiro identity check passed (#1074).
+
+    One way only: there is no call that writes False back, because a later
+    failure on a verified pane does not make it a different agent. Returns False
+    when the row is gone.
+    """
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.identity_verified = True
         db.commit()
         return True
 
