@@ -18,16 +18,26 @@ The SO-101 friction grasp does not lift a part in MuJoCo (see the Strands Robots
 example ``18_so101_pick_and_lift.py``), so the arm holds the part with
 ``attach_bodies(mode="weld")`` while it carries it. That is a grasp assist, not
 a physical grasp, and every pick reports ``grasp_assist: true``.
+
+Each world also has a fixed ``cell_view`` camera for the live view. Rendering a
+frame only reads the world; Strands Robots serializes it with the policy's own
+stepping, so watching never moves a robot.
 """
 
 from __future__ import annotations
 
 import math
+import time
 
 from cell import Point, Pose, Scene
 
 LIFT_M = 0.12
 HOVER_M = 0.10
+VIEW = "cell_view"
+VIEW_SIZE = (640, 400)
+ARM_SPEED_M_S = 0.15  # pace of the arm's moves in wall time, so a person can watch them
+WAYPOINT_M = 0.02
+BIN_COLORS = ([0.2, 0.7, 0.35, 1.0], [0.95, 0.65, 0.15, 1.0])
 
 
 def _payload(result: dict) -> dict:
@@ -42,7 +52,9 @@ def _payload(result: dict) -> dict:
 
 def _text(result: dict) -> str:
     return "; ".join(
-        item["text"] for item in result.get("content", []) if isinstance(item, dict) and item.get("text")
+        item["text"]
+        for item in result.get("content", [])
+        if isinstance(item, dict) and item.get("text")
     )
 
 
@@ -60,11 +72,17 @@ class StrandsBackend:
             sim = self.worlds[name] = create_simulation("mujoco")
             self._ok("create_world", sim.create_world())
             point = scene.locations[humanoid.start]
-            self._ok(f"add_robot({name})", sim.add_robot(humanoid.model, position=[point.x, point.y, 0.0]))
+            self._ok(
+                f"add_robot({name})",
+                sim.add_robot(humanoid.model, position=[point.x, point.y, 0.0]),
+            )
         for name, arm in scene.arms.items():
             sim = self.worlds[name] = create_simulation("mujoco")
             self._ok("create_world", sim.create_world())
-            self._ok(f"add_robot({name})", sim.add_robot(arm.model, position=[arm.base.x, arm.base.y, 0.0]))
+            self._ok(
+                f"add_robot({name})",
+                sim.add_robot(arm.model, position=[arm.base.x, arm.base.y, 0.0]),
+            )
         # The parts sit on the arm's table, so they live in the arm's world.
         self.part_world = next(iter(scene.arms))
         parts_sim = self.worlds[self.part_world]
@@ -80,7 +98,80 @@ class StrandsBackend:
                     mass=0.02,
                 ),
             )
+        # A thin static pad under each bin, so the view shows where the parts go.
+        # The bins are only positions to the cell; a pad changes no measurement.
+        for index, (name, point) in enumerate(scene.bins.items()):
+            self._ok(
+                f"add_object({name})",
+                parts_sim.add_object(
+                    name=f"{name}_pad",
+                    shape="box",
+                    position=[point.x, point.y, 0.001],
+                    size=[0.1, 0.1, 0.002],
+                    color=BIN_COLORS[index % len(BIN_COLORS)],
+                    is_static=True,
+                ),
+            )
         self._ok("step(settle)", parts_sim.step(200))
+        self._add_views(scene)
+
+    def _add_views(self, scene: Scene) -> None:
+        """One fixed camera per world, framed on what that world's robot does."""
+        width, height = VIEW_SIZE
+        floor = [*scene.locations.values(), *(arm.base for arm in scene.arms.values())]
+        cx = (min(p.x for p in floor) + max(p.x for p in floor)) / 2
+        cy = (min(p.y for p in floor) + max(p.y for p in floor)) / 2
+        for name in scene.humanoids:
+            # Behind the floor's front edge, high enough to see every location.
+            front = min(p.y for p in floor) - 1.9
+            self._ok(
+                f"add_camera({name})",
+                self.worlds[name].add_camera(
+                    VIEW,
+                    position=[cx, front, 1.7],
+                    target=[cx, cy, 0.35],
+                    width=width,
+                    height=height,
+                ),
+            )
+        for name, arm in scene.arms.items():
+            table = [part.at for part in scene.parts.values()] + list(scene.bins.values())
+            tx = sum(p.x for p in table) / len(table)
+            ty = sum(p.y for p in table) / len(table)
+            self._ok(
+                f"add_camera({name})",
+                self.worlds[name].add_camera(
+                    VIEW,
+                    position=[tx + 0.05, ty - 0.5, 0.42],
+                    target=[tx, (ty + arm.base.y) / 2, 0.06],
+                    width=width,
+                    height=height,
+                ),
+            )
+
+    def frame(self, world: str):
+        """The latest picture of one world, as an (H, W, 3) uint8 array."""
+        rgb, _depth = self.worlds[world].get_frame(VIEW)
+        return rgb
+
+    def project(
+        self, world: str, points: dict[str, tuple[float, float, float]]
+    ) -> dict[str, list[int]]:
+        """Pixel positions of named cell-frame points in a world's view (points behind the camera are left out)."""
+        import numpy as np
+
+        params = self.worlds[world].get_camera_params(VIEW)
+        cam_from_world = np.linalg.inv(params.T_world_cam)
+        pixels = {}
+        for label, (x, y, z) in points.items():
+            px, py, pz, _ = cam_from_world @ np.array([x, y, z, 1.0])
+            if pz >= -1e-6:  # OpenGL camera frame: -Z is forward
+                continue
+            u = params.K[0, 0] * px / -pz + params.K[0, 2]
+            v = params.K[1, 1] * -py / -pz + params.K[1, 2]
+            if 0 <= u < params.width and 0 <= v < params.height:
+                pixels[label] = [round(float(u)), round(float(v))]
+        return pixels
 
     def _ok(self, step: str, result: dict) -> dict:
         if result.get("status") == "error":
@@ -126,28 +217,56 @@ class StrandsBackend:
         steps: list[str] = []
         sim = self.worlds[arm]
         x, y, z = self.part_position(part)
+        at = list(_payload(sim.get_body_state(spec.gripper_body))["position"])
 
         def step(name: str, result: dict) -> None:
             if result.get("status") == "error":
                 raise _ArmRefused(name, _text(result), steps)
             steps.append(name)
 
+        def move(name: str, goal: list[float]) -> None:
+            """move_to in short waypoints, paced to ARM_SPEED_M_S, so the view shows the path.
+
+            The IK primitive itself runs as fast as the CPU allows; only the wait
+            between waypoints is paced, and it holds no lock of the world.
+            """
+            distance = math.dist(at, goal)
+            count = max(1, math.ceil(distance / WAYPOINT_M))
+            for index in range(1, count + 1):
+                started = time.monotonic()
+                waypoint = [a + (b - a) * index / count for a, b in zip(at, goal)]
+                result = sim.move_to(robot_name=model, position=waypoint, tol=0.02)
+                if result.get("status") == "error":
+                    raise _ArmRefused(name, _text(result), steps)
+                time.sleep(
+                    max(0.0, distance / count / ARM_SPEED_M_S - (time.monotonic() - started))
+                )
+            at[:] = goal
+            steps.append(name)
+
         try:
             step("open", sim.set_gripper(robot_name=model, state="open"))
-            step("hover", sim.move_to(robot_name=model, position=[x, y, z + HOVER_M], tol=0.02))
-            step("descend", sim.move_to(robot_name=model, position=[x, y, z + 0.005], tol=0.02))
+            move("hover", [x, y, z + HOVER_M])
+            move("descend", [x, y, z + 0.005])
             step("close", sim.set_gripper(robot_name=model, state="close"))
-            step("grasp_assist", sim.attach_bodies(parent=spec.gripper_body, child=part, mode="weld"))
-            step("lift", sim.move_to(robot_name=model, position=[x, y, z + LIFT_M], tol=0.02))
-            step("carry", sim.move_to(robot_name=model, position=[target.x, target.y, z + HOVER_M], tol=0.02))
-            step("lower", sim.move_to(robot_name=model, position=[target.x, target.y, z + 0.02], tol=0.02))
+            step(
+                "grasp_assist", sim.attach_bodies(parent=spec.gripper_body, child=part, mode="weld")
+            )
+            move("lift", [x, y, z + LIFT_M])
+            move("carry", [target.x, target.y, z + HOVER_M])
+            move("lower", [target.x, target.y, z + 0.02])
             step("release", sim.detach_bodies(parent=spec.gripper_body, child=part))
             step("open", sim.set_gripper(robot_name=model, state="open"))
             step("settle", sim.step(150))
         except _ArmRefused as refused:
             # Never leave a part welded to the gripper after a refusal.
             sim.detach_bodies(parent=spec.gripper_body, child=part)
-            return {"status": "refused", "detail": f"{refused.step}: {refused.detail}", "grasp_assist": True, "steps": steps}
+            return {
+                "status": "refused",
+                "detail": f"{refused.step}: {refused.detail}",
+                "grasp_assist": True,
+                "steps": steps,
+            }
         return {"status": "ok", "grasp_assist": True, "steps": steps}
 
     def close(self) -> None:

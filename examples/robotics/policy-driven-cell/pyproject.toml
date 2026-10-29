@@ -5,8 +5,15 @@ description = "Simulation-only work cell where a learned policy and motion primi
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
-    "fastmcp==4.0.11",
-    "httpx2==2.13.1",
+    # CVE-2026-114605: dnspython comes in via fastmcp -> pydantic[email] -> email-validator,
+    # and only 2.9.0 is fixed. The lock pins it; this floor holds for pip installs too.
+    "dnspython>=2.9.0",
+    # 4.1.2+ needs mcp>=2.2, and strands-agents (via strands-robots) caps mcp below 2.2.
+    "fastmcp==4.1.1",
+    "httpx2==2.16.0",
+    # MuJoCo 3.17 changed the weld-constraint data that the Strands Robots 0.5.3 grasp assist writes.
+    "mujoco==3.16.0",
+    "pillow>=11",
     "pydantic>=2.11,<3",
     "pyyaml==6.0.3",
     "strands-robots[sim-mujoco,holosoma]==0.5.3",

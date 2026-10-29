@@ -42,16 +42,33 @@ def test_humanoid_starts_inside_the_exclusion_radius_so_the_arm_is_interlocked()
 def test_the_default_job_succeeds_on_measured_state():
     cell = started()
     try:
-        assert finished(cell, cell.walk_to("g1_op", "w1", "g1", "inspection")["command_id"])["status"] == "succeeded"
-        pick = finished(cell, cell.pick_and_place("arm_op", "p1", "arm", "part_a", "pass_bin")["command_id"])
+        assert (
+            finished(cell, cell.walk_to("g1_op", "w1", "g1", "inspection")["command_id"])["status"]
+            == "succeeded"
+        )
+        pick = finished(
+            cell, cell.pick_and_place("arm_op", "p1", "arm", "part_a", "pass_bin")["command_id"]
+        )
         assert pick["status"] == "succeeded"
         assert pick["evidence"]["grasp_assist"] is True
         assert pick["evidence"]["in_bin"] == "pass_bin"
-        assert finished(cell, cell.pick_and_place("arm_op", "p2", "arm", "part_b", "rework_bin")["command_id"])["status"] == "succeeded"
-        assert finished(cell, cell.walk_to("g1_op", "w2", "g1", "dock")["command_id"])["status"] == "succeeded"
+        assert (
+            finished(
+                cell,
+                cell.pick_and_place("arm_op", "p2", "arm", "part_b", "rework_bin")["command_id"],
+            )["status"]
+            == "succeeded"
+        )
+        assert (
+            finished(cell, cell.walk_to("g1_op", "w2", "g1", "dock")["command_id"])["status"]
+            == "succeeded"
+        )
         measured = cell.observe()["measured"]
         assert measured["humanoids"]["g1"]["nearest_location"] == "dock"
-        assert {p: s["in_bin"] for p, s in measured["parts"].items()} == {"part_a": "pass_bin", "part_b": "rework_bin"}
+        assert {p: s["in_bin"] for p, s in measured["parts"].items()} == {
+            "part_a": "pass_bin",
+            "part_b": "rework_bin",
+        }
     finally:
         cell.close()
 
@@ -71,7 +88,9 @@ def test_a_reported_pick_is_failed_when_the_part_is_not_measured_in_the_bin():
     cell = started(FakeBackend(drop_parts=frozenset({"part_a"})))
     try:
         finished(cell, cell.walk_to("g1_op", "w1", "g1", "inspection")["command_id"])
-        record = finished(cell, cell.pick_and_place("arm_op", "p1", "arm", "part_a", "pass_bin")["command_id"])
+        record = finished(
+            cell, cell.pick_and_place("arm_op", "p1", "arm", "part_a", "pass_bin")["command_id"]
+        )
         assert record["status"] == "failed"
         assert record["evidence"]["in_bin"] is None
     finally:
@@ -138,11 +157,16 @@ def test_the_default_job_on_the_real_simulator():
     try:
         with pytest.raises(Refused, match="interlock"):
             cell.pick_and_place("arm_op", "early", "arm", "part_a", "pass_bin")
-        for view in (
-            cell.walk_to("g1_op", "w1", "g1", "inspection"),
-        ):
+        for view in (cell.walk_to("g1_op", "w1", "g1", "inspection"),):
             assert finished(cell, view["command_id"], timeout=120)["status"] == "succeeded"
-        assert finished(cell, cell.pick_and_place("arm_op", "p1", "arm", "part_a", "pass_bin")["command_id"], 120)["status"] == "succeeded"
+        assert (
+            finished(
+                cell,
+                cell.pick_and_place("arm_op", "p1", "arm", "part_a", "pass_bin")["command_id"],
+                120,
+            )["status"]
+            == "succeeded"
+        )
         g1 = cell.observe()["measured"]["humanoids"]["g1"]
         assert g1["upright"] and g1["nearest_location"] == "inspection"
     finally:

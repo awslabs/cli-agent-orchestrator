@@ -35,7 +35,9 @@ def controller(tmp_path):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", ws="none"))
+        server = uvicorn.Server(
+            uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", ws="none")
+        )
         thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
         thread.start()
         deadline = time.monotonic() + 10
@@ -78,14 +80,24 @@ def test_a_credential_commands_only_its_own_robot(controller):
     url, token = controller
     with pytest.raises(ToolError):
         call(url, token["humanoid"], "walk_to", command_id="w1", robot="g2", location="dock")
-    accepted = call(url, token["humanoid"], "walk_to", command_id="w1", robot="g1", location="inspection")
+    accepted = call(
+        url, token["humanoid"], "walk_to", command_id="w1", robot="g1", location="inspection"
+    )
     assert accepted.data["status"] in ("accepted", "running", "succeeded")
 
 
 def test_the_interlock_refusal_reaches_the_agent_as_a_tool_error(controller):
     url, token = controller
     with pytest.raises(ToolError, match="interlock"):
-        call(url, token["arm"], "pick_and_place", command_id="p1", robot="arm", part="part_a", bin="pass_bin")
+        call(
+            url,
+            token["arm"],
+            "pick_and_place",
+            command_id="p1",
+            robot="arm",
+            part="part_a",
+            bin="pass_bin",
+        )
 
 
 def test_profiles_document_exactly_the_tools_their_role_can_call():
@@ -98,7 +110,12 @@ def test_profiles_document_exactly_the_tools_their_role_can_call():
     for role, names in expected.items():
         _, body = demo.read_profile(demo.PROFILE_SOURCES[role])
         if "### cell-sim" not in body:
-            documented = set(re.findall(r"`(\w+)`", body)) & {"observe", "walk_to", "pick_and_place", "stop_cell"}
+            documented = set(re.findall(r"`(\w+)`", body)) & {
+                "observe",
+                "walk_to",
+                "pick_and_place",
+                "stop_cell",
+            }
         else:
             section = body.split("### cell-sim", 1)[1].split("\n### ", 1)[0].split("\n## ", 1)[0]
             documented = set(re.findall(r"\*\*(\w+)\*\*\(", section))
@@ -106,8 +123,16 @@ def test_profiles_document_exactly_the_tools_their_role_can_call():
 
 
 def test_prepare_writes_one_credential_and_profile_per_agent(tmp_path):
-    manifest = demo.prepare(tmp_path / "run", EXAMPLE / "cell.json", port=8767, provider="claude_code")
-    assert set(manifest["actors"]) == {"supervisor", "checker", "operator", "humanoid_g1", "arm_arm"}
+    manifest = demo.prepare(
+        tmp_path / "run", EXAMPLE / "cell.json", port=8767, provider="claude_code"
+    )
+    assert set(manifest["actors"]) == {
+        "supervisor",
+        "checker",
+        "operator",
+        "humanoid_g1",
+        "arm_arm",
+    }
     for actor in manifest["actors"]:
         credential = tmp_path / "run" / "credentials" / f"{actor}.json"
         assert credential.stat().st_mode & 0o777 == 0o600

@@ -8,12 +8,18 @@ prompt cannot widen either.
 * ``walk`` - the humanoid operator: ``walk_to`` with its own robot.
 * ``pick`` - the arm operator: ``pick_and_place`` with its own robot.
 * ``operate`` - the human operator: ``stop_cell``.
+
+The same 127.0.0.1 controller also serves a read-only live view: ``GET /`` is
+the page, ``GET /state`` is observe() plus the frame numbers of the pictures,
+and ``GET /frame/<robot>`` is the latest picture of that robot's world. They
+show only what an observe credential already sees, never a credential.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,8 +33,24 @@ from fastmcp.exceptions import AuthorizationError, ToolError
 from fastmcp.server.auth import require_scopes
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token
+from live_view import LiveView
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 LOGGER = logging.getLogger("cell")
+VIEWER_HTML = Path(__file__).resolve().parent / "viewer.html"
+
+
+def allowed_hosts() -> list[str] | None:
+    """Extra Host names the controller accepts, from CELL_ALLOWED_HOSTS.
+
+    The controller accepts only the loopback names (127.0.0.1, localhost, ::1)
+    in the Host header, so that a web page cannot use DNS rebinding to read the
+    live view. A port forward that rewrites Host to its own name needs that name
+    here, for example CELL_ALLOWED_HOSTS='*.cloudfront.net'.
+    """
+    names = [name.strip() for name in os.environ.get("CELL_ALLOWED_HOSTS", "").split(",")]
+    return [name for name in names if name] or None
 
 
 def save_snapshot(path: Path, state: dict) -> None:
@@ -77,12 +99,16 @@ def controller_client(url: str, token: str) -> Client:
 
 
 def make_server(cell: Cell, tokens: dict[str, dict], snapshot: Path) -> FastMCP:
+    view = LiveView(cell)
+
     @asynccontextmanager
     async def lifespan(_server):
         cell.start()
+        view.start()
         try:
             yield {}
         finally:
+            view.close()
             save_snapshot(snapshot, cell.close())
 
     server = FastMCP(
@@ -91,12 +117,37 @@ def make_server(cell: Cell, tokens: dict[str, dict], snapshot: Path) -> FastMCP:
         lifespan=lifespan,
     )
 
+    # Read-only live view on the same loopback controller. No credential: it
+    # shows only measured state, the scene and pictures, which every observe
+    # credential already reads, and it can neither command nor step a robot.
+    @server.custom_route("/", methods=["GET"], include_in_schema=False)
+    async def viewer(_request: Request) -> HTMLResponse:
+        return HTMLResponse(
+            VIEWER_HTML.read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"}
+        )
+
+    @server.custom_route("/state", methods=["GET"], include_in_schema=False)
+    async def state(_request: Request) -> JSONResponse:
+        return JSONResponse(
+            {"cell": cell.observe(), "view": view.state()}, headers={"Cache-Control": "no-store"}
+        )
+
+    @server.custom_route("/frame/{robot}", methods=["GET"], include_in_schema=False)
+    async def frame(request: Request) -> Response:
+        robot = request.path_params["robot"]
+        picture = view.jpeg(robot) if robot in view.worlds() else None
+        if picture is None:
+            return Response(status_code=404)
+        return Response(picture, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
     def caller() -> tuple[str, str | None]:
         token = get_access_token()
         if token is None:
             raise AuthorizationError("a credential is required")
         robot = token.claims.get("robot")
-        return str(token.claims.get("role") or token.client_id), robot if isinstance(robot, str) else None
+        return str(token.claims.get("role") or token.client_id), (
+            robot if isinstance(robot, str) else None
+        )
 
     def own_robot(requested: str) -> str:
         role, robot = caller()
@@ -106,7 +157,9 @@ def make_server(cell: Cell, tokens: dict[str, dict], snapshot: Path) -> FastMCP:
 
     def call(tool: str, run, **arguments: str) -> dict:
         role, _ = caller()
-        LOGGER.info("%s called %s(%s)", role, tool, ", ".join(f"{k}={v}" for k, v in arguments.items()))
+        LOGGER.info(
+            "%s called %s(%s)", role, tool, ", ".join(f"{k}={v}" for k, v in arguments.items())
+        )
         try:
             return run()
         except Refused as refused:
@@ -140,7 +193,9 @@ def make_server(cell: Cell, tokens: dict[str, dict], snapshot: Path) -> FastMCP:
         )
 
     @server.tool(auth=require_scopes("pick"))
-    def pick_and_place(command_id: Identifier, robot: Identifier, part: Identifier, bin: Identifier) -> dict:
+    def pick_and_place(
+        command_id: Identifier, robot: Identifier, part: Identifier, bin: Identifier
+    ) -> dict:
         """Ask your arm to move one part from the table into one bin.
 
         The cell refuses while any humanoid is inside the arm's exclusion

@@ -17,7 +17,6 @@ import logging
 import math
 import queue
 import threading
-import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Annotated, Any, Protocol
@@ -25,6 +24,7 @@ from typing import Annotated, Any, Protocol
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 LOGGER = logging.getLogger("cell")
+WALK_SEGMENT_S = 2.0  # simulated seconds of policy per walk segment
 
 Identifier = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
 
@@ -65,7 +65,7 @@ class Scene(BaseModel):
     walk_tolerance_m: float = Field(default=0.25, gt=0)
     bin_tolerance_m: float = Field(default=0.06, gt=0)
     fallen_height_m: float = Field(default=0.55, gt=0)
-    walk_budget_s: float = Field(default=40.0, gt=0)
+    walk_budget_s: float = Field(default=40.0, gt=0)  # simulated seconds of walking per command
 
     @model_validator(mode="after")
     def check_references(self) -> Scene:
@@ -98,7 +98,9 @@ class Backend(Protocol):
 
     def part_position(self, part: str) -> tuple[float, float, float]: ...
 
-    def walk_segment(self, robot: str, velocity: tuple[float, float], duration_s: float) -> dict: ...
+    def walk_segment(
+        self, robot: str, velocity: tuple[float, float], duration_s: float
+    ) -> dict: ...
 
     def pick_and_place(self, arm: str, part: str, target: Point) -> dict: ...
 
@@ -195,7 +197,10 @@ class Cell:
                 "commands": [command.view() for command in self._commands.values()],
                 "scene": {
                     "locations": {k: v.model_dump() for k, v in self.scene.locations.items()},
-                    "humanoids": {k: {"model": v.model, "controller": f"{v.policy} policy"} for k, v in self.scene.humanoids.items()},
+                    "humanoids": {
+                        k: {"model": v.model, "controller": f"{v.policy} policy"}
+                        for k, v in self.scene.humanoids.items()
+                    },
                     "arms": {
                         k: {
                             "model": v.model,
@@ -222,13 +227,18 @@ class Cell:
                 "upright": pose.z >= self.scene.fallen_height_m,
                 "nearest_location": self._nearest_location(pose),
                 "inside_exclusion_of": [
-                    arm for arm, spec in self.scene.arms.items() if self._distance(pose, spec.base) < spec.exclusion_radius_m
+                    arm
+                    for arm, spec in self.scene.arms.items()
+                    if self._distance(pose, spec.base) < spec.exclusion_radius_m
                 ],
             }
         parts = {}
         for name in self.scene.parts:
             x, y, z = self.backend.part_position(name)
-            parts[name] = {"position": [round(x, 3), round(y, 3), round(z, 3)], "in_bin": self._bin_of(x, y, z)}
+            parts[name] = {
+                "position": [round(x, 3), round(y, 3), round(z, 3)],
+                "in_bin": self._bin_of(x, y, z),
+            }
         with self._lock:
             self._snapshot = {"humanoids": humanoids, "parts": parts}
 
@@ -257,10 +267,16 @@ class Cell:
                 return replay
             self._check_motion()
             if robot not in self.scene.humanoids:
-                raise Refused(f"{robot} is not a humanoid in this cell; humanoids: {sorted(self.scene.humanoids)}")
+                raise Refused(
+                    f"{robot} is not a humanoid in this cell; humanoids: {sorted(self.scene.humanoids)}"
+                )
             if location not in self.scene.locations:
-                raise Refused(f"unknown location {location}; locations: {sorted(self.scene.locations)}")
-            return self._accept(Command(command_id, "walk_to", caller, robot, {"location": location}))
+                raise Refused(
+                    f"unknown location {location}; locations: {sorted(self.scene.locations)}"
+                )
+            return self._accept(
+                Command(command_id, "walk_to", caller, robot, {"location": location})
+            )
 
     def pick_and_place(self, caller: str, command_id: str, robot: str, part: str, bin: str) -> dict:
         arguments = {"part": part, "bin": bin}
@@ -270,7 +286,9 @@ class Cell:
                 return replay
             self._check_motion()
             if robot not in self.scene.arms:
-                raise Refused(f"{robot} is not an arm in this cell; arms: {sorted(self.scene.arms)}")
+                raise Refused(
+                    f"{robot} is not an arm in this cell; arms: {sorted(self.scene.arms)}"
+                )
             if part not in self.scene.parts:
                 raise Refused(f"unknown part {part}; parts: {sorted(self.scene.parts)}")
             if bin not in self.scene.bins:
@@ -286,7 +304,11 @@ class Cell:
             return self._accept(Command(command_id, "pick_and_place", caller, robot, arguments))
 
     def _intruders(self, arm: str) -> list[str]:
-        return [name for name, state in self._snapshot["humanoids"].items() if arm in state["inside_exclusion_of"]]
+        return [
+            name
+            for name, state in self._snapshot["humanoids"].items()
+            if arm in state["inside_exclusion_of"]
+        ]
 
     def _check_motion(self) -> None:
         if self._stopped:
@@ -294,20 +316,31 @@ class Cell:
         if not self.allow_motion:
             raise Refused("motion is disabled: the controller was started without --allow-motion")
 
-    def _replay(self, command_id: str, kind: str, caller: str, robot: str, arguments: dict) -> dict | None:
+    def _replay(
+        self, command_id: str, kind: str, caller: str, robot: str, arguments: dict
+    ) -> dict | None:
         existing = self._commands.get(command_id)
         if existing is None:
             return None
-        if (existing.kind, existing.caller, existing.robot, existing.arguments) != (kind, caller, robot, arguments):
+        if (existing.kind, existing.caller, existing.robot, existing.arguments) != (
+            kind,
+            caller,
+            robot,
+            arguments,
+        ):
             raise Refused(f"command_id {command_id} was already used for a different command")
         return existing.view()
 
     def _accept(self, command: Command) -> dict:
         if command.robot in self._busy:
-            raise Refused(f"{command.robot} is busy with command {self._busy[command.robot]}; observe until it finishes")
+            raise Refused(
+                f"{command.robot} is busy with command {self._busy[command.robot]}; observe until it finishes"
+            )
         self._busy[command.robot] = command.command_id
         self._commands[command.command_id] = command
-        LOGGER.info("%s accepted %s %s %s", command.caller, command.kind, command.robot, command.arguments)
+        LOGGER.info(
+            "%s accepted %s %s %s", command.caller, command.kind, command.robot, command.arguments
+        )
         self._queue.put(command)
         return command.view()
 
@@ -347,7 +380,6 @@ class Cell:
 
     def _walk(self, command: Command) -> None:
         goal = self.scene.locations[command.arguments["location"]]
-        start = time.monotonic()
         segments = 0
         while True:
             pose = self.backend.humanoid_pose(command.robot)
@@ -361,19 +393,35 @@ class Cell:
             }
             if pose.z < self.scene.fallen_height_m:
                 with self._lock:
-                    self._finish(command, "failed", "the robot fell: pelvis below the fallen height", **evidence)
+                    self._finish(
+                        command,
+                        "failed",
+                        "the robot fell: pelvis below the fallen height",
+                        **evidence,
+                    )
                 return
             if distance <= self.scene.walk_tolerance_m:
                 with self._lock:
-                    self._finish(command, "succeeded", "measured position is within tolerance of the goal", **evidence)
+                    self._finish(
+                        command,
+                        "succeeded",
+                        "measured position is within tolerance of the goal",
+                        **evidence,
+                    )
                 return
             if self._stopped:
                 with self._lock:
                     self._finish(command, "failed", "stopped by the operator", **evidence)
                 return
-            if time.monotonic() - start > self.scene.walk_budget_s:
+            # Budget in simulated seconds, so a slower machine walks as far as a fast one.
+            if segments * WALK_SEGMENT_S >= self.scene.walk_budget_s:
                 with self._lock:
-                    self._finish(command, "failed", "time budget exhausted before reaching the goal", **evidence)
+                    self._finish(
+                        command,
+                        "failed",
+                        "time budget exhausted before reaching the goal",
+                        **evidence,
+                    )
                 return
             # Command a base-frame velocity toward the goal. The policy turns it
             # into joint targets; this loop never sets a joint.
@@ -381,7 +429,7 @@ class Cell:
             cos, sin = math.cos(-pose.yaw), math.sin(-pose.yaw)
             bx, by = cos * dx - sin * dy, sin * dx + cos * dy
             scale = min(0.45, 0.6 * distance) / max(distance, 1e-6)
-            self.backend.walk_segment(command.robot, (bx * scale, by * scale), 2.0)
+            self.backend.walk_segment(command.robot, (bx * scale, by * scale), WALK_SEGMENT_S)
             segments += 1
             self._refresh()
 
@@ -391,7 +439,11 @@ class Cell:
             intruders = self._intruders(command.robot)
         if intruders:  # recheck at execution time, not only at acceptance
             with self._lock:
-                self._finish(command, "failed", f"interlock: {', '.join(intruders)} entered the exclusion radius")
+                self._finish(
+                    command,
+                    "failed",
+                    f"interlock: {', '.join(intruders)} entered the exclusion radius",
+                )
             return
         target = self.scene.bins[bin_name]
         result = self.backend.pick_and_place(command.robot, part, target)
@@ -406,7 +458,12 @@ class Cell:
         }
         with self._lock:
             if result.get("status") != "ok":
-                self._finish(command, "failed", f"the arm refused: {result.get('detail', 'unknown')}", **evidence)
+                self._finish(
+                    command,
+                    "failed",
+                    f"the arm refused: {result.get('detail', 'unknown')}",
+                    **evidence,
+                )
             elif landed != bin_name:
                 self._finish(command, "failed", f"measured part is not in {bin_name}", **evidence)
             else:
@@ -416,7 +473,9 @@ class Cell:
 class FakeBackend:
     """A kinematic stand-in for tests and dry runs: no MuJoCo, no policy."""
 
-    def __init__(self, *, fall_on_segment: int | None = None, drop_parts: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self, *, fall_on_segment: int | None = None, drop_parts: frozenset[str] = frozenset()
+    ) -> None:
         self.fall_on_segment = fall_on_segment
         self.drop_parts = drop_parts
         self.segments = 0

@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 import yaml
 from cell import Cell, FakeBackend, Refused, Scene
-from cell_mcp import controller_client, make_server
+from cell_mcp import allowed_hosts, controller_client, make_server
 from fastmcp.server import create_proxy
 
 HERE = Path(__file__).resolve().parent
@@ -50,7 +50,9 @@ CAO_PROVIDERS = frozenset(
         "opencode_cli",
     }
 )
-NATIVE_ENFORCEMENT = frozenset({"claude_code", "copilot_cli", "grok_cli", "kiro_cli", "opencode_cli"})
+NATIVE_ENFORCEMENT = frozenset(
+    {"claude_code", "copilot_cli", "grok_cli", "kiro_cli", "opencode_cli"}
+)
 UNSUPPORTED_PROVIDERS = {
     "antigravity_cli": "Antigravity CLI reads the MCP servers of all CAO terminals from one shared file",
     "cursor_cli": "CAO launches Cursor CLI without the instructions of the agent profile",
@@ -84,7 +86,11 @@ def actors_for(scene: Scene) -> dict[str, dict]:
         "operator": {"scopes": ["observe", "operate"], "role": "operator"},
     }
     for robot in scene.humanoids:
-        actors[f"humanoid_{robot}"] = {"scopes": ["observe", "walk"], "role": "humanoid", "robot": robot}
+        actors[f"humanoid_{robot}"] = {
+            "scopes": ["observe", "walk"],
+            "role": "humanoid",
+            "robot": robot,
+        }
     for robot in scene.arms:
         actors[f"arm_{robot}"] = {"scopes": ["observe", "pick"], "role": "arm", "robot": robot}
     return actors
@@ -95,7 +101,9 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
     if provider not in CAO_PROVIDERS:
-        raise ValueError(f"unknown CAO provider {provider!r}; use one of: {', '.join(sorted(CAO_PROVIDERS))}")
+        raise ValueError(
+            f"unknown CAO provider {provider!r}; use one of: {', '.join(sorted(CAO_PROVIDERS))}"
+        )
     if provider in UNSUPPORTED_PROVIDERS:
         raise ValueError(f"{provider} is not supported: {UNSUPPORTED_PROVIDERS[provider]}")
     sources = {role: read_profile(path) for role, path in PROFILE_SOURCES.items()}
@@ -113,19 +121,27 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
         for actor, meta in actors.items()
         if actor != "operator"
     }
-    operator_profiles = {meta["robot"]: profiles[actor] for actor, meta in actors.items() if "robot" in meta}
+    operator_profiles = {
+        meta["robot"]: profiles[actor] for actor, meta in actors.items() if "robot" in meta
+    }
     for actor, meta in actors.items():
         credential_path = run_dir / "credentials" / f"{actor}.json"
         write_private(credential_path, {"url": url, "token": secrets.token_urlsafe(32)})
         if actor == "operator":
             continue
         source, instructions = sources[meta["role"]]
-        description = source["description"] + (f" (robot {meta['robot']})" if "robot" in meta else "")
+        description = source["description"] + (
+            f" (robot {meta['robot']})" if "robot" in meta else ""
+        )
         profile: dict = {
             "name": profiles[actor],
             "description": description,
             "provider": provider,
-            **{k: copy.deepcopy(v) for k, v in source.items() if k not in ("name", "description", "provider")},
+            **{
+                k: copy.deepcopy(v)
+                for k, v in source.items()
+                if k not in ("name", "description", "provider")
+            },
         }
         profile["mcpServers"]["cell-sim"] = {
             "type": "stdio",
@@ -148,7 +164,13 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
             + "\n```\n"
         )
         (run_dir / "profiles" / f"{profiles[actor]}.md").write_text(text, encoding="utf-8")
-    manifest = {"run_id": run_id, "url": url, "actors": actors, "profiles": profiles, "provider": provider}
+    manifest = {
+        "run_id": run_id,
+        "url": url,
+        "actors": actors,
+        "profiles": profiles,
+        "provider": provider,
+    }
     write_private(run_dir / "run.json", manifest)
     write_private(run_dir / "scene.json", scene.model_dump(mode="json"))
     return manifest
@@ -160,7 +182,9 @@ def ensure_port_free(port: int) -> None:
         try:
             probe.bind(("127.0.0.1", port))
         except OSError as error:
-            raise OSError(f"port {port} is in use, for example by another run's controller: {error}") from error
+            raise OSError(
+                f"port {port} is in use, for example by another run's controller: {error}"
+            ) from error
 
 
 def _interrupt(signum, frame) -> None:
@@ -180,7 +204,9 @@ def serve(run_dir: Path, *, allow_motion: bool, backend: str) -> None:
     scene = Scene.model_validate_json((run_dir / "scene.json").read_text(encoding="utf-8"))
     tokens = {}
     for actor, meta in manifest["actors"].items():
-        credentials = json.loads((run_dir / "credentials" / f"{actor}.json").read_text(encoding="utf-8"))
+        credentials = json.loads(
+            (run_dir / "credentials" / f"{actor}.json").read_text(encoding="utf-8")
+        )
         if credentials["url"] != manifest["url"]:
             raise ValueError("all credentials must address this run's controller")
         tokens[credentials["token"]] = {"client_id": actor, **meta}
@@ -195,16 +221,31 @@ def serve(run_dir: Path, *, allow_motion: bool, backend: str) -> None:
         "approved for this run" if allow_motion else "DISABLED (no --allow-motion)",
     )
     server = make_server(cell, tokens, run_dir / "last-state.json")
+    logging.getLogger("cell").warning(
+        "LIVE VIEW: open http://127.0.0.1:%d/ in a browser to watch the run", port
+    )
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, _interrupt)
     try:
-        server.run(transport="http", host="127.0.0.1", port=port, stateless_http=True, show_banner=False)
+        server.run(
+            transport="http",
+            host="127.0.0.1",
+            port=port,
+            stateless_http=True,
+            show_banner=False,
+            # Check Host and Origin on every request, the MCP endpoint and the live
+            # view alike, so that DNS rebinding cannot reach the controller.
+            host_origin_protection=True,
+            allowed_hosts=allowed_hosts(),
+        )
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
 
 
 async def operator_call(run_dir: Path, tool: str) -> dict:
-    credentials = json.loads((run_dir / "credentials" / "operator.json").read_text(encoding="utf-8"))
+    credentials = json.loads(
+        (run_dir / "credentials" / "operator.json").read_text(encoding="utf-8")
+    )
     async with controller_client(credentials["url"], credentials["token"]) as client:
         result = await client.call_tool(tool)
         if result.is_error or not isinstance(result.data, dict):
@@ -223,7 +264,9 @@ def rehearse(scene_file: Path, *, backend: str) -> int:
 
     def wait(view: dict) -> dict:
         while True:
-            record = next(c for c in cell.observe()["commands"] if c["command_id"] == view["command_id"])
+            record = next(
+                c for c in cell.observe()["commands"] if c["command_id"] == view["command_id"]
+            )
             if record["status"] in ("succeeded", "failed"):
                 print(f"{record['command_id']}: {record['status']} - {record['exit_reason']}")
                 return record
@@ -269,13 +312,17 @@ def main() -> None:
     rehearse_parser.add_argument("--backend", choices=["strands", "fake"], default="strands")
     for command in ("status", "stop"):
         sub.add_parser(command).add_argument("--run-dir", type=Path, required=True)
-    sub.add_parser("connect", help="stdio MCP relay; used by generated profiles").add_argument("credential", type=Path)
+    sub.add_parser("connect", help="stdio MCP relay; used by generated profiles").add_argument(
+        "credential", type=Path
+    )
     args = parser.parse_args()
     if args.command == "prepare":
         if not args.request.strip():
             setup.error("--request must not be blank")
         if args.provider in UNSUPPORTED_PROVIDERS:
-            setup.error(f"--provider {args.provider} is not supported: {UNSUPPORTED_PROVIDERS[args.provider]}")
+            setup.error(
+                f"--provider {args.provider} is not supported: {UNSUPPORTED_PROVIDERS[args.provider]}"
+            )
         manifest = prepare(args.run_dir, args.scene, port=args.port, provider=args.provider)
         if args.provider not in NATIVE_ENFORCEMENT:
             print(
@@ -289,10 +336,19 @@ def main() -> None:
         print(
             shlex.join(
                 [
-                    "cao", "launch", "--agents", manifest["profiles"]["supervisor"],
-                    "--headless", "--async", "--auto-approve",
-                    "--session-name", f"cao-cell-{manifest['run_id'][:12]}",
-                    "--working-directory", str(HERE), "--", args.request,
+                    "cao",
+                    "launch",
+                    "--agents",
+                    manifest["profiles"]["supervisor"],
+                    "--headless",
+                    "--async",
+                    "--auto-approve",
+                    "--session-name",
+                    f"cao-cell-{manifest['run_id'][:12]}",
+                    "--working-directory",
+                    str(HERE),
+                    "--",
+                    args.request,
                 ]
             )
         )
@@ -302,7 +358,9 @@ def main() -> None:
         raise SystemExit(rehearse(args.scene, backend=args.backend))
     elif args.command == "connect":
         credentials = json.loads(args.credential.read_text(encoding="utf-8"))
-        proxy = create_proxy(controller_client(credentials["url"], credentials["token"]), name="cell-sim")
+        proxy = create_proxy(
+            controller_client(credentials["url"], credentials["token"]), name="cell-sim"
+        )
         proxy.run(transport="stdio", show_banner=False)
     else:
         tool = "stop_cell" if args.command == "stop" else "observe"

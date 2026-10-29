@@ -56,7 +56,7 @@ them. The human operator holds the only credential for `stop_cell`.
 the measured state says so:
 
 - a walk succeeds when the measured pelvis is within 0.25 m of the goal, and
-  fails if the pelvis drops below 0.55 m (the robot fell) or the time budget runs
+  fails if the pelvis drops below 0.55 m (the robot fell) or the walk budget (40 simulated seconds) runs
   out;
 - a pick succeeds when the measured part rests in the requested bin.
 
@@ -79,9 +79,13 @@ CLI. No GPU, no display, no robot hardware.
 
 ```bash
 cd examples/robotics/policy-driven-cell
-uv venv --python 3.12 .venv && source .venv/bin/activate
-uv pip install -e . pytest
+uv sync --locked          # Python 3.12 and the pinned packages in .venv
+source .venv/bin/activate
 ```
+
+On a Linux machine with no display, MuJoCo draws the live view on the CPU with
+EGL: install the Mesa EGL and OpenGL libraries (on Amazon Linux,
+`mesa-libEGL mesa-dri-drivers libglvnd-opengl`) and set `MUJOCO_GL=egl`.
 
 **1. Rehearse without CAO.** This runs the job with the same calls the agents
 make, on the real simulator. The first run downloads the robot models and the
@@ -92,7 +96,7 @@ python demo.py rehearse
 ```
 
 You see the interlock refuse the early pick, then four succeeded commands and
-the measured final state, in about 20 seconds.
+the measured final state, in about 30 seconds.
 
 **2. Run it with CAO agents.**
 
@@ -120,6 +124,32 @@ cao shutdown --session <session-name>
 
 Then stop `serve` with Ctrl+C. It writes `runs/demo/last-state.json`.
 
+## Watch it live
+
+While `serve` runs, the controller also serves a live view. It logs
+`LIVE VIEW: open http://127.0.0.1:8767/ in a browser to watch the run`. The
+page shows, as the agents act:
+
+- a moving picture of each robot's world: the G1 walking with its policy, and
+  the arm reaching, gripping, carrying and placing each part, with the named
+  locations and bins labelled;
+- a top-down map of the whole cell in measured positions, with the humanoid's
+  trail and the arm's exclusion radius, which turns solid red while a humanoid
+  is inside it;
+- who is acting right now, and every command with its status and reason.
+
+A world renders about 8 times a second while its robot moves and once a second
+while it is idle. The arm's moves are paced to about 0.15 m/s of wall time, so
+you can follow them; the physics and every measurement are the same without
+the pacing. The view is read-only: it shows what an observe credential sees,
+never a credential, and it cannot move a robot. If the renderer cannot start,
+the controller logs it once and the page shows only the map.
+
+The view is on `127.0.0.1` only. The controller accepts only loopback names in
+the `Host` header, so a web page cannot use DNS rebinding to read it. If you
+reach it through a port forward that rewrites `Host` to its own name, add that
+name before `serve`, for example `CELL_ALLOWED_HOSTS='*.cloudfront.net'`.
+
 ## A recorded run
 
 A live run with Claude Code agents on 21 October 2026 took about two minutes:
@@ -135,11 +165,11 @@ A live run with Claude Code agents on 21 October 2026 took about two minutes:
 ## Tests
 
 ```bash
-pytest -m "not sim"   # cell logic and MCP scopes, with a fake backend: no MuJoCo, seconds
+pytest -m "not sim"   # cell logic, MCP scopes and the live view, with a fake backend: no MuJoCo, seconds
 pytest -m sim         # the job on the real simulator, about 15 seconds
 ```
 
 ## Next steps
 
 See [PLAN.md](PLAN.md): the driver path (a robot's vendor driver on a MuJoCo
-twin, then on hardware), recorded video, and failure-injection scenarios.
+twin, then on hardware) and failure-injection scenarios.
