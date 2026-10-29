@@ -1,0 +1,13 @@
+{
+  "name": "cao-dojo-e2e",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local-only end-to-end check of the CAO Dojo page against a real cao-server. Not required to run the page (../index.html has zero dependencies).",
+  "scripts": {
+    "e2e": "./e2e-local.sh"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1"
+  }
+}

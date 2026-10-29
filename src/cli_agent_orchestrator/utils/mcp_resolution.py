@@ -23,15 +23,42 @@ server, or an explicit absolute path) passes through unchanged.
 """
 
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 
 logger = logging.getLogger(__name__)
 
 # The bundled orchestration MCP server's console-script name.
 CAO_MCP_SERVER_COMMAND = "cao-mcp-server"
+
+#: Variables that tell the bundled server which CAO launched it. Codex passes an
+#: MCP subprocess only the variables its config names, and Claude Code does not
+#: forward the parent environment, so without these a server started by a CAO on
+#: another port or home falls back to the defaults and talks to a different CAO.
+CAO_SERVER_ENV_KEYS = ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR")
+
+
+def cao_server_env() -> Dict[str, str]:
+    """The running CAO's own address and home, for the variables that are set."""
+    env = {key: os.environ[key] for key in CAO_SERVER_ENV_KEYS if os.environ.get(key)}
+    if "CAO_HOME_DIR" in env:
+        # Forward the already-resolved absolute path (constants.py tilde-expands
+        # and resolves it against this process's cwd at import), not the raw env
+        # text. A child spawned in a different cwd would otherwise re-resolve a
+        # relative value to a different, stray location of its own.
+        env["CAO_HOME_DIR"] = str(CAO_HOME_DIR)
+    if env.get("CAO_API_HOST") == "0.0.0.0":
+        # Same mapping main() applies to the --host flag: an IPv4 wildcard
+        # bind is not a usable client address, so agents are pointed at
+        # loopback instead.
+        env["CAO_API_HOST"] = "127.0.0.1"
+    return env
+
 
 # Module entrypoint equivalent of the console script — runnable by the
 # interpreter directly, with no dependency on a script being on PATH.
@@ -112,7 +139,9 @@ def resolve_cao_mcp_command(
     return interpreter, ["-m", CAO_MCP_SERVER_MODULE, *args]
 
 
-def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
+def resolve_mcp_server_config(
+    config: dict, *, persisted: bool = False, name: Optional[str] = None
+) -> dict:
     """Return a copy of an MCP server config with its command resolved.
 
     ``persisted`` is forwarded to :func:`resolve_cao_mcp_command`; set it True
@@ -126,12 +155,35 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     applies to command-launched servers, and injecting ``command=""``/``args``
     into a command-less entry would corrupt it for providers that emit every
     present key.
+
+    A runtime (not persisted) bundled entry also gains :func:`cao_server_env`,
+    under any ``env`` the entry already sets, so the server reaches the CAO that
+    launched it. A persisted entry gains nothing: it outlives this process and
+    may be read by another CAO.
+
+    ``name`` is the entry's own key in the profile's ``mcpServers`` map, for a
+    caller that iterates it by name (every provider using this function does).
+    A profile can start the bundled server through ``uvx`` or an absolute path
+    rather than the bare console-script command, same as Codex already
+    recognises in its own launch config (``codex.py``'s ``is_cao_server``). The
+    entry is still treated as the CAO server — and so still gains the address —
+    when its name is ``cao-mcp-server`` or its command's final path segment is,
+    even though ``command`` itself is not the bare string.
     """
     if "command" not in config:
         return dict(config)
     resolved = dict(config)
     command = resolved.get("command", "")
     args = resolved.get("args", []) or []
+    is_cao_server = (
+        command == CAO_MCP_SERVER_COMMAND
+        or name == CAO_MCP_SERVER_COMMAND
+        or (isinstance(command, str) and Path(command).name == CAO_MCP_SERVER_COMMAND)
+    )
+    if is_cao_server and not persisted:
+        server_env = cao_server_env()
+        if server_env:
+            resolved["env"] = {**server_env, **(resolved.get("env") or {})}
     new_command, new_args = resolve_cao_mcp_command(command, args, persisted=persisted)
     if (new_command, new_args) == (command, args):
         # Passthrough (non-bundled command): don't write back keys the entry

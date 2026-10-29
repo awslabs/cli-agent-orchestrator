@@ -25,7 +25,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
 )
 
-pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+pytestmark = pytest.mark.usefixtures("isolated_memory_db", "kiro_agent_store_not_under_test")
 
 
 def _registry_mock() -> MagicMock:
@@ -512,6 +512,7 @@ class TestTerminalPluginEvents:
             side_effect=lambda: call_order.append("provider_initialize")
         )
         provider.shell_baseline = None
+        provider.identity_verified = True  # a healthy Kiro launch (#1074)
         mock_provider_manager.create_provider.return_value = provider
 
         log_path = MagicMock()
@@ -773,9 +774,16 @@ class TestMessagePluginEvents:
         # Status is sourced from the event-driven StatusMonitor, not the provider.
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
 
-        inbox_service.deliver_pending("abcd1234", registry=registry)
+        # status_monitor is mocked bare here with no status_observation()
+        # configured, so the default-on submit confirmation (#78) would poll
+        # it forever and burn the real 8s timeout; this test is about event
+        # attribution, not that confirmation path.
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False
+        ):
+            inbox_service.deliver_pending("abcd1234", registry=registry)
 
-        mock_terminal_service.send_input.assert_called_once_with(
+        mock_terminal_service.dispatch_input.assert_called_once_with(
             "abcd1234",
             "Please review this",
             registry=registry,

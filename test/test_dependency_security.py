@@ -297,6 +297,10 @@ def test_cargo_manifest_does_not_make_trivy_drop_development_dependencies(reposi
     assert Path("another-project/Cargo.toml") not in inputs
 
 
+# must_run("unit"): only the 3.12 Unit Tests leg installs Trivy, and it is the
+# single place this assertion ever runs. If that install step goes away the
+# skipif would quietly make this a no-op on every leg.
+@pytest.mark.must_run("unit")
 @pytest.mark.skipif(shutil.which("trivy") is None, reason="Requires the CI-pinned Trivy binary")
 def test_real_trivy_keeps_dev_only_packages_in_published_inventory(repository, tmp_path):
     manifest = {
@@ -507,7 +511,6 @@ def test_vendored_fork_retains_the_reviewed_registry_bytes_and_metadata():
         ("docusaurus", "proxy-addr", "2.0.8"),
         ("docusaurus", "joi", "17.13.8"),
         ("docusaurus", "postcss-selector-parser", "7.1.6"),
-        ("web", "postcss-selector-parser", "7.1.6"),
         ("docusaurus", "tinypool", "2.1.2"),
     ],
 )

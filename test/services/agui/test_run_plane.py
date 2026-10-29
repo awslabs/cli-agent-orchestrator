@@ -12,10 +12,8 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -23,7 +21,6 @@ from cli_agent_orchestrator.services.agui.base import RecordingUiEmitter
 from cli_agent_orchestrator.services.agui.handoff_approval import (
     AgentHandoffWithApproval,
     ApprovalDecision,
-    Interrupt,
 )
 
 # ---------------------------------------------------------------------------
@@ -311,12 +308,12 @@ async def test_run_plane_resume_edit():
     emitter = RecordingUiEmitter()
     construct = AgentHandoffWithApproval(emitter=emitter, answer_delivery=None)
 
-    # Use a prompt that results in options including "edit"
-    # (permission_request includes ["approve", "deny", "edit"])
+    # Use a prompt whose options include "edit" (kiro permission_request).
+    # Claude Code permission prompts do not offer edit.
     interrupt = construct.on_provider_waiting(
         terminal_id="t-1",
-        provider="claude_code",
-        raw_prompt="\u2191/\u2193 to navigate",
+        provider="kiro_cli",
+        raw_prompt="Allow this action? [y/n/t]:",
         session_name="s-1",
     )
 
@@ -375,7 +372,7 @@ async def test_run_plane_resume_cancelled_maps_to_deny():
             approval_construct=construct,
         )
     )
-    parsed = _parse_frames(frames)
+    _parsed = _parse_frames(frames)
 
     assert construct.get_interrupt(interrupt.id).resolved
     assert construct.get_interrupt(interrupt.id).outcome == "deny"

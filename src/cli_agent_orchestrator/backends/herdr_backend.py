@@ -26,7 +26,10 @@ from cli_agent_orchestrator.backends.base import (
     TerminalCleanupResult,
     TerminalNotFoundError,
 )
-from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+from cli_agent_orchestrator.constants import (
+    BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
+    HERDR_PANE_READ_MAX_LINES,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
@@ -718,6 +721,14 @@ class HerdrBackend(TerminalBackend):
 
     # --- Output ---
 
+    @property
+    def max_history_lines(self) -> int:
+        # herdr clamps every ``pane read`` to 1000 lines server-side, whatever
+        # ``--lines`` asks for (see the constant). Reporting the real ceiling
+        # lets get_output skip its 5000-line rung here and classify an
+        # exhausted ladder against 1000, not 5000 (#728).
+        return HERDR_PANE_READ_MAX_LINES
+
     def get_history(
         self,
         session_name: str,
@@ -726,20 +737,36 @@ class HerdrBackend(TerminalBackend):
         strip_escapes: bool = False,
         full_history: bool = False,
         visible_only: bool = False,
+        join_wrapped: bool = False,
     ) -> str:
-        """Read pane output via herdr pane read."""
+        """Read pane output via herdr pane read.
+
+        ``join_wrapped`` is accepted for contract parity and ignored: ``herdr
+        pane read`` has no rejoin flag, so a caller gets whatever line shape
+        herdr returns. Callers that need a wrapped line intact must not rely
+        on it here (codex._find_config_rejection reassembles as context only).
+        """
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
         args = ["pane", "read", pane_id]
         if visible_only:
             # herdr has no viewport/scrollback split; approximate the "current
-            # screen" contract with a small bounded recent read. In practice this
-            # arm is unreachable from the one visible_only caller (the stale-
-            # PROCESSING capture fallback): event-inbox backends return from
-            # get_status() before that fallback is reached.
+            # screen" contract with a small bounded recent read. The Kiro
+            # identity check reads the TUI header through this arm
+            # (KiroCliProvider._verify_agent_identity, #1074), so the header must
+            # be within these 50 lines. The stale-PROCESSING capture fallback
+            # never reaches it: event-inbox backends return from get_status()
+            # before that fallback.
             args.extend(["--source", "recent", "--lines", "50"])
         elif full_history:
-            pass  # no flags — returns full scrollback
+            # Ask for herdr's read ceiling explicitly. A flagless `pane read`
+            # was assumed to mean "full scrollback", but herdr defaults
+            # ``--lines`` to 80, so on the get_output ladder this rung returned
+            # 80 lines right after the 5000-line rung returned 604 (#728). And
+            # herdr clamps every read to HERDR_PANE_READ_MAX_LINES, so asking
+            # for more than that would only make the argv look deeper than the
+            # reply can be. This is the deepest read herdr offers.
+            args.extend(["--source", "recent", "--lines", str(HERDR_PANE_READ_MAX_LINES)])
         elif tail_lines:
             args.extend(["--source", "recent", "--lines", str(tail_lines)])
         else:
@@ -1077,10 +1104,24 @@ class HerdrBackend(TerminalBackend):
         whereas the tmux backend accepts such values. This is an intentional,
         safety-conservative divergence; operator env values on herdr must be
         sanitizer-safe.
+
+        The running CAO's own address and home (``cao_server_env``) come first.
+        A pane otherwise inherits the herdr server's environment, which belongs
+        to whatever process started that server, not necessarily this CAO.
         """
         from cli_agent_orchestrator.clients.tmux import TmuxClient
+        from cli_agent_orchestrator.utils.mcp_resolution import cao_server_env
 
         env: Dict[str, str] = {}
+        for key, value in cao_server_env().items():
+            if not _SAFE_ARG_RE.fullmatch(f"{key}={value}"):
+                logger.warning(
+                    "Dropping this CAO's %s from herdr pane env -- value contains "
+                    "characters the herdr arg sanitizer rejects",
+                    key,
+                )
+                continue
+            env[key] = value
         for key, value in (extra_env or {}).items():
             if TmuxClient._is_blocked_env_key(key):
                 logger.warning("Dropping forwarded env var with blocked key: %s", key)

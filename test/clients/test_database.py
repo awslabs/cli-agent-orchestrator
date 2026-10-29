@@ -1,7 +1,6 @@
 """Tests for the database client."""
 
 import sqlite3
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -14,7 +13,6 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
     Base,
-    FlowModel,
     IdempotencyKeyModel,
     InboxModel,
     MemoryMetadataModel,
@@ -27,6 +25,7 @@ from cli_agent_orchestrator.clients.database import (
     delete_idempotency_key,
     delete_terminal,
     delete_terminals_by_session,
+    fail_orphaned_pending_messages,
     get_flow,
     get_idempotency_record,
     get_inbox_messages,
@@ -348,6 +347,96 @@ class TestTerminalOperations:
             result = list_pending_receiver_ids_older_than(30)
 
         assert result == ["term-old"]
+
+    def test_fail_orphaned_pending_messages(self, test_db):
+        """A PENDING message whose receiver row is gone is failed, not left
+        claiming PENDING forever (#708).
+
+        The reconcile join deliberately drops these so the sweep does not retry
+        deliveries to deleted agents; this is the counterpart that stops them
+        reporting a state they can never leave.
+        """
+        old = datetime.now(timezone.utc) - timedelta(seconds=120)
+        fresh = datetime.now(timezone.utc)
+
+        with test_db() as seed:
+            seed.add_all(
+                [
+                    TerminalModel(
+                        id="term-alive",
+                        tmux_session="cao-s",
+                        tmux_window="w",
+                        provider="kiro_cli",
+                    ),
+                    # Receiver alive — still the sweep's to deliver.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-alive",
+                        message="alive",
+                        status=MessageStatus.PENDING.value,
+                        created_at=old,
+                    ),
+                    # Receiver row gone and past the grace window — undeliverable.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-ghost",
+                        message="ghost",
+                        status=MessageStatus.PENDING.value,
+                        created_at=old,
+                    ),
+                    # Receiver row gone but inside the grace window — left alone.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-ghost",
+                        message="ghost-fresh",
+                        status=MessageStatus.PENDING.value,
+                        created_at=fresh,
+                    ),
+                    # Already delivered to a gone receiver — not touched.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-ghost",
+                        message="done",
+                        status=MessageStatus.DELIVERED.value,
+                        created_at=old,
+                    ),
+                ]
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            failed_ids = fail_orphaned_pending_messages(30)
+
+        with test_db() as check:
+            by_message = {m.message: m.status for m in check.query(InboxModel).all()}
+
+        assert len(failed_ids) == 1
+        assert by_message["ghost"] == MessageStatus.FAILED.value
+        assert by_message["alive"] == MessageStatus.PENDING.value
+        assert by_message["ghost-fresh"] == MessageStatus.PENDING.value
+        assert by_message["done"] == MessageStatus.DELIVERED.value
+
+    def test_fail_orphaned_pending_messages_is_a_noop_without_orphans(self, test_db):
+        """No orphans, no writes — the sweep runs every 30s."""
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(
+                    id="term-alive", tmux_session="cao-s", tmux_window="w", provider="kiro_cli"
+                )
+            )
+            seed.add(
+                InboxModel(
+                    sender_id="a",
+                    receiver_id="term-alive",
+                    message="m",
+                    status=MessageStatus.PENDING.value,
+                    created_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+                )
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            assert fail_orphaned_pending_messages(30) == []
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminals_by_session(self, mock_session_class):
@@ -1503,8 +1592,6 @@ class TestFlowOperations:
 
         mock_session.refresh.side_effect = mock_refresh
 
-        from cli_agent_orchestrator.clients.database import get_flows_to_run
-
         next_run = datetime.now()
         result = create_flow(
             name="test-flow",
@@ -1716,6 +1803,103 @@ class TestFlowOperations:
             create_inbox_message("sender-123", "dead-terminal", "Hello")
 
 
+class TestGetInboxMessagesOrdering:
+    """Ordering and sender filtering for get_inbox_messages."""
+
+    def _seed(self, test_db):
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [
+            InboxModel(
+                sender_id="worker-a",
+                receiver_id="supervisor",
+                message="oldest",
+                status=MessageStatus.PENDING.value,
+                created_at=base,
+            ),
+            InboxModel(
+                sender_id="worker-b",
+                receiver_id="supervisor",
+                message="middle",
+                status=MessageStatus.DELIVERED.value,
+                created_at=base + timedelta(minutes=1),
+            ),
+            InboxModel(
+                sender_id="worker-a",
+                receiver_id="supervisor",
+                message="newest-a",
+                status=MessageStatus.PENDING.value,
+                created_at=base + timedelta(minutes=2),
+            ),
+            InboxModel(
+                sender_id="worker-a",
+                receiver_id="other",
+                message="other-inbox",
+                status=MessageStatus.PENDING.value,
+                created_at=base + timedelta(minutes=3),
+            ),
+        ]
+        with test_db() as session:
+            session.add_all(rows)
+            session.commit()
+
+    def test_default_order_is_oldest_first(self, test_db):
+        """The default stays oldest-first and does not cross receivers."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor")
+
+        assert [message.message for message in messages] == ["oldest", "middle", "newest-a"]
+
+    def test_newest_first_applies_limit_after_ordering(self, test_db):
+        """newest_first returns the latest row when limit is 1."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor", limit=1, newest_first=True)
+
+        assert [message.message for message in messages] == ["newest-a"]
+
+    def test_explicit_oldest_first_still_limits_from_the_start(self, test_db):
+        """newest_first=False keeps limit applied to the oldest rows."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor", limit=1, newest_first=False)
+
+        assert [message.message for message in messages] == ["oldest"]
+
+    def test_sender_filter_excludes_other_senders(self, test_db):
+        """sender_id returns only that sender's messages for the receiver."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor", sender_id="worker-b")
+
+        assert [message.message for message in messages] == ["middle"]
+        assert messages[0].sender_id == "worker-b"
+
+    def test_sender_filter_combines_with_status_order_and_limit(self, test_db):
+        """sender_id, status, newest_first, and limit apply together."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages(
+                "supervisor",
+                limit=1,
+                status=MessageStatus.PENDING,
+                sender_id="worker-a",
+                newest_first=True,
+            )
+
+        assert [message.message for message in messages] == ["newest-a"]
+        assert messages[0].status == MessageStatus.PENDING
+
+    def test_pending_messages_stay_oldest_first(self, test_db):
+        """get_pending_messages keeps delivering the oldest pending message."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_pending_messages("supervisor", limit=1)
+
+        assert [message.message for message in messages] == ["oldest"]
+        assert messages[0].status == MessageStatus.PENDING
+
+
 class TestInitDb:
     """Tests for init_db function."""
 
@@ -1772,9 +1956,13 @@ class TestTerminalsSchemaMigration:
         assert "deferred_init_runtime_reclaimed" in columns
         assert "session_incarnation_id" in columns
         assert {"model", "model_honored"} <= columns
+        assert "delegate_tools" in columns
         assert rows == [
             ("abc12345", None, None, None, None)
         ], "existing rows must get NULL launch-model values"
+        with sqlite3.connect(str(db_file)) as conn:
+            ceilings = conn.execute("SELECT delegate_tools FROM terminals").fetchall()
+        assert ceilings == [(None,)], "pre-migration rows have no recorded ceiling"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
         """Running the migration twice must not fail or duplicate columns."""
@@ -1808,9 +1996,11 @@ class TestTerminalsSchemaMigration:
         assert columns.count("deferred_init_failure") == 1
         assert columns.count("deferred_init_external_owner") == 1
         assert columns.count("deferred_init_runtime_reclaimed") == 1
+        assert columns.count("delegate_tools") == 1
         assert columns.count("session_incarnation_id") == 1
         assert columns.count("model") == 1
         assert columns.count("model_honored") == 1
+        assert columns.count("identity_verified") == 1
 
     def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
         """#432: a pre-existing terminals table (predating group/metadata) gains both
@@ -1964,6 +2154,8 @@ class TestTerminalsSchemaMigration:
                 assert row["provider_variant"] is None
                 assert row["model"] is None
                 assert row["model_honored"] is None
+                # Legacy rows, never False: the Kiro input gate grandfathers them (#1074).
+                assert row["identity_verified"] is None
 
             # Original pre-migration data must survive untouched.
             assert aaaa["tmux_session"] == "cao-sess-1"

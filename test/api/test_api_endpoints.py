@@ -6,7 +6,7 @@ flow_daemon, lifespan, and the main() entry point.
 """
 
 import asyncio
-from datetime import datetime
+import os
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
@@ -30,6 +30,12 @@ from cli_agent_orchestrator.services.terminal_service import (
     TerminalRecordCorruptError,
 )
 from cli_agent_orchestrator.utils.skills import SkillNameError
+
+
+def _install_kiro_memory_manager(agents_dir):
+    """A Kiro sidecar is refused unless memory_manager is installed for Kiro (#1074)."""
+    (agents_dir / "memory_manager.json").write_text("{}")
+
 
 # ── Health endpoint ──────────────────────────────────────────────────
 
@@ -57,6 +63,18 @@ class TestHealthCheck:
         data = response.json()
         assert data["terminal_backend"] == "tmux"
 
+    def test_health_reports_the_servers_provider_init_timeout(self, client):
+        """Issue #710 (review on PR #1002, P3-1): clients size their wait for a
+        synchronous create from THEIR settings, so the server publishes the value
+        it applies for an operator to compare against."""
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.get_server_settings",
+            return_value={"provider_init_timeout": 180},
+        ):
+            response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["provider_init_timeout"] == 180
+
     def test_health_reports_terminal_backend_herdr(self, client):
         """GET /health reports terminal_backend='herdr' when server uses HerdrBackend."""
         from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -83,7 +101,7 @@ class TestAgentProfiles:
         with patch(
             "cli_agent_orchestrator.api.main.list_agent_profiles",
             create=True,
-        ) as mock_fn:
+        ) as _mock_fn:
             # The endpoint does a lazy import, so we need to patch at the import target
             with patch(
                 "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
@@ -358,6 +376,7 @@ class TestCreateSession:
             resume_session_id=None,
             group=None,
             metadata=None,
+            caller_ceiling=None,
         )
 
     def test_create_session_forwards_use_worktree_true(self, client):
@@ -433,7 +452,9 @@ class TestCreateSession:
         assert response.status_code == 201
         assert mock_svc.create_session.call_args.kwargs["idempotency_key"] == "retry-1"
 
-    def test_memory_manager_sidecar_gets_a_key_derived_from_the_callers(self, client):
+    def test_memory_manager_sidecar_gets_a_key_derived_from_the_callers(
+        self, client, hermetic_kiro_agent_store
+    ):
         """A keyed retry must not spawn a SECOND memory_manager (review on PR #634).
 
         The sidecar spawn is unconditional -- it runs after ``create_session``
@@ -448,6 +469,7 @@ class TestCreateSession:
         ``create_terminal`` even in the races a created-vs-reused boolean would
         miss. Suffixed so it can never collide with the caller's own key.
         """
+        _install_kiro_memory_manager(hermetic_kiro_agent_store)
         mock_terminal = Terminal(
             id="abcd1234",
             name="test-window",
@@ -478,13 +500,14 @@ class TestCreateSession:
         assert mock_create.call_args.kwargs["agent_profile"] == "memory_manager"
         assert mock_create.call_args.kwargs["idempotency_key"] == "job-1:memory-manager-sidecar"
 
-    def test_unkeyed_session_leaves_the_sidecar_unkeyed(self, client):
+    def test_unkeyed_session_leaves_the_sidecar_unkeyed(self, client, hermetic_kiro_agent_store):
         """No caller key means no sidecar key -- the default path is unchanged.
 
         Pinned because deriving `f"{key}:..."` from a `None` key would silently
         claim the literal string `"None:memory-manager-sidecar"` for every
         unkeyed request on the server, permanently, after the first one.
         """
+        _install_kiro_memory_manager(hermetic_kiro_agent_store)
         mock_terminal = Terminal(
             id="abcd1234",
             name="test-window",
@@ -939,7 +962,11 @@ class TestCreateSession:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             response = client.post(
                 f"/sessions/{bad_name}/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
             )
 
         assert response.status_code == 400
@@ -1154,6 +1181,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "claude_code",
                     "agent_profile": "reviewer",
                 },
@@ -1177,6 +1205,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/nonexistent/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                 },
@@ -1193,6 +1222,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                 },
@@ -1221,6 +1251,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "idempotency_key": "job-1",
@@ -1246,7 +1277,11 @@ class TestCreateTerminalInSession:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
             )
 
         assert response.status_code == 404
@@ -1270,6 +1305,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "idempotency_key": "job-1",
@@ -1470,9 +1506,9 @@ class TestSendTerminalInput:
     """Tests for POST /terminals/{terminal_id}/input endpoint."""
 
     def test_send_input_success(self, client):
-        """POST /terminals/{id}/input sends message successfully."""
+        """POST /terminals/{id}/input sends the message and names the turn it started."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            mock_svc.dispatch_input.return_value = 11
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1482,7 +1518,10 @@ class TestSendTerminalInput:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_svc.send_input.assert_called_once_with(
+        # The dispatch boundary lets the caller tell a status earned for THIS send
+        # from the previous turn's, which is still on screen (#735).
+        assert data["dispatch_boundary"] == 11
+        mock_svc.dispatch_input.assert_called_once_with(
             "abcd1234",
             "hello world",
             registry=ANY,
@@ -1493,7 +1532,7 @@ class TestSendTerminalInput:
     def test_send_input_with_orchestration_context(self, client):
         """POST /terminals/{id}/input forwards registry and orchestration metadata when provided."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            mock_svc.dispatch_input.return_value = 0
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1505,7 +1544,10 @@ class TestSendTerminalInput:
             )
 
         assert response.status_code == 200
-        mock_svc.send_input.assert_called_once_with(
+        # A first-ever dispatch has boundary 0; it must still be reported, and
+        # success must not be derived from it.
+        assert response.json() == {"success": True, "dispatch_boundary": 0}
+        mock_svc.dispatch_input.assert_called_once_with(
             "abcd1234",
             "hello world",
             registry=ANY,
@@ -1513,10 +1555,33 @@ class TestSendTerminalInput:
             orchestration_type="assign",
         )
 
+    def test_send_input_reports_no_boundary_for_event_inbox_backends(self, client):
+        """An event-inbox backend (herdr) never advances the output generation,
+        so ``dispatch_input`` always returns the meaningless int 0. Naming it
+        would make `cao session send` skip its 3-second grace sleep while the
+        GET-side gate stays inert for herdr (status_generation is None there)
+        -- the pre-#735 stale window, widened. The endpoint must report no
+        boundary at all so the CLI falls back to the flat sleep (#735 synthesis
+        item 2)."""
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main.get_backend") as mock_get_backend,
+        ):
+            mock_svc.dispatch_input.return_value = 0
+            mock_get_backend.return_value.supports_event_inbox.return_value = True
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={"message": "hello world"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"success": True, "dispatch_boundary": None}
+
     def test_send_input_terminal_not_found(self, client):
         """POST /terminals/{id}/input returns 404 for nonexistent terminal."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.side_effect = ValueError("Terminal not found")
+            mock_svc.dispatch_input.side_effect = ValueError("Terminal not found")
 
             response = client.post(
                 "/terminals/deadbeef/input",
@@ -1532,7 +1597,7 @@ class TestSendTerminalInput:
 
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.TerminalInputBlockedError = TerminalInputBlockedError
-            mock_svc.send_input.side_effect = TerminalInputBlockedError(
+            mock_svc.dispatch_input.side_effect = TerminalInputBlockedError(
                 "Terminal abcd1234 is waiting for a user answer"
             )
 
@@ -1547,7 +1612,7 @@ class TestSendTerminalInput:
     def test_send_input_server_error(self, client):
         """POST /terminals/{id}/input returns 500 on error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.side_effect = Exception("TMux send failed")
+            mock_svc.dispatch_input.side_effect = Exception("TMux send failed")
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1601,6 +1666,25 @@ class TestSendTerminalKey:
 
         assert response.status_code == 500
         assert "Failed to send key" in response.json()["detail"]
+
+    def test_send_key_refused_terminal_is_409(self, client):
+        """POST /terminals/{id}/key returns 409, not 500, for a refused terminal.
+
+        A special key is typed input (#1074): a Kiro terminal CAO has not
+        verified refuses it the same way /input does.
+        """
+        from cli_agent_orchestrator.models.terminal import ProviderExitedInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = ProviderExitedInputBlockedError(
+                "Terminal abcd1234 failed deferred initialization (identity_mismatch). "
+                "Refusing to deliver input."
+            )
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Enter"})
+
+        assert response.status_code == 409
+        assert "Refusing to deliver input" in response.json()["detail"]
 
 
 class TestGetTerminalOutput:
@@ -2012,6 +2096,15 @@ class TestLifespan:
 class TestMainEntryPoint:
     """Tests for the main() CLI entry point."""
 
+    @pytest.fixture(autouse=True)
+    def _restore_environ(self):
+        """main() writes CAO_API_HOST/PORT (and CAO_AGENTS_DIR) straight into
+        os.environ to mirror the real CLI entry point, which leaks into every
+        test that runs later in the same process. Snapshot and restore it so
+        these tests stay self-contained."""
+        with patch.dict(os.environ):
+            yield
+
     def test_main_default_args(self):
         """main() runs uvicorn with default host/port."""
         with (
@@ -2050,6 +2143,65 @@ class TestMainEntryPoint:
             assert call_kwargs["port"] == 9999
             assert call_kwargs["proxy_headers"] is True
             assert "forwarded_allow_ips" in call_kwargs
+
+    def test_main_custom_host_port_exports_to_environ(self, monkeypatch):
+        """P2-2: ``--host``/``--port`` must land in ``os.environ`` the same way
+        ``--agents-dir`` already does, so ``cao_server_env()`` (read by the MCP
+        env forwarding) sees this launch's actual address instead of whatever
+        was there before (or the 9889 default). A wildcard bind is mapped to
+        loopback since it isn't a usable client address."""
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_API_PORT", raising=False)
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+        ):
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host="0.0.0.0", port=9999, terminal=None
+            )
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert os.environ["CAO_API_HOST"] == "127.0.0.1"
+            assert os.environ["CAO_API_PORT"] == "9999"
+
+    def test_main_without_flags_does_not_touch_environ(self, monkeypatch):
+        """The env-var path (no CLI flags) already works because
+        ``cao_server_env()`` reads ``os.environ`` directly -- ``main()`` must
+        not overwrite it when no flag was given."""
+        monkeypatch.setenv("CAO_API_HOST", "10.0.0.5")
+        monkeypatch.setenv("CAO_API_PORT", "7000")
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None, terminal=None)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert os.environ["CAO_API_HOST"] == "10.0.0.5"
+            assert os.environ["CAO_API_PORT"] == "7000"
+
+    def test_main_flag_port_overrides_a_stale_env_var(self, monkeypatch):
+        """Mixed launch (``CAO_API_PORT=9899 cao-server --port 9900``): the
+        flag must win in the forwarded env too, not just in ``app.state``."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=9900, terminal=None)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert os.environ["CAO_API_PORT"] == "9900"
 
     def test_main_with_agents_dir(self):
         """main() sets KIRO_AGENTS_DIR when --agents-dir is provided."""

@@ -62,6 +62,7 @@ entries. The timeline shows delegation chains, parallel work, and message flow.
 **Resume surfaces:**
 - REST: `POST /agui/v1/interrupts/{id}/resume` with `{"decision": "approve"|"deny"|"edit", "edited_text": "..."}`
 - Run plane: `resume[]` mapping in the `POST /agui/v1/run` SSE stream
+- `claude-code:permission_request` offers only approve and deny; an `edit` decision on it is refused (422 on REST, `RUN_ERROR` on the run plane) before anything is typed, and the interrupt stays pending. If an approve or deny delivery for the same interrupt is already in flight, a later `edit` joins it instead and returns that decision's outcome, which names the delivered decision; nothing is typed for the edit.
 
 **Concurrency model (PR #485 hardening):**
 - Per-interrupt delivery task (`_deliver_and_commit`), shielded from cancellation

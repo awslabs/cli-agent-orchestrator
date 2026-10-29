@@ -20,14 +20,28 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/claude_code.py'
-      - 'test/providers/test_claude_code_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Claude Code test outside test_claude_code_unit.py was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_claude_code_*.py'
+      # Named in full because it sits outside the glob above: the busy-pattern
+      # guard is provider-agnostic by name, so it cannot be test_claude_code_*.
+      - 'test/providers/test_busy_pattern_settled_output_guard.py'
       - 'pyproject.toml'
       - '.github/workflows/test-claude-code-provider.yml'
   pull_request:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/claude_code.py'
-      - 'test/providers/test_claude_code_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Claude Code test outside test_claude_code_unit.py was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_claude_code_*.py'
+      # Named in full because it sits outside the glob above: the busy-pattern
+      # guard is provider-agnostic by name, so it cannot be test_claude_code_*.
+      - 'test/providers/test_busy_pattern_settled_output_guard.py'
       - 'pyproject.toml'
       - '.github/workflows/test-claude-code-provider.yml'
 
@@ -37,14 +51,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -57,7 +71,12 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          uv run pytest test/providers/test_claude_code_unit.py \
+          # The busy-pattern guard (GH #974) runs here too: this gate fires on a
+          # claude_code.py-only change, which is exactly when a spinner pattern
+          # can be widened back onto settled output. It is named in full because
+          # it sits outside the test_claude_code_* glob.
+          uv run pytest test/providers/test_claude_code_*.py \
+            test/providers/test_busy_pattern_settled_output_guard.py \
             --cov=src/cli_agent_orchestrator/providers/claude_code.py \
             --cov-report=xml \
             --cov-report=term-missing \
@@ -82,7 +101,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"

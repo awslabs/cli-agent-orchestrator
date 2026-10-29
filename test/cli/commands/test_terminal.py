@@ -1,8 +1,6 @@
 """Tests for terminal snapshot-on-delete and restore command."""
 
 import json
-import tempfile
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest

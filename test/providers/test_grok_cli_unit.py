@@ -977,7 +977,7 @@ def test_stale_processing_capture_opt_in_does_not_certify_deferred_task_pickup()
 
     with (
         patch.object(ts, "_worker_is_started_direct") as direct_probe,
-        patch.object(ts, "_message_visible_in_box", return_value=False),
+        patch.object(ts, "_message_in_composer", return_value=False),
         patch.object(ts, "dispatch_input") as resend,
     ):
         assert ts.redeliver_dropped_message("test-terminal", "new task", 1, provider) is False
@@ -1519,7 +1519,7 @@ def test_redeliver_dropped_message_full_resend_preserves_logical_turn(monkeypatc
     monkeypatch.setattr(ts.provider_manager, "get_provider", lambda _: provider)
     monkeypatch.setattr(ts, "inject_memory_context", lambda message, *_: message)
     monkeypatch.setattr(ts, "update_last_active", lambda _: None)
-    monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+    monkeypatch.setattr(ts, "_message_in_composer", lambda *_: None)
 
     assert ts.redeliver_dropped_message("grok-redelivery", "do the task", 1, provider) is False
     backend.send_keys.assert_called_once()
@@ -2255,6 +2255,29 @@ def test_cleanup_refuses_symlinked_managed_ancestor(tmp_path, symlinked_ancestor
         provider.cleanup()
 
     assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_bundled_server_gains_this_cao_address(monkeypatch):
+    """P3-2: Grok is resolver-routed (``_render_mcp_config`` calls
+    ``resolve_mcp_server_config``) but was only covered through the resolver's
+    own unit tests, not at the provider level."""
+    monkeypatch.setenv("CAO_API_PORT", "9899")
+    monkeypatch.delenv("CAO_API_HOST", raising=False)
+    monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+    rendered = make_provider()._render_mcp_config(
+        {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+    )
+    assert 'CAO_API_PORT" = "9899"' in rendered
+
+
+def test_default_cao_mcp_config_is_unchanged(monkeypatch):
+    for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    rendered = make_provider()._render_mcp_config(
+        {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+    )
+    assert "CAO_API_PORT" not in rendered
+    assert "CAO_HOME_DIR" not in rendered
 
 
 def test_url_mcp_rejects_unknown_transport():

@@ -142,6 +142,12 @@ class MiniMaxCodeProvider(BaseProvider):
 
     supports_screen_detection = True
     supports_direct_status_probe = True
+    # get_status binds COMPLETED to the dispatched turn: a completion whose
+    # identity matches the previous turn's, with no activity seen in the new
+    # buffer epoch, reports IDLE (see the ``_awaiting_turn`` branches). So a
+    # probe COMPLETED here cannot be the retained previous turn, and the inbox
+    # recovery may accept it as pickup evidence.
+    direct_status_probe_has_turn_identity = True
 
     @property
     def paste_enter_count(self) -> int:
@@ -315,7 +321,7 @@ class MiniMaxCodeProvider(BaseProvider):
             if isinstance(raw_config, dict)
             else raw_config.model_dump(exclude_none=True)
         )
-        config = resolve_mcp_server_config(config)
+        config = resolve_mcp_server_config(config, name=name)
         command = config.get("command")
         url = config.get("url")
         if not command and isinstance(url, str) and url:

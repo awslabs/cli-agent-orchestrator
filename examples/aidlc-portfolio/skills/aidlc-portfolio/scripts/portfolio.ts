@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
 
+import { readFile, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import {
   advanceLifecycle,
   answerQuestionPacket,
-  approveLearningProposal,
-  cleanWorktreeMemory,
+  promoteLearningProposal,
   confirmDiscovery,
   completeLifecycle,
   PortfolioError,
@@ -16,18 +17,16 @@ import {
   lifecycleStatus,
   listLearningProposals,
   listQuestionPackets,
-  memorySnapshot,
   migrateLifecycle,
   portfolioStatus,
-  refreshWorktreeMemory,
-  reconcileLearningProposal,
+  readRecalledMemories,
   registerDocument,
   registerLearningProposal,
   rejectLearningProposal,
+  renderRunnerMessage,
   submitQuestionPacket,
   updateSession,
   type LearningStatus,
-  type MemoryDestination,
   type QuestionAnswerMode,
   validateWorkspace,
   type SessionStatus,
@@ -201,7 +200,7 @@ async function main(argv: string[]): Promise<void> {
       return;
     case "learning list": {
       const status = optional(options, "status") as LearningStatus | undefined;
-      if (status && !["pending", "applied", "rejected"].includes(status)) {
+      if (status && !["pending", "promoted", "rejected"].includes(status)) {
         throw new PortfolioError(`invalid learning status: ${status}`);
       }
       printJson({
@@ -214,20 +213,15 @@ async function main(argv: string[]): Promise<void> {
       });
       return;
     }
-    case "learning reconcile":
+    case "learning promote":
       printJson({
         ok: true,
-        ...(await reconcileLearningProposal(
+        ...(await promoteLearningProposal(
           root,
           required(options, "id"),
-          required(options, "note"),
+          required(options, "promoted-by"),
+          required(options, "memory-key"),
         )),
-      });
-      return;
-    case "learning approve":
-      printJson({
-        ok: true,
-        ...(await approveLearningProposal(root, required(options, "id"))),
       });
       return;
     case "learning reject":
@@ -259,7 +253,7 @@ async function main(argv: string[]): Promise<void> {
           required(options, "id"),
           required(options, "file"),
           questionAnswerMode(options),
-          required(options, "answered-by"),
+          required(options, "approval-id"),
         )),
       });
       return;
@@ -279,44 +273,6 @@ async function main(argv: string[]): Promise<void> {
       });
       return;
     }
-    case "memory inspect":
-      printJson({
-        ok: true,
-        ...(await memorySnapshot(
-          root,
-          required(options, "project"),
-          required(options, "intent"),
-          memoryDestination(options),
-          String(options.space ?? "default"),
-        )),
-      });
-      return;
-    case "memory refresh":
-      printJson({
-        ok: true,
-        ...(await refreshWorktreeMemory(
-          root,
-          required(options, "project"),
-          required(options, "intent"),
-          memoryDestination(options),
-          required(options, "expected-worktree-revision"),
-          String(options.space ?? "default"),
-        )),
-      });
-      return;
-    case "memory clean":
-      printJson({
-        ok: true,
-        ...(await cleanWorktreeMemory(
-          root,
-          required(options, "project"),
-          required(options, "intent"),
-          memoryDestination(options),
-          required(options, "expected-worktree-revision"),
-          String(options.space ?? "default"),
-        )),
-      });
-      return;
     case "worktree create":
       printJson({
         ok: true,
@@ -339,6 +295,28 @@ async function main(argv: string[]): Promise<void> {
         )),
       });
       return;
+    case "dispatch message": {
+      const recalled = await readRecalledMemories(required(options, "recall"));
+      const contextFile = optional(options, "context");
+      const contractsFile = optional(options, "contracts");
+      const out = resolve(required(options, "out"));
+      const { message, learnings } = await renderRunnerMessage(
+        root,
+        required(options, "project"),
+        required(options, "intent"),
+        {
+          callbackTerminal: required(options, "callback-terminal"),
+          recalled,
+          context: contextFile ? await readFile(resolve(contextFile), "utf8") : undefined,
+          contractInputs: contractsFile
+            ? await readFile(resolve(contractsFile), "utf8")
+            : undefined,
+        },
+      );
+      await writeFile(out, message);
+      printJson({ ok: true, path: out, learnings });
+      return;
+    }
     case "session update": {
       const status = required(options, "status") as SessionStatus;
       if (!SESSION_STATUSES.includes(status)) {
@@ -375,7 +353,6 @@ function parseCommand(argv: string[]): { command: string; options: Options } {
     "result",
     "convergence",
     "question",
-    "memory",
     "worktree",
     "dispatch",
     "session",
@@ -406,14 +383,6 @@ function required(options: Options, key: string): string {
 function optional(options: Options, key: string): string | undefined {
   const value = options[key];
   return typeof value === "string" && value ? value : undefined;
-}
-
-function memoryDestination(options: Options): MemoryDestination {
-  const value = String(options.destination ?? "project");
-  if (value !== "project" && value !== "team") {
-    throw new PortfolioError(`invalid memory destination: ${value}`);
-  }
-  return value;
 }
 
 function questionAnswerMode(options: Options): QuestionAnswerMode {
@@ -454,17 +423,14 @@ Usage:
   portfolio.ts intent create --root PATH --file FILE
   portfolio.ts learning propose --root PATH --file FILE
   portfolio.ts learning list --root PATH [--project ID] [--status STATUS]
-  portfolio.ts learning reconcile --root PATH --id ID --note TEXT
-  portfolio.ts learning approve --root PATH --id ID
+  portfolio.ts learning promote --root PATH --id ID --promoted-by NAME --memory-key KEY
   portfolio.ts learning reject --root PATH --id ID --reason TEXT
   portfolio.ts question submit --root PATH --id ID --project ID --intent ID --stage ID --file FILE
-  portfolio.ts question answer --root PATH --id ID --file FILE --mode guided|markdown|chat --answered-by NAME
+  portfolio.ts question answer --root PATH --id ID --file FILE --mode guided|markdown|chat --approval-id APPROVAL
   portfolio.ts question list --root PATH [--project ID] [--intent ID] [--status pending|answered]
-  portfolio.ts memory inspect --root PATH --project ID --intent ID [--destination project|team] [--space ID]
-  portfolio.ts memory refresh --root PATH --project ID --intent ID --expected-worktree-revision HASH [--destination project|team] [--space ID]
-  portfolio.ts memory clean --root PATH --project ID --intent ID --expected-worktree-revision HASH [--destination project|team] [--space ID]
   portfolio.ts worktree create --root PATH --project ID --intent ID --branch NAME [--base REF]
   portfolio.ts dispatch check --root PATH --project ID --intent ID
+  portfolio.ts dispatch message --root PATH --project ID --intent ID --callback-terminal ID --recall FILE --out FILE [--context FILE] [--contracts FILE]
   portfolio.ts session update --root PATH --project ID --intent ID --status STATUS [--terminal ID]
 `);
 }

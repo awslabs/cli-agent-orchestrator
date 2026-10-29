@@ -22,11 +22,8 @@ from cli_agent_orchestrator.agent_plugins.mcp_delivery import (
     apply_plugin_mcp_servers,
     grantable_server_names,
     log_delivery_findings,
-    merge_plugin_mcp_servers,
     opencode_config_collision_finding,
 )
-from cli_agent_orchestrator.agent_plugins.mcp_mapping import is_pre_expanded as is_plugin_mcp_entry
-from cli_agent_orchestrator.agent_plugins.mcp_mapping import strip_marker as strip_plugin_mcp_marker
 from cli_agent_orchestrator.agent_plugins.models import Finding
 from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
 from cli_agent_orchestrator.constants import (
@@ -42,14 +39,17 @@ from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers.kiro_identity import (
+    kiro_agent_dirs,
+    require_kiro_agent_defined,
+)
 from cli_agent_orchestrator.services.profile_store import write_profile
-from cli_agent_orchestrator.utils import agent_profiles
+from cli_agent_orchestrator.utils import agent_profiles, opencode_config
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
 )
 from cli_agent_orchestrator.utils.env import load_env_vars, set_env_var
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
     OpenCodeAgentIdCollisionError,
     disable_mcp_server,
@@ -1144,6 +1144,47 @@ def _provider_artifact_path(provider: str, profile_name: str) -> Optional[Path]:
     return None
 
 
+def installed_artifact_paths(profile_name: str) -> Dict[str, Path]:
+    """Every per-profile file ``install_agent`` writes that a provider reads at launch, by path-free label.
+
+    One entry per provider with a per-agent sink (:func:`_provider_artifact_path`, keyed by the
+    ``ProviderType`` value) and one ``context:<n>`` entry per directory in :func:`_context_lookup_dirs`
+    (the configured directory, then the legacy default while an override is active), resolved the way
+    the ownership guard resolves a copy (:func:`_installed_context_copy_path`).
+
+    This is a PLAN-IDENTITY input list (#827, PR #1000 P2-2). A Kiro step starts as
+    ``kiro-cli chat --agent <name>``; Kiro reads ``tools``, ``allowedTools``, ``toolsSettings``,
+    ``hooks`` and ``mcpServers`` from the JSON written here and the system prompt from the context copy
+    that JSON references by ``file://``. A Copilot step reads its prompt from ``<name>.agent.md``. CAO
+    consults its own profile at launch only for ``model``. So these files decide what an approved plan
+    executes, and ``agent_profiles.read_profile_entry`` hashes each one (or its absence) into the entry.
+    Labels, not paths, so the digest does not depend on the machine.
+
+    ``opencode_cli:config`` is the SHARED ``opencode.json`` (PR #1000 round 2, P2-1). For OpenCode the
+    per-agent ``.md`` carries only the prompt and the permission map; :func:`_materialize_opencode_mcp`
+    writes the MCP servers -- each one's ``command`` -- into that file's ``mcp`` map and the agent's
+    grant into ``agent.<id>.tools``, and the provider launches with ``OPENCODE_CONFIG=<that file>`` and
+    reads the whole of it. The whole file is bound, not the agent's section: OpenCode's ``mcp`` map is
+    global (every agent sees every enabled server unless its own ``tools`` map says otherwise) and the
+    file's top-level ``instructions``, ``permission`` and ``model`` apply to every agent, so there is no
+    smaller part that decides what one agent executes. The cost is that an operator's edit to their own
+    key in that file moves every ``plan_id``, which the docs record. The path is looked up on the
+    ``opencode_config`` module at call time, as the installer's own writers do.
+
+    ``test_install_ownership_guard`` pins this list against the files a real install WRITES (a
+    filesystem diff around ``install_agent``), not only against the fields ``InstallResult`` reports.
+    """
+    paths: Dict[str, Path] = {}
+    for provider in ProviderType:
+        path = _provider_artifact_path(provider.value, profile_name)
+        if path is not None:
+            paths[provider.value] = path
+    paths[f"{ProviderType.OPENCODE_CLI.value}:config"] = opencode_config.OPENCODE_CONFIG_FILE
+    for index, directory in enumerate(_context_lookup_dirs()):
+        paths[f"context:{index}"] = _installed_context_copy_path(profile_name, directory)
+    return paths
+
+
 def _entry_occupying(path: Path) -> Optional[str]:
     """Name of the directory entry ``path`` lands on under that directory's own rules.
 
@@ -1642,6 +1683,57 @@ def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
     return tools
 
 
+def require_kiro_agent_resolves(
+    profile_name: str,
+    working_directory: str,
+    env_vars: Optional[Dict[str, str]] = None,
+) -> None:
+    """Refuse a Kiro launch from ``working_directory`` whose agent kiro-cli would not load.
+
+    kiro-cli starts its built-in ``kiro_default`` agent for an ``--agent`` it
+    cannot find (#1074), so the launch path calls this before any window exists.
+    The directories searched include ``KIRO_AGENTS_DIR``, the one this module
+    installs into; see ``providers.kiro_identity`` for the rest.
+
+    Raises ``KiroAgentIdentityError`` when no directory defines the name.
+    """
+    require_kiro_agent_defined(
+        profile_name, kiro_agent_dirs(working_directory, KIRO_AGENTS_DIR, env_vars)
+    )
+
+
+def installed_opencode_permission(
+    profile_name: str, agents_dir: Optional[Path] = None
+) -> Optional[Dict[str, str]]:
+    """The ``permission:`` block in the OpenCode agent file ``cao install`` wrote.
+
+    OpenCode enforces that installed block at launch, not the allowlist a
+    create request resolved, so the server compares the two before a bounded
+    launch (``terminal_service.create_terminal``, Step 0d), mirroring
+    :func:`installed_kiro_tools`. ``agents_dir`` defaults to
+    ``OPENCODE_AGENTS_DIR``; the launch path passes the directory the provider
+    will actually point OpenCode at. ``None`` when no agent file exists, its
+    front matter does not parse, or it carries no dict-valued ``permission``.
+
+    Every way the file can fail to yield a policy maps to ``None`` so the
+    bounded-launch gate refuses with the ``cao install`` remedy; an exception
+    escaping here would surface as a 500 instead. ``frontmatter.load`` raises
+    ``yaml.YAMLError`` subclasses (parser, scanner, composer) for bad YAML,
+    which are not ``ValueError``; ``UnicodeDecodeError`` is.
+    """
+    base = Path(agents_dir) if agents_dir is not None else OPENCODE_AGENTS_DIR
+    agent_file = base / f"{to_opencode_agent_id(profile_name)}.md"
+    try:
+        permission = frontmatter.load(agent_file).metadata.get("permission")
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+    if not isinstance(permission, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in permission.items()
+    ):
+        return None
+    return dict(permission)
+
+
 def kiro_install_predates_native_enforcement(
     profile_name: str, allowed_tools: Optional[List[str]]
 ) -> bool:
@@ -1983,6 +2075,11 @@ def install_agent(
                 toolsSettings=profile.toolsSettings,
                 hooks=profile.hooks,
                 model=profile.model,
+                # The profile keeps its historical ``useLegacyMcpJson`` spelling;
+                # the installed spec gets Kiro CLI's current ``includeMcpJson``.
+                # Unset in the profile means the historical default, False, so
+                # a profile that never mentioned it installs exactly as before.
+                includeMcpJson=bool(profile.useLegacyMcpJson),
             )
             agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
             agent_file.write_text(

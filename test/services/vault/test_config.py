@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services.vault import config as vault_config
 from cli_agent_orchestrator.services.vault.config import (
     ALWAYS_EXCLUDED_PATTERNS,
@@ -190,45 +189,8 @@ def test_rule_9_casefolds_mapping_paths_before_prefix_comparison():
     assert vault_config._is_path_prefix("Références", "Références")
 
 
-def test_alias_equivalent_project_mappings_are_rejected(tmp_path, monkeypatch):
-    document = _document(str(tmp_path))
-    document["vaults"][0]["mappings"][1].update(
-        folder="Other", scope="project", scope_id="old-project"
-    )
-    document["vaults"][0]["mappings"].append(
-        {"folder": "Elsewhere", "scope": "project", "scope_id": "renamed-project"}
-    )
-    monkeypatch.setattr(
-        vault_config,
-        "get_project_id_by_alias",
-        lambda scope_id, **_kwargs: (
-            "canonical-project" if scope_id in {"old-project", "renamed-project"} else None
-        ),
-    )
-
-    with pytest.raises(ValidationError, match=r"same \(scope, scope_id\)"):
-        _load(document)
-
-
-def test_project_alias_lookup_failure_refuses_config_identity_validation(tmp_path, monkeypatch):
-    document = _document(str(tmp_path))
-    document["vaults"][0]["mappings"][1].update(
-        folder="Other", scope="project", scope_id="old-project"
-    )
-    document["vaults"][0]["mappings"].append(
-        {"folder": "Elsewhere", "scope": "project", "scope_id": "renamed-project"}
-    )
-    monkeypatch.setattr(
-        database,
-        "SessionLocal",
-        lambda: (_ for _ in ()).throw(RuntimeError("project alias database unavailable")),
-    )
-
-    with pytest.raises(
-        database.ProjectAliasLookupUnavailableError,
-        match=r"^project alias database unavailable$",
-    ):
-        _load(document)
+# Alias canonicalisation and its failure modes are loader behaviour and live in
+# test_config_pure_validation.py; validation itself never consults the database.
 
 
 @pytest.mark.parametrize("pattern", ["./Private/**", "Private/./**", "."])
@@ -336,7 +298,8 @@ def test_secret_gate_defaults_to_reject(tmp_path):
     assert config.vaults[0].mappings[0].secret_gate == "reject"
 
 
-def test_rule_20_warn_and_inject_loads_with_persistent_warning(tmp_path, caplog):
+def test_warn_and_inject_loads_without_a_warning(tmp_path, caplog):
+    """#644 retired ADR-007 rule 20: warn + inject is redacted on every model-bound path."""
     document = _document(str(tmp_path))
     document["vaults"][0]["mappings"][1].update(inject=True, secret_gate="warn")
 
@@ -344,8 +307,8 @@ def test_rule_20_warn_and_inject_loads_with_persistent_warning(tmp_path, caplog)
 
     assert config.vaults[0].mappings[1].inject is True
     assert config.vaults[0].mappings[1].secret_gate == "warn"
-    assert config.warnings == ("mapping 'References' has secret_gate='warn' with inject=true",)
-    assert "secret_gate='warn' with inject=true" in caplog.text
+    assert config.warnings == ()
+    assert "secret_gate='warn' with inject=true" not in caplog.text
 
 
 def test_recall_budget_warns_when_it_exceeds_the_injection_scope_budget(tmp_path, caplog):

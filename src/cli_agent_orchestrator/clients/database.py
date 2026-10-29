@@ -23,10 +23,10 @@ from sqlalchemy import (
     literal_column,
     text,
 )
-from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.types import TypeDecorator
 
-from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
+from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 
@@ -165,6 +165,12 @@ class TerminalModel(Base):
     model_honored = Column(Boolean, nullable=True)  # NULL = unknown for pre-migration rows
     working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
+    # JSON-encoded delegation ceiling: the most this terminal may grant to the
+    # children it creates (utils/delegation.py). Capped by the creator's own
+    # ceiling at creation time and read from THIS ROW when it creates children,
+    # never re-derived from its profile. NULL = pre-migration row, which is
+    # bounded by its own allowed_tools until relaunched.
+    delegate_tools = Column(Text, nullable=True)
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
     engine = Column(String, nullable=True)  # resolved Kiro engine; NULL for legacy/non-Kiro rows
@@ -211,6 +217,12 @@ class TerminalModel(Base):
     # distinguish the old rows from failures that belong to the CURRENT live
     # session. NULL is reserved for rows created before this column existed.
     session_incarnation_id = Column(String, nullable=True)
+    # Whether CAO recorded that this Kiro runtime passed its identity check (#1074).
+    # False is written with every kiro_cli row and True only once the provider's
+    # header check has passed; it never goes back. NULL means a non-Kiro row, or a
+    # row that predates the column. A kiro_cli terminal takes typed input only when
+    # this is True (terminal_service.terminal_input_refusal).
+    identity_verified = Column(Boolean, nullable=True)
     last_active = Column(UTCDateTime, default=_utcnow)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
@@ -295,6 +307,8 @@ class DecisionRecordModel(Base):
     kind = Column(String, nullable=False)
     provider = Column(String, nullable=False)
     agent_profile = Column(String, nullable=True)
+    # installed, ephemeral or workflow; NULL on rows written before the column existed.
+    target_kind = Column(String, nullable=True)
     fallback_value = Column(String, nullable=True)
     fallback_source = Column(String, nullable=False)
     answer = Column(String, nullable=True)
@@ -799,6 +813,9 @@ def init_db() -> None:
     # Appended LAST (issue #447, ``handoff_results``). Its own new table, no shared
     # columns with anything above, so registry order is immaterial here too.
     _migrate_add_handoff_results()
+    # Appended LAST (issue #1067). One nullable column on decision_records, which
+    # create_all made above; no backfill, so registry order is immaterial here too.
+    _migrate_decision_records_target_kind()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -860,6 +877,30 @@ def _migrate_add_handoff_results() -> None:
             conn.commit()
     except Exception as e:
         logger.warning(f"Migration check for handoff_results failed: {e}")
+
+
+def _migrate_decision_records_target_kind() -> None:
+    """Add the nullable target_kind column to decision_records if missing (issue #1067).
+
+    Idempotent: PRAGMA table_info gate, ALTER TABLE ADD COLUMN only when missing. Fresh
+    DBs already have the column from ``Base.metadata.create_all``. Existing rows keep
+    NULL: their target kind was never recorded, and deriving it now from a profile name
+    could mislabel them, so they are not backfilled.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(decision_records)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if columns and "target_kind" not in columns:
+                conn.execute("ALTER TABLE decision_records ADD COLUMN target_kind TEXT")
+                logger.info("Migration: added target_kind column to decision_records")
+    except Exception as e:
+        # Records cannot be written without the column, so this is louder than debug.
+        logger.warning(f"Migration check for decision_records target_kind failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -1673,6 +1714,12 @@ def _migrate_workflow_run() -> None:
             if "kind" not in columns:
                 conn.execute("ALTER TABLE workflow_run ADD COLUMN kind TEXT DEFAULT NULL")
                 logger.info("Migration: added kind column to workflow_run")
+            if "caller_id" not in columns:
+                # The terminal that started the run; lets a resumed or recovered
+                # run re-bind to the ORIGINAL caller's delegation ceiling. NULL
+                # for operator-started runs and every pre-existing row.
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN caller_id TEXT DEFAULT NULL")
+                logger.info("Migration: added caller_id column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 
@@ -2019,9 +2066,59 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
             conn.commit()
             logger.info("Migration: added model_honored column to terminals table")
+        if "delegate_tools" not in columns:
+            # Nullable on purpose: rows from before the column have no recorded
+            # ceiling and read back as None, which create_terminal treats as
+            # "bounded by its own allowed_tools" (utils/delegation.ceiling_from_row).
+            conn.execute("ALTER TABLE terminals ADD COLUMN delegate_tools TEXT")
+            conn.commit()
+            logger.info("Migration: added delegate_tools column to terminals table")
+        if "identity_verified" not in columns:
+            # Nullable with no default (#1074): existing rows read back NULL, a
+            # legacy row, never False, so a Kiro pane running across the upgrade
+            # is not mistaken for one this version created and failed to verify.
+            conn.execute("ALTER TABLE terminals ADD COLUMN identity_verified BOOLEAN")
+            conn.commit()
+            logger.info("Migration: added identity_verified column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
+
+
+def terminal_id_in_use(terminal_id: str) -> bool:
+    """Whether ``terminal_id`` must not be issued to a new terminal (#1088).
+
+    ``terminals.id`` proves the id is live. The other two reads are what make a
+    DELETED id still dangerous: both tables join on this string and outlive the
+    terminal row (they are purged only by ``cleanup_service`` at
+    ``RETENTION_DAYS``), even though ``delete_terminal`` removes the row that
+    used to prove the id was taken.
+
+    - ``idempotency_keys.terminal_id``: a retry resolves its key to this id and
+      then looks the row up. If a new terminal reused it, ``get_terminal``
+      succeeds against the wrong terminal -- a fingerprint mismatch raises a
+      spurious conflict, and a coincidentally equal one hands the caller
+      somebody else's running worker.
+    - ``inbox.receiver_id``: reconciliation joins a PENDING message's receiver
+      id to ``terminals``, so a reused id types the deleted receiver's stale
+      message into the new terminal's live session.
+
+    Checking every status, not just PENDING: a delivered row still makes the
+    new terminal look like the receiver of history it never received. Once the
+    row ages out of retention, reuse is harmless and this returns False.
+    """
+    with SessionLocal() as db:
+        if db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first():
+            return True
+        if (
+            db.query(IdempotencyKeyModel.key)
+            .filter(IdempotencyKeyModel.terminal_id == terminal_id)
+            .first()
+        ):
+            return True
+        if db.query(InboxModel.id).filter(InboxModel.receiver_id == terminal_id).first():
+            return True
+        return False
 
 
 def create_terminal(
@@ -2047,8 +2144,18 @@ def create_terminal(
     model_honored: Optional[bool] = None,
     initial_delivery: Optional[Dict[str, Any]] = None,
     description: Optional[str] = None,
+    delegate_tools: Optional[List[str]] = None,
+    identity_verified: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
+
+    ``delegate_tools`` is the terminal's delegation ceiling as resolved and
+    capped by ``terminal_service.create_terminal``; it is persisted so children
+    of this terminal are bounded by the stored value rather than by a profile.
+
+    ``identity_verified`` is stored as given (#1074). ``terminal_service`` passes
+    False for every kiro_cli row; the default None is the value a row from before
+    the column reads, so a caller that leaves it out writes such a row.
 
     ``idempotency_key``, when given, is persisted in the SAME ``SessionLocal``
     session as the terminal row -- one ``commit()``, so SQLite's single-writer
@@ -2096,6 +2203,7 @@ def create_terminal(
             # falsiness test stores it as SQL NULL, and every reader treats
             # NULL as "nothing resolved", which is unrestricted.
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools is not None else None,
+            delegate_tools=_json.dumps(delegate_tools) if delegate_tools is not None else None,
             shell_command=shell_command,
             caller_id=caller_id,
             engine=engine,
@@ -2105,6 +2213,7 @@ def create_terminal(
             deferred_init_external_owner=bool(deferred_init_external_owner),
             session_incarnation_id=session_incarnation_id,
             initial_delivery_json=_json.dumps(initial_delivery) if initial_delivery else None,
+            identity_verified=identity_verified,
         )
         db.add(terminal)
         if idempotency_key:
@@ -2134,6 +2243,7 @@ def create_terminal(
             "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
+            "delegate_tools": delegate_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine,
@@ -2150,6 +2260,7 @@ def create_terminal(
             "initial_delivery": initial_delivery if initial_delivery else None,
             "deferred_init_runtime_reclaimed": False,
             "session_incarnation_id": session_incarnation_id,
+            "identity_verified": identity_verified,
         }
 
 
@@ -2233,6 +2344,10 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
         )
         allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
+        raw_delegate_tools = getattr(terminal, "delegate_tools", None)
+        delegate_tools = (
+            _json.loads(raw_delegate_tools) if isinstance(raw_delegate_tools, str) else None
+        )
         group = _json.loads(terminal.group) if terminal.group else None
         metadata = _json.loads(terminal.metadata_json) if terminal.metadata_json else None
         raw_deferred_failure = getattr(terminal, "deferred_init_failure_json", None)
@@ -2255,6 +2370,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
+            "delegate_tools": delegate_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),
@@ -2270,6 +2386,9 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
                 getattr(terminal, "deferred_init_runtime_reclaimed", False)
             ),
             "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
+            # As stored, None included (#1074): None is a non-Kiro or legacy row,
+            # which the Kiro input gate treats differently from False.
+            "identity_verified": getattr(terminal, "identity_verified", None),
             "last_active": terminal.last_active,
         }
 
@@ -2405,6 +2524,23 @@ def update_terminal_deferred_init_runtime_reclaimed(terminal_id: str, reclaimed:
         if not terminal:
             return False
         terminal.deferred_init_runtime_reclaimed = bool(reclaimed)
+        db.commit()
+        return True
+
+
+def mark_terminal_identity_verified(terminal_id: str) -> bool:
+    """Record that this terminal's Kiro identity check passed (#1074).
+
+    One way only: there is no call that writes False back, because a later
+    failure on a verified pane does not make it a different agent. Returns False
+    when the row is gone.
+    """
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.identity_verified = True
         db.commit()
         return True
 
@@ -2882,6 +3018,46 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
         return [row[0] for row in rows]
 
 
+def fail_orphaned_pending_messages(min_age_seconds: int) -> List[str]:
+    """Fail PENDING messages whose receiver terminal row is gone (#708).
+
+    The counterpart to the join in ``list_pending_receiver_ids_older_than``:
+    that join drops these rows so the sweep does not retry deliveries to
+    deleted agents, which leaves them claiming PENDING forever with no log
+    line, no state change, and nothing to tell them apart from a message that
+    is about to be delivered. They are not pending -- they are undeliverable,
+    and this says so.
+
+    ``create_inbox_message`` rejects an unknown receiver, and delivery requires
+    a row that ``list_pending_receiver_ids_older_than`` can join to, so a
+    missing receiver row makes the message undeliverable by every path
+    regardless of why the row is gone -- this does not depend on row deletion
+    being race-free. The same ``min_age_seconds`` grace window as the sweep
+    still applies.
+
+    Returns the ids of the messages that were failed, for logging.
+    """
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
+    with SessionLocal() as db:
+        orphaned = (
+            db.query(InboxModel)
+            .outerjoin(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.created_at < cutoff,
+                TerminalModel.id.is_(None),
+            )
+            .all()
+        )
+        failed_ids = []
+        for message in orphaned:
+            message.status = MessageStatus.FAILED.value
+            failed_ids.append(str(message.id))
+        if failed_ids:
+            db.commit()
+        return failed_ids
+
+
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata."""
     with SessionLocal() as db:
@@ -2973,17 +3149,28 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
 
 
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    sender_id: Optional[str] = None,
+    newest_first: bool = False,
 ) -> List[InboxMessage]:
-    """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
+    """Get inbox messages with optional status and sender filters.
+
+    Ordered by created_at ascending (oldest first) unless ``newest_first`` is set.
+    ``limit`` is applied after ordering. The defaults match historical callers,
+    including ``get_pending_messages``.
 
     Args:
         receiver_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10)
         status: Optional filter by message status (None = all statuses)
+        sender_id: Optional filter by sender id (None = all senders)
+        newest_first: When True, order by created_at descending so ``limit``
+            keeps the newest messages. Defaults to False.
 
     Returns:
-        List of inbox messages ordered by creation time (oldest first)
+        List of inbox messages ordered by creation time
     """
     with SessionLocal() as db:
         query = db.query(InboxModel).filter(InboxModel.receiver_id == receiver_id)
@@ -2991,7 +3178,13 @@ def get_inbox_messages(
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
 
-        messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
+        if sender_id is not None:
+            query = query.filter(InboxModel.sender_id == sender_id)
+
+        created_at_order = (
+            InboxModel.created_at.desc() if newest_first else InboxModel.created_at.asc()
+        )
+        messages = query.order_by(created_at_order).limit(limit).all()
 
         return [
             InboxMessage(

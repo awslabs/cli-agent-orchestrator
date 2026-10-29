@@ -66,12 +66,30 @@ def _number(value: Any, default: float, lower: float, upper: float) -> float:
         return default
 
 
+def resolve_on_timeout_ms(
+    raw: Mapping[str, Any], *, environment: Mapping[str, str] | None = None
+) -> int:
+    """The on-mode timeout from one raw settings snapshot, as load_settings resolves it."""
+    env = os.environ if environment is None else environment
+    block = _block(raw.get("decisions"))
+    return int(
+        _number(
+            env.get("CAO_DECISION_ON_TIMEOUT_MS", block.get("on_timeout_ms", 1000)),
+            1000,
+            *ON_TIMEOUT_MS_RANGE,
+        )
+    )
+
+
 def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSettings:
     try:
         raw = settings_service._load_or_raise()
     except settings_service.SettingsUnreadableError:
         logger.warning("Decision settings unreadable; all points off")
         return DecisionSettings()
+    from cli_agent_orchestrator.decisions.egress import is_halted
+
+    halted = is_halted()
     env = os.environ if environment is None else environment
     block = _block(raw.get("decisions"))
     saved = _block(block.get("points"))
@@ -84,6 +102,8 @@ def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSe
         except (ValueError, TypeError):
             parsed = PointState.OFF
             logger.warning("Invalid decision state; point off")
+        if halted:
+            parsed = PointState.OFF
         exclusions = item.get("exclude_profiles", []) if point == "model.route" else []
         names = (
             tuple(p for p in exclusions if isinstance(p, str))
@@ -98,13 +118,7 @@ def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSe
     shadow = _block(block.get("shadow"))
     return DecisionSettings(
         points=points,
-        on_timeout_ms=int(
-            _number(
-                env.get("CAO_DECISION_ON_TIMEOUT_MS", block.get("on_timeout_ms", 1000)),
-                1000,
-                *ON_TIMEOUT_MS_RANGE,
-            )
-        ),
+        on_timeout_ms=resolve_on_timeout_ms(raw, environment=env),
         confidence_threshold=_number(
             env.get("CAO_DECISION_CONFIDENCE_THRESHOLD", block.get("confidence_threshold", 0.70)),
             0.70,
@@ -146,6 +160,10 @@ def set_point(point: str, state: str, decider: str | None = None) -> None:
     if decider is not None:
         item["decider"] = decider
     settings_service._save(data)
+    if state in ("shadow", "on"):
+        from cli_agent_orchestrator.decisions import egress
+
+        egress.HALT_FILE.unlink(missing_ok=True)
 
 
 def set_tier(provider: str, tier: str, model: str | None) -> None:

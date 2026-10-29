@@ -1,6 +1,7 @@
 """Unit tests for the Antigravity CLI (``agy``) provider."""
 
 import json
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,6 +33,32 @@ def _skip_startup_dialog():
         patch.object(AntigravityCliProvider, "_prune_stale_mcp_entries"),
     ):
         yield
+
+
+def _cao_entries(servers: dict, server_name: str) -> dict:
+    """The shared entries CAO registered for ``server_name`` (``{name}-{digest}``)."""
+    pattern = re.compile(rf"{re.escape(server_name)}-[0-9a-f]{{8}}")
+    return {
+        key: entry
+        for key, entry in servers.items()
+        if pattern.fullmatch(key) and isinstance(entry, dict) and "caoTerminalIds" in entry
+    }
+
+
+def _cao_entry(servers: dict, server_name: str) -> tuple:
+    """The single shared entry CAO registered for ``server_name``, as ``(key, entry)``."""
+    entries = _cao_entries(servers, server_name)
+    assert len(entries) == 1, f"expected one shared {server_name} entry, got {sorted(servers)}"
+    return next(iter(entries.items()))
+
+
+def _pins_a_terminal(servers: dict) -> list:
+    """Keys of entries whose env pins CAO_TERMINAL_ID (what caused #940)."""
+    return [
+        key
+        for key, entry in servers.items()
+        if isinstance(entry, dict) and "CAO_TERMINAL_ID" in (entry.get("env") or {})
+    ]
 
 
 def load_fixture(name: str) -> str:
@@ -282,14 +309,18 @@ def test_mcp_registration_writes_config(tmp_path, monkeypatch):
         import json
 
         data = json.loads(cfg.read_text())
-        # Key is per-terminal: "{server_name}-{terminal_id}"
-        assert "cao-mcp-server-test-tid" in data["mcpServers"]
-        # CAO_TERMINAL_ID forwarded so cao-mcp-server can resolve the terminal.
-        assert data["mcpServers"]["cao-mcp-server-test-tid"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
+        # One shared entry keyed "{server_name}-{config digest}", owned by us ...
+        key, entry = _cao_entry(data["mcpServers"], "cao-mcp-server")
+        assert entry["caoTerminalIds"] == ["test-tid"]
+        assert p._mcp_server_names == [key]
+        # ... that pins no terminal identity: every agy process starts every
+        # server in this file, so cao-mcp-server takes CAO_TERMINAL_ID from the
+        # agy process environment instead (#940).
+        assert _pins_a_terminal(data["mcpServers"]) == []
         # cleanup removes our entry without clobbering the file.
         p.cleanup()
         data2 = json.loads(cfg.read_text())
-        assert "cao-mcp-server-test-tid" not in data2.get("mcpServers", {})
+        assert key not in data2.get("mcpServers", {})
 
 
 def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
@@ -324,7 +355,7 @@ def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
         p._build_agy_command()
         import json
 
-        entry = json.loads(cfg.read_text())["mcpServers"]["cao-mcp-server-test-tid"]
+        _, entry = _cao_entry(json.loads(cfg.read_text())["mcpServers"], "cao-mcp-server")
         # persisted=True prefers the stable PATH launcher, not the bare command
         # or the versioned sibling.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
@@ -463,8 +494,9 @@ def test_mcp_registration_accepts_pydantic_mcpserver(tmp_path):
     ):
         p._build_agy_command()
     data = json.loads(cfg.read_text())
-    assert data["mcpServers"]["cao-mcp-server-test-tid"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
-    assert data["mcpServers"]["other"]["command"] == "keep"  # untouched
+    _, entry = _cao_entry(data["mcpServers"], "cao-mcp-server")
+    assert entry["caoTerminalIds"] == ["test-tid"]
+    assert data["mcpServers"]["other"] == {"command": "keep"}  # untouched
 
 
 def test_mcp_registration_recovers_from_corrupt_config(tmp_path):
@@ -493,7 +525,7 @@ def test_mcp_registration_recovers_from_corrupt_config(tmp_path):
     ):
         p._build_agy_command()  # should not raise; starts fresh
     data = json.loads(cfg.read_text())
-    assert "cao-mcp-server-test-tid" in data["mcpServers"]
+    _cao_entry(data["mcpServers"], "cao-mcp-server")
 
 
 @pytest.mark.parametrize("payload", ["[1, 2, 3]", '"just a string"', "42"])
@@ -527,7 +559,7 @@ def test_mcp_registration_recovers_from_non_dict_config(tmp_path, payload):
         p._build_agy_command()  # must not raise
     data = json.loads(cfg.read_text())
     assert isinstance(data, dict)
-    assert "cao-mcp-server-test-tid" in data["mcpServers"]
+    _cao_entry(data["mcpServers"], "cao-mcp-server")
 
 
 def test_mcp_registration_replaces_non_dict_mcpservers(tmp_path):
@@ -558,7 +590,7 @@ def test_mcp_registration_replaces_non_dict_mcpservers(tmp_path):
         p._build_agy_command()  # must not raise
     data = json.loads(cfg.read_text())
     assert isinstance(data["mcpServers"], dict)
-    assert "cao-mcp-server-test-tid" in data["mcpServers"]
+    _cao_entry(data["mcpServers"], "cao-mcp-server")
 
 
 def test_unregister_noop_when_nothing_registered():
@@ -682,38 +714,48 @@ def test_unregister_handles_non_dict_config(tmp_path, payload):
     assert p._mcp_server_names == []
 
 
-def test_unregister_skips_entry_owned_by_different_terminal(tmp_path):
-    """_unregister_mcp_servers must only remove entries whose
-    env.CAO_TERMINAL_ID matches this terminal — entries re-registered by
-    a newer terminal under the same server name must survive."""
+def test_unregister_releases_only_this_terminals_ownership(tmp_path):
+    """_unregister_mcp_servers removes this terminal from each shared entry and
+    deletes an entry only once no other terminal uses it, whatever order
+    teardowns run in. An entry that no longer carries CAO's owner field (the
+    user replaced it) is left alone."""
     cfg = tmp_path / "mcp_config.json"
+    user_replaced = {"command": "user-replaced-this", "args": []}
     cfg.write_text(
         json.dumps(
             {
                 "mcpServers": {
-                    "cao-mcp-server-test-tid": {
+                    "cao-mcp-server-aaaaaaaa": {
                         "command": "cao-mcp-server",
                         "args": [],
-                        "env": {"CAO_TERMINAL_ID": "new-terminal-99"},
+                        "caoTerminalIds": ["test-tid", "other-tid"],
                     },
-                    "cao-ops-mcp-server-test-tid": {
+                    "cao-ops-mcp-server-bbbbbbbb": {
                         "command": "cao-ops-mcp-server",
                         "args": [],
-                        "env": {"CAO_TERMINAL_ID": "test-tid"},
+                        "caoTerminalIds": ["test-tid"],
                     },
+                    "demo-tools-cccccccc": user_replaced,
                 }
             }
         )
     )
     p = make_provider()  # terminal_id="test-tid"
-    p._mcp_server_names = ["cao-mcp-server-test-tid", "cao-ops-mcp-server-test-tid"]
+    p._mcp_server_names = [
+        "cao-mcp-server-aaaaaaaa",
+        "cao-ops-mcp-server-bbbbbbbb",
+        "demo-tools-cccccccc",
+    ]
     with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
         p._unregister_mcp_servers()
-    result = json.loads(cfg.read_text())
-    # "cao-mcp-server-test-tid" belongs to new-terminal-99 -> must survive
-    assert "cao-mcp-server-test-tid" in result["mcpServers"]
-    # "cao-ops-mcp-server-test-tid" belongs to test-tid -> must be removed
-    assert "cao-ops-mcp-server-test-tid" not in result["mcpServers"]
+    servers = json.loads(cfg.read_text())["mcpServers"]
+    # still used by other-tid -> survives, without us
+    assert servers["cao-mcp-server-aaaaaaaa"]["caoTerminalIds"] == ["other-tid"]
+    # we were the last user -> removed
+    assert "cao-ops-mcp-server-bbbbbbbb" not in servers
+    # no owner field any more -> not ours to touch
+    assert servers["demo-tools-cccccccc"] == user_replaced
+    assert p._mcp_server_names == []
 
 
 # --------------------------------------------------------------------------- #
@@ -721,12 +763,16 @@ def test_unregister_skips_entry_owned_by_different_terminal(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_concurrent_inits_get_distinct_mcp_keys(tmp_path):
-    """Two providers initializing concurrently must each write their own
-    per-terminal key into mcp_config.json, never overwriting the other's
-    entry. Regression test for the race where a shared static key caused
-    terminal B's write to clobber terminal A's entry before A's agy process
-    read the config."""
+def test_concurrent_inits_share_one_identity_free_entry(tmp_path):
+    """Regression test for #940 (and for the #509 race that preceded it).
+
+    Every agy process starts every server in the shared mcp_config.json. With
+    one entry per terminal pinning CAO_TERMINAL_ID, a reviewer launched while
+    its developer was alive ran the developer's entry as well, and whenever the
+    model picked that copy, the reviewer's send_message reached the supervisor
+    under the developer's terminal id. Two terminals with the same profile must
+    now register one shared entry that names no terminal for agy, and tearing
+    one down must leave the entry to the other."""
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
     cfg = tmp_path / "mcp_config.json"
@@ -752,19 +798,137 @@ def test_concurrent_inits_get_distinct_mcp_keys(tmp_path):
         p_a._build_agy_command()
         p_b._build_agy_command()
 
-        data = json.loads(cfg.read_text())
-        servers = data["mcpServers"]
-        # Each terminal has its own key
-        assert "cao-mcp-server-terminal-A" in servers
-        assert "cao-mcp-server-terminal-B" in servers
-        # Each key carries the correct CAO_TERMINAL_ID
-        assert servers["cao-mcp-server-terminal-A"]["env"]["CAO_TERMINAL_ID"] == "terminal-A"
-        assert servers["cao-mcp-server-terminal-B"]["env"]["CAO_TERMINAL_ID"] == "terminal-B"
-        # Cleanup of A doesn't touch B
+        servers = json.loads(cfg.read_text())["mcpServers"]
+        # Exactly one CAO entry: each agy runs one cao-mcp-server, its own.
+        assert list(servers) == list(_cao_entries(servers, "cao-mcp-server"))
+        key, entry = _cao_entry(servers, "cao-mcp-server")
+        assert entry["caoTerminalIds"] == ["terminal-A", "terminal-B"]
+        assert _pins_a_terminal(servers) == []
+        assert p_a._mcp_server_names == p_b._mcp_server_names == [key]
+
+        # Cleanup of A leaves the entry to B ...
         p_a._unregister_mcp_servers()
-        data2 = json.loads(cfg.read_text())
-        assert "cao-mcp-server-terminal-A" not in data2["mcpServers"]
-        assert "cao-mcp-server-terminal-B" in data2["mcpServers"]
+        servers = json.loads(cfg.read_text())["mcpServers"]
+        assert servers[key]["caoTerminalIds"] == ["terminal-B"]
+        # ... and the last user's cleanup removes it.
+        p_b._unregister_mcp_servers()
+        assert key not in json.loads(cfg.read_text())["mcpServers"]
+
+
+def _register_profiles(cfg, terminals_and_profiles):
+    """Run _build_agy_command for each (terminal_id, AgentProfile) in order."""
+    providers = []
+    for terminal_id, profile in terminals_and_profiles:
+        p = make_provider(terminal_id=terminal_id, agent_profile=profile.name)
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+                return_value="/usr/local/bin/agy",
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+                return_value=profile,
+            ),
+            patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+        ):
+            p._build_agy_command()
+        providers.append(p)
+    return providers
+
+
+def test_profile_env_cannot_pin_a_terminal_identity(tmp_path, caplog):
+    """A CAO_TERMINAL_ID in a profile's server env would be started by every
+    agy process, so it is dropped (with a warning); the rest of the env stays."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    profile = AgentProfile(
+        name="dev_gemini",
+        description="Dev",
+        mcpServers={
+            "cao-mcp-server": {
+                "command": "uvx",
+                "args": ["cao-mcp-server"],
+                "env": {"CAO_TERMINAL_ID": "pinned", "CAO_API_URL": "http://localhost:9889"},
+            }
+        },
+    )
+    with caplog.at_level("WARNING", logger="cli_agent_orchestrator.providers.antigravity_cli"):
+        _register_profiles(cfg, [("test-tid", profile)])
+
+    servers = json.loads(cfg.read_text())["mcpServers"]
+    _, entry = _cao_entry(servers, "cao-mcp-server")
+    assert entry["env"] == {"CAO_API_URL": "http://localhost:9889"}
+    assert _pins_a_terminal(servers) == []
+    assert "Ignoring CAO_TERMINAL_ID" in caplog.text
+
+
+def test_same_server_name_with_different_configs_gets_separate_entries(tmp_path):
+    """Two profiles that declare the same server name with different configs
+    must not overwrite each other's entry: each config gets its own key."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+
+    def profile(name, token):
+        return AgentProfile(
+            name=name,
+            description=name,
+            mcpServers={"github": {"command": "gh-mcp", "args": [], "env": {"TOKEN": token}}},
+        )
+
+    p_dev, p_rev = _register_profiles(
+        cfg, [("dev-tid", profile("dev", "dev-token")), ("rev-tid", profile("rev", "rev-token"))]
+    )
+
+    entries = _cao_entries(json.loads(cfg.read_text())["mcpServers"], "github")
+    assert len(entries) == 2
+    by_owner = {tuple(e["caoTerminalIds"]): e["env"]["TOKEN"] for e in entries.values()}
+    assert by_owner == {("dev-tid",): "dev-token", ("rev-tid",): "rev-token"}
+    assert p_dev._mcp_server_names != p_rev._mcp_server_names
+
+
+def test_shared_entry_keeps_fields_the_user_added(tmp_path):
+    """The shared entry outlives any one terminal, so a later registration must
+    keep what the user set on it (e.g. ``agy mcp disable`` / the /mcp panel)
+    while adding its own ownership."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    profile = AgentProfile(
+        name="dev_gemini",
+        description="Dev",
+        mcpServers={"cao-mcp-server": {"command": "uvx", "args": ["cao-mcp-server"]}},
+    )
+    _register_profiles(cfg, [("terminal-A", profile)])
+    data = json.loads(cfg.read_text())
+    key, _ = _cao_entry(data["mcpServers"], "cao-mcp-server")
+    data["mcpServers"][key]["disabledTools"] = ["assign"]
+    # ... but not a hand-added terminal identity, which every agy would start.
+    data["mcpServers"][key]["env"] = {"CAO_TERMINAL_ID": "terminal-A", "KEEP": "1"}
+    cfg.write_text(json.dumps(data))
+
+    _register_profiles(cfg, [("terminal-B", profile)])
+
+    servers = json.loads(cfg.read_text())["mcpServers"]
+    entry = servers[key]
+    assert entry["disabledTools"] == ["assign"]
+    assert entry["env"] == {"KEEP": "1"}
+    assert _pins_a_terminal(servers) == []
+    assert entry["caoTerminalIds"] == ["terminal-A", "terminal-B"]
+
+
+def test_shared_entry_key_ignores_field_order():
+    """Every terminal must compute the same key for the same server config."""
+    from cli_agent_orchestrator.providers.antigravity_cli import _shared_mcp_entry_key
+
+    a = {"command": "uvx", "args": ["cao-mcp-server"], "env": {"A": "1", "B": "2"}}
+    b = {"env": {"B": "2", "A": "1"}, "args": ["cao-mcp-server"], "command": "uvx"}
+    assert _shared_mcp_entry_key("cao-mcp-server", a) == _shared_mcp_entry_key("cao-mcp-server", b)
+    assert re.fullmatch(r"cao-mcp-server-[0-9a-f]{8}", _shared_mcp_entry_key("cao-mcp-server", a))
+    assert _shared_mcp_entry_key("cao-mcp-server", a) != _shared_mcp_entry_key(
+        "cao-mcp-server", {**a, "args": ["other"]}
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -871,33 +1035,56 @@ async def test_initialize_raises_when_agy_times_out(monkeypatch):
 
 
 def test_prune_stale_mcp_entries_on_register(tmp_path):
-    """_register_mcp_servers prunes entries whose terminal is no longer live,
-    preserves entries for live terminals and non-CAO entries, and adds the
-    new terminal's entry."""
+    """_register_mcp_servers releases dead terminals from shared entries,
+    removes shared entries no live terminal uses, drops per-terminal entries
+    in the pre-#940 shape whether or not their terminal is alive, preserves
+    every non-CAO entry, and adds the new terminal's entry."""
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
     cfg = tmp_path / "mcp_config.json"
+    user_pinned = {"command": "x", "args": [], "env": {"CAO_TERMINAL_ID": "live-tid"}}
     cfg.write_text(
         json.dumps(
             {
                 "mcpServers": {
-                    # Entry for a dead terminal — should be pruned
+                    # Pre-#940 per-terminal entries -- pruned even for a live
+                    # terminal: every agy that starts would run them under
+                    # that terminal's id. (A running agy keeps its servers.)
                     "cao-mcp-server-dead-tid": {
                         "command": "cao-mcp-server",
                         "args": [],
                         "env": {"CAO_TERMINAL_ID": "dead-tid"},
                     },
-                    # Entry for a live terminal — should survive
                     "cao-mcp-server-live-tid": {
                         "command": "cao-mcp-server",
                         "args": [],
                         "env": {"CAO_TERMINAL_ID": "live-tid"},
                     },
-                    # Non-CAO entry (no CAO_TERMINAL_ID) — should survive
+                    # Shared entry with a dead and a live user -- keeps the live one
+                    "cao-ops-mcp-server-aaaaaaaa": {
+                        "command": "cao-ops-mcp-server",
+                        "args": [],
+                        "caoTerminalIds": ["dead-tid", "live-tid"],
+                    },
+                    # Shared entry only a dead terminal used -- removed
+                    "demo-tools-bbbbbbbb": {
+                        "command": "demo-server",
+                        "args": [],
+                        "caoTerminalIds": ["dead-tid"],
+                    },
+                    # CAO-managed but with a mangled owner list -- nobody live, removed
+                    "demo-tools-cccccccc": {
+                        "command": "demo-server",
+                        "args": [],
+                        "caoTerminalIds": "not-a-list",
+                    },
+                    # Non-CAO entries -- survive, even one setting CAO_TERMINAL_ID
+                    # under a key that is not CAO's per-terminal shape
                     "user-custom-server": {
                         "command": "my-server",
                         "args": [],
                     },
+                    "user-pinned": user_pinned,
                 }
             }
         )
@@ -938,17 +1125,21 @@ def test_prune_stale_mcp_entries_on_register(tmp_path):
     ):
         p._build_agy_command()
 
-    data = json.loads(cfg.read_text())
-    servers = data["mcpServers"]
-    # Dead entry pruned
+    servers = json.loads(cfg.read_text())["mcpServers"]
+    # Pre-#940 per-terminal entries pruned, dead or alive
     assert "cao-mcp-server-dead-tid" not in servers
-    # Live entry preserved
-    assert "cao-mcp-server-live-tid" in servers
-    # Non-CAO entry preserved
-    assert "user-custom-server" in servers
-    # New entry added
-    assert "cao-mcp-server-new-tid" in servers
-    assert servers["cao-mcp-server-new-tid"]["env"]["CAO_TERMINAL_ID"] == "new-tid"
+    assert "cao-mcp-server-live-tid" not in servers
+    # Dead user released from a shared entry, entry kept for the live one
+    assert servers["cao-ops-mcp-server-aaaaaaaa"]["caoTerminalIds"] == ["live-tid"]
+    # Shared entries nobody alive uses -> removed
+    assert "demo-tools-bbbbbbbb" not in servers
+    assert "demo-tools-cccccccc" not in servers
+    # Non-CAO entries preserved verbatim
+    assert servers["user-custom-server"] == {"command": "my-server", "args": []}
+    assert servers["user-pinned"] == user_pinned
+    # New shared entry added, owned by the new terminal
+    _, entry = _cao_entry(servers, "cao-mcp-server")
+    assert entry["caoTerminalIds"] == ["new-tid"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1009,7 +1200,7 @@ def test_cwd_reaches_the_shared_mcp_config(tmp_path):
     ):
         p._build_agy_command()
 
-    entry = json.loads(cfg.read_text())["mcpServers"]["demo-tools-test-tid"]
+    _, entry = _cao_entry(json.loads(cfg.read_text())["mcpServers"], "demo-tools")
     assert entry["cwd"] == "/plugins/demo"
     assert entry["command"] == "demo-server", "must NOT be shimmed: the format has a cwd field"
 

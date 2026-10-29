@@ -93,11 +93,11 @@ export function ScrubBar({
         aria-valuenow={selectedIndex}
         aria-valuetext={valueText}
         onKeyDown={handleKey}
-        className="relative h-6 w-full rounded bg-gray-800 focus:outline-none focus:ring-2 focus:ring-emerald-500 cursor-pointer"
+        className="relative h-6 w-full rounded-sm bg-gray-800 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 cursor-pointer"
       >
         {/* Progress fill */}
         <div
-          className="absolute top-0 left-0 h-full rounded bg-emerald-600/40"
+          className="absolute top-0 left-0 h-full rounded-sm bg-emerald-600/40"
           style={{ width: max === 0 ? '100%' : `${(selectedIndex / max) * 100}%` }}
         />
         {/* Event ticks — a declared gap is a HATCHED tick (non-color: a striped

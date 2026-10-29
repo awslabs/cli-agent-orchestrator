@@ -45,6 +45,11 @@
       "items": {"type": "string"},
       "description": "CAO tool vocabulary allowlist."
     },
+    "delegateTools": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Delegation ceiling: the most this agent may grant to workers it creates via assign, handoff or a workflow step (same vocabulary as allowedTools). Defaults to ['*'] for role supervisor and to the agent's own allowedTools otherwise. See docs/tool-restrictions.md."
+    },
     "mcpServers": {
       "type": "object",
       "description": "MCP server configurations for additional tools.",

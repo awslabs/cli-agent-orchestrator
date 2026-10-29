@@ -479,7 +479,7 @@ async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(script_runner, "_reconcile_orphans", _fake_sweep)
     proc = _FakeProcess(exit_rc=1, stderr=f"Traceback: boom with {aws_key}\n".encode())
-    captured = _install_fake_spawn(monkeypatch, proc)
+    _captured = _install_fake_spawn(monkeypatch, proc)
 
     result = await run_script_workflow(_FakeScriptSpec(), {}, "run-crash")
     assert result.state == RunState.FAILED
@@ -1161,6 +1161,165 @@ async def test_resume_malformed_inputs_json_degrades_to_empty(monkeypatch: pytes
 
 
 # ---------------------------------------------------------------------------
+# Resume gate 7 — the working-directory root is still the approved one
+# (#827 criterion 2, "a running OR RESUMED script run"; ask 3 on PR #1051)
+# ---------------------------------------------------------------------------
+
+
+def _resumable_run_bound_to(monkeypatch, tmp_path, run_id: str, root) -> None:
+    """Seed a resumable, APPROVED script run whose admission record binds ``root``'s real identity.
+
+    Approval enforcement is turned back ON for these tests (the module fixture turns it off), because
+    gate 7 only applies while it is on -- and it is turned on through the real setting, so the
+    predicate under test is the production one.
+    """
+    from cli_agent_orchestrator.services import (
+        approval_store,
+        launch_guard,
+        manifest_freeze,
+        settings_service,
+    )
+    from cli_agent_orchestrator.utils import git_baseline
+
+    assert git_baseline.derive_baseline(str(root)).get("repository") is False, (
+        "fixture assumption broken: this root must be outside Git so its recorded identity is the "
+        "device/inode pair rather than a commit"
+    )
+    settings_service.SETTINGS_FILE.write_text(json.dumps({"workflow": {"require_approval": True}}))
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(launch_guard.agent_profiles, "list_agent_profiles", lambda: [])
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+
+    frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={}, cwd=str(root))
+    assert frozen.root_identity is not None and frozen.root_identity["bound"] is True
+    guard = launch_guard.capture(profile_set=frozen.profile_set, root_identity=frozen.root_identity)
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot=json.dumps(
+            {
+                "source": "print('resumed')\n",
+                "path": "/tmp/wf.py",
+                "working_directory": str(root),
+                "launch_guard": guard,
+            }
+        ),
+        inputs_json="{}",
+        state="failed",
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation="3",
+        manifest_json=frozen.manifest_json,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_with_a_replaced_root_is_refused_before_anything_is_bumped(
+    monkeypatch, tmp_path
+):
+    """THE DEFECT ask 3 names. Nothing compared the root at resume, so nothing refused this.
+
+    The first root comparison lived in ``run_agent_step``, which a RESUME reaches only when it starts
+    a NEW agent step. So a resume into a replacement directory ran the script code before that step
+    there, and a resume whose remaining agent steps are ALL REPLAYS ran to completion there -- a
+    replayed step returns before ``run_agent_step`` is ever called.
+
+    Gate 6 above cannot catch it: it compares the ``plan_id`` already frozen on the row and never
+    recomputes it, so the replaced root's pair is in the identifier the resume REUSES.
+
+    The refusal must also leave nothing behind, which is why the generation and the spawn are both
+    asserted: the bump fences out any still-live process for this run, so bumping and then refusing
+    would kill a possibly-healthy run on behalf of a resume that was itself rejected.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    root = tmp_path / "work"
+    root.mkdir()
+    _resumable_run_bound_to(monkeypatch, tmp_path, "run-root-swapped", root)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+
+    root.rename(tmp_path / "moved-away")
+    (tmp_path / "work").mkdir()
+
+    from cli_agent_orchestrator.services.launch_guard import PlanInputsChangedError
+
+    with pytest.raises(PlanInputsChangedError, match="path is unchanged"):
+        await resume_script_run("run-root-swapped")
+
+    row = workflow_journal.get_run("run-root-swapped")
+    assert row is not None and row.generation == "3", (
+        "the generation was bumped by a resume that was then refused, fencing out any still-live "
+        "process for this run"
+    )
+    assert spawned == {}, "a refused resume spawned the script anyway"
+    assert "run-root-swapped" not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+async def test_resume_with_the_root_intact_is_unchanged(monkeypatch, tmp_path):
+    """The false-positive direction. Gate 7 must be invisible to every ordinary resume.
+
+    A gate that refused a resume whose directory never moved would be worse than the hole it closes:
+    the operator cannot restore an identity that was never lost, and the run is not resumable by any
+    other route.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    root = tmp_path / "work"
+    root.mkdir()
+    _resumable_run_bound_to(monkeypatch, tmp_path, "run-root-intact", root)
+    proc = _FakeProcess(exit_rc=0, stdout=b"CAO_WORKFLOW_OUTPUT:null\n")
+    captured = _install_fake_spawn(monkeypatch, proc)
+
+    result = await resume_script_run("run-root-intact")
+
+    assert result.state == RunState.COMPLETED
+    row = workflow_journal.get_run("run-root-intact")
+    assert row is not None and row.generation == "4"
+    assert captured["cwd"] == str(root)
+    assert captured["env"]["CAO_WORKFLOW_RESUME"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_resume_of_a_record_written_before_the_root_binding_is_not_refused(
+    monkeypatch, tmp_path
+):
+    """Gate 7 carries the SAME migration posture as the launch guard, because it is the same code.
+
+    A ``launch-guard-v2`` record frozen before the root binding has no ``root_identity`` key, and a
+    Git-root record from before ask 2 has ``None``. Either must resume: those runs are resumable by
+    design (resume reuses the frozen ``plan_id``), and refusing them for a pair they never recorded
+    would strand every in-flight run at the upgrade. Two spellings of the comparison would be where
+    that posture drifts, which is why resume calls ``_check_root_identity`` rather than restating it.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    root = tmp_path / "work"
+    root.mkdir()
+    _resumable_run_bound_to(monkeypatch, tmp_path, "run-pre-binding", root)
+    row = workflow_journal.get_run("run-pre-binding")
+    assert row is not None
+    snapshot = json.loads(row.spec_snapshot)
+    del snapshot["launch_guard"]["root_identity"]
+    workflow_journal.insert_run(
+        run_id="run-pre-binding-2",
+        workflow_name="wf",
+        spec_snapshot=json.dumps(snapshot),
+        inputs_json="{}",
+        state="failed",
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation="3",
+        manifest_json=row.manifest_json,
+    )
+    proc = _FakeProcess(exit_rc=0, stdout=b"CAO_WORKFLOW_OUTPUT:null\n")
+    _install_fake_spawn(monkeypatch, proc)
+
+    root.rename(tmp_path / "moved-away")
+    (tmp_path / "work").mkdir()
+
+    result = await resume_script_run("run-pre-binding-2")
+    assert result.state == RunState.COMPLETED
+
+
+# ---------------------------------------------------------------------------
 # A5 — orphan sweep off the in-memory step_states (BR-31 5b)
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
@@ -1741,11 +1900,11 @@ async def test_fresh_run_executes_approved_bytes_after_mid_start_update(monkeypa
 
     capture = launch_guard.capture
 
-    def update_in_window():
+    def update_in_window(profile_set=None, root_identity=None):
         workflow_spec_service.update_workflow(
             spec.name, source_b, spec.content_hash, scan_dir=str(spec_dir)
         )
-        return capture()
+        return capture(profile_set=profile_set, root_identity=root_identity)
 
     monkeypatch.setattr(launch_guard, "capture", update_in_window)
     scratch = tmp_path / "scratch"
@@ -1913,3 +2072,257 @@ async def test_partial_start_snapshot_deleted_on_materialize_error(monkeypatch, 
     assert result.state == RunState.FAILED
     assert not (scratch / "start-partial-stage-failure.py").exists()
     assert "partial-stage-failure" not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "opt-out"])
+async def test_insert_failure_stops_enforced_script_before_spawn(
+    monkeypatch, tmp_path, enforced, caplog
+):
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    private_path = str(tmp_path / "private-journal-location")
+
+    def insert_failure(*args, **kwargs):
+        raise RuntimeError(private_path)
+
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_failure)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, "insert-failed", working_directory=str(tmp_path)
+    )
+    warnings = [
+        entry
+        for entry in caplog.records
+        if entry.name == script_runner.logger.name and "insert_run" in entry.getMessage()
+    ]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert "RuntimeError" in warnings[0].getMessage()
+    assert private_path not in caplog.text
+    if enforced:
+        assert spawned == {}, "an approved run without its journal row must never spawn"
+        assert result.state == RunState.FAILED
+        assert result.kind == "error"
+        assert result.warnings == [
+            "Could not durably record this script run; no script was started. "
+            "Repair the run journal and start a new run."
+        ]
+        assert private_path not in result.model_dump_json()
+        record = script_runner.run_registry["insert-failed"]
+        assert record.state == RunState.FAILED and record.finished_at is not None
+        assert "insert-failed" not in script_runner._active_drives
+    else:
+        assert spawned
+        assert result.state == RunState.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "opt-out"])
+async def test_duplicate_insert_preserves_winning_live_run(monkeypatch, tmp_path, enforced):
+    """A loser at the INSERT boundary must not settle or replace the winner."""
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    run_id = "duplicate-insert"
+    winner = _make_record(run_id, process=None, generation="7")
+    workflow_journal.insert_run(
+        run_id,
+        "winning-workflow",
+        '{"source":"winner"}',
+        '{"owner":"winner"}',
+        RunState.RUNNING.value,
+        winner.started_at,
+        "script",
+        "7",
+    )
+    before = workflow_journal.get_run(run_id)
+    script_runner.run_registry[run_id] = winner
+    script_runner._active_drives.add(run_id)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    conflict = None
+    try:
+        # The HTTP availability check can already have passed before the winner
+        # inserts. Exercise the real duplicate constraint at the engine boundary.
+        await run_script_workflow(_FakeScriptSpec(), {}, run_id, working_directory=str(tmp_path))
+    except KeyError as exc:
+        conflict = exc
+
+    assert workflow_journal.get_run(run_id) == before, "the winning row must remain untouched"
+    assert script_runner.run_registry[run_id] is winner
+    assert winner.state == RunState.RUNNING and winner.finished_at is None
+    assert run_id in script_runner._active_drives
+    assert spawned == {}
+    assert conflict is not None and "already exists" in str(conflict)
+
+
+@pytest.mark.asyncio
+async def test_insert_failure_refuses_when_enforcement_turns_on_after_capture(
+    monkeypatch, tmp_path
+):
+    from cli_agent_orchestrator.services import settings_service
+
+    settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":false}}')
+    real_capture = script_runner.launch_guard.capture
+    captured = []
+
+    def capture(profile_set=None, root_identity=None):
+        guard = real_capture(profile_set=profile_set)
+        captured.append(guard)
+        return guard
+
+    def insert_failure(*args, **kwargs):
+        assert json.loads(args[2])["launch_guard"] == {"approval_required": False}
+        settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":true}}')
+        raise RuntimeError(str(tmp_path / "private-journal-location"))
+
+    monkeypatch.setattr(script_runner.launch_guard, "capture", capture)
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_failure)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, "posture-flipped", working_directory=str(tmp_path)
+    )
+    assert captured == [{"approval_required": False}]
+    assert spawned == {}, "the current posture must be re-read before any spawn"
+    assert result.state == RunState.FAILED and result.kind == "error"
+    assert script_runner.run_registry["posture-flipped"].finished_at is not None
+    assert "posture-flipped" not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["before-commit", "after-commit"])
+@pytest.mark.parametrize("enforced", [False, True], ids=["opt-out", "enforced"])
+async def test_cancel_during_insert_is_honoured_before_spawn(
+    monkeypatch, tmp_path, timing, enforced
+):
+    """Cancel on the real loop while INSERT's worker has not returned to it."""
+    from fastapi import HTTPException
+
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    loop = asyncio.get_running_loop()
+    insert_run = workflow_journal.insert_run
+    run_id = "cancel-during-insert"
+    replies = []
+    errors = []
+    writes = []
+    update_run_state = workflow_journal.update_run_state
+
+    def track_state(run_id, state, *args, **kwargs):
+        writes.append(state)
+        return update_run_state(run_id, state, *args, **kwargs)
+
+    monkeypatch.setattr(workflow_journal, "update_run_state", track_state)
+
+    def cancel():
+        future = asyncio.run_coroutine_threadsafe(
+            api_main.cancel_workflow_run_endpoint(run_id, []), loop
+        )
+        try:
+            replies.append(future.result(timeout=5))
+        except HTTPException as exc:
+            errors.append(exc.status_code)
+
+    def insert_then_cancel(*args, **kwargs):
+        if timing == "before-commit":
+            cancel()
+        insert_run(*args, **kwargs)
+        if timing == "after-commit":
+            cancel()
+
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_then_cancel)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, run_id, working_directory=str(tmp_path)
+    )
+    assert errors == [], "an admission cancel must not return 404"
+    assert replies == [{"success": True, "run_id": run_id}]
+    assert result.state == RunState.CANCELLED and result.kind == "cancelled"
+    assert spawned == {}, "an acknowledged admission cancel must prevent spawning"
+    row = workflow_journal.get_run(run_id)
+    assert row.state == RunState.CANCELLED.value and row.generation == "2"
+    assert RunState.COMPLETED.value not in writes
+    record = script_runner.run_registry[run_id]
+    assert record.cancelled and record.state == RunState.CANCELLED
+    assert record.process is None and record.generation == "2"
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True], ids=["own-entry", "winner-entry"])
+async def test_duplicate_insert_removes_only_its_own_publication(
+    monkeypatch, tmp_path, replacement
+):
+    run_id = "duplicate-publication"
+    winner = _make_record(run_id, process=None, generation="7")
+    insert_run = workflow_journal.insert_run
+    insert_run(
+        run_id,
+        "winner",
+        '{"source":"winner"}',
+        "{}",
+        RunState.RUNNING.value,
+        winner.started_at,
+        "script",
+        "7",
+    )
+    before = workflow_journal.get_run(run_id)
+    publications = []
+
+    def duplicate(*args, **kwargs):
+        publications.append(script_runner.run_registry.get(run_id))
+        if replacement:
+            script_runner.run_registry[run_id] = winner
+            script_runner._active_drives.add(run_id)
+        return insert_run(*args, **kwargs)  # the real duplicate constraint
+
+    monkeypatch.setattr(workflow_journal, "insert_run", duplicate)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    with pytest.raises(KeyError, match="already exists"):
+        await run_script_workflow(_FakeScriptSpec(), {}, run_id, working_directory=str(tmp_path))
+    assert len(publications) == 1 and isinstance(publications[0], ScriptRunRecord)
+    assert publications[0] is not winner
+    assert workflow_journal.get_run(run_id) == before
+    assert spawned == {}
+    if replacement:
+        assert script_runner.run_registry[run_id] is winner
+        assert run_id in script_runner._active_drives
+    else:
+        assert run_id not in script_runner.run_registry
+        assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+async def test_active_drive_without_registry_rejects_new_admission(monkeypatch):
+    run_id = "active-without-record"
+    script_runner._active_drives.add(run_id)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    with pytest.raises(KeyError, match="already exists"):
+        await run_script_workflow(_FakeScriptSpec(), {}, run_id)
+    assert run_id not in script_runner.run_registry
+    assert workflow_journal.get_run(run_id) is None
+    assert run_id in script_runner._active_drives
+    assert spawned == {}

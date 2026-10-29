@@ -16,7 +16,7 @@ from cli_agent_orchestrator.services.vault.config import FolderMapping, VaultCon
 from cli_agent_orchestrator.services.vault.status import get_vault_status
 
 
-def test_status_keeps_combined_warn_inject_warning_from_live_config(tmp_path, monkeypatch):
+def test_status_has_no_warn_inject_warning_and_keeps_redaction_counters(tmp_path, monkeypatch):
     from cli_agent_orchestrator.services.vault import status
 
     engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
@@ -66,8 +66,9 @@ def test_status_keeps_combined_warn_inject_warning_from_live_config(tmp_path, mo
 
     result = get_vault_status(config)[0]
 
+    # Since #644 warn + inject is not warned about: every model-bound read is
+    # redacted at the chokepoint, so the pairing has no exposure of its own.
     assert result.warnings == (
-        "mapping 'Mapped' has secret_gate='warn' with inject=true",
         "agent-scoped mapping 'Mapped' is recall-only and is not injected in this release",
     )
     assert dict(result.recall_counters) == {

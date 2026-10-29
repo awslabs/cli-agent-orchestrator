@@ -22,7 +22,7 @@ import logging
 import re
 import shlex
 import time
-from typing import Optional
+from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -32,6 +32,14 @@ from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroPhase0KASError,
     build_kiro_command,
+)
+from cli_agent_orchestrator.providers.kiro_identity import (
+    PLAN_MODE_AGENT,
+    KiroAgentIdentityError,
+    header_agents,
+    identity_readable,
+    in_plan_mode,
+    require_header_identity,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -182,6 +190,15 @@ TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
 # Bottom pane lines scanned for the consent dialog (mirrors codex's window).
 STARTUP_PROMPT_BOTTOM_LINES = 15
 
+# Reads of the screen for the TUI header after the prompt is ready (see
+# KiroCliProvider._verify_agent_identity). A screen with no header row, only a
+# partial (elided or wrapped) name, or Kiro's plan mode is read again; a screen
+# whose header rows name any other agent is refused on the first read.
+# Provisional (#1074): about 2 s, after which a screen without a header (a
+# kiro-cli TUI change, say) is refused rather than trusted.
+IDENTITY_HEADER_READS = 5
+IDENTITY_HEADER_READ_INTERVAL_S = 0.5
+
 # =============================================================================
 # Error Detection
 # =============================================================================
@@ -246,6 +263,11 @@ class KiroCliProvider(BaseProvider):
         self._agent_profile = agent_profile
         self._engine = resolve_kiro_engine(persisted=engine)
         self._model = model
+        # The evidence that this runtime's TUI header named the agent (#1074).
+        # Only _verify_agent_identity sets it, and only once the check passed;
+        # terminal_service records it on the row before any task is typed.
+        # initialize() returning is not evidence on its own.
+        self.identity_verified = False
 
         # Build dynamic prompt pattern based on agent profile
         # This pattern matches various Kiro prompt formats after ANSI stripping:
@@ -340,12 +362,15 @@ class KiroCliProvider(BaseProvider):
         1. Waits for the shell to be ready in the tmux window
         2. Sends the kiro-cli chat command with the configured agent profile
         3. Waits for the agent to reach IDLE state (ready for input)
+        4. Checks that the TUI header names the configured agent profile
 
         Returns:
             True if initialization was successful
 
         Raises:
             TimeoutError: If shell or Kiro CLI initialization times out
+            KiroAgentIdentityError: If kiro-cli started a different agent (for
+                example its ``kiro_default`` fallback) or no header was read
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -419,8 +444,70 @@ class KiroCliProvider(BaseProvider):
                 f"(engine={self._engine.value}, profile={self._agent_profile!r})"
             )
 
+        # Step 4: the prompt being ready does not mean the requested agent is
+        # running. Nothing is typed into the pane until the header names it.
+        await self._verify_agent_identity()
+
         self._initialized = True
         return True
+
+    async def _verify_agent_identity(self) -> None:
+        """Raise unless every TUI header row names this provider's agent (#1074).
+
+        kiro-cli answers an ``--agent`` it cannot load by starting its built-in
+        ``kiro_default`` agent, which has every built-in tool, and reaches the
+        same ready prompt. Called after the prompt is ready and before
+        ``initialize`` returns, so on a refusal no task has been typed, and the
+        pane receives no keys from here. The creation path then closes the
+        window: a synchronous create rolls back, and a deferred create reclaims
+        the runtime even when an external owner keeps the failure row.
+        Provisional (#1074): no ``/exit`` is typed into the wrong agent either.
+
+        Reads the rendered screen, not the scrollback, so the requested name in
+        the echoed launch command is never what is matched (see
+        ``kiro_identity.header_agents``). A screen without a header row is read
+        again a few times, because the header can trail the prompt by a frame,
+        and so is one whose header name is only partial or that shows plan mode;
+        if that persists it is refused (``header_not_found``, or for plan mode
+        ``identity_mismatch``).
+
+        Raises:
+            KiroAgentIdentityError: ``identity_mismatch`` or ``header_not_found``.
+        """
+        backend = get_backend()
+        observed: List[str] = []
+        plan_mode = False
+        for attempt in range(IDENTITY_HEADER_READS):
+            if attempt:
+                await asyncio.sleep(IDENTITY_HEADER_READ_INTERVAL_S)
+            try:
+                screen = await asyncio.to_thread(
+                    backend.get_history,
+                    self.session_name,
+                    self.window_name,
+                    strip_escapes=True,
+                    visible_only=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - an unread screen is not identity
+                logger.debug("kiro_cli: screen read for the identity check failed: %s", exc)
+                continue
+            observed = header_agents(screen) if isinstance(screen, str) else []
+            plan_mode = (
+                bool(observed)
+                and self._agent_profile != PLAN_MODE_AGENT
+                and isinstance(screen, str)
+                and in_plan_mode(screen)
+            )
+            if identity_readable(observed) and not plan_mode:
+                break
+        try:
+            require_header_identity(self._agent_profile, observed, plan_mode=plan_mode)
+        except KiroAgentIdentityError as exc:
+            logger.error(
+                "kiro_cli: terminal %s refused before any input: %s", self.terminal_id, exc
+            )
+            raise
+        self.identity_verified = True
 
     async def _wait_ready_accepting_trust_dialog(self) -> bool:
         """Wait for the agent prompt, auto-answering the trust-all-tools dialog.
@@ -758,6 +845,59 @@ class KiroCliProvider(BaseProvider):
 
         # Default: Agent is IDLE, waiting for user input
         return TerminalStatus.IDLE
+
+    # The TUI's live prompt row: "› " then the first row of the text, or the
+    # placeholder / status text the TUI shows there when nothing is typed.
+    _COMPOSER_PROMPT_RE = re.compile(r"^\s*›(?:\s(.*)|\s*)$")
+    # Text the TUI itself paints in the prompt row; none of it is user input.
+    _COMPOSER_CHROME_RE = re.compile(
+        rf"{NEW_TUI_IDLE_PATTERN}|{TUI_PROCESSING_PATTERN}|{TUI_INITIALIZING_PATTERN}"
+        r"|type to queue a message|Type to steer"
+    )
+
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return the text sitting unsubmitted in the TUI's › prompt, if it is on screen.
+
+        Issue #78 (PR #1004 review, P2-1): the inbox recovery can only send the
+        bare Enter that submits a paste whose Enter was swallowed when the
+        provider can read its own composer; without this method kiro_cli had
+        no recovery at all and the next inbox message was pasted on top of the
+        first ({MSG1}{MSG2}).
+
+        The TUI pins its prompt to the bottom of the viewport below the last
+        "────" separator and a header row (agent · model · ◔ N% · auth). The
+        header text varies with the agent and the auth state, so the reader
+        anchors on the last separator and the first "›" row after it; the
+        composer is that row minus the glyph plus the indented continuation
+        rows a wrapped or multi-line paste occupies (real captures:
+        fixtures/COMPOSER_FIXTURES.md). Earlier "›" rows are transcript echoes
+        above the separator and are never included. Returns "" when the row
+        holds only the TUI's own text (the "ask a question" placeholder, "Kiro
+        is working", "Initializing") and None for frames without the TUI
+        prompt row (legacy "[agent]>" UI, boot screens).
+        """
+        rows = rendered_pane.splitlines()
+        separators = [
+            index for index, row in enumerate(rows) if re.match(TUI_SEPARATOR_PATTERN, row.strip())
+        ]
+        if not separators:
+            return None
+        prompt_index = next(
+            (
+                index
+                for index in range(separators[-1] + 1, len(rows))
+                if self._COMPOSER_PROMPT_RE.match(rows[index])
+            ),
+            None,
+        )
+        if prompt_index is None:
+            return None
+        match = self._COMPOSER_PROMPT_RE.match(rows[prompt_index])
+        first = ((match.group(1) if match else None) or "").strip()
+        if self._COMPOSER_CHROME_RE.search(first):
+            return ""
+        continuation = [row.strip() for row in rows[prompt_index + 1 :] if row.strip()]
+        return "\n".join([first] + continuation).strip()
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract agent's final response message using green arrow indicator."""

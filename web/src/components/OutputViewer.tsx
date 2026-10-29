@@ -67,9 +67,9 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
   const cleanOutput = stripAnsi(output)
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center">
+    <div className="fixed inset-0 z-60 flex items-center justify-center">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-xs" onClick={onClose} />
 
       {/* Modal */}
       <div className="relative bg-gray-900 border border-gray-700/50 rounded-2xl shadow-2xl w-full max-w-[800px] mx-4 overflow-hidden animate-in fade-in zoom-in-95 flex flex-col" style={{ maxHeight: '80vh' }}>
@@ -78,14 +78,14 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
           <div className="flex items-center gap-3">
             <FileText size={16} className="text-emerald-400" />
             <span className="text-sm font-semibold text-white">Terminal Output</span>
-            <span className="text-xs text-gray-500 font-mono bg-gray-800 px-2 py-0.5 rounded">{terminalId}</span>
+            <span className="text-xs text-gray-500 font-mono bg-gray-800 px-2 py-0.5 rounded-sm">{terminalId}</span>
           </div>
           <div className="flex items-center gap-2">
             {/* Copy button */}
             <button
               onClick={handleCopy}
               disabled={!cleanOutput}
-              className="p-1.5 text-gray-400 hover:text-white disabled:opacity-30 transition-colors rounded"
+              className="p-1.5 text-gray-400 hover:text-white disabled:opacity-30 transition-colors rounded-sm"
               title="Copy to clipboard"
             >
               {copied ? <Check size={16} className="text-emerald-400" /> : <Copy size={16} />}
@@ -95,7 +95,7 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
             <button
               onClick={handleRefresh}
               disabled={loading}
-              className="p-1.5 text-gray-400 hover:text-white disabled:opacity-30 transition-colors rounded"
+              className="p-1.5 text-gray-400 hover:text-white disabled:opacity-30 transition-colors rounded-sm"
               title="Refresh output"
             >
               <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
@@ -103,7 +103,7 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
             {/* Close button */}
             <button
               onClick={onClose}
-              className="p-1.5 text-gray-500 hover:text-white transition-colors rounded"
+              className="p-1.5 text-gray-500 hover:text-white transition-colors rounded-sm"
               title="Close"
             >
               <X size={16} />
@@ -144,7 +144,7 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
           ) : cleanOutput ? (
             <pre
               ref={outputRef}
-              className="bg-gray-950 rounded-lg p-4 font-mono text-sm text-gray-300 overflow-y-auto whitespace-pre-wrap break-words"
+              className="bg-gray-950 rounded-lg p-4 font-mono text-sm text-gray-300 overflow-y-auto whitespace-pre-wrap wrap-break-word"
               style={{ maxHeight: 'calc(80vh - 160px)' }}
             >
               {cleanOutput}

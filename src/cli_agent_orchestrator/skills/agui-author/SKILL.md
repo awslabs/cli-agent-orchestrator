@@ -104,7 +104,9 @@ them:
   → reason classification → interrupt → approve/deny/edit → delivery.
 - **`CrossProviderStateSync`** — convergence proof across providers.
 
-The **run plane** (`POST /agui/v1/run`) streams these as stock AG-UI wire frames.
+The **run plane** (`POST /agui/v1/run`) returns the run lifecycle and the approval
+interrupts as stock AG-UI wire frames; live construct frames are on
+`GET /agui/v1/stream`.
 Interrupts (approval prompts) route through `POST /agui/v1/interrupts/{id}/resume`.
 
 For details: [references/l2-constructs.md](references/l2-constructs.md) and
