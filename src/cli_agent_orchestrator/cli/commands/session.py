@@ -316,8 +316,9 @@ def send(session_name, message, terminal_id, is_async, timeout):
         output = output_resp.json().get("output", "")
         if output:
             click.echo(output)
-    except api_http.exceptions.RequestException:
-        pass
+    except api_http.exceptions.RequestException as exc:
+        if not interrupted:
+            raise click.ClickException(f"Failed to retrieve the agent response: {exc}") from exc
 
     if interrupted:
         sys.exit(130)
