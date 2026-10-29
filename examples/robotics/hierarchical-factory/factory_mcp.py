@@ -22,7 +22,7 @@ from fastmcp.server.auth import require_scopes
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token
 from pydantic import Field
-from simulation import Identifier, World
+from simulation import Identifier, Scene, World
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
@@ -113,6 +113,19 @@ def controller_client(url: str, token: str) -> Client:
     )
 
 
+def check_scene_matches_schema(scene: Scene) -> None:
+    """Raise if a formation team's scene limit disagrees with the MCP schema.
+
+    The scene sets the routine-length limit of each formation team; the
+    start_shipping schema must enforce the same number that the controller
+    reads from the scene. Call this before a run is marked started (prepare,
+    and serve before started.json), so a rejected scene never consumes a run.
+    """
+    for team in scene.teams.values():
+        if team.kind == "formation" and team.max_routine_moves != MAX_ROUTINE_MOVES:
+            raise ValueError("the scene's max_routine_moves does not match the MCP schema")
+
+
 def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMCP:
     @asynccontextmanager
     async def lifespan(_server):
@@ -128,12 +141,7 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         lifespan=lifespan,
     )
 
-    # The scene sets the routine-length limit of each formation team; the
-    # schema below must enforce the same number that the controller reads
-    # from the scene.
-    for team in world.scene.teams.values():
-        if team.kind == "formation" and team.max_routine_moves != MAX_ROUTINE_MOVES:
-            raise ValueError("the scene's max_routine_moves does not match the MCP schema")
+    check_scene_matches_schema(world.scene)
 
     # Read-only live view, served on the same 127.0.0.1 controller, as in the
     # cross-zone transport example. It exposes only observe(): the measured
