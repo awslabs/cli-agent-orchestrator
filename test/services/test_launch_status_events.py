@@ -6,13 +6,16 @@ A recording failure must never affect the status either path delivers."""
 
 import asyncio
 import json
+import logging
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services import herdr_inbox_service
+from cli_agent_orchestrator.services import herdr_inbox_service, status_monitor
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
@@ -37,6 +40,21 @@ def _rows(terminal_id):
             .order_by(database.LaunchStatusEventModel.id.asc())
             .all()
         )
+
+
+def _drain_tmux_status_writes():
+    """Wait for every queued tmux status write: the writer is one FIFO thread."""
+    status_monitor._status_event_executor().submit(lambda: None).result(timeout=10)
+
+
+def _on_loop(fn):
+    """Run ``fn`` on a running event loop's own thread, as the quiescence
+    handlers run ``_apply_detection``. Returns (fn's result, loop thread id)."""
+
+    async def run():
+        return fn(), threading.get_ident()
+
+    return asyncio.run(run())
 
 
 def _pane_event(pane_id, agent_status):
@@ -106,6 +124,120 @@ class TestTmuxBusyTimeRecording:
 
         assert changed is True
         mock_bus.publish.assert_called_once()  # the real side effect still ran
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_status_write_never_runs_on_the_event_loop(self, mock_get_backend, monkeypatch):
+        """A transition detected on the loop is written by another thread:
+        the commit can wait on the SQLite lock, and the loop must not."""
+        from cli_agent_orchestrator.clients import database
+
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        real_write = database.record_launch_status_event
+        writer_threads = []
+
+        def spy(*args, **kwargs):
+            writer_threads.append(threading.get_ident())
+            real_write(*args, **kwargs)
+
+        monkeypatch.setattr(database, "record_launch_status_event", spy)
+        sm = StatusMonitor()
+
+        changed, loop_thread = _on_loop(
+            lambda: sm._apply_detection("t5", TerminalStatus.PROCESSING)
+        )
+        _drain_tmux_status_writes()
+
+        assert changed is True
+        assert writer_threads, "no write observed"
+        assert loop_thread not in writer_threads
+        assert [r.status for r in _rows("t5")] == ["processing"]
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_status_event_is_stamped_at_the_transition_not_the_write(
+        self, mock_get_backend, monkeypatch
+    ):
+        """The writer is held busy while the clock moves on 60 s: the row
+        still carries the moment the transition was detected."""
+        from cli_agent_orchestrator.clients import database
+
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        clock = {"now": T0}
+        monkeypatch.setattr(status_monitor, "_utcnow", lambda: clock["now"])
+        monkeypatch.setattr(database, "_utcnow", lambda: clock["now"])
+        gate = threading.Event()
+        status_monitor._status_event_executor().submit(gate.wait, 10)
+        sm = StatusMonitor()
+
+        try:
+            _on_loop(lambda: sm._apply_detection("t6", TerminalStatus.PROCESSING))
+            clock["now"] = T0 + timedelta(seconds=60)
+        finally:
+            gate.set()
+        _drain_tmux_status_writes()
+
+        assert [(r.status, r.created_at) for r in _rows("t6")] == [("processing", T0)]
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_status_events_keep_the_transition_order(self, mock_get_backend, monkeypatch):
+        """Transitions from the loop and from a worker thread are written in
+        the order they happened, even when the first write is slow; busy
+        time reads the rows by id."""
+        from cli_agent_orchestrator.clients import database
+
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        real_write = database.record_launch_status_event
+        first_write = threading.Event()
+
+        def slow_first_write(*args, **kwargs):
+            if not first_write.is_set():
+                first_write.set()
+                time.sleep(0.3)
+            real_write(*args, **kwargs)
+
+        monkeypatch.setattr(database, "record_launch_status_event", slow_first_write)
+        sm = StatusMonitor()
+
+        _on_loop(lambda: sm._apply_detection("t7", TerminalStatus.PROCESSING))
+        _on_loop(lambda: sm._apply_detection("t7", TerminalStatus.COMPLETED))
+        sm.notify_input_sent("t7")
+        worker = threading.Thread(
+            target=sm._apply_detection, args=("t7", TerminalStatus.PROCESSING)
+        )
+        worker.start()
+        worker.join(timeout=10)
+        _drain_tmux_status_writes()
+
+        rows = _rows("t7")
+        assert [r.status for r in rows] == ["processing", "completed", "processing"]
+        assert [r.created_at for r in rows] == sorted(r.created_at for r in rows)
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_failed_status_write_on_the_loop_is_logged_and_swallowed(
+        self, mock_get_backend, mock_bus, caplog
+    ):
+        """The failure happens on the writer thread: the loop caller still
+        sees its change, it is logged, and the writer keeps writing."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = StatusMonitor()
+
+        with caplog.at_level(logging.DEBUG, logger=status_monitor.__name__):
+            with patch(
+                "cli_agent_orchestrator.clients.database.record_launch_status_event",
+                side_effect=RuntimeError("db is down"),
+            ):
+                changed, _ = _on_loop(lambda: sm._apply_detection("t8", TerminalStatus.PROCESSING))
+                _drain_tmux_status_writes()
+
+        assert changed is True
+        mock_bus.publish.assert_called_once()
+        assert any(
+            "Launch status event recording failed" in r.getMessage() and r.exc_info
+            for r in caplog.records
+        )
+        assert _rows("t8") == []
+        sm._apply_detection("t8", TerminalStatus.COMPLETED)
+        assert [r.status for r in _rows("t8")] == ["completed"]
 
 
 class TestHerdrBusyTimeFromEvents:
