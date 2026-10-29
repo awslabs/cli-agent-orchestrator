@@ -1897,6 +1897,91 @@ class TestClaudeCodeProviderClaudeConfig:
 
         assert "--effort" not in command
 
+    # A decided per-launch effort (#1068 C, #1083 ruling): the launch plan's effort wins over
+    # the profile's static claudeConfig.effort, giving exactly one --effort, and is never
+    # written back to the profile.
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_wins_over_claude_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = {"effort": "medium"}
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_claude_command()
+
+        assert command.count("--effort") == 1
+        assert "--effort high" in command
+        assert "--effort medium" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_no_per_launch_effort_falls_back_to_claude_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = {"effort": "medium"}
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort=None)
+        command = provider._build_claude_command()
+
+        assert command.count("--effort") == 1 and "--effort medium" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_is_emitted_when_claude_config_absent(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_claude_command()
+
+        assert command.count("--effort") == 1 and "--effort high" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_is_not_emitted_for_a_native_agent(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.native_agent = "my-claude-agent"
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_claude_command()
+
+        assert "--agent my-claude-agent" in command and "--effort" not in command
+
+    def test_a_per_launch_effort_is_emitted_with_no_cao_profile(self):
+        # No CAO profile exists: honors_effort is still True on this path (#201a §2.2).
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort="high")
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ):
+            command = provider._build_claude_command()
+
+        assert "--agent agent" in command
+        assert command.count("--effort") == 1 and "--effort high" in command
+
+    def test_no_per_launch_effort_with_no_cao_profile_emits_nothing(self):
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort=None)
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ):
+            command = provider._build_claude_command()
+
+        assert "--effort" not in command
+
 
 class TestClaudeCodeProviderPermissionMode:
 

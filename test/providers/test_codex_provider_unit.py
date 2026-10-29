@@ -1680,6 +1680,77 @@ class TestCodexProviderCodexConfig:
         assert "mcp_servers.cao-mcp-server.command=" in command
         assert 'model_reasoning_effort="xhigh"' in command
 
+    # A decided per-launch effort (#1068 C, #1083 ruling): merged into a copy of codexConfig,
+    # so it wins on a key conflict and is emitted even when codexConfig is empty, giving
+    # exactly one model_reasoning_effort override. Never written back to the profile.
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_wins_over_codex_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"model_reasoning_effort": "medium", "service_tier": "fast"}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_codex_command()
+
+        parts = shlex.split(command)
+        assert parts.count('model_reasoning_effort="high"') == 1
+        assert not any("model_reasoning_effort=" in p and "medium" in p for p in parts)
+        # Other codexConfig keys are kept, in order.
+        assert 'service_tier="fast"' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_no_per_launch_effort_falls_back_to_codex_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"model_reasoning_effort": "medium"}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", effort=None)
+        command = provider._build_codex_command()
+
+        parts = shlex.split(command)
+        assert parts.count('model_reasoning_effort="medium"') == 1
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_is_emitted_when_codex_config_is_none(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_codex_command()
+
+        parts = shlex.split(command)
+        assert parts.count('model_reasoning_effort="high"') == 1
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_is_emitted_when_codex_config_is_empty(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_codex_command()
+
+        parts = shlex.split(command)
+        assert parts.count('model_reasoning_effort="high"') == 1
+
 
 class TestCodexProviderStatusDetection:
     def test_get_status_idle(self):

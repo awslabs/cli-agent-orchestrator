@@ -44,21 +44,25 @@ def test_the_base_default_is_false():
     assert BaseProvider.honors_effort(None, None) is False
 
 
-def _claude_args(profile: AgentProfile) -> list[str]:
+def _claude_args(profile: AgentProfile, effort=None) -> list[str]:
     with patch(
         "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
         return_value=profile,
     ):
-        command = ClaudeCodeProvider("tid", "sess", "win", "worker")._build_claude_command()
+        command = ClaudeCodeProvider(
+            "tid", "sess", "win", "worker", effort=effort
+        )._build_claude_command()
     return shlex.split(command.split("; ")[-1])
 
 
-def _codex_args(profile: AgentProfile) -> list[str]:
+def _codex_args(profile: AgentProfile, effort=None) -> list[str]:
     with patch(
         "cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile",
         return_value=profile,
     ):
-        command = CodexProvider("tid", "sess", "win", "worker")._build_codex_command()
+        command = CodexProvider(
+            "tid", "sess", "win", "worker", effort=effort
+        )._build_codex_command()
     return shlex.split(command.split("; ")[-1])
 
 
@@ -84,3 +88,35 @@ def test_a_launch_without_a_profile_file_is_judged_like_honors_model():
     # As with honors_model, no profile means no native agent to drop claudeConfig.
     assert ClaudeCodeProvider.honors_effort(None, None) is True
     assert ClaudeCodeProvider.honors_model(None, None, None) is True
+
+
+# A structural guard (#201a §2.2, §5.2): a capability row can't declare effort_config
+# without a per-launch path, since every ephemeral-capable provider is checked here.
+
+_ARGS_BY_PROVIDER = {
+    ProviderType.CLAUDE_CODE.value: _claude_args,
+    ProviderType.CODEX.value: _codex_args,
+}
+
+
+def test_every_ephemeral_provider_with_an_effort_config_launches_a_decided_effort():
+    from cli_agent_orchestrator.utils.ephemeral_capabilities import (
+        capability_for,
+        ephemeral_providers,
+    )
+
+    checked = []
+    for provider in ephemeral_providers():
+        capability = capability_for(provider)
+        if capability.effort_config is None:
+            continue
+        section, key = capability.effort_config
+        profile = _profile(**{section: {key: "medium"}})
+        args = _ARGS_BY_PROVIDER[provider](profile, effort="high")
+        if key == "effort":
+            assert "--effort" in args and args[args.index("--effort") + 1] == "high"
+        else:
+            assert f'{key}="high"' in args and f'{key}="medium"' not in args
+        checked.append(provider)
+    # Every provider this table declares effort_config for was actually exercised above.
+    assert checked == [p for p in ephemeral_providers() if capability_for(p).effort_config]

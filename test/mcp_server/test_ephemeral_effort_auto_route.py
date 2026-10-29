@@ -1,8 +1,9 @@
 """#1083: effort.route for a spec that declared effort auto, through the real routes.
 
-The claim, bind, second finalize and provider construction are real; only the backend and the
-provider process are mocked. The launched effort is read back from the provider's own command
-line, built from the hash-verified live profile.
+The claim, bind and provider construction are real; only the backend and the provider process
+are mocked. The launched effort is read back from the provider's own command line, which the
+launch plan reaches through the provider (ruling C, #1068, #1083); the live profile and the
+registry row carry only the stored effort.
 """
 
 import asyncio
@@ -741,4 +742,224 @@ async def test_an_effort_only_launch_gets_no_note(rt, path):
     assert "auto:" not in result["message"]
     (record,) = rt.store.list()
     assert record["outcome"] == "capped"
+    delete_child()
+
+
+# 201a ruling C regression: a launch that fails before the bind leaves only the stored
+# effort. Before the ruling, a decided effort differing from the stored one was written into
+# the shared live profile by a second finalize, and outlived the failed launch; a later
+# claimless launch then ran it outside the operator's current bounds (review P2).
+
+
+def _assert_only_stored_effort_survives(rt):
+    row = database.get_ephemeral_agent(rt.name)
+    assert row["state"] == "pending" and row["effort"] == "medium"
+    payload = live_profile(rt)
+    assert frontmatter.loads(payload.decode())["claudeConfig"] == {"effort": "medium"}
+    assert hashlib.sha256(payload).hexdigest() == row["profile_sha256"]
+    assert audit(rt.name)["profile_sha256"] == row["profile_sha256"]
+    events = finalized(rt.name)
+    assert len(events) == 1 and events[0]["effort"] == "medium"
+
+
+async def _claimless(rt):
+    from cli_agent_orchestrator.services import terminal_service
+
+    rt.commands.clear()
+    return await terminal_service.create_terminal(
+        "claude_code", rt.name, session_name="cao-session", caller_id=CALLER
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+@pytest.mark.parametrize("case", [{**AUTO, "effort_answer": "high"}], indirect=True)
+async def test_a_terminal_limit_before_the_bind_leaves_only_the_stored_effort(
+    rt, monkeypatch, path
+):
+    from cli_agent_orchestrator.services import terminal_service
+
+    monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: 0)
+    result = await invoke(path, rt.name)
+    assert not result["success"], result
+    _assert_only_stored_effort_survives(rt)
+    monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: None)
+    operator_edit(rt, {"max_effort": "medium"})
+    await _claimless(rt)
+    assert launched_effort(rt) == "medium"
+    delete_child()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+@pytest.mark.parametrize("case", [{**AUTO, "effort_answer": "high"}], indirect=True)
+async def test_an_unresolvable_ceiling_before_the_bind_leaves_only_the_stored_effort(
+    rt, monkeypatch, path
+):
+    from cli_agent_orchestrator.utils import delegation
+
+    original = delegation.ceiling_from_row
+    monkeypatch.setattr(delegation, "ceiling_from_row", lambda row: None)
+    result = await invoke(path, rt.name)
+    assert not result["success"], result
+    _assert_only_stored_effort_survives(rt)
+    monkeypatch.setattr(delegation, "ceiling_from_row", original)
+    operator_edit(rt, {"max_effort": "medium"})
+    await _claimless(rt)
+    assert launched_effort(rt) == "medium"
+    delete_child()
+
+
+@pytest.mark.parametrize("site", ["terminal", "step"])
+@pytest.mark.parametrize("case", [{**AUTO, "effort_answer": "high"}], indirect=True)
+def test_an_owner_chosen_tool_mismatch_before_the_bind_leaves_only_the_stored_effort(rt, site):
+    # The owner chooses the pre-bind failure: a claimed raw launch posting an extra tool.
+    # "terminal" takes allowed_tools as a query string; "step" needs a JSON list.
+    extra = "fs_read,fs_write" if site == "terminal" else ["fs_read", "fs_write"]
+    token = claim(rt.env, rt.name)["claim_id"]
+    response = raw_launch(rt, site, token, allowed_tools=extra)
+    assert (
+        response.status_code == 400 and response.json()["detail"]["rule"] == "tool_exceeds_stored"
+    )
+    _assert_only_stored_effort_survives(rt)
+    operator_edit(rt, {"max_effort": "medium"})
+    # Assertion 4, the raw HTTP claimless route (the other half of "both"; the other tests
+    # above use the service call).
+    response = rt.client.post(
+        "/sessions/cao-session/terminals",
+        params={"provider": "claude_code", "agent_profile": rt.name, "caller_id": CALLER},
+    )
+    assert response.status_code < 300, response.text
+    assert launched_effort(rt) == "medium"
+    delete_child()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [{**AUTO, "effort_answer": "high"}], indirect=True)
+async def test_a_lapsed_lease_after_the_recheck_leaves_only_the_stored_effort(rt, monkeypatch):
+    service = rt.env[0]
+    original = service.recheck_decided
+
+    def recheck_then_lapse(*args, **kwargs):
+        decided = original(*args, **kwargs)
+        monkeypatch.setattr(database, "_utcnow", lambda: NOW + timedelta(seconds=61))
+        return decided
+
+    monkeypatch.setattr(service, "recheck_decided", recheck_then_lapse)
+    result = await invoke("assign", rt.name)
+    assert not result["success"] and result["rule"] == "claim_expired", result
+    _assert_only_stored_effort_survives(rt)
+    monkeypatch.setattr(database, "_utcnow", lambda: NOW)
+    operator_edit(rt, {"max_effort": "medium"})
+    await _claimless(rt)
+    assert launched_effort(rt) == "medium"
+    delete_child()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sweep", [True, False])
+@pytest.mark.parametrize("case", [{**AUTO, "effort_answer": "high"}], indirect=True)
+async def test_a_crash_before_the_bind_leaves_only_the_stored_effort(rt, monkeypatch, sweep):
+    # No cleanup runs, as if the CAO process died between the recheck and the bind.
+    from cli_agent_orchestrator.services import terminal_service
+
+    service = rt.env[0]
+    real_end_claim = service.end_claim
+    monkeypatch.setattr(service, "end_claim", lambda *a, **k: None)
+    monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: 0)
+    result = await invoke("assign", rt.name)
+    assert not result["success"], result
+    assert database.get_ephemeral_agent(rt.name)["state"] == "claimed"
+    monkeypatch.setattr(service, "end_claim", real_end_claim)
+    monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: None)
+    monkeypatch.setattr(database, "_utcnow", lambda: NOW + timedelta(seconds=61))
+    if sweep:
+        # A restart's startup sweep lapses the stale claim back to pending.
+        service.sweep(True)
+        _assert_only_stored_effort_survives(rt)
+    else:
+        # Without a sweep, the claimless bind's own _lapse returns the name inline.
+        row = database.get_ephemeral_agent(rt.name)
+        assert row["state"] == "claimed" and row["effort"] == "medium"
+    operator_edit(rt, {"max_effort": "medium"})
+    await _claimless(rt)
+    assert launched_effort(rt) == "medium"
+    delete_child()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        {
+            **AUTO,
+            "effort_answer": "high",
+            "policy": {"allowed_providers": ["claude_code", "codex"]},
+            "tiers": {
+                provider: {t: "model-" + t for t in ("small", "medium", "large")}
+                for provider in ("claude_code", "codex")
+            },
+        }
+    ],
+    indirect=True,
+)
+async def test_a_codex_launch_that_fails_before_the_bind_leaves_only_the_stored_effort(
+    rt, monkeypatch
+):
+    from test.services.test_ephemeral_service import SPEC, create
+
+    from cli_agent_orchestrator.services import terminal_service
+
+    name = create(rt.env, {**SPEC, "provider": "codex", "effort": "auto"})["name"]
+    monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: 0)
+    token = claim(rt.env, name)["claim_id"]
+    response = rt.client.post(
+        "/sessions/cao-session/terminals",
+        params={"provider": "codex", "agent_profile": name, "caller_id": CALLER, "claim_id": token},
+        json={"delegation_message": "inspect", "delegation_kind": "handoff"},
+    )
+    assert response.status_code >= 400
+    row = database.get_ephemeral_agent(name)
+    assert row["state"] == "pending" and row["effort"] == "medium"
+    monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: None)
+    operator_edit(rt, {"max_effort": "medium"})
+    rt.commands.clear()
+    terminal = await terminal_service.create_terminal(
+        "codex", name, session_name="cao-session", caller_id=CALLER
+    )
+    (args,) = rt.commands
+    assert args.count('model_reasoning_effort="medium"') == 1
+    assert not any(arg.startswith("model_reasoning_effort=") and "high" in arg for arg in args)
+    assert orchestration._delete_terminal_impl(terminal.id)["success"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [{**AUTO, "effort_answer": "high"}], indirect=True)
+async def test_a_floor_tightened_after_a_failed_launch_refuses_the_claimless_bind(rt, monkeypatch):
+    from cli_agent_orchestrator.services import terminal_service
+
+    monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: 0)
+    result = await invoke("assign", rt.name)
+    assert not result["success"], result
+    monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: None)
+    operator_edit(rt, {"min_effort": "low", "default_effort": "low", "max_effort": "low"})
+    with pytest.raises(rt.env[0].EphemeralPolicyError) as err:
+        await _claimless(rt)
+    assert err.value.rule == "policy_changed_since_create:effort_exceeds_policy"
+    row = database.get_ephemeral_agent(rt.name)
+    assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
+    assert rt.commands == [] and database.get_terminal_metadata(CHILD) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [{**AUTO, "effort_answer": "high"}], indirect=True)
+async def test_the_control_a_claimed_launch_without_a_failure_runs_the_decided_effort(rt):
+    # Proves the read-back isn't vacuous: with no failure, the command carries the decided
+    # effort while the live profile and row keep the stored one, unlike every failure above.
+    result = await invoke("assign", rt.name)
+    assert result["success"], result
+    assert launched_effort(rt) == "high"
+    row = database.get_ephemeral_agent(rt.name)
+    assert row["effort"] == "medium"
+    assert frontmatter.loads(live_profile(rt).decode())["claudeConfig"] == {"effort": "medium"}
     delete_child()
