@@ -31,6 +31,12 @@ from cli_agent_orchestrator.services.terminal_service import (
 )
 from cli_agent_orchestrator.utils.skills import SkillNameError
 
+
+def _install_kiro_memory_manager(agents_dir):
+    """A Kiro sidecar is refused unless memory_manager is installed for Kiro (#1074)."""
+    (agents_dir / "memory_manager.json").write_text("{}")
+
+
 # ── Health endpoint ──────────────────────────────────────────────────
 
 
@@ -446,7 +452,9 @@ class TestCreateSession:
         assert response.status_code == 201
         assert mock_svc.create_session.call_args.kwargs["idempotency_key"] == "retry-1"
 
-    def test_memory_manager_sidecar_gets_a_key_derived_from_the_callers(self, client):
+    def test_memory_manager_sidecar_gets_a_key_derived_from_the_callers(
+        self, client, hermetic_kiro_agent_store
+    ):
         """A keyed retry must not spawn a SECOND memory_manager (review on PR #634).
 
         The sidecar spawn is unconditional -- it runs after ``create_session``
@@ -461,6 +469,7 @@ class TestCreateSession:
         ``create_terminal`` even in the races a created-vs-reused boolean would
         miss. Suffixed so it can never collide with the caller's own key.
         """
+        _install_kiro_memory_manager(hermetic_kiro_agent_store)
         mock_terminal = Terminal(
             id="abcd1234",
             name="test-window",
@@ -491,13 +500,14 @@ class TestCreateSession:
         assert mock_create.call_args.kwargs["agent_profile"] == "memory_manager"
         assert mock_create.call_args.kwargs["idempotency_key"] == "job-1:memory-manager-sidecar"
 
-    def test_unkeyed_session_leaves_the_sidecar_unkeyed(self, client):
+    def test_unkeyed_session_leaves_the_sidecar_unkeyed(self, client, hermetic_kiro_agent_store):
         """No caller key means no sidecar key -- the default path is unchanged.
 
         Pinned because deriving `f"{key}:..."` from a `None` key would silently
         claim the literal string `"None:memory-manager-sidecar"` for every
         unkeyed request on the server, permanently, after the first one.
         """
+        _install_kiro_memory_manager(hermetic_kiro_agent_store)
         mock_terminal = Terminal(
             id="abcd1234",
             name="test-window",
@@ -1656,6 +1666,25 @@ class TestSendTerminalKey:
 
         assert response.status_code == 500
         assert "Failed to send key" in response.json()["detail"]
+
+    def test_send_key_refused_terminal_is_409(self, client):
+        """POST /terminals/{id}/key returns 409, not 500, for a refused terminal.
+
+        A special key is typed input (#1074): a Kiro terminal CAO has not
+        verified refuses it the same way /input does.
+        """
+        from cli_agent_orchestrator.models.terminal import ProviderExitedInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = ProviderExitedInputBlockedError(
+                "Terminal abcd1234 failed deferred initialization (identity_mismatch). "
+                "Refusing to deliver input."
+            )
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Enter"})
+
+        assert response.status_code == 409
+        assert "Refusing to deliver input" in response.json()["detail"]
 
 
 class TestGetTerminalOutput:

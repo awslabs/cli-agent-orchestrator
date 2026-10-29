@@ -32,6 +32,15 @@ class TerminalInputBlockedReason(str, Enum):
 
     PROVIDER_ERROR = "provider_error"
     WAITING_USER_ANSWER = "waiting_user_answer"
+    # The terminal's deferred initialization failed durably, or a Kiro terminal's
+    # init ended without CAO recording that its identity check passed (#1074): a
+    # refused Kiro identity, an init timeout before the header was read, a server
+    # restart mid-init. Permanent, like PROVIDER_ERROR.
+    INIT_FAILED = "init_failed"
+    # A Kiro terminal this server is still initializing has not passed its identity
+    # check yet (#1074). Transient, like WAITING_USER_ANSWER: the inbox keeps the
+    # message pending and delivers it once the check has passed.
+    IDENTITY_PENDING = "identity_pending"
 
 
 class TerminalInputBlockedError(Exception):
@@ -63,6 +72,9 @@ class TerminalInputBlockedError(Exception):
        WAITING_USER_ANSWER was NOT refused here; it was pasted straight into the live prompt.
        Raised with ``reason=TerminalInputBlockedReason.WAITING_USER_ANSWER``. Transient: the
        dialog will close, so inbox_service keeps the batch PENDING for the next sweep.
+    The Kiro identity gate (``terminal_service.terminal_input_refusal``, #1074) raises it
+    with ``reason=TerminalInputBlockedReason.IDENTITY_PENDING`` while this server is still
+    initializing a Kiro terminal whose identity check has not passed yet. Transient too.
     No provider raises this from initialize() today (providers/claude_code.py's init timeout
     raises a bare TimeoutError on purpose); ``reason`` defaults to ``None`` only so a caller
     outside this tree can still construct the exception without classifying it.
@@ -82,7 +94,10 @@ class ProviderExitedInputBlockedError(TerminalInputBlockedError):
 
     Raised by ``services/terminal_service.py``'s delivery guards when the
     terminal's status is ERROR or its pane's foreground process is the shell that
-    was running before the CLI launched (#1018). Still a
+    was running before the CLI launched (#1018), and with
+    ``reason=TerminalInputBlockedReason.INIT_FAILED`` for a Kiro terminal whose
+    init ended without a durable record that its identity check passed, or that
+    carries a durable deferred-init failure without one (#1074). Still a
     ``TerminalInputBlockedError`` so every existing handler keeps its answer --
     409 at ``/terminals/{id}/input``, 504 at ``run_step``, FAILED in the inbox --
     but the deferred-init path catches this subclass FIRST and tears the worker

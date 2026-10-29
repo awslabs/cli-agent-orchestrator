@@ -17,11 +17,16 @@ import pytest
 
 
 @pytest.mark.parametrize("state", ["off", "on"])
-def test_delegation_keeps_sidecar_provider(handler_path, state, monkeypatch):
+def test_delegation_keeps_sidecar_provider(
+    handler_path, state, monkeypatch, hermetic_kiro_agent_store
+):
     from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
     from cli_agent_orchestrator.decisions.settings import PointSettings
 
     api, client, engine, decider, store, events, calls = handler_path
+    # The sidecar launches on the default provider, kiro_cli, and is refused up
+    # front unless memory_manager is installed for Kiro (#1074).
+    (hermetic_kiro_agent_store / "memory_manager.json").write_text("{}")
     settings = engine.settings_loader()
     if state == "off":
         engine.settings_loader = lambda: replace(

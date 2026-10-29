@@ -61,9 +61,9 @@ export function ConfirmModal({
     : { icon: 'text-yellow-400 bg-yellow-900/40', btn: 'bg-yellow-600 hover:bg-yellow-500 focus:ring-yellow-500' }
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center">
+    <div className="fixed inset-0 z-60 flex items-center justify-center">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onCancel} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-xs" onClick={onCancel} />
 
       {/* Modal */}
       <div className="relative bg-gray-900 border border-gray-700/50 rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden animate-in fade-in zoom-in-95">
@@ -76,7 +76,7 @@ export function ConfirmModal({
             <h3 className="text-base font-semibold text-white">{title}</h3>
             <p className="text-sm text-gray-400 mt-1">{message}</p>
           </div>
-          <button onClick={onCancel} className="shrink-0 p-1 text-gray-500 hover:text-white rounded transition-colors">
+          <button onClick={onCancel} className="shrink-0 p-1 text-gray-500 hover:text-white rounded-sm transition-colors">
             <X size={16} />
           </button>
         </div>
@@ -107,7 +107,7 @@ export function ConfirmModal({
               spellCheck={false}
               value={typed}
               onChange={e => setTyped(e.target.value)}
-              className="w-full px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg text-sm text-gray-200 font-mono placeholder-gray-600 focus:outline-none focus:border-red-600"
+              className="w-full px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg text-sm text-gray-200 font-mono placeholder-gray-600 focus:outline-hidden focus:border-red-600"
             />
           </div>
         )}
@@ -118,14 +118,14 @@ export function ConfirmModal({
             ref={cancelRef}
             onClick={onCancel}
             disabled={loading}
-            className="px-4 py-2 text-sm font-medium text-gray-300 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-gray-500"
+            className="px-4 py-2 text-sm font-medium text-gray-300 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors focus:outline-hidden focus:ring-2 focus:ring-gray-500"
           >
             {cancelLabel}
           </button>
           <button
             onClick={onConfirm}
             disabled={loading || (confirmationText !== undefined && typed !== confirmationText)}
-            className={`px-4 py-2 text-sm font-medium text-white rounded-lg transition-all focus:outline-none focus:ring-2 disabled:opacity-60 flex items-center gap-2 ${colors.btn}`}
+            className={`px-4 py-2 text-sm font-medium text-white rounded-lg transition-all focus:outline-hidden focus:ring-2 disabled:opacity-60 flex items-center gap-2 ${colors.btn}`}
           >
             {loading && <Loader2 size={14} className="animate-spin" />}
             {loading ? 'Closing...' : confirmLabel}

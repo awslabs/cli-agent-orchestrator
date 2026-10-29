@@ -751,10 +751,12 @@ class HerdrBackend(TerminalBackend):
         args = ["pane", "read", pane_id]
         if visible_only:
             # herdr has no viewport/scrollback split; approximate the "current
-            # screen" contract with a small bounded recent read. In practice this
-            # arm is unreachable from the one visible_only caller (the stale-
-            # PROCESSING capture fallback): event-inbox backends return from
-            # get_status() before that fallback is reached.
+            # screen" contract with a small bounded recent read. The Kiro
+            # identity check reads the TUI header through this arm
+            # (KiroCliProvider._verify_agent_identity, #1074), so the header must
+            # be within these 50 lines. The stale-PROCESSING capture fallback
+            # never reaches it: event-inbox backends return from get_status()
+            # before that fallback.
             args.extend(["--source", "recent", "--lines", "50"])
         elif full_history:
             # Ask for herdr's read ceiling explicitly. A flagless `pane read`

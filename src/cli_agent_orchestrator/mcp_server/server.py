@@ -1962,6 +1962,12 @@ async def memory_store(
     """
     from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, store_memory
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    # Checked before the remote branch, as in memory_recall: the owner applies
+    # its own switch, never this caller's (#1087).
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
 
     try:
         terminal_context = _get_terminal_context_from_env()
@@ -2126,6 +2132,12 @@ async def memory_forget(
     """
     from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    # Checked before the remote branch, as in memory_recall: the owner applies
+    # its own switch, never this caller's (#1087).
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
 
     try:
         terminal_context = _get_terminal_context_from_env()

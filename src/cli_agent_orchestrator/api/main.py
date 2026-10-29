@@ -127,7 +127,13 @@ from cli_agent_orchestrator.models.memory import (
     MemoryType,
     recall_wire_dict,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.models.terminal import (
+    Terminal,
+    TerminalId,
+    TerminalInputBlockedReason,
+    TerminalLimitError,
+)
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
@@ -135,6 +141,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroPhase0KASError,
 )
+from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -4065,7 +4072,15 @@ async def create_session(
             # launch that reported success and no sidecar, so the bound is
             # checked HERE, with the same comparator, and the outcome rides on
             # the response as ``memory_manager`` for `cao launch` to print.
-            refusal = terminal_service.memory_sidecar_refusal(result, provider=sidecar_provider)
+            # On kiro_cli this also asks the create's agent check (#1074), so a
+            # memory_manager not installed for Kiro reads `refused` here rather
+            # than `scheduled` and a log line. Off the loop: it reads agent files.
+            refusal = await asyncio.to_thread(
+                terminal_service.memory_sidecar_refusal,
+                result,
+                provider=sidecar_provider,
+                working_directory=working_directory,
+            )
             if refusal is not None:
                 logger.warning(f"memory_manager sidecar not launched: {refusal}")
                 result.memory_manager = {"state": "refused", "detail": refusal}
@@ -4410,7 +4425,12 @@ async def create_terminal_in_session(
         # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
         # of the ValueError family can shadow it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+    except (
+        KiroPhase0KASError,
+        KiroCapabilityError,
+        KiroAgentPathError,
+        KiroAgentIdentityError,
+    ) as e:
         # These subclass ValueError, so they must precede the generic arm below —
         # a rejected configuration is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
@@ -4538,7 +4558,12 @@ async def create_terminal_in_session_as_operator(
         raise
     except IdempotencyKeyConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+    except (
+        KiroPhase0KASError,
+        KiroCapabilityError,
+        KiroAgentPathError,
+        KiroAgentIdentityError,
+    ) as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except TerminalLimitError as e:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
@@ -4891,6 +4916,11 @@ async def send_terminal_key(
         # Blocking tmux send-keys — off the loop.
         success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
+    except TerminalInputBlockedError as e:
+        # send_special_key carries typed text (#1074), so it is refused
+        # the same way /input is: a conflict with the terminal's state, not a
+        # server fault.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -4983,6 +5013,12 @@ async def exit_terminal(
         # Blocking tmux I/O — off the loop.
         await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
+    except TerminalInputBlockedError as e:
+        # A text exit command (e.g. "/exit") goes through dispatch_input, which
+        # refuses a terminal CAO does not trust (#1074) the same way /input
+        # does. That is a conflict with the terminal's state, not a server
+        # fault -- matching the 409 POST /terminals/{id}/input already returns.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -5546,25 +5582,44 @@ async def run_step(
         # running for answer_user_prompt) apart from "generic failure, worker
         # dead" (tear down) -- see terminal_service.py's own
         # _schedule_deferred_init. run_step never goes through that deferred
-        # path, though: run_agent_step calls terminal_service.send_input with
-        # no orchestration_type, so the WAITING_USER_ANSWER guard can never
-        # fire here -- the only producer reachable from run_step is
-        # send_input's ERROR-state guard (a terminal whose provider process
-        # has already exited, or flips to ERROR between the readiness wait
-        # and the send). Since run_step is the SYNCHRONOUS caller (handoff
-        # MCP client's step call, and the future run engine), there is no
-        # deferred worker to keep alive either way -- the call has simply
-        # failed to complete, so this maps to the same kind="timeout" / 504
-        # outcome as a plain TimeoutError. This preserves the pre-PR-#539 504
-        # status code for this exact failure instead of silently falling
-        # through to the generic kind-less 500 below.
+        # path: run_agent_step calls terminal_service.send_input with no
+        # orchestration_type, so the WAITING_USER_ANSWER guard can never fire
+        # here. Three producers can: send_input's ERROR-state and bare-shell
+        # guards (the provider process has exited), and the Kiro identity gate
+        # (#1074) for a reused terminal (reuse_terminal_id) whose identity check
+        # is still running (identity_pending) or whose init ended without it
+        # (init_failed). Nothing was typed in any of them.
+        #
+        # identity_pending is transient: the same call can succeed once the
+        # terminal is ready, so it gets its own retryable 409 rather than a
+        # timeout. Provisional (#1074): the kind is not yet a settled string.
+        # The others keep the pre-PR-#539 kind="timeout" / 504 for a call that
+        # failed to complete, instead of the generic kind-less 500 below.
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
+        if (
+            isinstance(e, TerminalInputBlockedError)
+            and e.reason == TerminalInputBlockedReason.IDENTITY_PENDING
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": str(e),
+                    "kind": "identity_pending",
+                    "terminal_id": None,
+                    "retryable": True,
+                },
+            )
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
-    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+    except (
+        KiroPhase0KASError,
+        KiroCapabilityError,
+        KiroAgentPathError,
+        KiroAgentIdentityError,
+    ) as e:
         # Ordered before the ValueError arm they subclass: a configuration rejection is
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))
@@ -8861,6 +8916,20 @@ async def get_inbox_messages_endpoint(
         )
 
 
+def _ws_input_refusal(
+    terminal_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[TerminalInputBlockedError]]:
+    """The terminal's row and the refusal for input to it, for ``/ws`` (#1074).
+
+    ``(None, None)`` when the row is gone. Blocking DB and file I/O: callers
+    to_thread it.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        return None, None
+    return metadata, terminal_service.terminal_input_refusal(terminal_id, metadata)
+
+
 @app.websocket("/terminals/{terminal_id}/ws")
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
@@ -8892,6 +8961,14 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     devcontainers or Codespaces exposed full PTY control with no credential.
     Do NOT expose the server to untrusted networks (e.g. --host 0.0.0.0)
     without authentication.
+
+    Provisional (#1074): a Kiro terminal whose identity CAO has not verified
+    (``terminal_service.terminal_input_refusal``) gets output but no input. The
+    attach is accepted, its output is forwarded, and each ``input`` frame is
+    re-checked and dropped while the terminal is refused, so typing starts once
+    its identity check passes. The attach is refused before accept, with 4409,
+    only when CAO itself already reclaimed that untrusted runtime: an attach by
+    the row's session and window names could then only reach another window.
     """
     # Reject connections from clients outside the configured allowlist.
     # Defaults to loopback; operators running cao-server inside a container can
@@ -8980,9 +9057,25 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             await websocket.close(code=4401, reason="Unauthorized")
             return
 
+    # The row, and whether input to it is refused, read off the loop before
+    # accept (#1074).
+    metadata, input_refusal = await asyncio.to_thread(_ws_input_refusal, terminal_id)
+    if (
+        metadata
+        and metadata.get("provider") == ProviderType.KIRO_CLI.value
+        and input_refusal is not None
+        and input_refusal.reason == TerminalInputBlockedReason.INIT_FAILED
+        and metadata.get("deferred_init_runtime_reclaimed")
+    ):
+        logger.warning(
+            "Rejected WebSocket attach for terminal %r: its untrusted runtime was reclaimed",
+            terminal_id,
+        )
+        await websocket.close(code=4409, reason="Terminal runtime was reclaimed")
+        return
+
     await websocket.accept()
 
-    metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         await websocket.close(code=4004, reason="Terminal not found")
         return
@@ -9076,6 +9169,38 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             except (Exception, asyncio.CancelledError):
                 break
 
+    # A terminal trusted at attach time is never re-checked; one that is not has
+    # each input frame re-checked until it passes, and trust only moves one way.
+    input_trusted = input_refusal is None
+    input_drop_logged = False
+
+    async def _input_allowed() -> bool:
+        nonlocal input_trusted, input_drop_logged
+        if input_trusted:
+            return True
+        try:
+            row, refusal = await asyncio.to_thread(_ws_input_refusal, terminal_id)
+        except Exception:  # noqa: BLE001 — an unreadable row is not a trusted one
+            reason = "check_failed"
+        else:
+            if row and refusal is None:
+                input_trusted = True
+                return True
+            reason = (
+                refusal.reason.value
+                if refusal is not None and refusal.reason is not None
+                else "terminal_not_found"
+            )
+        if not input_drop_logged:
+            input_drop_logged = True
+            logger.warning(
+                "Dropping WebSocket input for terminal %r until its Kiro identity is "
+                "verified (%s)",
+                terminal_id,
+                reason,
+            )
+        return False
+
     async def _forward_input():
         """Receive from WebSocket and write to PTY."""
         try:
@@ -9083,6 +9208,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                 msg = await websocket.receive_text()
                 payload = json.loads(msg)
                 if payload.get("type") == "input":
+                    if not await _input_allowed():
+                        # Dropped: zero bytes reach the PTY (#1074).
+                        continue
                     raw = payload["data"].encode()
                     # Write in chunks to avoid overflowing the PTY buffer
                     chunk_size = 1024

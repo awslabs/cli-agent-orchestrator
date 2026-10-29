@@ -54,7 +54,7 @@ export function AgentDescription({ id, description, onSaved, className = '' }: {
             if (event.key === 'Enter') { event.preventDefault(); void save() }
             if (event.key === 'Escape') { event.preventDefault(); cancel() }
           }}
-          className="min-w-0 flex-1 bg-gray-900 border border-gray-600 rounded px-2 py-1 focus:outline-none focus:border-emerald-500" />
+          className="min-w-0 flex-1 bg-gray-900 border border-gray-600 rounded-sm px-2 py-1 focus:outline-hidden focus:border-emerald-500" />
         <button disabled={pending} onClick={() => void save()} className="text-emerald-400 disabled:opacity-40">{pending ? 'Saving...' : 'Save'}</button>
         <button disabled={pending} onClick={cancel}>Cancel</button>
       </div>
@@ -62,7 +62,7 @@ export function AgentDescription({ id, description, onSaved, className = '' }: {
     </> : <div className="flex items-center gap-2 min-w-0">
       {description && <span className="truncate min-w-0" title={description}>{description}</span>}
       <button aria-label="Edit agent description" title="Edit agent description"
-        className="shrink-0 p-1 text-gray-500 hover:text-gray-200 focus-visible:outline focus-visible:outline-emerald-500"
+        className="shrink-0 p-1 text-gray-500 hover:text-gray-200 focus-visible:outline-solid focus-visible:outline-emerald-500"
         onClick={() => { setDraft(description || ''); setError(''); setEditing(true) }}><Pencil size={10} /></button>
     </div>}
   </div>

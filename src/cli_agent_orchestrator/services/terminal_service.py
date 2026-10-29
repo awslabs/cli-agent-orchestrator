@@ -59,10 +59,12 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    mark_terminal_identity_verified,
     terminal_id_in_use,
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
+    update_terminal_deferred_init_runtime_reclaimed,
     update_terminal_description,
     update_terminal_group,
     update_terminal_initial_delivery,
@@ -110,6 +112,8 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
+from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
 from cli_agent_orchestrator.services import ephemeral_service, worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
@@ -121,6 +125,7 @@ from cli_agent_orchestrator.services.install_service import (
     installed_kiro_tools,
     installed_opencode_permission,
     kiro_install_predates_native_enforcement,
+    require_kiro_agent_resolves,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
     memory_context_for_terminal,
@@ -405,6 +410,32 @@ def _clear_deferred_init_external_owner_active(terminal_id: str) -> None:
 def _is_deferred_init_external_owner_active(terminal_id: str) -> bool:
     with _active_deferred_init_external_owner_lock:
         return terminal_id in _active_deferred_init_external_owner_ids
+
+
+# Kiro terminals whose initialize() and identity-marker write are running in THIS
+# process (#1074). While a kiro_cli row still reads identity_verified=False, input
+# to it is refused either way; this set only decides whether the refusal is
+# transient (init still running here, so the inbox keeps the message pending) or
+# permanent (init ended without the record). Added at the same pre-insert fence
+# as the external-owner set above, for both the synchronous and the deferred
+# path, and released after the marker write or whenever that init ends.
+_identity_check_in_flight_ids: set[str] = set()
+_identity_check_in_flight_lock = threading.RLock()
+
+
+def _mark_identity_check_in_flight(terminal_id: str) -> None:
+    with _identity_check_in_flight_lock:
+        _identity_check_in_flight_ids.add(terminal_id)
+
+
+def _clear_identity_check_in_flight(terminal_id: str) -> None:
+    with _identity_check_in_flight_lock:
+        _identity_check_in_flight_ids.discard(terminal_id)
+
+
+def _is_identity_check_in_flight(terminal_id: str) -> bool:
+    with _identity_check_in_flight_lock:
+        return terminal_id in _identity_check_in_flight_ids
 
 
 def inject_memory_context(
@@ -774,6 +805,7 @@ def _roll_back_failed_create(
     """
     if terminal_id is not None:
         _clear_deferred_init_external_owner_active(terminal_id)
+        _clear_identity_check_in_flight(terminal_id)
         try:
             fifo_manager.stop_reader(terminal_id)
         except Exception:
@@ -1881,8 +1913,10 @@ async def _create_terminal_unguarded(
                 # No readable agent file with a `tools` list: on Kiro the installed
                 # file IS the policy, so the server cannot say what this launch
                 # would run. A bounded create fails closed here rather than
-                # skipping the check; the operator path is untouched (Kiro would
-                # fail to start the agent anyway, this just names the reason).
+                # skipping the check. Kiro itself would NOT fail on a missing
+                # agent: it starts its built-in kiro_default with every built-in
+                # tool (#1074). Unbounded and operator launches are covered by
+                # Step 1c's agent check and the provider's header identity check.
                 raise InstalledPolicyExceedsAllowlistError(
                     f"Delegation refused: no installed Kiro agent file with a `tools` list "
                     f"was found for '{agent_profile}', so the policy this bounded launch "
@@ -2018,6 +2052,23 @@ async def _create_terminal_unguarded(
         # (defeating the isolation #100 provides) and persist that stale path as the
         # terminal's working_directory. This is the effective launch cwd either way.
         resolved_working_directory = _resolve_working_directory(working_directory)
+
+        # Step 1c: a Kiro launch must name an agent kiro-cli will load. kiro-cli
+        # does not refuse an unknown --agent; it starts its built-in kiro_default
+        # with every built-in tool (#1074). Refused here, before any window or
+        # row exists, from the launch cwd (workspace agents live under it). The
+        # provider re-checks the pane header before any task is typed.
+        # Provisional (#1074): installed launches refuse rather than warn.
+        if provider == ProviderType.KIRO_CLI.value:
+            # A window joining an existing session launches with the session env
+            # under the per-launch env (Step 3c), so a forwarded KIRO_HOME there
+            # counts here too. Off the loop: a miss parses every agent file.
+            check_env = (
+                env_vars if new_session else {**get_session_env(session_name), **(env_vars or {})}
+            )
+            await asyncio.to_thread(
+                require_kiro_agent_resolves, agent_profile, resolved_working_directory, check_env
+            )
 
         # Normalize the session name BEFORE anything keys off it: the lifecycle
         # lock below is per session NAME, so it must be taken on the SAME string
@@ -2208,6 +2259,15 @@ async def _create_terminal_unguarded(
                         # mistakes this process's live initialization for a
                         # crash-stranded row from the previous process.
                         _mark_deferred_init_external_owner_active(terminal_id)
+                if provider == ProviderType.KIRO_CLI.value:
+                    # Same fence, both paths (#1074): the row becomes visible
+                    # reading identity_verified=False, and until this process
+                    # records the check (or the init ends) an input to it is
+                    # refused as pending, not as failed. The id was already
+                    # allocated and checked against live and retained records
+                    # (Step 1, #1088), so this never marks a candidate the
+                    # allocator rejects, nor one another terminal still holds.
+                    _mark_identity_check_in_flight(terminal_id)
 
                 # From here the backend resource EXISTS, so every remaining step
                 # is guarded: on failure the resource is rolled back under this
@@ -2258,6 +2318,13 @@ async def _create_terminal_unguarded(
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
                         delegate_tools=delegate_tools,
+                        # Written False with every Kiro row, in this same INSERT
+                        # (#1074): no write is needed later to refuse input to a
+                        # pane whose identity check never passed. Other providers
+                        # store NULL.
+                        identity_verified=(
+                            False if provider == ProviderType.KIRO_CLI.value else None
+                        ),
                         # The initial message is ACCEPTED the moment this row is
                         # visible, so its outcome starts life as pending in the same
                         # transaction (#566): a restart between here and the deferred
@@ -2271,6 +2338,7 @@ async def _create_terminal_unguarded(
                     )
                 except BaseException:
                     _clear_deferred_init_external_owner_active(terminal_id)
+                    _clear_identity_check_in_flight(terminal_id)
                     _roll_back_backend_create_locked(
                         session_name,
                         created_window_name,
@@ -2307,6 +2375,7 @@ async def _create_terminal_unguarded(
                     # ORIGINAL cancellation is re-raised below either way.
                     pass
             _clear_deferred_init_external_owner_active(terminal_id)
+            _clear_identity_check_in_flight(terminal_id)
             raise
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -2390,16 +2459,29 @@ async def _create_terminal_unguarded(
                 registry,
                 initial_caller_id=caller_id,
                 delete_on_failure=deferred_delete_on_failure,
+                provider=provider,
                 **launch_options,
             )
             # A handful of unit/integration seams patch the private scheduler
             # with a non-Task mock. Production always returns an asyncio.Task;
-            # if the seam replaced it, release the pre-insert fence here so one
+            # if the seam replaced it, release the pre-insert fences here so one
             # test cannot leak process-local recovery state into another.
-            if deferred_delete_on_failure is False and not isinstance(deferred_task, asyncio.Task):
-                _clear_deferred_init_external_owner_active(terminal_id)
+            if not isinstance(deferred_task, asyncio.Task):
+                _clear_identity_check_in_flight(terminal_id)
+                if deferred_delete_on_failure is False:
+                    _clear_deferred_init_external_owner_active(terminal_id)
         else:
-            await provider_instance.initialize()
+            try:
+                await provider_instance.initialize()
+                if provider == ProviderType.KIRO_CLI.value:
+                    # Before the create returns and before anything else is
+                    # written for it: the row reads False until this succeeds,
+                    # and a failure here fails the create (#1074).
+                    await _record_kiro_identity_verified(terminal_id, provider_instance)
+            finally:
+                # Init has ended in this process, verified or not: any later
+                # refusal of an unverified row is permanent.
+                _clear_identity_check_in_flight(terminal_id)
 
             # Persist shell_command baseline if the provider captured one
             shell_command = provider_instance.shell_baseline
@@ -2755,6 +2837,78 @@ def get_deferred_init_failure(terminal_id: str, candidate: Any = None) -> dict[s
     return _read_deferred_failure_fallback(terminal_id)
 
 
+def terminal_input_refusal(
+    terminal_id: str, metadata: dict[str, Any]
+) -> TerminalInputBlockedError | None:
+    """The refusal for typed input to this terminal, or None to accept it (#1074).
+
+    Provisional (#1074): a ``kiro_cli`` terminal takes input only when its row
+    records that its identity check passed (``identity_verified`` True). CAO
+    grants that trust from the positive record; it never infers it from a
+    missing failure record. So a pane still initializing, one whose init timed
+    out or was interrupted by a server restart before its header was read, and
+    one whose every failure record was lost all stay refused. The refusal is
+    transient (``IDENTITY_PENDING``) only while this process is still
+    initializing the terminal and no failure is recorded, and permanent
+    (``INIT_FAILED``) otherwise. Trust moves only from False to True, so a pane
+    verified before it failed (a restart during its initial delivery) accepts
+    the re-send.
+
+    A row from before the column (``identity_verified`` None) is grandfathered
+    unless it carries a durable failure, in the DB or the fallback sidecar.
+    Provisional (#1074): main never verified a Kiro pane, so refusing these
+    would break every Kiro worker running across an upgrade.
+
+    ``metadata`` is the caller's read of the row, which can be older than the
+    record: ``_record_kiro_identity_verified`` commits True and only then
+    releases the in-flight mark. So before a permanent refusal the row is read
+    again, and a row that now records a passed check is accepted, as any
+    verified row is; otherwise a delivery racing the record would fail for good.
+
+    Never decides on the failure's ``exception_type``, ``kind`` or
+    ``untrusted_runtime``; ``kind`` only names the failure in the message.
+    Other providers are not gated here. Reads the fallback sidecar and, on the
+    permanent path, the row, so it is blocking I/O: async callers to_thread it.
+    """
+    if metadata.get("provider") != ProviderType.KIRO_CLI.value:
+        return None
+    verified = metadata.get("identity_verified")
+    if verified is True:
+        return None
+    failure = get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
+    if failure is None:
+        if verified is None:
+            return None
+        if _is_identity_check_in_flight(terminal_id):
+            return TerminalInputBlockedError(
+                f"Terminal {terminal_id} has not passed its Kiro identity check yet. "
+                "Retry when it is ready.",
+                reason=TerminalInputBlockedReason.IDENTITY_PENDING,
+            )
+        kind = "identity_unverified"
+    else:
+        kind = failure.get("kind") or "unknown"
+    if _identity_verified_now(terminal_id):
+        return None
+    return ProviderExitedInputBlockedError(
+        f"Terminal {terminal_id} failed deferred initialization ({kind}). "
+        "Refusing to deliver input.",
+        reason=TerminalInputBlockedReason.INIT_FAILED,
+    )
+
+
+def _identity_verified_now(terminal_id: str) -> bool:
+    """True when a fresh read of the row records a passed Kiro identity check (#1074)."""
+    try:
+        fresh = get_terminal_metadata(terminal_id)
+    except Exception as exc:  # noqa: BLE001 - an unread row is not trust
+        logger.warning(
+            "Terminal %s: could not re-read its row before refusing input: %s", terminal_id, exc
+        )
+        return False
+    return fresh is not None and fresh.get("identity_verified") is True
+
+
 def _delete_deferred_failure_fallback(terminal_id: str) -> None:
     try:
         _deferred_failure_fallback_path(terminal_id).unlink(missing_ok=True)
@@ -3022,6 +3176,56 @@ async def _clear_deferred_init_external_owner(terminal_id: str) -> None:
     await asyncio.to_thread(_publish_deferred_init_complete_fallback, terminal_id)
 
 
+class KiroIdentityNotRecordedError(RuntimeError):
+    """CAO could not durably record that a Kiro runtime passed its identity check (#1074).
+
+    The create fails: a pane CAO cannot record as verified is not trusted with
+    input, so there is no fallback record for the positive marker.
+    """
+
+
+async def _record_kiro_identity_verified(terminal_id: str, provider_instance: Any) -> None:
+    """Write ``identity_verified`` True once the provider's header check passed (#1074).
+
+    The evidence is the provider's own ``identity_verified`` flag, which only
+    its header check sets; ``initialize()`` returning is not evidence. The
+    write is retried as ``_clear_deferred_init_external_owner`` retries; if the
+    row is gone or the retries run out, this raises and the create fails. On
+    success the terminal leaves the in-flight set.
+    """
+    if getattr(provider_instance, "identity_verified", False) is not True:
+        raise KiroIdentityNotRecordedError(
+            f"Terminal {terminal_id}: kiro-cli started, but its provider did not report "
+            "a passed agent identity check, so CAO does not trust it. No task was sent."
+        )
+    for attempt in range(1, _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS + 1):
+        try:
+            recorded = await asyncio.to_thread(mark_terminal_identity_verified, terminal_id)
+        except Exception as exc:  # noqa: BLE001 — retry a transient DB failure
+            logger.warning(
+                "Kiro identity record attempt %d/%d for %s failed: %s",
+                attempt,
+                _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS,
+                terminal_id,
+                exc,
+            )
+        else:
+            if not recorded:
+                # The query succeeded and the row is gone: a concurrent DELETE.
+                raise KiroIdentityNotRecordedError(
+                    f"Terminal {terminal_id} was deleted before its Kiro identity "
+                    "check could be recorded."
+                )
+            _clear_identity_check_in_flight(terminal_id)
+            return
+        if attempt < _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS:
+            await asyncio.sleep(0.05 * attempt)
+    raise KiroIdentityNotRecordedError(
+        f"Terminal {terminal_id}: its Kiro agent identity check passed, but CAO could not "
+        "record it, so it does not trust the pane. No task was sent."
+    )
+
+
 async def recover_interrupted_deferred_init_external_owners() -> bool:
     """Turn restart-stranded external deferred inits into durable failures.
 
@@ -3071,6 +3275,8 @@ async def recover_interrupted_deferred_init_external_owners() -> bool:
         if _has_deferred_init_complete_fallback(terminal_id):
             await _clear_deferred_init_external_owner(terminal_id)
             continue
+        # The reclaim decision is read from the row (#1074): a Kiro row that
+        # never recorded its identity check is reclaimed like a refusal.
         await _surface_deferred_init_failure(
             terminal_id,
             kind="interrupted_init",
@@ -3081,6 +3287,7 @@ async def recover_interrupted_deferred_init_external_owners() -> bool:
             exception_type="ServerRestart",
             registry=None,
             delete_on_failure=False,
+            provider_hint=metadata.get("provider"),
         )
     return complete_scan
 
@@ -3192,13 +3399,21 @@ async def recover_interrupted_initial_deliveries() -> bool:
                 get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
                 is None
             ):
-                await asyncio.to_thread(
+                # The same decision _surface_deferred_init_failure makes, from
+                # this row (#1074). This sweep still neither notifies nor deletes.
+                untrusted = _runtime_untrusted_from_row(metadata)
+                persisted = await asyncio.to_thread(
                     _persist_deferred_init_failure,
                     terminal_id,
                     kind="interrupted_init",
                     message=message,
                     exception_type="ServerRestart",
+                    untrusted_runtime=untrusted,
                 )
+                if persisted is not None and untrusted:
+                    # After the failure is on the row, so the window is closed by
+                    # exact terminal identity, never by its reusable name.
+                    await asyncio.to_thread(_reclaim_deferred_failure_runtime, terminal_id)
         except Exception as exc:  # noqa: BLE001 — retry on the next pass
             complete = False
             logger.warning(
@@ -3212,14 +3427,20 @@ def _persist_deferred_init_failure(
     *,
     kind: str,
     message: str,
+    untrusted_runtime: bool,
     exception_type: str | None = None,
 ) -> dict[str, Any] | None:
-    """Persist one server-owned deferred-init failure outside consumer metadata."""
+    """Persist one server-owned deferred-init failure outside consumer metadata.
 
-    failure = {
+    ``untrusted_runtime`` records the reclaim decision (#1074) for clients; the
+    input gate reads the terminal's ``identity_verified``, never this field.
+    """
+
+    failure: dict[str, Any] = {
         "phase": "deferred_init",
         "kind": str(kind),
         "message": _sanitize_deferred_failure_message(message),
+        "untrusted_runtime": bool(untrusted_runtime),
     }
     if exception_type:
         failure["exception_type"] = str(exception_type)
@@ -3227,6 +3448,88 @@ def _persist_deferred_init_failure(
         return None
     _delete_deferred_failure_fallback(terminal_id)
     return failure
+
+
+def _runtime_untrusted_from_row(metadata: dict[str, Any]) -> bool:
+    """The reclaim decision for a failure on this row (#1074).
+
+    True for a ``kiro_cli`` runtime whose row records that its identity check
+    has not passed (``identity_verified`` False): CAO wrote that row, and did
+    not verify which agent the pane is running. A row from before the column
+    (``identity_verified`` None) keeps its window, as live legacy rows are
+    grandfathered; once it carries a failure, input to it is still refused.
+    Provisional (#1074).
+    """
+    return (
+        metadata.get("provider") == ProviderType.KIRO_CLI.value
+        and metadata.get("identity_verified") is False
+    )
+
+
+def _deferred_failure_runtime_untrusted(terminal_id: str, provider_hint: str | None) -> bool:
+    """Decide once, before a failure is persisted, whether its runtime is untrusted.
+
+    From the row (``_runtime_untrusted_from_row``). When the row cannot be read,
+    the caller's provider hint stands in and the identity counts as not
+    verified. Blocking DB I/O: callers to_thread it.
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+    except Exception as exc:  # noqa: BLE001 — a DB outage must not trust the runtime
+        logger.warning(
+            "Deferred-init failure %s: could not read its row for the reclaim decision: %s",
+            terminal_id,
+            exc,
+        )
+        metadata = None
+    if metadata:
+        return _runtime_untrusted_from_row(metadata)
+    return provider_hint == ProviderType.KIRO_CLI.value
+
+
+def _reclaim_deferred_failure_runtime(terminal_id: str) -> bool:
+    """Close a failed deferred-init terminal's window and runtime; keep its row.
+
+    The tombstone reclaim the herdr reconciler runs for a pane that already
+    ended, with the window close included. The row carries its failure or the
+    creation-time external-owner bit, so ``dismantle_terminal_runtime`` closes
+    the window by exact terminal identity, never by its reusable name. On
+    success the row is marked ``deferred_init_runtime_reclaimed`` and stays as
+    the durable failure surface. Blocking tmux/DB I/O: callers to_thread it.
+
+    Returns False when the runtime could not be proven gone; the row is then
+    left unmarked, so a later delete retries the close, and ``dispatch_input``
+    refuses input to it meanwhile.
+    """
+    try:
+        # As the CAO-owned path does (_notify_caller_of_deferred_failure), release
+        # any ephemeral binding with the failure's reason first: the first
+        # release wins. Then snapshot the scrollback while the pane exists, and
+        # dismantle.
+        ephemeral_service.release(terminal_id, "launch_failed")
+        metadata = capture_terminal_snapshot(terminal_id)
+        if not metadata:
+            # The row is gone: a concurrent DELETE owns the teardown now.
+            return False
+        if not dismantle_terminal_runtime(terminal_id, metadata, kill_window=True):
+            logger.warning(
+                "Deferred-init failure %s: runtime reclaim deferred; its row is retained "
+                "and input to it is refused",
+                terminal_id,
+            )
+            return False
+        if not update_terminal_deferred_init_runtime_reclaimed(terminal_id, True):
+            return False
+    except Exception as exc:  # noqa: BLE001 — the failure record must survive a failed reclaim
+        logger.warning(
+            "Deferred-init failure %s: runtime reclaim failed; its row is retained and "
+            "input to it is refused: %s",
+            terminal_id,
+            exc,
+        )
+        return False
+    logger.info("Deferred-init failure %s: window closed, failure record retained", terminal_id)
+    return True
 
 
 async def _surface_deferred_init_failure(
@@ -3237,12 +3540,24 @@ async def _surface_deferred_init_failure(
     registry: PluginRegistry | None,
     exception_type: str | None = None,
     delete_on_failure: bool | None = None,
+    provider_hint: str | None = None,
 ) -> bool:
     """Persist/notify one init failure and apply lifecycle ownership.
 
     Returns True when CAO owns teardown, False when an external observer owns
     the retained terminal. Failure metadata is written before either branch so
     GET /terminals can remain an authoritative error surface across restarts.
+
+    A Kiro runtime whose identity CAO did not durably verify must not outlive
+    its failure even when an external observer owns the row (#1074): it may be
+    kiro-cli's kiro_default fallback, with every built-in tool and its
+    trust-all-tools consent accepted. That decision is made once, here, from the
+    row (``provider_hint`` stands in when the row cannot be read), and recorded
+    in the failure as ``untrusted_runtime``. Such a runtime has its window
+    closed and its runtime dismantled, and only the failure row is retained.
+    CAO-owned teardown already closes the window. Provisional (#1074): a Kiro
+    pane verified before it failed, and every other provider's failure, keep
+    their runtime for the owner, as before.
     """
 
     delete_worker = (
@@ -3250,12 +3565,16 @@ async def _surface_deferred_init_failure(
         if delete_on_failure is not None
         else await asyncio.to_thread(_deferred_failure_delete_worker, terminal_id)
     )
+    untrusted = await asyncio.to_thread(
+        _deferred_failure_runtime_untrusted, terminal_id, provider_hint
+    )
     persisted = False
     terminal_missing = False
-    failure_payload = {
+    failure_payload: dict[str, Any] = {
         "phase": "deferred_init",
         "kind": str(kind),
         "message": _sanitize_deferred_failure_message(message),
+        "untrusted_runtime": untrusted,
     }
     if exception_type:
         failure_payload["exception_type"] = str(exception_type)
@@ -3267,6 +3586,7 @@ async def _surface_deferred_init_failure(
                 kind=kind,
                 message=message,
                 exception_type=exception_type,
+                untrusted_runtime=untrusted,
             )
             persisted = failure is not None
             if persisted:
@@ -3299,6 +3619,12 @@ async def _surface_deferred_init_failure(
             await asyncio.to_thread(
                 _publish_deferred_failure_fallback, terminal_id, failure_payload
             )
+    # Close an untrusted runtime first, now that the row carries the failure (or
+    # the creation-time external-owner bit) and so is closed by exact terminal
+    # identity, never by its reusable name.
+    reclaimed: bool | None = None
+    if untrusted and not delete_worker and not terminal_missing:
+        reclaimed = await asyncio.to_thread(_reclaim_deferred_failure_runtime, terminal_id)
     # The initial message (if this terminal had one) is now known not to have
     # been delivered; settle its durable outcome alongside the failure marker
     # so a client waiting on initial_delivery stops with the reason (#566).
@@ -3309,6 +3635,19 @@ async def _surface_deferred_init_failure(
     notification = _sanitize_deferred_failure_message(message)
     if delete_worker:
         notification += " The failed worker terminal will be torn down."
+    elif reclaimed:
+        notification += (
+            " CAO had not verified its Kiro agent identity when initialization ended, so "
+            "its window was closed; the failure record is retained for its external "
+            "lifecycle owner."
+        )
+    elif reclaimed is False:
+        notification += (
+            " CAO had not verified its Kiro agent identity when initialization ended, and "
+            "closing its window could not be confirmed; input to it is refused. The "
+            "failure record is retained for its external lifecycle owner; deleting the "
+            "terminal closes the window."
+        )
     else:
         notification += " The failed worker terminal is retained for its external lifecycle owner."
     await asyncio.to_thread(
@@ -3862,9 +4201,16 @@ def _schedule_deferred_init(
     initial_caller_id: Optional[str] = None,
     delete_on_failure: bool | None = None,
     launch_plan: "LaunchPlan | None" = None,
+    provider: Optional[str] = None,
 ) -> asyncio.Task | None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via dispatch_input.
+
+    ``provider`` is the terminal's provider type (create_terminal passes it).
+    For ``kiro_cli`` the passed identity check is recorded on the row right
+    after ``initialize()`` returns and before the initial message is typed
+    (#1074). A direct caller that leaves it out gets the same for a
+    ``KiroCliProvider`` instance.
 
     Runs as an asyncio task on the running event loop so it doesn't block
     the caller. Because assign() has already returned success=True by the
@@ -3878,6 +4224,13 @@ def _schedule_deferred_init(
     answerable via answer_user_prompt, so we leave it in place and only log.
     """
 
+    is_kiro = (
+        provider == ProviderType.KIRO_CLI.value
+        if provider is not None
+        else isinstance(provider_instance, KiroCliProvider)
+    )
+    provider_hint = ProviderType.KIRO_CLI.value if is_kiro else provider
+
     async def _run() -> None:
         caller_id: Optional[str] = initial_caller_id
         # Whether the first dispatch_input() returned, i.e. the task was pasted
@@ -3888,6 +4241,11 @@ def _schedule_deferred_init(
         task_dispatched = False
         try:
             await provider_instance.initialize()
+            if is_kiro:
+                # Before anything else is written for this terminal and before
+                # the initial dispatch_input: until this succeeds the row reads
+                # False and no input reaches the pane (#1074).
+                await _record_kiro_identity_verified(terminal_id, provider_instance)
             shell_command = provider_instance.shell_baseline
             if isinstance(shell_command, str) and shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
@@ -4172,6 +4530,12 @@ def _schedule_deferred_init(
                 e,
                 exc_info=True,
             )
+            # Whether the runtime is reclaimed is decided from the row, not from
+            # this exception's class (#1074): a Kiro pane whose identity check
+            # never passed (a refusal, a timeout before the header was read, a
+            # failed marker write) is untrusted whatever ended its init. Only
+            # this path passes the provider hint, for a row that cannot be read:
+            # the other failures above happen after the check was recorded.
             await _surface_deferred_init_failure(
                 terminal_id,
                 kind="provider_init_error",
@@ -4179,6 +4543,7 @@ def _schedule_deferred_init(
                 exception_type=type(e).__name__,
                 registry=registry,
                 delete_on_failure=delete_on_failure,
+                provider_hint=provider_hint,
             )
         finally:
             # The single release point for every path, and on the happy path the
@@ -4193,12 +4558,16 @@ def _schedule_deferred_init(
             # to see it), the worker never starting after all resubmits, or the
             # loop being torn down. Idempotent, so double-clearing is harmless.
             _clear_initial_delivery_pending(terminal_id)
+            # Init has ended in this process: an unverified Kiro row is now
+            # refused permanently, not as pending (#1074).
+            _clear_identity_check_in_flight(terminal_id)
 
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
         _clear_deferred_init_external_owner_active(terminal_id)
+        _clear_identity_check_in_flight(terminal_id)
         return None
     # Mirrors _run's own ``if initial_message`` condition: defer_init is also used
     # with no message at all (see the create_terminal call site), and there is
@@ -4244,23 +4613,34 @@ def _schedule_deferred_init(
         # call does not own.
         if initial_message:
             _clear_initial_delivery_pending(terminal_id)
+        _clear_identity_check_in_flight(terminal_id)
         raise
     if delete_on_failure is False:
         # Direct callers of this private scheduler may not have come through
         # create_terminal's pre-insert fence. Marking again is idempotent.
         _mark_deferred_init_external_owner_active(terminal_id)
+    if is_kiro:
+        # The same for the identity check, so a direct caller's input during
+        # init is refused as pending. Idempotent.
+        _mark_identity_check_in_flight(terminal_id)
     _deferred_init_tasks.add(task)
 
     def _on_done(done_task: asyncio.Task) -> None:
         _deferred_init_tasks.discard(done_task)
         _clear_deferred_init_external_owner_active(terminal_id)
+        # A task cancelled before its first step never reaches _run's finally.
+        _clear_identity_check_in_flight(terminal_id)
 
     task.add_done_callback(_on_done)
     return task
 
 
 def memory_sidecar_refusal(
-    primary: Terminal, *, provider: str, sidecar_profile: str = "memory_manager"
+    primary: Terminal,
+    *,
+    provider: str,
+    sidecar_profile: str = "memory_manager",
+    working_directory: Optional[str] = None,
 ) -> Optional[str]:
     """Why the ``memory_manager`` sidecar would be refused under ``primary``, or ``None``.
 
@@ -4276,7 +4656,31 @@ def memory_sidecar_refusal(
     also when the primary's ceiling is not readable from the response (no
     ``delegate_tools`` and no ``allowed_tools``): then the create itself decides
     and logs, exactly as before.
+
+    On ``kiro_cli`` the create's Step 1c agent check is asked too, from the
+    sidecar's ``working_directory`` and the primary session's env, as the create
+    would run it (#1074). Blocking file I/O: callers to_thread it.
     """
+    refusal = _memory_sidecar_ceiling_refusal(primary, sidecar_profile)
+    if refusal is None and provider == ProviderType.KIRO_CLI.value:
+        try:
+            require_kiro_agent_resolves(
+                sidecar_profile,
+                _resolve_working_directory(working_directory),
+                get_session_env(primary.session_name),
+            )
+        except KiroAgentIdentityError as exc:
+            refusal = (
+                f"{exc} The memory_manager sidecar (`cao launch --memory`, "
+                "memory_manager=true) was not launched."
+            )
+        except Exception:  # noqa: BLE001  (an unusable cwd is the create's problem)
+            return None
+    return refusal
+
+
+def _memory_sidecar_ceiling_refusal(primary: Terminal, sidecar_profile: str) -> Optional[str]:
+    """The delegation-ceiling half of ``memory_sidecar_refusal``."""
     ceiling = (
         primary.delegate_tools if primary.delegate_tools is not None else primary.allowed_tools
     )
@@ -4677,6 +5081,15 @@ def dispatch_input(
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        # A Kiro terminal is typed into only once its row records that its
+        # identity check passed (#1074). Until then the pane may be kiro-cli's
+        # kiro_default fallback, with every built-in tool and trust-all-tools
+        # accepted, sitting at a perfectly ordinary IDLE. This reads the durable
+        # row, not the monitor's in-memory status. See terminal_input_refusal.
+        refusal = terminal_input_refusal(terminal_id, metadata)
+        if refusal is not None:
+            raise refusal
+
         if (
             metadata.get("provider") == ProviderType.KIRO_CLI.value
             and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
@@ -4879,6 +5292,13 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        # The same gate as dispatch_input (#1074): a special key is still typed
+        # input (``/key`` accepts single characters, Space and Enter), and
+        # ``/key``, MCP answer_user_prompt and the AG-UI path all reach here.
+        refusal = terminal_input_refusal(terminal_id, metadata)
+        if refusal is not None:
+            raise refusal
 
         # Arm StatusMonitor stickiness: special keys (Enter on a permission
         # prompt, C-c interrupting work, C-d sending EOF) all initiate a new

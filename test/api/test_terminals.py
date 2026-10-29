@@ -328,6 +328,115 @@ class TestTerminalCreationWithWorkingDirectory:
         [
             ("/sessions", "session_service.create_session"),
             ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
+            ("/sessions/test-session/terminals:operator", "terminal_service.create_terminal"),
+        ],
+    )
+    @pytest.mark.parametrize("kind", ["agent_not_found", "identity_mismatch"])
+    def test_kiro_agent_identity_refusal_is_a_bad_request(self, client, endpoint, target, kind):
+        """A Kiro launch whose agent kiro-cli would not run (#1074) is a configuration
+        refusal: 400 with the remedy, not the 404 the generic ValueError arm gives."""
+        from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
+        refusal = KiroAgentIdentityError(
+            kind, "analyst", "Kiro agent 'analyst' ... `cao install analyst --provider kiro_cli`"
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(f"cli_agent_orchestrator.api.main.{target}", new=AsyncMock(side_effect=refusal)),
+        ):
+            params = {"provider": "kiro_cli", "agent_profile": "analyst"}
+            if endpoint.endswith("/terminals"):
+                params["caller_id"] = "dcba8765"  # the in-session route requires one
+            response = client.post(endpoint, params=params)
+
+        assert response.status_code == 400, response.text
+        assert "cao install analyst" in response.json()["detail"]
+
+    def test_an_agent_not_found_body_names_no_server_path(self, client, tmp_path):
+        """The real refusal's text is the 400 body: the remedy, not the directories
+        searched, which only the server log gets (#1074; shared-server mode)."""
+        from cli_agent_orchestrator.providers.kiro_identity import (
+            KiroAgentIdentityError,
+            require_kiro_agent_defined,
+        )
+
+        searched = [tmp_path / "repo" / ".kiro" / "agents", tmp_path / "home" / ".kiro" / "agents"]
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            require_kiro_agent_defined("analyst", searched)
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.create_session",
+                new=AsyncMock(side_effect=excinfo.value),
+            ),
+        ):
+            response = client.post(
+                "/sessions", params={"provider": "kiro_cli", "agent_profile": "analyst"}
+            )
+
+        assert response.status_code == 400, response.text
+        detail = response.json()["detail"]
+        assert "cao install analyst --provider kiro_cli" in detail
+        assert str(tmp_path) not in detail
+
+    @pytest.mark.parametrize("kind", ["agent_not_found", "identity_mismatch"])
+    def test_kiro_agent_identity_refusal_is_a_bad_request_on_run_step(self, client, kind):
+        """run-step maps the refusal ahead of its generic ValueError arm too (#1074)."""
+        from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
+        refusal = KiroAgentIdentityError(
+            kind, "analyst", "Kiro agent 'analyst' ... `cao install analyst --provider kiro_cli`"
+        )
+        with patch(
+            "cli_agent_orchestrator.api.main.run_agent_step",
+            new=AsyncMock(side_effect=refusal),
+        ):
+            response = client.post(
+                "/terminals/run-step",
+                json={"provider": "kiro_cli", "agent": "analyst", "prompt": "do it"},
+            )
+
+        assert response.status_code == 400, response.text
+        assert "cao install analyst" in response.json()["detail"]
+
+    def test_input_to_a_terminal_with_a_deferred_init_failure_is_a_conflict(self, client):
+        """POST /terminals/{id}/input refuses a terminal whose deferred init failed
+        durably (#1074): 409, and no key reaches the pane."""
+        metadata = {
+            "id": "abcd1234",
+            "provider": "kiro_cli",
+            "tmux_session": "cao-s",
+            "tmux_window": "developer-w",
+            "deferred_init_failure": {
+                "phase": "deferred_init",
+                "kind": "provider_init_error",
+                "exception_type": "KiroAgentIdentityError",
+            },
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.get_backend") as backend,
+        ):
+            response = client.post("/terminals/abcd1234/input", params={"message": "SEND-CANARY"})
+
+        assert response.status_code == 409, response.text
+        assert "deferred initialization" in response.json()["detail"]
+        backend.return_value.send_keys.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "endpoint,target",
+        [
+            ("/sessions", "session_service.create_session"),
+            ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
         ],
     )
     def test_kiro_policy_path_refusal_is_a_bad_request(
@@ -639,6 +748,22 @@ class TestExitTerminalEndpoint:
 
             assert response.status_code == 500
             assert "Failed to exit terminal" in response.json()["detail"]
+
+    def test_exit_terminal_input_blocked_maps_to_409_not_500(self, client):
+        """A text exit command going through dispatch_input's refusal (#1074) is
+        a conflict with the terminal's state, not a server fault."""
+        from cli_agent_orchestrator.models.terminal import ProviderExitedInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.exit_terminal_cli.side_effect = ProviderExitedInputBlockedError(
+                "Terminal abcd1234 failed deferred initialization (identity_mismatch). "
+                "Refusing to deliver input."
+            )
+
+            response = client.post("/terminals/abcd1234/exit")
+
+            assert response.status_code == 409
+            assert "Refusing to deliver input" in response.json()["detail"]
 
 
 class TestDeleteTerminalEndpoint:

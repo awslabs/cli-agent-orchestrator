@@ -39,6 +39,10 @@ from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers.kiro_identity import (
+    kiro_agent_dirs,
+    require_kiro_agent_defined,
+)
 from cli_agent_orchestrator.services.profile_store import write_profile
 from cli_agent_orchestrator.utils import agent_profiles, opencode_config
 from cli_agent_orchestrator.utils.agent_profiles import (
@@ -1677,6 +1681,25 @@ def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
     if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
         return None
     return tools
+
+
+def require_kiro_agent_resolves(
+    profile_name: str,
+    working_directory: str,
+    env_vars: Optional[Dict[str, str]] = None,
+) -> None:
+    """Refuse a Kiro launch from ``working_directory`` whose agent kiro-cli would not load.
+
+    kiro-cli starts its built-in ``kiro_default`` agent for an ``--agent`` it
+    cannot find (#1074), so the launch path calls this before any window exists.
+    The directories searched include ``KIRO_AGENTS_DIR``, the one this module
+    installs into; see ``providers.kiro_identity`` for the rest.
+
+    Raises ``KiroAgentIdentityError`` when no directory defines the name.
+    """
+    require_kiro_agent_defined(
+        profile_name, kiro_agent_dirs(working_directory, KIRO_AGENTS_DIR, env_vars)
+    )
 
 
 def installed_opencode_permission(
