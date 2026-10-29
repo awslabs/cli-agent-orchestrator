@@ -413,6 +413,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `memory_store` and `memory_forget` MCP tools now honor the caller's local memory switch
+  when a remote memory owner is configured (#1087). `memory_recall` checked the switch before
+  branching to the owner, but the write and delete tools did not, so a caller with memory off
+  was refused a read yet could still write or delete on the owner, which applied only its own
+  switch. Both tools now return `disabled: true`, as `memory_recall` does, without calling the
+  owner.
 - Ephemeral profiles explicitly omit the inherited skill catalog while keeping named skill
   loading available. Every live-profile load verifies the parsed bytes against the registry
   hash and fails closed on missing or modified data, including claim-less launches and provider
