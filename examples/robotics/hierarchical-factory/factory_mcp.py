@@ -63,6 +63,9 @@ WAIT_POLL_SECONDS = 0.25
 Count = Annotated[int, Field(ge=1, le=24)]
 Seconds = Annotated[float, Field(gt=0, le=60)]
 Move = Literal["spin", "turn", "run"]
+# Must equal the max_routine_moves of every formation team in the scene;
+# make_server checks that at startup.
+MAX_ROUTINE_MOVES = 6
 
 
 def save_snapshot(path: Path, state: dict) -> None:
@@ -124,6 +127,13 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         auth=StaticTokenVerifier(tokens, required_scopes=["observe"]),
         lifespan=lifespan,
     )
+
+    # The scene sets the routine-length limit of each formation team; the
+    # schema below must enforce the same number that the controller reads
+    # from the scene.
+    for team in world.scene.teams.values():
+        if team.kind == "formation" and team.max_routine_moves != MAX_ROUTINE_MOVES:
+            raise ValueError("the scene's max_routine_moves does not match the MCP schema")
 
     # Read-only live view, served on the same 127.0.0.1 controller, as in the
     # cross-zone transport example. It exposes only observe(): the measured
@@ -195,7 +205,7 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         command_id: Identifier,
         units: Count,
         batch: Annotated[int, Field(ge=1, le=8)],
-        routine: Annotated[list[Move], Field(min_length=1, max_length=6)],
+        routine: Annotated[list[Move], Field(min_length=1, max_length=MAX_ROUTINE_MOVES)],
     ) -> dict:
         """Start the shipping program of a formation team.
 

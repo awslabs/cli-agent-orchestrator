@@ -131,7 +131,7 @@ The solid arrows from the supervisor are CAO assigns, and the dotted arrows are 
 
 ### Key benefits
 
-The solution meets each of the five criteria from [Understanding the challenge](#understanding-the-challenge). For each criterion, the table shows how the example meets it, and which part enforces it. With a provider that enforces the tool allowlist, most rules are enforced outside the agents: the controller and CAO reject a call that breaks a rule, whatever the prompt says.
+The solution meets each of the five criteria from [Understanding the challenge](#understanding-the-challenge). For each criterion, the table shows how the example meets it, and which part enforces it. With a provider that enforces the tool allowlist, the authority rules are enforced outside the agents; the order checks and the balancing are instructions in the supervisor profile.
 
 | Criterion | How the example meets it | Enforced by |
 | --- | --- | --- |
@@ -139,7 +139,7 @@ The solution meets each of the five criteria from [Understanding the challenge](
 | 2. Least authority, also between managers | One credential for each team, with no team or robot argument in any tool. Managers hold only `send_message` of the CAO tools, so CAO refuses them `assign` and `handoff`. | The controller and CAO |
 | 3. Decisions at the right time scale | The agents set the formation, the pace, the batch, and the routine. The team programs move the robots every 20 ms. | The controller |
 | 4. Balance on measured state | `wait_team` reports a block from the measured buffer. The supervisor balances from `observe`, not from the text of a manager. | The controller and the supervisor profile |
-| 5. Fail safe | Refusals before motion, one report for each block, a fallback to `observe` when a report does not arrive, and an operator stop that locks the run | The profiles and the controller |
+| 5. Fail safe | Refusals before motion, one report for each block, a fallback to `observe` when a report does not arrive, and an operator stop that locks the run | The supervisor profile (checks before any assign) and the controller (refuses each bad call) |
 
 ## Architecture overview
 
@@ -252,7 +252,7 @@ Across the nine runs, the supervisor changed the pace of a team only after a blo
 
 The runs also showed four things that we fixed in the example:
 
-- **A check after the start.** With the routine that had no `run`, the controller rejected the shipping program, but the other teams had already started. The supervisor now checks the whole order, the routine too, before it assigns any manager.
+- **A check after the start.** With the routine that had no `run`, the controller rejected the shipping program, but the other teams had already started. The supervisor profile now tells the supervisor to check the whole order, the routine too, before it assigns any manager.
 - **An average of two outputs.** In an early run, the supervisor balanced on an average of only two outputs, while the two lines of Team B had just delivered their first units close together. The controller now reports the average only after three outputs.
 - **A status after a stop.** After the operator stop, the status of each team still showed its last value, for example `running`. Now the command of an interrupted program shows `interrupted`, and its team shows `stopped`.
 - **An order delivered twice.** In some runs, CAO delivered the order to the supervisor a second time. The supervisor profile now says to run the order once, and in each of those runs the supervisor said so in its report and did not assign the managers again.
