@@ -1,8 +1,8 @@
 """#1083 at create, claim and the pre-bind recheck: effort auto, under #1068's rules for tiers.
 
 Provisional throughout: effort auto needs both effort bounds (Q2), the lease covers one
-on-mode wait per declared field (Q3), and the decided effort reaches the live profile through
-a second fenced finalize (Q1).
+on-mode wait per declared field (Q3), and the decided effort reaches the provider through the
+launch plan only, never the live profile (Q1, ruling C).
 """
 
 import hashlib
@@ -67,7 +67,8 @@ def test_auto_stores_its_fallback_and_the_spec_keeps_auto(auto_store):
     note = result["notes"][1]
     assert all(word in note for word in ("auto", "decided at launch", "medium", "default_effort"))
     assert "auto" not in json.dumps({k: v for k, v in result.items() if k != "notes"})
-    # The claim renders the same fallback; the decision applies through a second finalize.
+    # The claim renders the same fallback; a decided effort reaches the provider through the
+    # launch plan only (ruling C).
     service.claim_ephemeral_agent(name, {}, CALLER)
     assert frontmatter.loads(live(auto_store, name).read_text())["claudeConfig"] == {
         "effort": "medium"
@@ -238,38 +239,30 @@ def test_a_forged_auto_effort_never_opts_in(auto_store):
     assert service.decision_inputs(name, token, CALLER, "claude_code") is None
 
 
-# The pre-bind recheck and the second finalize.
+# The pre-bind recheck (#1068 C, #1083): the decided model and effort are returned to the
+# caller for the launch plan only; recheck_decided itself never writes anything.
 
 
-def test_recheck_writes_nothing_when_the_launched_effort_is_the_stored_one(auto_store):
-    service = auto_store[0]
-    name, token = claimed(auto_store, AUTO)
-    for effort in (None, "medium"):
-        decided = service.recheck_decided(name, token, CALLER, None, effort)
-        assert (decided.effort, decided.finalize) == ("medium", None)
-
-
-def test_recheck_finalizes_a_decided_effort_with_the_current_table(auto_store):
+def test_recheck_returns_the_decided_effort_with_the_current_tables_model(auto_store):
     service, _, _, _, raw = auto_store
     raw["ephemeral"]["default_tier"] = "small"
     name, token = claimed(auto_store, AUTO)
+    payload_at_claim = live(auto_store, name).read_bytes()
     raw["model_tiers"]["claude_code"]["small"] = "private-next-small"
     decided = service.recheck_decided(name, token, CALLER, None, "high")
     assert decided.model == "private-next-small"
-    assert decided.finalize == dict(model_tier="small", model="private-next-small", effort="high")
-    service.finalize_decided(name, token, CALLER, decided.finalize)
+    assert decided.effort == "high"
+    # Nothing is written: the row keeps the stored effort and the live profile, rendered at
+    # claim time with the old table, is untouched (#1068 C, #1083).
     row = database.get_ephemeral_agent(name)
+    assert row["effort"] == "medium" and row["model_tier"] == "small"
     payload = live(auto_store, name).read_bytes()
+    assert payload == payload_at_claim
     assert hashlib.sha256(payload).hexdigest() == row["profile_sha256"]
     profile = frontmatter.loads(payload.decode())
-    assert (
-        profile["claudeConfig"] == {"effort": "high"} and profile["model"] == "private-next-small"
-    )
-    # The row keeps the stored effort; the archive names the launched one.
-    assert row["effort"] == "medium"
-    events = [e for e in archive(name)["events"] if e["event"] == "finalized"]
-    assert [e["effort"] for e in events] == ["medium", "high"]
-    assert archive(name)["profile_sha256"] == row["profile_sha256"]
+    assert profile["claudeConfig"] == {"effort": "medium"}
+    assert profile["model"] == "private-claude_code-small"
+    assert [e["event"] for e in archive(name)["events"]] == ["created", "claimed", "finalized"]
 
 
 @pytest.mark.parametrize(
@@ -297,7 +290,7 @@ def test_recheck_launches_an_effort_still_within_the_bounds(auto_store):
     name, token = claimed(auto_store, AUTO)
     raw["ephemeral"].update(min_effort="medium", default_effort="high")
     decided = service.recheck_decided(name, token, CALLER, None, "high")
-    assert decided.effort == "high" and decided.finalize["effort"] == "high"
+    assert decided.effort == "high"
     assert database.get_ephemeral_agent(name)["state"] == "claimed"
 
 
@@ -309,33 +302,6 @@ def test_recheck_answers_only_for_the_live_claim(auto_store, monkeypatch):
     assert service.recheck_decided(name, token, CALLER, None, "high") is None
 
 
-def test_the_second_finalize_is_fenced_to_its_claim(auto_store, monkeypatch):
-    service = auto_store[0]
-    name, token = claimed(auto_store, AUTO)
-    decided = service.recheck_decided(name, token, CALLER, None, "high")
-    # The claim lapses and the owner claims again before the second finalize.
-    monkeypatch.setattr(database, "_utcnow", lambda: NOW + timedelta(seconds=61))
-    newer = service.claim_ephemeral_agent(name, {}, CALLER)["claim_id"]
-    before, events = live(auto_store, name).read_bytes(), archive(name)["events"]
-    with pytest.raises(service.EphemeralPolicyError) as err:
-        service.finalize_decided(name, token, CALLER, decided.finalize)
-    assert err.value.rule == "claim_expired" and err.value.status_code == 409
-    row = database.get_ephemeral_agent(name)
-    assert row["state"] == "claimed" and row["claim_id"] == newer
-    assert live(auto_store, name).read_bytes() == before
-    assert [e for e in archive(name)["events"] if e["event"] == "finalized"] == [
-        e for e in events if e["event"] == "finalized"
-    ]
-    assert archive(name)["refusals"]["claim_expired"]["count"] == 1
-
-
-def test_the_second_finalize_collects_a_name_whose_spec_is_gone(auto_store):
-    service, _, home, _, _ = auto_store
-    name, token = claimed(auto_store, AUTO)
-    decided = service.recheck_decided(name, token, CALLER, None, "high")
-    (home / "ephemeral/live" / (name + ".spec.json")).unlink()
-    with pytest.raises(service.EphemeralPolicyError) as err:
-        service.finalize_decided(name, token, CALLER, decided.finalize)
-    assert err.value.rule == "spec_unavailable"
-    row = database.get_ephemeral_agent(name)
-    assert row["state"] == "gc" and row["gc_reason"] == "launch_failed"
+# Under C, recheck_decided writes nothing, so there is no second finalize to fence or to
+# collect a missing spec; finalize's own claim-expired and spec_unavailable paths are already
+# covered at the claim (test_ephemeral_claim.py), including E9's tightened window (#1068).

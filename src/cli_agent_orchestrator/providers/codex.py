@@ -1370,6 +1370,7 @@ class CodexProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -1383,6 +1384,10 @@ class CodexProvider(BaseProvider):
         self._launched_codex_profile: Optional[str] = None
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
+        # A decided effort for this launch only (#1068 C, #1083): the launch plan's
+        # effort, merged into codexConfig as model_reasoning_effort. Never written
+        # back to the profile.
+        self._effort = effort
         # The release in the startup banner, and whether it ends each turn with
         # COMPLETION_FOOTER_PATTERN. initialize() sets both. A provider rebuilt
         # after a cao-server restart does not run initialize(), and keeps the
@@ -1840,9 +1845,15 @@ class CodexProvider(BaseProvider):
             # (e.g. "features.fast_mode"); values are serialized to TOML
             # scalars. Emitted last so they take precedence over CAO's own
             # overrides and the profile/config defaults on key conflicts.
-            if profile.codexConfig:
-                for key, value in profile.codexConfig.items():
-                    command_parts.extend(["-c", _toml_override(key, value)])
+            # self._effort is a decided value for this launch only (#1068 C, #1083): merged
+            # into a copy of codexConfig, so it wins on a key conflict and is emitted even
+            # when codexConfig is empty, giving exactly one model_reasoning_effort override.
+            # It is never written back to the profile.
+            codex_config = dict(profile.codexConfig) if profile.codexConfig else {}
+            if self._effort:
+                codex_config["model_reasoning_effort"] = self._effort
+            for key, value in codex_config.items():
+                command_parts.extend(["-c", _toml_override(key, value)])
 
         # Suppress the startup update dialog at the source. Placed last so it
         # wins even if a profile sets check_for_update_on_startup=true.

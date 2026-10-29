@@ -97,7 +97,7 @@ before the ceiling check, and a broken floor is `policy_config_error:min_effort`
 at a launch without a claim identifier, a stored effort below a floor raised since create, or a
 stored provider default under a new floor, refuses with
 `policy_changed_since_create:effort_below_policy` and collects the name. This floor is
-provisional (#1083) and follows whatever #1068 settles for the tier floor.
+provisional (#1083).
 
 Unknown keys in the block are accepted. The first create that sees one logs a single warning
 per server process naming it, never its value, so a typo such as `min_tierr` is visible.
@@ -191,23 +191,21 @@ request with the same request id and facts, so an on-mode launch can wait up to 
 doesn't affect the other. A provider that can't apply an effort is never asked: the record
 says `not_honored`. Claude Code (outside a native agent) and Codex apply it.
 
-A decided effort that differs from the stored one is written into the live profile by a second
-finalize, after the pre-bind recheck and before the bind. Like the claim's own finalize, it
-replaces the profile only for that claim, so a lapsed or replaced claim refuses with
-`claim_expired` and leaves a newer claim's profile alone. The provider then reads Claude Code's
-`claudeConfig.effort` or Codex's `codexConfig.model_reasoning_effort` from the hash-verified
-profile, just as for an explicit effort. The archive gains a second `finalized` event naming
-the launched effort; when the effort is unchanged there is no second write and no second event.
-The registry row keeps the stored effort. The answer applies even when its decision record
-can't be written.
+The decided effort applies to that launch only, through its launch plan, the same way as the
+decided model: CAO passes it to the provider at launch, as Claude Code's `--effort` or Codex's
+`-c model_reasoning_effort`, in place of the stored effort. Nothing writes it to disk. The live
+profile, the registry row and the archive keep the stored effort, so a launch that fails before
+the bind, a lapsed claim or a server restart leaves nothing behind: a later launch without a
+claim identifier runs the stored effort, and a later claimed launch decides again. The decision
+record names the applied effort, and the answer applies even when that record can't be written.
 
 The pre-bind recheck runs for every claimed `auto` launch, even when the engine returned no
 launch plan. A stored or decided effort now outside `[min_effort, max_effort]` gives
 `policy_changed_since_create:effort_exceeds_policy` or `:effort_below_policy` and collects the
 name. With only effort `auto`, the explicit or default tier still runs on its tier's current
 model id. A keyed retry of a launched name reattaches without a second decision or finalize,
-and a launch without a claim identifier asks nothing and runs the live profile. The creator's
-launch note stays model-only, so an effort-only launch gets none.
+and a launch without a claim identifier asks nothing and runs the live profile, which holds the
+stored effort. The creator's launch note stays model-only, so an effort-only launch gets none.
 
 **Upgrade note:** earlier releases ignored the tier and effort keys and table with a warning,
 whatever their values. All five tier and effort keys, including the new `min_tier`, are now
@@ -397,10 +395,12 @@ check (`tool_exceeds_creator:<atoms>`).
 
 Every ephemeral live-profile load verifies the exact bytes parsed against the registry's
 `profile_sha256`, including claim-less launches and provider reloads. Missing rows or hashes
-and modified files fail closed. Finalize updates the hash under the claim guard and replaces
-the profile inside the same transaction; between the replace and the commit, a concurrent
-load sees the new bytes with the old hash and refuses. If the commit fails after the replace,
-loads of that name fail closed until the next finalize rewrites both. Claim-less launches do not
+and modified files fail closed. Finalize updates the hash only while the row is still claimed by
+that claim identifier and its lease is running, and replaces the profile inside the same
+transaction; a replaced or lapsed claim refuses with `claim_expired` and writes nothing; between
+the replace and the commit, a concurrent load sees the new bytes with the old hash and refuses.
+If the commit fails after the replace, loads of that name fail closed until the next finalize
+rewrites both. Claim-less launches do not
 re-render profiles; pending names receive the empty skill catalog on their next claimed launch.
 A pending name created before this change and launched without a claim keeps its old
 profile, including the inherited skill catalog; that launch consumes the name. Only

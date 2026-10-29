@@ -68,6 +68,7 @@ def rt(e5, monkeypatch):
             allowed_tools=args[5],
             skill_prompt=kwargs.get("skill_prompt"),
             model=kwargs.get("model"),
+            effort=kwargs.get("effort"),
         )
         command = (
             instance._build_claude_command()
@@ -191,8 +192,9 @@ async def test_AC2_shadow_never_applies_an_answer_that_is_already_ready(rt, path
     delete_child()
 
 
-# AC3, and Q1's second finalize: on applies a confident answer, capped into [min_effort, max_effort], through a
-# second finalize of the live profile.
+# AC3, and Q1 (C): on applies a confident answer, capped into [min_effort, max_effort], to the
+# provider for that launch only, through the launch plan (#1068 C, #1083). The row and the
+# live profile keep the stored effort; nothing is written for the decision.
 
 
 @pytest.mark.asyncio
@@ -220,30 +222,21 @@ async def test_AC3_on_applies_the_answer_capped_into_bounds(rt, case, applied, p
     # The decider saw one point, the redacted description and purpose, never the brief.
     (request,) = rt.decider.requests
     assert request.points == ("effort.route",) and request.facts.profile is None
-    # The row keeps the stored effort; the live profile, verified by its hash, the applied one.
+    # The row and the live profile, verified by its hash, both keep the stored effort,
+    # whatever was applied; the command carries the applied one (#1068 C, #1083).
     ((profile, row),) = rt.profiles
     assert row["effort"] == "medium"
     assert hashlib.sha256(profile).hexdigest() == row["profile_sha256"]
-    assert frontmatter.loads(profile.decode())["claudeConfig"] == {"effort": applied}
-    events = finalized(rt.name)
-    # claimed, finalized (the claim), [finalized (the decided effort)], decided, then bound.
-    names = [e["event"] for e in audit(rt.name)["events"]]
-    second = [] if applied == "medium" else ["finalized"]
-    assert names[: 5 + len(second)] == [
+    assert frontmatter.loads(profile.decode())["claudeConfig"] == {"effort": "medium"}
+    assert [e["event"] for e in audit(rt.name)["events"]][:5] == [
         "created",
         "claimed",
         "finalized",
-        *second,
         "decided",
         "bound",
     ]
-    if applied == "medium":
-        assert len(events) == 1
-    else:
-        first, second = events
-        assert (first["effort"], second["effort"]) == ("medium", applied)
-        assert second["profile_sha256"] == row["profile_sha256"] != first["profile_sha256"]
-        assert audit(rt.name)["profile_sha256"] == row["profile_sha256"]
+    (event,) = finalized(rt.name)
+    assert event["effort"] == "medium" and event["profile_sha256"] == row["profile_sha256"]
     delete_child()
 
 
@@ -547,7 +540,10 @@ async def test_an_applied_effort_launches_when_its_record_cannot_be_written(rt, 
     assert result["success"], result
     assert launched_effort(rt) == "high"
     assert rt.store.list() == [] and decided_events(rt.name) == []
-    assert [e["effort"] for e in finalized(rt.name)] == ["medium", "high"]
+    # Nothing is written for the decision, record or no record: one finalized event, the
+    # claim's own, and the live profile keeps the stored effort (#1068 C, #1083).
+    (event,) = finalized(rt.name)
+    assert event["effort"] == "medium"
     delete_child()
 
 
@@ -650,35 +646,9 @@ def test_a_replaced_claim_keeps_its_own_profile_and_archive(rt, monkeypatch, sit
     rt.factory.assert_not_called()
 
 
-@pytest.mark.parametrize("site", ["terminal", "step"])
-@pytest.mark.parametrize("case", [{**AUTO, "effort_answer": "high"}], indirect=True)
-def test_the_second_finalize_is_fenced_to_its_own_claim(rt, monkeypatch, site):
-    service = rt.env[0]
-    token = claim(rt.env, rt.name)["claim_id"]
-    original = service.recheck_decided
-    after_reclaim = {}
-
-    def recheck_then_reclaim(*args, **kwargs):
-        decided = original(*args, **kwargs)
-        # Claim A passed its recheck; it lapses and B claims before A's second finalize.
-        monkeypatch.setattr(database, "_utcnow", lambda: NOW + timedelta(seconds=61))
-        after_reclaim["token"] = claim(rt.env, rt.name)["claim_id"]
-        after_reclaim["profile"] = live_profile(rt)
-        after_reclaim["sha"] = database.get_ephemeral_agent(rt.name)["profile_sha256"]
-        return decided
-
-    monkeypatch.setattr(service, "recheck_decided", recheck_then_reclaim)
-    response = raw_launch(rt, site, token)
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["rule"] == "claim_expired"
-    row = database.get_ephemeral_agent(rt.name)
-    assert row["state"] == "claimed" and row["claim_id"] == after_reclaim["token"]
-    assert live_profile(rt) == after_reclaim["profile"]
-    assert row["profile_sha256"] == after_reclaim["sha"]
-    assert all(e["effort"] == "medium" for e in finalized(rt.name))
-    (record,) = rt.store.list()
-    assert record["launch_status"] == "not_launched"
-    rt.factory.assert_not_called()
+# Under C, recheck_decided writes nothing, so a claim replaced right after it returns hits
+# the bind's own existing fence exactly as test_a_replaced_claim_keeps_its_own_profile_and_archive
+# does: there is no longer a separate "second finalize" race to pin here.
 
 
 # A keyed retry of a launched name reattaches without a second decision or finalize.
@@ -704,7 +674,8 @@ async def test_a_keyed_early_retry_reattaches_without_deciding(rt):
     assert first["terminal_id"] == second["terminal_id"]
     drain(rt)
     assert len(rt.decider.requests) == 1 and len(rt.store.list()) == 1
-    assert len(finalized(rt.name)) == 2 and rt.backend.create_window.call_count == 1
+    # Nothing is written for the decision (#1068 C, #1083): one finalized event either way.
+    assert len(finalized(rt.name)) == 1 and rt.backend.create_window.call_count == 1
     assert launched_effort(rt) == "high"
     delete_child()
 
@@ -720,7 +691,8 @@ def test_a_raw_keyed_create_replays_without_deciding_or_finalizing(rt):
     assert second.json()["id"] == first.json()["id"]
     drain(rt)
     assert len(rt.decider.requests) == 1 and len(rt.store.list()) == 1
-    assert len(finalized(rt.name)) == 2 and rt.backend.create_window.call_count == 1
+    # Nothing is written for the decision (#1068 C, #1083): one finalized event either way.
+    assert len(finalized(rt.name)) == 1 and rt.backend.create_window.call_count == 1
     delete_child()
 
 

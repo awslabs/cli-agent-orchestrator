@@ -28,7 +28,7 @@ from cli_agent_orchestrator.decisions.policy import (
     PolicyBounds,
     PolicyConfigError,
 )
-from cli_agent_orchestrator.decisions.types import POINTS
+from cli_agent_orchestrator.decisions.types import POINTS, Effort
 from cli_agent_orchestrator.models.ephemeral import TOOL_ATOMS, EphemeralSpec
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
@@ -925,12 +925,22 @@ def _row(db: Any, name: str) -> Optional[dict[str, Any]]:
 
 
 def _change(
-    db: Any, name: str, state: str, values: dict[str, Any], claim_id: Optional[str] = None
+    db: Any,
+    name: str,
+    state: str,
+    values: dict[str, Any],
+    claim_id: Optional[str] = None,
+    *,
+    live_at: Any = None,
 ) -> int:
     table = database.EphemeralAgentModel
     statement = update(table).where(table.name == name, table.state == state)
     if claim_id is not None:
         statement = statement.where(table.claim_id == claim_id)
+    if live_at is not None:
+        # E9: the same boundary as the bind's own fence (claim_expires_at > now), read
+        # inside this call's own transaction so a slow caller can't finalize a lapsed claim.
+        statement = statement.where(table.claim_expires_at > live_at)
     return cast(int, db.execute(statement.values(**values)).rowcount)
 
 
@@ -1148,7 +1158,14 @@ def _recheck_policy(
 
 
 def finalize(name: str, claim_id: str, values: dict[str, Any]) -> None:
-    """Re-render verified stored spec before returning the claim to its caller."""
+    """Re-render the verified stored spec with the claim's stored values, for one live claim.
+
+    ``values`` are ``_recheck_policy``'s: the stored tier, its current model id and the stored
+    effort. A decided value is never written here: it reaches the provider through the launch
+    plan (#1068, #1083). The hash moves, and the file is replaced, only while the row is still
+    claimed by ``claim_id`` and its lease is running, checked in one compare-and-update under
+    the write lock. A replaced or lapsed claim refuses with ``claim_expired`` and writes nothing.
+    """
     row = database.get_ephemeral_agent(name)
     if row is None:
         raise EphemeralPolicyError("unknown_ephemeral", status_code=404)
@@ -1183,7 +1200,12 @@ def finalize(name: str, claim_id: str, values: dict[str, Any]) -> None:
         _write_exclusive(temp, profile, owned)
         digest = hashlib.sha256(profile).hexdigest()
         with _transaction() as db:
-            changed = _change(db, name, "claimed", dict(profile_sha256=digest), claim_id)
+            # E9: read inside the write-locked transaction, not before it, so a slow
+            # recheck or a lease shorter than it can't finalize a claim that has lapsed.
+            now = database._utcnow()
+            changed = _change(
+                db, name, "claimed", dict(profile_sha256=digest), claim_id, live_at=now
+            )
             if changed:
                 os.replace(temp, EPHEMERAL_DIR / "live" / (name + ".md"))
                 # Failed commit: every load verifies profile_sha256 (#1063), so the
@@ -1248,9 +1270,7 @@ class DecidedLaunch:
     """What a claimed auto launch runs on after the pre-bind recheck (#1068, #1083)."""
 
     model: Optional[str]
-    effort: Optional[str]
-    # finalize's values when the launched effort differs from the stored one, else None.
-    finalize: Optional[dict[str, Any]]
+    effort: Optional[Effort]
 
 
 def _recovered_tier(
@@ -1275,7 +1295,7 @@ def recheck_decided(
     claim_id: str,
     caller_id: Optional[str],
     tier: Optional[str],
-    effort: Optional[str] = None,
+    effort: Optional[Effort] = None,
     launched_model: Optional[str] = None,
 ) -> Optional[DecidedLaunch]:
     """#1068: re-apply the operator's current policy to a claimed auto launch before the bind.
@@ -1285,10 +1305,9 @@ def recheck_decided(
     runs its fallback. Without a recorded tier, ``launched_model`` (the plan's model) is
     reverse-mapped through the snapshot this recheck has just validated, so a block broken
     during the decision refuses as at claim; with no match the launch runs the fallback.
-    Returns the model the current table maps the launched tier to, the launched effort, and,
-    when that effort differs from the stored one, the values for a second finalize (#1083 Q1,
-    provisional). Returns None when the claim is no longer live, so the bind refuses with its
-    own rule.
+    Returns the model the current table maps the launched tier to, and the launched effort;
+    the site passes both to the provider through the launch plan, and nothing is written.
+    Returns None when the claim is no longer live, so the bind refuses with its own rule.
     """
     row = database.get_ephemeral_agent(name)
     if (
@@ -1326,29 +1345,9 @@ def recheck_decided(
         # effort-only launch runs its stored tier's current id the same way.
         model = tiers[row["provider"]][tier] if tier is not None else values["model"]
         launched = effort if effort is not None else row["effort"]
-        return DecidedLaunch(
-            model,
-            launched,
-            {**values, "effort": launched} if launched != row["effort"] else None,
-        )
+        return DecidedLaunch(model, launched)
     except EphemeralPolicyError as exc:
         _report_refusal(name, caller_id, row, exc)
-        raise
-
-
-def finalize_decided(
-    name: str, claim_id: str, caller_id: Optional[str], values: dict[str, Any]
-) -> None:
-    """#1083 Q1 (provisional): write a decided effort into the live profile before the bind.
-
-    ``finalize`` replaces the profile only for this claim, so a lapsed or replaced claim
-    refuses with ``claim_expired`` and leaves a newer claim's profile alone. The provider
-    then reads the effort from the hash-verified profile, as for an explicit effort.
-    """
-    try:
-        finalize(name, claim_id, values)
-    except EphemeralPolicyError as exc:
-        _report_refusal(name, caller_id, database.get_ephemeral_agent(name), exc)
         raise
 
 

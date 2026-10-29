@@ -408,6 +408,17 @@ def resolve_launch_model(
     )
 
 
+def resolve_launch_effort(launch_plan: "LaunchPlan | None" = None) -> Optional[str]:
+    """Resolve the effort CAO passes to a provider for this launch (#1068 C, #1083).
+
+    Unlike the model, effort is never a per-call override or a profile-level default read
+    here: a provider falls back to its own profile config (``claudeConfig.effort``,
+    ``codexConfig.model_reasoning_effort``) when this is ``None``. A decided effort reaches
+    the provider only through the plan, never through a rewritten live profile.
+    """
+    return launch_plan.effort if launch_plan else None
+
+
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
@@ -1822,6 +1833,7 @@ async def _create_terminal_unguarded(
             profile = None
         decision_not_honored = False
         launch_model = resolve_launch_model(model, profile, launch_plan)
+        launch_effort = resolve_launch_effort(launch_plan)
         model_honored = ProviderManager.provider_class(provider).honors_model(
             agent_profile=agent_profile,
             profile=profile,
@@ -2549,6 +2561,7 @@ async def _create_terminal_unguarded(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=launch_model,
+            effort=launch_effort,
             engine=resolved_engine,
             resume_session_id=resume_session_id,
             session_id=fresh_claude_session_id,

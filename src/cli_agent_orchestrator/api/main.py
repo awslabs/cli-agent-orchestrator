@@ -3830,18 +3830,23 @@ async def _prepare_delegation(
                 plan.effort if plan is not None else None,
                 plan.model if plan is not None else None,
             )
-            if decided is not None and decided.finalize is not None:
-                # #1083 Q1 (provisional): a decided effort reaches the provider through the
-                # live profile, so it is written there before the bind.
-                ephemeral_service.finalize_decided(name, claim_id, caller_id, decided.finalize)
         except BaseException:
             _bind_unlaunched(plan)
             raise
-        if decided is not None and decided.model is not None:
-            if plan is None:
-                plan = LaunchPlan(model=decided.model)
-            elif decided.model != plan.model:
-                plan = replace(plan, model=decided.model)
+        if decided is not None:
+            # #1083 Q1 (provisional): a decided effort applies to this launch only, through
+            # the launch plan, like the decided model (#1068 Q2). The live profile keeps the
+            # stored effort, so a launch that fails before the bind leaves nothing behind.
+            if decided.model is not None:
+                if plan is None:
+                    plan = LaunchPlan(model=decided.model)
+                elif decided.model != plan.model:
+                    plan = replace(plan, model=decided.model)
+            if decided.effort is not None:
+                if plan is None:
+                    plan = LaunchPlan(effort=decided.effort)
+                elif decided.effort != plan.effort:
+                    plan = replace(plan, effort=decided.effort)
     except DecisionInputError as error:
         raise ephemeral_service.decision_refusal(name, claim_id, caller_id, error) from None
     except BaseException:

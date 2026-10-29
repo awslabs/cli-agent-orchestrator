@@ -422,6 +422,7 @@ class ClaudeCodeProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
         resume_session_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ):
@@ -445,6 +446,9 @@ class ClaudeCodeProvider(BaseProvider):
         # --model resolution below) -- e.g. a handoff/assign caller pinning a
         # specific model for one worker without needing a dedicated profile.
         self._model = model
+        # A decided effort for this launch only (#1068 C, #1083): the launch plan's
+        # effort, applied in place of claudeConfig.effort. Never written to the profile.
+        self._effort = effort
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
@@ -592,6 +596,8 @@ class ClaudeCodeProvider(BaseProvider):
             command_parts.extend(["--agent", self._agent_profile])
             if self._model:
                 command_parts.extend(["--model", self._model])
+            if self._effort:
+                command_parts.extend(["--effort", str(self._effort)])
         elif profile is not None:
             # Full CAO profile with config decomposition. self._model is an
             # explicit per-call override (handoff/assign's own `model`
@@ -610,10 +616,16 @@ class ClaudeCodeProvider(BaseProvider):
             # depending on the machine-global effortLevel in
             # ~/.claude/settings.json.
             claude_config = getattr(profile, "claudeConfig", None)
+            # self._effort is a decided value for this launch only (#1068 C, #1083) and
+            # wins over the profile's static claudeConfig.effort, giving exactly one
+            # --effort; it is never written back into the profile.
+            profile_effort = (
+                claude_config.get("effort") if isinstance(claude_config, dict) else None
+            )
+            effort = self._effort or profile_effort
+            if effort:
+                command_parts.extend(["--effort", str(effort)])
             if isinstance(claude_config, dict):
-                effort = claude_config.get("effort")
-                if effort:
-                    command_parts.extend(["--effort", str(effort)])
                 fallback_model = claude_config.get("fallback_model")
                 if fallback_model:
                     command_parts.extend(["--fallback-model", str(fallback_model)])
