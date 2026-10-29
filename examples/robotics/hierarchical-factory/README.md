@@ -1007,10 +1007,12 @@ layers** above the robots: the plan, the teams, and the balance of the line.
 | The credential of each manager | A separate access key for the cell controller of each area |
 | `demo.py stop` | A stop request in software. It does not replace the emergency stop and the safety system of the robots. |
 
-The CAO side stays the same: the profiles, the allowlists, `assign`, and
-`send_message`. Only the MCP server behind `factory-sim` changes. A real site
-also needs a safety system on the robots, a connection from the MCP server to
-each cell controller, and tests on the site with people who monitor the robots.
+The structure on the CAO side stays the same: one profile for each role, the
+allowlists, `assign`, and `send_message`. The MCP server behind `factory-sim`
+changes, and so does the text of each profile: today each profile says that
+it runs a simulation and must not contact physical robots. A real site also
+needs a safety system on the robots, a connection from the MCP server to each
+cell controller, and tests on the site with people who monitor the robots.
 
 ## Safety and limits
 

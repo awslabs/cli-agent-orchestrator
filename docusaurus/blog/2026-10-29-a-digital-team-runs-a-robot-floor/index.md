@@ -280,11 +280,11 @@ This example does not control real robots. It has no robot driver and no connect
 
 ### How the parts of the example map to a real site
 
-The CAO agents and their tools stay the same. Only the MCP server behind `factory-sim` changes, and the parts below it:
+The structure on the CAO side stays the same: one profile for each role, the tool allowlists, `assign`, and `send_message`. Only the MCP server behind `factory-sim` changes, and the parts below it:
 
 ![The parts of the example and of a real site. At the top, the CAO agents, the same on both sides: the supervisor agent and one manager agent for each area, with one credential for each agent. In this example, the agents call observe, form_team, start_line, start_shipping, set_pace, and wait_team on the factory-sim MCP server, the MuJoCo controller, which runs the simulated floor with three zones, two buffers, and nine Open Duck Mini robots. On a real site, the agents call the same tools on a new factory-sim MCP server. It sends jobs and pace, with one access key for each area, to the cell controller or fleet manager of each area, for example with VDA 5050 orders to mobile robots. The cell controller drives the real floor: robots, conveyors, buffers, and sensors.](./real-site.svg)
 
-On the CAO side, the agent profiles, the tool allowlists, `assign`, and `send_message` stay the same. MCP servers that connect agents to robots exist, for example [ROS-MCP-Server](https://github.com/robotmcp/ros-mcp-server) for robots that use the Robot Operating System (ROS). The example does not include such a server.
+The MCP server behind `factory-sim` changes, and so does the text of each profile: today each profile says that it runs a simulation and must not contact physical robots. MCP servers that connect agents to robots exist, for example [ROS-MCP-Server](https://github.com/robotmcp/ros-mcp-server) for robots that use the Robot Operating System (ROS). The example does not include such a server.
 
 ### What real robots need in addition
 
