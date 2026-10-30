@@ -34,6 +34,7 @@ from cli_agent_orchestrator.utils.init_allowance import (
     init_allowance,
     synchronous_create_timeout,
 )
+from cli_agent_orchestrator.utils.orchestration import _extract_error_detail
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
     sync_backend_from_server,
@@ -511,7 +512,16 @@ def launch(
             post_kwargs["json"] = body
 
         response = api_http.post(url, **post_kwargs)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except api_http.exceptions.HTTPError as exc:
+            # The server answered, so this is a refusal and not a connection
+            # failure: show its reason (a 400's ``detail``, e.g. an unavailable
+            # Kiro engine) instead of the generic "Failed to connect" arm below.
+            detail = _extract_error_detail(response, str(exc))
+            raise click.ClickException(
+                f"cao-server refused the launch ({response.status_code}): {detail}"
+            ) from exc
 
         terminal = response.json()
 

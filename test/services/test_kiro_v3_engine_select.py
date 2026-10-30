@@ -11,9 +11,11 @@ provisional choices of #1167.
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+import requests
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -70,6 +72,63 @@ def test_cao_launch_rejects_an_unknown_engine_before_any_request():
 
     assert result.exit_code == 2
     mock_post.assert_not_called()
+
+
+def _http_response(status: int, payload, url: str = "http://127.0.0.1:9889/sessions"):
+    response = requests.Response()
+    response.status_code = status
+    response.reason = {400: "Bad Request", 422: "Unprocessable Entity"}.get(status, "Error")
+    response.url = url
+    response._content = json.dumps(payload).encode("utf-8")
+    return response
+
+
+def test_cao_launch_shows_the_servers_400_detail_not_a_connection_failure():
+    """The 400 body reaches the operator (``Q8-3b`` showed "Failed to connect")."""
+    from cli_agent_orchestrator.cli.commands.launch import launch
+
+    detail = str(KiroV3UnavailableError())
+    with patch(
+        "cli_agent_orchestrator.cli.commands.launch.api_http.post",
+        return_value=_http_response(400, {"detail": detail}),
+    ):
+        result = CliRunner().invoke(
+            launch, ["--agents", "a", "--engine", "kas", "--headless", "--yolo"]
+        )
+
+    assert result.exit_code == 1
+    assert "Failed to connect" not in result.output
+    assert "refused the launch (400)" in result.output
+    assert "not available yet" in result.output
+
+
+def test_cao_launch_falls_back_to_the_http_error_for_a_non_string_detail():
+    from cli_agent_orchestrator.cli.commands.launch import launch
+
+    payload = {"detail": [{"loc": ["query", "engine"], "msg": "Input should be 'v2' or 'v3'"}]}
+    with patch(
+        "cli_agent_orchestrator.cli.commands.launch.api_http.post",
+        return_value=_http_response(422, payload),
+    ):
+        result = CliRunner().invoke(launch, ["--agents", "a", "--headless", "--yolo"])
+
+    assert result.exit_code == 1
+    assert "refused the launch (422)" in result.output
+    assert "422 Client Error" in result.output
+    assert "Failed to connect" not in result.output
+
+
+def test_cao_launch_still_reports_a_real_connection_failure():
+    from cli_agent_orchestrator.cli.commands.launch import launch
+
+    with patch(
+        "cli_agent_orchestrator.cli.commands.launch.api_http.post",
+        side_effect=requests.exceptions.ConnectionError("connection refused"),
+    ):
+        result = CliRunner().invoke(launch, ["--agents", "a", "--headless", "--yolo"])
+
+    assert result.exit_code == 1
+    assert "Failed to connect to cao-server" in result.output
 
 
 # ---------------------------------------------------------------------------
