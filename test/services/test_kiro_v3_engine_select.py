@@ -225,7 +225,7 @@ async def test_explicit_v3_probes_then_refuses_before_allocation(spelling):
                 kiro_capability_probe=probe,
             )
 
-    probe.assert_called_once_with(KiroEngine.V3, {"profile"})
+    probe.assert_called_once_with(KiroEngine.V3, {"profile", "trust", "trust_workspace"})
     backend.return_value.create_session.assert_not_called()
     backend.return_value.create_window.assert_not_called()
     db_create.assert_not_called()
