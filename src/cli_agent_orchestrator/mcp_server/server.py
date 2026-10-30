@@ -790,7 +790,10 @@ async def assign_elastic(
             "contains."
         ),
     ),
-    engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
+    engine: Optional[str] = Field(
+        default=None,
+        description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
+    ),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
     description: Annotated[
         Optional[str],

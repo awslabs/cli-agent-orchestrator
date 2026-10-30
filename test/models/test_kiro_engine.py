@@ -1,7 +1,9 @@
 """Unit coverage for Kiro engine selection and resolution (#1167)."""
 
+import json
+
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.kiro_engine import (
@@ -133,6 +135,62 @@ def test_every_typed_model_field_accepts_kas_and_stores_v3(spelling):
         assert reparsed.engine == KiroEngine.V3, type(model).__name__
 
 
-def test_json_schema_lists_each_engine_value_once():
-    schema = AgentProfile.model_json_schema()
-    assert schema["$defs"]["KiroEngine"]["enum"] == ["v2", "v3"]
+@pytest.mark.parametrize("mode", ["validation", "serialization"])
+def test_json_schema_lists_each_engine_value_once(mode):
+    """Also under ``use_enum_values`` (``Terminal``), which wraps the enum schema."""
+    from cli_agent_orchestrator.models.terminal import Terminal
+
+    for model in (AgentProfile, Terminal):
+        schema = model.model_json_schema(mode=mode)
+        assert schema["$defs"]["KiroEngine"]["enum"] == ["v2", "v3"], model.__name__
+
+
+@pytest.mark.parametrize("value", ["v4", "V3", "KAS", ""])
+def test_an_invalid_engine_error_lists_each_value_once(value):
+    """``KAS`` is an alias, so ``v3`` must not repeat in the message or ``ctx`` (#1167)."""
+    with pytest.raises(ValidationError) as excinfo:
+        AgentProfile(name="bad", description="bad", engine=value)
+    (error,) = excinfo.value.errors()
+    assert error["msg"] == "Input should be 'v2' or 'v3'"
+    assert error["ctx"]["expected"] == "'v2' or 'v3'"
+
+
+def test_every_engine_typed_model_lists_each_value_once():
+    from cli_agent_orchestrator.models.flow import Flow
+    from cli_agent_orchestrator.models.terminal import Terminal
+    from cli_agent_orchestrator.models.workflow import WorkflowStep
+
+    builders = [
+        lambda: TypeAdapter(KiroEngine).validate_python("v4"),
+        lambda: Terminal(
+            id="abcd1234",
+            name="w",
+            session_name="s",
+            provider="kiro_cli",
+            agent_profile="developer",
+            engine="v4",
+        ),
+        lambda: WorkflowStep(id="s", provider="kiro_cli", agent="dev", prompt="go", engine="V3"),
+        lambda: Flow(
+            name="f",
+            file_path="/f.md",
+            schedule="* * * * *",
+            agent_profile="developer",
+            engine="v4",
+        ),
+    ]
+    for build in builders:
+        with pytest.raises(ValidationError) as excinfo:
+            build()
+        messages = [e["msg"] for e in excinfo.value.errors() if e["type"] == "enum"]
+        assert messages == ["Input should be 'v2' or 'v3'"]
+
+
+@pytest.mark.parametrize("spelling", ["v3", "kas"])
+def test_v3_and_kas_validate_to_the_v3_member_in_python_and_json_mode(spelling):
+    adapter = TypeAdapter(KiroEngine)
+    assert adapter.validate_python(spelling) is KiroEngine.V3
+    assert adapter.validate_json(json.dumps(spelling)) is KiroEngine.V3
+    raw = {"name": "p", "description": "p", "engine": spelling}
+    assert AgentProfile.model_validate(raw).engine is KiroEngine.V3
+    assert AgentProfile.model_validate_json(json.dumps(raw)).engine is KiroEngine.V3

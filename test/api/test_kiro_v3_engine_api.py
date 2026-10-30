@@ -108,3 +108,19 @@ def test_run_step_body_accepts_kas_and_forwards_the_v3_member(client, spelling):
 
     assert response.status_code == 200
     assert run_step.await_args.kwargs["engine"] is KiroEngine.V3
+
+
+def test_an_unknown_engine_422_lists_each_value_once(client):
+    """``kas`` is an alias of ``v3``: the 422 names ``v3`` once, in ``msg`` and ``ctx`` (#1167)."""
+    with patch("cli_agent_orchestrator.api.main.session_service") as svc:
+        svc.create_session = AsyncMock()
+        response = client.post(
+            "/sessions",
+            params={"provider": "kiro_cli", "agent_profile": "developer", "engine": "v4"},
+        )
+
+    assert response.status_code == 422
+    (error,) = [e for e in response.json()["detail"] if e["loc"][-1] == "engine"]
+    assert error["msg"] == "Input should be 'v2' or 'v3'"
+    assert error["ctx"]["expected"] == "'v2' or 'v3'"
+    svc.create_session.assert_not_called()

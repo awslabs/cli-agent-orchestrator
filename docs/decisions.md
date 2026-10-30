@@ -219,7 +219,7 @@ complete: once that attempt has started, any other exception is bound
 or a cancelled deferred start moves a previously launched row back, in both
 cases without a second decision span. The attempt starts right after the
 terminal cap check, so any other validation refusal raised after that point —
-an unavailable ephemeral profile, a KAS request, an engine given for a
+an unavailable ephemeral profile, a v3 (`kas`) request, an engine given for a
 provider other than Kiro, or a `caller_ceiling` conflict — is bound
 `launch_failed`, even though nothing was actually allocated yet.
 

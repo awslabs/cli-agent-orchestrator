@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Optional, Union
+from typing import Any, Dict, Optional, Union, cast
 
-from pydantic import GetJsonSchemaHandler
-from pydantic.json_schema import JsonSchemaValue
+from pydantic import GetCoreSchemaHandler
 from pydantic_core import CoreSchema
 
 # Input spellings that name an engine under another value. ``kas`` was CAO's
@@ -40,15 +39,20 @@ class KiroEngine(str, Enum):
         return None
 
     @classmethod
-    def __get_pydantic_json_schema__(
-        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
-    ) -> JsonSchemaValue:
-        # pydantic lists every ``__members__`` value, aliases included, so the
-        # schema would say ``["v2", "v3", "v3"]``. List each value once.
-        json_schema = handler.resolve_ref_schema(handler(core_schema))
-        if isinstance(json_schema.get("enum"), list):
-            json_schema["enum"] = list(dict.fromkeys(json_schema["enum"]))
-        return json_schema
+    def __get_pydantic_core_schema__(cls, source: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
+        # pydantic takes the members from ``__members__``, aliases included, so
+        # a bad value's error would read "'v2', 'v3' or 'v3'" (in the message
+        # and in ``ctx.expected``) and the JSON schema would list ``v3`` twice.
+        # Iterating the class skips aliases: each value is listed once. Under
+        # ``use_enum_values`` (``Terminal``) pydantic wraps the enum schema in
+        # an after-validator, so the members are set on the enum schema itself.
+        schema = handler(source)
+        node: Dict[str, Any] = cast(Dict[str, Any], schema)
+        while node.get("type") != "enum" and isinstance(node.get("schema"), dict):
+            node = node["schema"]
+        if node.get("type") == "enum":
+            node["members"] = list(cls)
+        return schema
 
 
 EngineValue = Optional[Union[KiroEngine, str]]
