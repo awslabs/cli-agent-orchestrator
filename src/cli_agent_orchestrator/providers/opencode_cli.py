@@ -29,7 +29,11 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider, ProviderExitedError
+from cli_agent_orchestrator.providers.base import (
+    BaseProvider,
+    OutputExtractionRejected,
+    ProviderExitedError,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.opencode_cli import detect_opencode_major
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -118,6 +122,30 @@ class OpenCodeCliProvider(BaseProvider):
         self._cli_major = 1
         self._shell_baseline: Optional[str] = None
         self._dispatched_message: Optional[str] = None
+
+    @property
+    def runtime_variant(self) -> str:
+        """Persist the interface of the running process, not the installed binary."""
+        return f"opencode-v{self._cli_major}"
+
+    def restore_runtime_variant(self, value: Optional[str]) -> None:
+        """Restore a launch generation; recover pre-persistence rows from live UI only."""
+        if value is None:
+            clean = strip_terminal_escapes(
+                get_backend().get_history(self.session_name, self.window_name, visible_only=True)
+            )
+            v1 = bool(re.search(IDLE_FOOTER_PATTERN, clean))
+            v2 = bool(re.search(r"ctrl\+p\s+menu", clean))
+            if v1 != v2:
+                self._cli_major = 1 if v1 else 2
+                return
+            raise RuntimeError(
+                "Cannot determine the running OpenCode terminal's CLI generation. "
+                "Recreate the terminal; its launch generation was not persisted."
+            )
+        if value not in ("opencode-v1", "opencode-v2"):
+            raise ValueError(f"Unsupported OpenCode runtime variant: {value!r}")
+        self._cli_major = 1 if value == "opencode-v1" else 2
 
     @property
     def paste_enter_count(self) -> int:
@@ -403,6 +431,12 @@ class OpenCodeCliProvider(BaseProvider):
         return TerminalStatus.IDLE
 
     def _extract_mini_response(self, clean: str) -> str:
+        if not self._dispatched_message:
+            # Mini labels only the first user line. Without the dispatched
+            # prompt, blank lines cannot distinguish its body from the answer.
+            raise ValueError(
+                "OpenCode Mini dispatched task is unavailable; cannot validate response"
+            )
         summaries = list(re.finditer(self._mini_summary_pattern(), clean))
         if not summaries:
             raise ValueError("No OpenCode Mini completion summary found")
@@ -412,34 +446,27 @@ class OpenCodeCliProvider(BaseProvider):
         users = list(re.finditer(r"(?m)^\s*› [^\n]*(?:\n|$)", turn))
         if not users:
             raise ValueError("No user message found before OpenCode Mini summary")
-        if self._dispatched_message:
-            expected = re.sub(r"\s", "", self._dispatched_message)
-            if not expected:
-                raise ValueError("Empty OpenCode Mini dispatched task")
-            for user in reversed(users):
-                start = turn.index("›", user.start()) + 2
-                consumed = 0
-                for offset, char in enumerate(turn[start:]):
-                    if char.isspace():
-                        continue
-                    if char != expected[consumed]:
-                        break
-                    consumed += 1
-                    if consumed == len(expected):
-                        response = turn[start + offset + 1 :].strip()
-                        if response:
-                            return response
-                        raise ValueError("Empty OpenCode Mini response")
-            raise ValueError("OpenCode Mini prompt echo does not match the dispatched task")
-        # The user block is followed by a blank transcript row. Do not return
-        # the prompt as part of the worker's result (including multiline input).
-        boundary = re.search(r"\n[ \t]*\n", turn[users[-1].start() :])
-        if boundary is None:
-            raise ValueError("No response found after OpenCode Mini user message")
-        response = turn[users[-1].start() + boundary.end() :].strip()
-        if not response:
-            raise ValueError("Empty OpenCode Mini response")
-        return response
+        expected = re.sub(r"\s", "", self._dispatched_message)
+        if not expected:
+            raise ValueError("Empty OpenCode Mini dispatched task")
+        for user in reversed(users):
+            start = turn.index("›", user.start()) + 2
+            consumed = 0
+            for offset, char in enumerate(turn[start:]):
+                if char.isspace():
+                    continue
+                if char != expected[consumed]:
+                    break
+                consumed += 1
+                if consumed == len(expected):
+                    tail = turn[start + offset + 1 :]
+                    if not re.match(r"[ \t]*\n[ \t]*\n", tail):
+                        break  # A prompt prefix is not a validated full echo.
+                    response = tail.strip()
+                    if response:
+                        return response
+                    raise ValueError("Empty OpenCode Mini response")
+        raise ValueError("OpenCode Mini prompt echo does not match the dispatched task")
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-composited viewport (escape-free rows).
@@ -529,7 +556,12 @@ class OpenCodeCliProvider(BaseProvider):
             ValueError: If no user message or completion marker is found.
         """
         if self._cli_major == 2:
-            return self._extract_mini_response(strip_terminal_escapes(script_output))
+            try:
+                return self._extract_mini_response(strip_terminal_escapes(script_output))
+            except ValueError as exc:
+                # get_output must never publish a Mini transcript as an answer
+                # when its prompt/response boundary could not be validated.
+                raise OutputExtractionRejected(str(exc)) from exc
         clean = re.sub(ANSI_CODE_PATTERN, "", script_output)
 
         # Find the last FULL completion marker to anchor the turn boundary.

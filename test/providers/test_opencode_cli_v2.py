@@ -4,12 +4,12 @@ import json
 import shlex
 import subprocess
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import ProviderExitedError
+from cli_agent_orchestrator.providers.base import OutputExtractionRejected, ProviderExitedError
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 from cli_agent_orchestrator.utils.opencode_cli import detect_opencode_major
 
@@ -132,9 +132,9 @@ def test_mini_states(text, status):
 
 def test_mini_response_preserves_newlines_and_excludes_previous_turn():
     text = "› old task\n\nold answer\ndeveloper · Model · 1s\n› new task\ncontinued prompt\n\nNew answer\n```python\nprint(1)\n```\ndeveloper · Model · 2s\n┃ Ask anything…\nctrl+p menu"
-    assert (
-        provider().extract_last_message_from_script(text) == "New answer\n```python\nprint(1)\n```"
-    )
+    p = provider()
+    p.record_dispatched_message("new task\ncontinued prompt")
+    assert p.extract_last_message_from_script(text) == "New answer\n```python\nprint(1)\n```"
 
 
 def test_real_v223_completed_capture():
@@ -142,6 +142,7 @@ def test_real_v223_completed_capture():
     p = provider()
     assert p.get_status(capture) == TerminalStatus.COMPLETED
     assert p.get_status_from_screen(capture.splitlines()) == TerminalStatus.COMPLETED
+    p.record_dispatched_message("Reply with exactly CAO_V2_PROBE_OK. Do not use tools.")
     assert p.extract_last_message_from_script(capture) == "CAO_V2_PROBE_OK"
 
 
@@ -276,3 +277,136 @@ def test_mini_permission_and_question_dialogs(dialog):
     assert p.get_status(dialog) == TerminalStatus.WAITING_USER_ANSWER
     assert p.get_status_from_screen(dialog.splitlines()) == TerminalStatus.WAITING_USER_ANSWER
     assert p.get_status(dialog + "\nctrl+p menu") == TerminalStatus.IDLE
+
+
+@pytest.mark.parametrize("major", [1, 2])
+def test_manager_restores_persisted_generation_without_probing_installed_cli(major):
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    original = provider(major)
+    metadata = {
+        "provider": "opencode_cli",
+        "tmux_session": "session",
+        "tmux_window": "worker",
+        "agent_profile": "developer",
+        "provider_variant": original.runtime_variant,
+    }
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata", return_value=metadata
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.opencode_cli.detect_opencode_major",
+            side_effect=AssertionError("must not probe installed CLI"),
+        ),
+    ):
+        restored = ProviderManager().get_provider("worker")
+    assert restored.runtime_variant == original.runtime_variant
+    if major == 2:
+        capture = "› next task\n\nValidated answer\ndeveloper · Model · 2s\nctrl+p menu"
+        assert restored.get_status(capture) == TerminalStatus.COMPLETED
+        assert restored.get_status_from_screen(capture.splitlines()) == TerminalStatus.COMPLETED
+        restored.record_dispatched_message("next task")
+        assert restored.extract_last_message_from_script(capture) == "Validated answer"
+    else:
+        assert restored.get_status("ctrl+p commands") == TerminalStatus.IDLE
+
+
+@pytest.mark.parametrize("footer,major", [("ctrl+p commands", 1), ("ctrl+p menu", 2)])
+def test_upgrade_era_terminal_recovered_from_live_pane(footer, major):
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    metadata = {
+        "provider": "opencode_cli",
+        "tmux_session": "session",
+        "tmux_window": "worker",
+        "agent_profile": "developer",
+    }
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata", return_value=metadata
+        ),
+        patch("cli_agent_orchestrator.providers.opencode_cli.get_backend") as backend,
+    ):
+        backend.return_value.get_history.return_value = footer
+        restored = ProviderManager().get_provider("worker")
+        backend.return_value.get_history.assert_called_once_with(
+            "session", "worker", visible_only=True
+        )
+    assert restored.runtime_variant == f"opencode-v{major}"
+
+
+@pytest.mark.parametrize(
+    "variant,screen",
+    [(None, ""), (None, "ctrl+p menu\nctrl+p commands"), ("opencode-v3", "ctrl+p menu")],
+)
+def test_unknown_restored_generation_fails_closed_without_caching(variant, screen):
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    metadata = {
+        "provider": "opencode_cli",
+        "tmux_session": "session",
+        "tmux_window": "worker",
+        "agent_profile": "developer",
+        "provider_variant": variant,
+    }
+    manager = ProviderManager()
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata", return_value=metadata
+        ),
+        patch("cli_agent_orchestrator.providers.opencode_cli.get_backend") as backend,
+    ):
+        backend.return_value.get_history.return_value = screen
+        with pytest.raises((ValueError, RuntimeError)):
+            manager.get_provider("worker")
+    assert manager.list_providers() == {}
+
+
+def test_missing_dispatch_rejects_multiline_prompt_instead_of_guessing_boundary():
+    p = provider()
+    capture = "› First paragraph\n\nPRIVATE PROMPT CONTINUATION\n\nAnswer\ndeveloper · Model · 2s"
+    with pytest.raises(OutputExtractionRejected, match="dispatched task is unavailable"):
+        p.extract_last_message_from_script(capture)
+
+
+@pytest.mark.parametrize("tail_lines", [2000, None])
+@pytest.mark.parametrize("failure", ["missing_dispatch", "missing_summary", "wrong_echo"])
+def test_get_output_never_falls_back_to_unvalidated_mini_transcript(tail_lines, failure):
+    from cli_agent_orchestrator.services import terminal_service
+
+    p = provider()
+    capture = "› PRIVATE USER PROMPT\n\nUNVALIDATED CONTENT\ndeveloper · Model · 2s"
+    if failure == "missing_summary":
+        p.record_dispatched_message("PRIVATE USER PROMPT")
+        capture = "› PRIVATE USER PROMPT\n\nUNVALIDATED CONTENT"
+    elif failure == "wrong_echo":
+        p.record_dispatched_message("different task")
+    metadata = {"tmux_session": "session", "tmux_window": "worker"}
+    with (
+        patch.object(
+            OpenCodeCliProvider,
+            "extraction_tail_lines",
+            new_callable=PropertyMock,
+            return_value=tail_lines,
+        ),
+        patch.object(terminal_service, "get_terminal_metadata", return_value=metadata),
+        patch.object(terminal_service.provider_manager, "get_provider", return_value=p),
+        patch.object(terminal_service.status_monitor, "get_buffer", return_value=capture),
+        patch.object(terminal_service, "get_backend") as backend,
+    ):
+        backend.return_value.get_history.return_value = capture
+        with pytest.raises(OutputExtractionRejected):
+            terminal_service.get_output("worker", terminal_service.OutputMode.LAST)
+        assert backend.return_value.get_history.call_count == 1
+        # Explicit transcript viewing is separate from publishing an answer.
+        assert terminal_service.get_output("worker", terminal_service.OutputMode.FULL) == capture
+
+
+def test_prompt_prefix_is_not_a_validated_full_echo():
+    p = provider()
+    p.record_dispatched_message("task")
+    with pytest.raises(OutputExtractionRejected, match="does not match"):
+        p.extract_last_message_from_script(
+            "› task PRIVATE PROMPT CONTINUATION\n\nAnswer\ndeveloper · Model · 2s"
+        )
