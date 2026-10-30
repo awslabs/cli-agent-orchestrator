@@ -216,6 +216,14 @@ class TestAgentProviders:
         assert providers_dict["grok_cli"]["binary"] == "grok"
         assert providers_dict["mcode"]["binary"] == "mcode"
 
+    def test_list_providers_preserves_common_wire_contract(self, client):
+        """Provider discovery has the same shape consumed by the web and Rust clients."""
+        response = client.get("/agents/providers")
+
+        assert response.status_code == 200
+        for provider in response.json():
+            assert set(provider) == {"name", "binary", "installed"}
+
 
 # ── Skills endpoint ──────────────────────────────────────────────────
 
