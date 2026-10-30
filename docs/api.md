@@ -444,6 +444,18 @@ See [Workflows](workflows.md).
   "disabled" internally, and reporting that as 404 would tell the caller a
   configuration story about a filesystem fault. These are the routes the
   `report_outcome` / `list_outcomes` MCP tools call.
+  `POST /outcomes` also takes an optional `launch_terminal_id` (the MCP
+  tool's `terminal_id`), which links the outcome to that terminal's launch
+  record. The link is checked against the stored record before anything is
+  written: only a self-report (`source_terminal_id` equals
+  `launch_terminal_id`) or the launch's direct creator (the record's
+  `caller_id`) may link. The route answers **403** and writes nothing when
+  records exist for that id and none is bound to the reporter, or when
+  `launch_terminal_id` comes without a `source_terminal_id`. When
+  `launch_terminal_id` is sent, the response carries `launch_linked`: `true`
+  if the outcome was joined to a launch record, and `false` if it was written
+  without a link (no record for the id, a self-report on a launch that has
+  already ended, or a link that could not be read or written).
 - `/internal/memory/*` serves the memory tools on a node that does not own the
   database (`CAO_MEMORY_API_URL`). Its `key` is validated leniently and then
   normalised, matching what the tools have always done in-process — the strict

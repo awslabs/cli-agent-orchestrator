@@ -107,6 +107,21 @@ Surfaces:
 - Storage: `workflow_outcomes` table in CAO's SQLite DB, indexed by
   `(session_name, created_at)` and `(agent_profile, created_at)`.
 
+**Linking an outcome to a launch.** CAO keeps a small record of every
+terminal launch (labels, timings and ids, never prompts or output), and keeps
+it after the terminal is deleted. `report_outcome` takes an optional
+`terminal_id`: the worker terminal that did this unit of work. Only two
+reporters may link to it: the worker itself, or the terminal that created it
+directly with `assign` or `handoff`, also after the worker was deleted. A
+grandparent or any other terminal is refused: the tool returns
+`success: false` with an error, and nothing is recorded. When you pass
+`terminal_id`, the result also carries `launch_linked`:
+
+- `true`: the outcome was recorded and joined to that launch;
+- `false`: the outcome was recorded without a link, for example because
+  there is no launch record for that id (a worker on another node) or because
+  the worker reported on its own launch after the launch had ended.
+
 ### Wiring a workflow for learning
 
 Two SOP additions make a workflow learn (see
