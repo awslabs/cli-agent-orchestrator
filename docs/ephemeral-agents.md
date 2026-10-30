@@ -3,9 +3,9 @@
 This experimental feature creates bounded, creator-owned profiles within a session.
 The creator terminal launches a name with `assign` or `handoff`. Each name launches once.
 
-Keep `ephemeral.enabled` false outside testing. It defaults to false and will remain off
-through create/launch and model policy work. A default flip requires both lifecycle cleanup
-and the workflow runtime-creation refusal; cleanup alone is not enough.
+Keep `ephemeral.enabled` false outside testing. It defaults to false, and stays false until
+the rest of the lifecycle cleanup work (#1079) ships and creating an ephemeral agent from
+inside a workflow step is refused (#1080). The cleanup described below is not enough on its own.
 
 ## Operator settings
 
@@ -25,6 +25,7 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "max_effort": null,
     "default_effort": null,
     "max_depth": 1,
+    "child_may_delegate": false,
     "max_live_per_session": 0,
     "launch_grace_seconds": 600,
     "sweep_interval_seconds": 300,
@@ -40,8 +41,8 @@ recheck whether the feature is enabled before touching a name. Unreadable
 settings fail closed. `max_depth` accepts only integer 1. Ephemeral callers cannot create
 other ephemerals, even when `child_may_delegate` allows the existing delegation tools.
 
-The last four keys control lifecycle cleanup. Their defaults are proposals that await
-maintainer confirmation (#1079). `max_live_per_session` is an opt-in cap on the pending,
+The last four keys control lifecycle cleanup. Their defaults may still change (#1079).
+`max_live_per_session` is an opt-in cap on the pending,
 claimed and launched names one session holds. The default, `0`, means no cap, so current users
 see no change. To opt in, set a positive integer; `32` leaves room for a fleet-style
 supervisor. Collected names and expired pending names don't count. A create past the cap is
@@ -188,8 +189,8 @@ its provider:
 you don't recognize as `advisory`. A provider may also be unable to run a tool atom
 in an ephemeral agent. Create then refuses with `tool_unsupported_on_provider:<atom>`,
 naming the first such atom in the order `fs_read`, `fs_list`, `fs_write`, `execute_bash`,
-`web_fetch`; no current provider refuses one. The label values and this rule are
-provisional (#1074).
+`web_fetch`; no current provider refuses one. The label values and this rule may still
+change (#1074).
 
 Names have the form `<band>-<purpose>-<four-hex-digits>`. Reserved names refuse remote
 `assign`/`handoff` with `target_host` and `assign_elastic` before placement.
@@ -360,7 +361,7 @@ marked ephemeral and the existing delegation denial stays effective.
 ## Honesty statement
 
 > An ephemeral child's CAO-recorded allowlist is a subset of its creator's effective allowlist at creation time. Its generated profile declares only the CAO MCP server, no hooks or native agents, and `skills: []` so no skill catalog is inherited; named skills remain callable through `load_skill`; installed agent plugins' MCP servers are not added at launch; and CAO will not launch it with a wider list. An ephemeral child cannot create ephemerals. It cannot delegate or start or cancel workflows through CAO's MCP tools unless the operator sets `child_may_delegate`. That is all this guarantees. It does not guarantee:
-> 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro is unsupported until the deferred Kiro slice lands. The create response's `enforcement` field reports this class: `hard` or `advisory`.
+> 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro isn't supported yet. The create response's `enforcement` field reports this class: `hard` or `advisory`.
 > 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. MCP `send_message`, `answer_user_prompt` and `delete_terminal` bind targets to the caller's permitted terminal tree (#912). State-changing memory and metadata tools and workflow authoring (`workflow_create`/`workflow_update`; a changed spec needs a new plan approval, on by default) still use the coarse server grant (#671). With `child_may_delegate=true`, workflow cancellation also uses that grant, without run ownership binding.
 > 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself, edit `settings.json`, or read `ephemeral/live/`.
 > 4. **Per-tool MCP enforcement for installed profiles** (#671). Installed profiles ARE now bounded by their creator's recorded delegation ceiling through the same comparison (see [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance)); the remaining gap is the server-level `@cao-mcp-server` grant above.

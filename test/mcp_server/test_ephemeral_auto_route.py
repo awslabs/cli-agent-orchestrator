@@ -90,6 +90,8 @@ class Decider:
             self.during()
         if self.gate is not None:
             await self.gate.wait()
+        if self.failure == "cancelled":
+            raise asyncio.CancelledError()
         if self.failure == "error":
             raise ValueError("synthetic decider failure")
         if self.failure == "timeout":
@@ -334,6 +336,8 @@ async def test_AC3_on_applies_the_answer_capped_into_bounds(e5, case, applied, p
         ({"tier": "auto", "answer": "huge"}, "invalid_answer"),
         ({"tier": "auto", "failure": "no_answer"}, "no_answer"),
         ({"tier": "auto", "failure": "error"}, "error"),
+        # #1085: the decider's own cancellation is an error, not a failed launch.
+        ({"tier": "auto", "failure": "cancelled"}, "error"),
         ({"tier": "auto", "failure": "timeout"}, "timeout"),
     ],
     indirect=["case"],

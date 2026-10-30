@@ -10350,6 +10350,187 @@ async def list_outcomes_endpoint(
     return {"outcomes": outcomes, "count": len(outcomes)}
 
 
+@app.get("/fleet/status")
+async def fleet_status_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Read-only fleet summary for the web UI.
+
+    Mirrors ``cao fleet status``: reaches the worker broker through
+    ``FleetClient`` (``CAO_ELASTIC_BROKER_URL`` / ``CAO_ELASTIC_BROKER_TOKEN`` —
+    one port-forward away on EKS) and returns the broker url, the live and
+    cleanup-pending worker counts, and a lease-state histogram. The fleet routes on
+    cao-server are all reads (this one and ``/fleet/workers``): ``fleet shutdown``
+    and ``worker release`` are destructive and stay CLI/explicit actions, so there
+    is no write path here.
+
+    ``FleetClient`` raises ``click.ClickException`` both when no broker is
+    configured (``from_env``) and when the broker is unreachable or errors; both
+    surface here as 503 carrying the broker's own message, so the UI can show
+    "fleet not reachable" rather than a generic 500. The blocking ``requests``
+    calls run off the event loop via ``asyncio.to_thread``.
+    """
+    import asyncio
+    from collections import Counter
+
+    import click
+
+    from cli_agent_orchestrator.utils.fleet import FleetClient
+
+    def _collect() -> tuple[str, list]:
+        client = FleetClient.from_env()
+        return client.url, client.workers()
+
+    try:
+        broker_url, workers = await asyncio.to_thread(_collect)
+    except click.ClickException as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=e.format_message()
+        )
+
+    counts = Counter(w.get("state", "unknown") for w in workers)
+    return {
+        "broker": broker_url,
+        "live": sum(1 for w in workers if w.get("workload_present") is True),
+        "cleanup_pending": sum(1 for w in workers if w.get("cleanup_pending") is True),
+        "states": dict(counts),
+    }
+
+
+# Fields of a broker inventory row (the broker's WorkerStatus) and of a worker
+# terminal that the fleet worker routes pass through. An ALLOWLIST, not a filter:
+# anything the broker or the worker's cao-server adds later stays server-side until
+# someone decides it is safe to show. Notably never forwarded: the broker token,
+# the lease's release token / target host, and any node-proxy URL.
+_FLEET_WORKER_FIELDS = (
+    "worker_id",
+    "state",
+    "reason",
+    "agent_profile",
+    "provider",
+    "age_seconds",
+    "workload_present",
+    "cleanup_pending",
+    "lease_tracked",
+)
+_FLEET_TERMINAL_FIELDS = ("id", "name", "session_name", "agent_profile", "provider", "status")
+# A worker id is interpolated into the broker's proxy path
+# (/workers/{id}/api/...), so it must be a plain identifier: no '/', no '..'.
+_FLEET_WORKER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# Last-output preview cap; the full transcript stays one `cao worker attach` away.
+_FLEET_LAST_OUTPUT_MAX_CHARS = 4000
+
+
+def _pick(row: Any, fields: Tuple[str, ...]) -> Optional[Dict[str, Any]]:
+    if not isinstance(row, dict):
+        return None
+    return {k: row.get(k) for k in fields}
+
+
+@app.get("/fleet/workers")
+async def fleet_workers_endpoint(
+    include_settled: bool = Query(
+        False, alias="all", description="Include settled leases (cao worker list --all)"
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Read-only worker inventory for the web UI, mirroring ``cao worker list``.
+
+    Returns ``{"broker", "workers": [...]}`` where each worker carries exactly
+    ``_FLEET_WORKER_FIELDS``. Live workers only unless ``all=true``, as in the CLI.
+    No broker configured, unreachable or erroring -> 503 with its message.
+    """
+    import click
+
+    from cli_agent_orchestrator.utils.fleet import FleetClient
+
+    def _collect() -> Tuple[str, list]:
+        client = FleetClient.from_env()
+        return client.url, client.workers()
+
+    try:
+        broker_url, workers = await asyncio.to_thread(_collect)
+    except click.ClickException as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=e.format_message()
+        )
+    rows = [_pick(w, _FLEET_WORKER_FIELDS) for w in workers]
+    if not include_settled:
+        rows = [w for w in rows if w and w.get("workload_present") is True]
+    return {"broker": broker_url, "workers": [w for w in rows if w]}
+
+
+@app.get("/fleet/workers/{worker_id}")
+async def fleet_worker_endpoint(
+    worker_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """One worker's lease and what its agent is doing, mirroring ``cao worker status``.
+
+    ``{"worker_id", "lease", "terminal", "terminal_error", "last_output"}``. ``lease``
+    is the allowlisted inventory row or ``None`` (a broker restart forgets leases while
+    the workload lives on); ``terminal`` the allowlisted terminal of the worker's own
+    cao-server, read through the broker's proxy; ``last_output`` its last response,
+    capped at ``_FLEET_LAST_OUTPUT_MAX_CHARS``. As in the CLI, a leased worker whose
+    cao-server does not answer yet degrades to the lease with ``terminal_error`` set.
+    Errors: malformed id 400; no lease AND no answering worker 404 (503 when the broker
+    itself is unreachable or not configured).
+    """
+    import click
+
+    from cli_agent_orchestrator.utils.fleet import BrokerRequestError, FleetClient
+
+    if not _FLEET_WORKER_ID.match(worker_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="malformed worker id")
+
+    def _collect() -> Dict[str, Any]:
+        client = FleetClient.from_env()
+        lease = next((w for w in client.workers() if w.get("worker_id") == worker_id), None)
+        terminal = None
+        last_output = None
+        terminal_error = None
+        if lease is None or lease.get("workload_present") is True:
+            try:
+                sole = client.sole_terminal(worker_id)
+                terminal = client.terminal(worker_id, sole["id"])
+                last_output = client.terminal_output(worker_id, sole["id"])
+            except click.ClickException as exc:
+                if lease is None:
+                    raise
+                terminal_error = exc.format_message()
+        if isinstance(last_output, str) and len(last_output) > _FLEET_LAST_OUTPUT_MAX_CHARS:
+            last_output = last_output[-_FLEET_LAST_OUTPUT_MAX_CHARS:]
+        return {
+            "worker_id": worker_id,
+            "lease": _pick(lease, _FLEET_WORKER_FIELDS),
+            "terminal": _pick(terminal, _FLEET_TERMINAL_FIELDS),
+            "terminal_error": terminal_error,
+            "last_output": last_output if isinstance(last_output, str) else None,
+        }
+
+    try:
+        return await asyncio.to_thread(_collect)
+    except BrokerRequestError as e:
+        # Reached the broker and it said 4xx about this worker -> the worker is not there.
+        # Unreachable (status None) or a broker 5xx is the fleet being unavailable.
+        code = (
+            status.HTTP_404_NOT_FOUND
+            if e.status_code is not None and 400 <= e.status_code < 500
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        raise HTTPException(status_code=code, detail=e.format_message())
+    except click.ClickException as e:
+        # from_env with no broker configured -> 503. Otherwise the worker answered but
+        # has no (or more than one) terminal and no lease names it -> nothing to show.
+        no_fleet = "No fleet configured" in e.format_message()
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE if no_fleet else status.HTTP_404_NOT_FOUND
+            ),
+            detail=e.format_message(),
+        )
+
+
 # Static file serving for built web UI.
 # Anchored to the package via importlib.resources so it works for both
 # editable installs (uv sync) and wheel installs (uv tool install, pip install).
