@@ -215,6 +215,18 @@ def append_sender_suffix(
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 
+# How many times handoff's synchronous create is sent, all under the SAME
+# idempotency key and each with the full ``synchronous_create_timeout`` budget
+# (review on PR #773). That budget is the client's view of the server's init
+# allowance (issue #710); it can still be outrun, for example when the server
+# reads a larger ``provider_init_timeout`` than the client does. The client
+# never guesses from the exception type whether its timed-out attempt reached
+# the server: if it did, the retry is an idempotent replay, which cao-server
+# holds until the original provider.initialize() settles and then returns the
+# READY terminal (or the original failure); if it did not (e.g. a
+# ConnectTimeout), the retry is a fresh create that gets the same full budget
+# as a first attempt.
+_HANDOFF_CREATE_ATTEMPTS = 3
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
 
@@ -811,9 +823,12 @@ class EphemeralClaim(NamedTuple):
 class _ClaimRefused(ValueError):
     """Carry only the policy relay's public rule and message to the handler."""
 
-    def __init__(self, rule: str, message: str):
+    def __init__(self, rule: str, message: str, status_code: Optional[int] = None):
         super().__init__(message)
         self.rule = rule
+        # The HTTP status behind a generic refusal, so handoff can tell a failed
+        # original (424) from an unknown outcome (review on PR #773).
+        self.status_code = status_code
 
 
 def _local_claim_refusal(rule: str, detail: str = "") -> _ClaimRefused:
@@ -917,6 +932,7 @@ def _create_terminal(
     use_worktree: bool = False,
     create_timeout: Optional[Union[float, Tuple[float, float]]] = None,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     claim: Optional[EphemeralClaim] = None,
     description: Optional[str] = None,
     *,
@@ -931,6 +947,12 @@ def _create_terminal(
         working_directory: Optional working directory for the terminal
         claim: Optional ephemeral launch claim for binding the child terminal
         description: Optional description persisted on the child terminal
+        lookup_only: Review on PR #773. Ask cao-server only to RESOLVE
+            ``idempotency_key`` to the terminal a prior call committed: it
+            returns at once (without waiting for that terminal's provider
+            initialization), never allocates, and answers 404 when nothing is
+            committed. The result identifies a worker for inspection and
+            cleanup; it is not permission to send it input.
         idempotency_key: Review on PR #634, issue #616. Forwarded as a query
             param to whichever endpoint this call hits (existing-session or
             new-session); the server returns the terminal a PRIOR call with
@@ -949,6 +971,10 @@ def _create_terminal(
             ``utils.init_allowance`` for that case (issue #710), as handoff
             does. A ``(connect, read)`` tuple is accepted as ``requests`` takes
             it, so only the read half is widened.
+            A client-side timeout on this call is not fatal to the caller:
+            retrying with the same ``idempotency_key`` either replays the
+            original create (and waits for its initialization) or performs it
+            if it never arrived (see ``_HANDOFF_CREATE_ATTEMPTS``).
         defer_init: If True, tell
             cao-server to skip the ``provider.initialize()`` wait and return
             as soon as the tmux window and DB record exist. Provider init
@@ -1068,6 +1094,8 @@ def _create_terminal(
             params["use_worktree"] = "true"
         if idempotency_key:
             params["idempotency_key"] = idempotency_key
+        if lookup_only:
+            params["lookup_only"] = "true"
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -1101,7 +1129,9 @@ def _create_terminal(
             if kind == "ephemeral_policy":
                 raise _ClaimRefused(rule or "unexpected_failure", message)
             raise _ClaimRefused(
-                "unexpected_failure", f"ephemeral launch failed ({response.status_code})"
+                "unexpected_failure",
+                f"ephemeral launch failed ({response.status_code})",
+                status_code=response.status_code,
             )
         response.raise_for_status()
         terminal = response.json()
@@ -1153,6 +1183,8 @@ def _create_terminal(
             params["use_worktree"] = "true"
         if idempotency_key:
             params["idempotency_key"] = idempotency_key
+        if lookup_only:
+            params["lookup_only"] = "true"
 
         json_body = {"description": normalize_description(description, truncate=True)}
         if initial_message is not None:
@@ -1736,6 +1768,168 @@ async def _run_step_and_build_result(
 
 
 # Implementation functions
+
+
+class _HandoffCreateUnresolved(Exception):
+    """The create ended without telling the caller whether a worker exists.
+
+    Raised when the bounded attempts all time out, or when an attempt that
+    follows a timeout fails for a reason other than a failed original create.
+    In both cases an earlier attempt may have committed a worker under the same
+    key, so the caller looks its identity up before reporting the failure. The
+    original error is the ``__cause__``.
+    """
+
+
+def _http_error_detail(exc: requests.exceptions.HTTPError) -> str:
+    """Return the ``detail`` cao-server sent with an error response, if any."""
+    if exc.response is None:
+        return str(exc)
+    try:
+        detail = exc.response.json().get("detail")
+    except (AttributeError, ValueError):
+        detail = None
+    return detail if isinstance(detail, str) and detail else str(exc)
+
+
+def _create_handoff_terminal(
+    agent_profile: str,
+    working_directory: Optional[str],
+    *,
+    engine: Optional[str],
+    model: Optional[str],
+    use_worktree: bool,
+    idempotency_key: str,
+    description: Optional[str] = None,
+    claim: Optional[EphemeralClaim] = None,
+    delegation_message: Optional[str] = None,
+    delegation_kind: Optional[str] = None,
+    response_sink: Optional[Callable[[requests.Response], None]] = None,
+) -> Tuple[str, str]:
+    """Synchronously create handoff's worker, retrying a client timeout.
+
+    Every attempt carries the SAME idempotency key and the full
+    ``synchronous_create_timeout`` budget (review on PR #773). Only a timeout is
+    retried. Whether or not the timed-out attempt reached cao-server, the next
+    one is safe: a replay is held server-side until the original
+    provider.initialize() settles, and an attempt that never arrived is simply
+    performed.
+
+    A replay of a create whose initialization FAILED comes back as HTTP 424
+    with the cause. That is the original failure, so it is raised with that
+    cause and never retried: retrying would start a second worker for a key
+    whose first one already failed. Any other error after a timeout is not
+    retried either; it raises ``_HandoffCreateUnresolved`` so the caller can
+    still look up a worker an earlier attempt may have committed.
+    """
+    claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
+    saw_timeout = False
+    for attempt in range(1, _HANDOFF_CREATE_ATTEMPTS + 1):
+        try:
+            return _create_terminal(
+                agent_profile,
+                working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                create_timeout=synchronous_create_timeout(agent_profile),
+                idempotency_key=idempotency_key,
+                description=description,
+                delegation_message=delegation_message,
+                delegation_kind=delegation_kind,
+                response_sink=response_sink,
+                **claim_kwargs,
+            )
+        except requests.exceptions.Timeout as exc:
+            saw_timeout = True
+            if attempt == _HANDOFF_CREATE_ATTEMPTS:
+                raise _HandoffCreateUnresolved(str(exc)) from exc
+            logger.warning(
+                "handoff: create attempt %d/%d timed out; retrying with the same "
+                "idempotency key",
+                attempt,
+                _HANDOFF_CREATE_ATTEMPTS,
+            )
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 424:
+                raise RuntimeError(_http_error_detail(exc)) from exc
+            if saw_timeout:
+                raise _HandoffCreateUnresolved(str(exc)) from exc
+            raise
+        except _ClaimRefused as exc:
+            # With a claim, _create_terminal reports every 4xx/5xx as a refusal,
+            # so the 424 and other-error branches above never see it (review on
+            # PR #773). A 424 is the failed original, as without a claim: raise
+            # it and do not look anything up. After a timeout, any other refusal
+            # may hide a worker an earlier attempt committed: let the caller
+            # look it up. With nothing committed the caller re-raises this
+            # refusal, so its rule and message stay.
+            if saw_timeout and exc.status_code != 424:
+                raise _HandoffCreateUnresolved(str(exc)) from exc
+            raise
+    raise AssertionError("unreachable")  # the loop always returns or raises
+
+
+def _lookup_committed_handoff_terminal(
+    agent_profile: str,
+    working_directory: Optional[str],
+    *,
+    engine: Optional[str],
+    model: Optional[str],
+    use_worktree: bool,
+    idempotency_key: str,
+    description: Optional[str] = None,
+    claim: Optional[EphemeralClaim] = None,
+) -> Optional[str]:
+    """Return the terminal_id cao-server committed for this key, if any.
+
+    Used only after ``_create_handoff_terminal`` has exhausted its bounded
+    attempts (review on PR #773). Every one of those attempts may have been a
+    replay held behind a provider initialization that simply outlasted them
+    (a profile's ``provider_init_timeout`` is not capped by the retry
+    ceiling), in which case the worker exists and will finish starting, but
+    no response ever carried its id. This is the ``lookup_only`` form of the
+    same keyed request: it does not wait and cannot allocate, so it recovers
+    the identity of committed work without starting any. ``None`` means there
+    is nothing to recover (or the lookup itself failed), and the caller
+    reports the original timeout unchanged.
+    """
+    claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
+    try:
+        terminal_id, _provider = _create_terminal(
+            agent_profile,
+            working_directory,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
+            # A lookup answers without waiting for init, but it is still a
+            # create request to the server, so it carries the same derived
+            # budget as every other one (issue #710).
+            create_timeout=synchronous_create_timeout(agent_profile),
+            idempotency_key=idempotency_key,
+            lookup_only=True,
+            description=description,
+            **claim_kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001 -- best-effort recovery of an id
+        logger.info("handoff: no committed terminal recovered after create timeout: %s", exc)
+        return None
+    return terminal_id
+
+
+def _notify_terminal_id(on_terminal_id: Optional[Callable[[str], None]], terminal_id: str) -> None:
+    """Report a terminal_id to the caller's callback without letting it break the handoff."""
+    if on_terminal_id is None:
+        return
+    try:
+        on_terminal_id(terminal_id)
+    except Exception as exc:  # noqa: BLE001 -- a UI callback must never break the handoff
+        logger.warning(
+            "handoff: on_terminal_id callback failed for terminal %s: %s", terminal_id, exc
+        )
+
+
 async def _handoff_impl(
     agent_profile: str,
     message: str,
@@ -2016,27 +2210,60 @@ async def _handoff_impl(
         # be a flat 150s (#634), which was below a successful Claude init at
         # 3T=180s, let alone Kimi's 300s or Antigravity's 370s.
         claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
-        terminal_id, provider = _create_terminal(
-            agent_profile,
-            working_directory,
-            engine=engine,
-            model=model,
-            use_worktree=use_worktree,
-            create_timeout=synchronous_create_timeout(agent_profile),
-            idempotency_key=idempotency_key,
-            description=description,
-            delegation_message=message,
-            delegation_kind="handoff",
-            response_sink=_decision_response_sink(notes),
-            **claim_kwargs,
-        )
-        if on_terminal_id is not None:
-            try:
-                on_terminal_id(terminal_id)
-            except Exception as exc:  # noqa: BLE001 -- a UI callback must never break the handoff
-                logger.warning(
-                    "handoff: on_terminal_id callback failed for terminal %s: %s", terminal_id, exc
-                )
+        # A key is synthesized here even when the caller passed none (true of
+        # every caller today -- see this function's idempotency_key docstring
+        # note): it is used ONLY as this create call's own retry-safety net
+        # below, never forwarded past this function, so it carries none of
+        # the cross-call submission-dedup risk that note describes.
+        create_key = idempotency_key or uuid.uuid4().hex
+        try:
+            terminal_id, provider = _create_handoff_terminal(
+                agent_profile,
+                working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                idempotency_key=create_key,
+                description=description,
+                delegation_message=message,
+                delegation_kind="handoff",
+                response_sink=_decision_response_sink(notes),
+                **claim_kwargs,
+            )
+        except _HandoffCreateUnresolved as unresolved:
+            # The create ended without an answer. That says nothing about
+            # whether a worker was committed, and readiness is a separate
+            # question from identity: recover the id if there is one, report it,
+            # and send NOTHING to a terminal that is not known to be ready.
+            terminal_id = _lookup_committed_handoff_terminal(
+                agent_profile,
+                working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                idempotency_key=create_key,
+                description=description,
+                **claim_kwargs,
+            )
+            if terminal_id is None:
+                # Nothing is committed for this key: report the error that ended
+                # the create (the last attempt's), as before this lookup.
+                raise unresolved.__cause__ or unresolved
+            _notify_terminal_id(on_terminal_id, terminal_id)
+            return HandoffResult(
+                success=False,
+                message=(
+                    f"Handoff failed: worker terminal {terminal_id} was created, but "
+                    f"the create call did not complete ({unresolved}), so no task was "
+                    "sent to it. It may still become ready; inspect or delete it using "
+                    "this terminal_id."
+                ),
+                output=None,
+                terminal_id=terminal_id,
+                job_id=None,
+                pending=None,
+            )
+        _notify_terminal_id(on_terminal_id, terminal_id)
 
         if not wait:
             # --no-wait: send the prompt and return immediately. The terminal
