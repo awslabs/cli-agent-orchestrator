@@ -370,3 +370,21 @@ def test_findings_name_the_check_and_the_input_is_never_mutated():
     assert data == before
     assert findings[0].refusal == "kiro_v3_invalid:rule_effect"
     assert snapshot != data
+
+
+def test_meta_capabilities_refuse_even_when_a_schema_lists_them():
+    """The engine's own capability set includes ``all``, ``builtin`` and ``filesystem``.
+
+    A schema pinned straight from that set must still refuse them: meta
+    capabilities expand differently per engine version, so CAO never emits one.
+    """
+    engine_set = replace(
+        KAS_0_66_70,
+        engine="kas-test-engine-set",
+        capabilities=KAS_0_66_70.capabilities | KAS_0_66_70.meta_capabilities,
+    )
+    for meta in sorted(KAS_0_66_70.meta_capabilities):
+        data = _render()
+        data["permissions"]["rules"][0]["capability"] = meta
+        codes = {f.code for f in validate_kiro_v3_agent(data, engine_set, expected_name="reviewer")}
+        assert "rule_capability" in codes, meta
