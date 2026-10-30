@@ -38,6 +38,7 @@ from cli_agent_orchestrator.decisions.types import (
     DecisionAnswer,
     DecisionFacts,
     DecisionRequest,
+    Effort,
     Fallback,
     LaunchPlan,
     MissingTier,
@@ -92,6 +93,10 @@ def _honors(provider: str, name: str | None, profile: AgentProfile | None) -> bo
     return bool(ProviderManager.provider_class(provider).honors_model(name, profile, None))
 
 
+def _honors_effort(provider: str, name: str | None, profile: AgentProfile | None) -> bool:
+    return bool(ProviderManager.provider_class(provider).honors_effort(name, profile))
+
+
 def _label(value: str) -> str:
     # Decider names come from settings; a malformed one must not write arbitrary log text.
     return value if _LOG_LABEL.fullmatch(value) else "<invalid>"
@@ -130,6 +135,7 @@ class DecisionEngine:
         settings_loader: Callable[[], DecisionSettings] = load_settings,
         profile_loader: Callable[[str], AgentProfile | None] = load_agent_profile,
         honors_model: Callable[[str, str | None, AgentProfile | None], bool] = _honors,
+        honors_effort: Callable[[str, str | None, AgentProfile | None], bool] = _honors_effort,
         clock: Callable[[], float] = time.monotonic,
         warning_interval_s: float = 60.0,
         settings_version: Callable[[], object] = _settings_version,
@@ -138,6 +144,7 @@ class DecisionEngine:
         self.settings_loader = settings_loader
         self.profile_loader = profile_loader
         self.honors_model = honors_model
+        self.honors_effort = honors_effort
         self._clock = clock
         self._warning_interval_s = warning_interval_s
         self._settings_version = settings_version
@@ -389,6 +396,7 @@ class DecisionEngine:
             plan_model = fb_model.value
         if fields.get("model.route") not in (None, "auto"):
             plan_model = tiers.get(fields["model.route"])
+        plan_effort: Effort | None = None
         request: DecisionRequest | None = None
 
         def decision_request() -> DecisionRequest:
@@ -460,6 +468,9 @@ class DecisionEngine:
                 # A missing default tier was already refused above, before any decider call.
                 if point == "model.route" and values.get("candidate_model"):
                     plan_model = values["candidate_model"]
+                # #1083 Q1 (provisional): only an on-mode answer within the bounds is carried.
+                if point == "effort.route" and values.get("outcome") in ("applied", "capped"):
+                    plan_effort = cast(Effort, values["applied_value"])
                 insert({**base(point, decider), **values}, message())
             for point in eligible:
                 if point not in active or active[point].state != PointState.SHADOW:
@@ -503,12 +514,19 @@ class DecisionEngine:
         except BaseException:
             self.store.bind(tuple(ids), launch_status="not_launched")
             raise
-        return LaunchPlan(plan_model, tuple(ids)) if ids or plan_model is not None else None
+        if ids or plan_model is not None or plan_effort is not None:
+            return LaunchPlan(plan_model, tuple(ids), plan_effort)
+        return None
 
     def _resolve(
         self, point: str, req: DelegationRequest, profile: AgentProfile | None, name: str
     ) -> tuple[Decider | None, str | None]:
         if point == "model.route" and not self.honors_model(
+            req.provider, req.agent_profile, profile
+        ):
+            return None, "not_honored"
+        # #1083 (provisional): a provider that cannot apply an effort is never asked for one.
+        if point == "effort.route" and not self.honors_effort(
             req.provider, req.agent_profile, profile
         ):
             return None, "not_honored"

@@ -88,3 +88,7 @@ class MissingTier:
 class LaunchPlan:
     model: str | None = None
     record_ids: tuple[int, ...] = ()
+    # #1083 Q1 (provisional): an on-mode effort.route answer, applied or capped. Only the
+    # ephemeral site sets it; terminal_service.resolve_launch_effort passes it to the
+    # provider, and installed launches never set it.
+    effort: Effort | None = None

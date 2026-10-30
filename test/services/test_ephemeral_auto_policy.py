@@ -58,11 +58,11 @@ def test_an_auto_create_refuses_an_atom_the_provider_cannot_run(auto_store, monk
     assert_no_create(auto_store, AUTO, "tool_unsupported_on_provider:fs_read")
 
 
-def test_D1_effort_auto_still_refuses(auto_store):
-    err = assert_no_create(
-        auto_store, {**SPEC, "effort": "auto"}, "auto_requires_decision_platform"
-    )
-    assert err.detail == "effort"
+def test_D1_effort_auto_needs_its_own_bounds(auto_store):
+    # #1083 (provisional): the tier bounds never stand in for the effort bounds.
+    err = assert_no_create(auto_store, {**SPEC, "effort": "auto"}, "auto_requires_bounds")
+    assert "effort=auto" in err.detail and "ephemeral.min_effort" in err.detail
+    assert "ephemeral.max_effort" in err.detail and "min_tier" not in err.detail
 
 
 def test_F1_auto_stores_its_fallback_and_the_spec_keeps_auto(auto_store):

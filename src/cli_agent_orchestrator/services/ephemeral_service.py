@@ -28,7 +28,7 @@ from cli_agent_orchestrator.decisions.policy import (
     PolicyBounds,
     PolicyConfigError,
 )
-from cli_agent_orchestrator.decisions.types import POINTS
+from cli_agent_orchestrator.decisions.types import POINTS, Effort
 from cli_agent_orchestrator.models.ephemeral import TOOL_ATOMS, EphemeralSpec
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
@@ -205,21 +205,23 @@ def policy_bounds(settings: dict[str, Any]) -> PolicyBounds:
         max_effort=settings.get("max_effort"),
         allowed_providers=frozenset(settings["allowed_providers"]),
         min_tier=settings.get("min_tier"),
+        min_effort=settings.get("min_effort"),
     )
 
 
-def _validate_floor(settings: dict[str, Any]) -> None:
-    """MF1 rules 9-10 through #810's PolicyBounds (MF5), once rules 1-2 have passed."""
+def _validate_floor(settings: dict[str, Any], field: str = "tier") -> None:
+    """MF1 rules 9-10 through #810's PolicyBounds (MF5), once rules 1-2 have passed.
+
+    #1083 Q2 (provisional): the effort floor follows the same rules as the tier floor.
+    """
     try:
         PolicyBounds(
-            default_tier=settings.get("default_tier"),
-            max_tier=settings.get("max_tier"),
-            min_tier=settings.get("min_tier"),
+            **{bound + field: settings.get(bound + field) for bound in ("default_", "max_", "min_")}
         ).validate({})
     except PolicyConfigError:
         raise EphemeralPolicyError(
-            "policy_config_error:min_tier",
-            "ephemeral.min_tier needs ephemeral.default_tier at or above it, and must not exceed ephemeral.max_tier",
+            f"policy_config_error:min_{field}",
+            f"ephemeral.min_{field} needs ephemeral.default_{field} at or above it, and must not exceed ephemeral.max_{field}",
         ) from None
 
 
@@ -312,7 +314,7 @@ def validate_block(settings: dict[str, Any]) -> None:
             "ephemeral.default_tier must be set when ephemeral.max_tier is set, and must not exceed it",
         ) from None
     _validate_floor(settings)
-    for key in ("max_effort", "default_effort"):
+    for key in ("max_effort", "default_effort", "min_effort"):
         value = settings.get(key)
         options = POINTS["effort.route"].options
         if value is not None and (not isinstance(value, str) or value not in options):
@@ -329,6 +331,7 @@ def validate_block(settings: dict[str, Any]) -> None:
             "policy_config_error:default_effort",
             "ephemeral.default_effort must be set when ephemeral.max_effort is set, and must not exceed it",
         ) from None
+    _validate_floor(settings, "effort")
     try:
         policy_bounds(settings).validate(settings.get("_model_tiers", {}))
     except PolicyConfigError as exc:
@@ -519,9 +522,13 @@ def _policy_notes(
         )
     )
     effort_note = (
-        f"effort: {effort} ({'effort' if spec.effort is not None else 'ephemeral.default_effort'})"
-        if effort is not None
-        else "effort: provider default (effort omitted, no default_effort)"
+        f"effort: auto (decided at launch; fallback effort {effort}, ephemeral.default_effort)"
+        if spec.effort == "auto"
+        else (
+            f"effort: {effort} ({'effort' if spec.effort is not None else 'ephemeral.default_effort'})"
+            if effort is not None
+            else "effort: provider default (effort omitted, no default_effort)"
+        )
     )
     return [model, effort_note]
 
@@ -557,10 +564,15 @@ def _value_refusal(
                 f"{field}={value} is above ephemeral.{key}={ceiling}; request {ceiling} or lower, or omit {field}",
             )
         if exc.reason == "below_floor":
+            field, key, rule = (
+                ("model_tier", "min_tier", "tier_below_policy")
+                if point == "model.route"
+                else ("effort", "min_effort", "effort_below_policy")
+            )
             floor = bounds.floor_for(point)
             return EphemeralPolicyError(
-                "tier_below_policy",
-                f"model_tier={value} is below ephemeral.min_tier={floor}; request {floor} or higher, or omit model_tier",
+                rule,
+                f"{field}={value} is below ephemeral.{key}={floor}; request {floor} or higher, or omit {field}",
             )
         if exc.reason == "explicit_unmapped":
             return EphemeralPolicyError(
@@ -575,9 +587,14 @@ def _stored_default_refusal(point: str, bounds: PolicyBounds) -> Optional[Epheme
     """A5-3 (provisional M2), and MF3: a new floor or ceiling cannot bound a stored provider default."""
     floor = bounds.floor_for(point)
     if floor is not None:
+        field, key, rule = (
+            ("model_tier", "min_tier", "tier_below_policy")
+            if point == "model.route"
+            else ("effort", "min_effort", "effort_below_policy")
+        )
         return EphemeralPolicyError(
-            "tier_below_policy",
-            f"stored model_tier is the provider default, which ephemeral.min_tier={floor} does not bound",
+            rule,
+            f"stored {field} is the provider default, which ephemeral.{key}={floor} does not bound",
         )
     ceiling = bounds.ceiling_for(point)
     if ceiling is None:
@@ -593,21 +610,52 @@ def _stored_default_refusal(point: str, bounds: PolicyBounds) -> Optional[Epheme
     )
 
 
-def _auto_refusal(settings: dict[str, Any], *, at_create: bool) -> Optional[EphemeralPolicyError]:
-    """#1068 MF4 and A15 (provisional): auto needs both bounds and a lease that outlasts on mode."""
-    missing = [key for key in ("min_tier", "max_tier") if settings.get(key) is None]
+def _auto_fields(spec: EphemeralSpec) -> list[tuple[str, str, str]]:
+    """The (point, spec field, settings noun) a spec declared auto, model first (#1083 Q3)."""
+    return [
+        (point, field, noun)
+        for point, field, noun, value in (
+            ("model.route", "model_tier", "tier", spec.model_tier),
+            ("effort.route", "effort", "effort", spec.effort),
+        )
+        if value == "auto"
+    ]
+
+
+def _auto_refusal(
+    settings: dict[str, Any], spec: EphemeralSpec, *, at_create: bool
+) -> Optional[EphemeralPolicyError]:
+    """#1068 MF4 and A15 (provisional): auto needs both bounds and a lease that outlasts on mode.
+
+    #1083 (provisional): effort auto needs both effort bounds too. Each declared point is asked
+    in turn, so the lease covers one on-mode wait per declared field.
+    """
+    fields = _auto_fields(spec)
+    missing = [
+        (field, keys)
+        for _, field, noun in fields
+        if (keys := [key for key in ("min_" + noun, "max_" + noun) if settings.get(key) is None])
+    ]
     if missing:
         return EphemeralPolicyError(
-            "auto_requires_bounds" if at_create else "policy_config_error:" + missing[0],
-            "model_tier=auto requires " + " and ".join("ephemeral." + key for key in missing),
+            "auto_requires_bounds" if at_create else "policy_config_error:" + missing[0][1][0],
+            "; ".join(
+                field + "=auto requires " + " and ".join("ephemeral." + key for key in keys)
+                for field, keys in missing
+            ),
         )
     from cli_agent_orchestrator.decisions.settings import resolve_on_timeout_ms
 
-    floor = resolve_on_timeout_ms({"decisions": settings.get("_decisions")}) / 1000 + 30
+    waits = len(fields)
+    timeout = resolve_on_timeout_ms({"decisions": settings.get("_decisions")})
+    floor = waits * timeout / 1000 + 30
     if settings["claim_lease_seconds"] < floor:
         return EphemeralPolicyError(
             "policy_config_error:claim_lease_seconds",
-            f"ephemeral.claim_lease_seconds must be at least decisions.on_timeout_ms/1000 + 30 ({floor:g}) for model_tier=auto",
+            "ephemeral.claim_lease_seconds must be at least "
+            + (f"{waits} * " if waits > 1 else "")
+            + f"decisions.on_timeout_ms/1000 + 30 ({floor:g}) for "
+            + " and ".join(field + "=auto" for _, field, _ in fields),
         )
     return None
 
@@ -663,13 +711,10 @@ def create_ephemeral_agent(
             )
         if "@cao-mcp-server" not in creator_tools and "*" not in creator_tools:
             raise EphemeralPolicyError("tool_exceeds_creator", "@cao-mcp-server")
-        if spec.model_tier == "auto":
-            refusal = _auto_refusal(config, at_create=True)
+        if _auto_fields(spec):
+            refusal = _auto_refusal(config, spec, at_create=True)
             if refusal is not None:
                 raise refusal
-        if spec.effort == "auto":
-            # #1068 D1: a launch plan carries only a model, so a decided effort waits (Q2).
-            raise EphemeralPolicyError("auto_requires_decision_platform", "effort")
         provider = spec.provider.value if spec.provider is not None else creator["provider"]
         if provider not in {item.value for item in ProviderType}:
             raise EphemeralPolicyError("creator_unresolved")
@@ -688,7 +733,7 @@ def create_ephemeral_agent(
             refusal = _value_refusal("model.route", spec.model_tier, provider, bounds, tiers)
             if refusal is not None:
                 raise refusal
-        if spec.effort is not None:
+        if spec.effort not in (None, "auto"):
             refusal = _value_refusal("effort.route", spec.effort, provider, bounds, tiers)
             if refusal is not None:
                 raise refusal
@@ -715,10 +760,10 @@ def create_ephemeral_agent(
         created = database._utcnow()
         expires = created + timedelta(seconds=config["pending_ttl_seconds"])
         expires_at = expires.isoformat()
-        # An auto spec stores its fallback, resolved once like an omitted tier (F1, M4).
+        # An auto spec stores its fallback, resolved once like an omitted value (F1, M4; #1083).
         tier = config["default_tier"] if spec.model_tier in (None, "auto") else spec.model_tier
         model = tiers[provider][tier] if tier is not None else None
-        effort = spec.effort or config["default_effort"]
+        effort = config["default_effort"] if spec.effort in (None, "auto") else spec.effort
         notes = _policy_notes(config, spec, tier, effort)
         # Held from the cap count until the pending row commits, so concurrent creates
         # cannot pass the cap together and a sweep holding it sees every live file's row.
@@ -880,12 +925,22 @@ def _row(db: Any, name: str) -> Optional[dict[str, Any]]:
 
 
 def _change(
-    db: Any, name: str, state: str, values: dict[str, Any], claim_id: Optional[str] = None
+    db: Any,
+    name: str,
+    state: str,
+    values: dict[str, Any],
+    claim_id: Optional[str] = None,
+    *,
+    live_at: Any = None,
 ) -> int:
     table = database.EphemeralAgentModel
     statement = update(table).where(table.name == name, table.state == state)
     if claim_id is not None:
         statement = statement.where(table.claim_id == claim_id)
+    if live_at is not None:
+        # E9: the same boundary as the bind's own fence (claim_expires_at > now), read
+        # inside this call's own transaction so a slow caller can't finalize a lapsed claim.
+        statement = statement.where(table.claim_expires_at > live_at)
     return cast(int, db.execute(statement.values(**values)).rowcount)
 
 
@@ -1034,8 +1089,8 @@ def _recheck_policy(
     try:
         validate_block(settings)
         spec = _stored_spec(row)
-        if spec is not None and spec.model_tier == "auto":
-            auto = _auto_refusal(settings, at_create=False)
+        if spec is not None and _auto_fields(spec):
+            auto = _auto_refusal(settings, spec, at_create=False)
             if auto is not None:
                 raise auto
     except EphemeralPolicyError as exc:
@@ -1103,7 +1158,14 @@ def _recheck_policy(
 
 
 def finalize(name: str, claim_id: str, values: dict[str, Any]) -> None:
-    """Re-render verified stored spec before returning the claim to its caller."""
+    """Re-render the verified stored spec with the claim's stored values, for one live claim.
+
+    ``values`` are ``_recheck_policy``'s: the stored tier, its current model id and the stored
+    effort. A decided value is never written here: it reaches the provider through the launch
+    plan (#1068, #1083). The hash moves, and the file is replaced, only while the row is still
+    claimed by ``claim_id`` and its lease is running, checked in one compare-and-update under
+    the write lock. A replaced or lapsed claim refuses with ``claim_expired`` and writes nothing.
+    """
     row = database.get_ephemeral_agent(name)
     if row is None:
         raise EphemeralPolicyError("unknown_ephemeral", status_code=404)
@@ -1138,7 +1200,12 @@ def finalize(name: str, claim_id: str, values: dict[str, Any]) -> None:
         _write_exclusive(temp, profile, owned)
         digest = hashlib.sha256(profile).hexdigest()
         with _transaction() as db:
-            changed = _change(db, name, "claimed", dict(profile_sha256=digest), claim_id)
+            # E9: read inside the write-locked transaction, not before it, so a slow
+            # recheck or a lease shorter than it can't finalize a claim that has lapsed.
+            now = database._utcnow()
+            changed = _change(
+                db, name, "claimed", dict(profile_sha256=digest), claim_id, live_at=now
+            )
             if changed:
                 os.replace(temp, EPHEMERAL_DIR / "live" / (name + ".md"))
                 # Failed commit: every load verifies profile_sha256 (#1063), so the
@@ -1163,7 +1230,11 @@ class EphemeralDecisionInputs:
 def decision_inputs(
     name: str, claim_id: str, caller_id: Optional[str], provider: str
 ) -> Optional[EphemeralDecisionInputs]:
-    """#1068 D2 (provisional M7): ask only for a live, matching, unbound claim declaring auto."""
+    """#1068 D2 (provisional M7): ask only for a live, matching, unbound claim declaring auto.
+
+    #1083 (provisional): ``effort: "auto"`` opts ``effort.route`` in the same way. Only declared
+    fields are asked, model first, and each falls back to its value resolved at create.
+    """
     row = database.get_ephemeral_agent(name)
     if (
         row is None
@@ -1175,8 +1246,9 @@ def decision_inputs(
     ):
         return None  # Nothing is asked; the bind refuses with its own rule.
     spec = _stored_spec(row)
-    if spec is None or spec.model_tier != "auto":
-        return None  # D1: an explicit or omitted tier never reaches a decider.
+    fields = _auto_fields(spec) if spec is not None else []
+    if spec is None or not fields:
+        return None  # D1: an explicit or omitted value never reaches a decider.
     try:
         settings = read_settings()
         require_enabled(settings)
@@ -1184,9 +1256,21 @@ def decision_inputs(
     except EphemeralPolicyError as exc:
         _report_refusal(name, caller_id, row, exc)
         raise
-    # The fallback is the tier resolved at create (M4), which the recheck just bounded.
-    policy = replace(policy_bounds(settings), default_tier=row["model_tier"])
-    return EphemeralDecisionInputs({"model.route": "auto"}, policy, spec.purpose, spec.description)
+    # Each fallback is the value resolved at create (M4), which the recheck just bounded.
+    policy = replace(
+        policy_bounds(settings), **{"default_" + noun: row[field] for _, field, noun in fields}
+    )
+    return EphemeralDecisionInputs(
+        {point: "auto" for point, _, _ in fields}, policy, spec.purpose, spec.description
+    )
+
+
+@dataclass(frozen=True)
+class DecidedLaunch:
+    """What a claimed auto launch runs on after the pre-bind recheck (#1068, #1083)."""
+
+    model: Optional[str]
+    effort: Optional[Effort]
 
 
 def _recovered_tier(
@@ -1211,16 +1295,19 @@ def recheck_decided(
     claim_id: str,
     caller_id: Optional[str],
     tier: Optional[str],
+    effort: Optional[Effort] = None,
     launched_model: Optional[str] = None,
-) -> Optional[str]:
+) -> Optional[DecidedLaunch]:
     """#1068: re-apply the operator's current policy to a claimed auto launch before the bind.
 
-    The operator may change the bounds or the table while the decider runs. ``tier`` is the
-    tier an on-mode answer's record says it applied. Without one, ``launched_model`` (the
-    plan's model) is reverse-mapped through the snapshot this recheck has just validated, so
-    a block broken during the decision refuses as at claim; with no match the launch runs the
-    fallback. Returns the model the current table maps the launched tier to, or None when the
-    claim is no longer live, so the bind refuses with its own rule.
+    The operator may change the bounds or the table while the decider runs. ``tier`` and
+    ``effort`` are what on-mode answers' records say they applied, or None when that field
+    runs its fallback. Without a recorded tier, ``launched_model`` (the plan's model) is
+    reverse-mapped through the snapshot this recheck has just validated, so a block broken
+    during the decision refuses as at claim; with no match the launch runs the fallback.
+    Returns the model the current table maps the launched tier to, and the launched effort;
+    the site passes both to the provider through the launch plan, and nothing is written.
+    Returns None when the claim is no longer live, so the bind refuses with its own rule.
     """
     row = database.get_ephemeral_agent(name)
     if (
@@ -1233,26 +1320,32 @@ def recheck_decided(
     try:
         settings = read_settings()
         require_enabled(settings)
-        # The stored fallback tier, with the claim's rules: a block error reverts, a tier
-        # now outside the bounds collects.
+        # The stored fallbacks, with the claim's rules: a block error reverts, a value now
+        # outside the bounds collects.
         values = _recheck_policy(row, settings, claim_id)
         tiers = settings["_model_tiers"]
         bounds = policy_bounds(settings)
         if tier is None and launched_model is not None:
             tier = _recovered_tier(launched_model, row["provider"], bounds, tiers)
-        if tier is None:
-            return cast(Optional[str], values["model"])
-        refusal = _value_refusal("model.route", tier, row["provider"], bounds, tiers)
-        if refusal is not None:
-            # With a valid block every tier within both bounds is mapped, so the applied tier
-            # is outside them: tightened during the decision, as in decision_refusal.
-            _collect_policy_changed(row, "claimed", claim_id)
-            raise EphemeralPolicyError(
-                "policy_changed_since_create:" + refusal.rule,
-                "(the policy changed during the launch decision); re-create the ephemeral agent",
+        for point, applied in (("model.route", tier), ("effort.route", effort)):
+            refusal = (
+                _value_refusal(point, applied, row["provider"], bounds, tiers)
+                if applied is not None
+                else None
             )
-        # A remap during the decision moves only the model id: launch the applied tier's.
-        return cast(str, tiers[row["provider"]][tier])
+            if refusal is not None:
+                # With a valid block every tier within both bounds is mapped, so the applied
+                # value is outside them: tightened during the decision, as in decision_refusal.
+                _collect_policy_changed(row, "claimed", claim_id)
+                raise EphemeralPolicyError(
+                    "policy_changed_since_create:" + refusal.rule,
+                    "(the policy changed during the launch decision); re-create the ephemeral agent",
+                )
+        # A remap during the decision moves only the model id: launch the applied tier's. An
+        # effort-only launch runs its stored tier's current id the same way.
+        model = tiers[row["provider"]][tier] if tier is not None else values["model"]
+        launched = effort if effort is not None else row["effort"]
+        return DecidedLaunch(model, launched)
     except EphemeralPolicyError as exc:
         _report_refusal(name, caller_id, row, exc)
         raise
@@ -1266,6 +1359,11 @@ _DECISION_TIGHTENED = {
     "explicit_unmapped": "tier_unmapped",
     "provider_not_allowed": "provider_not_allowed",
 }
+# #1083 (provisional): a bound on effort.route names the effort rule, not the tier's.
+_EFFORT_TIGHTENED = {
+    "above_ceiling": "effort_exceeds_policy",
+    "below_floor": "effort_below_policy",
+}
 _DECISION_REVERTED = {
     "policy_invalid": "policy_config_error:model_tiers",
     "default_unmapped": "policy_config_error:model_tiers",
@@ -1278,7 +1376,10 @@ def decision_refusal(
 ) -> EphemeralPolicyError:
     """Apply E's transition for an engine refusal of this claim; never echo engine text."""
     row = database.get_ephemeral_agent(name)
-    rule = _DECISION_TIGHTENED.get(error.reason or "")
+    reason = error.reason or ""
+    rule = (
+        _EFFORT_TIGHTENED.get(reason) if error.point == "effort.route" else None
+    ) or _DECISION_TIGHTENED.get(reason)
     if rule is not None and row is not None:
         _collect_policy_changed(row, "claimed", claim_id)
         refusal = EphemeralPolicyError(
@@ -1287,7 +1388,7 @@ def decision_refusal(
         )
     else:
         end_claim(name, claim_id)
-        rule = _DECISION_REVERTED.get(error.reason or "")
+        rule = _DECISION_REVERTED.get(reason)
         if rule == "model_override_not_allowed":
             refusal = EphemeralPolicyError(rule, "set model_tier in the spec")
         elif rule is not None:

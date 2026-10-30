@@ -22,6 +22,7 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "min_tier": null,
     "max_tier": null,
     "default_tier": null,
+    "min_effort": null,
     "max_effort": null,
     "default_effort": null,
     "max_depth": 1,
@@ -62,9 +63,8 @@ lock file can't be created, as on a read-only home — every create is refused w
 ## Model tier and effort
 
 `model_tier` accepts `small`, `medium`, `large` or `auto`; `effort` accepts `low`,
-`medium`, or `high`. Either can be omitted. `auto` asks a decider at launch (see
-[Model tier `auto`](#model-tier-auto)); `effort: "auto"` still refuses with
-`auto_requires_decision_platform`.
+`medium`, `high` or `auto`. Either can be omitted. `auto` asks a decider at launch (see
+[Model tier `auto`](#model-tier-auto) and [Effort `auto`](#effort-auto)).
 
 Tier and effort resolve once at create: the explicit value, else
 `ephemeral.default_tier` or `ephemeral.default_effort`, else none. The registry row and response hold that resolved
@@ -90,6 +90,14 @@ It must not exceed `max_tier`, and it needs a `default_tier` at or above it, so
 still choose a cheaper explicit tier, down to the floor. An explicit tier below the floor
 refuses with `tier_below_policy`, before the ceiling and mapping checks. A broken floor is
 `policy_config_error:min_tier`.
+
+The optional `ephemeral.min_effort` floor bounds effort the same way: `min_effort <=
+default_effort <= max_effort`. An explicit effort below it refuses with `effort_below_policy`,
+before the ceiling check, and a broken floor is `policy_config_error:min_effort`. At claim, and
+at a launch without a claim identifier, a stored effort below a floor raised since create, or a
+stored provider default under a new floor, refuses with
+`policy_changed_since_create:effort_below_policy` and collects the name. This floor is
+provisional (#1083).
 
 Unknown keys in the block are accepted. The first create that sees one logs a single warning
 per server process naming it, never its value, so a typo such as `min_tierr` is visible.
@@ -156,6 +164,48 @@ snapshot it has just checked to recover its tier, so a block broken during the d
 refuses as above. The store's own warning is the signal that a record went unwritten, and
 `Decision record read failed` that it could not be read. A decision that outlives the
 claim lease cannot bind: the launch refuses with `claim_expired`, and no terminal is created.
+
+### Effort `auto`
+
+With `effort: "auto"`, the `effort.route` decision point sets the child's reasoning effort at
+launch, under the same rules as `model_tier: "auto"`. Only this literal value asks; an explicit
+or omitted effort never does, whatever the tier field says. This is provisional (#1083).
+
+`auto` needs both `ephemeral.min_effort` and `ephemeral.max_effort`; without them create
+refuses with `auto_requires_bounds`, naming the missing keys. The lease must cover one on-mode
+wait per field declared `auto`: `claim_lease_seconds` of at least `n *
+decisions.on_timeout_ms / 1000 + 30`, where `n` is 1 or 2. The default 60-second lease covers
+both fields even at the 5000 ms maximum timeout. An `auto` effort stores `default_effort` as
+its fallback: the row, response and live profile hold that effort, the stored spec keeps
+`auto`, and the create note says the effort is decided at launch and names the fallback.
+
+The decision runs at the same point as for the tier:
+
+- **off**, or after `cao decisions off`: nothing is asked or recorded, and the child runs on the stored effort.
+- **shadow**: one `effort.route` record names the ephemeral agent. The child launches on the stored effort without waiting; the answer is recorded and never applied.
+- **on**: the server waits up to `decisions.on_timeout_ms`. A confident answer is capped into `[min_effort, max_effort]`. An `unsure`, low-confidence, timed-out, failed or out-of-set answer runs the stored effort, and the record names the reason.
+
+With both fields `auto`, the server asks `model.route` and then `effort.route`, one point per
+request with the same request id and facts, so an on-mode launch can wait up to twice
+`decisions.on_timeout_ms`. Neither request sees the other's answer, and one point's failure
+doesn't affect the other. A provider that can't apply an effort is never asked: the record
+says `not_honored`. Claude Code (outside a native agent) and Codex apply it.
+
+The decided effort applies to that launch only, through its launch plan, the same way as the
+decided model: CAO passes it to the provider at launch, as Claude Code's `--effort` or Codex's
+`-c model_reasoning_effort`, in place of the stored effort. Nothing writes it to disk. The live
+profile, the registry row and the archive keep the stored effort, so a launch that fails before
+the bind, a lapsed claim or a server restart leaves nothing behind: a later launch without a
+claim identifier runs the stored effort, and a later claimed launch decides again. The decision
+record names the applied effort, and the answer applies even when that record can't be written.
+
+The pre-bind recheck runs for every claimed `auto` launch, even when the engine returned no
+launch plan. A stored or decided effort now outside `[min_effort, max_effort]` gives
+`policy_changed_since_create:effort_exceeds_policy` or `:effort_below_policy` and collects the
+name. With only effort `auto`, the explicit or default tier still runs on its tier's current
+model id. A keyed retry of a launched name reattaches without a second decision or finalize,
+and a launch without a claim identifier asks nothing and runs the live profile, which holds the
+stored effort. The creator's launch note stays model-only, so an effort-only launch gets none.
 
 **Upgrade note:** earlier releases ignored the tier and effort keys and table with a warning,
 whatever their values. All five tier and effort keys, including the new `min_tier`, are now
@@ -310,8 +360,9 @@ A stored tier or effort above a tightened ceiling, an unmapped stored tier, or a
 default under a newly added ceiling returns `policy_changed_since_create:tier_exceeds_policy`
 or `policy_changed_since_create:effort_exceeds_policy`, or
 `policy_changed_since_create:tier_unmapped`, and collects the name; re-create it. A stored
-tier below a floor raised since create, or a stored provider default under a newly added floor,
-returns `policy_changed_since_create:tier_below_policy` and collects the name the same way.
+tier or effort below a floor raised since create, or a stored provider default under a newly
+added floor, returns `policy_changed_since_create:tier_below_policy` or
+`policy_changed_since_create:effort_below_policy` and collects the name the same way.
 A broken table names `model_tiers`, never `ephemeral.model_tiers`.
 The stored spec is verified and the profile is finalized before the claim response.
 An owner may also launch a pending name without a claim identifier; that bind applies the
@@ -331,23 +382,25 @@ extraction failure tear down terminals owned by that call.
 | --- | --- |
 | 404 | `ephemeral_disabled`, `unknown_ephemeral` |
 | 409 | `already_claimed`, `claim_expired`, `ephemeral_expired`, `spec_unavailable` |
-| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:provider_unsupported`, `policy_changed_since_create:tool_unsupported_on_provider:<atom>`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_below_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy` |
+| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:provider_unsupported`, `policy_changed_since_create:tool_unsupported_on_provider:<atom>`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_below_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy`, `policy_changed_since_create:effort_below_policy` |
 | 422 | `invalid_request` for the claim body; invalid launch claim identifiers or claim-plus-reuse requests |
 | 500 | `unexpected_failure` |
 
 Create also refuses with `provider_unsupported`, `provider_not_allowed`,
 `tool_unsupported_on_provider:<atom>`, `tier_unmapped`, `tier_exceeds_policy`,
-`tier_below_policy`, `effort_exceeds_policy`, `auto_requires_bounds` and
+`tier_below_policy`, `effort_exceeds_policy`, `effort_below_policy`, `auto_requires_bounds` and
 `policy_config_error:<key>`, all HTTP 400. The three provider refusals come before the tier
 and effort refusals other than `auto_requires_bounds`, and before the creator tool-ceiling
 check (`tool_exceeds_creator:<atoms>`).
 
 Every ephemeral live-profile load verifies the exact bytes parsed against the registry's
 `profile_sha256`, including claim-less launches and provider reloads. Missing rows or hashes
-and modified files fail closed. Finalize updates the hash under the claim guard and replaces
-the profile inside the same transaction; between the replace and the commit, a concurrent
-load sees the new bytes with the old hash and refuses. If the commit fails after the replace,
-loads of that name fail closed until the next finalize rewrites both. Claim-less launches do not
+and modified files fail closed. Finalize updates the hash only while the row is still claimed by
+that claim identifier and its lease is running, and replaces the profile inside the same
+transaction; a replaced or lapsed claim refuses with `claim_expired` and writes nothing; between
+the replace and the commit, a concurrent load sees the new bytes with the old hash and refuses.
+If the commit fails after the replace, loads of that name fail closed until the next finalize
+rewrites both. Claim-less launches do not
 re-render profiles; pending names receive the empty skill catalog on their next claimed launch.
 A pending name created before this change and launched without a claim keeps its old
 profile, including the inherited skill catalog; that launch consumes the name. Only

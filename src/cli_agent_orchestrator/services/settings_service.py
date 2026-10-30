@@ -114,6 +114,7 @@ EPHEMERAL_DEFAULTS = {
     "min_tier": None,
     "max_tier": None,
     "default_tier": None,
+    "min_effort": None,
     "max_effort": None,
     "default_effort": None,
     # Lifecycle cleanup (#1079); every default here awaits maintainer confirmation.

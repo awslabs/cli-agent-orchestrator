@@ -322,6 +322,55 @@ def test_stale_finalize_guard_cannot_resurrect_claim(claimed_store):
     assert not list((env[2] / "ephemeral/live").glob("*.tmp"))
 
 
+# E9: finalize's own time fence, in the same compare-and-update as the claim_id check
+# (#201a §3). Its only caller today is the claim itself, so this guards a slow recheck, a
+# lease shorter than it, or a wall-clock jump from writing for a lease that has lapsed.
+
+
+def test_finalize_refuses_exactly_at_and_past_the_lease_deadline(claimed_store, monkeypatch):
+    env, name = claimed_store
+    token = claim(env, name)["claim_id"]
+    row = database.get_ephemeral_agent(name)
+    deadline = database.as_utc(row["claim_expires_at"])
+    values = {"model_tier": row["model_tier"], "model": None, "effort": "high"}
+    before = database.get_ephemeral_agent(name)
+    events_before = audit(name)["events"]
+
+    for when in (deadline, deadline + timedelta(seconds=1)):
+        monkeypatch.setattr(database, "_utcnow", lambda now=when: now)
+        with pytest.raises(env[0].EphemeralPolicyError, match="claim_expired"):
+            env[0].finalize(name, token, values)
+        assert database.get_ephemeral_agent(name) == before
+        assert audit(name)["events"] == events_before
+
+    # Control: one microsecond before the deadline (201a §5.3), finalize still writes. A
+    # fence with any slack (e.g. a 500 ms grace window) would survive a one-second control.
+    monkeypatch.setattr(database, "_utcnow", lambda: deadline - timedelta(microseconds=1))
+    env[0].finalize(name, token, values)
+    after = database.get_ephemeral_agent(name)
+    assert after["profile_sha256"] != before["profile_sha256"]
+    assert [e["event"] for e in audit(name)["events"]][-1] == "finalized"
+
+
+def test_a_replaced_claims_finalize_is_fenced_the_same_way(claimed_store, monkeypatch):
+    env, name = claimed_store
+    token_a = claim(env, name)["claim_id"]
+    row_a = database.get_ephemeral_agent(name)
+    monkeypatch.setattr(database, "_utcnow", lambda: NOW + timedelta(seconds=61))
+    token_b = claim(env, name)["claim_id"]
+    before = database.get_ephemeral_agent(name)
+    events_before = audit(name)["events"]
+
+    values = {"model_tier": row_a["model_tier"], "model": None, "effort": "high"}
+    with pytest.raises(env[0].EphemeralPolicyError, match="claim_expired"):
+        env[0].finalize(name, token_a, values)
+    row = database.get_ephemeral_agent(name)
+    assert row == before and row["state"] == "claimed" and row["claim_id"] == token_b
+    assert audit(name)["events"] == events_before
+    assert database.get_ephemeral_agent(name) == before
+    assert not list((env[2] / "ephemeral/live").glob("*.tmp"))
+
+
 def test_nonregular_spec_refuses_without_reading_it(claimed_store):
     env, name = claimed_store
     path = env[2] / "ephemeral/live" / (name + ".spec.json")

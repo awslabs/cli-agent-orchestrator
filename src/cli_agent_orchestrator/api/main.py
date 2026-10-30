@@ -3818,18 +3818,35 @@ async def _prepare_delegation(
                 description=inputs.description,
             )
         )
-        if plan is not None:
-            # The operator may have changed the policy while the decider ran: recheck the
-            # launched tier before the bind, whatever the outcome.
-            try:
-                model = ephemeral_service.recheck_decided(
-                    name, claim_id, caller_id, _recorded_tier(plan), plan.model
-                )
-            except BaseException:
-                _bind_unlaunched(plan)
-                raise
-            if model is not None and model != plan.model:
-                plan = replace(plan, model=model)
+        # The operator may have changed the policy while the decider ran: recheck the
+        # launched values before the bind, whatever the outcome, and even when the engine
+        # returned no plan, as an effort-only launch can (#1083).
+        try:
+            decided = ephemeral_service.recheck_decided(
+                name,
+                claim_id,
+                caller_id,
+                _recorded_tier(plan) if plan is not None else None,
+                plan.effort if plan is not None else None,
+                plan.model if plan is not None else None,
+            )
+        except BaseException:
+            _bind_unlaunched(plan)
+            raise
+        if decided is not None:
+            # #1083 Q1 (provisional): a decided effort applies to this launch only, through
+            # the launch plan, like the decided model (#1068 Q2). The live profile keeps the
+            # stored effort, so a launch that fails before the bind leaves nothing behind.
+            if decided.model is not None:
+                if plan is None:
+                    plan = LaunchPlan(model=decided.model)
+                elif decided.model != plan.model:
+                    plan = replace(plan, model=decided.model)
+            if decided.effort is not None:
+                if plan is None:
+                    plan = LaunchPlan(effort=decided.effort)
+                elif decided.effort != plan.effort:
+                    plan = replace(plan, effort=decided.effort)
     except DecisionInputError as error:
         raise ephemeral_service.decision_refusal(name, claim_id, caller_id, error) from None
     except BaseException:

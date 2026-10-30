@@ -195,9 +195,9 @@ def test_policy_rejections_leave_nothing(create_store, patch, rule, caplog):
 @pytest.mark.parametrize(
     "key,values,rule",
     [
-        # #1068 MF4: a tier auto now needs both bounds; effort auto still refuses.
+        # #1068 MF4 and #1083 (provisional): auto in either field needs that field's bounds.
         ("model_tier", ["auto"], "auto_requires_bounds"),
-        ("effort", ["auto"], "auto_requires_decision_platform"),
+        ("effort", ["auto"], "auto_requires_bounds"),
     ],
 )
 def test_auto_refuses_in_either_field(create_store, key, values, rule):
@@ -208,7 +208,7 @@ def test_auto_refuses_in_either_field(create_store, key, values, rule):
         assert err.value.rule == rule
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, {**SPEC, "model_tier": "small", "effort": "auto"})
-    assert err.value.rule == "auto_requires_decision_platform"
+    assert err.value.rule == "auto_requires_bounds"
 
 
 @pytest.mark.parametrize("value", [None, 0, 2, "1", True])
@@ -427,7 +427,7 @@ def test_invalid_config_precedes_creator(create_store, key, value):
             {},
             "kiro_cli",
             False,
-            "auto_requires_decision_platform",
+            "auto_requires_bounds",
         ),
         (["*"], {"effort": "low"}, {}, "kiro_cli", False, "provider_unsupported"),
         (["*"], {}, {"allowed_providers": ["codex"]}, "kiro_cli", False, "provider_unsupported"),

@@ -26,6 +26,8 @@ class DecisionInputError(ValueError):
     """A launch violates a deterministic input constraint."""
 
     reason: str | None = None
+    # The decision point a bound violation names, or None when the error names no point.
+    point: str | None = None
 
 
 class PolicyConfigError(DecisionInputError):
@@ -38,6 +40,7 @@ class PolicyViolation(DecisionInputError):
     reason = "above_ceiling"
 
     def __init__(self, point: str, value: str, ceiling: str) -> None:
+        self.point = point
         super().__init__(
             f"{'tier' if point == 'model.route' else 'effort'} '{value}' is above the policy ceiling '{ceiling}' for {point}"
         )
@@ -46,9 +49,11 @@ class PolicyViolation(DecisionInputError):
 class BelowFloorError(PolicyViolation):
     reason = "below_floor"
 
-    def __init__(self, value: str, floor: str) -> None:
+    def __init__(self, point: str, value: str, floor: str) -> None:
+        self.point = point
         DecisionInputError.__init__(
-            self, f"tier '{value}' is below the policy floor '{floor}' for model.route"
+            self,
+            f"{'tier' if point == 'model.route' else 'effort'} '{value}' is below the policy floor '{floor}' for {point}",
         )
 
 
@@ -105,14 +110,16 @@ class PolicyBounds:
     default_effort: Effort | None = None
     max_effort: Effort | None = None
     allowed_providers: frozenset[str] | None = None
-    # #1068 MF5 (provisional): an optional tier floor; there is no effort floor.
+    # #1068 MF5 (provisional): an optional tier floor.
     min_tier: Tier | None = None
+    # #1083 Q2 (provisional): an optional effort floor, following #1068's tier floor.
+    min_effort: Effort | None = None
 
     def ceiling_for(self, point: str) -> str | None:
         return self.max_tier if point == "model.route" else self.max_effort
 
     def floor_for(self, point: str) -> str | None:
-        return self.min_tier if point == "model.route" else None
+        return self.min_tier if point == "model.route" else self.min_effort
 
     def default_for(self, point: str) -> str | None:
         return self.default_tier if point == "model.route" else self.default_effort
@@ -130,18 +137,16 @@ class PolicyBounds:
                 and spec.options.index(default) > spec.options.index(ceiling)
             ):
                 raise PolicyConfigError(f"{point} default exceeds ceiling")
+            floor = self.floor_for(point)
+            if floor is None:
+                continue
+            if floor not in spec.options:
+                raise PolicyConfigError(f"invalid policy value for {point}")
+            if ceiling is not None and spec.options.index(floor) > spec.options.index(ceiling):
+                raise PolicyConfigError(f"{point} floor exceeds ceiling")
+            if default is None or spec.options.index(floor) > spec.options.index(default):
+                raise PolicyConfigError(f"{point} floor requires a default at or above it")
         tiers = POINTS["model.route"].options
-        if self.min_tier is not None:
-            if self.min_tier not in tiers:
-                raise PolicyConfigError("invalid policy value for model.route")
-            if self.max_tier is not None and tiers.index(self.min_tier) > tiers.index(
-                self.max_tier
-            ):
-                raise PolicyConfigError("model.route floor exceeds ceiling")
-            if self.default_tier is None or tiers.index(self.min_tier) > tiers.index(
-                self.default_tier
-            ):
-                raise PolicyConfigError("model.route floor requires a default at or above it")
         if self.allowed_providers is not None and not self.allowed_providers <= {
             p.value for p in ProviderType
         }:
@@ -173,7 +178,7 @@ class PolicyBounds:
             raise DecisionInputError(f"invalid explicit value for {point}")
         floor = self.floor_for(point)
         if floor is not None and options.index(value) < options.index(floor):
-            raise BelowFloorError(value, floor)
+            raise BelowFloorError(point, value, floor)
         ceiling = self.ceiling_for(point)
         if ceiling is not None and options.index(value) > options.index(ceiling):
             raise PolicyViolation(point, value, ceiling)

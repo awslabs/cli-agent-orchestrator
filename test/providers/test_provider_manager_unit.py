@@ -580,3 +580,63 @@ def test_create_provider_session_id_rejected_for_other_providers():
             agent_profile=None,
             session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
         )
+
+
+# A decided per-launch effort (#1068 C, #1083 ruling) reaches only the two providers that
+# honor it; every other provider still constructs with the parameter ignored.
+
+
+def test_create_provider_effort_reaches_claude_code():
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value,
+        terminal_id="t-effort-cc",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        effort="high",
+    )
+
+    assert isinstance(provider, ClaudeCodeProvider)
+    assert provider._effort == "high"
+
+
+def test_create_provider_effort_reaches_codex():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CODEX.value,
+        terminal_id="t-effort-codex",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        effort="high",
+    )
+
+    assert isinstance(provider, CodexProvider)
+    assert provider._effort == "high"
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [
+        ProviderType.COPILOT_CLI.value,
+        ProviderType.HERMES.value,
+        ProviderType.OMP.value,
+        ProviderType.MOCK_CLI.value,
+    ],
+)
+def test_create_provider_effort_is_ignored_by_other_providers(provider_type):
+    # None of these providers declare an effort config; passing effort must not raise.
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        provider_type,
+        terminal_id="t-effort-other",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        effort="high",
+    )
+
+    assert manager.get_provider("t-effort-other") is provider
