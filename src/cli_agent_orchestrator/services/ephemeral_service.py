@@ -47,7 +47,9 @@ from cli_agent_orchestrator.utils.atomic_file import (
 from cli_agent_orchestrator.utils.caller_tools import caller_effective_allowed_tools
 from cli_agent_orchestrator.utils.delegation import tools_exceeding
 from cli_agent_orchestrator.utils.ephemeral_capabilities import (
+    ADVISORY,
     capability_for,
+    enforcement_label,
     ephemeral_providers,
     unsupported_atoms,
 )
@@ -275,6 +277,50 @@ def provider_refusal(
     return None
 
 
+def _validate_provider_route(settings: dict[str, Any]) -> None:
+    """#1099 (provisional): ``ephemeral.provider_route.equivalent`` lists disjoint provider sets.
+
+    A decider may route an ``auto`` spec only within the set that holds its fallback. Each set
+    names two or more supported ephemeral providers, and none mixes an advisory provider with
+    a hard or sandboxed one: advisory is weaker for every tool set, so the sets can't let a
+    decider reading untrusted task text pick the weakest provider. Members need not be in
+    ``allowed_providers``; the launch's options drop those that aren't.
+    """
+
+    def refuse(detail: str) -> NoReturn:
+        raise EphemeralPolicyError(
+            "policy_config_error:provider_route", "ephemeral.provider_route" + detail
+        )
+
+    block = settings.get("provider_route", {"equivalent": []})
+    if not isinstance(block, dict) or set(block) != {"equivalent"}:
+        refuse(" must be an object whose only key is equivalent")
+    sets = block["equivalent"]
+    if not isinstance(sets, list) or any(not isinstance(members, list) for members in sets):
+        refuse(".equivalent must be a list of provider lists")
+    seen: set[str] = set()
+    for index, members in enumerate(sets, 1):
+        where = f".equivalent set {index}"
+        # Type first: a JSON object or list member is unhashable (see validate_block).
+        if any(not isinstance(member, str) for member in members):
+            refuse(where + " must contain only provider names")
+        if len(members) < 2 or len(set(members)) != len(members):
+            refuse(where + " must name two or more distinct providers")
+        if any(member not in ephemeral_providers() for member in members):
+            refuse(where + " must contain supported providers: " + ", ".join(ephemeral_providers()))
+        if seen.intersection(members):
+            refuse(where + " overlaps an earlier set; sets must be disjoint")
+        seen.update(members)
+        labels = {member: enforcement_label(member) for member in members}
+        if ADVISORY in labels.values() and set(labels.values()) != {ADVISORY}:
+            refuse(
+                where
+                + " mixes advisory with hard or sandboxed providers ("
+                + ", ".join(f"{member}={label}" for member, label in labels.items())
+                + ")"
+            )
+
+
 def validate_block(settings: dict[str, Any]) -> None:
     providers = settings["allowed_providers"]
     # A tuple membership test, so an unhashable JSON entry refuses rather than raising.
@@ -336,6 +382,7 @@ def validate_block(settings: dict[str, Any]) -> None:
         policy_bounds(settings).validate(settings.get("_model_tiers", {}))
     except PolicyConfigError as exc:
         raise EphemeralPolicyError("policy_config_error:model_tiers", str(exc)) from None
+    _validate_provider_route(settings)
 
 
 def normalize_brief(brief: str) -> str:
@@ -797,7 +844,7 @@ def create_ephemeral_agent(
                 "name": name,
                 "provider": provider,
                 # The label wording is provisional (#1074 question 6).
-                "enforcement": capability_for(provider).enforcement,
+                "enforcement": enforcement_label(provider),
                 "effective_tools": tools,
                 "model_tier": tier,
                 "effort": effort,

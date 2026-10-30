@@ -161,6 +161,7 @@ Only JSON `true` enables the tool, and agent terminals must restart to see it.
 | `min_effort` | `null` | Optional minimum reasoning effort; must not exceed `max_effort` and needs a `default_effort` at or above it. |
 | `max_effort` | `null` | Maximum reasoning effort; a ceiling requires a default at or below it. |
 | `default_effort` | `null` | Reasoning effort used when the spec omits `effort`, resolved once at creation. |
+| `provider_route` | `{"equivalent": []}` | Disjoint sets of providers a decider may choose between for a `provider: "auto"` spec. Each set names two or more supported providers and must not mix an advisory provider with a hard or sandboxed one; anything else refuses every create and claim with `policy_config_error:provider_route`. With today's providers no set validates. Provisional (#1099). |
 | `child_may_delegate` | `false` | Permit the existing ephemeral delegation/workflow tools; never permits ephemeral creation by an ephemeral caller. |
 | `max_live_per_session` | `0` | Opt-in cap on the pending, claimed and launched names one session may hold. `0` means no cap; for example, `32` suits a fleet-style supervisor. Collected and expired pending names don't count. |
 | `launch_grace_seconds` | `600` | How long periodic sweeps wait after a bind before collecting a launched name with no terminal row. The startup sweep doesn't wait. Rowless live files must also be this old before any sweep deletes them. |

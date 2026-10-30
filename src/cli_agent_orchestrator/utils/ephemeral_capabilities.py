@@ -88,6 +88,15 @@ def capability_for(provider: object) -> EphemeralCapability:
     return CAPABILITIES.get(provider, _REFUSED) if isinstance(provider, str) else _REFUSED
 
 
+def enforcement_label(provider: object) -> str:
+    """The class a create reports, provider.route validates and its records carry (#1099).
+
+    One helper, so a label that comes to depend on settings or an engine version changes here
+    and nowhere else.
+    """
+    return capability_for(provider).enforcement
+
+
 def ephemeral_providers() -> tuple[str, ...]:
     """Providers that support ephemeral agents, in table order (rule 8's accepted set)."""
     return tuple(p for p, capability in CAPABILITIES.items() if capability.supports_ephemeral)

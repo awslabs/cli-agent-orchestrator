@@ -25,6 +25,7 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "min_effort": null,
     "max_effort": null,
     "default_effort": null,
+    "provider_route": {"equivalent": []},
     "max_depth": 1,
     "child_may_delegate": false,
     "max_live_per_session": 0,
@@ -53,6 +54,27 @@ The other three keys tune the sweep described below. An unusable `launch_grace_s
 the two steps that need it: periodic collection of launched names with no terminal row, and
 deletion of rowless live files. An unusable `retention_days` skips retention. An unusable
 interval falls back to the default.
+
+`provider_route.equivalent` lists the sets of providers that you, the operator, accept as
+equivalent containment. A decider may move a `provider: "auto"` launch only to another
+provider in the set that holds its fallback, so the sets bound what a decider reading
+untrusted task text can choose. Declaring a set is your consent that any task may run on any
+of its providers, with that vendor's model and credentials. The rules, all provisional
+(#1099):
+
+- every set names two or more distinct providers that support ephemeral agents, each with
+  the `enforcement` label listed under
+  [Create surface and stored files](#create-surface-and-stored-files) (Kiro is not one yet);
+- no provider appears in two sets;
+- a set never mixes an `advisory` provider with a `hard` or `sandboxed` one, since advisory is
+  weaker for every tool set. Two advisory providers may share a set, and so may `hard` and
+  `sandboxed`;
+- the block has only the `equivalent` key.
+
+Members need not be in `allowed_providers`; a launch only ever routes to an allowed one. A block
+that breaks a rule refuses every create and claim with `policy_config_error:provider_route`, like
+any broken setting. With today's capability table (Claude Code `hard`, Codex `advisory`, Kiro
+refused) no set validates, so nothing is routed until a provider's class changes.
 
 Creates take an inter-process `flock` lock under `CAO_HOME/locks/`. A create that can't take
 the lock within 10 seconds is refused with `store_busy` (503) and can be retried. If the lock
