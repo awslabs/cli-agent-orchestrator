@@ -463,6 +463,59 @@ class TestTeardownDuringCreate:
         assert record["end_reason"] == "pane_closed"
 
 
+class TestRecheckFailureNeverFailsCreate:
+    @pytest.mark.asyncio
+    @_patch_create_terminal_collaborators
+    async def test_a_raising_recheck_never_rolls_back_the_create(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_delete_terminals_by_session,
+        monkeypatch,
+        caplog,
+    ):
+        """The re-check runs inside the create's ``try``: an exception that
+        escaped it would roll back a launch that succeeded. The outer guard
+        logs it instead, and the record stays open for the live terminal."""
+        import logging
+
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import terminal_service
+
+        _wire_common_mocks(
+            mock_load_profile,
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_db_create,
+            mock_provider_manager,
+            mock_fifo_dir,
+        )
+
+        def raising_recheck(record_id, *, end_reason):
+            raise RuntimeError("db is down")
+
+        monkeypatch.setattr(
+            terminal_service, "db_finalize_launch_record_if_terminal_gone", raising_recheck
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await create_terminal("codex", "developer", new_session=True)
+
+        assert database.get_terminal_metadata(result.id) is not None
+        assert database.get_launch_record(result.id)["ended_at"] is None
+        assert any("Launch record finalize failed" in r.getMessage() for r in caplog.records)
+
+
 class TestReusedTerminalId:
     @pytest.mark.asyncio
     @_patch_create_terminal_collaborators

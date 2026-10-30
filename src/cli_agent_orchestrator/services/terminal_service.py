@@ -368,6 +368,35 @@ def _record_launch_best_effort(**values: Any) -> Optional[int]:
     return record_id if isinstance(record_id, int) else None
 
 
+def _close_launch_if_row_gone_best_effort(record_id: int) -> None:
+    """Close a just-written launch record whose row a teardown removed first.
+
+    Issue #1082. ``db_finalize_launch_record_if_terminal_gone`` already
+    swallows its own exceptions; this second layer matters because the call
+    sits inside the create's ``try``, where any exception would roll back a
+    launch that succeeded.
+    """
+    try:
+        db_finalize_launch_record_if_terminal_gone(
+            record_id, end_reason=_UNSTAMPED_TEARDOWN_END_REASON
+        )
+    except Exception:
+        logger.warning("Launch record finalize failed for record %s", record_id, exc_info=True)
+
+
+def _finalize_launch_best_effort(terminal_id: str, *, end_reason: str) -> None:
+    """Finalize a launch record outside a row delete (issue #1082).
+
+    ``db_finalize_launch_records`` already swallows its own exceptions; this
+    second layer keeps a bad value from failing the caller, as
+    ``_record_launch_best_effort`` does for the write.
+    """
+    try:
+        db_finalize_launch_records([terminal_id], end_reason)
+    except Exception:
+        logger.warning("Launch record finalize failed for %s", terminal_id, exc_info=True)
+
+
 def resolve_launch_model(
     model: Optional[str], profile: Optional[AgentProfile], launch_plan: "LaunchPlan | None" = None
 ) -> Optional[str]:
@@ -2673,9 +2702,7 @@ async def _create_terminal_unguarded(
         # record exists and close the record if the row is gone. A teardown
         # after this check finds the record and stamps its own reason.
         if launch_record_id is not None:
-            db_finalize_launch_record_if_terminal_gone(
-                launch_record_id, end_reason=_UNSTAMPED_TEARDOWN_END_REASON
-            )
+            _close_launch_if_row_gone_best_effort(launch_record_id)
         return terminal
 
     except Exception as e:
@@ -3757,7 +3784,9 @@ async def _surface_deferred_init_failure(
         # would otherwise keep the record open until some later delete stamped
         # an unrelated reason. First reason wins, so the CAO-owned teardown
         # below cannot overwrite it.
-        await asyncio.to_thread(db_finalize_launch_records, [terminal_id], "launch_failed")
+        await asyncio.to_thread(
+            _finalize_launch_best_effort, terminal_id, end_reason="launch_failed"
+        )
     notification = _sanitize_deferred_failure_message(message)
     if delete_worker:
         notification += " The failed worker terminal will be torn down."

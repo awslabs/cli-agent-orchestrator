@@ -291,6 +291,39 @@ async def test_deferred_failure_retained_for_external_owner_records_launch_faile
 
 
 @pytest.mark.asyncio
+async def test_a_raising_finalize_never_fails_the_deferred_failure_path(
+    release_runtime, monkeypatch
+):
+    """The failure path still finishes (row retained, owner notified) when
+    the ``launch_failed`` finalize raises; the record simply stays open."""
+    await launch_runtime(release_runtime)
+    notified = []
+
+    def raising_finalize(terminal_ids, end_reason):
+        raise RuntimeError("db is down")
+
+    monkeypatch.setattr(terminal_service, "db_finalize_launch_records", raising_finalize)
+    monkeypatch.setattr(
+        terminal_service,
+        "_notify_caller_of_deferred_failure",
+        lambda terminal_id, message, *args, **kwargs: notified.append(terminal_id),
+    )
+
+    owned = await terminal_service._surface_deferred_init_failure(
+        CHILD,
+        kind="provider_init_error",
+        message="boom",
+        registry=None,
+        delete_on_failure=False,
+    )
+
+    assert owned is False
+    assert notified == [CHILD]
+    assert database.get_terminal_metadata(CHILD) is not None
+    assert database.get_launch_record(CHILD)["ended_at"] is None
+
+
+@pytest.mark.asyncio
 async def test_sync_init_failure_writes_no_record(release_runtime):
     """On the synchronous path the record is written only after init, so a
     rolled-back create leaves nothing behind."""
