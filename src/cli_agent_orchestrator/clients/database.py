@@ -3486,6 +3486,9 @@ def delete_terminals_by_session(tmux_session: str, *, end_reason: str) -> int:
 
     Finalizes each deleted terminal's launch record (issue #1082); see
     ``delete_terminal`` for why that runs after commit, in its own transaction.
+    A defensive path: nothing in ``src/`` calls it today (session teardown
+    uses ``delete_terminal_row`` and ``delete_terminals_by_ids``), but the
+    name is still exported for older integrations, so it keeps finalizing.
     """
     with SessionLocal() as db:
         ids = [

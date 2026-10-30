@@ -340,6 +340,25 @@ def test_delete_terminals_by_ids_finalizes(fresh_db):
         assert db_mod.get_launch_record(tid)["end_reason"] == "session_teardown"
 
 
+def test_delete_terminals_by_session_finalizes_the_ids_it_collected(fresh_db):
+    """A defensive path with no caller in src/ today: it still stamps each
+    deleted row's launch, and only that session's."""
+    from cli_agent_orchestrator.clients.database import TerminalModel
+
+    with db_mod.SessionLocal() as db:
+        for tid, session in (("ses00001", "s-a"), ("ses00002", "s-a"), ("ses00003", "s-b")):
+            db.add(TerminalModel(id=tid, tmux_session=session, tmux_window=tid, provider="codex"))
+        db.commit()
+    for tid in ("ses00001", "ses00002", "ses00003"):
+        _launch(tid)
+
+    assert db_mod.delete_terminals_by_session("s-a", end_reason="session_teardown") == 2
+
+    for tid in ("ses00001", "ses00002"):
+        assert db_mod.get_launch_record(tid)["end_reason"] == "session_teardown"
+    assert db_mod.get_launch_record("ses00003")["ended_at"] is None
+
+
 def test_delete_terminals_by_ids_finalizes_only_the_rows_it_deleted(fresh_db):
     """An id whose row another teardown already removed is not finalized
     again: with the newest-open-row rule, a second stamp would close an older
