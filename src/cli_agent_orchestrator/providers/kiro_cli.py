@@ -36,6 +36,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
 from cli_agent_orchestrator.providers.kiro_identity import (
     PLAN_MODE_AGENT,
     KiroAgentIdentityError,
+    fallback_notice,
     header_agents,
     identity_readable,
     in_plan_mode,
@@ -469,7 +470,8 @@ class KiroCliProvider(BaseProvider):
         again a few times, because the header can trail the prompt by a frame,
         and so is one whose header name is only partial or that shows plan mode;
         if that persists it is refused (``header_not_found``, or for plan mode
-        ``identity_mismatch``).
+        ``identity_mismatch``). kiro-cli's fallback notice for this agent on any
+        read refuses the launch too (#1167), whatever the header names.
 
         Raises:
             KiroAgentIdentityError: ``identity_mismatch`` or ``header_not_found``.
@@ -477,6 +479,7 @@ class KiroCliProvider(BaseProvider):
         backend = get_backend()
         observed: List[str] = []
         plan_mode = False
+        fallback: Optional[str] = None
         for attempt in range(IDENTITY_HEADER_READS):
             if attempt:
                 await asyncio.sleep(IDENTITY_HEADER_READ_INTERVAL_S)
@@ -492,6 +495,8 @@ class KiroCliProvider(BaseProvider):
                 logger.debug("kiro_cli: screen read for the identity check failed: %s", exc)
                 continue
             observed = header_agents(screen) if isinstance(screen, str) else []
+            if fallback is None and isinstance(screen, str):
+                fallback = fallback_notice(screen, self._agent_profile)
             plan_mode = (
                 bool(observed)
                 and self._agent_profile != PLAN_MODE_AGENT
@@ -501,7 +506,9 @@ class KiroCliProvider(BaseProvider):
             if identity_readable(observed) and not plan_mode:
                 break
         try:
-            require_header_identity(self._agent_profile, observed, plan_mode=plan_mode)
+            require_header_identity(
+                self._agent_profile, observed, plan_mode=plan_mode, fallback=fallback
+            )
         except KiroAgentIdentityError as exc:
             logger.error(
                 "kiro_cli: terminal %s refused before any input: %s", self.terminal_id, exc
