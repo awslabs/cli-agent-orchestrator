@@ -1841,7 +1841,7 @@ async def _create_terminal_unguarded(
             requested_model=launch_model,
         )
 
-        kiro_v3_schema = None
+        kiro_v3_admission = None
         if provider == ProviderType.KIRO_CLI.value:
             resolved_engine = resolve_kiro_engine(
                 explicit=engine,
@@ -1886,9 +1886,10 @@ async def _create_terminal_unguarded(
                     agent_profile=agent_profile, profile=profile, requested_model=launch_model
                 )
             if resolved_engine == KiroEngine.V3:
-                # #1167: the probed version must be allow-listed (and admitted
-                # while pending verification), and the policy restricted.
-                kiro_v3_schema = require_kiro_v3_admissible(capabilities, allowed_tools)
+                # #1167: the probed version must be allow-listed and verified
+                # (or pending, with the operator's opt-in), and the policy
+                # restricted.
+                kiro_v3_admission = require_kiro_v3_admissible(capabilities, allowed_tools)
         else:
             if engine is not None:
                 raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
@@ -2205,7 +2206,7 @@ async def _create_terminal_unguarded(
             await asyncio.to_thread(
                 require_kiro_agent_resolves, agent_profile, resolved_working_directory, check_env
             )
-            if kiro_v3_schema is not None:
+            if kiro_v3_admission is not None:
                 # #1167: from the same cwd and env, a v3 launch also needs the
                 # default Kiro home, an installed agent file that passes the
                 # validator for this launch's grant, and a workspace whose
@@ -2218,7 +2219,7 @@ async def _create_terminal_unguarded(
                     resolved_working_directory,
                     check_env,
                     list(allowed_tools or []),
-                    kiro_v3_schema,
+                    kiro_v3_admission.schema,
                     Path(install_service.KIRO_AGENTS_DIR),
                 )
 
@@ -2689,6 +2690,9 @@ async def _create_terminal_unguarded(
             session_incarnation_id=session_incarnation_id,
             status=initial_status,
             last_active=datetime.now(timezone.utc),
+            launch_notes=(
+                kiro_v3_admission.launch_notes if kiro_v3_admission is not None else None
+            ),
         )
 
         logger.info(

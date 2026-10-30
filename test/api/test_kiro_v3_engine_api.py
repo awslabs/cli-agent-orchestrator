@@ -43,6 +43,34 @@ def test_post_sessions_accepts_kas_and_v3_and_returns_v3(client, spelling):
     assert response.status_code == 201
     assert response.json()["engine"] == "v3"
     assert svc.create_session.call_args.kwargs["engine"] is KiroEngine.V3
+    assert response.json()["launch_notes"] is None
+
+
+def test_post_sessions_returns_the_launch_note_of_an_opted_in_pending_version(client):
+    """The note the operator opt-in adds (#1167, provisional) reaches the response."""
+    note = (
+        "kiro_v3_unverified_version_admitted: kiro-cli 2.36.0 is pending operator "
+        "verification; this v3 launch was admitted only by the operator opt-in "
+        "kiro.v3_allow_unverified_versions."
+    )
+    terminal = Terminal(
+        id="abcd1234",
+        name="w",
+        session_name="s",
+        provider="kiro_cli",
+        agent_profile="developer",
+        engine="v3",
+        launch_notes=[note],
+    )
+    with patch("cli_agent_orchestrator.api.main.session_service") as svc:
+        svc.create_session = AsyncMock(return_value=terminal)
+        response = client.post(
+            "/sessions",
+            params={"provider": "kiro_cli", "agent_profile": "developer", "engine": "v3"},
+        )
+
+    assert response.status_code == 201
+    assert response.json()["launch_notes"] == [note]
 
 
 def test_post_sessions_rejects_an_unknown_engine_with_422(client):

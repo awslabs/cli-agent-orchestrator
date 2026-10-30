@@ -187,7 +187,11 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   sidecar's outcome on the response as `memory_manager`
   (`{"state": "scheduled" | "refused", "detail"}`); a primary whose ceiling does
   not cover the sidecar's `@cao-mcp-server, fs_read, fs_list` gets `refused` and
-  no sidecar. `POST /sessions` and `POST /terminals/run-step` accept
+  no sidecar. A create's response may carry `launch_notes`, a list of strings for
+  the operator; today only a Kiro v3 launch that the operator's
+  `kiro.v3_allow_unverified_versions` opt-in admitted on a kiro-cli version still
+  pending verification (provisional, #1167). It is never persisted and is `null`
+  otherwise. `POST /sessions` and `POST /terminals/run-step` accept
   `caller_ceiling` in the JSON body for a caller on another node (remote
   `assign`/`handoff`); it is rejected together with a local `caller_id`, it is
   required when the body's `env_vars` carry `CAO_CALLBACK_TERMINAL_ID` (the

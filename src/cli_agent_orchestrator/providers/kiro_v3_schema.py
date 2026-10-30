@@ -270,12 +270,6 @@ def kiro_v3_schema_for_cli_version(version: Optional[str]) -> KiroV3EngineSchema
     return entry.schema
 
 
-#: Whether an allow-list entry still pending operator verification may admit a
-#: v3 launch. Provisional (#1167): False, fail closed, until the operator
-#: checklist has passed on that version and its flag is cleared.
-KIRO_V3_ADMIT_PENDING_VERSIONS = False
-
-
 class KiroV3UnverifiedVersionError(KiroV3Refusal):
     """The probed kiro-cli version is allow-listed but not yet operator-verified."""
 
@@ -284,19 +278,28 @@ class KiroV3UnverifiedVersionError(KiroV3Refusal):
     def __init__(self, version: str) -> None:
         super().__init__(
             f"{self.code}: kiro-cli {version}'s v3 engine schema was derived statically and "
-            "is pending operator verification, so CAO does not launch v3 on it yet. "
+            "is pending operator verification, so CAO does not launch v3 on it. "
             "Retry with engine 'v2'."
         )
         self.version = version
 
 
-def require_launchable_kiro_v3_version(version: Optional[str]) -> KiroV3EngineSchema:
-    """The pinned schema for a v3 launch on ``version``; refuses unknown or pending versions."""
-    schema = kiro_v3_schema_for_cli_version(version)
-    entry = SUPPORTED_KIRO_CLI_VERSIONS[version or ""]
-    if entry.pending_operator_verification and not KIRO_V3_ADMIT_PENDING_VERSIONS:
+def require_launchable_kiro_v3_version(
+    version: Optional[str], *, allow_unverified: bool = False
+) -> KiroCliVersionEntry:
+    """The allow-list entry a v3 launch on ``version`` runs under.
+
+    A version absent from the allow-list refuses whatever ``allow_unverified``
+    says: it has no pinned schema. An entry still pending operator verification
+    refuses unless ``allow_unverified`` is set, which only the operator's
+    ``kiro.v3_allow_unverified_versions`` opt-in passes. Provisional (#1167).
+    """
+    entry = SUPPORTED_KIRO_CLI_VERSIONS.get(version or "")
+    if entry is None:
+        raise KiroV3UnsupportedVersionError(version)
+    if entry.pending_operator_verification and not allow_unverified:
         raise KiroV3UnverifiedVersionError(entry.cli_version)
-    return schema
+    return entry
 
 
 def pinned_kiro_v3_schemas() -> Tuple[KiroV3EngineSchema, ...]:

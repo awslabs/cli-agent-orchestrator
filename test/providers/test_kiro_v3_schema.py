@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import pytest
 
-from cli_agent_orchestrator.providers import kiro_v3_schema
 from cli_agent_orchestrator.providers.kiro_v3_schema import (
     KAS_0_66_70,
     SUPPORTED_KIRO_CLI_VERSIONS,
@@ -146,8 +145,8 @@ def test_selection_reads_each_entry_worst_case(entry, selected):
 
 
 def test_a_launch_admits_a_measured_version_and_holds_a_pending_one():
-    assert kiro_v3_schema.KIRO_V3_ADMIT_PENDING_VERSIONS is False
-    assert require_launchable_kiro_v3_version("2.35.1") is KAS_0_66_70
+    entry = require_launchable_kiro_v3_version("2.35.1")
+    assert entry.schema is KAS_0_66_70 and entry.pending_operator_verification is False
     with pytest.raises(KiroV3UnverifiedVersionError) as excinfo:
         require_launchable_kiro_v3_version("2.36.0")
     assert excinfo.value.code == "kiro_v3_unverified_version"
@@ -157,17 +156,22 @@ def test_a_launch_admits_a_measured_version_and_holds_a_pending_one():
     assert "pending operator verification" in message and "engine 'v2'" in message
 
 
-@pytest.mark.parametrize("version", [None, "", "2.37.0", "2.35.1 "])
-def test_a_launch_refuses_a_version_outside_the_allow_list(version):
+@pytest.mark.parametrize("allow_unverified", [False, True])
+@pytest.mark.parametrize("version", [None, "", "2.37.0", "2.35.1 ", "v2.36.0"])
+def test_a_launch_refuses_a_version_outside_the_allow_list(version, allow_unverified):
+    """The operator opt-in admits pending entries only, never an unknown version."""
     with pytest.raises(KiroV3UnsupportedVersionError):
-        require_launchable_kiro_v3_version(version)
+        require_launchable_kiro_v3_version(version, allow_unverified=allow_unverified)
 
 
-def test_the_pending_switch_admits_a_pending_version(monkeypatch):
-    monkeypatch.setattr(kiro_v3_schema, "KIRO_V3_ADMIT_PENDING_VERSIONS", True)
-    assert require_launchable_kiro_v3_version("2.36.0") is KAS_0_66_70
-    with pytest.raises(KiroV3UnsupportedVersionError):
-        require_launchable_kiro_v3_version("2.37.0")
+def test_the_opt_in_admits_a_pending_version_under_its_own_entry():
+    entry = require_launchable_kiro_v3_version("2.36.0", allow_unverified=True)
+    assert entry is SUPPORTED_KIRO_CLI_VERSIONS["2.36.0"]
+    assert entry.schema is KAS_0_66_70 and entry.pending_operator_verification is True
+    # A verified version does not need it and is not changed by it.
+    assert require_launchable_kiro_v3_version("2.35.1", allow_unverified=True) is (
+        SUPPORTED_KIRO_CLI_VERSIONS["2.35.1"]
+    )
 
 
 def test_every_version_refusal_is_a_v3_refusal_and_a_value_error():

@@ -107,10 +107,28 @@ The launch command is:
 | kiro-cli | v3 engine | Status |
 |---|---|---|
 | 2.35.1 | `@kiro/agent` 0.66.70 | measured |
-| 2.36.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch until verified |
+| 2.36.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 
 Any other version refuses v3; v2 is not affected. A new kiro-cli release needs a
 CAO update before v3 runs on it.
+
+### Pending versions (operator only)
+
+A version marked *pending operator verification* has a schema CAO read from the
+installed files but has not yet measured on a live run. It is refused by default
+(`kiro_v3_unverified_version`). The setting below exists for one purpose: so an
+operator can run the live checklist on that version. **Leave it off otherwise.**
+
+```json
+{ "kiro": { "v3_allow_unverified_versions": true } }
+```
+
+- It goes in `settings.json` only. No environment variable or API call sets it,
+  and only JSON `true` turns it on. Provisional (#1167).
+- It admits a pending version and nothing else. A version that isn't in the
+  table still refuses, and every other check on this page still runs in full.
+- Each launch it admits logs a warning in the server log. The launch response
+  carries a `launch_notes` entry naming the version, and `cao launch` prints it.
 
 ### Workspace trust
 
@@ -125,7 +143,7 @@ is not checked.
 | Message starts with | What it means | Fix |
 |---|---|---|
 | `kiro_v3_unsupported_version` | kiro-cli is a version CAO has no schema for | use a supported version, or `--engine v2` |
-| `kiro_v3_unverified_version` | the version is listed but not yet operator-verified | `--engine v2` until it is verified |
+| `kiro_v3_unverified_version` | the version is listed but not yet operator-verified | `--engine v2` until it is verified (operators running the checklist: see *Pending versions*) |
 | `kiro_v3_unrestricted` | the agent or launch allows every tool (`*`) | restrict `allowedTools` |
 | `kiro_v3_home_unsupported` | `KIRO_HOME` points somewhere other than `~/.kiro` | unset it for the launch |
 | `kiro_v3_not_installed` | no agent file for this agent | `cao install <name> --provider kiro_cli --engine v3` |

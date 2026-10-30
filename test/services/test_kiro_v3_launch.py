@@ -79,8 +79,25 @@ def _caps(version="2.35.1"):
 # --- the version and the policy ---------------------------------------------
 
 
-def test_a_measured_version_and_a_restricted_policy_are_admitted():
-    assert require_kiro_v3_admissible(_caps(), GRANT) is KAS_0_66_70
+_OPT_IN = "cli_agent_orchestrator.services.kiro_v3_launch.kiro_v3_allow_unverified_versions"
+
+
+@pytest.fixture
+def opted_in():
+    with patch(_OPT_IN, return_value=True) as opt_in:
+        yield opt_in
+
+
+@pytest.fixture
+def opted_out():
+    with patch(_OPT_IN, return_value=False) as opt_in:
+        yield opt_in
+
+
+def test_a_measured_version_and_a_restricted_policy_are_admitted(opted_out):
+    admission = require_kiro_v3_admissible(_caps(), GRANT)
+    assert admission.schema is KAS_0_66_70
+    assert admission.unverified_version is None and admission.launch_notes is None
 
 
 @pytest.mark.parametrize(
@@ -92,20 +109,50 @@ def test_a_measured_version_and_a_restricted_policy_are_admitted():
         (Mock(), KiroV3UnsupportedVersionError),
     ],
 )
-def test_versions_outside_the_admitted_list_refuse(caps, error):
-    with pytest.raises(error):
+def test_versions_outside_the_admitted_list_refuse(opted_out, caps, error):
+    """By default a pending version refuses, with its own code."""
+    with pytest.raises(error) as excinfo:
+        require_kiro_v3_admissible(caps, GRANT)
+    assert excinfo.value.code == error.code
+
+
+def test_the_opt_in_admits_a_pending_version_with_a_warning_and_a_note(opted_in, caplog):
+    with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.kiro_v3_launch"):
+        admission = require_kiro_v3_admissible(_caps("2.36.0"), GRANT)
+    assert admission.schema is KAS_0_66_70
+    assert admission.unverified_version == "2.36.0"
+    (note,) = admission.launch_notes
+    assert note.startswith("kiro_v3_unverified_version_admitted: kiro-cli 2.36.0")
+    assert "pending operator verification" in note
+    assert "kiro.v3_allow_unverified_versions" in note
+    (record,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert "2.36.0" in record.getMessage()
+    assert "kiro.v3_allow_unverified_versions" in record.getMessage()
+
+
+@pytest.mark.parametrize("caps", [_caps("2.37.0"), _caps(None), _caps("v2.36.0"), Mock()])
+def test_the_opt_in_never_admits_a_version_outside_the_allow_list(opted_in, caps):
+    with pytest.raises(KiroV3UnsupportedVersionError):
         require_kiro_v3_admissible(caps, GRANT)
 
 
-def test_the_pending_switch_admits_a_pending_version(monkeypatch):
-    from cli_agent_orchestrator.providers import kiro_v3_schema
+def test_the_opt_in_is_read_only_for_a_pending_version():
+    with patch(_OPT_IN, side_effect=AssertionError("read for a non-pending version")):
+        assert require_kiro_v3_admissible(_caps("2.35.1"), GRANT).schema is KAS_0_66_70
+        with pytest.raises(KiroV3UnsupportedVersionError):
+            require_kiro_v3_admissible(_caps("2.37.0"), GRANT)
 
-    monkeypatch.setattr(kiro_v3_schema, "KIRO_V3_ADMIT_PENDING_VERSIONS", True)
-    assert require_kiro_v3_admissible(_caps("2.36.0"), GRANT) is KAS_0_66_70
+
+@pytest.mark.parametrize("allowed", [None, ["*"]])
+def test_the_opt_in_does_not_admit_an_unrestricted_policy(opted_in, caplog, allowed):
+    with pytest.raises(KiroV3LaunchError) as excinfo:
+        require_kiro_v3_admissible(_caps("2.36.0"), allowed)
+    assert excinfo.value.code == "kiro_v3_unrestricted"
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
 
 @pytest.mark.parametrize("allowed", [None, ["*"], ["fs_read", "*"]])
-def test_an_unrestricted_policy_refuses(allowed):
+def test_an_unrestricted_policy_refuses(opted_out, allowed):
     with pytest.raises(KiroV3LaunchError) as excinfo:
         require_kiro_v3_admissible(_caps(), allowed)
     assert excinfo.value.code == "kiro_v3_unrestricted"
@@ -301,3 +348,105 @@ def test_a_v3_row_without_a_recorded_identity_is_reclaimed_on_failure(engine, ve
     """v2 rows older than the identity column are grandfathered; no v3 row can be (#1167)."""
     row = {"provider": "kiro_cli", "engine": engine, "identity_verified": verified}
     assert terminal_service._runtime_untrusted_from_row(row) is untrusted
+
+
+# --- the operator opt-in through create_terminal ---------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setup", "kwargs", "code"),
+    [
+        ("file", {"allowed": ["*"]}, "kiro_v3_unrestricted"),
+        ("file", {"env_vars": {"KIRO_HOME": "/elsewhere"}}, "kiro_v3_home_unsupported"),
+        ("v2file", {}, "kiro_v3_invalid"),
+        ("missing", {}, None),
+        ("file+hooks", {}, "kiro_v3_workspace_config:hooks"),
+        ("file", {"version": "2.40.0"}, "kiro_v3_unsupported_version"),
+    ],
+)
+async def test_the_opt_in_widens_no_other_pre_allocation_check(
+    opted_in, agents, repo, setup, kwargs, code
+):
+    """With the opt-in on and 2.36.0 probed, every other refusal still refuses.
+
+    A missing agent file is refused first by the agent check every Kiro launch
+    passes (#1074), before the v3 file check.
+    """
+    from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
+    if setup == "v2file":
+        (agents / "reviewer.json").write_text(
+            json.dumps({"name": "reviewer", "tools": ["fs_read"]})
+        )
+    elif setup != "missing":
+        (agents / "reviewer.json").write_text(_universal("reviewer"))
+    if setup == "file+hooks":
+        (repo / ".kiro" / "hooks").mkdir(parents=True)
+    seen: dict = {}
+    with pytest.raises((KiroV3Refusal, KiroAgentIdentityError)) as excinfo:
+        await _create(PROFILE, repo, seen=seen, **{"version": "2.36.0", **kwargs})
+    if code is None:
+        assert isinstance(excinfo.value, KiroAgentIdentityError)
+    else:
+        assert excinfo.value.code.startswith(code)
+    assert seen == {"session": False, "other": False}
+
+
+@pytest.mark.asyncio
+async def test_the_opt_in_lets_a_pending_create_reach_allocation(opted_in, agents, repo):
+    (agents / "reviewer.json").write_text(_universal("reviewer"))
+    seen: dict = {}
+    with pytest.raises(Allocated):
+        await _create(PROFILE, repo, version="2.36.0", seen=seen)
+    assert seen["session"] is True
+
+
+async def _create_to_completion(repo, *, version):
+    """A v3 create that succeeds, with the provider and backend faked."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    provider = MagicMock()
+    provider.initialize = AsyncMock(return_value=True)
+    provider.identity_verified = True
+    provider.shell_baseline = None
+    with (
+        patch(f"{_TS}.agent_profiles.load_agent_profile", return_value=PROFILE),
+        patch(f"{_TS}.get_backend") as backend,
+        patch(f"{_TS}.db_create_terminal"),
+        patch(f"{_TS}.mark_terminal_identity_verified", return_value=True),
+        patch(f"{_TS}.delete_terminals_by_session"),
+        patch(f"{_TS}.fifo_manager"),
+        patch(f"{_TS}.provider_manager") as providers,
+        patch(f"{_TS}.generate_terminal_id", return_value="test1234"),
+        patch(f"{_TS}.generate_session_name", return_value="session"),
+        patch(f"{_TS}.generate_window_name", return_value="reviewer-window"),
+        patch(f"{_TS}.get_herdr_inbox_service", return_value=None),
+    ):
+        backend.return_value.session_exists.return_value = False
+        backend.return_value.supports_event_inbox.return_value = True
+        providers.create_provider.return_value = provider
+        return await terminal_service.create_terminal(
+            provider="kiro_cli",
+            agent_profile=PROFILE.name,
+            new_session=True,
+            engine="v3",
+            working_directory=str(repo),
+            kiro_capability_probe=Mock(return_value=_caps(version)),
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_launch_response_names_an_opted_in_pending_version(opted_in, agents, repo):
+    (agents / "reviewer.json").write_text(_universal("reviewer"))
+    terminal = await _create_to_completion(repo, version="2.36.0")
+    (note,) = terminal.launch_notes
+    assert "kiro-cli 2.36.0 is pending operator verification" in note
+    assert terminal.model_dump(mode="json")["launch_notes"] == [note]
+
+
+@pytest.mark.asyncio
+async def test_a_verified_launch_response_carries_no_note(opted_in, agents, repo):
+    (agents / "reviewer.json").write_text(_universal("reviewer"))
+    terminal = await _create_to_completion(repo, version="2.35.1")
+    assert terminal.launch_notes is None

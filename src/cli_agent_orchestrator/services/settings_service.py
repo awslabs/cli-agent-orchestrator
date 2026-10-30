@@ -147,6 +147,20 @@ def child_may_delegate() -> bool:
     return isinstance(block, dict) and block.get("child_may_delegate") is True
 
 
+def kiro_v3_allow_unverified_versions() -> bool:
+    """Operator-only ``kiro.v3_allow_unverified_versions`` (default false).
+
+    Provisional (#1167). When JSON ``true``, a Kiro v3 launch may run on a
+    kiro-cli version whose allow-list entry is still pending operator
+    verification, so that the operator can run the live checklist on it.
+    Nothing else is widened: a version absent from the allow-list still
+    refuses, and every other v3 check still applies. No environment override;
+    an unreadable settings file reads as off.
+    """
+    block = _load().get("kiro", {})
+    return isinstance(block, dict) and block.get("v3_allow_unverified_versions") is True
+
+
 def _load() -> Dict[str, Any]:
     """Load settings from disk, tolerating an unreadable file.
 
