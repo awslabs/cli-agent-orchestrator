@@ -87,7 +87,14 @@ def _queue_status_transition(terminal_id: str, status: "TerminalStatus") -> Opti
 
 def _wait_for_status_write_off_loop(write: Optional[Future]) -> None:
     """Let a worker-thread caller return only once its row is written, as when
-    it wrote inline. On the event loop, never wait."""
+    it wrote inline. On the event loop, never wait.
+
+    The wait is deliberate: it keeps parity with the old inline write, so a
+    caller that reads the row back right after the transition finds it. It
+    runs outside the monitor lock, and only on a real transition, but under
+    SQLite lock contention it can add up to the driver's 5 s timeout to that
+    worker thread's call.
+    """
     if write is None:
         return
     try:
@@ -477,6 +484,8 @@ class StatusMonitor:
             # re-enter StatusMonitor while the latch state is mid-update.
             bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
+            # Off the loop, wait for the row on purpose (see the helper);
+            # queued above, so the write order is already fixed.
             _wait_for_status_write_off_loop(status_write)
         return True
 

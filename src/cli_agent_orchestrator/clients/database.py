@@ -590,10 +590,12 @@ def find_bound_launch_record(
     post-teardown case the feature exists for.
 
     Returns ``(record_id, any_records)``: the newest bound record for that
-    terminal id, or ``None`` with ``any_records`` saying whether records exist
-    for the id at all (so a refusal can be told apart from "nothing recorded
-    here"). A missing reporter is never bound, so a record with no
-    ``caller_id`` (a workflow step's) cannot match an anonymous report.
+    terminal id, or ``None`` with ``any_records`` saying whether the reporter
+    is refused. It is True when records exist for the id and none is bound to
+    the reporter, and False when there is nothing to refuse: no record for the
+    id, or a self-report whose newest row is already closed (answered
+    unlinked, as above). A missing reporter is never bound, so a record with
+    no ``caller_id`` (a workflow step's) cannot match an anonymous report.
     Read-only; raises on a genuine DB error so the caller decides.
     """
     with SessionLocal() as db:
