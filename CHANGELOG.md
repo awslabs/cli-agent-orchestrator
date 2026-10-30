@@ -242,6 +242,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
   run-step transport does not yet receive that credential; subprocess credential delivery
   remains a separate security-boundary decision.
+- Launch records (#1082): CAO writes one content-free record per terminal launch to a new
+  `launch_records` table (labels, timings, ids and the reported outcome, never prompts or output)
+  and keeps it after teardown, with the reason the launch ended. `launch_status_events` records
+  status changes for a provisional busy-time figure. `report_outcome` takes an optional
+  `terminal_id` and returns `launch_linked`, and `POST /outcomes` takes `launch_terminal_id`: only a
+  self-report or the launch's direct creator may link, and the route answers `403`, writing
+  nothing, when records exist for that id and none is bound to the reporter. **Behaviour change:**
+  a fresh Claude Code launch now always gets a CAO-generated `--session-id` (never together with
+  `--resume`), so a Claude Code CLI too old to know the flag fails every fresh launch.
 
 ### Changed
 
