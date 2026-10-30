@@ -319,9 +319,10 @@ class TestInstallAgent:
         # persisted=True prefers the stable PATH launcher.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
 
-    def test_install_rejects_kas_profile_before_writing_kiro_config(
+    def test_install_writes_the_universal_file_for_a_kas_profile(
         self, install_paths: dict[str, Path]
     ) -> None:
+        """``engine: kas`` reads as v3, whose install writes one universal file (#1167)."""
         profile_path = install_paths["local_store_dir"] / "kas-agent.md"
         profile_path.write_text(
             "---\n"
@@ -336,9 +337,10 @@ class TestInstallAgent:
 
         result = install_agent("kas-agent", "kiro_cli")
 
-        assert result.success is False
-        assert "cannot be installed yet" in result.message
-        assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
+        assert result.success is True, result.message
+        written = json.loads((install_paths["kiro_dir"] / "kas-agent.json").read_text())
+        assert written["allowedTools"] == ["fs_read"]
+        assert {"excludedTools", "permissions"} <= set(written)
 
     def test_install_resolves_env_vars_before_parsing_and_persists_them_after_the_guard(
         self, install_paths: dict[str, Path]

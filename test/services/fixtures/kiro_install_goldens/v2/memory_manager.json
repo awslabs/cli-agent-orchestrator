@@ -1,0 +1,26 @@
+{
+  "name": "memory_manager",
+  "description": "Context-Manager Agent — curates memory injection for worker agents",
+  "tools": [
+    "memory_recall"
+  ],
+  "allowedTools": [
+    "@cao-mcp-server",
+    "fs_read",
+    "fs_list"
+  ],
+  "includeMcpJson": false,
+  "resources": [
+    "file://<ROOT>/agent-context/memory_manager.md",
+    "skill://<ROOT>/skills/**/SKILL.md",
+    "skill://<ROOT>/skills/*/SKILL.md"
+  ],
+  "mcpServers": {
+    "cao-mcp-server": {
+      "type": "stdio",
+      "command": "/fixture/bin/cao-mcp-server",
+      "args": [],
+      "timeout": 1200000
+    }
+  }
+}

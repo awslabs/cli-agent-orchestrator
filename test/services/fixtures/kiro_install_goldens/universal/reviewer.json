@@ -1,0 +1,107 @@
+{
+  "name": "reviewer",
+  "description": "Code Reviewer Agent in a multi-agent system",
+  "tools": [
+    "@cao-mcp-server",
+    "file_search",
+    "fs_read",
+    "glob",
+    "goal",
+    "grep",
+    "grep_search",
+    "introspect",
+    "knowledge",
+    "list_directory",
+    "read_file",
+    "todo_list"
+  ],
+  "allowedTools": [
+    "@builtin",
+    "fs_read",
+    "fs_list",
+    "@cao-mcp-server"
+  ],
+  "excludedTools": [
+    "code",
+    "knowledge"
+  ],
+  "includeMcpJson": false,
+  "resources": [
+    "file://<ROOT>/agent-context/reviewer.md",
+    "skill://<ROOT>/skills/**/SKILL.md",
+    "skill://<ROOT>/skills/*/SKILL.md"
+  ],
+  "mcpServers": {
+    "cao-mcp-server": {
+      "type": "stdio",
+      "command": "/fixture/bin/cao-mcp-server",
+      "args": [],
+      "timeout": 1200000
+    }
+  },
+  "permissions": {
+    "rules": [
+      {
+        "capability": "context",
+        "effect": "allow"
+      },
+      {
+        "capability": "diagnostics",
+        "effect": "allow"
+      },
+      {
+        "capability": "fs_read",
+        "effect": "allow"
+      },
+      {
+        "capability": "mcp",
+        "match": [
+          "cao-mcp-server/*"
+        ],
+        "effect": "allow"
+      },
+      {
+        "capability": "skill",
+        "effect": "allow"
+      },
+      {
+        "capability": "fs_write",
+        "effect": "deny"
+      },
+      {
+        "capability": "mcp",
+        "match": [
+          "*"
+        ],
+        "exclude": [
+          "cao-mcp-server/*"
+        ],
+        "effect": "deny"
+      },
+      {
+        "capability": "power",
+        "effect": "deny"
+      },
+      {
+        "capability": "shell",
+        "effect": "deny"
+      },
+      {
+        "capability": "subagent",
+        "effect": "deny"
+      },
+      {
+        "capability": "web_fetch",
+        "effect": "deny"
+      },
+      {
+        "capability": "web_search",
+        "effect": "deny"
+      },
+      {
+        "capability": "workflow",
+        "effect": "deny"
+      }
+    ]
+  }
+}

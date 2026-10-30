@@ -1,0 +1,110 @@
+{
+  "name": "workflow_scout",
+  "description": "Read-only locator for existing CAO workflow specs",
+  "tools": [
+    "@cao-mcp-server",
+    "execute_bash",
+    "fs_read",
+    "goal",
+    "introspect",
+    "invoke_sub_agent",
+    "knowledge",
+    "list_directory",
+    "read_file",
+    "shell",
+    "subagent",
+    "todo_list",
+    "use_aws"
+  ],
+  "allowedTools": [
+    "@builtin",
+    "fs_read",
+    "execute_bash",
+    "@cao-mcp-server"
+  ],
+  "excludedTools": [
+    "code",
+    "file_search",
+    "grep_search",
+    "knowledge"
+  ],
+  "includeMcpJson": false,
+  "resources": [
+    "file://<ROOT>/agent-context/workflow_scout.md",
+    "skill://<ROOT>/skills/**/SKILL.md",
+    "skill://<ROOT>/skills/*/SKILL.md"
+  ],
+  "mcpServers": {
+    "cao-mcp-server": {
+      "type": "stdio",
+      "command": "/fixture/bin/cao-mcp-server",
+      "args": [],
+      "timeout": 1200000
+    }
+  },
+  "permissions": {
+    "rules": [
+      {
+        "capability": "context",
+        "effect": "allow"
+      },
+      {
+        "capability": "diagnostics",
+        "effect": "allow"
+      },
+      {
+        "capability": "fs_read",
+        "effect": "allow"
+      },
+      {
+        "capability": "mcp",
+        "match": [
+          "cao-mcp-server/*"
+        ],
+        "effect": "allow"
+      },
+      {
+        "capability": "shell",
+        "effect": "allow"
+      },
+      {
+        "capability": "skill",
+        "effect": "allow"
+      },
+      {
+        "capability": "subagent",
+        "effect": "allow"
+      },
+      {
+        "capability": "fs_write",
+        "effect": "deny"
+      },
+      {
+        "capability": "mcp",
+        "match": [
+          "*"
+        ],
+        "exclude": [
+          "cao-mcp-server/*"
+        ],
+        "effect": "deny"
+      },
+      {
+        "capability": "power",
+        "effect": "deny"
+      },
+      {
+        "capability": "web_fetch",
+        "effect": "deny"
+      },
+      {
+        "capability": "web_search",
+        "effect": "deny"
+      },
+      {
+        "capability": "workflow",
+        "effect": "deny"
+      }
+    ]
+  }
+}
