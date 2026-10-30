@@ -26,6 +26,12 @@ def test_extract_latest_panel_answer(provider):
     assert provider.extract_last_message_from_script(output) == "Second answer"
 
 
+def test_composer_panel_padding_is_not_part_of_answer(provider):
+    output = user_panel("Question") + "  Answer\n"
+    output += " \x1b[48;2;21;21;21m composer padding \x1b[49m\n" + composer()
+    assert provider.extract_last_message_from_script(output) == "Answer"
+
+
 def test_strip_tool_badge_preserve_answer_indentation(provider):
     output = user_panel("Read example.txt")
     output += "  \x1b[2m\x1b[37m \x1b[0m \x1b[1mRead\x1b[0m \x1b[2mexample.txt\x1b[0m\n"

@@ -1000,11 +1000,12 @@ class CursorCliProvider(BaseProvider):
 
     @staticmethod
     def _extract_panel_response(script_output: str) -> Optional[str]:
-        """Read the coloured transcript/composer panels in Cursor 2026.10.
+        """Read the coloured transcript/composer panels measured on 2026.10.22.
 
         Keep SGR until boundaries are known: the text alone cannot distinguish
         a submitted request from the assistant's reply. Unknown layouts fall
-        through to the existing separator grammar rather than guessing.
+        through to the existing separator grammar rather than guessing. These
+        RGB values are build/theme-specific; an unrecognised theme fails closed.
         """
         rows = script_output.splitlines()
         user_panel = re.compile(r"^\s*\x1b\[(?:\d+;)*48;2;36;36;40(?:;\d+)*m")

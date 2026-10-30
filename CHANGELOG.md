@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kimi Code 2.3 and Cursor 2026.10.22 replies** (#1149): recognise the new
+  submission/trust and coloured-panel layouts, and recover Kimi execution evidence
+  after long prompt redraws. Kimi turns that finish without a final text answer
+  complete after a short, stable ready interval; fetching their answer still reports
+  an extraction error. **Behaviour change:** synchronous `cao session send` exits 1
+  when fetching the answer fails, instead of silently exiting 0. Ctrl-C still exits 130.
+
 - **Kiro launches refuse an agent that kiro-cli would not run** (#1074). kiro-cli does not fail on
   an unknown `--agent`. It prints `agent "<name>" not found, using "kiro_default"` and starts its
   built-in default agent, which has every built-in tool, so launching a profile that was not
