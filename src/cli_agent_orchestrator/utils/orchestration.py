@@ -806,6 +806,9 @@ class EphemeralClaim(NamedTuple):
     effective_tools: list[str]
     claim_id: Optional[str] = None
     terminal_id: Optional[str] = None
+    # #1099 (provisional): the stored spec declared provider "auto", so the launch may run
+    # another CLI than ``provider``; text shaped before the launch is provider-neutral.
+    provider_auto: bool = False
 
 
 class _ClaimRefused(ValueError):
@@ -867,7 +870,12 @@ def _claim_ephemeral(
             return EphemeralClaim(
                 metadata["provider"], metadata["allowed_tools"], terminal_id=terminal_id
             )
-        return EphemeralClaim(data["provider"], data["effective_tools"], data["claim_id"])
+        return EphemeralClaim(
+            data["provider"],
+            data["effective_tools"],
+            data["claim_id"],
+            provider_auto=data.get("provider_auto") is True,
+        )
     except _ClaimRefused:
         raise
     except requests.exceptions.JSONDecodeError:
@@ -1182,7 +1190,9 @@ def _create_terminal(
 
     if response_sink is not None:
         response_sink(response)
-    return terminal["id"], provider
+    # The created terminal's own provider: a routed ephemeral launch runs another CLI than
+    # the request named (#1099), and every later step reuses or shapes for this one.
+    return terminal["id"], terminal.get("provider") or provider
 
 
 def _send_direct_input(
@@ -1551,7 +1561,7 @@ _CLIENT_TIMEOUT_HEADROOM = 180
 async def _run_step_and_build_result(
     payload: Dict[str, Any],
     agent_profile: str,
-    provider: str,
+    provider: Optional[str],
     timeout: int,
     start_time: float,
     base_url: str = API_BASE_URL,
@@ -1728,8 +1738,11 @@ async def _run_step_and_build_result(
     placement = f" on node {target_host}" if target_host else ""
     return HandoffResult(
         success=True,
-        message=f"Successfully handed off to {agent_profile} ({provider})"
-        f"{placement} in {execution_time:.2f}s" + _get_cleanup_nudge(),
+        # None for a provider "auto" claim: the provider that ran is in GET /terminals/<id>.
+        message=f"Successfully handed off to {agent_profile}"
+        + (f" ({provider})" if provider else "")
+        + f"{placement} in {execution_time:.2f}s"
+        + _get_cleanup_nudge(),
         output=output,
         terminal_id=terminal_id,
     )
@@ -1944,7 +1957,12 @@ async def _handoff_impl(
             # session; caller_id/allowed_tools preserve #284 callback routing
             # and tool inheritance. Byte-for-byte the original single-seam
             # behavior (BR-8) -- this is what the MCP tool always takes.
-            shaped_message = _shape_handoff_message(provider, message)
+            # #1099 (provisional): a provider "auto" claim may run on any CLI in its set, so
+            # it always gets the blocking-handoff banner, which is correct for any of them.
+            auto = claim is not None and claim.provider_auto
+            shaped_message = _shape_handoff_message(
+                ProviderType.CODEX.value if auto else provider, message
+            )
             # Minted HERE, before the POST, so the key exists on the client even
             # if the response never arrives (issue #447). The server records the
             # result under it; client-side generation is what makes it available
@@ -1986,7 +2004,7 @@ async def _handoff_impl(
             result = await _run_step_and_build_result(
                 payload,
                 agent_profile,
-                provider,
+                None if auto else provider,
                 timeout,
                 start_time,
                 base_url=base_url,
@@ -2344,7 +2362,9 @@ def _assign_worker_provider(agent_profile: str, claim: Optional[EphemeralClaim])
     ``@``-leading tasks.
     """
     if claim is not None:
-        return claim.provider
+        # #1099 (provisional): a provider "auto" claim may run on the structured-prompt
+        # provider, where the suffix would become a prompt parameter, so it is dropped.
+        return ProviderType.KIRO_CLI.value if claim.provider_auto else claim.provider
     return _resolve_handoff_provider(agent_profile).provider
 
 

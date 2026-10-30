@@ -297,4 +297,4 @@ def test_mcp_schema_advertises_the_table_providers():
 
     advertised = server.Tool.from_function(server.create_ephemeral_agent).parameters
     choices = advertised["properties"]["provider"]["anyOf"][0]["enum"]
-    assert choices == list(caps.ephemeral_providers())
+    assert choices == [*caps.ephemeral_providers(), "auto"]

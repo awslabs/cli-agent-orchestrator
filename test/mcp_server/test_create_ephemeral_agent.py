@@ -317,7 +317,7 @@ async def test_mcp_unstructured_server_error_fails_redacted(
 
 # Canonical advertised schema of the original FastMCP function registration,
 # pinned so the raw-argument tool keeps it byte-identical.
-PINNED_CREATE_TOOL_SCHEMA = '{"additionalProperties":false,"properties":{"brief":{"type":"string"},"description":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null},"effort":{"anyOf":[{"enum":["low","medium","high","auto"],"type":"string"},{"type":"null"}],"default":null},"model_tier":{"anyOf":[{"enum":["small","medium","large","auto"],"type":"string"},{"type":"null"}],"default":null},"provider":{"anyOf":[{"enum":["claude_code","codex"],"type":"string"},{"type":"null"}],"default":null},"purpose":{"type":"string"},"tools":{"anyOf":[{"items":{"enum":["fs_read","fs_list","fs_write","execute_bash","web_fetch"],"type":"string"},"type":"array"},{"type":"null"}],"default":null}},"required":["purpose","brief"],"type":"object"}'
+PINNED_CREATE_TOOL_SCHEMA = '{"additionalProperties":false,"properties":{"brief":{"type":"string"},"description":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null},"effort":{"anyOf":[{"enum":["low","medium","high","auto"],"type":"string"},{"type":"null"}],"default":null},"model_tier":{"anyOf":[{"enum":["small","medium","large","auto"],"type":"string"},{"type":"null"}],"default":null},"provider":{"anyOf":[{"enum":["claude_code","codex","auto"],"type":"string"},{"type":"null"}],"default":null},"purpose":{"type":"string"},"tools":{"anyOf":[{"items":{"enum":["fs_read","fs_list","fs_write","execute_bash","web_fetch"],"type":"string"},"type":"array"},{"type":"null"}],"default":null}},"required":["purpose","brief"],"type":"object"}'
 
 
 @pytest.mark.asyncio

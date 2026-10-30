@@ -329,6 +329,11 @@ class DecisionRecordModel(Base):
     message_hash = Column(String, nullable=True)
     hash_key_id = Column(String, nullable=True)
     message_bytes = Column(Integer, nullable=True)
+    # provider.route rows only (#1099): the per-launch options as a JSON list, and the
+    # enforcement labels of the fallback and the applied provider. NULL on other rows.
+    options = Column(Text, nullable=True)
+    fallback_enforcement = Column(String, nullable=True)
+    applied_enforcement = Column(String, nullable=True)
     __table_args__ = (
         Index("ix_decision_records_created_at", "created_at"),
         Index("ix_decision_records_terminal_id", "terminal_id"),
@@ -1208,6 +1213,8 @@ def init_db() -> None:
     # Appended LAST (issue #1067). One nullable column on decision_records, which
     # create_all made above; no backfill, so registry order is immaterial here too.
     _migrate_decision_records_target_kind()
+    # Appended LAST (issue #1099). Three nullable decision_records columns, no backfill.
+    _migrate_decision_records_provider_route()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1293,6 +1300,39 @@ def _migrate_decision_records_target_kind() -> None:
     except Exception as e:
         # Records cannot be written without the column, so this is louder than debug.
         logger.warning(f"Migration check for decision_records target_kind failed: {e}")
+
+
+_PROVIDER_ROUTE_COLUMNS = {
+    "options": "ALTER TABLE decision_records ADD COLUMN options TEXT",
+    "fallback_enforcement": "ALTER TABLE decision_records ADD COLUMN fallback_enforcement TEXT",
+    "applied_enforcement": "ALTER TABLE decision_records ADD COLUMN applied_enforcement TEXT",
+}
+
+
+def _migrate_decision_records_provider_route() -> None:
+    """Add provider.route's three nullable decision_records columns if missing (issue #1099).
+
+    Idempotent, like ``_migrate_decision_records_target_kind``: PRAGMA table_info gate, one
+    ALTER TABLE ADD COLUMN per missing column. Fresh DBs already have them from
+    ``Base.metadata.create_all``. Existing rows keep NULL: they are not provider.route rows.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(decision_records)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if not columns:
+                return
+            for column, statement in _PROVIDER_ROUTE_COLUMNS.items():
+                if column not in columns:
+                    conn.execute(statement)
+                    logger.info(f"Migration: added {column} column to decision_records")
+    except Exception as e:
+        # Records cannot be written without the columns, so this is louder than debug.
+        logger.warning(f"Migration check for decision_records provider.route columns failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:

@@ -153,7 +153,7 @@ Only JSON `true` enables the tool, and agent terminals must restart to see it.
 | `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex is an operator opt-in. |
 | `max_brief_bytes` | `8192` | Maximum UTF-8 bytes after brief normalization. |
 | `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched or swept. |
-| `claim_lease_seconds` | `60` | Lease from claim to terminal creation. With `model_tier` or `effort` set to `"auto"` it must be at least `n * decisions.on_timeout_ms / 1000 + 30`, where `n` counts the fields set to `"auto"`. |
+| `claim_lease_seconds` | `60` | Lease from claim to terminal creation. With `model_tier`, `effort` or `provider` set to `"auto"` it must be at least `n * decisions.on_timeout_ms / 1000 + 30`, where `n` counts the fields set to `"auto"`, `provider` included. |
 | `max_depth` | `1` | Only integer 1 is supported; ephemeral callers cannot create ephemerals. |
 | `min_tier` | `null` | Optional minimum model tier; must not exceed `max_tier` and needs a `default_tier` at or above it. |
 | `max_tier` | `null` | Maximum model tier; a ceiling requires a default at or below it and mappings for every permitted tier, from the floor up, and allowed provider. |
@@ -161,6 +161,7 @@ Only JSON `true` enables the tool, and agent terminals must restart to see it.
 | `min_effort` | `null` | Optional minimum reasoning effort; must not exceed `max_effort` and needs a `default_effort` at or above it. |
 | `max_effort` | `null` | Maximum reasoning effort; a ceiling requires a default at or below it. |
 | `default_effort` | `null` | Reasoning effort used when the spec omits `effort`, resolved once at creation. |
+| `provider_route` | `{"equivalent": []}` | Disjoint sets of providers a decider may choose between for a `provider: "auto"` spec. Each set names two or more supported providers and must not mix an advisory provider with a hard or sandboxed one; anything else refuses every create and claim with `policy_config_error:provider_route`. With today's providers no set validates. Provisional (#1099). |
 | `child_may_delegate` | `false` | Permit the existing ephemeral delegation/workflow tools; never permits ephemeral creation by an ephemeral caller. |
 | `max_live_per_session` | `0` | Opt-in cap on the pending, claimed and launched names one session may hold. `0` means no cap; for example, `32` suits a fleet-style supervisor. Collected and expired pending names don't count. |
 | `launch_grace_seconds` | `600` | How long periodic sweeps wait after a bind before collecting a launched name with no terminal row. The startup sweep doesn't wait. Rowless live files must also be this old before any sweep deletes them. |
@@ -484,12 +485,13 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 
 ### Launch decisions
 
-`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_ON_TIMEOUT_MS` and
-`CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision settings loader, not through
-`ConfigService`, and override the `decisions` block of `settings.json`. The chain above does not
-apply as written: `cao-server --decision <point>=<state>` sets the matching point-state variable
-(`CAO_DECISION_MODEL_ROUTE` or `CAO_DECISION_EFFORT_ROUTE`), so the flag and that variable are one
-layer, and the server keeps the values it started with until it restarts.
+`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_PROVIDER_ROUTE`,
+`CAO_DECISION_ON_TIMEOUT_MS` and `CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision
+settings loader, not through `ConfigService`, and override the `decisions` block of
+`settings.json`. The chain above does not apply as written: `cao-server --decision
+<point>=<state>` sets the matching point-state variable (`CAO_DECISION_MODEL_ROUTE`,
+`CAO_DECISION_EFFORT_ROUTE` or `CAO_DECISION_PROVIDER_ROUTE`), so the flag and that variable are
+one layer, and the server keeps the values it started with until it restarts.
 See [Launch decisions](decisions.md#settings).
 
 ### Not yet routed through ConfigService

@@ -25,6 +25,7 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "min_effort": null,
     "max_effort": null,
     "default_effort": null,
+    "provider_route": {"equivalent": []},
     "max_depth": 1,
     "child_may_delegate": false,
     "max_live_per_session": 0,
@@ -53,6 +54,27 @@ The other three keys tune the sweep described below. An unusable `launch_grace_s
 the two steps that need it: periodic collection of launched names with no terminal row, and
 deletion of rowless live files. An unusable `retention_days` skips retention. An unusable
 interval falls back to the default.
+
+`provider_route.equivalent` lists the sets of providers that you, the operator, accept as
+equivalent containment. A decider may move a `provider: "auto"` launch only to another
+provider in the set that holds its fallback, so the sets bound what a decider reading
+untrusted task text can choose. Declaring a set is your consent that any task may run on any
+of its providers, with that vendor's model and credentials. The rules, all provisional
+(#1099):
+
+- every set names two or more distinct providers that support ephemeral agents, each with
+  the `enforcement` label listed under
+  [Create surface and stored files](#create-surface-and-stored-files) (Kiro is not one yet);
+- no provider appears in two sets;
+- a set never mixes an `advisory` provider with a `hard` or `sandboxed` one, since advisory is
+  weaker for every tool set. Two advisory providers may share a set, and so may `hard` and
+  `sandboxed`;
+- the block has only the `equivalent` key.
+
+Members need not be in `allowed_providers`; a launch only ever routes to an allowed one. A block
+that breaks a rule refuses every create and claim with `policy_config_error:provider_route`, like
+any broken setting. With today's capability table (Claude Code `hard`, Codex `advisory`, Kiro
+refused) no set validates, so nothing is routed until a provider's class changes.
 
 Creates take an inter-process `flock` lock under `CAO_HOME/locks/`. A create that can't take
 the lock within 10 seconds is refused with `store_busy` (503) and can be retried. If the lock
@@ -118,7 +140,8 @@ and no default, no provider config or effort flag is emitted.
 
 With `model_tier: "auto"`, the `model.route` decision point sizes the child at launch
 (see [Launch decisions](decisions.md)). Only this literal value asks. A decider never
-chooses tools, the provider, or whether to spawn a child at all.
+chooses tools or whether to spawn a child at all, and chooses the provider only for a
+`provider: "auto"` spec (see [Provider `auto`](#provider-auto)).
 
 `auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier`; without them create
 refuses with `auto_requires_bounds`. It also needs `claim_lease_seconds` of at least
@@ -207,6 +230,66 @@ model id. A keyed retry of a launched name reattaches without a second decision 
 and a launch without a claim identifier asks nothing and runs the live profile, which holds the
 stored effort. The creator's launch note stays model-only, so an effort-only launch gets none.
 
+### Provider `auto`
+
+With `provider: "auto"`, the `provider.route` decision point chooses which CLI runs the
+child, at launch, so you don't have to name one for every child. It is off by default. With
+today's providers it routes nothing, because no `ephemeral.provider_route` set validates until
+a provider's enforcement class changes (see [Operator settings](#operator-settings)). This is
+provisional (#1099).
+
+At create, `auto` resolves to your own provider, the creator's, which is the fallback. Every
+create check runs on it, and the response's `provider` and `enforcement`, the registry row, the
+live profile and the archive all name it; the stored spec keeps `auto`, and the notes gain
+`provider: auto (decided at launch within ephemeral.provider_route.equivalent; fallback <provider>,
+the creator's provider)`. If your own provider can't run ephemeral agents, create refuses with
+`provider_unsupported` and asks you to set a provider explicitly. The lease must cover one more
+on-mode wait, so `n` in the `claim_lease_seconds` floor counts `provider: "auto"` too.
+
+An explicit provider is never routed, and the sets don't bind it: only `allowed_providers` does.
+An omitted provider behaves as before.
+
+At launch, after the claim, CAO computes the options: the fallback, plus each other provider in
+the fallback's set that is in `allowed_providers`, can run every stored tool atom, maps every
+tier the launch can reach (`[min_tier, max_tier]` for `model_tier: "auto"`, otherwise the
+stored tier), and can apply an effort when the launch carries one. They are listed in the
+capability table's order. With one option nothing is asked, and the record says
+`single_option`. Otherwise `provider.route` is asked first, and `model.route` and
+`effort.route` are then asked for the provider it resolved to, with the same request id:
+
+- **off**, or after `cao decisions off`: nothing is asked or recorded, and the child runs on the fallback.
+- **shadow**: one `provider.route` record names the ephemeral agent. The child launches on the fallback without waiting; the answer is recorded and never applied.
+- **on**: the server waits up to `decisions.on_timeout_ms`. A confident answer that is one of the options runs the child on that provider. An `unsure`, low-confidence, timed-out or failed answer, or one outside the options, runs the fallback, and the record names the reason.
+
+The decided provider applies to that launch only, through its launch plan, the same way as the
+decided model and effort. Nothing shared records it: while it runs, the registry row, the live
+profile and the archive's `provider` still name the fallback. The decision record (`provider`
+and `applied_value`), the terminal, the archive's `bound` event (`provider`) and the launch
+record name the provider that ran. Its command takes the model mapped from its own tier table
+and the effort from the launch plan, never the fallback's model id or config section.
+
+Just before the bind, the stored fallback must still pass the claim's checks, and the decided
+provider must still pass the option rules against a fresh snapshot. A change made while the
+decider ran that drops it from the set, removes it from `allowed_providers` or unmaps its tier
+gives `policy_changed_since_create:<rule>`, such as `provider_not_equivalent`,
+`provider_not_allowed` or `tier_unmapped`, and collects the name. CAO never runs another
+provider instead.
+
+A routed launch that fails before the bind for any other reason (the node cap, the delegation
+ceiling, the owner's own 400, a lapsed lease, a crash) leaves nothing behind. The name returns to
+`pending` with its stored values, a launch without a claim identifier runs the stored provider,
+and a later claim decides again. A routed launch that fails after the bind is released as usual,
+and no other provider is tried.
+
+The MCP helpers shape the delegated text before the launch is decided, so for an `auto` claim
+they shape it the same way whichever CLI runs. The default `handoff` always adds the
+`[CAO Handoff]` banner, `assign` drops the sender suffix from a task that starts with `@`, and
+the `handoff` success message names no provider; read `GET /terminals/<id>` for it. This applies
+to every `auto` claim, routed or not. Explicit and omitted providers are unchanged.
+
+Declaring a set is your consent that any task may run on any provider in it. A decider reads
+the task text, which is untrusted, so it may pick any member for any task.
+
 **Upgrade note:** earlier releases ignored the tier and effort keys and table with a warning,
 whatever their values. All five tier and effort keys, including the new `min_tier`, are now
 validated. A previously accepted block, such as a ceiling without a default, can therefore
@@ -220,6 +303,8 @@ admin scope. The JSON body is the flat eight-field spec: `spec_version` (1), `pu
 can be omitted or null. Extra fields are refused. The MCP tool forwards this same body.
 
 Providers are Claude Code by default, or Codex when explicitly enabled by the operator.
+`provider: "auto"` lets a decider choose between equivalent providers at launch (see
+[Provider `auto`](#provider-auto)).
 Tools are restricted to `fs_read`, `fs_list`, `fs_write`, `execute_bash`, and `web_fetch`,
 within the creator's effective allowlist. `@cao-mcp-server` is required in the creator's
 list (or `*`) and appended to every child. With tools omitted, creation requests `fs_read`
@@ -335,7 +420,8 @@ Claim with `POST /ephemeral-agents/{name}/claim?caller_id=<creator-terminal-id>`
 body containing optional `idempotency_key`, `claim_id`, and `model`. A per-call model is
 refused; set model tier in the spec instead. The server checks creator identity and
 ownership, answers a matching launched retry, then atomically claims a pending name.
-A successful response contains `claim_id`, `provider`, `effective_tools`, and `replayed: false`.
+A successful response contains `claim_id`, `provider`, `effective_tools`, `replayed: false`, and
+`provider_auto`, which is `true` when the stored spec declared `provider: "auto"`.
 A matching launched retry returns `terminal_id` and `replayed: true`, without rechecking policy.
 
 Launch through `POST /sessions/{session}/terminals`, with `agent_profile=<name>`,
@@ -382,7 +468,7 @@ extraction failure tear down terminals owned by that call.
 | --- | --- |
 | 404 | `ephemeral_disabled`, `unknown_ephemeral` |
 | 409 | `already_claimed`, `claim_expired`, `ephemeral_expired`, `spec_unavailable` |
-| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:provider_unsupported`, `policy_changed_since_create:tool_unsupported_on_provider:<atom>`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_below_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy`, `policy_changed_since_create:effort_below_policy` |
+| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:provider_not_equivalent`, `policy_changed_since_create:provider_unsupported`, `policy_changed_since_create:tool_unsupported_on_provider:<atom>`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_below_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy`, `policy_changed_since_create:effort_below_policy` |
 | 422 | `invalid_request` for the claim body; invalid launch claim identifiers or claim-plus-reuse requests |
 | 500 | `unexpected_failure` |
 
@@ -414,7 +500,7 @@ marked ephemeral and the existing delegation denial stays effective.
 ## Honesty statement
 
 > An ephemeral child's CAO-recorded allowlist is a subset of its creator's effective allowlist at creation time. Its generated profile declares only the CAO MCP server, no hooks or native agents, and `skills: []` so no skill catalog is inherited; named skills remain callable through `load_skill`; installed agent plugins' MCP servers are not added at launch; and CAO will not launch it with a wider list. An ephemeral child cannot create ephemerals. It cannot delegate or start or cancel workflows through CAO's MCP tools unless the operator sets `child_may_delegate`. That is all this guarantees. It does not guarantee:
-> 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro isn't supported yet. The create response's `enforcement` field reports this class: `hard` or `advisory`.
+> 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro isn't supported yet. The create response's `enforcement` field reports this class: `hard` or `advisory`. A `provider: "auto"` child may run on any provider in its fallback's `ephemeral.provider_route` set, and while it does, the response, the registry row and the live profile still name the fallback.
 > 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. MCP `send_message`, `answer_user_prompt` and `delete_terminal` bind targets to the caller's permitted terminal tree (#912). State-changing memory and metadata tools and workflow authoring (`workflow_create`/`workflow_update`; a changed spec needs a new plan approval, on by default) still use the coarse server grant (#671). With `child_may_delegate=true`, workflow cancellation also uses that grant, without run ownership binding.
 > 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself, edit `settings.json`, or read `ephemeral/live/`.
 > 4. **Per-tool MCP enforcement for installed profiles** (#671). Installed profiles ARE now bounded by their creator's recorded delegation ceiling through the same comparison (see [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance)); the remaining gap is the server-level `@cao-mcp-server` grant above.
