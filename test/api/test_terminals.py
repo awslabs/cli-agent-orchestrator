@@ -400,6 +400,67 @@ class TestTerminalCreationWithWorkingDirectory:
         assert response.status_code == 400, response.text
         assert response.json()["detail"].startswith(refusal.code)
 
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/sessions",
+            "/sessions/test-session/terminals",
+            "/sessions/test-session/terminals:operator",
+            "/terminals/run-step",
+        ],
+    )
+    def test_a_bad_kiro_effort_on_v3_is_a_bad_request_through_a_real_create(self, client, endpoint):
+        """Through the real create_terminal: the effort refusal is coded, so the
+        in-session, operator and run-step routes answer 400, not the 404 their
+        generic ValueError arm gives (#1167 review)."""
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        profile = AgentProfile(
+            name="analyst",
+            description="a",
+            allowedTools=["fs_read"],
+            kiroConfig={"effort": "--agent"},
+        )
+        probe = MagicMock()
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile",
+                return_value=profile,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.probe_kiro_capabilities", probe
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.get_backend") as backend,
+        ):
+            backend.return_value.session_exists.return_value = True
+            if endpoint == "/terminals/run-step":
+                response = client.post(
+                    endpoint,
+                    json={
+                        "provider": "kiro_cli",
+                        "agent": "analyst",
+                        "prompt": "go",
+                        "engine": "v3",
+                    },
+                )
+            else:
+                params = {"provider": "kiro_cli", "agent_profile": "analyst", "engine": "v3"}
+                if endpoint.endswith("/terminals"):
+                    params["caller_id"] = "dcba8765"
+                response = client.post(endpoint, params=params)
+
+        assert response.status_code == 400, response.text
+        body = response.json()["detail"]
+        text = body if isinstance(body, str) else body["message"]
+        assert text.startswith("kiro_v3_bad_effort: "), text
+        probe.assert_not_called()
+        backend.return_value.create_session.assert_not_called()
+        backend.return_value.create_window.assert_not_called()
+
     def test_an_agent_not_found_body_names_no_server_path(self, client, tmp_path):
         """The real refusal's text is the 400 body: the remedy, not the directories
         searched, which only the server log gets (#1074; shared-server mode)."""

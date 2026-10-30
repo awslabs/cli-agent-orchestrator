@@ -207,6 +207,74 @@ async def test_a_startup_dialog_refuses_and_no_key_is_sent(cwd, ready, code):
     assert pane.texts == [pane.command]
 
 
+def _unrecognised_selector() -> str:
+    """The captured approval block retitled as a dialog CAO has no pattern for
+    (shaped like v2's trust-all consent; v3's has not been captured)."""
+    screen = (
+        _screen("approval")
+        .replace("Create marker file p10-shell requires approval", "Accept trust-all tools?")
+        .replace("❯ Allow once", "❯ Yes, I accept")
+        .replace("   Deny once", "   No, exit")
+        .replace("Create deny rule to block future similar actions", "Yes, and don't ask again")
+    )
+    assert screen != _screen("approval")
+    return screen
+
+
+async def _launch_with_the_real_wait(pane, status):
+    """``_launch`` with the real ``wait_until_status``, so its poll hook runs."""
+    provider = _provider()
+    with (
+        patch(f"{_KC}.get_backend", return_value=pane),
+        patch(f"{_KC}.wait_for_shell", return_value=True),
+        patch(f"{_KC}.get_server_settings", return_value={"provider_init_timeout": 30}),
+        patch(f"{_KC}.load_agent_profile", side_effect=FileNotFoundError("no profile")),
+        patch("cli_agent_orchestrator.services.status_monitor.status_monitor") as monitor,
+    ):
+        monitor.get_status.return_value = status
+        await provider.initialize()
+    return provider
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ready", "status", "code", "words"),
+    [
+        (_unrecognised_selector(), TerminalStatus.PROCESSING, "kiro_v3_startup_dialog", "not"),
+        ("trust_declined_exit", TerminalStatus.ERROR, "kiro_v3_trust_dialog", "declined"),
+    ],
+    ids=["unrecognised_selector", "trust_declined"],
+)
+async def test_a_startup_dialog_the_status_cannot_express_refuses_at_once(
+    cwd, ready, status, code, words
+):
+    """Neither waits out the 30 s init timeout: the wait's poll hook reads the
+    pane and refuses on the first poll, with no key sent (#1167 review)."""
+    import time
+
+    pane = FakePane(str(cwd), ready=ready)
+    start = time.monotonic()
+    with pytest.raises(KiroV3LaunchError) as excinfo:
+        await _launch_with_the_real_wait(pane, status)
+    assert time.monotonic() - start < 5
+    assert excinfo.value.code == code
+    assert words in str(excinfo.value)
+    assert pane.keys == []
+    assert pane.texts == [pane.command]
+
+
+def test_only_a_selector_with_no_prompt_below_is_a_startup_selector():
+    from cli_agent_orchestrator.providers.kiro_cli import kiro_v3_startup_selector
+
+    assert kiro_v3_startup_selector(_unrecognised_selector()) is True
+    assert kiro_v3_startup_selector(_screen("trust_dialog")) is True
+    assert kiro_v3_startup_selector(_screen("idle")) is False
+    # A selector the user already answered, with the prompt back below it, is history.
+    assert kiro_v3_startup_selector(_unrecognised_selector() + "\n" + _screen("idle")) is False
+    # v2's own selector footer is not v3's.
+    assert kiro_v3_startup_selector("x\n esc to cancel · ↑↓ to navigate · ↵ to select\n") is False
+
+
 @pytest.mark.asyncio
 async def test_the_v3_fallback_agent_refuses_before_any_slash_command(cwd):
     pane = FakePane(str(cwd), ready="fallback_not_found")

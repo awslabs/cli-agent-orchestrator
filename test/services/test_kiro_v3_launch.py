@@ -289,11 +289,14 @@ PROFILE = AgentProfile(name="reviewer", description="r", allowedTools=GRANT)
         ("file", {"allowed": ["*"]}, "kiro_v3_unrestricted"),
         ("file", {"env_vars": {"KIRO_HOME": "/elsewhere"}}, "kiro_v3_home_unsupported"),
         ("v2file", {}, "kiro_v3_invalid"),
+        ("missing", {}, "kiro_v3_not_installed"),
         ("file+hooks", {}, "kiro_v3_workspace_config:hooks"),
     ],
 )
 async def test_each_pre_allocation_refusal_allocates_nothing(agents, repo, setup, kwargs, code):
-    if setup == "v2file":
+    if setup == "missing":
+        pass
+    elif setup == "v2file":
         (agents / "reviewer.json").write_text(
             json.dumps({"name": "reviewer", "tools": ["fs_read"]})
         )
@@ -309,6 +312,16 @@ async def test_each_pre_allocation_refusal_allocates_nothing(agents, repo, setup
 
 
 @pytest.mark.asyncio
+async def test_a_missing_agent_file_refuses_with_the_v3_install_remedy(agents, repo):
+    """The v3 check runs before the v2 resolver, so the remedy names --engine v3
+    and a v2-only install is not what the user is told to do (#1167 review)."""
+    with pytest.raises(KiroV3LaunchError) as excinfo:
+        await _create(PROFILE, repo)
+    assert excinfo.value.code == "kiro_v3_not_installed"
+    assert "cao install reviewer --provider kiro_cli --engine v3" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
 async def test_a_create_that_passes_every_check_reaches_allocation(agents, repo):
     (agents / "reviewer.json").write_text(_universal("reviewer"))
     seen: dict = {}
@@ -318,13 +331,30 @@ async def test_a_create_that_passes_every_check_reaches_allocation(agents, repo)
 
 
 @pytest.mark.asyncio
-async def test_a_bad_kiro_effort_refuses_before_the_probe(agents, repo):
+async def test_a_bad_kiro_effort_refuses_before_the_probe_with_its_code(agents, repo):
+    """A coded refusal, so every create route answers 400 (#1167 review)."""
     profile = AgentProfile(
         name="reviewer", description="r", allowedTools=GRANT, kiroConfig={"effort": "--agent"}
     )
     (agents / "reviewer.json").write_text(_universal("reviewer"))
-    with pytest.raises(ValueError, match="kiroConfig.effort"):
-        await _create(profile, repo)
+    probe = Mock()
+    with (
+        patch(f"{_TS}.agent_profiles.load_agent_profile", return_value=profile),
+        patch(f"{_TS}.get_backend") as backend,
+        pytest.raises(KiroV3LaunchError) as excinfo,
+    ):
+        await terminal_service.create_terminal(
+            provider="kiro_cli",
+            agent_profile="reviewer",
+            new_session=True,
+            engine="v3",
+            working_directory=str(repo),
+            kiro_capability_probe=probe,
+        )
+    assert excinfo.value.code == "kiro_v3_bad_effort"
+    assert "kiroConfig.effort" in str(excinfo.value)
+    probe.assert_not_called()
+    backend.return_value.create_session.assert_not_called()
 
 
 def test_the_module_reads_the_agents_dir_install_writes(agents):
@@ -360,7 +390,7 @@ def test_a_v3_row_without_a_recorded_identity_is_reclaimed_on_failure(engine, ve
         ("file", {"allowed": ["*"]}, "kiro_v3_unrestricted"),
         ("file", {"env_vars": {"KIRO_HOME": "/elsewhere"}}, "kiro_v3_home_unsupported"),
         ("v2file", {}, "kiro_v3_invalid"),
-        ("missing", {}, None),
+        ("missing", {}, "kiro_v3_not_installed"),
         ("file+hooks", {}, "kiro_v3_workspace_config:hooks"),
         ("file", {"version": "2.40.0"}, "kiro_v3_unsupported_version"),
     ],
@@ -368,12 +398,7 @@ def test_a_v3_row_without_a_recorded_identity_is_reclaimed_on_failure(engine, ve
 async def test_the_opt_in_widens_no_other_pre_allocation_check(
     opted_in, agents, repo, setup, kwargs, code
 ):
-    """With the opt-in on and 2.36.0 probed, every other refusal still refuses.
-
-    A missing agent file is refused first by the agent check every Kiro launch
-    passes (#1074), before the v3 file check.
-    """
-    from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+    """With the opt-in on and 2.36.0 probed, every other refusal still refuses."""
 
     if setup == "v2file":
         (agents / "reviewer.json").write_text(
@@ -384,12 +409,9 @@ async def test_the_opt_in_widens_no_other_pre_allocation_check(
     if setup == "file+hooks":
         (repo / ".kiro" / "hooks").mkdir(parents=True)
     seen: dict = {}
-    with pytest.raises((KiroV3Refusal, KiroAgentIdentityError)) as excinfo:
+    with pytest.raises(KiroV3Refusal) as excinfo:
         await _create(PROFILE, repo, seen=seen, **{"version": "2.36.0", **kwargs})
-    if code is None:
-        assert isinstance(excinfo.value, KiroAgentIdentityError)
-    else:
-        assert excinfo.value.code.startswith(code)
+    assert excinfo.value.code.startswith(code)
     assert seen == {"session": False, "other": False}
 
 

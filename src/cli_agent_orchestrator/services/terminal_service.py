@@ -120,6 +120,7 @@ from cli_agent_orchestrator.providers.base import (
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroCapabilityError,
+    KiroV3LaunchError,
     kiro_effort,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
@@ -1863,7 +1864,17 @@ async def _create_terminal_unguarded(
             # explicit override launch --model on a wrapper never probed for it.
             # A v3 launch also passes kiroConfig.effort as --effort (#1167), so
             # the probe asks for that flag too; v2's request is unchanged.
-            launch_effort = kiro_effort(profile) if resolved_engine == KiroEngine.V3 else None
+            launch_effort: Optional[str] = None
+            if resolved_engine == KiroEngine.V3:
+                try:
+                    launch_effort = kiro_effort(profile)
+                except ValueError as exc:
+                    # A coded refusal, so every create route answers 400 (the
+                    # in-session and run-step routes map a bare ValueError to 404).
+                    raise KiroV3LaunchError(
+                        "kiro_v3_bad_effort",
+                        f"{exc}. Fix the profile's kiroConfig.effort, or retry with engine 'v2'.",
+                    ) from None
             requested = requested_kiro_capabilities(
                 resolved_engine,
                 model=launch_model,
@@ -2203,14 +2214,12 @@ async def _create_terminal_unguarded(
             check_env = (
                 env_vars if new_session else {**get_session_env(session_name), **(env_vars or {})}
             )
-            await asyncio.to_thread(
-                require_kiro_agent_resolves, agent_profile, resolved_working_directory, check_env
-            )
             if kiro_v3_admission is not None:
-                # #1167: from the same cwd and env, a v3 launch also needs the
-                # default Kiro home, an installed agent file that passes the
-                # validator for this launch's grant, and a workspace whose
-                # .kiro/ v3 would not load as configuration.
+                # #1167: from the same cwd and env, a v3 launch needs the default
+                # Kiro home, an installed agent file that passes the validator
+                # for this launch's grant, and a workspace whose .kiro/ v3 would
+                # not load as configuration. First, so a missing file refuses
+                # with the v3 install remedy rather than the v2 resolver's.
                 from cli_agent_orchestrator.services import install_service
 
                 await asyncio.to_thread(
@@ -2222,6 +2231,9 @@ async def _create_terminal_unguarded(
                     kiro_v3_admission.schema,
                     Path(install_service.KIRO_AGENTS_DIR),
                 )
+            await asyncio.to_thread(
+                require_kiro_agent_resolves, agent_profile, resolved_working_directory, check_env
+            )
 
         # Normalize the session name BEFORE anything keys off it: the lifecycle
         # lock below is per session NAME, so it must be taken on the SAME string

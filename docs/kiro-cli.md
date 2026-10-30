@@ -74,6 +74,7 @@ Before anything is allocated:
 
 - the kiro-cli version is one CAO supports (see below);
 - the agent is not unrestricted (`*`);
+- the profile's `kiroConfig.effort`, if set, is a plain level such as `high`;
 - no `KIRO_HOME` other than `~/.kiro` reaches the launch;
 - the installed agent file on disk is exactly what `cao install --engine v3`
   writes for its grant, and that grant fits the launch;
@@ -147,13 +148,15 @@ is not checked.
 | `kiro_v3_unrestricted` | the agent or launch allows every tool (`*`) | restrict `allowedTools` |
 | `kiro_v3_home_unsupported` | `KIRO_HOME` points somewhere other than `~/.kiro` | unset it for the launch |
 | `kiro_v3_not_installed` | no agent file for this agent | `cao install <name> --provider kiro_cli --engine v3` |
-| `kiro_v3_bad_cwd` | CAO could not read the launch directory to check it | launch from an existing directory |
+| `kiro_v3_bad_effort` | the profile's `kiroConfig.effort` is not a plain level such as `low`, `medium` or `high` | fix `kiroConfig.effort`, or `--engine v2` |
+| `kiro_v3_bad_cwd` | CAO could not read the launch directory to check it, or the pane's own directory at the re-check after startup | launch from an existing directory |
 | `kiro_v3_invalid:<check>` | the agent file on disk is not CAO's v3 render (a v2 file, a hand edit, or Kiro's own upgrader rewrote it) | `cao install <name> --provider kiro_cli --engine v3`; the message names any `.bak` copy Kiro left |
-| `kiro_v3_workspace_config:<entry>` | the workspace's `.kiro/` holds configuration v3 would load | remove it, use a worktree without it, or `--engine v2` |
-| `kiro_v3_trust_dialog` | kiro-cli asked to trust the workspace anyway | report it; CAO never answers that dialog |
-| `kiro_v3_startup_dialog` | kiro-cli showed a dialog CAO does not know | report it with a screenshot |
-| `kiro_v3_tools_mismatch` | `/tools` shows a tag or MCP tool the grant does not allow, or the agent file changed after the launch check | reinstall; if it persists, report it |
-| `kiro_v3_mcp_not_ready` | `/mcp` shows an extra, failed or missing server, or one still loading after about 20 s | check that the server starts on its own, then retry |
+| `kiro_v3_workspace_config:<entry>` | the workspace's `.kiro/` (or a parent's) holds configuration v3 would load, an entry CAO does not know, a symlink, or can't be read | remove it, use a worktree without it, or `--engine v2` |
+| `kiro_v3_trust_dialog` | kiro-cli asked to trust the workspace anyway, including when that dialog was declined and Kiro exited | report it; CAO never answers that dialog |
+| `kiro_v3_startup_dialog` | kiro-cli showed a dialog or a selector at startup that CAO doesn't answer: one it has no pattern for, the approval picker, or v2's "Switch to V3" offer | report it with a screenshot |
+| `kiro_v3_tools_mismatch` | `/tools` shows a tag or MCP tool the grant does not allow, shows no tools, or shows a layout CAO can't read (a clipped list too); the `/tools` palette didn't appear; the launch allows every tool; or the agent file is no longer a v3 universal file, or its grant no longer fits the launch | reinstall; if it persists, report it |
+| `kiro_v3_mcp_not_ready` | `/mcp` shows an extra, failed or missing server, one still loading after about 20 s, or a layout CAO can't read; the `/mcp` palette didn't appear; or the prompt didn't come back after the panels | check that the server starts on its own, then retry |
+| `kiro_v3_mcp_not_ready` (ungranted servers) | the agent file configures an MCP server its grant doesn't name | `cao install <name> --provider kiro_cli --engine v3` |
 
 ### FAQ
 

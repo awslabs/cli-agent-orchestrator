@@ -296,6 +296,27 @@ def kiro_v3_dialog(output: str) -> Optional[str]:
     return None
 
 
+# Any v3 selector's own footer: the approval picker's and the trust dialog's
+# (``esc to close`` / ``esc to exit``, then ``↑↓ to navigate · ↵ to select``).
+# At startup no selector is expected and CAO answers none (#1167).
+_V3_SELECTOR_FOOTER = re.compile(r"^\s*esc to (?:close|exit) · ↑↓ to navigate · ↵ to select\b")
+
+
+def kiro_v3_startup_selector(output: str) -> bool:
+    """Whether the bottom of ``output`` is a v3 selector with no idle prompt below it.
+
+    Covers dialogs CAO has no pattern for (the uncaptured v3 trust-all consent
+    is the expected one): the startup wait refuses on it instead of waiting out
+    the init timeout. Used at startup only; status parsing does not read it.
+    """
+    lines = [line.rstrip() for line in strip_terminal_escapes(output).splitlines() if line.strip()]
+    lines = lines[-V3_DIALOG_BOTTOM_LINES:]
+    footers = [i for i, line in enumerate(lines) if _V3_SELECTOR_FOOTER.match(line)]
+    if not footers:
+        return False
+    return not any(re.search(NEW_TUI_IDLE_PATTERN, line) for line in lines[footers[-1] + 1 :])
+
+
 # Reads of the pane during the v3 attestation (#1167): for the typed palette
 # and each panel, then for MCP servers still loading. Provisional, about 3 s
 # and 20 s.
@@ -753,31 +774,56 @@ class KiroCliProvider(BaseProvider):
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         init_timeout = float(get_server_settings()["provider_init_timeout"])
+        # Every poll also reads the pane, so a dialog the status cannot express
+        # (an unrecognised selector reads PROCESSING, a declined trust dialog
+        # ERROR) refuses at once instead of waiting out the timeout.
         ready = await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=init_timeout,
+            on_poll=self._refuse_v3_startup_screen,
         )
         if not ready:
             return False
         current = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
         if current != TerminalStatus.WAITING_USER_ANSWER:
             return True
-        screen = await asyncio.to_thread(
-            get_backend().get_history, self.session_name, self.window_name
+        await self._refuse_v3_startup_screen()
+        raise KiroV3LaunchError(
+            "kiro_v3_startup_dialog",
+            "kiro-cli is waiting for an answer at startup on a screen CAO does not "
+            "recognize for v3; it was not answered and no task was sent.",
         )
-        if kiro_v3_dialog(screen if isinstance(screen, str) else "") == "trust":
+
+    async def _refuse_v3_startup_screen(self) -> None:
+        """Refuse, sending no key, if the pane shows any v3 dialog at startup (#1167).
+
+        ``kiro_v3_trust_dialog`` for the workspace-trust dialog (``--trust-workspace``
+        was not honoured), also once declined (Kiro exited); ``kiro_v3_startup_dialog``
+        for any other dialog or selector. The creation path then closes the window.
+        """
+        screen = await self._read_screen()
+        dialog = kiro_v3_dialog(screen)
+        if dialog == "trust":
             raise KiroV3LaunchError(
                 "kiro_v3_trust_dialog",
                 "kiro-cli showed the workspace-trust dialog although CAO passed "
                 "--trust-workspace, so the flag was not honoured. CAO does not answer "
                 "it; no task was sent.",
             )
-        raise KiroV3LaunchError(
-            "kiro_v3_startup_dialog",
-            "kiro-cli showed a startup dialog CAO does not recognize for v3; it was not "
-            "answered and no task was sent.",
-        )
+        if dialog == "trust_declined":
+            raise KiroV3LaunchError(
+                "kiro_v3_trust_dialog",
+                "kiro-cli showed the workspace-trust dialog although CAO passed "
+                "--trust-workspace, and it was declined, so Kiro exited. CAO never "
+                "answers that dialog; no task was sent.",
+            )
+        if dialog is not None or kiro_v3_startup_selector(screen):
+            raise KiroV3LaunchError(
+                "kiro_v3_startup_dialog",
+                "kiro-cli showed a startup dialog CAO does not answer on v3; it was not "
+                "answered and no task was sent.",
+            )
 
     async def _read_screen(self) -> str:
         screen = await asyncio.to_thread(

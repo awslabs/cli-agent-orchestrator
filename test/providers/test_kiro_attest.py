@@ -155,3 +155,15 @@ def test_the_typed_palettes_are_recognized_and_tab_is_not():
     assert not palette_shows_only(_screen("palette_tools_tab"), "/tools")
     assert not palette_shows_only(_screen("typed_mcp"), "/tools")
     assert not palette_shows_only(_screen("idle"), "/tools")
+
+
+@pytest.mark.parametrize("selected", ["❯ trust-all    Trust every tool", "  ❯ /tools trust-all"])
+def test_a_palette_with_a_selected_row_is_refused_on_its_own(selected):
+    """The ``❯`` clause alone: the completion row and the cancel/select footer are
+    both present, so only the selected row (``trust-all`` after a Tab) refuses."""
+    typed = _screen("typed_tools")
+    completion = "/tools    List available tools (tab for sub-commands)"
+    assert completion in typed and palette_shows_only(typed, "/tools")
+    with_selection = typed.replace(completion, f"{completion}\n{selected}")
+    assert "esc to cancel · ↵ to select" in with_selection
+    assert not palette_shows_only(with_selection, "/tools")
