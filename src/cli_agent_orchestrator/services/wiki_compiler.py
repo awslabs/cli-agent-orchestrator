@@ -392,9 +392,15 @@ _CLI_BACKENDS: "dict[str, _CliBackend]" = {
         provider="kiro_cli",
         binary="kiro-cli",
         # --trust-tools= (empty set) trusts no tools for the run.
+        # --agent-engine v2 pins the engine: unpinned, the call follows the
+        # user's chat.agentEngine setting, and a v3 session start may upgrade
+        # the user's agent files. Provisional for #1167 Phase 1; Phase 3
+        # decides whether this call moves to v3.
         build_argv=lambda prompt, outfile: [
             "kiro-cli",
             "chat",
+            "--agent-engine",
+            "v2",
             "--no-interactive",
             "--trust-tools=",
             prompt,

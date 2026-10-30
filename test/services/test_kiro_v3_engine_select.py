@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -315,3 +317,52 @@ def test_direct_provider_initialize_refuses_v3():
         with pytest.raises(KiroV3UnavailableError):
             asyncio.run(provider.initialize())
     backend.return_value.send_keys.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Wiki compiler (D16, G14): the Kiro call pins v2; a nonzero exit is llm_error
+# ---------------------------------------------------------------------------
+
+
+def test_wiki_compiler_kiro_argv_pins_agent_engine_v2():
+    from cli_agent_orchestrator.services import wiki_compiler
+
+    argv = wiki_compiler._CLI_BACKENDS["kiro_cli"].build_argv("PROMPT", None)
+    assert argv[:2] == ["kiro-cli", "chat"]
+    index = argv.index("--agent-engine")
+    assert argv[index + 1] == "v2"
+    assert argv[-1] == "PROMPT"
+    assert "--v3" not in argv
+
+
+def test_wiki_compiler_kiro_nonzero_exit_still_falls_back_as_llm_error(tmp_path, monkeypatch):
+    """A fake ``kiro-cli`` on PATH records its argv and exits 3; no real Kiro runs."""
+    from cli_agent_orchestrator.services import wiki_compiler
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_file = tmp_path / "argv.bin"
+    fake = bin_dir / "kiro-cli"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f"for a in \"$@\"; do printf '%s\\0' \"$a\"; done > '{argv_file}'\n"
+        "exit 3\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin")
+
+    result = asyncio.run(
+        wiki_compiler.compile(
+            "<!-- id: t -->\n# t\n\nold fact.\n",
+            "new fact.",
+            topic_key="t",
+            timeout_s=10.0,
+            provider_hint="kiro_cli",
+        )
+    )
+
+    assert result.used_llm is False
+    assert result.fallback_reason == "llm_error"
+    recorded = Path(argv_file).read_bytes().split(b"\0")
+    assert recorded[:3] == [b"chat", b"--agent-engine", b"v2"]
