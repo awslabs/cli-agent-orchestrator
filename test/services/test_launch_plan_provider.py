@@ -315,3 +315,57 @@ def test_the_decided_providers_command_ignores_the_fallbacks_rendered_section(
     # Control: the fallback's own command does carry its section, so the check above can see it.
     own_efforts, own_reasoning = _effort_flags(_command(fallback, "abcd0002", name, None, None))
     assert (own_efforts or own_reasoning) and "low" in " ".join(own_efforts + own_reasoning)
+
+
+# Text shaped before the launch: a provider "auto" claim shapes it the same way whichever CLI
+# runs (#1099, provisional); every other claim exactly as before.
+
+TASK = "@agent-sop:code-analysis query=logs"
+
+
+@pytest.mark.parametrize("auto,provider", [(True, "claude_code"), (False, "claude_code")])
+def test_assign_drops_the_suffix_from_an_at_task_only_for_a_provider_auto_claim(auto, provider):
+    claim = orchestration.EphemeralClaim(provider, ["fs_read"], "b" * 32, provider_auto=auto)
+
+    def shape(message):
+        return orchestration.append_sender_suffix(
+            message,
+            orchestration.ASSIGN_SUFFIX_TEMPLATE,
+            CALLER,
+            provider=lambda: orchestration._assign_worker_provider("Ramones-x-3f9a", claim),
+        )
+
+    suffix = "\n\n" + orchestration.ASSIGN_SUFFIX_TEMPLATE.format(terminal_id=CALLER)
+    assert shape(TASK) == (TASK if auto else TASK + suffix)
+    # Prose keeps the suffix either way.
+    assert shape("inspect the logs") == "inspect the logs" + suffix
+
+
+def test_a_claim_without_provider_auto_keeps_its_provider_for_the_suffix_check():
+    claim = orchestration.EphemeralClaim("kiro_cli", ["fs_read"], "b" * 32)
+    assert claim.provider_auto is False
+    assert orchestration._assign_worker_provider("Ramones-x-3f9a", claim) == "kiro_cli"
+    codex_claim = orchestration.EphemeralClaim("codex", ["fs_read"], "b" * 32)
+    assert orchestration._assign_worker_provider("Ramones-x-3f9a", codex_claim) == "codex"
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ({"provider_auto": True}, True),
+        ({"provider_auto": False}, False),
+        ({}, False),
+        ({"provider_auto": "true"}, False),
+        ({"provider_auto": 1}, False),
+    ],
+)
+def test_the_claim_response_flag_is_read_only_as_json_true(monkeypatch, body, expected):
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
+    monkeypatch.setattr(agent_profiles, "routes_to_ephemeral_store", lambda _: True)
+    data = {"claim_id": "c" * 32, "provider": "claude_code", "effective_tools": ["fs_read"]}
+    response = Mock(status_code=200, json=lambda: {**data, "replayed": False, **body})
+    monkeypatch.setattr(orchestration.requests, "post", lambda *a, **kw: response)
+    claim = orchestration._claim_ephemeral("Ramones-log_triage-3f9a", None)
+    assert claim.provider_auto is expected and claim.provider == "claude_code"

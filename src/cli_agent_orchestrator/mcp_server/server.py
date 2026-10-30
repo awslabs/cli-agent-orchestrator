@@ -1769,7 +1769,7 @@ async def create_ephemeral_agent(
         WithJsonSchema(
             {
                 "anyOf": [
-                    {"type": "string", "enum": list(ephemeral_providers())},
+                    {"type": "string", "enum": [*ephemeral_providers(), "auto"]},
                     {"type": "null"},
                 ]
             }
@@ -1806,7 +1806,9 @@ async def create_ephemeral_agent(
     The CAO-recorded tool list is bounded by the creator's effective list.
     This is not an OS privilege boundary or a per-tool MCP restriction.
     Codex tools are advisory when the operator enables Codex, and the response's
-    ``enforcement`` field reports ``hard`` or ``advisory``. The feature defaults
+    ``enforcement`` field reports ``hard`` or ``advisory``. ``provider="auto"`` lets
+    the operator's decider choose the CLI at launch, within the operator's declared
+    provider sets; it falls back to your own provider. The feature defaults
     off; see docs/ephemeral-agents.md for the full honesty statement.
     """
     return await _create_ephemeral_from_arguments(

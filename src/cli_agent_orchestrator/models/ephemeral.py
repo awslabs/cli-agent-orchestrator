@@ -22,19 +22,23 @@ class EphemeralSpec(BaseModel):
     purpose: str = Field(pattern=r"^[a-z][a-z0-9_]{2,31}$")
     brief: str
     description: Optional[str] = Field(default=None, max_length=280)
-    provider: Optional[ProviderType] = None
+    # #1099 (provisional): "auto" lets provider.route choose within the operator's
+    # ephemeral.provider_route set, falling back to the creator's provider.
+    provider: Optional[ProviderType | Literal["auto"]] = None
     tools: Optional[list[ToolAtom]] = None
     model_tier: Optional[ModelTier] = None
     effort: Optional[Effort] = None
 
     @field_validator("provider", mode="before")
     @classmethod
-    def provider_is_known(cls, value: Any) -> Optional[ProviderType]:
+    def provider_is_known(cls, value: Any) -> Optional[ProviderType | Literal["auto"]]:
         if value is None or isinstance(value, ProviderType):
             return value
+        if value == "auto":
+            return "auto"
         if isinstance(value, str):
             return ProviderType(value)
-        raise ValueError("provider must be a known provider id")
+        raise ValueError("provider must be a known provider id or auto")
 
     @field_validator("spec_version", mode="before")
     @classmethod

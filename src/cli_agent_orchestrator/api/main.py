@@ -3816,6 +3816,7 @@ async def _prepare_delegation(
                 policy=inputs.policy,
                 purpose=inputs.purpose,
                 description=inputs.description,
+                provider_options=inputs.provider_options,
             )
         )
         # The operator may have changed the policy while the decider ran: recheck the
@@ -3829,6 +3830,8 @@ async def _prepare_delegation(
                 _recorded_tier(plan) if plan is not None else None,
                 plan.effort if plan is not None else None,
                 plan.model if plan is not None else None,
+                # #1099: only the engine sets the provider; the recheck can only refuse it.
+                provider=plan.provider if plan is not None else None,
             )
         except BaseException:
             _bind_unlaunched(plan)

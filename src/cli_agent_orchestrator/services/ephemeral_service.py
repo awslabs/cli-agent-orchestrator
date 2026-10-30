@@ -28,7 +28,7 @@ from cli_agent_orchestrator.decisions.policy import (
     PolicyBounds,
     PolicyConfigError,
 )
-from cli_agent_orchestrator.decisions.types import POINTS, Effort
+from cli_agent_orchestrator.decisions.types import POINTS, Effort, ProviderOptions
 from cli_agent_orchestrator.models.ephemeral import TOOL_ATOMS, EphemeralSpec
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
@@ -557,7 +557,11 @@ def _live_names(session: str, now: Any) -> int:
 
 
 def _policy_notes(
-    settings: dict[str, Any], spec: EphemeralSpec, tier: Optional[str], effort: Optional[str]
+    settings: dict[str, Any],
+    spec: EphemeralSpec,
+    tier: Optional[str],
+    effort: Optional[str],
+    provider: Optional[str] = None,
 ) -> list[str]:
     model = (
         f"model: tier auto (decided at launch; fallback tier {tier}, ephemeral.default_tier)"
@@ -577,7 +581,14 @@ def _policy_notes(
             else "effort: provider default (effort omitted, no default_effort)"
         )
     )
-    return [model, effort_note]
+    notes = [model, effort_note]
+    if spec.provider == "auto":
+        # #1099 (provisional): only an auto spec gains a provider note.
+        notes.append(
+            f"provider: auto (decided at launch within ephemeral.provider_route.equivalent; "
+            f"fallback {provider}, the creator's provider)"
+        )
+    return notes
 
 
 def _launch_value(requested: Optional[str], resolved: Optional[str]) -> dict[str, Any]:
@@ -669,13 +680,19 @@ def _auto_fields(spec: EphemeralSpec) -> list[tuple[str, str, str]]:
     ]
 
 
+def _declares_auto(spec: EphemeralSpec) -> bool:
+    """Whether a launch of this spec asks any decision point (#1068, #1083, #1099)."""
+    return bool(_auto_fields(spec)) or spec.provider == "auto"
+
+
 def _auto_refusal(
     settings: dict[str, Any], spec: EphemeralSpec, *, at_create: bool
 ) -> Optional[EphemeralPolicyError]:
     """#1068 MF4 and A15 (provisional): auto needs both bounds and a lease that outlasts on mode.
 
     #1083 (provisional): effort auto needs both effort bounds too. Each declared point is asked
-    in turn, so the lease covers one on-mode wait per declared field.
+    in turn, so the lease covers one on-mode wait per declared field. #1099 (provisional):
+    provider auto has no bounds, and is one more wait, asked first.
     """
     fields = _auto_fields(spec)
     missing = [
@@ -693,7 +710,10 @@ def _auto_refusal(
         )
     from cli_agent_orchestrator.decisions.settings import resolve_on_timeout_ms
 
-    waits = len(fields)
+    declared = (["provider=auto"] if spec.provider == "auto" else []) + [
+        field + "=auto" for _, field, _ in fields
+    ]
+    waits = len(declared)
     timeout = resolve_on_timeout_ms({"decisions": settings.get("_decisions")})
     floor = waits * timeout / 1000 + 30
     if settings["claim_lease_seconds"] < floor:
@@ -702,7 +722,7 @@ def _auto_refusal(
             "ephemeral.claim_lease_seconds must be at least "
             + (f"{waits} * " if waits > 1 else "")
             + f"decisions.on_timeout_ms/1000 + 30 ({floor:g}) for "
-            + " and ".join(field + "=auto" for _, field, _ in fields),
+            + " and ".join(declared),
         )
     return None
 
@@ -758,11 +778,14 @@ def create_ephemeral_agent(
             )
         if "@cao-mcp-server" not in creator_tools and "*" not in creator_tools:
             raise EphemeralPolicyError("tool_exceeds_creator", "@cao-mcp-server")
-        if _auto_fields(spec):
+        if _declares_auto(spec):
             refusal = _auto_refusal(config, spec, at_create=True)
             if refusal is not None:
                 raise refusal
-        provider = spec.provider.value if spec.provider is not None else creator["provider"]
+        # #1099 (provisional): auto resolves to the creator's provider, the fallback that every
+        # later check, the row and the live profile use; a decision never changes them.
+        declared = spec.provider not in (None, "auto")
+        provider = cast(ProviderType, spec.provider).value if declared else creator["provider"]
         if provider not in {item.value for item in ProviderType}:
             raise EphemeralPolicyError("creator_unresolved")
         requested = sorted(
@@ -771,7 +794,7 @@ def create_ephemeral_agent(
         )
         # Provider limits precede the tier, effort and creator tool-ceiling checks: no grant
         # lifts them (provisional order, #1074).
-        refusal = provider_refusal(provider, config, requested, declared=spec.provider is not None)
+        refusal = provider_refusal(provider, config, requested, declared=declared)
         if refusal is not None:
             raise refusal
         bounds = policy_bounds(config)
@@ -811,7 +834,7 @@ def create_ephemeral_agent(
         tier = config["default_tier"] if spec.model_tier in (None, "auto") else spec.model_tier
         model = tiers[provider][tier] if tier is not None else None
         effort = config["default_effort"] if spec.effort in (None, "auto") else spec.effort
-        notes = _policy_notes(config, spec, tier, effort)
+        notes = _policy_notes(config, spec, tier, effort, provider)
         # Held from the cap count until the pending row commits, so concurrent creates
         # cannot pass the cap together and a sweep holding it sees every live file's row.
         # Held with no cap too: the sweep's rowless step relies on it either way.
@@ -1136,7 +1159,7 @@ def _recheck_policy(
     try:
         validate_block(settings)
         spec = _stored_spec(row)
-        if spec is not None and _auto_fields(spec):
+        if spec is not None and _declares_auto(spec):
             auto = _auto_refusal(settings, spec, at_create=False)
             if auto is not None:
                 raise auto
@@ -1272,6 +1295,79 @@ class EphemeralDecisionInputs:
     policy: PolicyBounds
     purpose: str
     description: Optional[str]
+    # #1099: CAO's options for a provider "auto" spec; None for every other spec.
+    provider_options: Optional[ProviderOptions] = None
+
+
+def _equivalent_set(settings: dict[str, Any], provider: str) -> list[str]:
+    """The declared ephemeral.provider_route set holding ``provider``, or none (#1099)."""
+    for members in settings.get("provider_route", {}).get("equivalent", []):
+        if provider in members:
+            return list(members)
+    return []
+
+
+def _route_refusal(
+    row: dict[str, Any],
+    settings: dict[str, Any],
+    provider: str,
+    *,
+    tiers: Sequence[str],
+    effort: Optional[str],
+) -> Optional[EphemeralPolicyError]:
+    """#1099 (provisional): the first rule that keeps ``provider`` from running this launch.
+
+    One rule for the claim's options and the pre-bind recheck of a decided provider, so the
+    two can't drift apart: rule 8, support and the stored tools' atoms, then every tier the
+    launch can reach mapped in the provider's table, then an effort it can apply and
+    membership of the fallback's declared set.
+    """
+    refusal = provider_refusal(provider, settings, row["effective_tools"])
+    if refusal is not None:
+        return refusal
+    table = settings["_model_tiers"].get(provider, {})
+    unmapped = [tier for tier in tiers if not table.get(tier)]
+    if unmapped:
+        return EphemeralPolicyError(
+            "tier_unmapped", f"model_tiers.{provider}.{unmapped[0]} is not set or not valid"
+        )
+    if effort is not None and not capability_for(provider).honors_effort:
+        return EphemeralPolicyError("provider_not_equivalent", f"{provider} cannot apply an effort")
+    if provider not in _equivalent_set(settings, row["provider"]):
+        return EphemeralPolicyError(
+            "provider_not_equivalent",
+            f"{provider} is not in the fallback's ephemeral.provider_route set",
+        )
+    return None
+
+
+def provider_options(
+    row: dict[str, Any], spec: EphemeralSpec, settings: dict[str, Any]
+) -> ProviderOptions:
+    """#1099 (provisional): the providers this claimed provider "auto" launch may run on.
+
+    Pure: computed after the claim's recheck, on the same settings snapshot. The fallback is
+    always an option, since the recheck has just passed it; a declared set member is one
+    only when ``_route_refusal`` passes it. Options are in capability-table order, never the
+    set's, and a single option means nothing is asked.
+    """
+    fallback = row["provider"]
+    tiers = POINTS["model.route"].options
+    if spec.model_tier == "auto":
+        reachable = list(
+            tiers[tiers.index(settings["min_tier"]) : tiers.index(settings["max_tier"]) + 1]
+        )
+    else:
+        reachable = [row["model_tier"]] if row["model_tier"] is not None else []
+    effort = row["effort"] if row["effort"] is not None else spec.effort
+    survivors = {fallback} | {
+        member
+        for member in _equivalent_set(settings, fallback)
+        if member != fallback
+        and _route_refusal(row, settings, member, tiers=reachable, effort=effort) is None
+    }
+    options = tuple(p for p in ephemeral_providers() if p in survivors)
+    return ProviderOptions(options, {p: enforcement_label(p) for p in options})
 
 
 def decision_inputs(
@@ -1293,9 +1389,9 @@ def decision_inputs(
     ):
         return None  # Nothing is asked; the bind refuses with its own rule.
     spec = _stored_spec(row)
-    fields = _auto_fields(spec) if spec is not None else []
-    if spec is None or not fields:
+    if spec is None or not _declares_auto(spec):
         return None  # D1: an explicit or omitted value never reaches a decider.
+    fields = _auto_fields(spec)
     try:
         settings = read_settings()
         require_enabled(settings)
@@ -1307,9 +1403,13 @@ def decision_inputs(
     policy = replace(
         policy_bounds(settings), **{"default_" + noun: row[field] for _, field, noun in fields}
     )
-    return EphemeralDecisionInputs(
-        {point: "auto" for point, _, _ in fields}, policy, spec.purpose, spec.description
-    )
+    states = {point: "auto" for point, _, _ in fields}
+    options = None
+    if spec.provider == "auto":
+        # #1099 (provisional): provider.route is asked first; its fallback is the row's.
+        states = {"provider.route": "auto", **states}
+        options = provider_options(row, spec, settings)
+    return EphemeralDecisionInputs(states, policy, spec.purpose, spec.description, options)
 
 
 @dataclass(frozen=True)
@@ -1344,6 +1444,8 @@ def recheck_decided(
     tier: Optional[str],
     effort: Optional[Effort] = None,
     launched_model: Optional[str] = None,
+    *,
+    provider: Optional[str] = None,
 ) -> Optional[DecidedLaunch]:
     """#1068: re-apply the operator's current policy to a claimed auto launch before the bind.
 
@@ -1355,6 +1457,11 @@ def recheck_decided(
     Returns the model the current table maps the launched tier to, and the launched effort;
     the site passes both to the provider through the launch plan, and nothing is written.
     Returns None when the claim is no longer live, so the bind refuses with its own rule.
+
+    #1099 (provisional): ``provider`` is a decided provider that differs from the row's. The
+    stored fallback must still pass; the decided one must pass the claim's option rules
+    again, and its own table and bounds map and bound the launched tier and effort. A failure
+    collects the name rather than running another provider silently.
     """
     row = database.get_ephemeral_agent(name)
     if (
@@ -1372,11 +1479,27 @@ def recheck_decided(
         values = _recheck_policy(row, settings, claim_id)
         tiers = settings["_model_tiers"]
         bounds = policy_bounds(settings)
+        launch_provider = provider if provider is not None else row["provider"]
+        if provider is not None:
+            stored = tier or row["model_tier"]
+            refusal = _route_refusal(
+                row,
+                settings,
+                provider,
+                tiers=[stored] if stored is not None else [],
+                effort=effort or row["effort"],
+            )
+            if refusal is not None:
+                _collect_policy_changed(row, "claimed", claim_id)
+                raise EphemeralPolicyError(
+                    "policy_changed_since_create:" + refusal.rule,
+                    "(the policy changed during the launch decision); re-create the ephemeral agent",
+                )
         if tier is None and launched_model is not None:
-            tier = _recovered_tier(launched_model, row["provider"], bounds, tiers)
+            tier = _recovered_tier(launched_model, launch_provider, bounds, tiers)
         for point, applied in (("model.route", tier), ("effort.route", effort)):
             refusal = (
-                _value_refusal(point, applied, row["provider"], bounds, tiers)
+                _value_refusal(point, applied, launch_provider, bounds, tiers)
                 if applied is not None
                 else None
             )
@@ -1389,8 +1512,14 @@ def recheck_decided(
                     "(the policy changed during the launch decision); re-create the ephemeral agent",
                 )
         # A remap during the decision moves only the model id: launch the applied tier's. An
-        # effort-only launch runs its stored tier's current id the same way.
-        model = tiers[row["provider"]][tier] if tier is not None else values["model"]
+        # effort-only launch runs its stored tier's current id the same way. A routed launch
+        # maps its tier, applied or stored, with the decided provider's table, since the
+        # live profile names the fallback's id (#1099).
+        if provider is not None:
+            launched_tier = tier or row["model_tier"]
+            model = tiers[provider][launched_tier] if launched_tier is not None else None
+        else:
+            model = tiers[row["provider"]][tier] if tier is not None else values["model"]
         launched = effort if effort is not None else row["effort"]
         return DecidedLaunch(model, launched)
     except EphemeralPolicyError as exc:
@@ -1554,11 +1683,19 @@ def claim_ephemeral_agent(
         _audit_update(row, "claimed")
         values = _recheck_policy(row, config, token)
         finalize(name, token, values)
+        # #1099 (provisional): the launch may run another CLI than ``provider``, so the MCP
+        # helpers shape the delegated text the same way whichever one runs. The spec finalize
+        # has just verified is read again strictly: if it changed or vanished since, the
+        # claim ends and fails instead of reporting a provider "auto" spec as explicit.
+        payload = _read_regular(EPHEMERAL_DIR / "live" / (name + ".spec.json"))
+        if hashlib.sha256(payload).hexdigest() != row["spec_sha256"]:
+            raise ValueError("stored spec changed after finalize")
         return dict(
             claim_id=token,
             provider=row["provider"],
             effective_tools=row["effective_tools"],
             replayed=False,
+            provider_auto=json.loads(payload).get("provider") == "auto",
         )
     except EphemeralPolicyError as exc:
         log_refusal(
