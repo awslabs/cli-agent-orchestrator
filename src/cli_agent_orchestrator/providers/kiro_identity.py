@@ -3,7 +3,9 @@
 kiro-cli does not refuse an ``--agent`` it cannot load. It prints ``agent "<name>"
 not found, using "kiro_default"`` and starts its built-in default agent, which has
 every built-in tool (shell, write, use_aws and more). Measured on kiro-cli 2.32.0;
-the same fallback follows an agent file that does not parse. CAO therefore checks
+the same fallback follows an agent file that does not parse. kiro-cli 2.35.1's v3
+engine does the same with its ``Default`` agent (read, write, shell and web), for
+a missing name, a v2-only file and an invalid one (#1167). CAO therefore checks
 identity twice, and both checks fail closed:
 
 1. Before launch (``kiro_agent_defined``): one of the agent directories in
@@ -11,7 +13,7 @@ identity twice, and both checks fail closed:
    refuses otherwise, before any window exists.
 2. After launch, before any task is typed (``require_header_identity``): every
    TUI header row on the screen, ``<agent> · <model> · ◔ N% · ...``, must name
-   the agent.
+   the agent, and kiro-cli must not have printed a fallback notice for it.
    ``KiroCliProvider.initialize`` raises otherwise, and the creation path closes
    the terminal's window: a synchronous create rolls back, and a deferred create
    always reclaims the runtime, keeping only the failure record. Nothing is
@@ -38,16 +40,44 @@ logger = logging.getLogger(__name__)
 # Agents a launch may never be identified as, whatever was requested: kiro-cli's
 # built-in fallback, and the tool-less default agent proposed for CAO-owned Kiro
 # homes. Provisional (#1074): an explicit request for either is refused too.
-KIRO_FALLBACK_AGENTS = frozenset({"kiro_default", "cao-null"})
+# ``Default`` is the v3 engine's fallback as its header draws it, and ``default``
+# as its fallback notice names it. Provisional (#1167): both spellings, exactly,
+# and an explicit request for either is refused like ``kiro_default``.
+KIRO_FALLBACK_AGENTS = frozenset({"kiro_default", "cao-null", "Default", "default"})
 
-# The TUI header row: agent, model, then the context gauge and percentage. The
-# gauge glyph is not pinned (``◔`` in every capture so far, at 0-14%), and the
-# row continues with auth and cwd columns that vary by version. Matching the
-# gauge keeps a wrapped cwd column (``~/project · (main)``) from reading as a
-# header. Only rows of this shape, starting at column 0, are read: the
-# requested name also appears in the echoed launch command and in kiro-cli's
-# fallback warning, so searching the pane for it would accept the fallback.
-_HEADER_ROW = re.compile(r"^(?P<agent>[^\s·]+)\s+·\s+(?P<model>[^\s·]+)\s+·\s+\S\s*\d{1,3}%")
+# The TUI header row: agent, model, up to ``_MAX_EXTRA_COLUMNS`` short columns,
+# then the context gauge and percentage. The extra columns are the effort and
+# thinking settings: ``v2ro · claude-haiku-5.5 · low · ◔ 2%`` on v2 with
+# ``--effort low``, ``v3ro · claude-haiku-5.5 · thinking · low · ◔ 1%`` on v3 with
+# a pinned thinking model (kiro-cli 2.35.1). Provisional (#1167): at most 3 extra
+# columns of at most 16 characters each, with no ``·`` or whitespace, so a long
+# line holding a ``·`` and a percentage does not read as a header. The gauge
+# glyph is not pinned (``◔`` in every capture so far, at 0-14%), and the row
+# continues with auth and cwd columns that vary by version. Matching the gauge
+# keeps a wrapped cwd column (``~/project · (main)``) from reading as a header.
+# Only rows of this shape, starting at column 0, are read: the requested name
+# also appears in the echoed launch command and in kiro-cli's fallback warning,
+# so searching the pane for it would accept the fallback.
+_MAX_EXTRA_COLUMNS = 3
+_MAX_EXTRA_COLUMN_CHARS = 16
+_HEADER_ROW = re.compile(
+    r"^(?P<agent>[^\s·]+)\s+·\s+(?P<model>[^\s·]+)"
+    rf"(?:\s+·\s+[^\s·]{{1,{_MAX_EXTRA_COLUMN_CHARS}}}){{0,{_MAX_EXTRA_COLUMNS}}}"
+    r"\s+·\s+\S\s*\d{1,3}%"
+)
+
+# kiro-cli's notice that it did not start the agent asked for, drawn above the
+# header: ``agent "<name>" not found, using "kiro_default"`` on v2, and on
+# 2.35.1's v3 engine ``… not found, using "default"``, ``… needs upgrading for
+# this agent engine, using "default"`` and ``… has an invalid config, using
+# "default"``. Every capture's header names the fallback too; the notice also
+# refuses a screen whose header happens to name the requested agent.
+# Provisional (#1167): on either engine, a notice naming the requested agent
+# refuses, whatever reason and fallback it gives; a notice naming another agent
+# does not refuse on its own, and the header decides.
+_FALLBACK_NOTICE = re.compile(
+    r'\bagent "(?P<requested>[^"\n]{1,256})" [^\n]{1,160}?, using "(?P<fallback>[^"\n]{1,64})"'
+)
 
 # A header name kiro-cli could not draw whole: elided with an ellipsis, or cut by
 # a wrap (``header_agents`` marks a fragment whose start is on the row above with
@@ -211,8 +241,8 @@ def header_agents(pane: str) -> List[str]:
     """The agents named by the Kiro TUI header rows in ``pane``, in screen order, once each.
 
     A header row starts at column 0, as kiro-cli draws it in every capture so
-    far (2.x to 2.34.2). An indented row of header shape, such as a wrapped cwd
-    column or a composer continuation line, is not one.
+    far (2.x to 2.35.1, v2 and v3). An indented row of header shape, such as a
+    wrapped cwd column or a composer continuation line, is not one.
 
     No single row is taken as the live header. The composer, its hint and the
     right-hand cwd column all render below it, so the last row of header shape
@@ -238,6 +268,20 @@ def header_agents(pane: str) -> List[str]:
     return agents
 
 
+def fallback_notice(pane: str, agent: str) -> Optional[str]:
+    """The agent kiro-cli says it used instead of ``agent``, from its first fallback
+    notice in ``pane`` that names ``agent``; None when no notice names it.
+
+    A notice is read anywhere on a row, unlike a header row: it only ever
+    refuses a launch, so a row that merely quotes one fails closed. Notices
+    naming another agent are skipped.
+    """
+    for match in _FALLBACK_NOTICE.finditer(strip_terminal_escapes(pane)):
+        if match.group("requested") == agent:
+            return match.group("fallback")
+    return None
+
+
 def _ends_a_wrapped_name(row: str) -> bool:
     """True when ``row`` could be the start of a header name wrapped onto the next row."""
     text = row.rstrip()
@@ -261,7 +305,11 @@ def identity_readable(observed: Sequence[str]) -> bool:
 
 
 def require_header_identity(
-    expected: str, observed: Sequence[str], *, plan_mode: bool = False
+    expected: str,
+    observed: Sequence[str],
+    *,
+    plan_mode: bool = False,
+    fallback: Optional[str] = None,
 ) -> None:
     """Refuse a started Kiro session unless every header row named ``expected``.
 
@@ -275,13 +323,17 @@ def require_header_identity(
     that disagrees it is ``header_not_found``, the class a TUI change gives,
     not ``identity_mismatch``. ``plan_mode`` says the screen stayed in Kiro's
     plan mode, whose ``Plan`` header hides the agent's name: a mismatch, unless
-    ``Plan`` is the agent asked for.
+    ``Plan`` is the agent asked for. ``fallback`` is the agent a fallback
+    notice for ``expected`` on the screen names (``fallback_notice``): it
+    refuses a screen the header rows would pass, and leaves any other
+    refusal's kind as the header gives it.
 
     Raises:
         KiroAgentIdentityError: ``header_not_found`` when no header row names an
             agent in full, or a partial name sits beside the expected one;
             ``identity_mismatch`` when a full name is another agent's (plan
-            mode's ``Plan`` included), or the only one names a fallback.
+            mode's ``Plan`` included), the only one names a fallback, or the
+            screen shows a fallback notice for ``expected``.
     """
     names = list(dict.fromkeys(observed))
     full = [name for name in names if not is_partial_agent_name(name)]
@@ -339,4 +391,15 @@ def require_header_identity(
             f"CAO_AGENTS_DIR is set, kiro-cli reads it only when it is ~/.kiro/agents "
             f"or $KIRO_HOME/agents.",
             observed=observed_agent,
+        )
+    if fallback is not None:
+        raise KiroAgentIdentityError(
+            "identity_mismatch",
+            expected,
+            f"Kiro agent identity not confirmed for '{expected}': the header names it, "
+            f"but kiro-cli printed that it did not load that agent and is using "
+            f"'{fallback}' instead, so CAO cannot tell which agent is running. No task "
+            f"was sent. Check `kiro-cli agent list` for errors and that the agent file "
+            f"loads on this Kiro engine, then retry.",
+            observed=fallback,
         )
