@@ -1972,6 +1972,37 @@ class TestClaudeCodeProviderClaudeConfig:
         assert "--agent agent" in command
         assert command.count("--effort") == 1 and "--effort high" in command
 
+    def test_a_per_launch_effort_and_a_fresh_session_id_both_apply(self):
+        # #1143's --session-id and #1083's per-launch --effort are independent
+        # flags on independent code paths; both must reach the command together.
+        provider = ClaudeCodeProvider(
+            "tid", "sess", "win", "agent", effort="high", session_id="fresh-sid"
+        )
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ):
+            command = provider._build_claude_command()
+
+        assert "--session-id fresh-sid" in command
+        assert command.count("--effort") == 1 and "--effort high" in command
+
+    def test_a_per_launch_effort_and_resume_both_apply(self):
+        # --resume (durable-orchestra recovery) and the per-launch --effort are
+        # independent too: resuming a prior conversation still honors a decided effort.
+        provider = ClaudeCodeProvider(
+            "tid", "sess", "win", "agent", effort="high", resume_session_id="resume-sid"
+        )
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ):
+            command = provider._build_claude_command()
+
+        assert "--resume resume-sid" in command
+        assert "--session-id" not in command
+        assert command.count("--effort") == 1 and "--effort high" in command
+
     def test_no_per_launch_effort_with_no_cao_profile_emits_nothing(self):
         provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort=None)
         with patch(
