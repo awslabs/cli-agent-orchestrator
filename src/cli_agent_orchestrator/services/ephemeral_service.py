@@ -1677,8 +1677,15 @@ def bind_ephemeral_agent(
     claim_id: Optional[str],
     allowed_tools: Optional[list[str]],
     idempotency_key: Optional[str] = None,
+    *,
+    launched_provider: Optional[str] = None,
 ) -> None:
-    """Bind exactly one owner launch before any backend resource or terminal row."""
+    """Bind exactly one owner launch before any backend resource or terminal row.
+
+    ``provider`` is the launch request's, which must equal the row's. ``launched_provider``
+    is the CLI that actually runs, which a ``provider.route`` decision may change (#1099);
+    it is only an audit fact, and nothing ever launches from it.
+    """
     row = None
     try:
         now = database._utcnow()
@@ -1731,7 +1738,18 @@ def bind_ephemeral_agent(
                 _finish_gc(row)
             raise _bind_rule(row, caller_id, provider, claim_id)
         assert row is not None
-        _audit_update(row, "bound", terminal_id=terminal_id, effective_tools=tools)
+        _audit_update(
+            row,
+            "bound",
+            terminal_id=terminal_id,
+            effective_tools=tools,
+            # #1099 (provisional): a routed launch's bound event names the provider that ran.
+            **(
+                {"provider": launched_provider}
+                if launched_provider not in (None, row["provider"])
+                else {}
+            ),
+        )
     except EphemeralPolicyError as exc:
         _report_refusal(name, caller_id, row, exc)
         raise

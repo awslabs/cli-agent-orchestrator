@@ -1182,7 +1182,9 @@ def _create_terminal(
 
     if response_sink is not None:
         response_sink(response)
-    return terminal["id"], provider
+    # The created terminal's own provider: a routed ephemeral launch runs another CLI than
+    # the request named (#1099), and every later step reuses or shapes for this one.
+    return terminal["id"], terminal.get("provider") or provider
 
 
 def _send_direct_input(
