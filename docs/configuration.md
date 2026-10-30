@@ -484,12 +484,13 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 
 ### Launch decisions
 
-`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_ON_TIMEOUT_MS` and
-`CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision settings loader, not through
-`ConfigService`, and override the `decisions` block of `settings.json`. The chain above does not
-apply as written: `cao-server --decision <point>=<state>` sets the matching point-state variable
-(`CAO_DECISION_MODEL_ROUTE` or `CAO_DECISION_EFFORT_ROUTE`), so the flag and that variable are one
-layer, and the server keeps the values it started with until it restarts.
+`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_PROVIDER_ROUTE`,
+`CAO_DECISION_ON_TIMEOUT_MS` and `CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision
+settings loader, not through `ConfigService`, and override the `decisions` block of
+`settings.json`. The chain above does not apply as written: `cao-server --decision
+<point>=<state>` sets the matching point-state variable (`CAO_DECISION_MODEL_ROUTE`,
+`CAO_DECISION_EFFORT_ROUTE` or `CAO_DECISION_PROVIDER_ROUTE`), so the flag and that variable are
+one layer, and the server keeps the values it started with until it restarts.
 See [Launch decisions](decisions.md#settings).
 
 ### Not yet routed through ConfigService

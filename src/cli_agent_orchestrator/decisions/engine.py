@@ -43,6 +43,7 @@ from cli_agent_orchestrator.decisions.types import (
     LaunchPlan,
     MissingTier,
     PointState,
+    ProviderOptions,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.providers.manager import ProviderManager
@@ -61,10 +62,12 @@ FALLBACK_REASONS = frozenset(
         "tier_unmapped",
         "not_honored",
         "decider_unavailable",
+        # #1099 (provisional): provider.route had one option, so nothing was asked.
+        "single_option",
     )
 )
 # Reasons that mean the decider gave no usable answer. Other reasons are answers, such as
-# unsure or low_confidence, except not_honored, which never asked the decider.
+# unsure or low_confidence, except not_honored and single_option, which never asked it.
 DECIDER_FAILURES = frozenset(
     ("timeout", "error", "invalid_answer", "no_answer", "decider_unavailable")
 )
@@ -87,6 +90,8 @@ class DelegationRequest:
     purpose: str | None = None
     # #1068 Q4 (provisional): the creator-written description, sent only for ephemeral targets.
     description: str | None = None
+    # #1099 (provisional): provider.route's per-launch options, set only by decision_inputs.
+    provider_options: ProviderOptions | None = None
 
 
 def _honors(provider: str, name: str | None, profile: AgentProfile | None) -> bool:
@@ -203,7 +208,7 @@ class DecisionEngine:
         self, decider: str, point: str, reason: str | None, asked: Decider | None = None
     ) -> None:
         # Labels only: never the request, profile, purpose, brief or exception text.
-        if reason == "not_honored":
+        if reason in ("not_honored", "single_option"):
             return
         if reason == "no_answer" and type(asked) is FixedTableDecider:
             # The built-in table returns nothing for a profile it has no entry for: an
@@ -273,6 +278,18 @@ class DecisionEngine:
                 raise DecisionInputError(
                     f"{point} must be one of {', '.join(POINTS[point].options)} (got {value!r})"
                 )
+        # #1099: only decision_inputs asks provider.route, for a claimed ephemeral launch and
+        # with options CAO computed that contain the fallback. Anything else is a bug.
+        route_options = req.provider_options
+        if "provider.route" in fields and (
+            fields["provider.route"] != "auto"
+            or target != TargetKind.EPHEMERAL
+            or route_options is None
+            or req.provider not in route_options.options
+            or len(set(route_options.options)) != len(route_options.options)
+            or set(route_options.labels) != set(route_options.options)
+        ):
+            raise DecisionInputError("provider.route needs CAO's per-launch options")
         try:
             profile = (
                 self.profile_loader(req.agent_profile)
@@ -377,26 +394,8 @@ class DecisionEngine:
             for point, value in fields.items()
             if value == "auto" and not excluded(point) and req.owner != WORKFLOW_STEP
         )
-        resolved: dict[str, tuple[Decider | None, str | None]] = {}
-        for point in eligible:
-            if point in active and active[point].state == PointState.ON:
-                resolved[point] = self._resolve(point, req, profile, active[point].decider)
-        # Scope selects only the question and record; it never bypasses policy.
-        out_of_scope = tuple(
-            point
-            for point, value in fields.items()
-            if value == "auto"
-            and point in active
-            and req.owner == WORKFLOW_STEP
-            and not excluded(point)
-        )
-        plan_model: str | None = None
-        fb_model = fallbacks.get("model.route")
-        if isinstance(fb_model, Fallback) and fb_model.source == "policy":
-            plan_model = fb_model.value
-        if fields.get("model.route") not in (None, "auto"):
-            plan_model = tiers.get(fields["model.route"])
         plan_effort: Effort | None = None
+        plan_provider: str | None = None
         request: DecisionRequest | None = None
 
         def decision_request() -> DecisionRequest:
@@ -440,15 +439,183 @@ class DecisionEngine:
                 )
             return request
 
+        def request_for(point: str) -> DecisionRequest:
+            # #1099 Q4 (provisional): every ask of one launch shares one request and one
+            # request_id. provider.route sees the fallback and this launch's options; the
+            # points asked after it see the provider it resolved to.
+            shared = decision_request()
+            if point == "provider.route":
+                assert route_options is not None  # The invariant check above.
+                return replace(shared, options=route_options.options)
+            if shared.facts.provider == req.provider:
+                return shared
+            return replace(shared, facts=replace(shared.facts, provider=req.provider))
+
         def insert(values: dict[str, Any], body: str | None) -> int | None:
             record_id = self.store.insert(values, body)
             if record_id is not None:
                 ids.append(record_id)
             return record_id
 
+        def shadow(point: str, ask_tiers: Mapping[str, str], extra: Mapping[str, Any]) -> None:
+            decider, reason = self._resolve(point, req, profile, active[point].decider)
+            if reason:
+                self._observe(active[point].decider, point, reason)
+                insert(
+                    {**base(point, decider), **extra, "outcome": "shadow", "reason": reason},
+                    message(),
+                )
+                return
+            ask_request = request_for(point)
+            record_id = insert(
+                {
+                    **base(point, decider),
+                    **extra,
+                    "outcome": "shadow",
+                    "decision_status": "pending",
+                },
+                message(),
+            )
+            if record_id is not None:
+                try:
+                    self.runner.submit(
+                        record_id,
+                        partial(
+                            self._ask_observed,
+                            active[point].decider,
+                            point,
+                            decider,
+                            ask_request,
+                            settings,
+                            req.policy,
+                            ask_tiers,
+                            settings.shadow_timeout_ms,
+                        ),
+                    )
+                except Exception:
+                    self.store.update_decision(
+                        record_id,
+                        dict(outcome="shadow", reason="error", decision_status="done"),
+                        emit=False,
+                    )
+
         try:
+            # #1099: provider.route is asked first, so every provider-dependent value below
+            # (the tier table, honors_model and honors_effort, the fallbacks, facts.provider)
+            # is the resolved provider's. From here every record binds on any failure.
+            route = active.get("provider.route")
+            if route is not None:
+                assert route_options is not None  # The invariant check above.
+                labels = route_options.labels
+                # #1099 (provisional): the record carries the options and both labels.
+                route_extra = dict(
+                    options=list(route_options.options),
+                    fallback_enforcement=labels[req.provider],
+                )
+                if req.owner == WORKFLOW_STEP:
+                    insert(
+                        {**base("provider.route"), **route_extra, "reason": "out_of_scope"}, None
+                    )
+                elif len(route_options.options) == 1:
+                    # Nothing to choose between: no decider is resolved or asked.
+                    self._observe(route.decider, "provider.route", "single_option")
+                    insert(
+                        {
+                            **base("provider.route"),
+                            **route_extra,
+                            "outcome": "shadow" if route.state == PointState.SHADOW else "fallback",
+                            "reason": "single_option",
+                        },
+                        message(),
+                    )
+                elif route.state == PointState.SHADOW:
+                    shadow("provider.route", {}, route_extra)
+                else:
+                    decider, reason = self._resolve("provider.route", req, profile, route.decider)
+                    values = (
+                        {"outcome": "fallback", "reason": reason}
+                        if reason
+                        else await self._ask(
+                            "provider.route",
+                            decider,
+                            request_for("provider.route"),
+                            settings,
+                            req.policy,
+                            {},
+                            settings.on_timeout_ms,
+                        )
+                    )
+                    self._observe(route.decider, "provider.route", values["reason"], decider)
+                    decided = values["applied_value"] if values["outcome"] == "applied" else None
+                    insert(
+                        {
+                            **base("provider.route", decider),
+                            **route_extra,
+                            **values,
+                            # The provider this plan launches on; fallback_value stays the
+                            # creator's.
+                            "provider": decided or req.provider,
+                            "applied_enforcement": labels[decided] if decided else None,
+                        },
+                        message(),
+                    )
+                    if decided is not None and decided != req.provider:
+                        req = replace(req, provider=decided)
+                        tiers = settings.model_tiers.get(decided, {})
+                        for point in fields:
+                            if point != "provider.route":
+                                fallbacks[point] = resolve_fallback(
+                                    point, profile, req.policy, tiers, decided
+                                )
+                        # Defensive: the options already required both for the decided one.
+                        others = tuple(point for point in active if point != "provider.route")
+                        if (
+                            req.policy.allowed_providers is not None
+                            and decided not in req.policy.allowed_providers
+                        ):
+                            reject(
+                                ProviderNotAllowedError(decided, req.policy.allowed_providers),
+                                others,
+                            )
+                        for point, fb in fallbacks.items():
+                            if isinstance(fb, MissingTier):
+                                reject(
+                                    DefaultUnmappedTierError(
+                                        point, fb.provider, fb.tier, "default_unmapped"
+                                    ),
+                                    (point,),
+                                )
+                        plan_provider = decided
+            resolved: dict[str, tuple[Decider | None, str | None]] = {}
             for point in eligible:
-                if point not in active or active[point].state != PointState.ON:
+                if (
+                    point != "provider.route"
+                    and point in active
+                    and active[point].state == PointState.ON
+                ):
+                    resolved[point] = self._resolve(point, req, profile, active[point].decider)
+            # Scope selects only the question and record; it never bypasses policy.
+            out_of_scope = tuple(
+                point
+                for point, value in fields.items()
+                if value == "auto"
+                and point in active
+                and req.owner == WORKFLOW_STEP
+                and not excluded(point)
+                and point != "provider.route"
+            )
+            plan_model: str | None = None
+            fb_model = fallbacks.get("model.route")
+            if isinstance(fb_model, Fallback) and fb_model.source == "policy":
+                plan_model = fb_model.value
+            if fields.get("model.route") not in (None, "auto"):
+                plan_model = tiers.get(fields["model.route"])
+            for point in eligible:
+                if (
+                    point == "provider.route"
+                    or point not in active
+                    or active[point].state != PointState.ON
+                ):
                     continue
                 decider, reason = resolved[point]
                 values = (
@@ -457,7 +624,7 @@ class DecisionEngine:
                     else await self._ask(
                         point,
                         decider,
-                        decision_request(),
+                        request_for(point),
                         settings,
                         req.policy,
                         tiers,
@@ -473,49 +640,20 @@ class DecisionEngine:
                     plan_effort = cast(Effort, values["applied_value"])
                 insert({**base(point, decider), **values}, message())
             for point in eligible:
-                if point not in active or active[point].state != PointState.SHADOW:
+                if (
+                    point == "provider.route"
+                    or point not in active
+                    or active[point].state != PointState.SHADOW
+                ):
                     continue
-                decider, reason = self._resolve(point, req, profile, active[point].decider)
-                if reason:
-                    self._observe(active[point].decider, point, reason)
-                    insert(
-                        {**base(point, decider), "outcome": "shadow", "reason": reason}, message()
-                    )
-                    continue
-                ask_request = decision_request()
-                record_id = insert(
-                    {**base(point, decider), "outcome": "shadow", "decision_status": "pending"},
-                    message(),
-                )
-                if record_id is not None:
-                    try:
-                        self.runner.submit(
-                            record_id,
-                            partial(
-                                self._ask_observed,
-                                active[point].decider,
-                                point,
-                                decider,
-                                ask_request,
-                                settings,
-                                req.policy,
-                                tiers,
-                                settings.shadow_timeout_ms,
-                            ),
-                        )
-                    except Exception:
-                        self.store.update_decision(
-                            record_id,
-                            dict(outcome="shadow", reason="error", decision_status="done"),
-                            emit=False,
-                        )
+                shadow(point, tiers, {})
             for point in out_of_scope:
                 insert({**base(point), "reason": "out_of_scope"}, None)
         except BaseException:
             self.store.bind(tuple(ids), launch_status="not_launched")
             raise
-        if ids or plan_model is not None or plan_effort is not None:
-            return LaunchPlan(plan_model, tuple(ids), plan_effort)
+        if ids or plan_model is not None or plan_effort is not None or plan_provider is not None:
+            return LaunchPlan(plan_model, tuple(ids), plan_effort, plan_provider)
         return None
 
     def _resolve(
@@ -606,7 +744,7 @@ class DecisionEngine:
             if answer is None:
                 values["reason"] = "no_answer"
                 return values
-            if not self._valid(point, answer):
+            if not self._valid(point, answer, request):
                 values["reason"] = "invalid_answer"
                 return values
             confidence = answer.probabilities[answer.option]
@@ -640,8 +778,15 @@ class DecisionEngine:
         return values
 
     @staticmethod
-    def _valid(point: str, answer: Any) -> bool:
-        options = POINTS[point].options + ("unsure",)
+    def _valid(point: str, answer: Any, request: DecisionRequest) -> bool:
+        # #1099: a provider.route answer must be one of this launch's options, never just a
+        # known provider id; a provider.route request without options accepts nothing.
+        if point == "provider.route":
+            if request.options is None:
+                return False
+            options = request.options + ("unsure",)
+        else:
+            options = POINTS[point].options + ("unsure",)
         return (
             isinstance(answer, DecisionAnswer)
             and answer.option in options
