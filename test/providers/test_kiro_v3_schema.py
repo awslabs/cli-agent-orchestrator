@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import pytest
 
+from cli_agent_orchestrator.providers import kiro_v3_schema
 from cli_agent_orchestrator.providers.kiro_v3_schema import (
     KAS_0_66_70,
     SUPPORTED_KIRO_CLI_VERSIONS,
+    KiroV3Refusal,
     KiroV3UnsupportedVersionError,
+    KiroV3UnverifiedVersionError,
     kiro_v3_schema_for_cli_version,
     pinned_kiro_v3_schemas,
+    require_launchable_kiro_v3_version,
 )
 
 
@@ -136,3 +140,38 @@ def test_the_unsupported_version_refusal_names_the_supported_versions_and_v2():
 )
 def test_selection_reads_each_entry_worst_case(entry, selected):
     assert KAS_0_66_70.select(entry) == selected
+
+
+# --- which allow-listed versions a v3 launch admits ------------------------------
+
+
+def test_a_launch_admits_a_measured_version_and_holds_a_pending_one():
+    assert kiro_v3_schema.KIRO_V3_ADMIT_PENDING_VERSIONS is False
+    assert require_launchable_kiro_v3_version("2.35.1") is KAS_0_66_70
+    with pytest.raises(KiroV3UnverifiedVersionError) as excinfo:
+        require_launchable_kiro_v3_version("2.36.0")
+    assert excinfo.value.code == "kiro_v3_unverified_version"
+    assert excinfo.value.version == "2.36.0"
+    message = str(excinfo.value)
+    assert message.startswith("kiro_v3_unverified_version: kiro-cli 2.36.0")
+    assert "pending operator verification" in message and "engine 'v2'" in message
+
+
+@pytest.mark.parametrize("version", [None, "", "2.37.0", "2.35.1 "])
+def test_a_launch_refuses_a_version_outside_the_allow_list(version):
+    with pytest.raises(KiroV3UnsupportedVersionError):
+        require_launchable_kiro_v3_version(version)
+
+
+def test_the_pending_switch_admits_a_pending_version(monkeypatch):
+    monkeypatch.setattr(kiro_v3_schema, "KIRO_V3_ADMIT_PENDING_VERSIONS", True)
+    assert require_launchable_kiro_v3_version("2.36.0") is KAS_0_66_70
+    with pytest.raises(KiroV3UnsupportedVersionError):
+        require_launchable_kiro_v3_version("2.37.0")
+
+
+def test_every_version_refusal_is_a_v3_refusal_and_a_value_error():
+    for error in (KiroV3UnsupportedVersionError("2.37.0"), KiroV3UnverifiedVersionError("2.36.0")):
+        assert isinstance(error, KiroV3Refusal) and isinstance(error, ValueError)
+        assert str(error).startswith(f"{error.code}: ")
+    assert KiroV3Refusal.code == "kiro_v3_refused"
