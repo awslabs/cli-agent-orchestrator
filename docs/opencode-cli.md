@@ -8,7 +8,13 @@ The OpenCode CLI provider enables CLI Agent Orchestrator (CAO) to work with **Op
 
 ## Prerequisites
 
-1. **OpenCode binary** — install from [opencode.ai](https://opencode.ai):
+1. **OpenCode binary** — OpenCode v1.x or v2.x with the Mini interface (verified with v2.2.3). Install v2 with:
+   ```bash
+   npm install -g @opencode/cli
+   opencode --version
+   opencode mini --help
+   ```
+   Existing v1 installations remain supported:
    ```bash
    npm install -g opencode-ai
    # or
@@ -23,6 +29,30 @@ The OpenCode CLI provider enables CLI Agent Orchestrator (CAO) to work with **Op
 On its **first ever launch** against a fresh CAO config directory (`~/.aws/opencode/`), OpenCode runs `npm install @opencode-ai/plugin` — roughly 57 MB of dependencies that take **5–30 seconds** to install. The TUI will appear blank until the install completes. This is expected; CAO's 120-second initialization timeout covers it automatically.
 
 Subsequent launches complete in ~2 seconds.
+
+### CLI generations
+
+CAO checks `opencode --version` and the interactive interface's help before
+launching a worker. Unknown major versions, failed probes, and missing required
+flags fail initialization with a diagnostic rather than timing out.
+
+| Generation | Launch | Terminal protocol |
+|---|---|---|
+| v1.x | `opencode --agent developer [--model provider/model]` | Full-screen TUI, `ctrl+p commands`, `▣` turn summary |
+| v2.x | `opencode mini --standalone --agent developer [--model provider/model]` | Scrollback Mini, `ctrl+p menu`, plain agent/model/duration summary |
+
+The v2 root command does **not** accept `--agent` or `--model`. Mini must
+advertise both flags and `--standalone`. A private server is required so MCP
+subprocesses inherit this worker's `CAO_TERMINAL_ID` and managed configuration,
+rather than a background service's environment from a different terminal.
+
+Both generations use the installed Markdown profiles and CAO's
+`~/.aws/opencode/opencode.json`. OpenCode v2's compatibility loader translates
+v1 frontmatter permissions, per-agent tool gates, and MCP declarations into its
+native schema. CAO does not migrate or overwrite personal configuration or
+credentials. V2 receives an environment-only CLI UI overlay that enables footer
+and turn summaries, fixes the relevant keybindings, and hides reasoning/tool
+transcripts for reliable result extraction. It does not auto-approve permissions.
 
 ## Quick Start
 
@@ -150,7 +180,18 @@ The provider detects terminal state from the tmux capture buffer (ANSI-stripped)
 | `PROCESSING` | `esc interrupt` footer keybind |
 | `COMPLETED` | `▣ <agent> · <model> · Ns` completion marker followed by idle footer |
 | `WAITING_USER_ANSWER` | `△ Permission required` or `△ Always allow` heading |
-| `ERROR` | Fallback — no state marker matched |
+| `ERROR` | CLI exited to its launching shell, or initialization displayed an error/help |
+| `UNKNOWN` | No recognized state marker |
+
+Mini uses `ctrl+p menu` for readiness, `esc interrupt` (or `esc stop` at
+narrower widths) for processing, and `<agent> · <model> · <duration>` followed
+by a current idle footer for completion. Permission dialogs retain the `△`
+heading. Results come from the last completed turn in terminal scrollback,
+excluding the `›` user prompt and turn summary. Keep the pane wide enough to
+display the footer and summary without truncation; manually hiding these markers
+or changing the pinned keybindings can prevent detection. Terminal extraction is
+bounded by CAO's scrollback capture limit, so very long results may not be fully
+available.
 
 ## MCP Server Wiring
 
@@ -228,6 +269,9 @@ uv run pytest -m e2e test/e2e/test_assign.py -k opencode -v
 
 # Run a single test
 uv run pytest -m e2e test/e2e/test_assign.py::TestOpenCodeCliAssign::test_assign_with_callback -v
+
+# Real Codex supervisor -> OpenCode v2 developer -> supervisor via MCP handoff
+uv run pytest -o addopts='' -m e2e test/e2e/test_opencode_v2_delegation.py -v
 ```
 
 The `test_assign_with_callback` test validates all four orchestration modes:
@@ -298,10 +342,10 @@ OPENCODE_CONFIG_DIR=~/.aws/opencode opencode --help
 
 Ensure the CAO server running on port 9889 is the **dev version**, not the pre-installed binary:
 ```bash
-# Kill any stale installed binary
-pkill -f 'cao-server'
-# Start the dev server
-uv run cao-server
+# Start this checkout's editable source on an unused port if another server runs.
+uv sync --group dev
+uv run python -c 'import cli_agent_orchestrator; print(cli_agent_orchestrator.__file__)'
+uv run cao-server --port 9889
 ```
 
 ### Authentication / model errors
@@ -312,7 +356,17 @@ OpenCode itself handles model authentication. Verify your credentials are set fo
 
 CAO emits only `allow` or `deny` in the permission frontmatter, so `△ Permission required` should not appear for CAO-managed tools. If it does:
 1. Verify the profile's `allowedTools` / `role` grants the tool in question and reinstall — CAO translates allowed tools directly to `permission: allow`.
-2. If the prompt comes from a tool outside CAO's vocabulary, respond to it manually in the tmux window, or use `--yolo` to disable all restrictions **(DANGEROUS — allows any command including `aws`, `rm`, `curl`)**.
+2. If the prompt comes from a tool outside CAO's vocabulary, respond to it manually in the tmux window. OpenCode's CAO integration does not support a runtime permission bypass.
+
+### `Unrecognized flag: --agent` or Mini initialization failure
+
+Check `command -v opencode`, `opencode --version`, and `opencode mini --help`
+inside the worker's tmux shell. Ensure the CAO server runs the modified checkout
+as shown above. V2 must launch with `mini --standalone`; simply adding `mini`
+while reusing a shared service can attach MCP servers to the wrong terminal.
+If initialization reports an exit, inspect the pane tail in the error for missing
+credentials, invalid models, missing installed agents, or configuration errors.
+Do not pass `--auto` to work around permission failures.
 
 ### Status stuck as `PROCESSING`
 

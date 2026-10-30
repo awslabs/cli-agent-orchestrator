@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -19,6 +19,15 @@ from cli_agent_orchestrator.providers.opencode_cli import (
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def mock_cli_probe():
+    """Legacy provider tests must not depend on a locally installed binary."""
+    with patch(
+        "cli_agent_orchestrator.providers.opencode_cli.detect_opencode_major", return_value=1
+    ):
+        yield
 
 
 def load_fixture(name: str) -> str:
@@ -470,6 +479,11 @@ class TestExtractLastMessage:
 
 
 class TestInitialize:
+    @pytest.fixture(autouse=True)
+    def startup_pane(self):
+        with patch.object(OpenCodeCliProvider, "_check_startup", new=AsyncMock()):
+            yield
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
