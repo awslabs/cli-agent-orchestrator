@@ -132,10 +132,7 @@ TUI_PROCESSING_INDICATOR_PATTERN = r"ctrl\+c to stop"
 
 # Workspace trust dialog (Cursor asks once per directory the first time the
 # agent is launched there).
-TRUST_PROMPT_PATTERN = (
-    r"do you trust (?:the )?files? in this folder|confirm folder trust"
-    r"|Workspace Trust Required|do you trust the contents of this directory\?"
-)
+TRUST_PROMPT_PATTERN = r"do you trust (?:the )?files? in this folder|confirm folder trust"
 
 # Permission / approval dialog that appears when the agent wants to run a
 # shell command or edit a file without ``--force`` enabled.
@@ -401,9 +398,9 @@ class CursorCliProvider(BaseProvider):
         # CAO so per-tool approval prompts do not block handoff /
         # assign flows. --trust was removed because v2026 rejects it
         # in interactive REPL mode ("only works with --print/headless
-        # mode"); the CAO launch flow already confirms workspace
-        # trust, and the interactive REPL has no per-directory trust
-        # dialog that --trust would skip.
+        # mode"). Newer interactive builds can still show their own
+        # workspace-trust dialog; --force does not answer it. The
+        # provider reports WAITING_USER_ANSWER for operator action.
         command_parts.append("--force")
 
         # Model override (--model, when explicitly set or supplied
@@ -624,6 +621,53 @@ class CursorCliProvider(BaseProvider):
         self._initialized = True
         return True
 
+    @staticmethod
+    def _has_new_workspace_trust_dialog(clean: str) -> bool:
+        """Recognise the measured trust action block, not quoted dialog text."""
+        # A newer composer ends this startup dialog. Limit only the new trust
+        # grammar this way: tool approvals can coexist with an older composer.
+        composers = list(
+            re.finditer(
+                r"(?m)^[ \t]*(?:[│|][ \t]*)?→[ \t]*" + TUI_PLACEHOLDER_PATTERN,
+                clean,
+                re.IGNORECASE,
+            )
+        )
+        if composers:
+            clean = clean[composers[-1].end() :]
+        rows = [line.strip().strip("│|").strip() for line in clean.splitlines()]
+        title = max(
+            (
+                i
+                for i, row in enumerate(rows)
+                if re.fullmatch(r"(?:⚠\ufe0f?\s*)?Workspace Trust Required", row, re.IGNORECASE)
+            ),
+            default=-1,
+        )
+        if title < 0:
+            return False
+        accept = next(
+            (
+                i
+                for i in range(title + 1, len(rows))
+                if re.fullmatch(
+                    r"(?:[▶❯>]\s*)?\[\s*a\s*\]\s+Trust this workspace", rows[i], re.IGNORECASE
+                )
+            ),
+            None,
+        )
+        if accept is None:
+            return False
+        # Joining only the question area tolerates line wrapping in a narrow
+        # pane while the title and the action choices remain structural rows.
+        question = " ".join(rows[title + 1 : accept])
+        return re.search(
+            r"Do you trust the contents of this directory\?", question, re.IGNORECASE
+        ) is not None and any(
+            re.fullmatch(r"(?:[▶❯>]\s*)?\[\s*q\s*\]\s+Quit", row, re.IGNORECASE)
+            for row in rows[accept + 1 :]
+        )
+
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         """Get Cursor CLI status by analyzing terminal output.
 
@@ -818,9 +862,12 @@ class CursorCliProvider(BaseProvider):
         # Check for active TUI selection widgets (mode picker, model
         # picker, etc.) which show a ↑/↓ navigation footer. Exclude
         # the trust/permission dialogs, which are separate states.
+        trust_prompt = re.search(
+            TRUST_PROMPT_PATTERN, clean, re.IGNORECASE
+        ) is not None or self._has_new_workspace_trust_dialog(clean)
         if (
             re.search(WAITING_USER_ANSWER_PATTERN, clean)
-            and not re.search(TRUST_PROMPT_PATTERN, clean, re.IGNORECASE)
+            and not trust_prompt
             and not re.search(PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE)
         ):
             return TerminalStatus.WAITING_USER_ANSWER
@@ -828,9 +875,7 @@ class CursorCliProvider(BaseProvider):
         # Trust / permission dialogs are an interactive prompt that
         # blocks the agent until the operator accepts. Treat them as
         # WAITING_USER_ANSWER.
-        if re.search(TRUST_PROMPT_PATTERN, clean, re.IGNORECASE) or re.search(
-            PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE
-        ):
+        if trust_prompt or re.search(PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # v2026+ TUI: "ctrl+c to stop" is on the input-box line.

@@ -148,6 +148,35 @@ def test_previous_generation_cannot_accept_new_turn(provider):
 
 
 @pytest.mark.parametrize("screen_path", [False, True])
+def test_code_sparkle_submission_completes_without_settle_when_answer_is_offscreen(
+    provider, monkeypatch, screen_path
+):
+    # Older CODE builds submit with ✨ but still render the boxed composer.
+    # Feed a complete generation so the new gate cannot bypass a missing spool.
+    monkeypatch.setattr(kimi_module.time, "monotonic", lambda: 1000.0)
+    begin(provider)
+    replay(provider, ECHO.replace("❯", "✨") + "⠋ Thinking…\n" + ANSWER + FOOTER)
+    assert provider._swarm_stream_complete
+    assert provider._execution_observed
+
+    backend = Mock()
+    backend.get_native_status.return_value = None
+    backend.get_history.return_value = FOOTER
+    monkeypatch.setattr(kimi_module, "get_backend", lambda: backend)
+    confirm = Mock(wraps=provider._confirm_code_completion)
+    monkeypatch.setattr(provider, "_confirm_code_completion", confirm)
+
+    # Neither status input nor a re-capture contains the answer. Completion
+    # must succeed on the first poll, without advancing the settle clock.
+    if screen_path:
+        result = provider.get_status_from_screen(kt.strip_sgr(FOOTER).splitlines())
+    else:
+        result = provider.get_status(FOOTER)
+    assert result is TerminalStatus.COMPLETED
+    confirm.assert_called_once_with()
+
+
+@pytest.mark.parametrize("screen_path", [False, True])
 @pytest.mark.parametrize("final_answer", [False, True])
 def test_completion_waits_for_answer_after_tool(provider, monkeypatch, screen_path, final_answer):
     now = Mock(return_value=1000.0)
