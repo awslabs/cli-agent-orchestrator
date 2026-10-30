@@ -135,6 +135,10 @@ _KIMI_CONFIG_WRITE_LOCK = threading.Lock()
 # here rather than a copy there that a change here would silently leave short.
 READY_TIMEOUT_FLOOR_S = 120.0
 
+# Bridge the tool-to-answer repaint gap without requiring a final prose answer.
+# This is a quiet, ready-frame interval, never a timeout for an active turn.
+CODE_COMPLETION_SETTLE_SECONDS = 2.0
+
 
 # Custom exception for provider errors
 class ProviderError(Exception):
@@ -849,6 +853,8 @@ class KimiCliProvider(BaseProvider):
         self._swarm_generation = 0
         self._swarm_revision = 0
         self._swarm_final_floor = 0
+        self._code_23_submission_seen = False
+        self._code_completion_candidate: Optional[Tuple[int, int, str, float]] = None
         self._swarm_stream: Optional[tempfile.SpooledTemporaryFile[str]] = None
         self._swarm_stream_complete = False
         self._swarm_submission_probe_pending = False
@@ -950,6 +956,99 @@ class KimiCliProvider(BaseProvider):
         if self._awaiting_turn:
             return TerminalStatus.PROCESSING
         return TerminalStatus.COMPLETED if self._has_received_input else TerminalStatus.IDLE
+
+    def _confirm_code_completion(self) -> TerminalStatus:
+        """Confirm a ready-looking composite against the real current turn.
+
+        The oversized pyte screen can retain an old ready footer below the
+        current tool/spinner rows. A tool finishing is also not the end of the
+        assistant turn. Check the real viewport and prefer a publishable
+        answer after this turn's latest tool call. A turn may legitimately end
+        without prose; allow that after the ready pane AND generation bytes
+        settle. Output extraction must still refuse private/absent content.
+        """
+        # Apply this extra final-answer check to the measured 2.3 submission
+        # grammar. Older Code/legacy builds retain their existing readiness
+        # contract, including frames whose answer has left the viewport.
+        with self._swarm_stream_lock:
+            generation = self._swarm_generation
+            revision = self._swarm_revision
+            if not self._swarm_stream_complete or self._swarm_stream is None:
+                return TerminalStatus.COMPLETED
+            # Submission ownership is immutable within a complete generation.
+            # Do not re-read and classify an ever-growing spool on every poll.
+            if not self._code_23_submission_seen:
+                try:
+                    self._swarm_stream.seek(0)
+                    proof = self._swarm_stream.read()
+                except (OSError, ValueError):
+                    return TerminalStatus.UNKNOWN
+                self._code_23_submission_seen = any(
+                    kind is kt.KimiLineKind.USER_INPUT and clean.lstrip().startswith("❯")
+                    for _, clean, kind in kt.classify_lines(
+                        kt.normalize_activity_rows(proof),
+                        kt.SpinnerSemantics.CODE,
+                        include_unclosed_fences=True,
+                    )
+                )
+                if not self._code_23_submission_seen:
+                    return TerminalStatus.COMPLETED
+        try:
+            pane = get_backend().get_history(
+                self.session_name, self.window_name, visible_only=True, strip_escapes=False
+            )
+            clean_rows = kt.strip_sgr(pane).splitlines()
+            busy = any(
+                _is_live_turn_spinner_line(row, kt.SpinnerSemantics.CODE)
+                for row in clean_rows[-25:]
+            )
+            # A draft in the composer does not make the previous turn busy.
+            ready = re.search(NEW_TUI_STATUS_PATTERN, "\n".join(clean_rows)) and any(
+                re.match(r"^\s*[│|]\s*>.*[│|]\s*$", row) for row in clean_rows
+            )
+            dialog = False
+            for _, _, kind in reversed(kt.classify_lines(pane, kt.SpinnerSemantics.CODE)):
+                if kind in (kt.KimiLineKind.USER_INPUT, kt.KimiLineKind.FINAL_BULLET):
+                    break  # A historical dialog cannot block a later turn/answer.
+                if kind in (kt.KimiLineKind.TRUST_DIALOG, kt.KimiLineKind.APPROVAL_DIALOG):
+                    dialog = True
+                    break
+            if busy or dialog or not ready:
+                with self._swarm_stream_lock:
+                    self._code_completion_candidate = None
+                return TerminalStatus.PROCESSING
+            with self._swarm_stream_lock:
+                if generation != self._swarm_generation or revision != self._swarm_revision:
+                    return TerminalStatus.UNKNOWN
+                candidate = self._code_completion_candidate
+                if candidate is not None and candidate[:3] == (generation, revision, pane):
+                    # The same refused extraction needs no repeated history
+                    # capture. A byte, pane or generation change starts over.
+                    if time.monotonic() - candidate[3] >= CODE_COMPLETION_SETTLE_SECONDS:
+                        return TerminalStatus.COMPLETED
+                    return TerminalStatus.PROCESSING
+            history = get_backend().get_history(
+                self.session_name, self.window_name, full_history=True, strip_escapes=False
+            )
+            try:
+                self.extract_last_message_from_script(history)
+            except ValueError:
+                # Includes deliberate OutputExtractionRejected and a missing
+                # boundary. Neither proves an otherwise-ready turn is running.
+                # Keep capture/lookup ValueErrors outside this catch.
+                with self._swarm_stream_lock:
+                    if generation != self._swarm_generation or revision != self._swarm_revision:
+                        return TerminalStatus.UNKNOWN
+                    self._code_completion_candidate = (generation, revision, pane, time.monotonic())
+                return TerminalStatus.PROCESSING
+        except Exception:
+            with self._swarm_stream_lock:
+                self._code_completion_candidate = None
+            logger.debug("Cannot confirm Kimi completion for %s", self.terminal_id, exc_info=True)
+            return TerminalStatus.UNKNOWN
+        with self._swarm_stream_lock:
+            self._code_completion_candidate = None
+        return TerminalStatus.COMPLETED
 
     def notify_status_buffer_reset(self, epoch: int) -> None:
         """A new buffer generation still awaits actual activity, not a redraw."""
@@ -2380,6 +2479,8 @@ class KimiCliProvider(BaseProvider):
             self._swarm_generation += 1
             self._swarm_revision += 1
             self._swarm_final_floor = 0
+            self._code_23_submission_seen = False
+            self._code_completion_candidate = None
             stream = self._swarm_stream
             self._swarm_stream = None
             self._swarm_stream_complete = False
@@ -2725,6 +2826,10 @@ class KimiCliProvider(BaseProvider):
                     # fall through to the stream-derived ready status.
                     pass
 
+            if semantics is kt.SpinnerSemantics.CODE and self._execution_observed:
+                confirmed = self._confirm_code_completion()
+                if confirmed is not TerminalStatus.COMPLETED:
+                    return confirmed
             with self._swarm_stream_lock:
                 if generation != self._swarm_generation or revision != self._swarm_revision:
                     return TerminalStatus.UNKNOWN
@@ -2848,7 +2953,30 @@ class KimiCliProvider(BaseProvider):
         """
         if epoch != self._status_buffer_epoch:
             return
-        if self._awaiting_turn:
+        # A large prompt/first repaint can fill the monitor's 32 KiB window
+        # BEFORE the first spinner. The per-generation spool already retains
+        # every byte, including SGR/fence ownership, so use that complete proof
+        # instead of permanently treating later activity as an ambiguous suffix.
+        # Never clear ambiguity when the spool has a gap or failed to persist.
+        complete_evidence_checked = False
+        if self._awaiting_turn and (truncated or self.execution_evidence_ambiguous):
+            with self._swarm_stream_lock:
+                if (
+                    self._dialect is KimiDialect.CODE
+                    and self._swarm_stream is not None
+                    and self._swarm_stream_complete
+                    and not self._swarm_storage_failed
+                ):
+                    try:
+                        self._swarm_stream.seek(0)
+                        complete_output = self._swarm_stream.read()
+                    except (OSError, ValueError):
+                        self.execution_evidence_ambiguous = True
+                    else:
+                        self.execution_evidence_ambiguous = False
+                        self.has_execution_evidence(complete_output)
+                        complete_evidence_checked = True
+        if self._awaiting_turn and not complete_evidence_checked:
             self.has_execution_evidence(output)
         if self._dialect is KimiDialect.CODE:
             self._observe_swarm_turn_state(kt.normalize_activity_rows(output).rpartition("\n")[0])
@@ -2924,6 +3052,10 @@ class KimiCliProvider(BaseProvider):
             # post-dispatch stale repaint stays PROCESSING via _awaiting_turn.
             if not self._has_received_input and self._has_response_evidence(joined):
                 self._has_received_input = True
+            if semantics is kt.SpinnerSemantics.CODE and self._execution_observed:
+                confirmed = self._confirm_code_completion()
+                if confirmed is not TerminalStatus.COMPLETED:
+                    return confirmed
             with self._swarm_stream_lock:
                 if generation != self._swarm_generation or revision != self._swarm_revision:
                     return TerminalStatus.UNKNOWN

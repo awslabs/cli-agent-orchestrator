@@ -75,7 +75,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, OutputExtractionRejected
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
@@ -398,9 +398,9 @@ class CursorCliProvider(BaseProvider):
         # CAO so per-tool approval prompts do not block handoff /
         # assign flows. --trust was removed because v2026 rejects it
         # in interactive REPL mode ("only works with --print/headless
-        # mode"); the CAO launch flow already confirms workspace
-        # trust, and the interactive REPL has no per-directory trust
-        # dialog that --trust would skip.
+        # mode"). Newer interactive builds can still show their own
+        # workspace-trust dialog; --force does not answer it. The
+        # provider reports WAITING_USER_ANSWER for operator action.
         command_parts.append("--force")
 
         # Model override (--model, when explicitly set or supplied
@@ -621,6 +621,53 @@ class CursorCliProvider(BaseProvider):
         self._initialized = True
         return True
 
+    @staticmethod
+    def _has_new_workspace_trust_dialog(clean: str) -> bool:
+        """Recognise the measured trust action block, not quoted dialog text."""
+        # A newer composer ends this startup dialog. Limit only the new trust
+        # grammar this way: tool approvals can coexist with an older composer.
+        composers = list(
+            re.finditer(
+                r"(?m)^[ \t]*(?:[│|][ \t]*)?→[ \t]*" + TUI_PLACEHOLDER_PATTERN,
+                clean,
+                re.IGNORECASE,
+            )
+        )
+        if composers:
+            clean = clean[composers[-1].end() :]
+        rows = [line.strip().strip("│|").strip() for line in clean.splitlines()]
+        title = max(
+            (
+                i
+                for i, row in enumerate(rows)
+                if re.fullmatch(r"(?:⚠\ufe0f?\s*)?Workspace Trust Required", row, re.IGNORECASE)
+            ),
+            default=-1,
+        )
+        if title < 0:
+            return False
+        accept = next(
+            (
+                i
+                for i in range(title + 1, len(rows))
+                if re.fullmatch(
+                    r"(?:[▶❯>]\s*)?\[\s*a\s*\]\s+Trust this workspace", rows[i], re.IGNORECASE
+                )
+            ),
+            None,
+        )
+        if accept is None:
+            return False
+        # Joining only the question area tolerates line wrapping in a narrow
+        # pane while the title and the action choices remain structural rows.
+        question = " ".join(rows[title + 1 : accept])
+        return re.search(
+            r"Do you trust the contents of this directory\?", question, re.IGNORECASE
+        ) is not None and any(
+            re.fullmatch(r"(?:[▶❯>]\s*)?\[\s*q\s*\]\s+Quit", row, re.IGNORECASE)
+            for row in rows[accept + 1 :]
+        )
+
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         """Get Cursor CLI status by analyzing terminal output.
 
@@ -667,6 +714,13 @@ class CursorCliProvider(BaseProvider):
         # sequences survive and the structural checks below misfire on
         # the raw stream.
         clean = strip_terminal_escapes(output)
+
+        # A resolved startup trust dialog can remain in scrollback above the
+        # version banner. Only discard that prefix: a later permission prompt
+        # must still block even when an old composer is visible below it.
+        banners = list(re.finditer(r"(?m)^[ \t]*Cursor Agent[ \t]*\n[ \t]*v\d{4}\.", clean))
+        if banners:
+            clean = clean[banners[-1].start() :]
 
         # =================================================================
         # v2026+ TUI detection — primary signal: "ctrl+c to stop".
@@ -808,9 +862,12 @@ class CursorCliProvider(BaseProvider):
         # Check for active TUI selection widgets (mode picker, model
         # picker, etc.) which show a ↑/↓ navigation footer. Exclude
         # the trust/permission dialogs, which are separate states.
+        trust_prompt = re.search(
+            TRUST_PROMPT_PATTERN, clean, re.IGNORECASE
+        ) is not None or self._has_new_workspace_trust_dialog(clean)
         if (
             re.search(WAITING_USER_ANSWER_PATTERN, clean)
-            and not re.search(TRUST_PROMPT_PATTERN, clean, re.IGNORECASE)
+            and not trust_prompt
             and not re.search(PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE)
         ):
             return TerminalStatus.WAITING_USER_ANSWER
@@ -818,9 +875,7 @@ class CursorCliProvider(BaseProvider):
         # Trust / permission dialogs are an interactive prompt that
         # blocks the agent until the operator accepts. Treat them as
         # WAITING_USER_ANSWER.
-        if re.search(TRUST_PROMPT_PATTERN, clean, re.IGNORECASE) or re.search(
-            PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE
-        ):
+        if trust_prompt or re.search(PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # v2026+ TUI: "ctrl+c to stop" is on the input-box line.
@@ -896,6 +951,10 @@ class CursorCliProvider(BaseProvider):
         Raises:
             ValueError: When no response boundary is detected.
         """
+        panel_response = self._extract_panel_response(script_output)
+        if panel_response is not None:
+            return panel_response
+
         # Match a separator line, with ANY CSI sequence (not just
         # SGR) interleaved between the box-drawing characters.
         # Cursor re-renders the separator with new colour escapes
@@ -979,6 +1038,51 @@ class CursorCliProvider(BaseProvider):
         if not response:
             raise ValueError("Empty Cursor CLI response - no content found between separators")
 
+        return response
+
+    # A failed extraction must not publish echoed input or tool IO as an answer.
+    allow_raw_transcript_fallback = False
+
+    @staticmethod
+    def _extract_panel_response(script_output: str) -> Optional[str]:
+        """Read the coloured transcript/composer panels measured on 2026.10.22.
+
+        Keep SGR until boundaries are known: the text alone cannot distinguish
+        a submitted request from the assistant's reply. Unknown layouts fall
+        through to the existing separator grammar rather than guessing. These
+        RGB values are build/theme-specific; an unrecognised theme fails closed.
+        """
+        rows = script_output.splitlines()
+        user_panel = re.compile(r"^\s*\x1b\[(?:\d+;)*48;2;36;36;40(?:;\d+)*m")
+        input_panel = re.compile(r"^\s*\x1b\[(?:\d+;)*48;2;21;21;21(?:;\d+)*m")
+        user_rows = [i for i, row in enumerate(rows) if user_panel.match(row)]
+        if not user_rows:
+            return None
+        clean = [strip_terminal_escapes(row).rstrip() for row in rows]
+        composers = [
+            i
+            for i, row in enumerate(rows)
+            if input_panel.match(row)
+            and re.match(r"^\s*→\s*(?:Add a follow-up|Plan, search, build anything)", clean[i])
+        ]
+        if not composers or composers[-1] <= user_rows[-1]:
+            raise ValueError("Cursor response has no following composer boundary")
+        end = composers[-1]
+        # The stop hint can wrap below the composer in a narrow pane.
+        if re.search(TUI_PROCESSING_INDICATOR_PATTERN, "\n".join(clean[end:]), re.IGNORECASE):
+            raise OutputExtractionRejected("Cursor is still processing this turn")
+        while end > 0 and input_panel.match(rows[end - 1]):
+            end -= 1
+        start = user_rows[-1] + 1
+        # Compact tool badges have a dim grey glyph followed by a bold name.
+        tool_badge = re.compile(r"^\s*\x1b\[2m\x1b\[37m[^\x1b]*\x1b\[0m\s*\x1b\[1m")
+        response_rows = [clean[i] for i in range(start, end) if not tool_badge.match(rows[i])]
+        # Retain indentation beyond the two-space transcript gutter.
+        response = "\n".join(
+            row[2:] if row.startswith("  ") else row for row in response_rows
+        ).strip()
+        if not response:
+            raise OutputExtractionRejected("Cursor has not produced a final answer for this turn")
         return response
 
     def exit_cli(self) -> str:
