@@ -63,7 +63,9 @@ portable and make profile listings useful.
   authenticates. An entry defining neither is invalid. For a worked example
   of a remote-URL MCP server that authenticates with a header and keeps the
   key out of the committed profile, see
-  [examples/serply-research](../examples/serply-research/README.md); for a
+  [examples/serply-research](../examples/serply-research/README.md) or
+  [examples/cooper-email-inbox](../examples/cooper-email-inbox/README.md)
+  (which also gives the agent a narrower key than the account's); for a
   keyless one, see
   [examples/deed-page-publisher](../examples/deed-page-publisher/README.md).
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
