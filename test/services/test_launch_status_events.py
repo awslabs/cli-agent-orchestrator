@@ -240,24 +240,18 @@ class TestTmuxBusyTimeRecording:
         assert [r.status for r in _rows("t8")] == ["completed"]
 
 
-# The follow-up issue "Busy time misses two tmux status transitions that
-# StatusMonitor publishes". When it lands, the strict xfails below start
-# passing and fail the run, so drop their markers in that change.
-_UNRECORDED_GET_STATUS_TRANSITION = (
-    "Known gap: StatusMonitor.get_status publishes this transition without "
-    "recording it, so busy time is off until the next recorded change "
-    "(follow-up: 'Busy time misses two tmux status transitions that "
-    "StatusMonitor publishes')"
-)
+def _direct(read):
+    return read()
 
 
-class TestUnrecordedGetStatusTransitions:
-    """Two latch changes in ``get_status`` are published on the bus but not
-    written to ``launch_status_events``. The plain tests pin that each one is
-    published today; the strict xfails say it is not recorded yet."""
+class TestGetStatusTransitionsAreRecorded:
+    """Issue #1169: ``get_status`` changes the latch at two sites of its own,
+    the native-swarm revoke and the stale-PROCESSING capture recovery. Each
+    change is published on the bus and written to ``launch_status_events``,
+    stamped at the transition, as ``_apply_detection`` does."""
 
     @staticmethod
-    def _swarm_revoke(mock_pm, terminal_id):
+    def _swarm_revoke(mock_pm, terminal_id, final_read=_direct):
         """A native swarm starts another batch while the latch reads COMPLETED:
         get_status revokes the ready status to PROCESSING."""
         provider = MagicMock()
@@ -265,12 +259,12 @@ class TestUnrecordedGetStatusTransitions:
         mock_pm.get_provider.return_value = provider
         sm = StatusMonitor()
         assert sm._apply_detection(terminal_id, TerminalStatus.COMPLETED) is True
-        status = sm.get_status(terminal_id)
+        status = final_read(lambda: sm.get_status(terminal_id))
         _drain_tmux_status_writes()
         return status
 
     @staticmethod
-    def _stale_capture_recovery(mock_pm, mock_get_backend, terminal_id):
+    def _stale_capture_recovery(mock_pm, mock_get_backend, terminal_id, final_read=_direct):
         """The buffer stopped changing while the latch reads PROCESSING, and
         two matching pane captures confirm IDLE: get_status heals to IDLE."""
         provider = MagicMock()
@@ -288,7 +282,7 @@ class TestUnrecordedGetStatusTransitions:
         sm._buffer_changed_at[terminal_id] = -1000.0  # quiet for good
         assert sm.get_status(terminal_id) == TerminalStatus.PROCESSING  # first read
         sm._last_stale_capture_check[terminal_id] = None  # skip the rate limit
-        status = sm.get_status(terminal_id)  # the confirming read
+        status = final_read(lambda: sm.get_status(terminal_id))  # the confirming read
         _drain_tmux_status_writes()
         return status
 
@@ -304,7 +298,6 @@ class TestUnrecordedGetStatusTransitions:
         assert self._swarm_revoke(mock_pm, "t10") == TerminalStatus.PROCESSING
         assert self._published(mock_bus) == ["completed", "processing"]
 
-    @pytest.mark.xfail(strict=True, reason=_UNRECORDED_GET_STATUS_TRANSITION)
     @patch("cli_agent_orchestrator.services.status_monitor.bus")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
@@ -322,7 +315,6 @@ class TestUnrecordedGetStatusTransitions:
         assert status == TerminalStatus.IDLE
         assert self._published(mock_bus) == ["processing", "idle"]
 
-    @pytest.mark.xfail(strict=True, reason=_UNRECORDED_GET_STATUS_TRANSITION)
     @patch("cli_agent_orchestrator.services.status_monitor.bus")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
@@ -330,6 +322,102 @@ class TestUnrecordedGetStatusTransitions:
         mock_get_backend.return_value = _backend(event_inbox=False)
         self._stale_capture_recovery(mock_pm, mock_get_backend, "t13")
         assert [r.status for r in _rows("t13")] == ["processing", "idle"]
+
+    @staticmethod
+    def _stopped_clock(monkeypatch):
+        from cli_agent_orchestrator.clients import database
+
+        clock = {"now": T0 - timedelta(seconds=30)}
+        monkeypatch.setattr(status_monitor, "_utcnow", lambda: clock["now"])
+        monkeypatch.setattr(database, "_utcnow", lambda: clock["now"])
+        return clock
+
+    @staticmethod
+    def _read_on_loop_while_the_writer_is_busy(clock):
+        """Run the transition read on the loop at T0 with the writer held
+        busy, and move the clock on 60 s before the writer is let go."""
+
+        def final_read(read):
+            gate = threading.Event()
+            status_monitor._status_event_executor().submit(gate.wait, 10)
+            clock["now"] = T0
+            try:
+                status, _ = _on_loop(read)
+                clock["now"] = T0 + timedelta(seconds=60)
+            finally:
+                gate.set()
+            return status
+
+        return final_read
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_native_swarm_revoke_is_stamped_at_the_transition(
+        self, mock_get_backend, mock_pm, mock_bus, monkeypatch
+    ):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        final_read = self._read_on_loop_while_the_writer_is_busy(self._stopped_clock(monkeypatch))
+
+        assert self._swarm_revoke(mock_pm, "t14", final_read) == TerminalStatus.PROCESSING
+
+        assert [(r.status, r.created_at) for r in _rows("t14")] == [
+            ("completed", T0 - timedelta(seconds=30)),
+            ("processing", T0),
+        ]
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_stale_capture_recovery_is_stamped_at_the_transition(
+        self, mock_get_backend, mock_pm, mock_bus, monkeypatch
+    ):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        final_read = self._read_on_loop_while_the_writer_is_busy(self._stopped_clock(monkeypatch))
+
+        status = self._stale_capture_recovery(mock_pm, mock_get_backend, "t15", final_read)
+
+        assert status == TerminalStatus.IDLE
+        assert [(r.status, r.created_at) for r in _rows("t15")] == [
+            ("processing", T0 - timedelta(seconds=30)),
+            ("idle", T0),
+        ]
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_revoke_row_keeps_the_transition_order_with_apply_detection(
+        self, mock_get_backend, mock_pm, mock_bus, monkeypatch
+    ):
+        """The revoke's row lands between the ``_apply_detection`` rows on
+        either side of it, even when the first write is slow."""
+        from cli_agent_orchestrator.clients import database
+
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        real_write = database.record_launch_status_event
+        first_write = threading.Event()
+
+        def slow_first_write(*args, **kwargs):
+            if not first_write.is_set():
+                first_write.set()
+                time.sleep(0.3)
+            real_write(*args, **kwargs)
+
+        monkeypatch.setattr(database, "record_launch_status_event", slow_first_write)
+        provider = MagicMock()
+        provider.has_pending_native_swarm = True
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+
+        _on_loop(lambda: sm._apply_detection("t16", TerminalStatus.COMPLETED))
+        _on_loop(lambda: sm.get_status("t16"))
+        provider.has_pending_native_swarm = False
+        _on_loop(lambda: sm._apply_detection("t16", TerminalStatus.COMPLETED))
+        _drain_tmux_status_writes()
+
+        rows = _rows("t16")
+        assert [r.status for r in rows] == ["completed", "processing", "completed"]
+        assert [r.created_at for r in rows] == sorted(r.created_at for r in rows)
 
 
 class TestHerdrBusyTimeFromEvents:
