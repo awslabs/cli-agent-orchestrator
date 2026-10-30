@@ -20,7 +20,6 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KIRO_V3_UNSET_ENV,
     KiroCapabilityError,
-    KiroV3UnavailableError,
     build_kiro_command,
     kiro_effort,
     probe_kiro_capabilities,
@@ -265,7 +264,9 @@ async def test_create_refuses_an_unsupported_version_before_allocation():
 
 
 @pytest.mark.asyncio
-async def test_a_supported_v3_create_still_refuses_as_unavailable():
+async def test_a_pending_version_refuses_v3_before_allocation():
+    """2.36.0 is allow-listed but pending operator verification (#1167): not admitted."""
+    from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3UnverifiedVersionError
     from cli_agent_orchestrator.services import terminal_service
 
     _TS = "cli_agent_orchestrator.services.terminal_service"
@@ -276,12 +277,12 @@ async def test_a_supported_v3_create_still_refuses_as_unavailable():
     with (
         patch(
             f"{_TS}.agent_profiles.load_agent_profile",
-            return_value=AgentProfile(name="r", description="d"),
+            return_value=AgentProfile(name="r", description="d", allowedTools=["fs_read"]),
         ),
         patch(f"{_TS}.get_backend") as backend,
         patch(f"{_TS}.db_create_terminal") as db_create,
     ):
-        with pytest.raises(KiroV3UnavailableError):
+        with pytest.raises(KiroV3UnverifiedVersionError, match="pending operator verification"):
             await terminal_service.create_terminal(
                 provider="kiro_cli",
                 agent_profile="r",

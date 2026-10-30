@@ -293,12 +293,12 @@ class TestTerminalCreationWithWorkingDirectory:
     def test_create_terminal_kas_refusal_maps_to_400_not_404(self, client):
         """A KAS refusal is a bad request, not a missing resource.
 
-        KiroV3UnavailableError subclasses ValueError, and this endpoint's generic
+        Every Kiro v3 refusal subclasses ValueError, and this endpoint's generic
         ValueError arm means "session/window not found" -- so without a narrower
         arm ordered first, an engine rejection reports 404. POST /sessions
         already returns 400 for the identical failure.
         """
-        from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
+        from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3LaunchError
 
         with (
             patch(
@@ -307,7 +307,9 @@ class TestTerminalCreationWithWorkingDirectory:
             ),
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
-            mock_svc.create_terminal = AsyncMock(side_effect=KiroV3UnavailableError())
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=KiroV3LaunchError("kiro_v3_unrestricted", "refused")
+            )
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -352,6 +354,51 @@ class TestTerminalCreationWithWorkingDirectory:
 
         assert response.status_code == 400, response.text
         assert "cao install analyst" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "endpoint,target",
+        [
+            ("/sessions", "session_service.create_session"),
+            ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
+            ("/sessions/test-session/terminals:operator", "terminal_service.create_terminal"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "kind", ["unverified_version", "invalid_agent", "workspace", "attestation"]
+    )
+    def test_every_kiro_v3_refusal_is_a_bad_request(self, client, endpoint, target, kind):
+        """Each v3 refusal subclass is 400 on every create route, never the 404 the
+        in-session routes' generic ValueError arm gives (#1167)."""
+        from cli_agent_orchestrator.providers.kiro_attest import KiroAttestationError
+        from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3UnverifiedVersionError
+        from cli_agent_orchestrator.providers.kiro_workspace import KiroWorkspaceError
+        from cli_agent_orchestrator.services.kiro_v3_validate import (
+            KiroV3Finding,
+            KiroV3InvalidAgentError,
+        )
+
+        refusal = {
+            "unverified_version": lambda: KiroV3UnverifiedVersionError("2.36.0"),
+            "invalid_agent": lambda: KiroV3InvalidAgentError(
+                "analyst", [KiroV3Finding("forbidden_key", "kiroUpgrade")], "Reinstall it."
+            ),
+            "workspace": lambda: KiroWorkspaceError("hooks", "/repo/.kiro/hooks"),
+            "attestation": lambda: KiroAttestationError("kiro_v3_tools_mismatch", "shell"),
+        }[kind]()
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(f"cli_agent_orchestrator.api.main.{target}", new=AsyncMock(side_effect=refusal)),
+        ):
+            params = {"provider": "kiro_cli", "agent_profile": "analyst", "engine": "v3"}
+            if endpoint.endswith("/terminals"):
+                params["caller_id"] = "dcba8765"  # the in-session route requires one
+            response = client.post(endpoint, params=params)
+
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"].startswith(refusal.code)
 
     def test_an_agent_not_found_body_names_no_server_path(self, client, tmp_path):
         """The real refusal's text is the 400 body: the remedy, not the directories

@@ -16,7 +16,8 @@ from cli_agent_orchestrator.models.terminal import (
     TerminalStatus,
 )
 from cli_agent_orchestrator.providers.base import OutputExtractionError
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3LaunchError
+from cli_agent_orchestrator.providers.kiro_workspace import KiroWorkspaceError
 from cli_agent_orchestrator.services.agent_step import StepExecutionError
 from cli_agent_orchestrator.services.ephemeral_service import EphemeralPolicyError
 from cli_agent_orchestrator.services.install_service import KiroAgentPathError
@@ -159,7 +160,8 @@ class TestRunStepDurabilityErrorBranches:
         ("exc", "expected_status", "fragment"),
         [
             (OutputExtractionError("no response marker in scrollback"), 500, "response marker"),
-            (KiroV3UnavailableError(), 400, "not available yet"),
+            (KiroV3LaunchError("kiro_v3_unrestricted", "refused"), 400, "kiro_v3_unrestricted"),
+            (KiroWorkspaceError("hooks", "/repo/.kiro/hooks"), 400, "kiro_v3_workspace_config"),
             (
                 KiroAgentPathError("Kiro agent file must resolve beneath the agent directory"),
                 400,
@@ -171,7 +173,8 @@ class TestRunStepDurabilityErrorBranches:
         ],
         ids=[
             "output_extraction",
-            "kiro_v3_unavailable",
+            "kiro_v3_launch",
+            "kiro_v3_workspace",
             "kiro_agent_path",
             "terminal_limit",
             "worktree",

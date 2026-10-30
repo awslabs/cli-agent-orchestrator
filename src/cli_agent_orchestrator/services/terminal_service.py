@@ -120,7 +120,7 @@ from cli_agent_orchestrator.providers.base import (
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroCapabilityError,
-    KiroV3UnavailableError,
+    kiro_effort,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
@@ -139,6 +139,10 @@ from cli_agent_orchestrator.services.install_service import (
     installed_opencode_permission,
     kiro_install_predates_native_enforcement,
     require_kiro_agent_resolves,
+)
+from cli_agent_orchestrator.services.kiro_v3_launch import (
+    require_kiro_v3_admissible,
+    require_kiro_v3_launchable,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
     memory_context_for_terminal,
@@ -1837,6 +1841,7 @@ async def _create_terminal_unguarded(
             requested_model=launch_model,
         )
 
+        kiro_v3_schema = None
         if provider == ProviderType.KIRO_CLI.value:
             resolved_engine = resolve_kiro_engine(
                 explicit=engine,
@@ -1856,28 +1861,34 @@ async def _create_terminal_unguarded(
             # Mirror the launch-time precedence (`model or profile.model`, see
             # _get_profile_model): probing the profile snapshot alone would let an
             # explicit override launch --model on a wrapper never probed for it.
+            # A v3 launch also passes kiroConfig.effort as --effort (#1167), so
+            # the probe asks for that flag too; v2's request is unchanged.
+            launch_effort = kiro_effort(profile) if resolved_engine == KiroEngine.V3 else None
             requested = requested_kiro_capabilities(
                 resolved_engine,
                 model=launch_model,
                 yolo=True,
+                effort=launch_effort,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
             try:
-                await asyncio.to_thread(probe, resolved_engine, requested)
+                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
             except KiroCapabilityError:
                 if model or launch_plan is None or launch_plan.model is None:
                     raise
                 launch_model = resolve_launch_model(model, profile)
                 requested = requested_kiro_capabilities(
-                    resolved_engine, model=launch_model, yolo=True
+                    resolved_engine, model=launch_model, yolo=True, effort=launch_effort
                 )
-                await asyncio.to_thread(probe, resolved_engine, requested)
+                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
                 decision_not_honored = True
                 model_honored = ProviderManager.provider_class(provider).honors_model(
                     agent_profile=agent_profile, profile=profile, requested_model=launch_model
                 )
             if resolved_engine == KiroEngine.V3:
-                raise KiroV3UnavailableError()
+                # #1167: the probed version must be allow-listed (and admitted
+                # while pending verification), and the policy restricted.
+                kiro_v3_schema = require_kiro_v3_admissible(capabilities, allowed_tools)
         else:
             if engine is not None:
                 raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
@@ -2194,6 +2205,22 @@ async def _create_terminal_unguarded(
             await asyncio.to_thread(
                 require_kiro_agent_resolves, agent_profile, resolved_working_directory, check_env
             )
+            if kiro_v3_schema is not None:
+                # #1167: from the same cwd and env, a v3 launch also needs the
+                # default Kiro home, an installed agent file that passes the
+                # validator for this launch's grant, and a workspace whose
+                # .kiro/ v3 would not load as configuration.
+                from cli_agent_orchestrator.services import install_service
+
+                await asyncio.to_thread(
+                    require_kiro_v3_launchable,
+                    agent_profile,
+                    resolved_working_directory,
+                    check_env,
+                    list(allowed_tools or []),
+                    kiro_v3_schema,
+                    Path(install_service.KIRO_AGENTS_DIR),
+                )
 
         # Normalize the session name BEFORE anything keys off it: the lifecycle
         # lock below is per session NAME, so it must be taken on the SAME string
@@ -3017,7 +3044,7 @@ def terminal_input_refusal(
     verified before it failed (a restart during its initial delivery) accepts
     the re-send.
 
-    A row from before the column (``identity_verified`` None) is grandfathered
+    A v2 row from before the column (``identity_verified`` None) is grandfathered
     unless it carries a durable failure, in the DB or the fallback sidecar.
     Provisional (#1074): main never verified a Kiro pane, so refusing these
     would break every Kiro worker running across an upgrade.
@@ -3040,7 +3067,10 @@ def terminal_input_refusal(
         return None
     failure = get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
     if failure is None:
-        if verified is None:
+        # Grandfathering is for v2 rows older than the column. No v3 row can
+        # predate it (v3 never launched before #1167), so an unset value on a
+        # v3 row is not trust.
+        if verified is None and canonical_kiro_engine(metadata.get("engine")) != "v3":
             return None
         if _is_identity_check_in_flight(terminal_id):
             return TerminalInputBlockedError(
@@ -3621,11 +3651,13 @@ def _runtime_untrusted_from_row(metadata: dict[str, Any]) -> bool:
     not verify which agent the pane is running. A row from before the column
     (``identity_verified`` None) keeps its window, as live legacy rows are
     grandfathered; once it carries a failure, input to it is still refused.
+    A v3 row is never grandfathered: none can predate the column (#1167).
     Provisional (#1074).
     """
-    return (
-        metadata.get("provider") == ProviderType.KIRO_CLI.value
-        and metadata.get("identity_verified") is False
+    verified = metadata.get("identity_verified")
+    return metadata.get("provider") == ProviderType.KIRO_CLI.value and (
+        verified is False
+        or (verified is None and canonical_kiro_engine(metadata.get("engine")) == "v3")
     )
 
 
@@ -5261,12 +5293,6 @@ def dispatch_input(
         refusal = terminal_input_refusal(terminal_id, metadata)
         if refusal is not None:
             raise refusal
-
-        if (
-            metadata.get("provider") == ProviderType.KIRO_CLI.value
-            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.V3
-        ):
-            raise KiroV3UnavailableError()
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = _orchestration_value(orchestration_type)

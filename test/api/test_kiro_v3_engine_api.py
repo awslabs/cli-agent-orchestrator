@@ -1,4 +1,4 @@
-"""Kiro v3 engine values on the HTTP API, with v3 still refused (#1167 Phase 1).
+"""Kiro v3 engine values and refusals on the HTTP API (#1167 Phase 1).
 
 ``v3`` is canonical and ``kas`` an input alias stored as ``v3`` (design D1).
 The CLI, model, fingerprint and refusal-point checks live in
@@ -13,7 +13,10 @@ import pytest
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import Terminal
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
+from cli_agent_orchestrator.providers.kiro_attest import KiroAttestationError
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3LaunchError
+from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3UnverifiedVersionError
+from cli_agent_orchestrator.providers.kiro_workspace import KiroWorkspaceError
 
 # ---------------------------------------------------------------------------
 # API: query parameters, OpenAPI
@@ -54,17 +57,28 @@ def test_post_sessions_rejects_an_unknown_engine_with_422(client):
     svc.create_session.assert_not_called()
 
 
-def test_post_sessions_maps_the_v3_refusal_to_400_with_its_message(client):
+@pytest.mark.parametrize(
+    ("refusal", "code"),
+    [
+        (
+            KiroV3LaunchError("kiro_v3_unrestricted", "Retry with engine 'v2'."),
+            "kiro_v3_unrestricted",
+        ),
+        (KiroV3UnverifiedVersionError("2.36.0"), "kiro_v3_unverified_version"),
+        (KiroWorkspaceError("hooks", "/repo/.kiro/hooks"), "kiro_v3_workspace_config:hooks"),
+        (KiroAttestationError("kiro_v3_tools_mismatch", "shell"), "kiro_v3_tools_mismatch"),
+    ],
+)
+def test_post_sessions_maps_each_v3_refusal_to_400_with_its_code(client, refusal, code):
     with patch("cli_agent_orchestrator.api.main.session_service") as svc:
-        svc.create_session = AsyncMock(side_effect=KiroV3UnavailableError())
+        svc.create_session = AsyncMock(side_effect=refusal)
         response = client.post(
             "/sessions",
             params={"provider": "kiro_cli", "agent_profile": "developer", "engine": "kas"},
         )
 
     assert response.status_code == 400
-    assert "not available yet" in response.json()["detail"]
-    assert "Retry with engine 'v2'" in response.json()["detail"]
+    assert code in response.json()["detail"]
 
 
 def test_openapi_lists_v2_and_v3_once_and_never_kas():

@@ -37,7 +37,6 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
 from cli_agent_orchestrator.services import frozen_run_memory, launch_guard, terminal_service
 from cli_agent_orchestrator.services.provider_error_classifier import (
     classify_provider_error,
@@ -110,10 +109,6 @@ async def _validate_reused_terminal(
 
     explicit_engine = parse_kiro_engine(requested_engine)
     assert explicit_engine is not None
-    if explicit_engine == KiroEngine.V3:
-        # v3 remains unavailable regardless of which engine the terminal
-        # persisted; use the same structured guard as terminal creation.
-        raise KiroV3UnavailableError()
 
     persisted_engine = parse_kiro_engine(metadata.get("engine"))
     if persisted_engine is None:

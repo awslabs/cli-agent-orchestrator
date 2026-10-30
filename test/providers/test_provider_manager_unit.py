@@ -4,12 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
 from cli_agent_orchestrator.providers.manager import ProviderManager
 from cli_agent_orchestrator.providers.omp import OmpProvider
 
@@ -444,8 +444,8 @@ def test_get_provider_marks_kiro_initialized_on_restore():
 
 
 @pytest.mark.parametrize("stored", ["v3", "kas"])
-def test_get_provider_rejects_persisted_v3_before_provider_construction(stored):
-    """A persisted v3 terminal (either spelling) is never restored as a runnable provider."""
+def test_get_provider_restores_a_persisted_v3_terminal(stored):
+    """A persisted v3 row (either spelling) restores a v3 provider: no relaunch, no re-check."""
     manager = ProviderManager()
 
     with (
@@ -459,16 +459,11 @@ def test_get_provider_rejects_persisted_v3_before_provider_construction(stored):
                 "engine": stored,
             },
         ),
-        patch("cli_agent_orchestrator.providers.manager.KiroCliProvider") as provider_class,
         patch.object(manager, "create_provider") as create_provider,
     ):
-        with pytest.raises(KiroV3UnavailableError, match="not available yet"):
-            manager.get_provider("t1")
+        manager.get_provider("t1")
 
-    # Refused from the row itself, before restore reaches create_provider.
-    create_provider.assert_not_called()
-    provider_class.assert_not_called()
-    assert "t1" not in manager._providers
+    assert create_provider.call_args.kwargs["engine"] is KiroEngine.V3
 
 
 def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():
