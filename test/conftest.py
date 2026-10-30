@@ -291,6 +291,30 @@ def _no_llm_compile_in_tests(monkeypatch):
     monkeypatch.setenv("CAO_MEMORY_COMPILE_MODE", "append")
 
 
+def _drain_launch_status_writes() -> None:
+    """Wait for every tmux status-event write queued so far (issue #1082).
+
+    ``StatusMonitor`` writes status transitions on one module-level FIFO
+    thread, and a caller on the event loop does not wait for its write, so a
+    write queued by one test could otherwise land in a later test's database.
+    A no-op submitted behind them returns once they are all done.
+    """
+    import sys
+
+    status_monitor = sys.modules.get("cli_agent_orchestrator.services.status_monitor")
+    writer = getattr(status_monitor, "_status_event_writer", None)
+    if writer is not None:
+        writer.submit(lambda: None).result(timeout=30)
+
+
+@pytest.fixture(autouse=True)
+def _drain_launch_status_writer():
+    """No queued status-event write crosses a test boundary (issue #1082)."""
+    _drain_launch_status_writes()
+    yield
+    _drain_launch_status_writes()
+
+
 @pytest.fixture(autouse=True)
 def _reset_backend_registry():
     """Prevent leaked backend singletons from crossing test boundaries (fixes #522)."""
@@ -438,4 +462,6 @@ def isolated_memory_db(tmp_path, monkeypatch):
     try:
         yield engine
     finally:
+        # Land this test's queued status-event writes in its own database.
+        _drain_launch_status_writes()
         engine.dispose()
