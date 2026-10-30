@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 import yaml
@@ -179,6 +180,41 @@ def _skill_text() -> str:
     return SKILL.read_text()
 
 
+# The ``references/`` pages the skill's long sections moved into under
+# progressive disclosure (#1121 follow-up 3 / R8). Named rather than globbed
+# because two guards below depend on these specific files: a rename would
+# otherwise leave the glob matching something else and the guards passing
+# against the wrong page.
+REQUIRED_REFERENCE_PAGES = frozenset({"pr-gating-workflows.md", "test-isolation.md"})
+
+
+def _reference_files() -> list[Path]:
+    """Every ``references/`` page of this skill, in a stable order."""
+    return sorted((SKILL.parent / "references").glob("*.md"))
+
+
+def _skill_text_with_references() -> str:
+    """``SKILL.md`` plus every ``references/`` page.
+
+    Follow-up 3 moved two sections out of ``SKILL.md``: the four-cell "Other
+    workflows that gate a PR" table now lives in
+    ``references/pr-gating-workflows.md``, and the isolated-``HOME`` recipe in
+    ``references/test-isolation.md``. The guards that read those two assert
+    facts about THE SKILL rather than about one of its files, so they read the
+    whole skill.
+
+    This does not weaken them. The same bytes are parsed -- the move was
+    verified byte-identical -- and only the corpus supplying them grew. What it
+    does mean is that a guard reading this cannot tell WHICH file a fact came
+    from, so anything that must live in ``SKILL.md`` itself (the ``ci.yml`` gate
+    map, the dependency section, the checklist anchor) deliberately keeps
+    reading ``_skill_text()``.
+    """
+    parts = [_skill_text()]
+    parts.extend(path.read_text(encoding="utf-8") for path in _reference_files())
+    return "\n".join(parts)
+
+
 def _gate_map_rows() -> list[tuple[str, str, str]]:
     """Three-cell Markdown table rows from the skill, cells stripped."""
     rows: list[tuple[str, str, str]] = []
@@ -274,8 +310,14 @@ def _isolated_home_recipe() -> str:
     Located by its ``mktemp -d``, and asserted unique: if a second isolation
     recipe is ever added, the guards below would silently check only one of
     them, which is the same vacuity hazard the parametrize floors exist for.
+
+    Reads the whole skill (``SKILL.md`` plus ``references/``) because follow-up
+    3 moved this recipe into ``references/test-isolation.md``. The uniqueness
+    assertion is what makes the wider corpus safe: if the recipe is ever left
+    in two places at once -- the likely outcome of a half-finished move -- this
+    fails loudly instead of executing whichever copy came first.
     """
-    blocks = re.findall(r"```bash\n(.*?)```", _skill_text(), re.DOTALL)
+    blocks = re.findall(r"```bash\n(.*?)```", _skill_text_with_references(), re.DOTALL)
     matching = [b for b in blocks if "mktemp -d" in b]
     assert len(matching) == 1, (
         f"Expected exactly one mktemp-based isolation recipe, found {len(matching)}. "
@@ -922,9 +964,15 @@ def _other_workflow_rows() -> dict[str, tuple[str, str, str, str]]:
 
     Four-cell rows only, which is what keeps this table out of the three-cell
     ci.yml job parser above -- and keeps that parser's phantom-job guard strict.
+
+    Reads the whole skill (``SKILL.md`` plus ``references/``) because follow-up
+    3 moved this table into ``references/pr-gating-workflows.md``. The cell
+    shape still does the separating: the ci.yml gate map is three-cell and its
+    parser still reads ``SKILL.md`` alone, so widening the corpus here cannot
+    feed a reference page's rows to it.
     """
     rows: dict[str, tuple[str, str, str, str]] = {}
-    for line in _skill_text().splitlines():
+    for line in _skill_text_with_references().splitlines():
         line = line.strip()
         if not line.startswith("|"):
             continue
@@ -1010,6 +1058,454 @@ class TestOtherPrGatingWorkflowsAreDocumented:
         assert claimed == actual, (
             f"{workflow!r}: the skill says blocking={claimed}, but the workflow's "
             f"PR jobs give blocking={actual}."
+        )
+
+
+class TestReferencePagesAreReachable:
+    """A ``references/`` page nothing links to is dead weight in the package.
+
+    Progressive disclosure only works if the top-level ``SKILL.md`` says a
+    deeper page exists: an agent loads ``SKILL.md`` and follows links from it,
+    so an unlinked reference page ships bytes in every installed copy that no
+    reader will ever open. It is also the failure mode a move like follow-up 3
+    produces -- the section leaves ``SKILL.md`` and the link is forgotten -- and
+    neither the packaging parity test nor the link validator notices, because
+    both only check links that EXIST.
+    """
+
+    def test_the_pages_the_other_guards_depend_on_are_present(self):
+        """Named, not globbed: a rename must break here rather than silently.
+
+        ``_other_workflow_rows`` and ``_isolated_home_recipe`` read whichever
+        pages the glob finds. If one were renamed, those guards would keep
+        passing against the renamed file and this test is the only place that
+        records which names the suite was written against.
+        """
+        present = {path.name for path in _reference_files()}
+        missing = sorted(REQUIRED_REFERENCE_PAGES - present)
+        assert not missing, (
+            f"These reference pages are missing from {SKILL.parent.relative_to(REPO_ROOT)}"
+            f"/references/: {missing}. Present: {sorted(present)}. If a page was renamed, "
+            "update REQUIRED_REFERENCE_PAGES deliberately -- the guards that parse the "
+            "'Other workflows' table and execute the isolated-HOME recipe read these files."
+        )
+
+    @pytest.mark.parametrize("reference", _reference_files(), ids=lambda path: path.name)
+    def test_every_reference_page_is_linked_from_the_skill(self, reference: Path):
+        link = re.compile(r"\]\(\s*(?:\./)?references/" + re.escape(reference.name) + r"\s*\)")
+        assert link.search(_skill_text()), (
+            f"references/{reference.name} is not linked from "
+            f"{SKILL.relative_to(REPO_ROOT)}. A reference page is only reachable if the "
+            "skill body points at it; an agent reads SKILL.md and follows its links, so an "
+            "unlinked page ships in every copy and is never opened."
+        )
+
+
+DEPENDENCY_SECTION_HEADING = "## Dependency and lockfile changes"
+
+# Every path this section names sits inside a backtick span, so the spans are
+# what gets scanned -- but a span is not necessarily a path, which is why there
+# are two matchers rather than one. They differ in how much of the span has to
+# be the path, because the two kinds of token carry different false-positive
+# risk:
+#
+# * A ``scripts/`` or ``examples/`` token is matched ANYWHERE INSIDE a span.
+#   The directory prefix disambiguates it, and matching inside the span is the
+#   entire point: the only script this section names appears as an argument to a
+#   command, ``uv run python scripts/dependency_security.py``, so the span is
+#   the command and the path is a substring of it. Requiring the path to BE the
+#   whole span -- which this pattern used to do -- dropped that path silently
+#   and left #1120 AC6 ("every script path the section names exists")
+#   unenforced. Review on #1121 (P3-4) demonstrated the gap by renaming the
+#   script to ``scripts/no_such_gate.py``: this file stayed green at 103 passed.
+# * A bare filename is matched only as a WHOLE span. ``uv.lock``,
+#   ``pyproject.toml`` and ``SECURITY.md`` have no directory prefix to
+#   disambiguate them, and the section also quotes them inside prose commands
+#   (``git diff uv.lock``) where the token is part of a command rather than a
+#   reference to the root file. Keeping those whole-span preserves the previous
+#   behaviour exactly, so this change only ever ADDS collected paths.
+DEPENDENCY_SECTION_PATH_PATTERN = r"""(?:scripts|examples)/[^\s`'",;)]+"""
+DEPENDENCY_SECTION_BARE_FILE_NAMES = frozenset({"pyproject.toml", "SECURITY.md", "uv.lock"})
+_BACKTICK_SPAN_PATTERN = r"`([^`]+)`"
+
+# Floor for the parametrize below, which is evaluated at COLLECTION time: a
+# matcher that stops matching collects zero tests and reports success instead of
+# failing. Named as the one path whose absence was the actual defect rather than
+# as a count, because a count floor is satisfied by the four whole-span paths
+# that were already collected while the script path stays missing -- which is
+# precisely the state the review found.
+DEPENDENCY_SECTION_REQUIRED_PATH = "scripts/dependency_security.py"
+
+DEPENDENCY_SECURITY_ACTION = (
+    REPO_ROOT / ".github" / "actions" / "dependency-security" / "action.yml"
+)
+
+
+def _dependency_section() -> str:
+    text = _skill_text()
+    start = text.index(DEPENDENCY_SECTION_HEADING)
+    end = text.index("\n## ", start + len(DEPENDENCY_SECTION_HEADING))
+    return text[start:end]
+
+
+def _dependency_section_paths() -> set[str]:
+    """Repo paths the dependency section names, read out of its backtick spans."""
+    paths: set[str] = set()
+    for span in re.findall(_BACKTICK_SPAN_PATTERN, _dependency_section()):
+        span = span.strip()
+        if span in DEPENDENCY_SECTION_BARE_FILE_NAMES:
+            paths.add(span)
+        paths.update(re.findall(DEPENDENCY_SECTION_PATH_PATTERN, span))
+    return paths
+
+
+class TestDependencySectionMatchesTheRepo:
+    """#1120: the lockfile and CVE-floor rules must point at real files and versions."""
+
+    def test_the_section_exists(self):
+        assert DEPENDENCY_SECTION_HEADING in _skill_text()
+
+    def test_the_pre_pr_checklist_links_to_it(self):
+        assert "(#dependency-and-lockfile-changes)" in _skill_text()
+
+    def test_the_named_path_guard_collects_the_script_the_section_runs(self):
+        """Non-vacuity floor for the parametrize below, and the P3-4 regression.
+
+        The gate is #1120 AC6: every script path the section names must exist.
+        The section names exactly one, inside the command span ``uv run python
+        scripts/dependency_security.py``, so a matcher that only accepts a path
+        occupying a whole span collects the four whole-span paths, passes, and
+        checks the script not at all. Asserting the path is COLLECTED rather
+        than counting collected paths is what distinguishes those two states.
+        """
+        collected = _dependency_section_paths()
+        assert DEPENDENCY_SECTION_REQUIRED_PATH in collected, (
+            f"{DEPENDENCY_SECTION_REQUIRED_PATH!r} is not among the paths collected from "
+            f"the dependency section: {sorted(collected)}. Either the section no longer "
+            "names the dependency gate -- in which case rule 4 has changed and this floor "
+            "should move deliberately -- or DEPENDENCY_SECTION_PATH_PATTERN stopped "
+            "matching inside backtick spans, which makes the existence check below "
+            "silently skip the only script path the section has."
+        )
+
+    @pytest.mark.parametrize("quoted", sorted(_dependency_section_paths()))
+    def test_every_named_path_exists(self, quoted: str):
+        path = REPO_ROOT / quoted.removesuffix("**").rstrip("/")
+        assert path.exists(), f"{quoted!r} is named but does not exist"
+
+    def test_security_md_names_the_trivy_version_ci_pins(self):
+        pinned = re.search(r"version:\s*v?(\d+\.\d+\.\d+)", DEPENDENCY_SECURITY_ACTION.read_text())
+        assert pinned, "the dependency-security action no longer pins a Trivy version"
+        security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        assert f"Trivy {pinned.group(1)}" in security, (
+            f"the skill sends readers to SECURITY.md for the Trivy version, but SECURITY.md "
+            f"does not name the pinned {pinned.group(1)}"
+        )
+
+
+# --- Absolute self-links, which CI's link checker does not see ----------------
+#
+# N6 rewrote this skill's relative links as absolute
+# ``https://github.com/awslabs/cli-agent-orchestrator/blob/main/...`` URLs, so
+# they resolve from the packaged mirror and the plugin copy, where ``../../``
+# does not. That fix silently removed them from the repo's link validation:
+# ``utils/markdown_links.py`` returns ``None`` for any destination carrying a
+# scheme or a host, so ``scripts/validate_markdown_links.py`` checks RELATIVE
+# links only. Review on #1121 filed this as R8 -- six links that can now rot
+# with nothing noticing.
+#
+# These guards restore the coverage for the links that point back into this
+# repository, which are exactly the ones a repo test can check: the path must
+# exist in the tree, and an anchor must name a heading GitHub would actually
+# generate. Links to anywhere else (agentskills.io, agent-plugins.org) are out
+# of scope -- an external URL cannot be verified without network access, and a
+# test that needs the network is not a test this suite can run.
+
+CONTRIBUTING_SKILL_DIR = REPO_ROOT / "skills" / "cao-contributing"
+BLOB_MAIN_PREFIX = "https://github.com/awslabs/cli-agent-orchestrator/blob/main/"
+_ABSOLUTE_SELF_LINK_PATTERN = re.compile(
+    re.escape(BLOB_MAIN_PREFIX) + r"(?P<path>[^)\s#]+)(?:#(?P<anchor>[^)\s]+))?"
+)
+# On a file GitHub does not render as Markdown, the only anchor that means
+# anything is a line reference (``#L42``, ``#L10-L20``).
+_LINE_ANCHOR_PATTERN = re.compile(r"^L\d+(?:-L\d+)?$")
+
+
+class AbsoluteSelfLink(NamedTuple):
+    """One ``blob/main`` link: the repo path, its anchor if any, and where it was found."""
+
+    path: str
+    anchor: str | None
+    source: str
+
+
+# Floors for the parametrize below, which is evaluated at COLLECTION time: a
+# collector that stops matching yields zero cases and reports success. Two
+# floors rather than one, because the test has two arms and a count alone
+# leaves the second vacuous -- if every anchored link were reworded away, the
+# heading-slug half would check nothing while the total still looked healthy.
+# Both are stated low deliberately: text moving between SKILL.md and
+# references/ must not redden this.
+MINIMUM_ABSOLUTE_SELF_LINKS = 3
+MINIMUM_ANCHORED_SELF_LINKS = 1
+
+
+def _skill_markdown_files(skill_dir: Path) -> list[Path]:
+    """``SKILL.md`` plus any ``references/`` page, which is where long sections go.
+
+    Both are scanned because progressive disclosure MOVES prose rather than
+    rewriting it: a link that lived in ``SKILL.md`` yesterday can be in
+    ``references/`` today, and a guard anchored to ``SKILL.md`` alone would
+    quietly stop checking it at the moment it moved.
+    """
+    files = [skill_dir / "SKILL.md"]
+    files.extend(sorted((skill_dir / "references").glob("*.md")))
+    return [path for path in files if path.is_file()]
+
+
+def _absolute_self_links(skill_dir: Path = CONTRIBUTING_SKILL_DIR) -> list[AbsoluteSelfLink]:
+    links: list[AbsoluteSelfLink] = []
+    for path in _skill_markdown_files(skill_dir):
+        text = path.read_text(encoding="utf-8")
+        for match in _ABSOLUTE_SELF_LINK_PATTERN.finditer(text):
+            links.append(
+                AbsoluteSelfLink(
+                    path=match.group("path"),
+                    anchor=match.group("anchor"),
+                    source=path.name,
+                )
+            )
+    return links
+
+
+def _github_heading_slugs(markdown: str) -> set[str]:
+    """The anchors GitHub generates for a Markdown file's ATX headings.
+
+    Mirrors ``github-slugger``, which is what GitHub runs: take the heading's
+    rendered text, lowercase it, drop every character that is not a letter,
+    digit, space, hyphen or underscore, then replace spaces with hyphens. A
+    repeated slug gets ``-1``, ``-2``, ... appended, so the second
+    ``## Notes`` is reachable as ``#notes-1``.
+
+    Fenced blocks are skipped. A ``# comment`` inside a ``bash`` fence is not a
+    heading, and admitting it would invent slugs -- which would make a WRONG
+    anchor pass, the one direction that matters here.
+    """
+    slugs: set[str] = set()
+    seen: dict[str, int] = {}
+    in_fence = False
+    for line in markdown.splitlines():
+        if re.match(r"^\s*(```|~~~)", line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.*?)\s*#*\s*$", line)
+        if not heading:
+            continue
+        text = heading.group(2)
+        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)  # a link contributes its text
+        text = text.replace("`", "")
+        slug = re.sub(r"[^\w\- ]", "", text.lower()).replace(" ", "-")
+        if not slug:
+            continue
+        occurrence = seen.get(slug, 0)
+        seen[slug] = occurrence + 1
+        slugs.add(slug if occurrence == 0 else f"{slug}-{occurrence}")
+    return slugs
+
+
+def _absolute_link_problem(link: AbsoluteSelfLink, repo_root: Path = REPO_ROOT) -> str | None:
+    """Why this link is broken, or ``None``.
+
+    Separated from the assertion so the negative controls below can exercise it
+    on synthetic links. A guard whose only input is the current tree cannot
+    demonstrate that it would fail on a bad one.
+    """
+    target = repo_root / link.path
+    if not target.exists():
+        return (
+            f"{link.source} links to {BLOB_MAIN_PREFIX}{link.path}, but "
+            f"{link.path!r} does not exist in the repo"
+        )
+    if link.anchor is None:
+        return None
+    if target.suffix.lower() != ".md":
+        if _LINE_ANCHOR_PATTERN.match(link.anchor):
+            return None
+        return (
+            f"{link.source} puts the anchor #{link.anchor} on {link.path!r}, which GitHub "
+            "does not render as Markdown; only a line anchor such as #L42 resolves there"
+        )
+    slugs = _github_heading_slugs(target.read_text(encoding="utf-8"))
+    if link.anchor not in slugs:
+        return (
+            f"{link.source} links to {link.path}#{link.anchor}, but that file has no heading "
+            f"whose GitHub anchor is {link.anchor!r}. Available: {sorted(slugs)}"
+        )
+    return None
+
+
+class TestAbsoluteSelfLinksResolve:
+    """R8: the absolute links CI's validator skips, checked here instead."""
+
+    def test_the_validator_really_does_skip_these_links(self):
+        """Anchor the premise to the validator's BEHAVIOUR, not to its source text.
+
+        This used to assert an exact indented source string, so reformatting
+        ``markdown_links.py`` would have broken it for no real reason (round-2
+        review). Calling the function is both sturdier and a stronger claim: it
+        shows the validator returns no error for an absolute URL that could not
+        possibly resolve, which is precisely why the links below need checking
+        here.
+
+        If the validator ever starts checking absolute URLs, this fails and
+        this class becomes duplicate coverage -- remove it deliberately then,
+        rather than leaving two checkers with different rules.
+        """
+        from markdown_it import MarkdownIt
+
+        from cli_agent_orchestrator.utils import markdown_links
+
+        unresolvable = f"{BLOB_MAIN_PREFIX}NO_SUCH_FILE_ANYWHERE.md#no-such-anchor"
+        skipped = markdown_links._validate_destination(
+            repo_root=REPO_ROOT,
+            source=SKILL,
+            destination=unresolvable,
+            line=1,
+            headings={},
+            parser=MarkdownIt(),
+        )
+        assert skipped is None, (
+            "scripts/validate_markdown_links.py now reports absolute URLs "
+            f"({skipped}). This class exists only because it does not -- if that "
+            "changed, delete these guards on purpose instead of keeping two "
+            "validators with different rules."
+        )
+        # Control: the same function DOES report a relative path that is missing,
+        # so the None above is the scheme short-circuit rather than a validator
+        # that reports nothing at all.
+        reported = markdown_links._validate_destination(
+            repo_root=REPO_ROOT,
+            source=SKILL,
+            destination="NO_SUCH_FILE_ANYWHERE.md",
+            line=1,
+            headings={},
+            parser=MarkdownIt(),
+        )
+        assert reported is not None, (
+            "The validator reported nothing for a MISSING RELATIVE path either, so "
+            "the assertion above proves nothing about absolute URLs specifically. "
+            "Check how _validate_destination is being called."
+        )
+
+    def test_the_guard_has_links_to_check(self):
+        links = _absolute_self_links()
+        assert len(links) >= MINIMUM_ABSOLUTE_SELF_LINKS, (
+            f"Expected at least {MINIMUM_ABSOLUTE_SELF_LINKS} absolute {BLOB_MAIN_PREFIX}... "
+            f"links across {CONTRIBUTING_SKILL_DIR.relative_to(REPO_ROOT)}, found {links}. "
+            "If N6's absolute links were reverted to relative ones, CI's validator covers "
+            "them again and this floor should be lowered deliberately -- otherwise the "
+            "parametrized check below collects nothing and passes silently."
+        )
+
+    def test_the_guard_has_an_anchored_link_to_check(self):
+        """The heading-slug arm needs its own floor; a total count does not cover it."""
+        anchored = [link for link in _absolute_self_links() if link.anchor]
+        assert len(anchored) >= MINIMUM_ANCHORED_SELF_LINKS, (
+            f"Expected at least {MINIMUM_ANCHORED_SELF_LINKS} absolute self-link with an "
+            f"anchor, found {anchored}. Without one, the heading-slug half of this guard "
+            "verifies nothing while the link count still looks healthy."
+        )
+
+    @pytest.mark.parametrize(
+        "link", _absolute_self_links(), ids=lambda link: f"{link.source}:{link.path}"
+    )
+    def test_every_absolute_self_link_resolves(self, link: AbsoluteSelfLink):
+        problem = _absolute_link_problem(link)
+        assert problem is None, (
+            f"{problem}. These links are invisible to scripts/validate_markdown_links.py, "
+            "so nothing else in CI will catch this."
+        )
+
+    @pytest.mark.parametrize(
+        "link,expected_fragment",
+        [
+            # A path that does not exist -- the R8 failure mode itself.
+            (AbsoluteSelfLink("SECURITY.md", None, "SKILL.md"), None),
+            (AbsoluteSelfLink("NO_SUCH_FILE.md", None, "SKILL.md"), "does not exist"),
+            (AbsoluteSelfLink("docs/no_such_doc.md", None, "SKILL.md"), "does not exist"),
+            # A real file, with an anchor no heading produces.
+            (AbsoluteSelfLink("SECURITY.md", "full-dependency-gate", "SKILL.md"), None),
+            (AbsoluteSelfLink("SECURITY.md", "no-such-heading", "SKILL.md"), "no heading"),
+            # An anchor on a file GitHub does not render as Markdown.
+            (AbsoluteSelfLink("mypy-baseline.json", None, "SKILL.md"), None),
+            (AbsoluteSelfLink("mypy-baseline.json", "L1", "SKILL.md"), None),
+            (
+                AbsoluteSelfLink("mypy-baseline.json", "some-heading", "SKILL.md"),
+                "does not render as Markdown",
+            ),
+        ],
+    )
+    def test_it_distinguishes_a_broken_link_from_a_working_one(
+        self, link: AbsoluteSelfLink, expected_fragment: str | None
+    ):
+        """Non-vacuity, enforced rather than demonstrated once by hand.
+
+        Each case is a link that MUST be judged broken, paired with one that
+        must not. Without these, a collector or a slugger that silently stopped
+        working would leave the parametrized test above green on a rotten tree.
+        """
+        problem = _absolute_link_problem(link)
+        if expected_fragment is None:
+            assert problem is None, f"{link} should resolve, but was reported as: {problem}"
+        else:
+            assert problem is not None, f"{link} is broken, but the guard reported no problem"
+            assert expected_fragment in problem, (
+                f"{link} was reported, but the message does not explain the real cause "
+                f"({expected_fragment!r} not in {problem!r})"
+            )
+
+
+class TestTheGithubSlugRule:
+    """Pins the slugger, because the tree exercises almost none of it.
+
+    ``cao-contributing`` has one anchored link today, so the real tree would
+    not notice the rule being wrong about bold text, punctuation, code spans or
+    duplicate headings. GitHub's own algorithm is the contract here.
+    """
+
+    @pytest.mark.parametrize(
+        "markdown,expected",
+        [
+            ("## Full dependency gate", {"full-dependency-gate"}),
+            # Case, punctuation and emphasis are dropped; underscores are kept.
+            ("# Mixed CASE Heading", {"mixed-case-heading"}),
+            ("## **Bold** heading", {"bold-heading"}),
+            ("## What's a gate?", {"whats-a-gate"}),
+            ("## `make check-agent-plugin`", {"make-check-agent-plugin"}),
+            ("## snake_case_name", {"snake_case_name"}),
+            ("## A -- B", {"a----b"}),
+            # A link in a heading contributes its text, not its URL.
+            ("## [Releasing](docs/RELEASING.md)", {"releasing"}),
+            # Duplicates: the second occurrence is reachable as `-1`.
+            ("## Notes\n\n## Notes", {"notes", "notes-1"}),
+            # A `#` inside a fence is a shell comment, not a heading.
+            ("```bash\n# not a heading\n```\n## Real", {"real"}),
+            # Setext headings are not ATX and are deliberately not handled;
+            # recorded so the limitation is visible rather than surprising.
+            ("Underlined\n==========", set()),
+        ],
+    )
+    def test_slugs_match_githubs_rule(self, markdown: str, expected: set):
+        assert _github_heading_slugs(markdown) == expected
+
+    def test_the_real_anchor_target_is_covered_by_the_rule(self):
+        """Keeps the table above honest: it models this repo, not an invention."""
+        slugs = _github_heading_slugs((REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8"))
+        assert "full-dependency-gate" in slugs, (
+            "SECURITY.md no longer has a heading that slugs to 'full-dependency-gate'. "
+            "The skill links there with that anchor; fix one or the other."
         )
 
 

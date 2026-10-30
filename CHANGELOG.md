@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3
+  `Default` fallback** (#1167). A Kiro header with extra columns between the model and the context
+  gauge, such as `<agent> · claude-haiku-5.5 · low · ◔ 2%` on the v2 engine with `--effort`, or
+  `<agent> · <model> · thinking · low · ◔ 1%` on v3 with a pinned thinking model, used to read as no
+  header, so the launch was refused as `header_not_found`. Up to three short extra columns are now
+  read. The v3 engine's fallback agent, `Default` (`default` in its notice), has read, write, shell
+  and web tools; a header naming it, or an explicit request for it, is refused like `kiro_default`.
+  A launch is also refused, before any task is typed, when the screen shows kiro-cli's notice that
+  it did not load the requested agent (`agent "<name>" not found, using "kiro_default"` on v2,
+  `… using "default"` and its variants on v3), even under a header that names that agent; a notice
+  naming another agent leaves the header to decide. Elided and wrapped names still refuse. See
+  `docs/kiro-cli.md`, troubleshooting item 7.
 - **Kiro launches refuse an agent that kiro-cli would not run** (#1074). kiro-cli does not fail on
   an unknown `--agent`. It prints `agent "<name>" not found, using "kiro_default"` and starts its
   built-in default agent, which has every built-in tool, so launching a profile that was not

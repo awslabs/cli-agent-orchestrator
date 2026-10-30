@@ -8,7 +8,8 @@ CAO ships **two** packages, split by audience rather than cosmetically:
                      Agent-Plugins-compatible client. "Install profiles, launch
                      sessions, message a running fleet."
 ``cao-contributor``  **Contributor** — someone extending CAO itself. Authoring a
-                     provider, authoring an event plugin.
+                     provider, authoring an event plugin, working on the repo
+                     itself.
 ===================  ==========================================================
 
 Shipping repo-development skills inside the operator package would enlarge the
@@ -34,9 +35,9 @@ Naming caveats, both deliberate and both recorded rather than silently resolved:
   the event-plugin authoring skill depend on **maintainer decision M4**. Both are
   provisional. Because each package's allowlist is *data*, a rename is a
   one-line edit here plus a rebuild — no restructuring.
-* ``cao-contributing`` is **conditional and not present**. It depends on PR #448,
-  which is open and still a draft, so this build does not claim it. Adding it
-  when #448 lands is likewise one allowlist line.
+* ``cao-contributing`` ships in the contributor package. It was held back while
+  PR #448 was a draft; #448 merged, and adding it was the one allowlist line this
+  design promised (#1120).
 """
 
 from __future__ import annotations
@@ -63,6 +64,22 @@ PYPROJECT = ROOT / "pyproject.toml"
 SPEC_VERSION = "1.0.0"
 PLUGIN_SCHEMA_ID = f"https://agent-plugins.org/schemas/{SPEC_VERSION}/plugin.schema.json"
 MCP_SCHEMA_ID = f"https://agent-plugins.org/schemas/{SPEC_VERSION}/mcp.schema.json"
+# The human-readable specification, as opposed to the two machine-readable
+# schema ids above. Named once because both rendered files cite it.
+SPEC_URL = "https://agent-plugins.org/specification"
+
+# Absolute GitHub URLs for the generated files. A RELATIVE link is wrong in
+# anything this script renders: the whole point of a package is to be installed
+# somewhere else, and `cao plugin add <url> --subdir agent-plugin/<name>` copies
+# the directory out of the repository, leaving `../../docs/...` pointing at
+# nothing (audit follow-up 6).
+REPO_URL = "https://github.com/awslabs/cli-agent-orchestrator"
+AGENT_PLUGINS_DOC_URL = f"{REPO_URL}/blob/main/docs/agent-plugins.md"
+# Release notes live on the GitHub Release for the tag, which is `v` + the
+# version (`git tag --list 'v2.5*'` -> v2.5.2, v2.5.3, v2.5.4). The repo has no
+# per-package changelog to point at, so this is the existing convention rather
+# than a new notes system (audit follow-up 7).
+RELEASE_NOTES_URL_TEMPLATE = f"{REPO_URL}/releases/tag/v{{version}}"
 
 # The distribution the packaged MCP server is launched from, and the console
 # script that server exposes.
@@ -146,9 +163,11 @@ CONTRIBUTOR = PackageConfig(
     name="cao-contributor",
     description=(
         "Skills for extending CLI Agent Orchestrator: authoring providers and event "
-        "plugins. Development-facing; install the `cao` plugin instead to drive sessions."
+        "plugins, and working on the repo itself (dev loop, CI gates, dependency and "
+        "lockfile rules). Development-facing; install the `cao` plugin instead to "
+        "drive sessions."
     ),
-    keywords=["cao", "development", "provider", "extension"],
+    keywords=["cao", "development", "provider", "extension", "contributing", "ci"],
     skills=[
         # Authoring a new provider: the skill encodes the provider contract that is
         # otherwise only discoverable by reading providers/.
@@ -156,14 +175,13 @@ CONTRIBUTOR = PackageConfig(
         # Authoring an *event* plugin. Packaged under whichever name M4 settles on,
         # since the packaged folder name must equal the frontmatter `name`.
         "cao-plugin",
-        # `cao-contributing` joins here when PR #448 lands. Deliberately absent:
-        # the skill does not exist in the tree yet and this build does not claim it.
+        # Working on CAO itself: the dev loop, the CI gate map, dependency and
+        # lockfile rules, and PR discipline. Added once PR #448 merged (#1120).
+        "cao-contributing",
     ],
     excluded_note=(
         "Excluded: every operator-facing skill (they belong in the `cao` package), and "
-        "the adjacent-feature and vendored skills excluded there for the same reasons. "
-        "`cao-contributing` is conditional on PR #448 (open, draft) and is not present; "
-        "adding it is a one-line allowlist edit in scripts/build_agent_plugin.py."
+        "the adjacent-feature and vendored skills excluded there for the same reasons."
     ),
 )
 
@@ -575,6 +593,7 @@ def verify_published(version: str) -> None:
 def render_changelog(config: PackageConfig, version: str) -> str:
     """Render a package CHANGELOG recording what it ships and what it omits."""
     skill_lines = "\n".join(f"- `{skill}`" for skill in config.skills) or "- (none)"
+    release_notes = RELEASE_NOTES_URL_TEMPLATE.format(version=version)
     return f"""\
 # Changelog — `{config.name}`
 
@@ -584,9 +603,14 @@ any hand edit.
 
 ## {version}
 
-Targets the [Agent Plugins 1.0.0](https://agent-plugins.org/specification)
-specification. Version is synced from CAO's own package metadata, so the plugin
-and the CAO release it corresponds to cannot diverge.
+Targets the [Agent Plugins {SPEC_VERSION}]({SPEC_URL})
+specification.
+
+This package is pinned to CAO v{version}; see
+[its release notes]({release_notes}).
+Between releases the skills here are rebuilt from `main`, so they can be newer
+than that release. The release workflow re-pins after publishing, which is why
+the committed pin lags by one release by construction.
 
 Skills:
 
@@ -625,7 +649,8 @@ From GitHub, without cloning:
 cao plugin add https://github.com/awslabs/cli-agent-orchestrator --subdir {install_path}
 ```
 
-Any Agent-Plugins-compatible client can install this directory the same way.
+Any [Agent-Plugins-compatible]({SPEC_URL}) client can install this directory
+the same way.
 
 ## Contents
 
@@ -633,8 +658,8 @@ Version `{version}`, synced from CAO's package metadata.
 
 {chr(10).join(f"- `{skill}`" for skill in config.skills) or "- (none)"}
 
-See [docs/agent-plugins.md](../../docs/agent-plugins.md) for the prerequisites
-and the localhost-only posture.
+See [docs/agent-plugins.md]({AGENT_PLUGINS_DOC_URL}) for the prerequisites and
+the localhost-only posture.
 """
 
 
