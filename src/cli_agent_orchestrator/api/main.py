@@ -12,7 +12,7 @@ import struct
 import subprocess
 import termios
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -3786,9 +3786,77 @@ def _launch_options(plan: LaunchPlan | None) -> dict[str, Any]:
 
 
 def _claimed_ephemeral(agent_profile: str | None, claim_id: str | None) -> bool:
-    # A claimed ephemeral launch has its own decision path, so delegation sites skip it.
+    # A claimed ephemeral launch is asked only when its stored spec declared auto (#1068).
     # A claim on an installed profile claims nothing, so that launch is routed as usual.
     return claim_id is not None and profile_source(agent_profile) is TargetKind.EPHEMERAL
+
+
+async def _prepare_delegation(
+    req: DelegationRequest, claim_id: str | None, caller_id: str | None
+) -> LaunchPlan | None:
+    """#1068 D2 (provisional M7): decide after the claim and before the bind."""
+    if not _claimed_ephemeral(req.agent_profile, claim_id):
+        return await prepare_launch(req)
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    assert req.agent_profile is not None and claim_id is not None
+    if req.model is not None:
+        return None  # The launch refuses a per-call model and ends the claim; nothing is asked.
+    name = req.agent_profile
+    try:
+        inputs = ephemeral_service.decision_inputs(name, claim_id, caller_id, req.provider)
+        if inputs is None:
+            return None
+        # Q2 (provisional): the decided model applies only through this launch plan.
+        plan = await prepare_launch(
+            replace(
+                req,
+                target_kind=TargetKind.EPHEMERAL,
+                field_states=inputs.field_states,
+                policy=inputs.policy,
+                purpose=inputs.purpose,
+                description=inputs.description,
+            )
+        )
+        if plan is not None:
+            # The operator may have changed the policy while the decider ran: recheck the
+            # launched tier before the bind, whatever the outcome.
+            try:
+                model = ephemeral_service.recheck_decided(
+                    name, claim_id, caller_id, _recorded_tier(plan), plan.model
+                )
+            except BaseException:
+                _bind_unlaunched(plan)
+                raise
+            if model is not None and model != plan.model:
+                plan = replace(plan, model=model)
+    except DecisionInputError as error:
+        raise ephemeral_service.decision_refusal(name, claim_id, caller_id, error) from None
+    except BaseException:
+        ephemeral_service.end_claim(name, claim_id)
+        raise
+    if plan is not None:
+        ephemeral_service.record_decided(name, claim_id, plan.record_ids)
+    return plan
+
+
+def _recorded_tier(plan: LaunchPlan) -> str | None:
+    """The tier an on-mode answer's record says it applied to this plan, if there is one."""
+    for record_id in plan.record_ids:
+        try:
+            row = app.state.decision_engine.store.get(record_id)
+        except Exception:
+            # No record content and no traceback: the error can carry the row's values.
+            logger.warning("Decision record read failed")
+            return None
+        if row and row["point"] == "model.route" and row["outcome"] in ("applied", "capped"):
+            value = row["applied_value"]
+            return value if isinstance(value, str) else None
+    # No applied/capped record: either nothing was applied, or the store couldn't write or
+    # read one (its warning is the signal). Either way, recheck_decided reverse-maps the
+    # plan's own model through the settings snapshot it validates: an installed target
+    # already applies this way regardless of the record.
+    return None
 
 
 def _bind_unlaunched(plan: LaunchPlan | None) -> None:
@@ -4309,12 +4377,8 @@ async def create_terminal_in_session(
                     ),
                 )
 
-        if (
-            body
-            and body.delegation_message is not None
-            and not _claimed_ephemeral(agent_profile, claim_id)
-        ):
-            launch_plan = await prepare_launch(
+        if body and body.delegation_message is not None:
+            launch_plan = await _prepare_delegation(
                 DelegationRequest(
                     kind="handoff" if body.delegation_kind else "assign",
                     provider=resolved_provider,
@@ -4324,7 +4388,9 @@ async def create_terminal_in_session(
                     use_worktree=use_worktree,
                     owner=launch_owner("create_terminal_in_session", body),
                     target_kind=profile_source(agent_profile),
-                )
+                ),
+                claim_id,
+                caller_id,
             )
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
@@ -5367,12 +5433,10 @@ async def run_step(
             # EXECUTE falls through — the step runs normally.
 
         owner = launch_owner("run_step", body)
-        if (
-            body.reuse_terminal_id is None
-            and not _claimed_ephemeral(body.agent, body.claim_id)
-            and (body.orchestration_type is not None or owner == WORKFLOW_STEP)
+        if body.reuse_terminal_id is None and (
+            body.orchestration_type is not None or owner == WORKFLOW_STEP
         ):
-            launch_plan = await prepare_launch(
+            launch_plan = await _prepare_delegation(
                 DelegationRequest(
                     kind="handoff",
                     provider=body.provider,
@@ -5386,7 +5450,9 @@ async def run_step(
                     use_worktree=body.use_worktree,
                     owner=owner,
                     target_kind=profile_source(body.agent),
-                )
+                ),
+                body.claim_id,
+                body.caller_id,
             )
         result = await run_agent_step(
             provider=body.provider,
@@ -10354,6 +10420,187 @@ async def list_outcomes_endpoint(
         limit=limit,
     )
     return {"outcomes": outcomes, "count": len(outcomes)}
+
+
+@app.get("/fleet/status")
+async def fleet_status_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Read-only fleet summary for the web UI.
+
+    Mirrors ``cao fleet status``: reaches the worker broker through
+    ``FleetClient`` (``CAO_ELASTIC_BROKER_URL`` / ``CAO_ELASTIC_BROKER_TOKEN`` —
+    one port-forward away on EKS) and returns the broker url, the live and
+    cleanup-pending worker counts, and a lease-state histogram. The fleet routes on
+    cao-server are all reads (this one and ``/fleet/workers``): ``fleet shutdown``
+    and ``worker release`` are destructive and stay CLI/explicit actions, so there
+    is no write path here.
+
+    ``FleetClient`` raises ``click.ClickException`` both when no broker is
+    configured (``from_env``) and when the broker is unreachable or errors; both
+    surface here as 503 carrying the broker's own message, so the UI can show
+    "fleet not reachable" rather than a generic 500. The blocking ``requests``
+    calls run off the event loop via ``asyncio.to_thread``.
+    """
+    import asyncio
+    from collections import Counter
+
+    import click
+
+    from cli_agent_orchestrator.utils.fleet import FleetClient
+
+    def _collect() -> tuple[str, list]:
+        client = FleetClient.from_env()
+        return client.url, client.workers()
+
+    try:
+        broker_url, workers = await asyncio.to_thread(_collect)
+    except click.ClickException as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=e.format_message()
+        )
+
+    counts = Counter(w.get("state", "unknown") for w in workers)
+    return {
+        "broker": broker_url,
+        "live": sum(1 for w in workers if w.get("workload_present") is True),
+        "cleanup_pending": sum(1 for w in workers if w.get("cleanup_pending") is True),
+        "states": dict(counts),
+    }
+
+
+# Fields of a broker inventory row (the broker's WorkerStatus) and of a worker
+# terminal that the fleet worker routes pass through. An ALLOWLIST, not a filter:
+# anything the broker or the worker's cao-server adds later stays server-side until
+# someone decides it is safe to show. Notably never forwarded: the broker token,
+# the lease's release token / target host, and any node-proxy URL.
+_FLEET_WORKER_FIELDS = (
+    "worker_id",
+    "state",
+    "reason",
+    "agent_profile",
+    "provider",
+    "age_seconds",
+    "workload_present",
+    "cleanup_pending",
+    "lease_tracked",
+)
+_FLEET_TERMINAL_FIELDS = ("id", "name", "session_name", "agent_profile", "provider", "status")
+# A worker id is interpolated into the broker's proxy path
+# (/workers/{id}/api/...), so it must be a plain identifier: no '/', no '..'.
+_FLEET_WORKER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# Last-output preview cap; the full transcript stays one `cao worker attach` away.
+_FLEET_LAST_OUTPUT_MAX_CHARS = 4000
+
+
+def _pick(row: Any, fields: Tuple[str, ...]) -> Optional[Dict[str, Any]]:
+    if not isinstance(row, dict):
+        return None
+    return {k: row.get(k) for k in fields}
+
+
+@app.get("/fleet/workers")
+async def fleet_workers_endpoint(
+    include_settled: bool = Query(
+        False, alias="all", description="Include settled leases (cao worker list --all)"
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Read-only worker inventory for the web UI, mirroring ``cao worker list``.
+
+    Returns ``{"broker", "workers": [...]}`` where each worker carries exactly
+    ``_FLEET_WORKER_FIELDS``. Live workers only unless ``all=true``, as in the CLI.
+    No broker configured, unreachable or erroring -> 503 with its message.
+    """
+    import click
+
+    from cli_agent_orchestrator.utils.fleet import FleetClient
+
+    def _collect() -> Tuple[str, list]:
+        client = FleetClient.from_env()
+        return client.url, client.workers()
+
+    try:
+        broker_url, workers = await asyncio.to_thread(_collect)
+    except click.ClickException as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=e.format_message()
+        )
+    rows = [_pick(w, _FLEET_WORKER_FIELDS) for w in workers]
+    if not include_settled:
+        rows = [w for w in rows if w and w.get("workload_present") is True]
+    return {"broker": broker_url, "workers": [w for w in rows if w]}
+
+
+@app.get("/fleet/workers/{worker_id}")
+async def fleet_worker_endpoint(
+    worker_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """One worker's lease and what its agent is doing, mirroring ``cao worker status``.
+
+    ``{"worker_id", "lease", "terminal", "terminal_error", "last_output"}``. ``lease``
+    is the allowlisted inventory row or ``None`` (a broker restart forgets leases while
+    the workload lives on); ``terminal`` the allowlisted terminal of the worker's own
+    cao-server, read through the broker's proxy; ``last_output`` its last response,
+    capped at ``_FLEET_LAST_OUTPUT_MAX_CHARS``. As in the CLI, a leased worker whose
+    cao-server does not answer yet degrades to the lease with ``terminal_error`` set.
+    Errors: malformed id 400; no lease AND no answering worker 404 (503 when the broker
+    itself is unreachable or not configured).
+    """
+    import click
+
+    from cli_agent_orchestrator.utils.fleet import BrokerRequestError, FleetClient
+
+    if not _FLEET_WORKER_ID.match(worker_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="malformed worker id")
+
+    def _collect() -> Dict[str, Any]:
+        client = FleetClient.from_env()
+        lease = next((w for w in client.workers() if w.get("worker_id") == worker_id), None)
+        terminal = None
+        last_output = None
+        terminal_error = None
+        if lease is None or lease.get("workload_present") is True:
+            try:
+                sole = client.sole_terminal(worker_id)
+                terminal = client.terminal(worker_id, sole["id"])
+                last_output = client.terminal_output(worker_id, sole["id"])
+            except click.ClickException as exc:
+                if lease is None:
+                    raise
+                terminal_error = exc.format_message()
+        if isinstance(last_output, str) and len(last_output) > _FLEET_LAST_OUTPUT_MAX_CHARS:
+            last_output = last_output[-_FLEET_LAST_OUTPUT_MAX_CHARS:]
+        return {
+            "worker_id": worker_id,
+            "lease": _pick(lease, _FLEET_WORKER_FIELDS),
+            "terminal": _pick(terminal, _FLEET_TERMINAL_FIELDS),
+            "terminal_error": terminal_error,
+            "last_output": last_output if isinstance(last_output, str) else None,
+        }
+
+    try:
+        return await asyncio.to_thread(_collect)
+    except BrokerRequestError as e:
+        # Reached the broker and it said 4xx about this worker -> the worker is not there.
+        # Unreachable (status None) or a broker 5xx is the fleet being unavailable.
+        code = (
+            status.HTTP_404_NOT_FOUND
+            if e.status_code is not None and 400 <= e.status_code < 500
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        raise HTTPException(status_code=code, detail=e.format_message())
+    except click.ClickException as e:
+        # from_env with no broker configured -> 503. Otherwise the worker answered but
+        # has no (or more than one) terminal and no lease names it -> nothing to show.
+        no_fleet = "No fleet configured" in e.format_message()
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE if no_fleet else status.HTTP_404_NOT_FOUND
+            ),
+            detail=e.format_message(),
+        )
 
 
 # Static file serving for built web UI.

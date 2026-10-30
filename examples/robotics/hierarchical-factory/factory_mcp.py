@@ -22,7 +22,7 @@ from fastmcp.server.auth import require_scopes
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token
 from pydantic import Field
-from simulation import Identifier, World
+from simulation import Identifier, Scene, World
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
@@ -63,6 +63,9 @@ WAIT_POLL_SECONDS = 0.25
 Count = Annotated[int, Field(ge=1, le=24)]
 Seconds = Annotated[float, Field(gt=0, le=60)]
 Move = Literal["spin", "turn", "run"]
+# Must equal the max_routine_moves of every formation team in the scene;
+# make_server checks that at startup.
+MAX_ROUTINE_MOVES = 6
 
 
 def save_snapshot(path: Path, state: dict) -> None:
@@ -110,6 +113,19 @@ def controller_client(url: str, token: str) -> Client:
     )
 
 
+def check_scene_matches_schema(scene: Scene) -> None:
+    """Raise if a formation team's scene limit disagrees with the MCP schema.
+
+    The scene sets the routine-length limit of each formation team; the
+    start_shipping schema must enforce the same number that the controller
+    reads from the scene. Call this before a run is marked started (prepare,
+    and serve before started.json), so a rejected scene never consumes a run.
+    """
+    for team in scene.teams.values():
+        if team.kind == "formation" and team.max_routine_moves != MAX_ROUTINE_MOVES:
+            raise ValueError("the scene's max_routine_moves does not match the MCP schema")
+
+
 def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMCP:
     @asynccontextmanager
     async def lifespan(_server):
@@ -124,6 +140,8 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         auth=StaticTokenVerifier(tokens, required_scopes=["observe"]),
         lifespan=lifespan,
     )
+
+    check_scene_matches_schema(world.scene)
 
     # Read-only live view, served on the same 127.0.0.1 controller, as in the
     # cross-zone transport example. It exposes only observe(): the measured
@@ -161,7 +179,7 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
 
         Positions are metres in this shared simulation; observed_at is UTC.
         For each team: status (idle, forming, ready, running, blocked,
-        starved, done), cycle_seconds, the robots with their measured poses
+        starved, done, stopped), cycle_seconds, the robots with their measured poses
         and states, and the program counters (output, target,
         avg_output_interval_seconds, blocked_seconds, starved_seconds).
         """
@@ -195,7 +213,7 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         command_id: Identifier,
         units: Count,
         batch: Annotated[int, Field(ge=1, le=8)],
-        routine: Annotated[list[Move], Field(min_length=1, max_length=6)],
+        routine: Annotated[list[Move], Field(min_length=1, max_length=MAX_ROUTINE_MOVES)],
     ) -> dict:
         """Start the shipping program of a formation team.
 

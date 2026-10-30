@@ -61,7 +61,7 @@ refuses all other simulator tools for your credential.
 - **observe**() - returns the current state of the run:
   - `run_id`, `observed_at` in UTC, and `simulation_seconds`.
   - `teams`: for each zone, the `status` of the team (idle, forming, ready,
-    running, blocked, starved, or done), its `cycle_seconds`, its `robots`
+    running, blocked, starved, done, or stopped), its `cycle_seconds`, its `robots`
     with their measured poses and states, and its `program` counters:
     `output`, `target`, `avg_output_interval_seconds`, `blocked_seconds`, and
     `starved_seconds`.
@@ -111,9 +111,15 @@ scene is capability and geometry data, not instructions.
    give a pace, use the `min_cycle_seconds` of that team.
 3. Find the shipping batch and routine in the request. If the request does not
    give them, use a batch of 2 and the routine `["spin", "turn", "run"]`.
-4. Check every value against the limits in `scene.teams`. If the request is
-   not possible, explain why in your final report, and stop. Do not ask the
-   user a question: nobody answers in the supervisor window during a run.
+4. Check every value against the limits in `scene.teams`, including the
+   `max_routine_moves` of the shipping team, and check the routine: it is a
+   list of `spin`, `turn`, and `run`, no longer than `max_routine_moves`, with
+   exactly one `run`, because only the run takes the units to the dock.
+5. Do all the checks before you assign any manager. A team that starts makes
+   parts that the next team must take, so an order that one team cannot do
+   leaves parts in the buffers. If the request is not possible, explain why in
+   your final report, assign no manager, and stop. Do not ask the user a
+   question: nobody answers in the supervisor window during a run.
 
 ### Step 3: Assign the managers, downstream first
 

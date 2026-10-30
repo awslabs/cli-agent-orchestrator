@@ -280,7 +280,7 @@ judgment to make: for example, an inspection robot that interprets camera
 images, a mobile manipulator with open-ended tasks, or a fleet of different
 robots with no cell controller. To do that with this example, give each robot
 its own profile and credential (a `robot` claim next to `zone`), and let the
-team manager delegate to its robot agents with `assign`: a fourth layer.
+team manager delegate to its robot agents with `assign`: a third layer of agents.
 
 ## Requirements
 
@@ -978,19 +978,19 @@ Use a new run for each scenario: stop and clean up the previous run, then do
 Steps 2 to 8 with the request of the scenario. To use `--port` or `--provider`,
 add them to the `prepare` command of Step 2.
 
-The runs of this guide did the first scenario with `--provider claude_code`,
-and the third scenario with the default provider, `copilot_cli`. The tests of
-the example check the controller side of the other scenarios: the
-`routine_needs_one_run` rejection and the operator stop.
+The runs of this guide did every scenario in the table: "Another routine" with
+the default provider, `copilot_cli`, and the others with
+`--provider claude_code`.
 
 | Scenario | Request | Expected result |
 | --- | --- | --- |
 | Balance the line | The request of Step 2 | Team A blocks. The supervisor slows Team A to the pace of Team B. All 16 units are at the dock. |
-| Defaults | `Make, assemble, and ship all the parts.` | The supervisor uses the defaults of its profile: each line at its `min_cycle_seconds`, a batch of 2, and the routine spin, turn, run. |
+| Defaults | `Make, assemble, and ship all the parts.` | The supervisor uses the defaults of its profile: each line at its `min_cycle_seconds` (Team A at 2 s, Team B at 4 s), a batch of 2, and the routine spin, turn, run. Team A blocks, and the supervisor sets it to the measured pace of Team B, about 6 s. |
 | Another routine | `Make, assemble, and ship 8 units. Start Team A at 6 s and Team B at 4 s. Ship in batches of 4 with the routine turn, run, spin.` | Team C loads four units, turns, runs, and spins after it runs back. Team B is faster, so the block is less likely. |
 | Impossible request | `Make, assemble, and ship 30 units.` | The supervisor finds only 16 raw parts. It reports that the order is not possible, and it assigns no manager. |
-| Not a valid routine | `Ship 16 units in batches of 2 with the routine spin, turn.` | The routine has no `run`. The supervisor refuses, or the controller rejects `start_shipping` with `routine_needs_one_run`, and the manager reports the rejection. |
-| Operator stop | The request of Step 2 | While the teams work, run `demo.py stop` in Terminal 1. The programs become `interrupted`, reason `operator_stop`. The robots stop where they are, and the controller rejects all later actions. |
+| Not a valid routine | `Make, assemble, and ship 8 units. Ship in batches of 2 with the routine spin, turn.` | The routine has no `run`. The supervisor refuses before it assigns any manager, and no robot moves. If a manager still calls `start_shipping`, the controller rejects it with `routine_needs_one_run`. |
+| A routine that is too long | `Make, assemble, and ship 16 units. Start Team A at 2 s and Team B at 8 s. Ship in batches of 2 with the routine spin, turn, spin, turn, spin, turn, run.` | The routine has seven moves, and `max_routine_moves` of Team C is 6. The supervisor refuses before it assigns any manager, and no robot moves. |
+| Operator stop | The request of Step 2 | While the teams work, run `demo.py stop` in Terminal 1. The programs become `interrupted`, reason `operator_stop`, and each team shows `stopped`. The robots stop where they are, and the controller rejects all later actions. |
 
 ## From the simulation to real robots
 
@@ -1008,10 +1008,12 @@ layers** above the robots: the plan, the teams, and the balance of the line.
 | The credential of each manager | A separate access key for the cell controller of each area |
 | `demo.py stop` | A stop request in software. It does not replace the emergency stop and the safety system of the robots. |
 
-The CAO side stays the same: the profiles, the allowlists, `assign`, and
-`send_message`. Only the MCP server behind `factory-sim` changes. A real site
-also needs a safety system on the robots, a connection from the MCP server to
-each cell controller, and tests on the site with people who monitor the robots.
+The structure on the CAO side stays the same: one profile for each role, the
+allowlists, `assign`, and `send_message`. The MCP server behind `factory-sim`
+changes, and so does the text of each profile: today each profile says that
+it runs a simulation and must not contact physical robots. A real site also
+needs a safety system on the robots, a connection from the MCP server to each
+cell controller, and tests on the site with people who monitor the robots.
 
 ## Safety and limits
 

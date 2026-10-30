@@ -415,3 +415,31 @@ def test_extra_host_names_come_only_from_the_environment(monkeypatch):
     assert factory_mcp.allowed_hosts() is None
     monkeypatch.setenv("FACTORY_ALLOWED_HOSTS", " ide.example.com , ,other.example ")
     assert factory_mcp.allowed_hosts() == ["ide.example.com", "other.example"]
+
+
+def test_a_routine_longer_than_the_scene_limit_fails_the_schema(controller):
+    url, credentials, world, _ = controller
+    limit = world.scene.teams["east"].max_routine_moves
+
+    async def exercise():
+        async with controller_client(url, credentials["east"].get_secret_value()) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    "start_shipping",
+                    {
+                        "command_id": "ship",
+                        "units": 2,
+                        "batch": 2,
+                        "routine": ["spin"] * limit + ["run"],
+                    },
+                )
+
+    asyncio.run(exercise())
+
+
+def test_make_server_refuses_a_scene_that_disagrees_with_the_schema_limit(tmp_path):
+    data = json.loads((EXAMPLE / "factory.json").read_text())
+    data["teams"]["east"]["max_routine_moves"] += 1
+    world = World(Scene.model_validate(data), allow_motion=True)
+    with pytest.raises(ValueError, match="max_routine_moves"):
+        make_server(world, {}, tmp_path / "snapshot.json")

@@ -24,8 +24,9 @@ on:
       - 'patches/**'
       - 'vendor/**'
       - 'scripts/test-braces-security.cjs'
-      # The physical AI blog post embeds these images.
+      # The physical AI blog posts embed these images.
       - 'examples/robotics/cross-zone-transport/images/**'
+      - 'examples/robotics/hierarchical-factory/images/**'
       - '.github/workflows/gh-pages.yml'
   pull_request:
     paths:
@@ -33,8 +34,9 @@ on:
       - 'patches/**'
       - 'vendor/**'
       - 'scripts/test-braces-security.cjs'
-      # The physical AI blog post embeds these images.
+      # The physical AI blog posts embed these images.
       - 'examples/robotics/cross-zone-transport/images/**'
+      - 'examples/robotics/hierarchical-factory/images/**'
       - '.github/workflows/gh-pages.yml'
   workflow_dispatch:
 

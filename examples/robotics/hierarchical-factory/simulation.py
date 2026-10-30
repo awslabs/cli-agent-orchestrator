@@ -93,6 +93,7 @@ class Team(Model):
     min_cycle_seconds: Positive | None = None
     max_cycle_seconds: Positive | None = None
     max_batch: int | None = Field(default=None, ge=1)
+    max_routine_moves: int | None = Field(default=None, ge=1)
     run_to: XY | None = None
     run_speed_m_s: Positive | None = None
     turn_deg_s: Positive = 90
@@ -181,6 +182,8 @@ class Scene(Model):
             # team before it never fills the buffer past its capacity.
             if team.max_batch > source.capacity:
                 raise ValueError("max_batch must not exceed the capacity of the input buffer")
+            if team.max_routine_moves is None:
+                raise ValueError("max_routine_moves must be set for a formation team")
             if team.run_to is None or team.run_speed_m_s is None:
                 raise ValueError("a formation team needs run_to and run_speed_m_s")
             # The formation turns about its centre, so every slot must stay in
@@ -831,6 +834,8 @@ class World:
                     reason = "wrong_team_kind"
                 elif not 1 <= batch <= team.max_batch:
                     reason = "batch_out_of_range"
+                elif len(routine) > team.max_routine_moves:
+                    reason = "routine_too_long"
                 elif any(move not in MOVES for move in routine) or routine.count("run") != 1:
                     reason = "routine_needs_one_run"
             if reason:
@@ -1229,7 +1234,10 @@ class World:
         with self.lock:
             team, state = self.scene.teams[zone], self.teams[zone]
             program = state.program
-            if state.forming is not None:
+            if self.stopped and (state.forming is not None or (program and not program.done)):
+                # The operator stopped the run: the program is interrupted for good.
+                status = "stopped"
+            elif state.forming is not None:
                 status = "forming"
             elif program is None:
                 status = "ready" if state.formed else "idle"

@@ -85,11 +85,28 @@ Every derived path resolves from this value, so one override moves everything â€
   },
   "logging": {
     "level": "INFO"
-  }
+  },
+  "ephemeral": {
+    "enabled": false,
+    "allowed_providers": ["claude_code"]
+  },
+  "decisions": {
+    "points": {
+      "model.route": {"state": "off", "decider": "fixed_table"},
+      "effort.route": {"state": "off", "decider": "fixed_table"}
+    },
+    "on_timeout_ms": 1000,
+    "confidence_threshold": 0.7,
+    "retention_days": 90
+  },
+  "model_tiers": {}
 }
 ```
 
 Every top-level key is optional â€” omit any section/key you don't want to override; `ConfigService` fills in built-in defaults.
+The `ephemeral`, `decisions` and `model_tiers` blocks are read outside `ConfigService`. See
+[Ephemeral agents (`ephemeral`)](#ephemeral-agents-ephemeral) below for every `ephemeral` key,
+and [Launch decisions](decisions.md#settings) for `decisions` and `model_tiers`.
 
 ## `cao config` CLI
 
@@ -136,9 +153,10 @@ Only JSON `true` enables the tool, and agent terminals must restart to see it.
 | `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex is an operator opt-in. |
 | `max_brief_bytes` | `8192` | Maximum UTF-8 bytes after brief normalization. |
 | `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched or swept. |
-| `claim_lease_seconds` | `60` | Lease from claim to terminal creation. |
+| `claim_lease_seconds` | `60` | Lease from claim to terminal creation. With `model_tier: "auto"` it must be at least `decisions.on_timeout_ms / 1000 + 30`. |
 | `max_depth` | `1` | Only integer 1 is supported; ephemeral callers cannot create ephemerals. |
-| `max_tier` | `null` | Maximum model tier; a ceiling requires a default at or below it and mappings for every permitted tier and allowed provider. |
+| `min_tier` | `null` | Optional minimum model tier; must not exceed `max_tier` and needs a `default_tier` at or above it. |
+| `max_tier` | `null` | Maximum model tier; a ceiling requires a default at or below it and mappings for every permitted tier, from the floor up, and allowed provider. |
 | `default_tier` | `null` | Model tier used when the spec omits `model_tier`, resolved once at creation and required to be mapped for every allowed provider. |
 | `max_effort` | `null` | Maximum reasoning effort; a ceiling requires a default at or below it. |
 | `default_effort` | `null` | Reasoning effort used when the spec omits `effort`, resolved once at creation. |

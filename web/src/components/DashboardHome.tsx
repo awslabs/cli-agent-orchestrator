@@ -8,6 +8,8 @@ import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 import { AgentDescription } from './AgentDescription'
+import { FleetStatusCard } from './FleetStatusCard'
+import { FleetWorkers } from './FleetWorkers'
 import { parseServerTime } from '../time'
 
 const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
@@ -289,6 +291,11 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
         </button>
       </div>
 
+      {/* Fleet */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <FleetStatusCard />
+      </div>
+
       {/* Quick Actions */}
       <div className="flex gap-3 flex-wrap">
         <button onClick={() => onNavigate('agents')} className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium px-4 py-2.5 rounded-lg transition-colors">
@@ -511,6 +518,9 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
           })}
         </div>
       )}
+
+      {/* CAO cluster workers (read-only); collapsed, fetches only when opened. */}
+      <FleetWorkers />
 
       {/* Modals */}
       {inboxTerminalId && <InboxPanel terminalId={inboxTerminalId} onClose={() => setInboxTerminalId(null)} />}
