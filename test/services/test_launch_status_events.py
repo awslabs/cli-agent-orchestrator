@@ -240,6 +240,98 @@ class TestTmuxBusyTimeRecording:
         assert [r.status for r in _rows("t8")] == ["completed"]
 
 
+# The follow-up issue "Busy time misses two tmux status transitions that
+# StatusMonitor publishes". When it lands, the strict xfails below start
+# passing and fail the run, so drop their markers in that change.
+_UNRECORDED_GET_STATUS_TRANSITION = (
+    "Known gap: StatusMonitor.get_status publishes this transition without "
+    "recording it, so busy time is off until the next recorded change "
+    "(follow-up: 'Busy time misses two tmux status transitions that "
+    "StatusMonitor publishes')"
+)
+
+
+class TestUnrecordedGetStatusTransitions:
+    """Two latch changes in ``get_status`` are published on the bus but not
+    written to ``launch_status_events``. The plain tests pin that each one is
+    published today; the strict xfails say it is not recorded yet."""
+
+    @staticmethod
+    def _swarm_revoke(mock_pm, terminal_id):
+        """A native swarm starts another batch while the latch reads COMPLETED:
+        get_status revokes the ready status to PROCESSING."""
+        provider = MagicMock()
+        provider.has_pending_native_swarm = True
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+        assert sm._apply_detection(terminal_id, TerminalStatus.COMPLETED) is True
+        status = sm.get_status(terminal_id)
+        _drain_tmux_status_writes()
+        return status
+
+    @staticmethod
+    def _stale_capture_recovery(mock_pm, mock_get_backend, terminal_id):
+        """The buffer stopped changing while the latch reads PROCESSING, and
+        two matching pane captures confirm IDLE: get_status heals to IDLE."""
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.supports_screen_detection = False
+        provider.supports_direct_status_probe = True
+        provider.has_pending_native_swarm = False
+        provider.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = provider
+        mock_get_backend.return_value.get_history.return_value = "the real pane, idle"
+        sm = StatusMonitor()
+        assert sm._apply_detection(terminal_id, TerminalStatus.PROCESSING) is True
+        sm._buffers[terminal_id] = ""
+        sm._buffer_changed_at[terminal_id] = -1000.0  # quiet for good
+        assert sm.get_status(terminal_id) == TerminalStatus.PROCESSING  # first read
+        sm._last_stale_capture_check[terminal_id] = None  # skip the rate limit
+        status = sm.get_status(terminal_id)  # the confirming read
+        _drain_tmux_status_writes()
+        return status
+
+    @staticmethod
+    def _published(mock_bus):
+        return [c.args[1]["status"] for c in mock_bus.publish.call_args_list]
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_native_swarm_revoke_is_published(self, mock_get_backend, mock_pm, mock_bus):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        assert self._swarm_revoke(mock_pm, "t10") == TerminalStatus.PROCESSING
+        assert self._published(mock_bus) == ["completed", "processing"]
+
+    @pytest.mark.xfail(strict=True, reason=_UNRECORDED_GET_STATUS_TRANSITION)
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_native_swarm_revoke_is_recorded(self, mock_get_backend, mock_pm, mock_bus):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        self._swarm_revoke(mock_pm, "t11")
+        assert [r.status for r in _rows("t11")] == ["completed", "processing"]
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_stale_capture_recovery_is_published(self, mock_get_backend, mock_pm, mock_bus):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        status = self._stale_capture_recovery(mock_pm, mock_get_backend, "t12")
+        assert status == TerminalStatus.IDLE
+        assert self._published(mock_bus) == ["processing", "idle"]
+
+    @pytest.mark.xfail(strict=True, reason=_UNRECORDED_GET_STATUS_TRANSITION)
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_stale_capture_recovery_is_recorded(self, mock_get_backend, mock_pm, mock_bus):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        self._stale_capture_recovery(mock_pm, mock_get_backend, "t13")
+        assert [r.status for r in _rows("t13")] == ["processing", "idle"]
+
+
 class TestHerdrBusyTimeFromEvents:
     def test_agent_status_events_record_transitions_at_event_time(self, monkeypatch):
         _feed(
