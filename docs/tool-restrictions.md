@@ -359,6 +359,29 @@ own `tools` list keeps it. Enforcement is therefore install-time: change the
 profile, re-run `cao install`. Profiles installed before CAO wrote `tools`
 still carry `["*"]`; `cao launch` warns when it finds one.
 
+**Kiro CLI, v3 engine (preview, pending the operator checklist)** — `cao install
+… --engine v3` writes one universal file: the v2 fields above, plus
+`excludedTools` and `permissions.rules`. v3 selects tools by id and by tag, and
+its `read` tag also brings `code`, which can write files. So for v3:
+
+| CAO atom | Added to `tools` (v3 ids) | v3 tools the agent gets | Denied when not granted |
+|---|---|---|---|
+| `fs_read` | `read_file`, `list_directory` | the same | `fs_read`, `diagnostics`, `context`, `skill` (when `fs_list` is not granted either) |
+| `fs_list` | `file_search`, `grep_search` | the same | as `fs_read` |
+| `fs_write` | `fs_append`, `str_replace`, `delete_file` | those, `fs_write` and `code` | `fs_write` |
+| `execute_bash` | `invoke_sub_agent` | that, `execute_bash` and the per-agent `subagent/…` tools | `shell`, `subagent` |
+| `web_fetch` | `remote_web_search` | that and `web_fetch` | `web_fetch`, `web_search` |
+| `@server`, `@server/tool` | unchanged | that server's (or tool's) MCP tools | every other MCP tool |
+
+`tools` never holds the `read` tag; `excludedTools` removes everything the
+remaining entries could reach beyond the grant (`code` unless `fs_write` is
+granted, and always `knowledge`). Every capability outside the grant gets an
+unconditional deny, and `power` and `workflow` are always denied. CAO checks
+the file on disk at every v3 launch and refuses one that differs, so
+enforcement on v3 is install-time plus a launch-time check, and the pane's own
+`/tools` and `/mcp` panels are read before the first task. See
+[Kiro v3 (preview)](kiro-cli.md#kiro-v3-preview).
+
 **Copilot CLI** — Adds `--deny-tool` flags that override `--allow-all`:
 ```bash
 copilot --allow-all --deny-tool shell --deny-tool write

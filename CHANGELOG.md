@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
+  API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one
+  universal agent file with v3 tool exclusions and deny rules. A v3 launch is refused before
+  anything is allocated unless the kiro-cli version is supported, the agent file on disk is CAO's
+  own render for its grant, `KIRO_HOME` is the default and the workspace's `.kiro/` holds no
+  configuration; after the header, CAO reads `/tools` and `/mcp` before any task. **Not yet a
+  supported configuration:** v3 support is claimed only once the live operator checklist has passed.
+  Also: `cao launch` now shows the server's refusal reason instead of "Failed to connect", and the
+  memory wiki compiler's Kiro call pins `--agent-engine v2`.
+
 - **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3
   `Default` fallback** (#1167). A Kiro header with extra columns between the model and the context
   gauge, such as `<agent> · claude-haiku-5.5 · low · ◔ 2%` on the v2 engine with `--effort`, or

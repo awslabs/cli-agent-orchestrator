@@ -40,8 +40,114 @@ curl -X POST "http://localhost:9889/sessions?provider=kiro_cli&agent_profile=dev
 
 `--engine v2` is explicit but optional because v2 is the default. `--engine v3`
 selects Kiro's v3 engine (`kas`, its earlier CAO name, is accepted as an alias
-and stored as `v3`). CAO capability-probes it and currently rejects it before
-terminal allocation rather than claiming runtime v3 support.
+and stored as `v3`). v3 is opt-in and **not yet a supported configuration**; see
+[Kiro v3 (preview)](#kiro-v3-preview) below.
+
+## Kiro v3 (preview)
+
+> **Status: preview, pending the operator checklist.** The v3 launch path below is
+> built and unit-tested, but CAO does not claim v3 support until a live operator
+> checklist has passed on a supported kiro-cli version. Until then, use `v2` for
+> real work.
+
+**Why it matters.** Kiro ships a second agent engine, v3, and offers to switch
+users to it. On v3 an agent file in v2's format is skipped and Kiro starts its
+own `Default` agent, which has read, write, shell and web tools. So CAO only
+launches v3 when it can prove the agent's limits before any task is typed.
+
+### Quick start
+
+```bash
+# Write one agent file that both engines are meant to load
+cao install reviewer --provider kiro_cli --engine v3
+
+# Launch it on v3
+cao launch --agents reviewer --provider kiro_cli --engine v3
+```
+
+`--engine v2` writes a v2-only file again. A reinstall without `--engine`, and
+an agent-plugin MCP refresh, keep whichever format is on disk.
+
+### What CAO checks
+
+Before anything is allocated:
+
+- the kiro-cli version is one CAO supports (see below);
+- the agent is not unrestricted (`*`);
+- no `KIRO_HOME` other than `~/.kiro` reaches the launch;
+- the installed agent file on disk is exactly what `cao install --engine v3`
+  writes for its grant, and that grant fits the launch;
+- the launch directory and its parents have no `.kiro/` configuration v3 would
+  load (see *Workspace trust*).
+
+After kiro-cli starts, and before any task is typed:
+
+- no dialog is on screen (CAO never answers the workspace-trust dialog);
+- the header names the agent (as on v2);
+- the workspace check runs again;
+- CAO reads the agent file's grant again (it must still fit the launch), then
+  types `/tools` and `/mcp` and reads both panels: every tool tag must be one
+  that grant implies, every MCP tool must belong to a granted server, and
+  exactly the configured MCP servers must be running, each with a tool.
+
+Only then does the terminal accept input. If any check fails, no task is typed
+and the window is closed.
+
+The launch command is:
+
+```bash
+/usr/bin/env -u ASBX_KIRO_MANDATORY_MCPS -u KIRO_AGENT_CONFIG_DIR -u KIRO_AGENT_ENGINE -u KIRO_HOME \
+  kiro-cli chat --agent-engine v3 --trust-workspace --trust-all-tools [--model m] [--effort e] --agent <name>
+```
+
+`--effort` comes from the profile's `kiroConfig.effort`, when set.
+
+### Supported kiro-cli versions
+
+| kiro-cli | v3 engine | Status |
+|---|---|---|
+| 2.35.1 | `@kiro/agent` 0.66.70 | measured |
+| 2.36.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch until verified |
+
+Any other version refuses v3; v2 is not affected. A new kiro-cli release needs a
+CAO update before v3 runs on it.
+
+### Workspace trust
+
+CAO passes `--trust-workspace` only when no `.kiro/` in the launch directory or
+its parents holds configuration. Allowed: `steering/`, `specs/`, `skills/` and
+`AGENTS.md`. Refused: `agents/`, `hooks/`, `settings/`, `workflows/`,
+`extensions/`, `powers/`, any other entry, and any symlink. Your own `~/.kiro`
+is not checked.
+
+### When a v3 launch is refused
+
+| Message starts with | What it means | Fix |
+|---|---|---|
+| `kiro_v3_unsupported_version` | kiro-cli is a version CAO has no schema for | use a supported version, or `--engine v2` |
+| `kiro_v3_unverified_version` | the version is listed but not yet operator-verified | `--engine v2` until it is verified |
+| `kiro_v3_unrestricted` | the agent or launch allows every tool (`*`) | restrict `allowedTools` |
+| `kiro_v3_home_unsupported` | `KIRO_HOME` points somewhere other than `~/.kiro` | unset it for the launch |
+| `kiro_v3_not_installed` | no agent file for this agent | `cao install <name> --provider kiro_cli --engine v3` |
+| `kiro_v3_bad_cwd` | CAO could not read the launch directory to check it | launch from an existing directory |
+| `kiro_v3_invalid:<check>` | the agent file on disk is not CAO's v3 render (a v2 file, a hand edit, or Kiro's own upgrader rewrote it) | `cao install <name> --provider kiro_cli --engine v3`; the message names any `.bak` copy Kiro left |
+| `kiro_v3_workspace_config:<entry>` | the workspace's `.kiro/` holds configuration v3 would load | remove it, use a worktree without it, or `--engine v2` |
+| `kiro_v3_trust_dialog` | kiro-cli asked to trust the workspace anyway | report it; CAO never answers that dialog |
+| `kiro_v3_startup_dialog` | kiro-cli showed a dialog CAO does not know | report it with a screenshot |
+| `kiro_v3_tools_mismatch` | `/tools` shows a tag or MCP tool the grant does not allow, or the agent file changed after the launch check | reinstall; if it persists, report it |
+| `kiro_v3_mcp_not_ready` | `/mcp` shows an extra, failed or missing server, or one still loading after about 20 s | check that the server starts on its own, then retry |
+
+### FAQ
+
+**Will my v2 agents change?** No. Only `cao install --engine v3`, or a profile
+that says `engine: v3`, writes the universal file; every other install is
+byte-identical to before.
+
+**Can I use `hooks`, `toolsSettings` or `toolAliases` on v3?** Not yet: CAO
+refuses to install such a profile for v3 rather than approximate it.
+
+**Does CAO answer Kiro's approval prompt on v3?** No. It reads as waiting for an
+answer, for you or a supervisor.
 
 ## Features
 
