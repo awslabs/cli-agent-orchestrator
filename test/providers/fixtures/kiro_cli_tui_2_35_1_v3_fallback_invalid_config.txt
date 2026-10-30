@@ -1,0 +1,50 @@
+• agent "v3bad" has an invalid config, using "default" — v3bad.json: AgentFileFormatError: Schema validation failed: permissions.rules.0.effect: Invalid enum …
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Trust All Tools active, confirmations are off · /quit to exit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Default · auto · ◔ 1%                                                                                                                                                       /private/tmp/kv3.XXXXXX/repo
+
+›  ask a question or describe a task ↵
+                                                                                                                                                               /sessions to resume · /copy to clipboard
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

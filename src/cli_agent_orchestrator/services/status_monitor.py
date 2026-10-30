@@ -8,6 +8,8 @@ import asyncio
 import logging
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
@@ -29,6 +31,81 @@ if TYPE_CHECKING:
     from cli_agent_orchestrator.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
+
+
+# The one thread that writes tmux status transitions (issue #1082). Detection
+# runs on the event loop (the quiescence handlers) as well as on worker
+# threads, and a SQLite commit can wait up to the driver's 5 s lock timeout,
+# so the write never runs on the loop. One thread fed in transition order also
+# keeps each terminal's rows in that order: compute_busy_seconds reads them
+# by id. Created on first use.
+_status_event_writer: Optional[ThreadPoolExecutor] = None
+_status_event_writer_lock = threading.Lock()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _status_event_executor() -> ThreadPoolExecutor:
+    global _status_event_writer
+    with _status_event_writer_lock:
+        if _status_event_writer is None:
+            _status_event_writer = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="cao-launch-status"
+            )
+        return _status_event_writer
+
+
+def _write_status_transition(terminal_id: str, status: str, observed_at: datetime) -> None:
+    try:
+        from cli_agent_orchestrator.clients import database
+
+        database.record_launch_status_event(terminal_id, status, observed_at)
+    except Exception:
+        logger.debug("Launch status event recording failed for %s", terminal_id, exc_info=True)
+
+
+def _queue_status_transition(terminal_id: str, status: "TerminalStatus") -> Optional[Future]:
+    """Hand one tmux status transition to the writer thread (issue #1082).
+
+    Call it in the critical section that decided the change: ``observed_at``
+    is then the transition time, and the queue order is the transition order.
+    herdr terminals never reach this: their transitions come from herdr's own
+    ``agent_status`` events (``HerdrInboxService``), not from polling
+    ``get_status()``. Side-effect only: never raises, so a recording failure
+    can never affect the status any caller observes.
+    """
+    try:
+        return _status_event_executor().submit(
+            _write_status_transition, terminal_id, status.value, _utcnow()
+        )
+    except Exception:
+        logger.debug("Launch status event recording failed for %s", terminal_id, exc_info=True)
+        return None
+
+
+def _wait_for_status_write_off_loop(write: Optional[Future]) -> None:
+    """Let a worker-thread caller return only once its row is written, as when
+    it wrote inline. On the event loop, never wait.
+
+    The wait is deliberate: it keeps parity with the old inline write, so a
+    caller that reads the row back right after the transition finds it. It
+    runs outside the monitor lock, and only on a real transition, but under
+    SQLite lock contention it can add up to the driver's 5 s timeout to that
+    worker thread's call.
+    """
+    if write is None:
+        return
+    try:
+        asyncio.get_running_loop()
+        return
+    except RuntimeError:
+        pass
+    try:
+        write.result()
+    except Exception:
+        logger.debug("Launch status event recording failed", exc_info=True)
 
 
 # Statuses that represent a stable "ready" state — the agent has finished
@@ -388,6 +465,7 @@ class StatusMonitor:
             if detected == TerminalStatus.WAITING_USER_ANSWER:
                 self._waiting_generation[terminal_id] = self._capture_generation.get(terminal_id, 0)
             changed = self._apply_detection_locked(terminal_id, detected)
+            status_write = _queue_status_transition(terminal_id, detected) if changed else None
             if (
                 not changed
                 and detected == TerminalStatus.PROCESSING
@@ -406,6 +484,9 @@ class StatusMonitor:
             # re-enter StatusMonitor while the latch state is mid-update.
             bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
+            # Off the loop, wait for the row on purpose (see the helper);
+            # queued above, so the write order is already fixed.
+            _wait_for_status_write_off_loop(status_write)
         return True
 
     def _apply_detection_locked(self, terminal_id: str, detected: TerminalStatus) -> bool:

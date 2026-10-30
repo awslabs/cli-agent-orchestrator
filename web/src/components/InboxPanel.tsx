@@ -40,7 +40,7 @@ function MessageStatusBadge({ status }: { status: InboxMessage['status'] }) {
   }
   const c = config[status] || config.pending
   return (
-    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${c.bg} ${c.text}`}>
+    <span className={`inline-flex items-center px-1.5 py-0.5 rounded-sm text-[10px] font-medium ${c.bg} ${c.text}`}>
       {c.label}
     </span>
   )
@@ -114,9 +114,9 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
   const isReceiver = (msg: InboxMessage) => msg.receiver_id === terminalId
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center">
+    <div className="fixed inset-0 z-60 flex items-center justify-center">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-xs" onClick={onClose} />
 
       {/* Modal */}
       <div className="relative bg-gray-900 border border-gray-700/50 rounded-2xl shadow-2xl w-full max-w-[600px] mx-4 flex flex-col" style={{ maxHeight: 'calc(100vh - 80px)' }}>
@@ -192,7 +192,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
                       </span>
                       <MessageStatusBadge status={msg.status} />
                     </div>
-                    <p className="text-sm text-gray-200 whitespace-pre-wrap break-words">{msg.message}</p>
+                    <p className="text-sm text-gray-200 whitespace-pre-wrap wrap-break-word">{msg.message}</p>
                     {msg.created_at && (
                       <p className="text-[10px] text-gray-600 mt-1">{formatRelativeTime(msg.created_at)}</p>
                     )}
@@ -214,7 +214,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
               onChange={e => setSendText(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder="Type a message..."
-              className="flex-1 bg-gray-800 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-none placeholder-gray-600"
+              className="flex-1 bg-gray-800 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-hidden placeholder-gray-600"
             />
             <button
               onClick={handleSend}

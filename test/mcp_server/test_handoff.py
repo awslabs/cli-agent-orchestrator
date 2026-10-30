@@ -890,15 +890,13 @@ class TestHandoffSlowCreateSurfacesTerminalId:
     TestHandoffCreateTimeoutRecovery."""
 
     def test_slow_but_successful_create_is_not_killed_client_side(self, monkeypatch):
-        """Companion end-to-end sanity check, independent of the constant's
-        actual value: a real HTTP round trip (no `requests` mocking) against a
-        stand-in server that sleeps past a client timeout before answering
-        successfully must still surface the terminal_id, not just a clean
-        failure. Zero existing test exercised this path against a real
-        timeout window before this. Uses its own stand-in timeout/delay
-        values (not the real constant) purely so the test runs in
-        milliseconds -- the mechanism being verified is identical at the real
-        240.0s scale."""
+        """Companion end-to-end sanity check, independent of the budget
+        ``synchronous_create_timeout`` derives: a real HTTP round trip (no
+        `requests` mocking) against a stand-in server that sleeps past a client
+        timeout before answering successfully must still surface the
+        terminal_id, not just a clean failure. Uses its own stand-in
+        timeout/delay values purely so the test runs in milliseconds -- the
+        mechanism is the same at the real derived budget."""
         import http.server
         import threading
         import time

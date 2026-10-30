@@ -182,7 +182,7 @@ class TestHappyPath:
         m_out.assert_called_once_with("abc12345", OutputMode.LAST)
         # Created-here + teardown default -> graceful exit THEN delete.
         m_exit.assert_called_once_with("abc12345")
-        m_delete.assert_called_once_with("abc12345", registry=None)
+        m_delete.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
 
     def test_teardown_false_skips_delete(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
@@ -439,7 +439,7 @@ class TestHappyPath:
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with create, send, delete as m_delete, get_output, exit_cli, wait, status:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", registry=sentinel))
-        m_delete.assert_called_once_with("abc12345", registry=sentinel)
+        m_delete.assert_called_once_with("abc12345", registry=sentinel, end_reason="deleted")
 
     def test_explicit_wd_wins_over_caller_inheritance(self):
         """An explicit working_directory takes precedence even when caller_id
@@ -707,7 +707,7 @@ class TestTeardownIsBestEffort:
             result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert result.status == TerminalStatus.COMPLETED
         # Exit failed but delete still ran.
-        m_delete.assert_called_once_with("abc12345", registry=None)
+        m_delete.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
 
     def test_on_step_terminal_ready_callback_failure_does_not_fail_step(self):
         """F9(b): a raising ``on_step_terminal_ready`` callback (BR-31 sweep
@@ -1060,7 +1060,7 @@ class TestInterruptibleCancel:
         m_out.assert_not_called()
         # A terminal this call created is reclaimed exactly like the success path.
         m_exit.assert_called_once_with("abc12345")
-        m_delete.assert_called_once_with("abc12345", registry=None)
+        m_delete.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
 
     def test_reused_terminal_not_torn_down_on_cancel(self):
         """A cancelled step must NOT delete a terminal it did not create — the
@@ -1122,7 +1122,7 @@ class TestOutputExtractionTeardown:
         m_out.assert_called_once_with("abc12345", OutputMode.LAST)
         # A terminal this call created is reclaimed exactly like the success path.
         m_exit.assert_called_once_with("abc12345")
-        m_delete.assert_called_once_with("abc12345", registry=None)
+        m_delete.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
 
     def test_extraction_failure_does_not_tear_down_reused_terminal(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
@@ -1178,7 +1178,7 @@ def test_extraction_error_prefix_preserves_type_cause_and_owned_teardown(rejecte
     assert str(raised.value) == "terminal abc12345: no publishable response"
     assert raised.value.__cause__ is original
     exited.assert_called_once_with("abc12345")
-    deleted.assert_called_once_with("abc12345", registry=None)
+    deleted.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
 
 
 class TestInBandProviderError:
@@ -1428,7 +1428,7 @@ class TestInBandProviderError:
         assert self.ERROR in str(excinfo.value)  # criterion 2: text retrievable
         assert excinfo.value.terminal_id == "abc12345"  # still reported
         m_exit.assert_called_once_with("abc12345")
-        m_delete.assert_called_once_with("abc12345", registry=None)
+        m_delete.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
 
     def test_provider_error_on_a_reused_terminal_is_not_torn_down(self):
         """Teardown stays scoped to a terminal THIS call created: a reused terminal

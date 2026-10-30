@@ -132,4 +132,4 @@ class TestCrossNodeDeferredFailureNotify:
 
         _notify_caller_of_deferred_failure("feed0004", "boom", registry=None, delete_worker=True)
 
-        mock_delete.assert_called_once_with("feed0004", registry=None)
+        mock_delete.assert_called_once_with("feed0004", registry=None, end_reason="launch_failed")

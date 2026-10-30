@@ -5,8 +5,10 @@ the caller omits a model. Local and remote assign, elastic assign, handoff and
 CLI handoff use it. Both decision points are **off by default**, so normal
 launches keep their existing behavior until an operator enables routing.
 
-Plain terminal creates and older clients that do not send the original task
-message are not routed. An empty task message is also not routed: local and
+An ephemeral agent is routed only when its spec set `model_tier: "auto"`; see
+[Ephemeral agents](ephemeral-agents.md#model-tier-auto). Plain terminal creates and
+older clients that do not send the original task message are not routed. An empty
+task message is also not routed: local and
 remote assign, elastic assign, handoff and CLI handoff launch it unrouted
 rather than refusing it, the same as when no message is sent at all. The CLI
 still refuses an empty `--message-file` before it launches anything. Reusing a
@@ -32,6 +34,9 @@ The fallback order is the installed profile default, the policy default, then
 the provider default. A required policy tier must map to a model; otherwise the
 launch is refused. Policy checks run before scope and decider calls. An explicit
 value above a policy ceiling is refused; a decider answer above it is capped.
+A policy may also carry a model tier floor. An explicit tier below it is refused,
+and a decider answer below it is raised to the floor and recorded as `capped`. With
+a floor and a ceiling, every tier from the floor to the ceiling must be mapped.
 The launch-time policy check covers every checked provider in the envelope,
 including providers other than the target. A missing mapping anywhere in that
 set refuses the launch and names `model_tiers.<provider>.<tier>`.
@@ -127,7 +132,7 @@ the launch check still refuses an unmapped required default on the target.
 
 `exclude_profiles` pins installed profiles to their existing model resolution:
 no `model.route` question and no `model.route` record for launches that pass
-policy. Other points, such as `effort.route`, are still asked and recorded.
+policy. It changes no other point; no installed launch asks `effort.route` in this version.
 Refused launches still write a rejected record in shadow or on. Names not
 installed are retained but have no effect. There is no profile-frontmatter
 switch for decisions.
@@ -138,7 +143,9 @@ refused; it does not mean unlimited. Values outside these ranges in
 `settings.json` or in the scalar overrides `CAO_DECISION_ON_TIMEOUT_MS` and
 `CAO_DECISION_CONFIDENCE_THRESHOLD` are clamped, with a warning. The fixed table
 looks up profile first, then role, and returns probability 1.0; a miss gives no
-answer. It is a decider, never part of fallback resolution. Shadow defaults to
+answer. It is a decider, never part of fallback resolution. `effort.route` table
+entries are stored but not read yet, because no launch asks `effort.route` in this
+version. Shadow defaults to
 four concurrent and 64 pending tasks, with a 10000 ms decider timeout. These have
 no CLI setter; values in `settings.json` are clamped, with a warning, to 1–1024
 concurrent, 0–100000 pending and 50–60000 ms. Overflow is recorded as `shadow_dropped`;
@@ -180,9 +187,12 @@ can lose updates because the existing settings writer is not atomic.
 ## Records and telemetry
 
 The node's SQLite `decision_records` table holds one record per point per
-launch in shadow or on. Records include state, decider name/version, fallback
-value/source, answer and probabilities, capped candidate, applied value, latency,
-reason, terminal ID, launched model and whether it was honored. `target_kind` is
+launch in shadow or on. Records include `state`, `decider` and `decider_version`,
+`fallback_value` and `fallback_source`, `answer`, `probabilities` and `confidence`, the
+capped candidate (`candidate_value`, `candidate_model`), `applied_value`, `outcome`,
+`latency_ms`, `reason`, `terminal_id`, `launched_model` and whether it was honored
+(`model_honored`). They also hold `message_hash`, `hash_key_id` and `message_bytes`.
+`cao decisions list` prints every column as JSON. `target_kind` is
 `installed`, `ephemeral` or `workflow`; `workflow` marks a script workflow's own
 step. Records written before the column existed keep `target_kind` null: the
 upgrade adds the column and does not backfill it. A policy model
@@ -213,10 +223,15 @@ an unavailable ephemeral profile, a KAS request, an engine given for a
 provider other than Kiro, or a `caller_ceiling` conflict — is bound
 `launch_failed`, even though nothing was actually allocated yet.
 
-Records never hold task messages, descriptions, purposes, prompts or working directories.
+Records never hold task messages, descriptions, prompts or working directories. They hold
+no purpose either, except inside an ephemeral agent's name: `agent_profile` records that
+name, and ephemeral names include the purpose.
 Messages, descriptions and purposes are redacted before every decider call, including the
 fixed table. Installed profile names and roles are bounded and redacted facts;
-ephemeral targets send neither. The message hash is a keyed HMAC of the redacted
+ephemeral targets send no profile name or role. Instead, an ephemeral target sends its redacted purpose and,
+when the creator wrote one, its redacted description in `profile_description`; it
+never sends the creator brief. A decider whose consent binds the fields it receives
+needs fresh operator consent before it sees an ephemeral description. The message hash is a keyed HMAC of the redacted
 canonical message, with a key identifier; the hash is never sent to deciders.
 
 The HMAC key is `decision-hash.key` in the database directory, mode 0600. Creation
@@ -417,7 +432,8 @@ need an interactive terminal. CAO's own agent-facing tools offer no consent.
 - A decider that blocks the event loop cannot be preempted by an asynchronous timeout.
 - Terminal records expose the launched model and whether it was honored, independently of decision state; decision fields stay in operator records.
 - If a policy tightens between a launch and `create_terminal`'s own idempotent retry, the retry can be refused before replaying the existing terminal. This does not occur with an identity policy. Each replayed delegation create writes its own `not_launched` row; in shadow or on the decider is asked again.
-- A direct API delegation to a reserved ephemeral name without a claim, carrying a per-call model, is refused at the delegation site with HTTP 400 "set the tier in the spec instead of a per-call model". The response names no reason code and no decision record is written. The ephemeral launch policy never sees the request, so it does not log the refusal either. Assign and handoff refuse reserved names before sending any request. A claimed launch skips the delegation site and is refused, and logged, by the ephemeral policy itself.
+- A direct API delegation to a reserved ephemeral name without a claim, carrying a per-call model, is refused at the delegation site with HTTP 400 "set the tier in the spec instead of a per-call model". The response names no reason code and no decision record is written. The ephemeral launch policy never sees the request, so it does not log the refusal either. Assign and handoff refuse reserved names before sending any request. A claimed launch with a per-call model asks no decider and is refused, and logged, by the ephemeral policy itself.
+- A claimed ephemeral launch asks `model.route` only when its stored spec declared `model_tier: "auto"` (see [Ephemeral agents](ephemeral-agents.md#model-tier-auto)). Explicit and omitted tiers, and launches without a claim, ask nothing and write no record. The decided model applies through the launch plan only; the ephemeral archive stores the record ids. `effort.route` is never asked for an ephemeral target.
 - A delegation is decided before the server applies the creator's delegation ceiling. A launch
   the ceiling refuses (403) has still been decided: in shadow or on, the decider was asked once
   with the redacted message, and in on mode the refusal waits for that answer. Its records are

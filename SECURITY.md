@@ -267,7 +267,7 @@ The lockfiles include these published fixes across all affected toolchains:
 | `compression` | `1.8.2` | Docs | CVE-2026-87776 |
 | `proxy-addr` | `2.0.8` | Docs | CVE-2026-90711 |
 | `joi` | `17.13.8` | Docs | CVE-2026-90771 |
-| `postcss-selector-parser` | `7.1.6` | Docs, web | CVE-2026-104844 |
+| `postcss-selector-parser` | `7.1.6` | Docs | CVE-2026-104844 |
 | `tinypool` | `2.1.2` | Docs | CVE-2026-104848, CVE-2026-104849 |
 
 The selector-parser v6 and Tinypool v1 consumer ranges exclude their fixed

@@ -490,7 +490,7 @@ can drive a CAO session without CAO-specific integration code:
 | Package | Install this if you are… | Skills | Also ships |
 |---|---|---|---|
 | [`cao`](../agent-plugin/cao) | **an operator** driving CAO from another client | `cao-session-management`, `cao-agent-routing`, `cao-supervisor-protocols`, `cao-worker-protocols` | the `cao-ops` MCP server |
-| [`cao-contributor`](../agent-plugin/cao-contributor) | **a contributor** extending CAO itself | `cao-provider`, `cao-plugin` | — |
+| [`cao-contributor`](../agent-plugin/cao-contributor) | **a contributor** extending CAO itself | `cao-provider`, `cao-plugin`, `cao-contributing` | — |
 
 The skill names are the folder names you will see under
 `~/.aws/cli-agent-orchestrator/skills/` after installing, which is what makes a

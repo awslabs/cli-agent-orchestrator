@@ -359,11 +359,18 @@ class InboxService:
                 # on herdr, status_monitor.get_status() shells out to the herdr CLI
                 # and returns UNKNOWN on any error, which would misclassify a
                 # provably-transient dialog refusal as FAILED and strand it anyway.
-                if e.reason == TerminalInputBlockedReason.WAITING_USER_ANSWER:
+                #
+                # A Kiro terminal this server is still initializing has not passed
+                # its identity check yet (#1074); that is transient too, and the
+                # reconcile sweep delivers once the check has been recorded.
+                if e.reason in (
+                    TerminalInputBlockedReason.WAITING_USER_ANSWER,
+                    TerminalInputBlockedReason.IDENTITY_PENDING,
+                ):
                     for message in batch:
                         update_message_status(message.id, MessageStatus.PENDING)
                     logger.warning(
-                        f"Terminal {terminal_id} is waiting on a user answer; leaving "
+                        f"Terminal {terminal_id} cannot take input yet; leaving "
                         f"{len(batch)} message(s) pending for retry: {e}"
                     )
                 else:

@@ -3,9 +3,8 @@
 **Validates: Requirements 1.1–1.6, 2.1–2.8, 3.1–3.5, 23.2**
 
 Both packages must validate as loadable with zero fatal findings, each
-allowlist must be enforced *independently*, and the absence of
-``cao-contributing`` from the contributor package must not read as a failure —
-it depends on PR #448, which is open and still a draft.
+allowlist must be enforced *independently*, and ``cao-contributing`` ships in
+the contributor package now that PR #448 has merged (#1120).
 """
 
 from __future__ import annotations
@@ -170,25 +169,25 @@ class TestContributorPackage:
         assert not (CONTRIBUTOR_DIR / "mcp.json").exists()
         assert not (CONTRIBUTOR_DIR / ".mcp.json").exists()
 
-    def test_the_absence_of_cao_contributing_is_not_a_failure(self):
-        """Requirement 2.6 — PR #448 is open and still a draft."""
+    def test_cao_contributing_ships_in_the_contributor_package(self):
+        """Requirement 2.6 — PR #448 merged, so the skill ships (#1120)."""
         report = validate_plugin(CONTRIBUTOR_DIR)
 
-        assert "cao-contributing" not in report.skill_names
+        assert "cao-contributing" in report.skill_names
         assert report.loadable
         assert [f for f in report.findings if f.severity is Severity.FATAL] == []
 
-    def test_adding_cao_contributing_is_one_allowlist_line(self, tmp_path):
+    def test_adding_a_skill_is_one_allowlist_line(self, tmp_path):
         """Requirement 2.7 — no change to structure, tooling, or CI.
 
         Simulated by building with an extended allowlist against a stub skill,
-        which is exactly the edit #448 landing would require.
+        which is exactly the edit adding ``cao-contributing`` took (#1120).
         """
         from dataclasses import replace
 
         stub_skills = tmp_path / "skills"
         stub_skills.mkdir()
-        for skill in [*builder.CONTRIBUTOR.skills, "cao-contributing"]:
+        for skill in [*builder.CONTRIBUTOR.skills, "cao-future-skill"]:
             folder = stub_skills / skill
             folder.mkdir()
             (folder / "SKILL.md").write_text(
@@ -196,7 +195,7 @@ class TestContributorPackage:
             )
 
         extended = replace(
-            builder.CONTRIBUTOR, skills=[*builder.CONTRIBUTOR.skills, "cao-contributing"]
+            builder.CONTRIBUTOR, skills=[*builder.CONTRIBUTOR.skills, "cao-future-skill"]
         )
 
         original = builder.CANONICAL_SKILLS_DIR
@@ -208,7 +207,7 @@ class TestContributorPackage:
 
         report = validate_plugin(built)
         assert report.loadable
-        assert "cao-contributing" in report.skill_names
+        assert "cao-future-skill" in report.skill_names
 
 
 class TestAllowlistsAreEnforcedIndependently:

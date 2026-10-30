@@ -1440,6 +1440,44 @@ class TestClaudeCodeProviderMisc:
 
         assert "--resume" not in command
 
+    def test_build_claude_command_with_fresh_session_id(self):
+        """Issue #1082 (provisional): a fresh launch's CAO-generated session_id
+        maps to `claude --session-id <sid>`."""
+        provider = ClaudeCodeProvider(
+            "test123",
+            "test-session",
+            "window-0",
+            session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+        )
+        command = provider._build_claude_command()
+
+        assert "--session-id 11d55034-bb41-46ca-8686-59a9dbff16b5" in command
+
+    def test_build_claude_command_no_session_id_by_default(self):
+        """Mutation guard: without session_id the command must not carry
+        --session-id at all."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        command = provider._build_claude_command()
+
+        assert "--session-id" not in command
+
+    def test_build_claude_command_resume_wins_over_session_id(self):
+        """Issue #1082 AC: 'Given a resumed launch, then it still uses --resume,
+        as today.' The two ids are mutually exclusive on a single launch, but if
+        both were ever set together --resume must win and --session-id must be
+        absent."""
+        provider = ClaudeCodeProvider(
+            "test123",
+            "test-session",
+            "window-0",
+            resume_session_id="resume-sid",
+            session_id="fresh-sid",
+        )
+        command = provider._build_claude_command()
+
+        assert "--resume resume-sid" in command
+        assert "--session-id" not in command
+
     @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
         """Test building Claude command with system prompt."""

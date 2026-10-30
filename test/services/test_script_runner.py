@@ -1326,9 +1326,11 @@ async def test_resume_of_a_record_written_before_the_root_binding_is_not_refused
 async def test_orphan_sweep_tears_down_in_flight_terminals(monkeypatch: pytest.MonkeyPatch):
     """In-flight step terminals are torn down; a terminal step is left alone."""
     deleted: List[str] = []
+    reasons: List[str] = []
 
-    def _fake_delete(terminal_id, registry=None):
+    def _fake_delete(terminal_id, registry=None, *, end_reason):
         deleted.append(terminal_id)
+        reasons.append(end_reason)
         return True
 
     monkeypatch.setattr(
@@ -1347,13 +1349,15 @@ async def test_orphan_sweep_tears_down_in_flight_terminals(monkeypatch: pytest.M
     await script_runner._reconcile_orphans("run-sweep")
     # Only s1 (in-flight + has a terminal) is torn down.
     assert deleted == ["term-1"]
+    # Issue #1082: an orphan sweep ends the launch as a stale cleanup.
+    assert reasons == ["stale_cleanup"]
 
 
 @pytest.mark.asyncio
 async def test_orphan_sweep_teardown_failure_never_raises(monkeypatch: pytest.MonkeyPatch):
     """INV-4: a teardown failure is logged, never raised into the drive path."""
 
-    def _boom_delete(terminal_id, registry=None):
+    def _boom_delete(terminal_id, registry=None, *, end_reason):
         raise RuntimeError("terminal already gone")
 
     monkeypatch.setattr(

@@ -33,7 +33,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
 )
 
-pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+pytestmark = pytest.mark.usefixtures("isolated_memory_db", "kiro_agent_store_not_under_test")
 
 
 class TestCreateTerminal:
@@ -76,6 +76,7 @@ class TestCreateTerminal:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -146,6 +147,7 @@ class TestCreateTerminal:
             model="profile-default-model",
         )
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
@@ -180,10 +182,12 @@ class TestCreateTerminal:
             None,
             initial_caller_id=None,
             delete_on_failure=False,
+            provider="codex",
         )
         # The scheduler is mocked in this test, so create_terminal releases the
-        # process-local fence instead of leaking it into later tests.
+        # process-local fences instead of leaking them into later tests.
         assert not terminal_service._is_deferred_init_external_owner_active("test1234")
+        assert not terminal_service._is_identity_check_in_flight("test1234")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service._schedule_deferred_init")
@@ -225,6 +229,7 @@ class TestCreateTerminal:
         }
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
@@ -355,6 +360,7 @@ class TestCreateTerminal:
         )
         mock_resolve_allowed.return_value = ["fs_read"]
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -385,6 +391,8 @@ class TestCreateTerminal:
             request_fingerprint=None,
             # Operator launch: the profile's own list is its delegation ceiling.
             delegate_tools=["fs_read"],
+            # Every Kiro row is written unverified (#1074).
+            identity_verified=False,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
@@ -432,6 +440,7 @@ class TestCreateTerminal:
             name="developer", description="Developer", model="profile-default-model"
         )
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -481,6 +490,7 @@ class TestCreateTerminal:
             name="developer", description="Developer", model="profile-default-model"
         )
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -530,6 +540,7 @@ class TestCreateTerminal:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -573,6 +584,7 @@ class TestCreateTerminal:
         mock_tmux.create_window.return_value = "developer-abcd"
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -847,6 +859,7 @@ class TestCreateTerminal:
             "- **python-testing**: Pytest conventions"
         )
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_path = MagicMock()
@@ -908,6 +921,7 @@ class TestCreateTerminal:
         )
         mock_build_skill_catalog.return_value = ""
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_path = MagicMock()
@@ -972,6 +986,7 @@ class TestCreateTerminal:
             "- **python-testing**: Pytest conventions"
         )
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_path = MagicMock()
@@ -1025,6 +1040,7 @@ class TestCreateTerminal:
         )
         mock_build_skill_catalog.return_value = "## Available Skills\n\n- skill-a"
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_dir.__truediv__.return_value = MagicMock()
@@ -1080,6 +1096,7 @@ class TestCreateTerminal:
         )
         mock_build_skill_catalog.return_value = ""
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_dir.__truediv__.return_value = MagicMock()
@@ -1130,6 +1147,7 @@ class TestCreateTerminal:
         mock_load_profile.side_effect = FileNotFoundError("Agent profile not found: developer")
         mock_build_skill_catalog.return_value = "## Available Skills\n\n- skill-a"
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_dir.__truediv__.return_value = MagicMock()
@@ -1182,6 +1200,7 @@ class TestCreateTerminal:
             name="developer", description="Developer", system_prompt="Base prompt"
         )
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_dir.__truediv__.return_value = MagicMock()
@@ -1226,6 +1245,7 @@ class TestCreateTerminal:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.side_effect = FileNotFoundError("Agent profile not found: my-agent")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_path = MagicMock()
@@ -1324,6 +1344,7 @@ class TestCreateTerminalIdempotencyKey:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -1376,6 +1397,7 @@ class TestCreateTerminalIdempotencyKey:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -1430,7 +1452,8 @@ class TestCreateTerminalIdempotencyKey:
             "developer",
             idempotency_key="stale-key",
         )
-        assert db_delete_terminal("long-gone-terminal") is True  # orphans the key row
+        # orphans the key row
+        assert db_delete_terminal("long-gone-terminal", end_reason="deleted") is True
 
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
@@ -1438,6 +1461,7 @@ class TestCreateTerminalIdempotencyKey:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -1569,6 +1593,7 @@ class TestReplayDuringInitializationBehaviour:
             return True
 
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.side_effect = initialize
         mock_provider_manager.create_provider.return_value = mock_provider
         # The original sees no record; once it has committed, the replay does.
@@ -1876,6 +1901,7 @@ class TestIdempotentReplayWaitsForInitialization:
             return True
 
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.side_effect = initialize
         mock_provider_manager.create_provider.return_value = mock_provider
 
@@ -2204,6 +2230,7 @@ class TestIdempotencyKeyRequestFingerprint:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="reviewer", description="Reviewer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -2281,6 +2308,7 @@ class TestCreateTerminalWorktree:
         mock_tmux.create_window.return_value = "developer-abcd"
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -2352,6 +2380,7 @@ class TestCreateTerminalWorktree:
         mock_tmux.create_window.return_value = "developer-abcd"
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -2425,6 +2454,7 @@ class TestCreateTerminalWorktree:
         mock_tmux.create_window.return_value = "developer-abcd"
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.side_effect = TimeoutError("provider init timed out")
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -2472,6 +2502,7 @@ class TestCreateTerminalEnvVars:
         mock_tmux.session_exists.return_value = session_exists
         mock_tmux.create_window.return_value = "developer-abcd"
         mock_provider = AsyncMock()
+        mock_provider.identity_verified = True
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
@@ -3607,7 +3638,7 @@ class TestDeleteTerminal:
         }
         mock_db_delete.return_value = True
 
-        result = delete_terminal("test1234")
+        result = delete_terminal("test1234", end_reason="deleted")
 
         assert result is True
         mock_tmux.stop_pipe_pane.assert_called_once()
@@ -3637,7 +3668,7 @@ class TestDeleteTerminal:
         mock_db_delete.return_value = True
 
         # Should not raise, just warn
-        result = delete_terminal("test1234")
+        result = delete_terminal("test1234", end_reason="deleted")
 
         assert result is True
 
@@ -3664,7 +3695,7 @@ class TestDeleteTerminal:
         }
         mock_provider_manager.cleanup_provider.return_value = False
 
-        assert delete_terminal("test1234") is False
+        assert delete_terminal("test1234", end_reason="deleted") is False
         mock_db_delete.assert_not_called()
         mock_provider_manager.cleanup_provider.assert_called_once_with("test1234")
 
@@ -3685,7 +3716,7 @@ class TestDeleteTerminal:
         mock_get_metadata.return_value = None
         mock_db_delete.return_value = True
 
-        result = delete_terminal("test1234")
+        result = delete_terminal("test1234", end_reason="deleted")
 
         assert result is True
 
@@ -3724,7 +3755,7 @@ class TestDeleteTerminalWorktree:
         mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
         mock_db_delete.return_value = True
 
-        result = delete_terminal("test1234")
+        result = delete_terminal("test1234", end_reason="deleted")
 
         assert result is True
         mock_worktree_service.remove_worktree.assert_called_once_with("/repo", "test1234")
@@ -3767,7 +3798,7 @@ class TestDeleteTerminalWorktree:
         mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
         mock_db_delete.return_value = True
 
-        result = delete_terminal("terminalB")
+        result = delete_terminal("terminalB", end_reason="deleted")
 
         assert result is True
         mock_worktree_service.remove_worktree.assert_not_called()
@@ -3801,7 +3832,7 @@ class TestDeleteTerminalWorktree:
         mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
         mock_db_delete.return_value = True
 
-        result = delete_terminal("test1234")
+        result = delete_terminal("test1234", end_reason="deleted")
 
         assert result is True
         mock_worktree_service.remove_worktree.assert_not_called()
@@ -3843,7 +3874,7 @@ class TestDeleteTerminalWorktree:
         mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
         mock_db_delete.return_value = True
 
-        result = delete_terminal("test1234")  # must not raise
+        result = delete_terminal("test1234", end_reason="deleted")  # must not raise
 
         assert result is True
         mock_worktree_service.remove_worktree.assert_not_called()
@@ -3887,7 +3918,9 @@ class TestDeferredInitFailureNotification:
 
         terminal_service._purge_stale_session_rows_for_recreate("cao-reused")
 
-        assert delete_row.call_args_list == [call("stale001", metadata["stale001"], registry=None)]
+        assert delete_row.call_args_list == [
+            call("stale001", metadata["stale001"], registry=None, end_reason="stale_cleanup")
+        ]
 
     """PR #390 must-fixes #1/#3: a deferred-init failure must be OBSERVABLE to
     the supervisor (assign already returned success=True), teardown must pass
@@ -3919,7 +3952,9 @@ class TestDeferredInitFailureNotification:
         assert kwargs["sender_id"] == "worker99"
         assert "init failed: boom" in kwargs["message"]
         # Teardown passes the registry so post_kill_terminal hooks fire.
-        mock_delete.assert_called_once_with("worker99", registry=registry)
+        mock_delete.assert_called_once_with(
+            "worker99", registry=registry, end_reason="launch_failed"
+        )
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
@@ -4007,7 +4042,7 @@ class TestDeferredInitFailureNotification:
                 "worker99", "provider startup failed", None, delete_worker=True
             )
 
-        mock_delete.assert_called_once_with("worker99", registry=None)
+        mock_delete.assert_called_once_with("worker99", registry=None, end_reason="launch_failed")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
@@ -4050,7 +4085,7 @@ class TestDeferredInitFailureNotification:
         await task
 
         mock_create_inbox.assert_called_once()
-        mock_delete.assert_called_once_with("worker99", registry=None)
+        mock_delete.assert_called_once_with("worker99", registry=None, end_reason="launch_failed")
         mock_terminal_ended.assert_called_once_with("worker99")
 
     @pytest.mark.asyncio
@@ -4264,6 +4299,7 @@ class TestDeferredInitFailureNotification:
             kind="provider_init_error",
             message="workspace trust required\x00",
             exception_type="ProviderError",
+            untrusted_runtime=False,
         )
 
         assert failure == {
@@ -4271,6 +4307,7 @@ class TestDeferredInitFailureNotification:
             "kind": "provider_init_error",
             "message": "workspace trust required",
             "exception_type": "ProviderError",
+            "untrusted_runtime": False,
         }
         assert update.call_args.args == ("worker99", failure)
 

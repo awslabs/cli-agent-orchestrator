@@ -109,7 +109,7 @@ async def test_restart_retry_propagates_cancellation_without_another_scan(monkey
 @pytest.mark.parametrize("kind", ["failure", "complete"])
 def test_deleted_terminal_cannot_acquire_a_late_sidecar(kind):
     pending("deleted")
-    assert ts.delete_terminal_row("deleted", None)
+    assert ts.delete_terminal_row("deleted", None, end_reason="deleted")
 
     if kind == "failure":
         published = ts._publish_deferred_failure_fallback("deleted", {"message": "late failure"})

@@ -126,14 +126,14 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         <div className="flex items-center gap-3">
           <TermIcon size={16} className="text-emerald-400" />
           <span className="text-sm font-mono text-gray-300">{terminalId}</span>
-          {provider && <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">{provider}</span>}
-          {agentProfile && <span className="text-xs text-emerald-400 bg-emerald-900/30 px-2 py-0.5 rounded">{agentProfile}</span>}
+          {provider && <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded-sm">{provider}</span>}
+          {agentProfile && <span className="text-xs text-emerald-400 bg-emerald-900/30 px-2 py-0.5 rounded-sm">{agentProfile}</span>}
         </div>
         <div className="flex items-center gap-3">
           <span className="text-[10px] text-gray-600">Click X to close</span>
           <button
             onClick={onClose}
-            className="p-1 text-gray-500 hover:text-white transition-colors rounded"
+            className="p-1 text-gray-500 hover:text-white transition-colors rounded-sm"
             title="Close terminal"
           >
             <X size={18} />

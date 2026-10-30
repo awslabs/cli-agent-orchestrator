@@ -254,6 +254,30 @@ def test_serve_refuses_an_unusable_frames_directory_without_consuming_the_run(
     assert not (run_dir / "started.json").exists()
 
 
+def test_serve_refuses_a_scene_whose_routine_limit_exceeds_the_schema(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    demo.prepare(run_dir, SCENE, port=_free_port(), provider="copilot_cli")
+    data = json.loads((run_dir / "scene.json").read_text())
+    data["teams"]["east"]["max_routine_moves"] += 1
+    (run_dir / "scene.json").write_text(json.dumps(data))
+    monkeypatch.setattr(demo, "make_server", lambda *args: pytest.fail("must not start"))
+    with pytest.raises(ValueError, match="max_routine_moves"):
+        demo.serve(run_dir, allow_motion=True)
+    assert not (run_dir / "started.json").exists()
+
+    # A corrected scene can then run: the run directory was never consumed.
+    data["teams"]["east"]["max_routine_moves"] -= 1
+    (run_dir / "scene.json").write_text(json.dumps(data))
+
+    class Server:
+        def run(self, **kwargs):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(demo, "make_server", lambda *args: Server())
+    demo.serve(run_dir, allow_motion=True)
+    assert (run_dir / "started.json").exists()
+
+
 def test_glfw_on_macos_turns_recording_off_instead_of_crashing(tmp_path, monkeypatch, caplog):
     run_dir = tmp_path / "run"
     demo.prepare(run_dir, SCENE, port=_free_port(), provider="copilot_cli")
@@ -270,6 +294,16 @@ def test_glfw_on_macos_turns_recording_off_instead_of_crashing(tmp_path, monkeyp
         demo.serve(run_dir, allow_motion=False, record=tmp_path / "frames")
     assert "Recording is off: MUJOCO_GL=glfw" in caplog.text
     assert not (tmp_path / "frames").exists()
+
+
+def test_prepare_refuses_a_scene_whose_routine_limit_exceeds_the_schema(tmp_path):
+    data = json.loads(SCENE.read_text())
+    data["teams"]["east"]["max_routine_moves"] += 1
+    scene = tmp_path / "oversized.json"
+    scene.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="max_routine_moves"):
+        demo.prepare(tmp_path / "run", scene, port=8767, provider="copilot_cli")
+    assert not (tmp_path / "run").exists()
 
 
 def test_a_refused_scene_or_profile_leaves_no_run_directory(tmp_path, monkeypatch):

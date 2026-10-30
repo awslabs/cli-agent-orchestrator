@@ -21,6 +21,7 @@ import time
 import uuid
 from typing import Any, Dict
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 
@@ -290,6 +291,30 @@ def _no_llm_compile_in_tests(monkeypatch):
     monkeypatch.setenv("CAO_MEMORY_COMPILE_MODE", "append")
 
 
+def _drain_launch_status_writes() -> None:
+    """Wait for every tmux status-event write queued so far (issue #1082).
+
+    ``StatusMonitor`` writes status transitions on one module-level FIFO
+    thread, and a caller on the event loop does not wait for its write, so a
+    write queued by one test could otherwise land in a later test's database.
+    A no-op submitted behind them returns once they are all done.
+    """
+    import sys
+
+    status_monitor = sys.modules.get("cli_agent_orchestrator.services.status_monitor")
+    writer = getattr(status_monitor, "_status_event_writer", None)
+    if writer is not None:
+        writer.submit(lambda: None).result(timeout=30)
+
+
+@pytest.fixture(autouse=True)
+def _drain_launch_status_writer():
+    """No queued status-event write crosses a test boundary (issue #1082)."""
+    _drain_launch_status_writes()
+    yield
+    _drain_launch_status_writes()
+
+
 @pytest.fixture(autouse=True)
 def _reset_backend_registry():
     """Prevent leaked backend singletons from crossing test boundaries (fixes #522)."""
@@ -354,6 +379,47 @@ def _hermetic_cao_env(monkeypatch, tmp_path):
     monkeypatch.delenv("CAO_API_PORT", raising=False)
 
 
+@pytest.fixture(scope="session")
+def _empty_home(tmp_path_factory):
+    """The HOME and cwd ``hermetic_kiro_agent_store`` gives every test of a session.
+
+    One per session, not per test: a test that reaches a real herdr backend (an
+    inherited ``CAO_TERMINAL_BACKEND=herdr``, say) starts a herdr server under
+    HOME, and a fresh HOME per test would leave one server behind per such test.
+    """
+    return tmp_path_factory.mktemp("home")
+
+
+@pytest.fixture
+def hermetic_kiro_agent_store(_empty_home, tmp_path_factory, monkeypatch):
+    """An empty Kiro agent store, so the developer's real agents are never read (#1074).
+
+    ``create_terminal`` refuses a Kiro launch whose agent no agent directory
+    defines, and it searches ``~/.kiro/agents``, ``$KIRO_HOME/agents``, the
+    ``cao install`` directory (fixed from the real home at import) and the launch
+    cwd's ``.kiro/agents``. All four are empty here, so a contributor who ran
+    ``cao install developer`` for Kiro sees what CI sees. HOME and the cwd are an
+    empty directory shared by the session (see ``_empty_home``); a test that
+    writes under ``~`` sets its own HOME. Returns the ``cao install`` directory,
+    fresh and empty per test, for a test that needs an agent installed.
+
+    Autouse for ``test/services`` (its conftest); opt in elsewhere. It moves the
+    cwd, which tests that read repo files by relative path cannot take.
+    """
+    # A UUID-named directory under the shared basetemp, not a numbered
+    # tmp_path_factory.mktemp(): mktemp scans every existing basetemp entry to
+    # pick its next number, which is O(n) per call and quadratic over a run
+    # that creates one of these per test (#1074).
+    agents = tmp_path_factory.getbasetemp() / f"kiro-agents-{uuid4().hex}"
+    agents.mkdir()
+    monkeypatch.setenv("HOME", str(_empty_home))
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.setattr("cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", agents)
+    # A create with no working_directory launches from the process cwd.
+    monkeypatch.chdir(_empty_home)
+    return agents
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_ephemeral_store(monkeypatch, tmp_path_factory):
     """Keep the ephemeral store and CAO's lock dir out of the startup CAO home.
@@ -396,4 +462,6 @@ def isolated_memory_db(tmp_path, monkeypatch):
     try:
         yield engine
     finally:
+        # Land this test's queued status-event writes in its own database.
+        _drain_launch_status_writes()
         engine.dispose()

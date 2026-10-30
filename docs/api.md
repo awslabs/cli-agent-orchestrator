@@ -313,7 +313,10 @@ and `RunStepRequest` (`POST /terminals/run-step`).
   behaves exactly as before, with no persistence overhead.
 - A step-level `detail.kind` distinguishes worker failures (`error` -> 502),
   in-band provider refusals (`provider_error` -> 502), and timeouts (`timeout` ->
-  504); callers branch on `kind`, not the numeric status alone.
+  504); callers branch on `kind`, not the numeric status alone. A reused Kiro
+  terminal (`reuse_terminal_id`) whose identity check is still running answers
+  `identity_pending` -> 409 with `retryable: true`: nothing was typed, so retry
+  the same call once it is ready.
 - `GET /handoff-results/{job_id}` retrieves the persisted record for that
   `job_id`. `state` is one of `running` (step still in progress), `completed`
   (result in `last_message`), or `error` (failure in `error_message`). `404`
@@ -425,6 +428,23 @@ that check is inert.
 
 See [Workflows](workflows.md).
 
+### Fleet
+
+Read-only views of a CAO cluster's workers, reached through the fleet's worker broker
+(`CAO_ELASTIC_BROKER_URL` / `CAO_ELASTIC_BROKER_TOKEN` in cao-server's environment). No
+broker configured, unreachable, or erroring is a `503` carrying the broker's message.
+Releasing workers and shutting the fleet down stay CLI actions (`cao worker release`,
+`cao fleet shutdown`).
+
+- `GET /fleet/status` mirrors `cao fleet status`: `{broker, live, cleanup_pending, states}`.
+- `GET /fleet/workers` mirrors `cao worker list` (`?all=true` for `--all`):
+  `{broker, workers: [{worker_id, state, reason, agent_profile, provider, age_seconds,
+  workload_present, cleanup_pending, lease_tracked}]}`. Only those fields are returned.
+- `GET /fleet/workers/{worker_id}` mirrors `cao worker status`:
+  `{worker_id, lease, terminal, terminal_error, last_output}`. `terminal` carries
+  `{id, name, session_name, agent_profile, provider, status}`; `last_output` is capped at
+  4000 characters. A malformed id is `400`; no lease and no answering worker is `404`.
+
 ### Memory and graph
 
 - `/settings/memory` reports memory enablement (including `learning_enabled`).
@@ -441,6 +461,18 @@ See [Workflows](workflows.md).
   "disabled" internally, and reporting that as 404 would tell the caller a
   configuration story about a filesystem fault. These are the routes the
   `report_outcome` / `list_outcomes` MCP tools call.
+  `POST /outcomes` also takes an optional `launch_terminal_id` (the MCP
+  tool's `terminal_id`), which links the outcome to that terminal's launch
+  record. The link is checked against the stored record before anything is
+  written: only a self-report (`source_terminal_id` equals
+  `launch_terminal_id`) or the launch's direct creator (the record's
+  `caller_id`) may link. The route answers **403** and writes nothing when
+  records exist for that id and none is bound to the reporter, or when
+  `launch_terminal_id` comes without a `source_terminal_id`. When
+  `launch_terminal_id` is sent, the response carries `launch_linked`: `true`
+  if the outcome was joined to a launch record, and `false` if it was written
+  without a link (no record for the id, a self-report on a launch that has
+  already ended, or a link that could not be read or written).
 - `/internal/memory/*` serves the memory tools on a node that does not own the
   database (`CAO_MEMORY_API_URL`). Its `key` is validated leniently and then
   normalised, matching what the tools have always done in-process — the strict

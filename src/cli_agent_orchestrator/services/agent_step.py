@@ -937,7 +937,12 @@ async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegis
         # Off the loop: delete_terminal does blocking tmux kills, a full-history
         # scrollback snapshot, and DB writes — the exact teardown that wedged the
         # server in issue #382.
-        await asyncio.to_thread(terminal_service.delete_terminal, terminal_id, registry=registry)
+        await asyncio.to_thread(
+            terminal_service.delete_terminal,
+            terminal_id,
+            registry=registry,
+            end_reason="deleted",
+        )
     except Exception as exc:  # noqa: BLE001 — teardown is best-effort; the step already settled
         logger.warning(
             "run_agent_step: failed to tear down terminal %s after settle: %s",

@@ -414,6 +414,7 @@ class ClaudeCodeProvider(BaseProvider):
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
         resume_session_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -424,6 +425,13 @@ class ClaudeCodeProvider(BaseProvider):
         # conversation. Used to re-open a supervisor conversation inside a
         # new CAO session (durable-orchestra recovery).
         self._resume_session_id = resume_session_id
+        # Issue #1082 (provisional): a CAO-generated id for a FRESH launch
+        # (never set together with ``resume_session_id`` -- the caller only
+        # generates one when there is nothing to resume), passed as
+        # ``--session-id`` so a later usage adapter can join this terminal to
+        # the provider's own session log by id instead of working directory
+        # and start time.
+        self._session_id = session_id
         # Explicit per-call override for profile.model (see launch()'s own
         # --model resolution below) -- e.g. a handoff/assign caller pinning a
         # specific model for one worker without needing a dedicated profile.
@@ -546,6 +554,11 @@ class ClaudeCodeProvider(BaseProvider):
         # session id was validated at the API boundary.
         if self._resume_session_id:
             command_parts.extend(["--resume", self._resume_session_id])
+        elif self._session_id:
+            # Issue #1082 (provisional): only on a FRESH launch -- mutually
+            # exclusive with --resume, same as the two ids are mutually
+            # exclusive on self.
+            command_parts.extend(["--session-id", self._session_id])
 
         # Route based on profile state
         native = getattr(profile, "native_agent", None) if profile else None

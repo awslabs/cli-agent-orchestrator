@@ -84,6 +84,8 @@ class DelegationRequest:
     policy: PolicyBounds = IDENTITY_POLICY
     target_kind: TargetKind | None = None
     purpose: str | None = None
+    # #1068 Q4 (provisional): the creator-written description, sent only for ephemeral targets.
+    description: str | None = None
 
 
 def _honors(provider: str, name: str | None, profile: AgentProfile | None) -> bool:
@@ -405,7 +407,15 @@ class DecisionEngine:
                     str(uuid.uuid4()),
                     eligible,
                     message(),
-                    redact_secrets(profile.description)[0] if profile else None,
+                    (
+                        redact_secrets(profile.description)[0]
+                        if profile
+                        else (
+                            redact_secrets(req.description)[0]
+                            if target == TargetKind.EPHEMERAL and req.description is not None
+                            else None
+                        )
+                    ),
                     DecisionFacts(
                         req.provider,
                         req.kind,

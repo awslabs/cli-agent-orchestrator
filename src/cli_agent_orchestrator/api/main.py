@@ -12,7 +12,7 @@ import struct
 import subprocess
 import termios
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -127,7 +127,13 @@ from cli_agent_orchestrator.models.memory import (
     MemoryType,
     recall_wire_dict,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.models.terminal import (
+    Terminal,
+    TerminalId,
+    TerminalInputBlockedReason,
+    TerminalLimitError,
+)
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
@@ -135,6 +141,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroPhase0KASError,
 )
+from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -3781,9 +3788,77 @@ def _launch_options(plan: LaunchPlan | None) -> dict[str, Any]:
 
 
 def _claimed_ephemeral(agent_profile: str | None, claim_id: str | None) -> bool:
-    # A claimed ephemeral launch has its own decision path, so delegation sites skip it.
+    # A claimed ephemeral launch is asked only when its stored spec declared auto (#1068).
     # A claim on an installed profile claims nothing, so that launch is routed as usual.
     return claim_id is not None and profile_source(agent_profile) is TargetKind.EPHEMERAL
+
+
+async def _prepare_delegation(
+    req: DelegationRequest, claim_id: str | None, caller_id: str | None
+) -> LaunchPlan | None:
+    """#1068 D2 (provisional M7): decide after the claim and before the bind."""
+    if not _claimed_ephemeral(req.agent_profile, claim_id):
+        return await prepare_launch(req)
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    assert req.agent_profile is not None and claim_id is not None
+    if req.model is not None:
+        return None  # The launch refuses a per-call model and ends the claim; nothing is asked.
+    name = req.agent_profile
+    try:
+        inputs = ephemeral_service.decision_inputs(name, claim_id, caller_id, req.provider)
+        if inputs is None:
+            return None
+        # Q2 (provisional): the decided model applies only through this launch plan.
+        plan = await prepare_launch(
+            replace(
+                req,
+                target_kind=TargetKind.EPHEMERAL,
+                field_states=inputs.field_states,
+                policy=inputs.policy,
+                purpose=inputs.purpose,
+                description=inputs.description,
+            )
+        )
+        if plan is not None:
+            # The operator may have changed the policy while the decider ran: recheck the
+            # launched tier before the bind, whatever the outcome.
+            try:
+                model = ephemeral_service.recheck_decided(
+                    name, claim_id, caller_id, _recorded_tier(plan), plan.model
+                )
+            except BaseException:
+                _bind_unlaunched(plan)
+                raise
+            if model is not None and model != plan.model:
+                plan = replace(plan, model=model)
+    except DecisionInputError as error:
+        raise ephemeral_service.decision_refusal(name, claim_id, caller_id, error) from None
+    except BaseException:
+        ephemeral_service.end_claim(name, claim_id)
+        raise
+    if plan is not None:
+        ephemeral_service.record_decided(name, claim_id, plan.record_ids)
+    return plan
+
+
+def _recorded_tier(plan: LaunchPlan) -> str | None:
+    """The tier an on-mode answer's record says it applied to this plan, if there is one."""
+    for record_id in plan.record_ids:
+        try:
+            row = app.state.decision_engine.store.get(record_id)
+        except Exception:
+            # No record content and no traceback: the error can carry the row's values.
+            logger.warning("Decision record read failed")
+            return None
+        if row and row["point"] == "model.route" and row["outcome"] in ("applied", "capped"):
+            value = row["applied_value"]
+            return value if isinstance(value, str) else None
+    # No applied/capped record: either nothing was applied, or the store couldn't write or
+    # read one (its warning is the signal). Either way, recheck_decided reverse-maps the
+    # plan's own model through the settings snapshot it validates: an installed target
+    # already applies this way regardless of the record.
+    return None
 
 
 def _bind_unlaunched(plan: LaunchPlan | None) -> None:
@@ -4010,7 +4085,15 @@ async def create_session(
             # launch that reported success and no sidecar, so the bound is
             # checked HERE, with the same comparator, and the outcome rides on
             # the response as ``memory_manager`` for `cao launch` to print.
-            refusal = terminal_service.memory_sidecar_refusal(result, provider=sidecar_provider)
+            # On kiro_cli this also asks the create's agent check (#1074), so a
+            # memory_manager not installed for Kiro reads `refused` here rather
+            # than `scheduled` and a log line. Off the loop: it reads agent files.
+            refusal = await asyncio.to_thread(
+                terminal_service.memory_sidecar_refusal,
+                result,
+                provider=sidecar_provider,
+                working_directory=working_directory,
+            )
             if refusal is not None:
                 logger.warning(f"memory_manager sidecar not launched: {refusal}")
                 result.memory_manager = {"state": "refused", "detail": refusal}
@@ -4326,13 +4409,8 @@ async def create_terminal_in_session(
         # Passed only when set, so the ordinary create call stays
         # byte-identical for every existing caller (review on PR #773).
         lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
-        if (
-            body
-            and not lookup_only
-            and body.delegation_message is not None
-            and not _claimed_ephemeral(agent_profile, claim_id)
-        ):
-            launch_plan = await prepare_launch(
+        if body and not lookup_only and body.delegation_message is not None:
+            launch_plan = await _prepare_delegation(
                 DelegationRequest(
                     kind="handoff" if body.delegation_kind else "assign",
                     provider=resolved_provider,
@@ -4342,7 +4420,9 @@ async def create_terminal_in_session(
                     use_worktree=use_worktree,
                     owner=launch_owner("create_terminal_in_session", body),
                     target_kind=profile_source(agent_profile),
-                )
+                ),
+                claim_id,
+                caller_id,
             )
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
@@ -4386,7 +4466,12 @@ async def create_terminal_in_session(
         # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
         # of the ValueError family can shadow it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+    except (
+        KiroPhase0KASError,
+        KiroCapabilityError,
+        KiroAgentPathError,
+        KiroAgentIdentityError,
+    ) as e:
         # These subclass ValueError, so they must precede the generic arm below —
         # a rejected configuration is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
@@ -4514,7 +4599,12 @@ async def create_terminal_in_session_as_operator(
         raise
     except IdempotencyKeyConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+    except (
+        KiroPhase0KASError,
+        KiroCapabilityError,
+        KiroAgentPathError,
+        KiroAgentIdentityError,
+    ) as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except TerminalLimitError as e:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
@@ -4867,6 +4957,11 @@ async def send_terminal_key(
         # Blocking tmux send-keys — off the loop.
         success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
+    except TerminalInputBlockedError as e:
+        # send_special_key carries typed text (#1074), so it is refused
+        # the same way /input is: a conflict with the terminal's state, not a
+        # server fault.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -4959,6 +5054,12 @@ async def exit_terminal(
         # Blocking tmux I/O — off the loop.
         await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
+    except TerminalInputBlockedError as e:
+        # A text exit command (e.g. "/exit") goes through dispatch_input, which
+        # refuses a terminal CAO does not trust (#1074) the same way /input
+        # does. That is a conflict with the terminal's state, not a server
+        # fault -- matching the 409 POST /terminals/{id}/input already returns.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -5373,12 +5474,10 @@ async def run_step(
             # EXECUTE falls through — the step runs normally.
 
         owner = launch_owner("run_step", body)
-        if (
-            body.reuse_terminal_id is None
-            and not _claimed_ephemeral(body.agent, body.claim_id)
-            and (body.orchestration_type is not None or owner == WORKFLOW_STEP)
+        if body.reuse_terminal_id is None and (
+            body.orchestration_type is not None or owner == WORKFLOW_STEP
         ):
-            launch_plan = await prepare_launch(
+            launch_plan = await _prepare_delegation(
                 DelegationRequest(
                     kind="handoff",
                     provider=body.provider,
@@ -5392,7 +5491,9 @@ async def run_step(
                     use_worktree=body.use_worktree,
                     owner=owner,
                     target_kind=profile_source(body.agent),
-                )
+                ),
+                body.claim_id,
+                body.caller_id,
             )
         result = await run_agent_step(
             provider=body.provider,
@@ -5522,25 +5623,44 @@ async def run_step(
         # running for answer_user_prompt) apart from "generic failure, worker
         # dead" (tear down) -- see terminal_service.py's own
         # _schedule_deferred_init. run_step never goes through that deferred
-        # path, though: run_agent_step calls terminal_service.send_input with
-        # no orchestration_type, so the WAITING_USER_ANSWER guard can never
-        # fire here -- the only producer reachable from run_step is
-        # send_input's ERROR-state guard (a terminal whose provider process
-        # has already exited, or flips to ERROR between the readiness wait
-        # and the send). Since run_step is the SYNCHRONOUS caller (handoff
-        # MCP client's step call, and the future run engine), there is no
-        # deferred worker to keep alive either way -- the call has simply
-        # failed to complete, so this maps to the same kind="timeout" / 504
-        # outcome as a plain TimeoutError. This preserves the pre-PR-#539 504
-        # status code for this exact failure instead of silently falling
-        # through to the generic kind-less 500 below.
+        # path: run_agent_step calls terminal_service.send_input with no
+        # orchestration_type, so the WAITING_USER_ANSWER guard can never fire
+        # here. Three producers can: send_input's ERROR-state and bare-shell
+        # guards (the provider process has exited), and the Kiro identity gate
+        # (#1074) for a reused terminal (reuse_terminal_id) whose identity check
+        # is still running (identity_pending) or whose init ended without it
+        # (init_failed). Nothing was typed in any of them.
+        #
+        # identity_pending is transient: the same call can succeed once the
+        # terminal is ready, so it gets its own retryable 409 rather than a
+        # timeout. Provisional (#1074): the kind is not yet a settled string.
+        # The others keep the pre-PR-#539 kind="timeout" / 504 for a call that
+        # failed to complete, instead of the generic kind-less 500 below.
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
+        if (
+            isinstance(e, TerminalInputBlockedError)
+            and e.reason == TerminalInputBlockedReason.IDENTITY_PENDING
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": str(e),
+                    "kind": "identity_pending",
+                    "terminal_id": None,
+                    "retryable": True,
+                },
+            )
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
-    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+    except (
+        KiroPhase0KASError,
+        KiroCapabilityError,
+        KiroAgentPathError,
+        KiroAgentIdentityError,
+    ) as e:
         # Ordered before the ValueError arm they subclass: a configuration rejection is
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))
@@ -8655,6 +8775,7 @@ async def delete_terminal(
             terminal_service.delete_terminal,
             terminal_id,
             registry=get_plugin_registry(request),
+            end_reason="deleted",
         )
         if not success:
             raise HTTPException(
@@ -8837,6 +8958,20 @@ async def get_inbox_messages_endpoint(
         )
 
 
+def _ws_input_refusal(
+    terminal_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[TerminalInputBlockedError]]:
+    """The terminal's row and the refusal for input to it, for ``/ws`` (#1074).
+
+    ``(None, None)`` when the row is gone. Blocking DB and file I/O: callers
+    to_thread it.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        return None, None
+    return metadata, terminal_service.terminal_input_refusal(terminal_id, metadata)
+
+
 @app.websocket("/terminals/{terminal_id}/ws")
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
@@ -8868,6 +9003,14 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     devcontainers or Codespaces exposed full PTY control with no credential.
     Do NOT expose the server to untrusted networks (e.g. --host 0.0.0.0)
     without authentication.
+
+    Provisional (#1074): a Kiro terminal whose identity CAO has not verified
+    (``terminal_service.terminal_input_refusal``) gets output but no input. The
+    attach is accepted, its output is forwarded, and each ``input`` frame is
+    re-checked and dropped while the terminal is refused, so typing starts once
+    its identity check passes. The attach is refused before accept, with 4409,
+    only when CAO itself already reclaimed that untrusted runtime: an attach by
+    the row's session and window names could then only reach another window.
     """
     # Reject connections from clients outside the configured allowlist.
     # Defaults to loopback; operators running cao-server inside a container can
@@ -8956,9 +9099,25 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             await websocket.close(code=4401, reason="Unauthorized")
             return
 
+    # The row, and whether input to it is refused, read off the loop before
+    # accept (#1074).
+    metadata, input_refusal = await asyncio.to_thread(_ws_input_refusal, terminal_id)
+    if (
+        metadata
+        and metadata.get("provider") == ProviderType.KIRO_CLI.value
+        and input_refusal is not None
+        and input_refusal.reason == TerminalInputBlockedReason.INIT_FAILED
+        and metadata.get("deferred_init_runtime_reclaimed")
+    ):
+        logger.warning(
+            "Rejected WebSocket attach for terminal %r: its untrusted runtime was reclaimed",
+            terminal_id,
+        )
+        await websocket.close(code=4409, reason="Terminal runtime was reclaimed")
+        return
+
     await websocket.accept()
 
-    metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         await websocket.close(code=4004, reason="Terminal not found")
         return
@@ -9052,6 +9211,38 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             except (Exception, asyncio.CancelledError):
                 break
 
+    # A terminal trusted at attach time is never re-checked; one that is not has
+    # each input frame re-checked until it passes, and trust only moves one way.
+    input_trusted = input_refusal is None
+    input_drop_logged = False
+
+    async def _input_allowed() -> bool:
+        nonlocal input_trusted, input_drop_logged
+        if input_trusted:
+            return True
+        try:
+            row, refusal = await asyncio.to_thread(_ws_input_refusal, terminal_id)
+        except Exception:  # noqa: BLE001 — an unreadable row is not a trusted one
+            reason = "check_failed"
+        else:
+            if row and refusal is None:
+                input_trusted = True
+                return True
+            reason = (
+                refusal.reason.value
+                if refusal is not None and refusal.reason is not None
+                else "terminal_not_found"
+            )
+        if not input_drop_logged:
+            input_drop_logged = True
+            logger.warning(
+                "Dropping WebSocket input for terminal %r until its Kiro identity is "
+                "verified (%s)",
+                terminal_id,
+                reason,
+            )
+        return False
+
     async def _forward_input():
         """Receive from WebSocket and write to PTY."""
         try:
@@ -9059,6 +9250,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                 msg = await websocket.receive_text()
                 payload = json.loads(msg)
                 if payload.get("type") == "input":
+                    if not await _input_allowed():
+                        # Dropped: zero bytes reach the PTY (#1074).
+                        continue
                     raw = payload["data"].encode()
                     # Write in chunks to avoid overflowing the PTY buffer
                     chunk_size = 1024
@@ -9966,6 +10160,9 @@ class OutcomeCreateBody(BaseModel):
     source_terminal_id: Optional[str] = None
     score: Optional[int] = None
     friction_notes: str = ""
+    # Issue #1082: joins this outcome to one launch record. The route checks
+    # the binding against the stored record (see create_outcome_endpoint).
+    launch_terminal_id: Optional[str] = None
 
 
 def _require_learning_enabled() -> None:
@@ -10013,6 +10210,7 @@ async def create_outcome_endpoint(
     )
 
     _require_learning_enabled()
+    link_record_id = _bound_launch_record_id(body)
     try:
         outcome = OutcomeService().record_outcome(
             session_name=body.session_name,
@@ -10035,7 +10233,74 @@ async def create_outcome_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    return {"success": True, "outcome": outcome}
+    if not body.launch_terminal_id:
+        return {"success": True, "outcome": outcome}
+    launch_linked = False
+    if link_record_id is not None:
+        # Best-effort join: never turns a recorded outcome into a failed
+        # response. ``link_launch_outcome`` already swallows its own
+        # exceptions; this try/except is defense in depth so a bad value can
+        # never surface as a 500 on an outcome already committed above.
+        try:
+            from cli_agent_orchestrator.clients.database import link_launch_outcome
+
+            launch_linked = link_launch_outcome(
+                link_record_id, body.success, cast(str, body.source_terminal_id)
+            )
+        except Exception as e:
+            logger.warning(f"Launch outcome link failed for {body.launch_terminal_id}: {e}")
+    return {"success": True, "outcome": outcome, "launch_linked": launch_linked}
+
+
+def _bound_launch_record_id(body: OutcomeCreateBody) -> Optional[int]:
+    """Authorise an outcome's launch link from the stored launch record (issue #1082).
+
+    Runs before the outcome is written, so a refusal writes nothing. The
+    stored record, which outlives teardown, is the authority, not the live
+    terminal row: a link is allowed only for a self-report or from the
+    launch's direct creator (its recorded ``caller_id``). The MCP tool's own
+    pre-check only stops live outsiders early.
+
+    - Records exist for the id but none is bound to the reporter: 403.
+    - ``launch_terminal_id`` without ``source_terminal_id``: 403 (fail closed).
+    - No record for the id (a remote worker's record lives on its own node, a
+      best-effort write failed, or it predates this table), or the binding
+      read raises: returns None, so the outcome is written but not linked.
+
+    Same trust class as #912: ``source_terminal_id`` is asserted by the
+    client and this API authorises by scope only, so this stops a confused or
+    prompt-injected agent working through the tool, not a direct HTTP caller
+    holding ``cao:write``.
+    """
+    if not body.launch_terminal_id:
+        return None
+    if not body.source_terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Refusing to link an outcome to launch {body.launch_terminal_id}: "
+                "no source_terminal_id names the reporter."
+            ),
+        )
+    try:
+        from cli_agent_orchestrator.clients.database import find_bound_launch_record
+
+        record_id, any_records = find_bound_launch_record(
+            body.launch_terminal_id, body.source_terminal_id
+        )
+    except Exception as e:
+        logger.warning(f"Launch outcome binding read failed for {body.launch_terminal_id}: {e}")
+        return None
+    if record_id is None and any_records:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Terminal {body.source_terminal_id} may not report an outcome for launch "
+                f"{body.launch_terminal_id}: only that terminal itself or the terminal that "
+                "created it may; refusing."
+            ),
+        )
+    return record_id
 
 
 class LessonCreateBody(BaseModel):
@@ -10196,6 +10461,187 @@ async def list_outcomes_endpoint(
         limit=limit,
     )
     return {"outcomes": outcomes, "count": len(outcomes)}
+
+
+@app.get("/fleet/status")
+async def fleet_status_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Read-only fleet summary for the web UI.
+
+    Mirrors ``cao fleet status``: reaches the worker broker through
+    ``FleetClient`` (``CAO_ELASTIC_BROKER_URL`` / ``CAO_ELASTIC_BROKER_TOKEN`` —
+    one port-forward away on EKS) and returns the broker url, the live and
+    cleanup-pending worker counts, and a lease-state histogram. The fleet routes on
+    cao-server are all reads (this one and ``/fleet/workers``): ``fleet shutdown``
+    and ``worker release`` are destructive and stay CLI/explicit actions, so there
+    is no write path here.
+
+    ``FleetClient`` raises ``click.ClickException`` both when no broker is
+    configured (``from_env``) and when the broker is unreachable or errors; both
+    surface here as 503 carrying the broker's own message, so the UI can show
+    "fleet not reachable" rather than a generic 500. The blocking ``requests``
+    calls run off the event loop via ``asyncio.to_thread``.
+    """
+    import asyncio
+    from collections import Counter
+
+    import click
+
+    from cli_agent_orchestrator.utils.fleet import FleetClient
+
+    def _collect() -> tuple[str, list]:
+        client = FleetClient.from_env()
+        return client.url, client.workers()
+
+    try:
+        broker_url, workers = await asyncio.to_thread(_collect)
+    except click.ClickException as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=e.format_message()
+        )
+
+    counts = Counter(w.get("state", "unknown") for w in workers)
+    return {
+        "broker": broker_url,
+        "live": sum(1 for w in workers if w.get("workload_present") is True),
+        "cleanup_pending": sum(1 for w in workers if w.get("cleanup_pending") is True),
+        "states": dict(counts),
+    }
+
+
+# Fields of a broker inventory row (the broker's WorkerStatus) and of a worker
+# terminal that the fleet worker routes pass through. An ALLOWLIST, not a filter:
+# anything the broker or the worker's cao-server adds later stays server-side until
+# someone decides it is safe to show. Notably never forwarded: the broker token,
+# the lease's release token / target host, and any node-proxy URL.
+_FLEET_WORKER_FIELDS = (
+    "worker_id",
+    "state",
+    "reason",
+    "agent_profile",
+    "provider",
+    "age_seconds",
+    "workload_present",
+    "cleanup_pending",
+    "lease_tracked",
+)
+_FLEET_TERMINAL_FIELDS = ("id", "name", "session_name", "agent_profile", "provider", "status")
+# A worker id is interpolated into the broker's proxy path
+# (/workers/{id}/api/...), so it must be a plain identifier: no '/', no '..'.
+_FLEET_WORKER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# Last-output preview cap; the full transcript stays one `cao worker attach` away.
+_FLEET_LAST_OUTPUT_MAX_CHARS = 4000
+
+
+def _pick(row: Any, fields: Tuple[str, ...]) -> Optional[Dict[str, Any]]:
+    if not isinstance(row, dict):
+        return None
+    return {k: row.get(k) for k in fields}
+
+
+@app.get("/fleet/workers")
+async def fleet_workers_endpoint(
+    include_settled: bool = Query(
+        False, alias="all", description="Include settled leases (cao worker list --all)"
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Read-only worker inventory for the web UI, mirroring ``cao worker list``.
+
+    Returns ``{"broker", "workers": [...]}`` where each worker carries exactly
+    ``_FLEET_WORKER_FIELDS``. Live workers only unless ``all=true``, as in the CLI.
+    No broker configured, unreachable or erroring -> 503 with its message.
+    """
+    import click
+
+    from cli_agent_orchestrator.utils.fleet import FleetClient
+
+    def _collect() -> Tuple[str, list]:
+        client = FleetClient.from_env()
+        return client.url, client.workers()
+
+    try:
+        broker_url, workers = await asyncio.to_thread(_collect)
+    except click.ClickException as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=e.format_message()
+        )
+    rows = [_pick(w, _FLEET_WORKER_FIELDS) for w in workers]
+    if not include_settled:
+        rows = [w for w in rows if w and w.get("workload_present") is True]
+    return {"broker": broker_url, "workers": [w for w in rows if w]}
+
+
+@app.get("/fleet/workers/{worker_id}")
+async def fleet_worker_endpoint(
+    worker_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """One worker's lease and what its agent is doing, mirroring ``cao worker status``.
+
+    ``{"worker_id", "lease", "terminal", "terminal_error", "last_output"}``. ``lease``
+    is the allowlisted inventory row or ``None`` (a broker restart forgets leases while
+    the workload lives on); ``terminal`` the allowlisted terminal of the worker's own
+    cao-server, read through the broker's proxy; ``last_output`` its last response,
+    capped at ``_FLEET_LAST_OUTPUT_MAX_CHARS``. As in the CLI, a leased worker whose
+    cao-server does not answer yet degrades to the lease with ``terminal_error`` set.
+    Errors: malformed id 400; no lease AND no answering worker 404 (503 when the broker
+    itself is unreachable or not configured).
+    """
+    import click
+
+    from cli_agent_orchestrator.utils.fleet import BrokerRequestError, FleetClient
+
+    if not _FLEET_WORKER_ID.match(worker_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="malformed worker id")
+
+    def _collect() -> Dict[str, Any]:
+        client = FleetClient.from_env()
+        lease = next((w for w in client.workers() if w.get("worker_id") == worker_id), None)
+        terminal = None
+        last_output = None
+        terminal_error = None
+        if lease is None or lease.get("workload_present") is True:
+            try:
+                sole = client.sole_terminal(worker_id)
+                terminal = client.terminal(worker_id, sole["id"])
+                last_output = client.terminal_output(worker_id, sole["id"])
+            except click.ClickException as exc:
+                if lease is None:
+                    raise
+                terminal_error = exc.format_message()
+        if isinstance(last_output, str) and len(last_output) > _FLEET_LAST_OUTPUT_MAX_CHARS:
+            last_output = last_output[-_FLEET_LAST_OUTPUT_MAX_CHARS:]
+        return {
+            "worker_id": worker_id,
+            "lease": _pick(lease, _FLEET_WORKER_FIELDS),
+            "terminal": _pick(terminal, _FLEET_TERMINAL_FIELDS),
+            "terminal_error": terminal_error,
+            "last_output": last_output if isinstance(last_output, str) else None,
+        }
+
+    try:
+        return await asyncio.to_thread(_collect)
+    except BrokerRequestError as e:
+        # Reached the broker and it said 4xx about this worker -> the worker is not there.
+        # Unreachable (status None) or a broker 5xx is the fleet being unavailable.
+        code = (
+            status.HTTP_404_NOT_FOUND
+            if e.status_code is not None and 400 <= e.status_code < 500
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        raise HTTPException(status_code=code, detail=e.format_message())
+    except click.ClickException as e:
+        # from_env with no broker configured -> 503. Otherwise the worker answered but
+        # has no (or more than one) terminal and no lease names it -> nothing to show.
+        no_fleet = "No fleet configured" in e.format_message()
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE if no_fleet else status.HTTP_404_NOT_FOUND
+            ),
+            detail=e.format_message(),
+        )
 
 
 # Static file serving for built web UI.

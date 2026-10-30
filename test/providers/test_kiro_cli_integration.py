@@ -91,7 +91,7 @@ async def terminal(event_pipeline, mock_db, ensure_test_agent):
     )
     yield t
     try:
-        delete_terminal(t.id)
+        delete_terminal(t.id, end_reason="deleted")
     except Exception:
         pass
     # Kill the tmux session unconditionally, regardless of test outcome.

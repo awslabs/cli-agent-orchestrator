@@ -43,6 +43,7 @@ from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.utils.caller_tools import (
     caller_effective_allowed_tools as _caller_effective_allowed_tools,
 )
+from cli_agent_orchestrator.utils.ephemeral_capabilities import ephemeral_providers
 from cli_agent_orchestrator.utils.orchestration import (
     ENABLE_SENDER_ID_INJECTION,
     REMOTE_CONNECT_TIMEOUT,
@@ -1766,7 +1767,12 @@ async def create_ephemeral_agent(
     provider: Annotated[
         Any,
         WithJsonSchema(
-            {"anyOf": [{"type": "string", "enum": ["claude_code", "codex"]}, {"type": "null"}]}
+            {
+                "anyOf": [
+                    {"type": "string", "enum": list(ephemeral_providers())},
+                    {"type": "null"},
+                ]
+            }
         ),
     ] = None,
     model_tier: Annotated[
@@ -1799,8 +1805,9 @@ async def create_ephemeral_agent(
 
     The CAO-recorded tool list is bounded by the creator's effective list.
     This is not an OS privilege boundary or a per-tool MCP restriction.
-    Codex tools are advisory when the operator enables Codex. The feature
-    defaults off; see docs/ephemeral-agents.md for the full honesty statement.
+    Codex tools are advisory when the operator enables Codex, and the response's
+    ``enforcement`` field reports ``hard`` or ``advisory``. The feature defaults
+    off; see docs/ephemeral-agents.md for the full honesty statement.
     """
     return await _create_ephemeral_from_arguments(
         {
@@ -1955,6 +1962,12 @@ async def memory_store(
     """
     from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, store_memory
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    # Checked before the remote branch, as in memory_recall: the owner applies
+    # its own switch, never this caller's (#1087).
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
 
     try:
         terminal_context = _get_terminal_context_from_env()
@@ -2119,6 +2132,12 @@ async def memory_forget(
     """
     from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    # Checked before the remote branch, as in memory_recall: the owner applies
+    # its own switch, never this caller's (#1087).
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
 
     try:
         terminal_context = _get_terminal_context_from_env()
@@ -2253,6 +2272,16 @@ async def report_outcome(
             "Conclusions only — never transcripts, logs, or file contents. Max 1000 chars."
         ),
     ),
+    terminal_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Join this outcome to one launch (issue #1082): the terminal id of the "
+            "worker this unit of work was performed by. Must be your own terminal "
+            "or one you created directly via assign/handoff (still allowed after it "
+            "was deleted); anything else is refused. The result's launch_linked "
+            "says whether a launch record was joined."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Record the outcome of a unit of agent work (self-learning signal).
 
@@ -2270,6 +2299,13 @@ async def report_outcome(
                 "success": False,
                 "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
             }
+        if terminal_id:
+            # Stops a live outsider before anything is posted. POST /outcomes
+            # is the authority: it re-checks against the stored launch record,
+            # which also covers a torn-down target this lookup cannot see.
+            denial = _target_binding_denial(terminal_id)
+            if denial:
+                return {"success": False, "error": denial}
         payload = mcp_utils.post_body_json(
             "/outcomes",
             {
@@ -2281,12 +2317,16 @@ async def report_outcome(
                 "source_terminal_id": terminal_context["terminal_id"],
                 "score": score,
                 "friction_notes": friction_notes,
+                "launch_terminal_id": terminal_id,
             },
             timeout=_mcp_timeout(),
         )
         # Only the id: the route returns the whole record, and echoing it would
         # newly surface friction_notes back to the agent that wrote them.
-        return {"success": True, "outcome_id": payload["outcome"]["id"]}
+        result: Dict[str, Any] = {"success": True, "outcome_id": payload["outcome"]["id"]}
+        if terminal_id:
+            result["launch_linked"] = payload.get("launch_linked") is True
+        return result
     except requests.RequestException as e:
         return _outcome_tool_error(e, "Failed to record outcome")
     except Exception as e:

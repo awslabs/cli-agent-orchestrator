@@ -648,6 +648,48 @@ export interface RunSummaryRow {
   current_step_id: string | null
 }
 
+/** Read-only fleet summary from `GET /fleet/status`. */
+export interface FleetStatus {
+  broker: string
+  live: number
+  cleanup_pending: number
+  states: Record<string, number>
+}
+
+/** One broker inventory row from `GET /fleet/workers` (server-side allowlisted). */
+export interface FleetWorker {
+  worker_id: string
+  state: string
+  reason: string | null
+  agent_profile: string | null
+  provider: string | null
+  age_seconds: number | null
+  workload_present: boolean
+  cleanup_pending: boolean
+  lease_tracked: boolean
+}
+
+export interface FleetWorkerList {
+  broker: string
+  workers: FleetWorker[]
+}
+
+/** `GET /fleet/workers/{id}`: the `cao worker status` view. */
+export interface FleetWorkerDetail {
+  worker_id: string
+  lease: FleetWorker | null
+  terminal: {
+    id: string
+    name: string | null
+    session_name: string | null
+    agent_profile: string | null
+    provider: string | null
+    status: string | null
+  } | null
+  terminal_error: string | null
+  last_output: string | null
+}
+
 // ── Agent Plugins (Agent Plugins 1.0.0) ──────────────────────────────────────
 // Distinct from CAO's event-plugin system, which has no web surface.
 
@@ -982,6 +1024,17 @@ export const api = {
   // (fetchJSON returns undefined). Idempotent server-side (unknown id -> 204).
   deleteWorkflowRun: (runId: string) =>
     fetchJSON<void>(`/workflows/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' }),
+
+  // Read-only fleet summary (`cao fleet status`). 503 when no broker is configured or it
+  // is unreachable — the caller renders that as "fleet not reachable".
+  getFleetStatus: () => fetchJSON<FleetStatus>('/fleet/status'),
+
+  // Worker inventory (`cao worker list`; `all` = include settled leases) and one
+  // worker's lease + terminal + last output (`cao worker status`). Read-only.
+  listFleetWorkers: (all = false) =>
+    fetchJSON<FleetWorkerList>(`/fleet/workers${all ? '?all=true' : ''}`),
+  getFleetWorker: (workerId: string) =>
+    fetchJSON<FleetWorkerDetail>(`/fleet/workers/${encodeURIComponent(workerId)}`),
 
   // U5 terminal offset-range read — the bytes produced around a selected event
   // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null

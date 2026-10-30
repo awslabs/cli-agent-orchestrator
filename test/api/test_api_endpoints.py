@@ -33,6 +33,12 @@ from cli_agent_orchestrator.services.terminal_service import (
 )
 from cli_agent_orchestrator.utils.skills import SkillNameError
 
+
+def _install_kiro_memory_manager(agents_dir):
+    """A Kiro sidecar is refused unless memory_manager is installed for Kiro (#1074)."""
+    (agents_dir / "memory_manager.json").write_text("{}")
+
+
 # ── Health endpoint ──────────────────────────────────────────────────
 
 
@@ -448,7 +454,9 @@ class TestCreateSession:
         assert response.status_code == 201
         assert mock_svc.create_session.call_args.kwargs["idempotency_key"] == "retry-1"
 
-    def test_memory_manager_sidecar_gets_a_key_derived_from_the_callers(self, client):
+    def test_memory_manager_sidecar_gets_a_key_derived_from_the_callers(
+        self, client, hermetic_kiro_agent_store
+    ):
         """A keyed retry must not spawn a SECOND memory_manager (review on PR #634).
 
         The sidecar spawn is unconditional -- it runs after ``create_session``
@@ -463,6 +471,7 @@ class TestCreateSession:
         ``create_terminal`` even in the races a created-vs-reused boolean would
         miss. Suffixed so it can never collide with the caller's own key.
         """
+        _install_kiro_memory_manager(hermetic_kiro_agent_store)
         mock_terminal = Terminal(
             id="abcd1234",
             name="test-window",
@@ -493,13 +502,14 @@ class TestCreateSession:
         assert mock_create.call_args.kwargs["agent_profile"] == "memory_manager"
         assert mock_create.call_args.kwargs["idempotency_key"] == "job-1:memory-manager-sidecar"
 
-    def test_unkeyed_session_leaves_the_sidecar_unkeyed(self, client):
+    def test_unkeyed_session_leaves_the_sidecar_unkeyed(self, client, hermetic_kiro_agent_store):
         """No caller key means no sidecar key -- the default path is unchanged.
 
         Pinned because deriving `f"{key}:..."` from a `None` key would silently
         claim the literal string `"None:memory-manager-sidecar"` for every
         unkeyed request on the server, permanently, after the first one.
         """
+        _install_kiro_memory_manager(hermetic_kiro_agent_store)
         mock_terminal = Terminal(
             id="abcd1234",
             name="test-window",
@@ -583,6 +593,30 @@ class TestCreateSession:
 
         assert response.status_code == 404
         assert mock_svc.create_session.call_args.kwargs["lookup_only"] is True
+
+    def test_lookup_only_does_not_ask_the_decider(self, client):
+        """Review on PR #773: a lookup never launches, so a delegation_message
+        sent with it must not reach prepare_launch."""
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main.prepare_launch", new=AsyncMock()) as decider,
+        ):
+            mock_svc.create_session = AsyncMock(
+                side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")
+            )
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "lookup_only": "true",
+                },
+                json={"delegation_message": "do the task", "delegation_kind": "handoff"},
+            )
+
+        assert response.status_code == 404
+        decider.assert_not_called()
 
     def test_idempotency_key_conflict_is_409_not_400(self, client):
         """A reused key for a DIFFERENT request must surface as 409.
@@ -1338,6 +1372,30 @@ class TestCreateTerminalInSession:
         assert response.status_code == 404
         assert mock_svc.create_terminal.call_args.kwargs["lookup_only"] is True
 
+    def test_lookup_only_does_not_ask_the_decider(self, client):
+        """Review on PR #773: same contract as POST /sessions."""
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main._prepare_delegation", new=AsyncMock()) as decider,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")
+            )
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "lookup_only": "true",
+                },
+                json={"delegation_message": "do the task", "delegation_kind": "handoff"},
+            )
+
+        assert response.status_code == 404
+        decider.assert_not_called()
+
     def test_idempotency_key_conflict_is_409_not_404(self, client):
         """A reused key for a DIFFERENT request must surface as 409.
 
@@ -1774,6 +1832,25 @@ class TestSendTerminalKey:
         assert response.status_code == 500
         assert "Failed to send key" in response.json()["detail"]
 
+    def test_send_key_refused_terminal_is_409(self, client):
+        """POST /terminals/{id}/key returns 409, not 500, for a refused terminal.
+
+        A special key is typed input (#1074): a Kiro terminal CAO has not
+        verified refuses it the same way /input does.
+        """
+        from cli_agent_orchestrator.models.terminal import ProviderExitedInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = ProviderExitedInputBlockedError(
+                "Terminal abcd1234 failed deferred initialization (identity_mismatch). "
+                "Refusing to deliver input."
+            )
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Enter"})
+
+        assert response.status_code == 409
+        assert "Refusing to deliver input" in response.json()["detail"]
+
 
 class TestGetTerminalOutput:
     """Tests for GET /terminals/{terminal_id}/output endpoint."""
@@ -1856,7 +1933,9 @@ class TestDeleteTerminal:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
+        mock_svc.delete_terminal.assert_called_once_with(
+            "abcd1234", registry=ANY, end_reason="deleted"
+        )
 
     def test_delete_terminal_deferred_cleanup_is_conflict(self, client):
         """HTTP 200 + success:false would hide a still-retryable Grok home."""
