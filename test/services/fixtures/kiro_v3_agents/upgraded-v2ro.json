@@ -1,0 +1,50 @@
+{
+  "name": "v2ro",
+  "description": "KV3 v2-shape read-only agent",
+  "prompt": "You are a KV3 probe agent for a CAO compatibility test. Answer briefly.",
+  "tools": [
+    "@cao-mcp-server",
+    "glob",
+    "grep",
+    "read"
+  ],
+  "allowedTools": [
+    "read",
+    "glob",
+    "grep",
+    "@cao-mcp-server"
+  ],
+  "resources": [],
+  "includeMcpJson": false,
+  "mcpServers": {
+    "cao-mcp-server": {
+      "command": "cao-mcp-server",
+      "args": [],
+      "timeout": 1200000
+    }
+  },
+  "permissions": {
+    "rules": [
+      {
+        "capability": "fs_read",
+        "effect": "allow"
+      },
+      {
+        "capability": "mcp",
+        "match": [
+          "cao-mcp-server/*"
+        ],
+        "effect": "allow"
+      },
+      {
+        "capability": "skill",
+        "effect": "allow"
+      }
+    ]
+  },
+  "kiroUpgrade": {
+    "revision": 2,
+    "fingerprint": "sha256:ac0fd8de8507a3650ee811b6cdb578afa44844f5bd0d870ad824513093057d9d",
+    "source": "sha256:70895cec9da4755fdf9899d8a9c1c2d11dcf1f861dbc3b94b6e52252274deb7a"
+  }
+}

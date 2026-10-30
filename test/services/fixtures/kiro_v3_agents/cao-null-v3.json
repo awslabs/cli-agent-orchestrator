@@ -1,0 +1,10 @@
+{
+  "name": "cao-null",
+  "description": "CAO sentinel: no tools (v3 shape)",
+  "prompt": "You have no tools. Reply exactly CAO_AGENT_NOT_LOADED and stop.",
+  "tools": [],
+  "resources": [],
+  "includeMcpJson": false,
+  "includePowers": false,
+  "mcpServers": {}
+}
