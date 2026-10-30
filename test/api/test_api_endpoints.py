@@ -22,6 +22,7 @@ from cli_agent_orchestrator.api.main import (
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services import session_service, terminal_service
 from cli_agent_orchestrator.services.inbox_service import inbox_service
@@ -622,8 +623,8 @@ class TestCreateSession:
             )
 
         assert response.status_code == 201
-        assert response.json()["engine"] == "kas"
-        assert mock_svc.create_session.call_args.kwargs["engine"] == "kas"
+        assert response.json()["engine"] == "v3"
+        assert mock_svc.create_session.call_args.kwargs["engine"] is KiroEngine.V3
 
     def test_create_session_passes_model_and_initial_message(self, client):
         """The launch override and first task reach the session service, while

@@ -30,6 +30,7 @@ from sqlalchemy.types import TypeDecorator
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.kiro_engine import canonical_kiro_engine
 
 logger = logging.getLogger(__name__)
 
@@ -2598,7 +2599,9 @@ def create_terminal(
             delegate_tools=_json.dumps(delegate_tools) if delegate_tools is not None else None,
             shell_command=shell_command,
             caller_id=caller_id,
-            engine=engine,
+            # The column's one writer stores the canonical spelling, so a
+            # ``kas`` that reaches here is stored as ``v3`` (#1167).
+            engine=canonical_kiro_engine(engine),
             provider_variant=provider_variant,
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,

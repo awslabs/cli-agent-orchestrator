@@ -345,7 +345,8 @@ if ENABLE_WORKING_DIRECTORY:
             description='Optional working directory where the agent should execute (e.g., "/path/to/workspace/src/Package")',
         ),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -462,7 +463,8 @@ else:
             le=3600,
         ),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -648,7 +650,8 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Optional working directory where the agent should execute"
         ),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -693,7 +696,8 @@ else:
         ),
         message: str = Field(description=_assign_message_field_desc),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(

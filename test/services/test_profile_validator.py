@@ -75,7 +75,7 @@ class TestValidateFrontmatter:
 
     def test_schema_error_carries_the_field_path(self) -> None:
         """Errors must be locatable, so the UI can point at the offending key."""
-        findings = validate_frontmatter({"name": "agent", "engine": "v3"})
+        findings = validate_frontmatter({"name": "agent", "engine": "v4"})
 
         errors = [f for f in findings if f.severity == "error"]
         assert any(f.path == "engine" for f in errors)
@@ -151,7 +151,7 @@ class TestValidateFrontmatter:
 
     def test_findings_are_validation_message_instances(self) -> None:
         """The service must not leak the CLI's pre-formatted string shape."""
-        findings = validate_frontmatter({"name": "agent", "engine": "v3"})
+        findings = validate_frontmatter({"name": "agent", "engine": "v4"})
 
         assert all(isinstance(f, ValidationMessage) for f in findings)
         assert all(not f.message.startswith("[") for f in findings)
@@ -198,7 +198,7 @@ class TestValidateProfileText:
         assert validate_profile_text(text) == []
 
     def test_surfaces_findings_from_the_parsed_frontmatter(self) -> None:
-        text = "---\nname: agent\nengine: v3\n---\n\nBody.\n"
+        text = "---\nname: agent\nengine: v4\n---\n\nBody.\n"
 
         findings = validate_profile_text(text)
         assert any(f.severity == "error" and f.path == "engine" for f in findings)

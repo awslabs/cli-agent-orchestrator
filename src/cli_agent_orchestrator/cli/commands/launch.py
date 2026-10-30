@@ -164,9 +164,9 @@ def _parse_env_pairs(pairs):
 @click.option(
     "--engine",
     "engine",
-    type=click.Choice(["v2", "kas"], case_sensitive=True),
+    type=click.Choice(["v2", "v3", "kas"], case_sensitive=True),
     default=None,
-    help="Explicit Kiro engine (default: profile engine or v2).",
+    help="Explicit Kiro engine (default: profile engine or v2; 'kas' is an alias of 'v3').",
 )
 @click.option(
     "--allowed-tools",

@@ -45,7 +45,8 @@ class AgentProfile(BaseModel):
     # default: ``*`` for ``supervisor``, the agent's own allowedTools otherwise.
     # Consumed by CAO's create-terminal policy only; never passed to provider JSON.
     delegateTools: Optional[List[str]] = None
-    engine: Optional[KiroEngine] = None  # Kiro v2/KAS selection; omitted resolves to v2.
+    # Kiro v2/v3 selection ("kas" is an alias of v3); omitted resolves to v2.
+    engine: Optional[KiroEngine] = None
 
     # CAO-native. Per-agent skill-catalog scope: when set, only skills whose name
     # matches one of these patterns (exact name or fnmatch glob, e.g. "ads-*") are

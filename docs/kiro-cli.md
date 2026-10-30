@@ -38,9 +38,10 @@ curl -X POST "http://localhost:9889/sessions?provider=kiro_cli&agent_profile=dev
 
 **Note**: Kiro CLI requires an agent profile — it cannot be launched without one.
 
-`--engine v2` is explicit but optional because v2 is the default. `--engine kas`
-is an opt-in Phase 0 selection; CAO capability-probes it and currently rejects it
-before terminal allocation rather than claiming runtime KAS support.
+`--engine v2` is explicit but optional because v2 is the default. `--engine v3`
+selects Kiro's v3 engine (`kas`, its earlier CAO name, is accepted as an alias
+and stored as `v3`). CAO capability-probes it and currently rejects it before
+terminal allocation rather than claiming runtime v3 support.
 
 ## Features
 
