@@ -273,6 +273,28 @@ def test_only_a_selector_with_no_prompt_below_is_a_startup_selector():
     assert kiro_v3_startup_selector(_unrecognised_selector() + "\n" + _screen("idle")) is False
     # v2's own selector footer is not v3's.
     assert kiro_v3_startup_selector("x\n esc to cancel · ↑↓ to navigate · ↵ to select\n") is False
+    # An answered selector, the prompt, then a new selector below it: the new one counts.
+    answered_then_new = (
+        _unrecognised_selector() + "\n" + _screen("idle") + "\n" + _unrecognised_selector()
+    )
+    assert kiro_v3_startup_selector(answered_then_new) is True
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_an_answer_on_a_screen_the_hook_does_not_know_refuses(cwd):
+    """The status says WAITING_USER_ANSWER, but no v3 dialog or selector is on screen
+    (here v2's footer): refused after the wait, not left to the init timeout."""
+    unknown = _screen("idle").rstrip("\n") + (
+        "\n  Continue with the old engine?\n  ❯ Yes\n    No\n"
+        " esc to cancel · ↑↓ to navigate · ↵ to select\n"
+    )
+    pane = FakePane(str(cwd), ready=unknown)
+    with pytest.raises(KiroV3LaunchError) as excinfo:
+        await _launch(pane, status=TerminalStatus.WAITING_USER_ANSWER)
+    assert excinfo.value.code == "kiro_v3_startup_dialog"
+    assert "waiting for an answer" in str(excinfo.value)
+    assert pane.keys == []
+    assert pane.texts == [pane.command]
 
 
 @pytest.mark.asyncio

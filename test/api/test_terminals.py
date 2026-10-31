@@ -461,6 +461,93 @@ class TestTerminalCreationWithWorkingDirectory:
         backend.return_value.create_session.assert_not_called()
         backend.return_value.create_window.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/sessions",
+            "/sessions/test-session/terminals",
+            "/sessions/test-session/terminals:operator",
+            "/terminals/run-step",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("state", "agent", "starts"),
+        [
+            ("missing", "analyst", "kiro_v3_not_installed: "),
+            ("directory", "analyst", "kiro_v3_agent_unreadable: "),
+            ("symlink_loop", "analyst", "kiro_v3_agent_unreadable: "),
+            ("missing", "kiro_default", "Kiro agent 'kiro_default' is refused"),
+        ],
+        ids=["missing", "directory", "symlink_loop", "kiro_default"],
+    )
+    def test_a_v3_agent_file_refusal_is_a_400_naming_no_server_path(
+        self, client, tmp_path, monkeypatch, endpoint, state, agent, starts
+    ):
+        """Through the real create_terminal, on every create route: a missing or
+        unreadable v3 agent file is a coded 400 whose body names neither the
+        agents directory nor the server's home (#1074's contract, #1167 review);
+        ``kiro_default`` keeps its own fallback refusal and no install remedy."""
+        import os
+
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+        from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilities
+        from cli_agent_orchestrator.services import install_service, terminal_service
+
+        agents = tmp_path / "server-home" / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", agents)
+        target = agents / f"{agent}.json"
+        if state == "directory":
+            target.mkdir()
+        elif state == "symlink_loop":
+            os.symlink(target, target)
+        profile = AgentProfile(name=agent, description="a", allowedTools=["fs_read"])
+        caller = {"id": "dcba8765", "provider": "claude_code", "allowed_tools": ["*"]}
+        real_metadata = terminal_service.get_terminal_metadata
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile",
+                return_value=profile,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.probe_kiro_capabilities",
+                return_value=KiroCapabilities(version="2.35.1", flags=frozenset()),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                side_effect=lambda tid: caller if tid == "dcba8765" else real_metadata(tid),
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.get_backend") as backend,
+        ):
+            backend.return_value.session_exists.return_value = True
+            if endpoint == "/terminals/run-step":
+                response = client.post(
+                    endpoint,
+                    json={"provider": "kiro_cli", "agent": agent, "prompt": "go", "engine": "v3"},
+                )
+            else:
+                params = {"provider": "kiro_cli", "agent_profile": agent, "engine": "v3"}
+                if endpoint.endswith("/terminals"):
+                    params["caller_id"] = "dcba8765"
+                response = client.post(endpoint, params=params)
+
+        assert response.status_code == 400, response.text
+        body = response.json()["detail"]
+        text = body if isinstance(body, str) else body["message"]
+        assert text.startswith(starts), text
+        assert str(agents) not in text and os.path.realpath(agents) not in text
+        assert str(tmp_path) not in text and "server-home" not in text
+        if agent == "kiro_default":
+            assert "--engine v3" not in text
+        else:
+            assert f"cao install {agent} --provider kiro_cli --engine v3" in text
+        backend.return_value.create_session.assert_not_called()
+        backend.return_value.create_window.assert_not_called()
+
     def test_an_agent_not_found_body_names_no_server_path(self, client, tmp_path):
         """The real refusal's text is the 400 body: the remedy, not the directories
         searched, which only the server log gets (#1074; shared-server mode)."""

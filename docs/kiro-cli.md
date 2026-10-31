@@ -141,6 +141,8 @@ is not checked.
 
 ### When a v3 launch is refused
 
+The message never names a path on the server (it may be a shared server); the server log does.
+
 | Message starts with | What it means | Fix |
 |---|---|---|
 | `kiro_v3_unsupported_version` | kiro-cli is a version CAO has no schema for | use a supported version, or `--engine v2` |
@@ -148,6 +150,7 @@ is not checked.
 | `kiro_v3_unrestricted` | the agent or launch allows every tool (`*`) | restrict `allowedTools` |
 | `kiro_v3_home_unsupported` | `KIRO_HOME` points somewhere other than `~/.kiro` | unset it for the launch |
 | `kiro_v3_not_installed` | no agent file for this agent | `cao install <name> --provider kiro_cli --engine v3` |
+| `kiro_v3_agent_unreadable` | something that can't be read as a file is where the agent file goes (a directory, a symlink loop, no permission) | remove it, then `cao install <name> --provider kiro_cli --engine v3` |
 | `kiro_v3_bad_effort` | the profile's `kiroConfig.effort` is not a plain level such as `low`, `medium` or `high` | fix `kiroConfig.effort`, or `--engine v2` |
 | `kiro_v3_bad_cwd` | CAO could not read the launch directory to check it, or the pane's own directory at the re-check after startup | launch from an existing directory |
 | `kiro_v3_invalid:<check>` | the agent file on disk is not CAO's v3 render (a v2 file, a hand edit, or Kiro's own upgrader rewrote it) | `cao install <name> --provider kiro_cli --engine v3`; the message names any `.bak` copy Kiro left |

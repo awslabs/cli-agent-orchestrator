@@ -27,6 +27,10 @@ from pathlib import Path
 from typing import Iterable, List, Mapping, Optional
 
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilities, KiroV3LaunchError
+from cli_agent_orchestrator.providers.kiro_identity import (
+    KIRO_FALLBACK_AGENTS,
+    require_kiro_agent_defined,
+)
 from cli_agent_orchestrator.providers.kiro_v3_schema import (
     KiroV3EngineSchema,
     KiroV3UnverifiedVersionError,
@@ -65,9 +69,19 @@ class KiroV3Admission:
 
 
 def reinstall_remedy(agent_profile: str, agent_file: Path) -> str:
-    """The remedy every on-disk refusal names, with any Kiro upgrader backups beside it."""
+    """The remedy every on-disk refusal names, with any Kiro upgrader backups beside it.
+
+    Backups are named by file name only; their directory goes to the server log.
+    The refusal is the API's 400 body, and in shared-server mode the caller is
+    not the server's user, so no absolute server path goes in it (as #1074's
+    ``require_kiro_agent_defined`` does).
+    """
     backups = sorted(glob.glob(f"{glob.escape(str(agent_file))}.bak*"))
-    note = f" Kiro's upgrader left {', '.join(backups)} beside it." if backups else ""
+    note = ""
+    if backups:
+        logger.warning("Kiro v3 agent file %s has upgrader backups: %s", agent_file, backups)
+        names = ", ".join(os.path.basename(backup) for backup in backups)
+        note = f" Kiro's upgrader left {names} beside it (the server log names the directory)."
     return f"Reinstall it: `cao install {agent_profile} --provider kiro_cli --engine v3`.{note}"
 
 
@@ -116,10 +130,12 @@ def require_default_kiro_home(environments: Iterable[Optional[Mapping[str, str]]
     for environment in environments:
         value = (environment or {}).get("KIRO_HOME")
         if value and os.path.realpath(os.path.expanduser(value)) != default:
+            logger.warning("Kiro v3 launch refused: KIRO_HOME=%s is set for it", value)
             raise KiroV3LaunchError(
                 "kiro_v3_home_unsupported",
-                f"KIRO_HOME={value} is set for this launch; Kiro engine 'v3' runs only with "
-                "the default Kiro home in this release. Unset it, or retry with engine 'v2'.",
+                "KIRO_HOME is set to a directory other than ~/.kiro for this launch (the "
+                "server log names it); Kiro engine 'v3' runs only with the default Kiro "
+                "home in this release. Unset it, or retry with engine 'v2'.",
             )
 
 
@@ -131,18 +147,40 @@ def require_kiro_v3_launchable(
     schema: KiroV3EngineSchema,
     agents_dir: Path,
 ) -> None:
-    """Step 1c for a v3 create: the home, the agent file on disk, and the workspace."""
+    """Step 1c for a v3 create: the home, the agent file on disk, and the workspace.
+
+    No refusal names an absolute server path: each one is the API's 400 body,
+    so paths go to the server log, as #1074's ``require_kiro_agent_defined`` does.
+    """
+    stem = flatten_path_separators(agent_profile)
+    if agent_profile in KIRO_FALLBACK_AGENTS:
+        # Its own refusal (``fallback_agent``), before the file read: no v3 file
+        # can be installed for a fallback name, so an install remedy would be
+        # one the validator refuses.
+        require_kiro_agent_defined(agent_profile, [])
     require_default_kiro_home([os.environ, launch_env])
 
-    stem = flatten_path_separators(agent_profile)
     agent_file = Path(agents_dir) / f"{stem}.json"
+    install = f"`cao install {agent_profile} --provider kiro_cli --engine v3`"
     try:
         raw = agent_file.read_bytes()
     except FileNotFoundError:
+        logger.warning("Kiro v3 agent file for %r not found at %s", agent_profile, agent_file)
         raise KiroV3LaunchError(
             "kiro_v3_not_installed",
-            f"no Kiro agent file at {agent_file}. Install it for v3: "
-            f"`cao install {agent_profile} --provider kiro_cli --engine v3`.",
+            f"no Kiro v3 agent file for '{agent_profile}' in the directory `cao install` "
+            f"writes (the server log names it). Install it for v3: {install}.",
+        ) from None
+    except OSError as exc:
+        # A directory, a symlink loop, no permission: a refusal, not a 500.
+        logger.warning(
+            "Kiro v3 agent file for %r at %s could not be read: %s", agent_profile, agent_file, exc
+        )
+        raise KiroV3LaunchError(
+            "kiro_v3_agent_unreadable",
+            f"the Kiro v3 agent file for '{agent_profile}' in the directory `cao install` "
+            f"writes could not be read ({type(exc).__name__}; the server log names the "
+            f"path). Remove whatever is there, then install it for v3: {install}.",
         ) from None
     findings = validate_kiro_v3_agent_bytes(
         raw, schema, expected_name=stem, launch_allowlist=list(allowed_tools)

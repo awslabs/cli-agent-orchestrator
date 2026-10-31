@@ -18,12 +18,15 @@ Provisional (#1167): the code ``kiro_v3_workspace_config:<entry>`` and the lists
 
 from __future__ import annotations
 
+import logging
 import os
 import stat
 from pathlib import Path
 from typing import Iterator, Optional
 
 from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
+
+logger = logging.getLogger(__name__)
 
 KIRO_WORKSPACE_DIR = ".kiro"
 #: Content Kiro reads as text, never as configuration that runs or grants anything.
@@ -45,10 +48,14 @@ class KiroWorkspaceError(KiroV3Refusal):
             if entry in CONFIG_ENTRIES
             else "an entry CAO does not know"
         )
+        # No absolute path in the message: it is the API's 400 body, and in
+        # shared-server mode the caller is not the server's user. ``path`` is
+        # logged by ``check_kiro_workspace`` (as #1074 keeps paths out).
         super().__init__(
-            f"{self.code}: {path} holds {kind} ({entry}), which Kiro v3 would load once "
-            "the workspace is trusted. Remove it, launch from a worktree without it, or "
-            "retry with engine 'v2'."
+            f"{self.code}: a .kiro/ in the launch directory or one of its parents holds "
+            f"{kind} ({entry}), which Kiro v3 would load once the workspace is trusted "
+            "(the server log names the path). Remove it, launch from a worktree without "
+            "it, or retry with engine 'v2'."
         )
 
 
@@ -91,6 +98,14 @@ def check_kiro_workspace(cwd: str, home: Optional[str] = None) -> None:
     # The home directory itself is skipped, not whatever its ``.kiro`` resolves
     # to: a user may keep ``~/.kiro`` as a symlink, while a workspace ``.kiro``
     # that is a symlink (to ``~/.kiro`` or anywhere) still refuses.
+    try:
+        _check_workspace_dirs(cwd, home)
+    except KiroWorkspaceError as exc:
+        logger.warning("Kiro v3 workspace check refused %s: %s", exc.path, exc.code)
+        raise
+
+
+def _check_workspace_dirs(cwd: str, home: Optional[str]) -> None:
     user_home = Path(os.path.realpath(home or str(Path.home())))
     for directory in _workspace_dirs(cwd):
         if directory == user_home:

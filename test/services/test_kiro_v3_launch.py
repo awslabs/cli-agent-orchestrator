@@ -231,6 +231,73 @@ def test_a_workspace_with_kiro_settings_refuses(agents, repo):
     assert excinfo.value.code == "kiro_v3_workspace_config:settings"
 
 
+# --- no absolute server path in any refusal (#1074's contract; #1167 review) ------
+
+
+@pytest.mark.parametrize("state", ["missing", "directory", "symlink_loop"])
+def test_an_absent_or_unreadable_agent_file_is_coded_and_names_no_path(agents, repo, caplog, state):
+    import os
+
+    target = agents / "reviewer.json"
+    if state == "directory":
+        target.mkdir()
+    elif state == "symlink_loop":
+        os.symlink(target, target)
+    with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.kiro_v3_launch"):
+        with pytest.raises(KiroV3LaunchError) as excinfo:
+            _launchable(agents, repo)
+    expected = "kiro_v3_not_installed" if state == "missing" else "kiro_v3_agent_unreadable"
+    assert excinfo.value.code == expected
+    message = str(excinfo.value)
+    assert str(agents) not in message and os.path.realpath(agents) not in message
+    assert "cao install reviewer --provider kiro_cli --engine v3" in message
+    # The server log keeps the path for the operator.
+    assert any(str(target) in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.parametrize("name", ["kiro_default", "Default"])
+def test_a_fallback_agent_keeps_its_own_refusal_before_any_read(agents, repo, name):
+    from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
+    (agents / f"{name}.json").write_text(_universal(name))
+    with (
+        patch.object(Path, "read_bytes", side_effect=AssertionError("read")),
+        pytest.raises(KiroAgentIdentityError) as excinfo,
+    ):
+        require_kiro_v3_launchable(name, str(repo), None, GRANT, KAS_0_66_70, agents)
+    assert excinfo.value.kind == "fallback_agent"
+    assert "--engine v3" not in str(excinfo.value)
+
+
+def test_backups_and_kiro_home_are_named_without_server_paths(agents, repo, tmp_path, caplog):
+    target = agents / "reviewer.json"
+    target.write_text(json.dumps({"name": "reviewer", "tools": ["read"]}))
+    (agents / "reviewer.json.bak.1").write_text("{}")
+    with pytest.raises(KiroV3InvalidAgentError) as excinfo:
+        _launchable(agents, repo)
+    assert "reviewer.json.bak.1" in str(excinfo.value)
+    assert str(agents) not in str(excinfo.value)
+
+    home = str(tmp_path / "elsewhere-home")
+    with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.kiro_v3_launch"):
+        with pytest.raises(KiroV3LaunchError) as excinfo:
+            require_default_kiro_home([{"KIRO_HOME": home}])
+    assert excinfo.value.code == "kiro_v3_home_unsupported"
+    assert home not in str(excinfo.value)
+    assert any(home in record.getMessage() for record in caplog.records)
+
+
+def test_a_workspace_refusal_names_no_path_and_logs_it(agents, repo, caplog):
+    (agents / "reviewer.json").write_text(_universal("reviewer"))
+    (repo / ".kiro" / "hooks").mkdir(parents=True)
+    with caplog.at_level("WARNING", logger="cli_agent_orchestrator.providers.kiro_workspace"):
+        with pytest.raises(KiroWorkspaceError) as excinfo:
+            _launchable(agents, repo)
+    assert excinfo.value.code == "kiro_v3_workspace_config:hooks"
+    assert str(repo) not in str(excinfo.value)
+    assert any(str(repo / ".kiro" / "hooks") in r.getMessage() for r in caplog.records)
+
+
 def test_no_working_directory_refuses(agents):
     (agents / "reviewer.json").write_text(_universal("reviewer"))
     with pytest.raises(KiroV3LaunchError, match="kiro_v3_bad_cwd"):
