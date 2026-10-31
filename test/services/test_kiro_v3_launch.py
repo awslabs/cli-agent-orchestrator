@@ -14,7 +14,14 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilities, KiroV3LaunchError
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    MISSING_FLAG_REMEDY,
+    KiroCapabilities,
+    KiroCapabilityError,
+    KiroV3LaunchError,
+    missing_flag_message,
+)
 from cli_agent_orchestrator.providers.kiro_v3_schema import (
     KAS_0_66_70,
     KiroV3Refusal,
@@ -346,8 +353,10 @@ class Allocated(Exception):
     pass
 
 
-async def _create(profile, repo, *, version="2.35.1", env_vars=None, allowed=None, seen=None):
-    probe = Mock(return_value=_caps(version))
+async def _create(
+    profile, repo, *, version="2.35.1", env_vars=None, allowed=None, seen=None, probe=None
+):
+    probe = probe or Mock(return_value=_caps(version))
     with (
         patch(f"{_TS}.agent_profiles.load_agent_profile", return_value=profile),
         patch(f"{_TS}.get_backend") as backend,
@@ -412,6 +421,32 @@ async def test_each_pre_allocation_refusal_allocates_nothing(agents, repo, setup
         await _create(PROFILE, repo, seen=seen, **kwargs)
     assert excinfo.value.code.startswith(code)
     assert seen == {"session": False, "other": False}
+
+
+@pytest.mark.asyncio
+async def test_an_installed_launch_keeps_its_v2_remedies(opted_out, agents, repo):
+    """Only a helper's version and wrapper refusals drop "retry with engine 'v2'" (#1167 Phase 2)."""
+    (agents / "reviewer.json").write_text(_universal("reviewer"))
+    with pytest.raises(KiroV3UnverifiedVersionError) as excinfo:
+        await _create(PROFILE, repo, version="2.36.0")
+    assert str(excinfo.value).endswith("so CAO does not launch v3 on it. Retry with engine 'v2'.")
+    with pytest.raises(KiroV3UnsupportedVersionError) as excinfo:
+        await _create(PROFILE, repo, version="2.40.0")
+    assert str(excinfo.value).endswith(
+        "each with a pinned engine schema. Retry with engine 'v2', or use a supported kiro-cli "
+        "version."
+    )
+    flag = KiroCapabilityError(
+        "unsupported_capability",
+        KiroEngine.V3,
+        missing_flag_message(KiroEngine.V3, "--effort", "2.35.1", MISSING_FLAG_REMEDY),
+        capability="--effort",
+        version="2.35.1",
+    )
+    assert str(flag).endswith("Detected wrapper version: 2.35.1. Retry with engine 'v2'.")
+    with pytest.raises(KiroCapabilityError) as excinfo:
+        await _create(PROFILE, repo, probe=Mock(side_effect=flag))
+    assert excinfo.value is flag
 
 
 @pytest.mark.asyncio

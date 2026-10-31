@@ -33,10 +33,19 @@ from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers import kiro_launch_home
 from cli_agent_orchestrator.providers.kiro_capabilities import (
+    MISSING_FLAG_REMEDY,
     KiroCapabilityError,
+    KiroV3LaunchError,
+    missing_flag_message,
     probe_kiro_capabilities,
 )
 from cli_agent_orchestrator.providers.kiro_launch_home import KiroLaunchRefusal
+from cli_agent_orchestrator.providers.kiro_v3_schema import (
+    UNSUPPORTED_VERSION_REMEDY,
+    UNVERIFIED_VERSION_REMEDY,
+    KiroV3UnsupportedVersionError,
+    KiroV3UnverifiedVersionError,
+)
 from cli_agent_orchestrator.services import kiro_v3_launch, session_env, terminal_service
 
 CHILD = "eeeeeeee"
@@ -273,13 +282,23 @@ async def test_a_kiro_cli_version_off_the_allow_list_refuses_before_bind(kiro):
     with pytest.raises(KiroCapabilityError) as err:
         await launch(kiro)
     assert err.value.kind == "kiro_v3_unsupported_version"
+    assert err.value.capability == "--version" and err.value.version == "9.9.9"
+    # A helper runs only on v3, so the remedy is a supported kiro-cli, never v2.
+    assert "v2" not in str(err.value)
+    assert str(err.value).endswith(terminal_service._HELPER_SUPPORTED_CLI)
     assert_refused_before_bind(kiro)
 
 
 @pytest.mark.asyncio
 async def test_a_pending_version_needs_the_operators_opt_in(kiro, monkeypatch):
     (kiro.fake / "version").write_text("2.36.0")
-    assert await policy_rule(kiro) == "kiro_v3_unverified_version"
+    with pytest.raises(kiro.service.EphemeralPolicyError) as err:
+        await launch(kiro)
+    assert err.value.rule == "kiro_v3_unverified_version"
+    # The remedy is the opt-in or a verified kiro-cli, never v2, which a helper refuses.
+    assert "v2" not in err.value.message
+    assert err.value.detail.endswith(terminal_service._HELPER_VERIFIED_CLI)
+    assert "kiro.v3_allow_unverified_versions" in err.value.detail
     assert_refused_before_bind(kiro)
     monkeypatch.setattr(kiro_v3_launch, "kiro_v3_allow_unverified_versions", lambda: True)
     terminal = await launch(kiro)
@@ -613,8 +632,50 @@ async def test_a_wrapper_without_effort_refuses_an_effort_launch_before_bind(kir
     )
     with pytest.raises(KiroCapabilityError) as err:
         await launch(kiro)
-    assert err.value.capability == "--effort"
+    assert err.value.kind == "unsupported_capability" and err.value.capability == "--effort"
+    assert "v2" not in str(err.value)
+    assert str(err.value).endswith(terminal_service._HELPER_SUPPORTED_CLI)
     assert_refused_before_bind(kiro)
+
+
+def test_a_helpers_remedy_replaces_only_the_v2_clause():
+    """Each helper refusal is Phase 1's, same code and fields, with the remedy swapped."""
+    installed = KiroCapabilityError(
+        "unsupported_capability",
+        KiroEngine.V3,
+        missing_flag_message(KiroEngine.V3, "--effort", "2.35.1", MISSING_FLAG_REMEDY),
+        capability="--effort",
+        version="2.35.1",
+    )
+    helper = terminal_service._helper_capability_error(installed)
+    assert (helper.kind, helper.engine, helper.capability, helper.version) == (
+        "unsupported_capability",
+        KiroEngine.V3,
+        "--effort",
+        "2.35.1",
+    )
+    stem = str(installed).removesuffix(MISSING_FLAG_REMEDY)
+    assert stem != str(installed) and str(helper) == stem + terminal_service._HELPER_SUPPORTED_CLI
+    unsupported = KiroV3UnsupportedVersionError("9.9.9")
+    for error, remedy in [
+        (KiroV3UnverifiedVersionError("2.36.0"), UNVERIFIED_VERSION_REMEDY),
+        (unsupported, UNSUPPORTED_VERSION_REMEDY),
+    ]:
+        swapped = terminal_service._helper_v3_refusal(error)
+        assert type(swapped) is type(error) and swapped.code == error.code
+        assert swapped.version == error.version and "v2" not in str(swapped)
+        assert str(swapped).startswith(str(error).removesuffix(remedy))
+    probed = KiroCapabilityError(
+        unsupported.code, KiroEngine.V3, str(unsupported), capability="--version", version="9.9.9"
+    )
+    assert str(terminal_service._helper_capability_error(probed)) == str(
+        terminal_service._helper_v3_refusal(unsupported)
+    )
+    # Refusals that suggest no engine are returned as they are.
+    other = KiroCapabilityError("probe_failed", KiroEngine.V3, "kiro-cli --help failed")
+    assert terminal_service._helper_capability_error(other) is other
+    unrestricted = KiroV3LaunchError("kiro_v3_unrestricted", "restrict the grant")
+    assert terminal_service._helper_v3_refusal(unrestricted) is unrestricted
 
 
 # --- the session environment ---------------------------------------------------
@@ -985,6 +1046,8 @@ def test_every_helper_refusal_code_is_in_the_kiro_docs():
         codes |= set(re.findall(r'KiroLaunchRefusal\(\s*"([a-z0-9_:]+)"', text))
         codes |= set(re.findall(r'self\.code = "(kiro_[a-z0-9_:]+)"', text))
     assert {"kiro_v3_global_home:secrets", "kiro_ephemeral_engine:v2"} <= codes
+    # The version refusals carry the helper's own remedy, so they get helper rows too.
+    codes |= {KiroV3UnverifiedVersionError.code, KiroV3UnsupportedVersionError.code}
     docs = (root / "docs/kiro-cli.md").read_text(encoding="utf-8")
     table = docs[docs.index("#### When a helper is refused") :]
     table = table[: table.index("#### FAQ")]
@@ -995,3 +1058,6 @@ def test_every_helper_refusal_code_is_in_the_kiro_docs():
         if f"`{code}`" not in rows and f"`:{code.split(':', 1)[-1]}`" not in rows
     )
     assert not missing, f"no symptom-table row for {missing}"
+    assert "`Kiro engine 'v3' requires wrapper flag`" in rows
+    fixes = [line.rstrip(" |").rsplit("|", 1)[-1] for line in rows.splitlines()]
+    assert not [fix for fix in fixes if "v2" in fix], "a helper fix suggests engine v2"

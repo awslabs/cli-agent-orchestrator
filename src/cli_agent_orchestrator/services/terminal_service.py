@@ -119,10 +119,12 @@ from cli_agent_orchestrator.providers.base import (
     OutputExtractionRejected,
 )
 from cli_agent_orchestrator.providers.kiro_capabilities import (
+    MISSING_FLAG_REMEDY,
     KiroCapabilities,
     KiroCapabilityError,
     KiroV3LaunchError,
     kiro_effort,
+    missing_flag_message,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
@@ -135,7 +137,12 @@ from cli_agent_orchestrator.providers.kiro_launch_home import (
     KiroLaunchRefusal,
     ResolvedKiroCli,
 )
-from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3EngineSchema, KiroV3Refusal
+from cli_agent_orchestrator.providers.kiro_v3_schema import (
+    KiroV3EngineSchema,
+    KiroV3Refusal,
+    KiroV3UnsupportedVersionError,
+    KiroV3UnverifiedVersionError,
+)
 from cli_agent_orchestrator.providers.kiro_workspace import check_kiro_helper_workspace
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
 from cli_agent_orchestrator.services import ephemeral_service, worktree_service
@@ -1374,6 +1381,60 @@ def _ephemeral_kiro_refusal(
     return policy
 
 
+#: A helper runs only on v3 (``kiro_ephemeral_engine:v2``), so its version and
+#: wrapper refusals name these in place of "retry with engine 'v2'" (#1167 Phase 2).
+_HELPER_SUPPORTED_CLI = "Use a supported kiro-cli version: a Kiro helper runs only on engine 'v3'."
+_HELPER_VERIFIED_CLI = (
+    "Use a verified kiro-cli version, or have the operator opt in with "
+    "kiro.v3_allow_unverified_versions: a Kiro helper runs only on engine 'v3'."
+)
+
+
+def _helper_v3_refusal(error: KiroV3Refusal) -> KiroV3Refusal:
+    """A version refusal with the helper's remedy and the same code; any other as it is."""
+    if isinstance(error, KiroV3UnverifiedVersionError):
+        return KiroV3UnverifiedVersionError(error.version, remedy=_HELPER_VERIFIED_CLI)
+    if isinstance(error, KiroV3UnsupportedVersionError):
+        return KiroV3UnsupportedVersionError(error.version, remedy=_HELPER_SUPPORTED_CLI)
+    return error
+
+
+def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
+    """The probe's version or missing-flag refusal with the helper's remedy, same kind.
+
+    It stays a capability error (a 400 with a plain-string detail); any other
+    probe failure, which suggests no engine, is returned as it is.
+    """
+    if error.kind == KiroV3UnsupportedVersionError.code:
+        message = str(KiroV3UnsupportedVersionError(error.version, remedy=_HELPER_SUPPORTED_CLI))
+    elif (
+        error.kind == "unsupported_capability"
+        and error.capability
+        and str(error)
+        == missing_flag_message(error.engine, error.capability, error.version, MISSING_FLAG_REMEDY)
+    ):
+        message = missing_flag_message(
+            error.engine, error.capability, error.version, _HELPER_SUPPORTED_CLI
+        )
+    else:
+        return error
+    return KiroCapabilityError(
+        error.kind, error.engine, message, capability=error.capability, version=error.version
+    )
+
+
+def _helper_probe(probe: Callable[..., KiroCapabilities]) -> Callable[..., KiroCapabilities]:
+    """``probe``, whose refusals carry the helper's remedy."""
+
+    def run(*args: Any, **kwargs: Any) -> KiroCapabilities:
+        try:
+            return probe(*args, **kwargs)
+        except KiroCapabilityError as exc:
+            raise _helper_capability_error(exc) from exc
+
+    return run
+
+
 def _helper_engine(
     agent_profile: str, caller_id: Optional[str], engine: Any, profile: Optional[AgentProfile]
 ) -> KiroEngine:
@@ -2150,10 +2211,12 @@ async def _create_terminal_unguarded(
                     _helper_stage_a, agent_profile, caller_id, env_vars
                 )
                 kiro_helper = (resolved_cli, global_home)
-                probe = functools.partial(
-                    probe,
-                    executable=resolved_cli.path,
-                    env=kiro_launch_home.kiro_env(kiro_probe_home),
+                probe = _helper_probe(
+                    functools.partial(
+                        probe,
+                        executable=resolved_cli.path,
+                        env=kiro_launch_home.kiro_env(kiro_probe_home),
+                    )
                 )
             try:
                 capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
@@ -2185,7 +2248,9 @@ async def _create_terminal_unguarded(
                 except KiroV3Refusal as exc:
                     if not helper:
                         raise
-                    raise _ephemeral_kiro_refusal(agent_profile, caller_id, exc) from None
+                    raise _ephemeral_kiro_refusal(
+                        agent_profile, caller_id, _helper_v3_refusal(exc)
+                    ) from None
             if kiro_helper is not None and not use_worktree:
                 # A5: the request's cwd, before bind. With a worktree the cwd does
                 # not exist yet; stage B checks the final cwd either way.

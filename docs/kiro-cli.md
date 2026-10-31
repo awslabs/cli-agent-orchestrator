@@ -232,7 +232,9 @@ holds `/tools` and `/mcp list` to the helper's own file.
 #### When a helper is refused
 
 The message never names a path on the server; the server log does. The table covers the
-helper's own refusals. The [v3 table above](#when-a-v3-launch-is-refused) applies too.
+helper's own refusals. The [v3 table above](#when-a-v3-launch-is-refused) applies too,
+except that a helper is never told to use engine `v2`: the version and wrapper rows below
+replace those.
 
 | Message starts with | What it means | Fix |
 |---|---|---|
@@ -242,7 +244,10 @@ helper's own refusals. The [v3 table above](#when-a-v3-launch-is-refused) applie
 | `kiro_v3_global_home:unknown` | the CAO server has no absolute `HOME` | start the server with `HOME` set |
 | `kiro_v3_global_home:changed` | after kiro-cli started, the helper's powers placeholder changed or a Kiro migration marker in `~/.kiro` appeared or vanished: Kiro's legacy copy may have run | nothing was sent and the home is removed; report it, with your kiro-cli version |
 | `kiro_v3_workspace_config:home` | the launch directory is your home folder, or is inside a home folder that is a git repository | launch from a repository folder, or use a worktree |
-| `kiro_home_invalid:ignored` | Kiro would ignore the helper's `KIRO_HOME` (the CAO home is your home folder, one of its parents, or the root) | set `CAO_HOME_DIR` to an ordinary folder |
+| `kiro_v3_unverified_version` | the kiro-cli version is listed but not yet operator-verified | use a verified kiro-cli version; operators running the checklist can opt in (see [Pending versions](#pending-versions-operator-only)) |
+| `kiro_v3_unsupported_version` | kiro-cli is a version CAO has no schema for | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
+| `Kiro engine 'v3' requires wrapper flag` | the kiro-cli on the server's `PATH` doesn't list a flag the helper needs (`--trust-workspace`, or `--model` or `--effort` when asked for) | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
+| `kiro_home_invalid:ignored` | Kiro would ignore the helper's `KIRO_HOME` and use `~/.kiro`: the server's `HOME` is the helper's Kiro home (`ephemeral/kiro/<id>` or `ephemeral/kiro-probe` under the CAO home) or a folder inside it | set `HOME`, or `CAO_HOME_DIR`, so that `HOME` is not under `$CAO_HOME_DIR/ephemeral/` |
 | `kiro_home_invalid:forwarded` | the launch forwarded its own `KIRO_HOME` in `env_vars` | don't forward `KIRO_HOME`; each helper has its own |
 | `kiro_home_invalid:unsafe_path` | on herdr, the CAO home path holds characters herdr cannot pass to a pane | use a CAO home path of letters, digits and `-_./` |
 | `kiro_home_invalid:exists` | something is already at the helper's home path | remove it; CAO never deletes what it did not make |

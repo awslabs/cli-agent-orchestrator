@@ -999,7 +999,7 @@ def kiro_store(store, monkeypatch, tmp_path):
                 path.chmod(0o700)
 
 
-def kiro_launch(s, with_row=True, prepared=True):
+def kiro_launch(s, with_row=True, prepared=True, recorded_home=None):
     """Bind a kiro_cli name and prepare its home as stage B does; no kiro-cli runs."""
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
@@ -1019,7 +1019,7 @@ def kiro_launch(s, with_row=True, prepared=True):
         s.service.record_kiro_event(
             CHILD,
             "kiro_home_prepared",
-            home=str(home.home),
+            home=recorded_home or str(home.home),
             hashes=home.hashes(),
             global_home=snapshot.record(),
         )
@@ -1051,6 +1051,17 @@ def test_the_sweep_removes_a_kiro_home_whose_terminal_row_is_gone(kiro_store):
     assert removed["event"] == "kiro_home_removed"
     assert removed["agent_modified"] is False and removed["settings_modified"] is False
     assert removed["secrets_store_changed"] is False and removed["global_home_changed"] is False
+
+
+def test_an_archive_record_proves_only_this_homes_path(kiro_store, tmp_path):
+    """A record for the same terminal id under another CAO home is no proof for this one."""
+    s = kiro_store
+    other = tmp_path / "other-cao" / "ephemeral" / "kiro" / CHILD
+    kiro_launch(s, with_row=False, recorded_home=str(other))
+    home = s.kiro.kiro_home_path(CHILD)
+    assert str(home) != str(other) and s.service.kiro_home_record(CHILD) is None
+    assert s.service.remove_kiro_home(CHILD) is True  # not CAO's: nothing to retry
+    assert home.is_dir() and s.owners.calls == []
 
 
 def test_the_release_record_says_what_kiro_changed(kiro_store):

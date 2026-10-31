@@ -19,7 +19,10 @@ from test.providers.test_kiro_cli_v3_launch import FakePane
 from unittest.mock import Mock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -370,6 +373,33 @@ def test_a_helpers_cleanup_removes_its_home_and_an_installed_agents_does_nothing
     removed.reset_mock()
     assert installed.cleanup() is None  # no home at its path: nothing to do
     removed.assert_not_called()
+
+
+@pytest.mark.parametrize("ephemeral_row", [False, True], ids=["no_row", "ephemeral_row"])
+def test_a_rebuilt_provider_removes_a_home_only_with_row_proof(
+    helper, tmp_path, monkeypatch, ephemeral_row
+):
+    """No launch object and no archive record: only an ephemeral terminal row is proof.
+
+    An installed Kiro terminal, or a helper whose ``kiro_home_prepared`` event
+    was never written, must leave an entry at the home path alone.
+    """
+    engine = create_engine("sqlite:///" + str(tmp_path / "rebuilt.sqlite"))
+    database.Base.metadata.create_all(engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    k.discard_launch_home(TID)  # as after a restart: this process holds no prepared home
+    home = k.kiro_home_path(TID)
+    assert home.is_dir() and ephemeral_service.kiro_home_record(TID) is None
+    stopped = []
+    monkeypatch.setattr(k, "stop_kiro_home_processes", lambda path: stopped.append(path) or True)
+    monkeypatch.setattr(database, "is_ephemeral_terminal", lambda tid: ephemeral_row)
+    rebuilt = KiroCliProvider(TID, "s", "w", AGENT, None, engine=KiroEngine.V3)
+    assert rebuilt.cleanup() is True  # nothing of CAO's is left to retry, either way
+    if ephemeral_row:
+        assert not os.path.lexists(home) and stopped == [home]
+    else:
+        assert home.is_dir() and (home / "agents").is_dir() and stopped == []
+    engine.dispose()
 
 
 def test_a_helper_rebuilt_after_a_restart_still_removes_its_home(helper, monkeypatch):

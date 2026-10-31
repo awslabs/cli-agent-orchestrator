@@ -451,19 +451,21 @@ v3 (see [Kiro v3](kiro-cli.md#kiro-v3-preview)). Each launch gets its own CAO-ow
   windows get the server's `KIRO_HOME`, never the helper's. If CAO can't set it back,
   the session is torn down and the launch fails. On herdr, `--env` reaches only the pane
   it launches (measured on herdr 0.9.3).
-- The workspace check is Phase 1's: no `.kiro/` configuration in the launch directory or
-  its parents. A helper is also refused in your home folder itself, or under a home
-  folder that is a git repository, where Kiro would load your own `~/.kiro` as workspace
-  configuration.
+- The [workspace check](kiro-cli.md#workspace-trust) applies: no `.kiro/` configuration in
+  the launch directory or its parents. A helper is also refused in your home folder
+  itself, or under a home folder that is a git repository, where Kiro would load your own
+  `~/.kiro` as workspace configuration.
 - The model tier becomes `--model`. Effort is written as `kiroConfig.effort` and becomes
   `--effort`; the probe refuses a wrapper that does not declare `--effort`.
 
 Before any task is typed, CAO checks that the header names the agent, that the home and
 your `~/.kiro` markers are unchanged, and that `/tools` and `/mcp list` show only what
 the per-launch file grants and `cao-mcp-server`. Every refusal and its fix is in the
-[Kiro helper symptom table](kiro-cli.md#when-a-helper-is-refused). Refusals raised
-before the window are `ephemeral_policy` errors; the later ones are 400s with a message,
-and a deferred failure records the `rule`.
+[Kiro helper symptom table](kiro-cli.md#when-a-helper-is-refused). CAO's own refusals
+before the window are `ephemeral_policy` errors. The probe's refusals before the window
+(an unsupported kiro-cli version, or a missing wrapper flag) keep their capability-error
+shape: a 400 whose detail is a plain string. The later ones are 400s with a message, and
+a deferred failure records the `rule`.
 
 On release, after the window is killed, CAO stops every process whose `KIRO_HOME` is the
 home (SIGTERM, then SIGKILL). A process whose `CAO_TERMINAL_ID` names another terminal is

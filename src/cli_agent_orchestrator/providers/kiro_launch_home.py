@@ -510,6 +510,14 @@ def kiro_home_ignored_reason(kiro_home: str, user_home: str) -> Optional[str]:
     return None
 
 
+#: What each of Kiro's reasons means for a helper's home, for the refusal message.
+_IGNORED_CAUSES = {
+    "contains-home": "the server's HOME is that folder or inside it",
+    "relative": "the path is relative",
+    "root": "the path is the root",
+}
+
+
 def require_kiro_home_honoured(kiro_home: Path) -> None:
     """Refuse ``kiro_home_invalid:ignored`` when Kiro would not use ``kiro_home`` at all.
 
@@ -523,11 +531,11 @@ def require_kiro_home_honoured(kiro_home: Path) -> None:
     reason = kiro_home_ignored_reason(created, server_home())
     if reason is not None:
         logger.warning("Kiro would ignore KIRO_HOME=%s (%s)", kiro_home, reason)
+        cause = _IGNORED_CAUSES.get(reason, reason)
         raise KiroLaunchRefusal(
             "kiro_home_invalid:ignored",
-            f"Kiro would ignore the helper's KIRO_HOME ({reason}) and use ~/.kiro instead; "
-            "set CAO_HOME_DIR to an absolute folder that is not your home folder or one of "
-            "its parents",
+            f"Kiro would ignore the helper's KIRO_HOME ({cause}) and use ~/.kiro instead; "
+            "set HOME, or CAO_HOME_DIR, so that HOME is not under $CAO_HOME_DIR/ephemeral/",
         )
 
 
