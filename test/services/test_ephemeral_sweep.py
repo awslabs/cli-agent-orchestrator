@@ -973,16 +973,8 @@ def test_sweep_interval_keeps_the_default_for_errors_the_loader_does_not_wrap():
 
 @pytest.fixture
 def kiro_store(store, monkeypatch, tmp_path):
-    from cli_agent_orchestrator.models.ephemeral import TOOL_ATOMS
     from cli_agent_orchestrator.providers import kiro_launch_home
-    from cli_agent_orchestrator.utils import ephemeral_capabilities as caps
 
-    # The row the capability table gains in a later commit, patched in.
-    monkeypatch.setitem(
-        caps.CAPABILITIES,
-        "kiro_cli",
-        caps.EphemeralCapability(caps.HARD, frozenset(TOOL_ATOMS), True, ("kiroConfig", "effort")),
-    )
     store.config["allowed_providers"] = ["claude_code", "kiro_cli"]
     owners = SimpleNamespace(stoppable=True, calls=[])
 

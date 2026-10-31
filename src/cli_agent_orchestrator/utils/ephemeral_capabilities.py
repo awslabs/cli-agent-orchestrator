@@ -6,9 +6,8 @@ validates ``ephemeral.allowed_providers``, by the MCP tool schema, and later by
 provider can run and the enforcement label a create reports cannot drift apart.
 
 This is the ephemeral counterpart of ``utils/enforcement.py``, which describes
-installed launches. The two differ on purpose: Kiro enforces installed agents
-natively but runs no ephemeral, and the contained Codex launch planned in #1074
-gets a sandbox class that installed Codex launches do not.
+installed launches. The two differ on purpose: the contained Codex launch
+planned in #1074 gets a sandbox class that installed Codex launches do not.
 
 The class names and the ``tool_unsupported_on_provider:<atom>`` rule built from
 ``unsupported_atoms`` are provisional public strings (#1074 open questions 4 and
@@ -76,10 +75,12 @@ CAPABILITIES: dict[str, EphemeralCapability] = {
     "codex": EphemeralCapability(
         ADVISORY, frozenset(TOOL_ATOMS), True, ("codexConfig", "model_reasoning_effort")
     ),
-    # Refused until the per-launch Kiro agent lands (#1074). An ephemeral
-    # profile's model would not reach --model either: Kiro reads it with
-    # load_agent_profile, which cannot read reserved names.
-    "kiro_cli": _REFUSED,
+    # Hard on the v3 engine, from a per-launch universal agent file (#1167
+    # Phase 2): v3 exposes only what the file selects minus what it excludes,
+    # and denies every capability outside the grant; /tools and /mcp list are
+    # checked before each task. The model reaches --model through the launch
+    # object, and effort goes in kiroConfig.effort and becomes --effort.
+    "kiro_cli": EphemeralCapability(HARD, frozenset(TOOL_ATOMS), True, ("kiroConfig", "effort")),
 }
 
 

@@ -30,7 +30,6 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from cli_agent_orchestrator.clients import database
-from cli_agent_orchestrator.models.ephemeral import TOOL_ATOMS
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers import kiro_launch_home
 from cli_agent_orchestrator.providers.kiro_capabilities import (
@@ -39,7 +38,6 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
 )
 from cli_agent_orchestrator.providers.kiro_launch_home import KiroLaunchRefusal
 from cli_agent_orchestrator.services import kiro_v3_launch, session_env, terminal_service
-from cli_agent_orchestrator.utils import ephemeral_capabilities as caps
 
 CHILD = "eeeeeeee"
 FIXTURES = Path(__file__).parents[1] / "providers" / "fixtures"
@@ -61,14 +59,6 @@ elif args == ["--version"]:
 else:
     sys.exit(2)
 """
-
-
-def _kiro_row() -> caps.EphemeralCapability:
-    # The row the capability table gains in a later commit; patched in so the
-    # helper launch is testable before kiro_cli is admitted to rule 8.
-    return caps.EphemeralCapability(
-        caps.HARD, frozenset(TOOL_ATOMS), True, ("kiroConfig", "effort")
-    )
 
 
 class SimpleEnv:
@@ -93,7 +83,6 @@ def kiro(create_store, operator_home, tmp_path, monkeypatch):  # noqa: F811
     env = create_store
     service, _, cao_home, _, config = env
     config["ephemeral"]["allowed_providers"] = ["claude_code", "kiro_cli"]
-    monkeypatch.setitem(caps.CAPABILITIES, "kiro_cli", _kiro_row())
     name = create(env, {**SPEC, "provider": "kiro_cli", "tools": ["fs_read", "fs_list"]})["name"]
 
     fake = tmp_path / "fake-bin"
