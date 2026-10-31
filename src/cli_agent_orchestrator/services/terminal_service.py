@@ -1448,10 +1448,7 @@ def _check_helper_workspace(
 def _remove_unowned_kiro_home(prepared: KiroLaunchHome) -> None:
     """Remove a prepared Kiro home no provider owns; the sweep retries a failure."""
     try:
-        removed = kiro_launch_home.remove_kiro_home(
-            prepared.terminal_id, prepared.hashes(), global_home=prepared.global_home
-        )
-        if not removed:
+        if not ephemeral_service.remove_kiro_home(prepared.terminal_id):
             logger.warning("Kiro home for terminal %s retained for a retry", prepared.terminal_id)
     except Exception:  # noqa: BLE001 - cleanup must not replace the launch's own error
         logger.exception("Removing the Kiro home for terminal %s failed", prepared.terminal_id)

@@ -19,6 +19,7 @@ The provider detects the following terminal states:
 
 import asyncio
 import logging
+import os
 import re
 import shlex
 import time
@@ -57,7 +58,9 @@ from cli_agent_orchestrator.providers.kiro_launch_home import (
     CAO_MCP_SERVER,
     KiroLaunch,
     check_global_home_unchanged,
+    kiro_home_path,
     launch_agent_grant,
+    valid_terminal_id,
     verify_launch_home,
 )
 from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
@@ -1666,6 +1669,29 @@ class KiroCliProvider(BaseProvider):
         """Get the command to exit Kiro CLI."""
         return "/exit"
 
-    def cleanup(self) -> None:
-        """Clean up Kiro CLI provider."""
+    def cleanup(self) -> Optional[bool]:
+        """Clean up Kiro CLI provider; a helper also removes its per-launch home.
+
+        The window is already killed. Every process whose ``KIRO_HOME`` is the
+        helper's home is stopped, then the home is removed, Kiro's session files
+        included (#1167 Phase 2). ``False`` keeps the provider and the row for a
+        retry when an owner cannot be proven gone.
+        """
         self._initialized = False
+        from cli_agent_orchestrator.services import ephemeral_service
+
+        if self._launch is not None:
+            return ephemeral_service.remove_kiro_home(self.terminal_id, row_proof=True)
+        # A helper's provider rebuilt from its row after a restart has no launch
+        # object, but its home keeps its deterministic path; removal still needs
+        # proof (the archive, or the ephemeral row). Installed Kiro terminals
+        # have no home, so for them this is one lstat and nothing else.
+        if not valid_terminal_id(self.terminal_id) or not os.path.lexists(
+            kiro_home_path(self.terminal_id)
+        ):
+            return None
+        from cli_agent_orchestrator.clients.database import is_ephemeral_terminal
+
+        return ephemeral_service.remove_kiro_home(
+            self.terminal_id, row_proof=is_ephemeral_terminal(self.terminal_id)
+        )

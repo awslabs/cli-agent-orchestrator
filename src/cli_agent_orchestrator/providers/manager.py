@@ -1,6 +1,7 @@
 """Provider manager as module singleton with direct terminal_id → provider mapping."""
 
 import logging
+import os
 from typing import Dict, List, Optional, Type
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -345,9 +346,9 @@ class ProviderManager:
             if metadata is None or metadata.get("provider") == ProviderType.KIRO_CLI.value:
                 # An ephemeral Kiro helper's per-launch home (#1167 Phase 2). A
                 # failed create rolls back through here before (or without) its
-                # provider and row; the home still has its deterministic path.
-                # Installed Kiro rows have none.
-                if not self._cleanup_kiro_home(terminal_id):
+                # provider and row, and a restart loses the provider; the home
+                # still has its deterministic path. Installed Kiro rows have none.
+                if not self._cleanup_kiro_home(terminal_id, metadata):
                     logger.warning("Cleanup deferred for Kiro home of terminal: %s", terminal_id)
                     return False
             if metadata and metadata.get("provider") == ProviderType.GROK_CLI.value:
@@ -419,20 +420,24 @@ class ProviderManager:
             return False
 
     @staticmethod
-    def _cleanup_kiro_home(terminal_id: str) -> bool:
+    def _cleanup_kiro_home(terminal_id: str, metadata: Optional[dict]) -> bool:
         """Remove a per-launch Kiro home with no live provider; False to retry later.
 
-        Only a home this process prepared is removed: an entry at the path that
-        CAO has no record of is left alone.
+        A home is removed only with proof that CAO prepared it: the prepared
+        home this process holds, the archive's record, or an ephemeral Kiro
+        terminal row (written only after the home was prepared). An entry at
+        the path without proof is left alone.
         """
+        from cli_agent_orchestrator.clients.database import is_ephemeral_terminal
+        from cli_agent_orchestrator.services import ephemeral_service
+
         if not kiro_launch_home.valid_terminal_id(terminal_id):
             return True
-        prepared = kiro_launch_home.prepared_launch_home(terminal_id)
-        if prepared is None:
+        if not os.path.lexists(kiro_launch_home.kiro_home_path(terminal_id)):
+            kiro_launch_home.discard_launch_home(terminal_id)
             return True
-        return kiro_launch_home.remove_kiro_home(
-            terminal_id, prepared.hashes(), global_home=prepared.global_home
-        )
+        row_proof = metadata is not None and is_ephemeral_terminal(terminal_id)
+        return ephemeral_service.remove_kiro_home(terminal_id, row_proof=row_proof)
 
     def list_providers(self) -> Dict[str, str]:
         """List all active providers (for debugging)."""

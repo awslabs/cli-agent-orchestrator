@@ -1,5 +1,6 @@
 """Persist bounded ephemeral profiles and guard their claim lifecycle."""
 
+import functools
 import hashlib
 import json
 import logging
@@ -31,6 +32,7 @@ from cli_agent_orchestrator.decisions.policy import (
 from cli_agent_orchestrator.decisions.types import POINTS, Effort, ProviderOptions
 from cli_agent_orchestrator.models.ephemeral import TOOL_ATOMS, EphemeralSpec
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers import kiro_launch_home
 from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
 from cli_agent_orchestrator.services.settings_service import (
     EPHEMERAL_DEFAULTS,
@@ -1934,6 +1936,115 @@ def record_kiro_event(terminal_id: str, event: str, **facts: Any) -> None:
         )
 
 
+def kiro_home_record(terminal_id: str) -> Optional[dict[str, Any]]:
+    """What CAO recorded when it prepared this terminal's Kiro home, if it did.
+
+    Read from the archive of the name bound to the terminal: the last
+    ``kiro_home_prepared`` event for exactly this home, unless a later
+    ``kiro_home_removed`` closed it. This is what proves, after a restart, that
+    an entry at the home path is CAO's to remove. Fail-closed: a missing
+    archive is no record, but an unreadable one raises, so the caller keeps
+    the home and its row for a retry instead of mistaking it for no record.
+    """
+    row = _launched_row(terminal_id)
+    if row is None:
+        return None
+    try:
+        payload = _read_regular(Path(row["audit_path"]))
+    except FileNotFoundError:
+        return None
+    archive = json.loads(payload)
+    expected = str(kiro_launch_home.kiro_home_path(terminal_id))
+    record: Optional[dict[str, Any]] = None
+    for entry in archive.get("events", []) if isinstance(archive, dict) else []:
+        if not isinstance(entry, dict) or entry.get("home") != expected:
+            continue
+        if entry.get("event") == "kiro_home_prepared" and isinstance(entry.get("hashes"), dict):
+            record = entry
+        elif entry.get("event") == "kiro_home_removed":
+            record = None
+    return record
+
+
+def _recorded_global_home(entry: dict[str, Any]) -> Optional[kiro_launch_home.KiroGlobalHome]:
+    """The stage-A ``~/.kiro`` snapshot an archive entry recorded, under this server's HOME."""
+    record = entry.get("global_home")
+    if not isinstance(record, dict):
+        return None
+    try:
+        user_home = kiro_launch_home.server_home()
+    except kiro_launch_home.KiroLaunchRefusal:
+        return None
+    return kiro_launch_home.KiroGlobalHome(
+        user_home=user_home,
+        **{
+            key: record.get(key) is True
+            for key in (
+                "powers_source",
+                "powers_marker",
+                "secrets_source",
+                "secrets_marker",
+                "placeholder_listable",
+            )
+        },
+    )
+
+
+def _record_kiro_home_removed(
+    terminal_id: str, home: str, evidence: kiro_launch_home.HomeRemoval
+) -> None:
+    record_kiro_event(
+        terminal_id,
+        "kiro_home_removed",
+        home=home,
+        agent_modified=evidence.agent_modified,
+        settings_modified=evidence.settings_modified,
+        secrets_store_changed=evidence.secrets_store_changed,
+        global_home_changed=evidence.global_home_changed,
+    )
+
+
+def remove_kiro_home(terminal_id: str, *, row_proof: bool = False) -> bool:
+    """Remove a helper's per-launch Kiro home and record it; False to keep the row for a retry.
+
+    The proof that the home is CAO's is the prepared home this process holds,
+    else the archive's ``kiro_home_prepared`` event, else ``row_proof`` (a live
+    provider or an ephemeral terminal row, which exists only once the home was
+    prepared). Without any, an entry at the path is left alone. The release
+    record says whether the agent, settings or secret-store files and the
+    ``~/.kiro`` markers changed. Raises when the registry or the archive cannot
+    be read: every caller then retains.
+    """
+    if not kiro_launch_home.valid_terminal_id(terminal_id):
+        return True
+    prepared = kiro_launch_home.prepared_launch_home(terminal_id)
+    recorded: Optional[dict[str, str]] = None
+    global_home: Optional[kiro_launch_home.KiroGlobalHome] = None
+    if prepared is not None:
+        recorded, global_home = prepared.hashes(), prepared.global_home
+    else:
+        entry = kiro_home_record(terminal_id)
+        if entry is not None:
+            recorded = {str(name): str(digest) for name, digest in entry["hashes"].items()}
+            global_home = _recorded_global_home(entry)
+    if recorded is None and row_proof:
+        recorded = {}
+    home = str(kiro_launch_home.kiro_home_path(terminal_id))
+    return kiro_launch_home.remove_kiro_home(
+        terminal_id,
+        recorded,
+        global_home=global_home,
+        on_removed=functools.partial(_record_kiro_home_removed, terminal_id, home),
+    )
+
+
+def _kiro_home_exists(row: dict[str, Any]) -> bool:
+    terminal_id = row.get("launched_terminal_id")
+    if not isinstance(terminal_id, str) or not kiro_launch_home.valid_terminal_id(terminal_id):
+        return False
+    return os.path.lexists(kiro_launch_home.kiro_home_path(terminal_id))
+
+
 def _terminal_exists(db: Any, terminal_id: Optional[str]) -> bool:
     return terminal_id is not None and db.get(database.TerminalModel, terminal_id) is not None
 
@@ -2099,6 +2210,8 @@ def _retain(row: dict[str, Any], cutoff: Any, counts: Counter[str]) -> None:
     with database.SessionLocal() as db:
         if _terminal_exists(db, row["launched_terminal_id"]):
             return  # A surviving terminal stays marked ephemeral through this row.
+    if _kiro_home_exists(row):
+        return  # A Kiro home keeps its row, name and archive until it is gone (#1167).
     if _live_entries(name, regular_only=False):
         return
     archive = _remove_archive(session, name, cutoff)
@@ -2196,6 +2309,16 @@ def sweep(startup: bool) -> dict[str, int]:
                     _finish_gc(row)
                     if not _live_entries(row["name"], regular_only=True):
                         counts["retried"] += 1
+                # A Kiro helper's home whose terminal row is gone: a release that
+                # never ran provider cleanup, a crash after bind, or a cleanup that
+                # deferred (#1167 Phase 2). A home whose terminal row survives is
+                # its provider's to remove.
+                if row["provider"] == ProviderType.KIRO_CLI.value and _kiro_home_exists(row):
+                    with database.SessionLocal() as db:
+                        orphaned = not _terminal_exists(db, row["launched_terminal_id"])
+                    if orphaned and remove_kiro_home(row["launched_terminal_id"]):
+                        if not _kiro_home_exists(row):
+                            counts["kiro_homes"] += 1
     if grace is not None:
         with _isolated("rowless"):
             _sweep_rowless(counts, now - grace)

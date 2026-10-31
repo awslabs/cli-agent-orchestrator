@@ -356,3 +356,29 @@ def test_a_helper_runs_on_v3_only(helper):
     launch, _, _ = helper
     with pytest.raises(ValueError):
         KiroCliProvider(TID, "s", "w", AGENT, None, engine=KiroEngine.V2, launch=launch)
+
+
+def test_a_helpers_cleanup_removes_its_home_and_an_installed_agents_does_nothing(
+    helper, monkeypatch
+):
+    launch, _, _ = helper
+    removed = Mock(return_value=False)
+    monkeypatch.setattr(ephemeral_service, "remove_kiro_home", removed)
+    assert _provider(launch).cleanup() is False
+    removed.assert_called_once_with(TID, row_proof=True)
+    installed = KiroCliProvider("0a1b2c3e", "s", "w", AGENT, None, engine=KiroEngine.V3)
+    removed.reset_mock()
+    assert installed.cleanup() is None  # no home at its path: nothing to do
+    removed.assert_not_called()
+
+
+def test_a_helper_rebuilt_after_a_restart_still_removes_its_home(helper, monkeypatch):
+    """The manager rebuilds a provider from the row with no launch object (#1167 Phase 2)."""
+    removed = Mock(return_value=True)
+    monkeypatch.setattr(ephemeral_service, "remove_kiro_home", removed)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.is_ephemeral_terminal", lambda tid: True
+    )
+    rebuilt = KiroCliProvider(TID, "s", "w", AGENT, None, engine=KiroEngine.V3)
+    assert rebuilt.cleanup() is True
+    removed.assert_called_once_with(TID, row_proof=True)

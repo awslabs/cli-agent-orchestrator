@@ -888,3 +888,90 @@ async def test_on_herdr_only_the_launched_pane_has_the_home(kiro, private_herdr)
     )
     later = private_herdr.pane_env("bbbbbbbb", "later")
     assert later == {"KIRO_HOME": None, "CAO_TERMINAL_ID": "bbbbbbbb"}
+
+
+# --- release ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def real_provider(kiro, monkeypatch):
+    """The real KiroCliProvider in the real manager map; its initialize is a stand-in."""
+    from cli_agent_orchestrator.providers.kiro_cli import KiroAttestation, KiroCliProvider
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    manager = terminal_service.provider_manager
+    kiro.factory.side_effect = lambda *a, **kw: ProviderManager.create_provider(manager, *a, **kw)
+
+    async def initialize(self):
+        self.identity_verified = True
+        self.attestation = KiroAttestation(("read",), (("cao-mcp-server", 34),), "auto")
+        return True
+
+    monkeypatch.setattr(KiroCliProvider, "initialize", initialize)
+    owners = SimpleEnv(stoppable=True, calls=[])
+
+    def stop(home):
+        owners.calls.append(home)
+        return owners.stoppable
+
+    monkeypatch.setattr(kiro_launch_home, "stop_kiro_home_processes", stop)
+    kiro.owners = owners
+    yield kiro
+    manager._providers.pop(CHILD, None)
+
+
+@pytest.mark.asyncio
+async def test_the_launch_is_audited_and_delete_removes_the_home_after_its_owners(real_provider):
+    kiro = real_provider
+    await launch(kiro)
+    attested = kiro_events(kiro)["kiro_attested"]
+    assert attested["tags"] == ["read"] and attested["mcp_tools"] == {"cao-mcp-server": 34}
+    assert attested["kiro_version"] == "2.35.1" and attested["schema"]
+    assert terminal_service.delete_terminal(CHILD, end_reason="deleted") is True
+    assert kiro.owners.calls == [home()]
+    assert not os.path.lexists(home())
+    removed = kiro_events(kiro)["kiro_home_removed"]
+    assert removed["agent_modified"] is False and removed["settings_modified"] is False
+    assert removed["secrets_store_changed"] is False and removed["global_home_changed"] is False
+    assert database.get_ephemeral_agent(kiro.name)["gc_reason"] == "terminal_deleted"
+    # The launch cwd is untouched: the home lives under the CAO home only.
+    assert list(kiro.repo.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_an_owner_that_may_remain_keeps_the_row_and_home_for_a_retry(real_provider):
+    kiro = real_provider
+    await launch(kiro)
+    kiro.owners.stoppable = False
+    assert terminal_service.delete_terminal(CHILD, end_reason="deleted") is False
+    assert home().is_dir() and database.get_terminal_metadata(CHILD) is not None
+    kiro.owners.stoppable = True
+    assert terminal_service.delete_terminal(CHILD, end_reason="deleted") is True
+    assert not os.path.lexists(home()) and database.get_terminal_metadata(CHILD) is None
+
+
+@pytest.mark.asyncio
+async def test_a_provider_rebuilt_after_a_restart_removes_the_home_on_delete(real_provider):
+    kiro = real_provider
+    await launch(kiro)
+    manager = terminal_service.provider_manager
+    manager._providers.pop(CHILD)
+    kiro_launch_home.discard_launch_home(CHILD)
+    rebuilt = manager.get_provider(CHILD)  # a status read after the restart rebuilds it
+    assert rebuilt is not None and getattr(rebuilt, "_launch", None) is None
+    assert terminal_service.delete_terminal(CHILD, end_reason="deleted") is True
+    assert not os.path.lexists(home())
+    assert kiro_events(kiro)["kiro_home_removed"]["agent_modified"] is False
+
+
+@pytest.mark.asyncio
+async def test_after_a_restart_delete_still_removes_the_home(real_provider):
+    kiro = real_provider
+    await launch(kiro)
+    terminal_service.provider_manager._providers.pop(CHILD)
+    kiro_launch_home.discard_launch_home(CHILD)
+    kiro.operator.set_entry(".secrets-migrated", "file")  # Kiro wrote a marker meanwhile
+    assert terminal_service.delete_terminal(CHILD, end_reason="deleted") is True
+    assert not os.path.lexists(home())
+    removed = kiro_events(kiro)["kiro_home_removed"]
+    assert removed["agent_modified"] is False and removed["global_home_changed"] is True
