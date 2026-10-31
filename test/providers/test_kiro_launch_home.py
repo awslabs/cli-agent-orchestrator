@@ -8,6 +8,7 @@ tests check which rule a refusal names, not its wording.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import itertools
 import json
@@ -792,18 +793,20 @@ class TestGlobalHomeGuard:
         assert k.placeholder_is_listable(sealed) is True
         assert k.placeholder_is_listable(tmp_path / "missing") is True
 
-    @pytest.mark.parametrize("error", [PermissionError, OSError])
+    @pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.ELOOP, errno.ENAMETOOLONG])
     def test_a_source_that_cannot_be_stat_ed_counts_as_present(
-        self, store, operator_home, monkeypatch, error  # noqa: F811
+        self, store, operator_home, monkeypatch, code  # noqa: F811
     ):
         """An lstat error other than absence never reads as "no secret store"."""
         probe = k.ensure_probe_home()
         source = os.path.join(str(operator_home.home), ".kiro", "secrets.json")
         real = os.lstat
+        # OSError maps EACCES to PermissionError; the others stay plain OSErrors.
+        assert (type(OSError(code, "")) is PermissionError) == (code == errno.EACCES)
 
         def lstat(path, *args, **kwargs):
             if os.fspath(path) == source:
-                raise error(13, "Permission denied", source)
+                raise OSError(code, os.strerror(code), source)
             return real(path, *args, **kwargs)
 
         monkeypatch.setattr(os, "lstat", lstat)
@@ -1063,7 +1066,7 @@ class TestRemove:
 
     @pytest.mark.parametrize("kind", ["file", "hard_link"])
     def test_a_placeholder_that_is_not_a_directory_is_never_chmod_ed(
-        self, store, tmp_path, monkeypatch, kind
+        self, store, operator_home, tmp_path, monkeypatch, kind  # noqa: F811
     ):
         """Only a directory is unsealed: a file, or a hard link to one outside, keeps its mode."""
         prepared = prepare()
@@ -1090,9 +1093,13 @@ class TestRemove:
                 modes.append(mode)
             return real(path, mode, *args, **kwargs)
 
-        monkeypatch.setattr(os, "chmod", chmod)
-        assert k.remove_kiro_home(TID, prepared.hashes(), stop_owners=lambda _: True) is True
-        monkeypatch.undo()
+        # Scoped, so the fixtures' fake HOME, ~/.kiro spy and store root stay in force.
+        with monkeypatch.context() as m:
+            m.setattr(os, "chmod", chmod)
+            assert k.remove_kiro_home(TID, prepared.hashes(), stop_owners=lambda _: True) is True
+        assert os.chmod is real
+        assert os.environ["HOME"] == str(operator_home.home)
+        assert ephemeral_service.EPHEMERAL_DIR == store
         assert modes == []  # never chmod-ed: not a directory
         assert stat.S_IMODE(os.lstat(outside).st_mode) == 0o600
         assert outside.read_text() == "keep"
