@@ -657,6 +657,48 @@ SOFT_ENFORCEMENT_PROVIDERS = {
 }
 
 
+def _runner_placement_kwargs(terminal_id: str) -> Dict[str, Any]:
+    """``{"runner_id": ...}`` for a placed terminal, ``{}`` otherwise."""
+    placement = _backend_placement(terminal_id)
+    return {"runner_id": placement} if placement else {}
+
+
+def _backend_placement(terminal_id: str) -> Optional[str]:
+    """Where the backend placed ``terminal_id`` (a runner id), or None for local."""
+    placement_of = getattr(get_backend(), "placement_of", None)
+    placement = placement_of(terminal_id) if callable(placement_of) else None
+    return placement if isinstance(placement, str) and placement else None
+
+
+def _backend_resolves_paths_locally() -> bool:
+    """Whether terminal paths (cwd, worktrees) live on this host's filesystem.
+
+    False only for a backend whose terminals run elsewhere (``RemoteBackend``);
+    there the path is validated by the runner that owns it.
+    """
+    # ``is not False`` rather than ``bool()``: only an explicit False means the
+    # paths live elsewhere; a test double's attribute must not flip the default.
+    return getattr(get_backend(), "resolves_paths_locally", True) is not False
+
+
+def _resolve_launch_working_directory(working_directory: Optional[str]) -> Optional[str]:
+    """The launch cwd to hand the backend, resolved where it can be.
+
+    For a backend whose terminals run on another host the path cannot be
+    checked here: an absolute path is passed through for the runner to validate
+    (its own tmux client applies the same rules), and no path means the
+    runner's own default rather than this server's cwd. Every other backend
+    gets :func:`_resolve_working_directory`, unchanged.
+    """
+    if not _backend_resolves_paths_locally():
+        if working_directory is not None and not os.path.isabs(working_directory):
+            raise ValueError(
+                f"Working directory must be an absolute path on the runner: {working_directory}"
+            )
+        return working_directory
+    return _resolve_working_directory(working_directory)
+
+
 def _resolve_working_directory(working_directory: Optional[str]) -> str:
     """Resolve launch cwd exactly as the tmux backend does before creation."""
     return resolve_and_validate_path(
@@ -1801,6 +1843,18 @@ async def _create_terminal_unguarded(
     # ran (use_worktree=False) or itself failed before create_worktree returned.
     worktree_repo_root: Optional[str] = None
     try:
+        # A backend that runs terminals somewhere other than this host (the
+        # remote backend, #745) refuses providers whose launch reads or probes
+        # this host's filesystem: their checks would describe the server, not
+        # the runner the agent actually starts on. Refused before any probe or
+        # backend resource, like every other launch refusal below.
+        refusal = getattr(get_backend(), "unsupported_provider_reason", None)
+        reason = refusal(provider) if callable(refusal) else None
+        # Only a string is a refusal: a duck-typed backend may not define the
+        # hook at all, and a test double answers it with arbitrary objects.
+        if isinstance(reason, str) and reason:
+            raise ValueError(reason)
+
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
         # resource. A KAS request must probe then fail closed with no window,
         # database row, FIFO, Herdr registration, or provider process.
@@ -2138,6 +2192,11 @@ async def _create_terminal_unguarded(
         # (explicit or caller-inherited), so the terminal always launches inside
         # its own isolated checkout rather than the shared one it would
         # otherwise have used.
+        if use_worktree and not _backend_resolves_paths_locally():
+            raise ValueError(
+                "use_worktree is not supported by the remote terminal backend: the "
+                "worktree would be created on the server host, not on the runner"
+            )
         if use_worktree:
             # `find_repo_root`/`create_worktree` are synchronous `subprocess.run`
             # calls (a full worktree checkout can take seconds to tens of
@@ -2159,7 +2218,7 @@ async def _create_terminal_unguarded(
         # so resolving earlier would both launch tmux in the pre-worktree directory
         # (defeating the isolation #100 provides) and persist that stale path as the
         # terminal's working_directory. This is the effective launch cwd either way.
-        resolved_working_directory = _resolve_working_directory(working_directory)
+        resolved_working_directory = _resolve_launch_working_directory(working_directory)
 
         # Step 1c: a Kiro launch must name an agent kiro-cli will load. kiro-cli
         # does not refuse an unknown --agent; it starts its built-in kiro_default
@@ -2174,6 +2233,9 @@ async def _create_terminal_unguarded(
             check_env = (
                 env_vars if new_session else {**get_session_env(session_name), **(env_vars or {})}
             )
+            # A backend that resolves paths remotely refuses kiro_cli above, so
+            # this launch resolved its cwd locally.
+            assert resolved_working_directory is not None
             await asyncio.to_thread(
                 require_kiro_agent_resolves, agent_profile, resolved_working_directory, check_env
             )
@@ -2426,6 +2488,11 @@ async def _create_terminal_unguarded(
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
                         delegate_tools=delegate_tools,
+                        # The runner it was placed on (remote backend, #745), in
+                        # the same INSERT, so the row and its routing are never
+                        # apart. Passed only when there is one: local creates are
+                        # byte-for-byte the call they were.
+                        **_runner_placement_kwargs(terminal_id),
                         # Written False with every Kiro row, in this same INSERT
                         # (#1074): no write is needed later to refuse input to a
                         # pane whose identity check never passed. Other providers

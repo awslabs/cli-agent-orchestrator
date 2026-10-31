@@ -485,6 +485,35 @@ class TerminalBackend(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support get_pane_id()")
 
+    @property
+    def resolves_paths_locally(self) -> bool:
+        """Whether terminal paths (cwd, worktrees, provider files) are on this host.
+
+        True for every backend whose terminals run beside the server. A backend
+        that runs them elsewhere (``RemoteBackend``) returns False, and the
+        server then leaves path validation to the host that owns the path.
+        """
+        return True
+
+    def unsupported_provider_reason(self, provider: str) -> Optional[str]:
+        """Why this backend cannot launch ``provider``, or None if it can."""
+        return None
+
+    def placement_of(self, terminal_id: str) -> Optional[str]:
+        """Which execution host runs ``terminal_id``, persisted with its row.
+
+        None for every backend whose terminals run on this host.
+        """
+        return None
+
+    def agent_server_env(self) -> Optional[Dict[str, str]]:
+        """The CAO address variables an agent on this backend should use.
+
+        None means "this server's own" (``utils.mcp_resolution``); a backend
+        whose agents run on another host returns the address they can reach.
+        """
+        return None
+
     def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
         """Query native agent status if the backend has agent awareness.
 

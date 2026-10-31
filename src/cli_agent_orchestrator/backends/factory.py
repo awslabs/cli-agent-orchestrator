@@ -1,7 +1,8 @@
 """BackendFactory — constructs the configured TerminalBackend at startup.
 
 Reads `terminal.backend` via ConfigService (CLI flag > CAO_TERMINAL_BACKEND
-env var > settings.json > "tmux" default). "herdr" is opt-in and experimental.
+env var > settings.json > "tmux" default). "herdr" is opt-in and experimental;
+"remote" (terminals on cao-runner processes, #745) is opt-in and experimental.
 """
 
 import logging
@@ -83,8 +84,25 @@ class BackendFactory:
                 "Report issues at https://github.com/awslabs/cli-agent-orchestrator/issues"
             )
             return HerdrBackend(herdr_session=herdr_session)
+        elif backend_name == "remote":
+            from cli_agent_orchestrator.backends.remote_backend import (
+                DEFAULT_REMOTE_PROVIDERS,
+                RemoteBackend,
+            )
+
+            configured = ConfigService.get(
+                "terminal.remote_providers", default=",".join(sorted(DEFAULT_REMOTE_PROVIDERS))
+            )
+            providers = frozenset(p.strip() for p in str(configured).split(",") if p.strip())
+            logger.info(
+                "[EXPERIMENTAL] terminal_backend='remote': terminals run on cao-runner "
+                "processes connected to this server"
+            )
+            # No hub here: only cao-server hosts one (its lifespan attaches it). A
+            # client that mirrors the server's backend gets explicit errors instead.
+            return RemoteBackend(supported_providers=providers)
         else:
             raise ConfigurationError(
                 f"Unknown terminal_backend: '{backend_name}'. "
-                f"Valid options are: 'tmux', 'herdr' [EXPERIMENTAL]"
+                f"Valid options are: 'tmux', 'herdr' [EXPERIMENTAL], 'remote' [EXPERIMENTAL]"
             )

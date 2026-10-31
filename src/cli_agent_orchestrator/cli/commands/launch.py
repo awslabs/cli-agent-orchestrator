@@ -36,6 +36,7 @@ from cli_agent_orchestrator.utils.init_allowance import (
 )
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
+    server_terminal_backend,
     sync_backend_from_server,
     wait_for_initial_delivery,
     wait_until_terminal_status,
@@ -431,13 +432,25 @@ def launch(
                 if not auto_approve and not click.confirm("Proceed?", default=True):
                     raise click.ClickException("Launch cancelled by user")
 
+        # A server on the remote terminal backend (#745) runs the terminal on a
+        # cao-runner: there is no local pane to attach to, and this machine's cwd
+        # is not a path on the runner. Refuse an interactive launch BEFORE the
+        # agent exists rather than create it and then fail to attach, and let the
+        # runner choose its own directory unless one was given explicitly.
+        remote_terminals = server_terminal_backend() == "remote"
+        if remote_terminals and not headless:
+            raise click.ClickException(
+                "This cao-server runs terminals on cao-runners (terminal backend "
+                "'remote'); interactive attach is not supported. Relaunch with --headless."
+            )
+
         # Call API to create session — pass working_directory only if explicitly
         # provided. When omitted, the server defaults to its own CWD.
         url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
-        params = {
-            "agent_profile": agents,
-            "working_directory": working_directory or os.getcwd(),
-        }
+        params = {"agent_profile": agents}
+        launch_directory = working_directory or (None if remote_terminals else os.getcwd())
+        if launch_directory is not None:
+            params["working_directory"] = launch_directory
         if explicit_provider:
             params["provider"] = provider
         if engine is not None:

@@ -46,7 +46,7 @@ dependencies = [
     "apscheduler>=3.10.4",
     "sqlalchemy>=2.0.0",
     "uvicorn[standard]>=0.24.0",
-    "websockets>=12.0",
+    "websockets>=13.0",  # websockets.asyncio (runner hub / cao-runner)
     # Upper bound: libtmux 0.53.1 rewrote `neo.parse_output` to zip a fixed
     # 125-name format list against each row's values with `strict=True`, so any
     # row short of 125 values (a pane/session vanishing mid-listing, or a
@@ -132,6 +132,7 @@ otel = [
 "cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 "cao-ops-mcp-server" = "cli_agent_orchestrator.ops_mcp_server.server:main"
+"cao-runner" = "cli_agent_orchestrator.runner.agent:main"
 
 [project.entry-points."cao.plugins"]
 claude_code_memory = "cli_agent_orchestrator.plugins.builtin.claude_code_memory:ClaudeCodeMemoryPlugin"

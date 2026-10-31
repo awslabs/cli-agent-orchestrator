@@ -84,6 +84,7 @@ class TerminalConfig(BaseModel):
     spawn_mode: str = "window"
     pane_window: str = "cao-agents"
     pane_layout: str = "tiled"
+    remote_providers: str = "claude_code,mock_cli"
 
 
 class AppsConfig(BaseModel):
@@ -168,6 +169,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.spawn_mode": "window",
     "terminal.pane_window": "cao-agents",
     "terminal.pane_layout": "tiled",
+    "terminal.remote_providers": "claude_code,mock_cli",
     "apps.enabled": False,
     "apps.static_dir": None,
     "auth.jwks_uri": "",
@@ -190,6 +192,11 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_TERMINAL_SPAWN_MODE": ("terminal.spawn_mode", "str", "window"),
     "CAO_TERMINAL_PANE_WINDOW": ("terminal.pane_window", "str", "cao-agents"),
     "CAO_TERMINAL_PANE_LAYOUT": ("terminal.pane_layout", "str", "tiled"),
+    "CAO_TERMINAL_REMOTE_PROVIDERS": (
+        "terminal.remote_providers",
+        "str",
+        "claude_code,mock_cli",
+    ),
     "CAO_MCP_APPS_ENABLED": ("apps.enabled", "bool", False),
     "CAO_MCP_APPS_STATIC_DIR": ("apps.static_dir", "str", None),
     "CAO_AUTH_JWKS_URI": ("auth.jwks_uri", "str", ""),
@@ -681,6 +688,9 @@ class ConfigService:
                 spawn_mode=_get_value("terminal.spawn_mode", default="window"),
                 pane_window=_get_value("terminal.pane_window", default="cao-agents"),
                 pane_layout=_get_value("terminal.pane_layout", default="tiled"),
+                remote_providers=_get_value(
+                    "terminal.remote_providers", default="claude_code,mock_cli"
+                ),
             ),
             apps=AppsConfig(
                 enabled=_get_value("apps.enabled", default=False),

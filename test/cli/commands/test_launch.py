@@ -16,6 +16,21 @@ from cli_agent_orchestrator.cli.commands.launch import (
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils.agent_profiles import ProfileSource
 
+
+@pytest.fixture(autouse=True)
+def _server_backend_unknown():
+    """Launch probes the server's backend before creating (#745).
+
+    These tests script ``api_http.get`` call by call, so the probe must not
+    consume one of their responses. Unknown is the local-behavior answer;
+    the remote-backend tests below override it.
+    """
+    with patch(
+        "cli_agent_orchestrator.cli.commands.launch.server_terminal_backend", return_value=None
+    ):
+        yield
+
+
 # ── Backend auto-detection (issue #308) ──────────────────────────────
 
 
@@ -1898,3 +1913,45 @@ def test_launch_is_quiet_about_a_scheduled_memory_sidecar():
         result = runner.invoke(launch, ["--agents", "reviewer", "--headless", "--yolo", "--memory"])
     assert result.exit_code == 0, result.output
     assert "NOT launched" not in result.output
+
+
+# ── Remote terminal backend (#745) ───────────────────────────────────
+
+
+def test_launch_refuses_interactive_attach_before_creating_on_a_remote_server():
+    """No agent is created when it could never be attached to."""
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch(
+            "cli_agent_orchestrator.cli.commands.launch.server_terminal_backend",
+            return_value="remote",
+        ),
+    ):
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+    assert result.exit_code != 0
+    assert "--headless" in result.output
+    mock_post.assert_not_called()
+
+
+def test_launch_headless_on_a_remote_server_lets_the_runner_pick_its_directory():
+    """This machine's cwd is not a path on the runner, so it is not sent."""
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch(
+            "cli_agent_orchestrator.cli.commands.launch.server_terminal_backend",
+            return_value="remote",
+        ),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        result = runner.invoke(launch, ["--agents", "test-agent", "--headless", "--yolo"])
+
+    assert result.exit_code == 0, result.output
+    assert "working_directory" not in mock_post.call_args.kwargs["params"]

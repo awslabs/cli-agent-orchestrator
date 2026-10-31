@@ -23,6 +23,15 @@ def get_backend() -> TerminalBackend:
     return _backend
 
 
+def current_backend() -> Optional[TerminalBackend]:
+    """The backend already configured in this process, without creating one.
+
+    For code that only needs to adapt to a backend that is in use (e.g. MCP env
+    forwarding) and must not instantiate one as a side effect.
+    """
+    return _backend
+
+
 def set_backend(backend: TerminalBackend) -> None:
     """Set the terminal backend (called at application startup)."""
     global _backend

@@ -246,6 +246,22 @@ async def wait_until_status(
     return False
 
 
+def server_terminal_backend() -> Optional[str]:
+    """The terminal backend the running cao-server reports, or None if unknown.
+
+    Unknown (server unreachable, unexpected response) is not an error here: the
+    callers fall back to their ordinary local behavior.
+    """
+    try:
+        resp = api_http.get(f"{API_BASE_URL}/health", timeout=2.0)
+        resp.raise_for_status()
+        name = resp.json().get("terminal_backend")
+        return name if isinstance(name, str) and name else None
+    except Exception as e:
+        logger.debug(f"server_terminal_backend: could not reach server: {e}")
+        return None
+
+
 def sync_backend_from_server() -> None:
     """Query the running cao-server's /health endpoint and align the local backend singleton.
 
@@ -261,15 +277,13 @@ def sync_backend_from_server() -> None:
     from cli_agent_orchestrator.backends.factory import BackendFactory
     from cli_agent_orchestrator.backends.registry import set_backend
 
+    backend_name = server_terminal_backend()
+    if not backend_name:
+        return
     try:
-        resp = api_http.get(f"{API_BASE_URL}/health", timeout=2.0)
-        resp.raise_for_status()
-        data = resp.json()
-        backend_name = data.get("terminal_backend")
-        if backend_name:
-            set_backend(BackendFactory.create(backend_override=backend_name))
+        set_backend(BackendFactory.create(backend_override=backend_name))
     except Exception as e:
-        logger.debug(f"sync_backend_from_server: could not reach server: {e}")
+        logger.debug(f"sync_backend_from_server: could not select {backend_name!r}: {e}")
 
 
 def _is_transient_poll_error(

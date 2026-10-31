@@ -191,6 +191,11 @@ class StatusMonitor:
         # stale screen redraw.
         self._buffer_epochs: Dict[str, int] = {}
         self._last_status: Dict[str, TerminalStatus] = {}
+        # Terminals whose execution host is out of reach (remote backend, #745).
+        # Their last detected status is a statement about a pane nobody can see
+        # any more: it is reported as UNKNOWN until the host reports back, never
+        # as the stale PROCESSING/IDLE it last was. Empty for local backends.
+        self._unreachable: set = set()
         # Generation in which PROCESSING was last established from provider
         # output/screen evidence. A cached PROCESSING latch can survive
         # notify_input_sent() into the next turn, so the status value alone is
@@ -1064,6 +1069,10 @@ class StatusMonitor:
         if get_backend().supports_event_inbox():
             return StatusObservation(status, None)
         with self._lock:
+            if terminal_id in self._unreachable:
+                return StatusObservation(
+                    TerminalStatus.UNKNOWN, self._status_generation.get(terminal_id, 0)
+                )
             if terminal_id not in self._last_status:
                 # No detection has ever been applied/stamped for this terminal --
                 # there is no turn stamp to pair, so trust whatever get_status()
@@ -1192,9 +1201,31 @@ class StatusMonitor:
             logger.error(f"Error detecting status for {terminal_id}: {e}")
             return TerminalStatus.UNKNOWN
 
+    def set_unreachable(self, terminal_id: str, unreachable: bool) -> None:
+        """Mark a terminal's execution host out of (or back in) reach.
+
+        While marked, every status read answers UNKNOWN; the detector's own
+        state is kept, so clearing the mark restores whatever it last derived.
+        Each change is published, so a waiter blocked on a status topic wakes up
+        and re-reads instead of trusting the value it saw before.
+        """
+        with self._lock:
+            if unreachable:
+                if terminal_id in self._unreachable:
+                    return
+                self._unreachable.add(terminal_id)
+                published = TerminalStatus.UNKNOWN
+            else:
+                if terminal_id not in self._unreachable:
+                    return
+                self._unreachable.discard(terminal_id)
+                published = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+        bus.publish(f"terminal.{terminal_id}.status", {"status": published.value})
+
     def clear_terminal(self, terminal_id: str) -> None:
         """Free buffer and status for a deleted terminal."""
         with self._lock:
+            self._unreachable.discard(terminal_id)
             self._buffers.pop(terminal_id, None)
             self._buffer_epochs.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
@@ -1267,6 +1298,9 @@ class StatusMonitor:
         """
         from cli_agent_orchestrator.backends.registry import get_backend
 
+        with self._lock:
+            if terminal_id in self._unreachable:
+                return TerminalStatus.UNKNOWN
         if get_backend().supports_event_inbox():
             try:
                 provider = provider_manager.get_provider(terminal_id)

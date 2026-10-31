@@ -35,6 +35,12 @@ PACKAGE = Path(__file__).resolve().parents[1] / "src" / "cli_agent_orchestrator"
 # A write path whose pre-image may be a lenient load, with the reason it is allowed.
 # Keys are "<path relative to src/>::<qualified function name>".
 ALLOWLIST: Dict[str, str] = {
+    "cli_agent_orchestrator/runner/hub.py::RunnerHub._on_frame": (
+        "_decode_frame parses a WebSocket frame from a runner, not a file. The "
+        "runner-hub.json it then writes is serialized from in-memory state, never "
+        "from a prior read of that file, so a garbled frame is dropped and cannot "
+        "erase the file's other contents (#745)."
+    ),
     "cli_agent_orchestrator/services/config_service.py::_load_raw": (
         "The legacy config.json migration is a write on a read path. It is "
         "suppressed when the settings.json read actually failed (#737); only an "
