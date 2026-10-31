@@ -1,0 +1,16 @@
+# One central cao-server, execution-only runners, no per-worker server (#745).
+# kind flavour: storage-kind.yaml is a hostPath stand-in for a shared RWX volume.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: cao-remote
+resources:
+  - namespace.yaml
+  - storage-kind.yaml
+  - server.yaml
+  - runners.yaml
+  - networkpolicy.yaml
+images:
+  # deploy-kind.sh sets the tag to the image it built and loaded.
+  - name: cao-server
+    newName: cao-server
+    newTag: dev

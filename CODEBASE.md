@@ -15,6 +15,9 @@ CAO is a local client-server application with several entry points:
   `src/cli_agent_orchestrator/mcp_server/`.
 - `cao-ops-mcp-server` exposes external fleet-management tools from
   `src/cli_agent_orchestrator/ops_mcp_server/`.
+- `cao-runner` is the execution-only process for the remote terminal backend
+  (`src/cli_agent_orchestrator/runner/agent.py`): it drives tmux on its own
+  host and dials in to the server's runner hub.
 - The bundled browser client is built from `web/`; MCP App views are built
   from `cao_mcp_apps/` and served through `ext_apps/` and the built-in plugin.
 
@@ -32,7 +35,8 @@ to use.
 | `src/cli_agent_orchestrator/ops_mcp_server/` | External operations MCP tools |
 | `src/cli_agent_orchestrator/services/` | Session, terminal, inbox, workflow, memory, event, configuration, and plugin services |
 | `src/cli_agent_orchestrator/decisions/` | Launch-decision platform: points, policy, settings, deciders, records, shadow runner, telemetry, and operator access ([docs](docs/decisions.md)) |
-| `src/cli_agent_orchestrator/backends/` | Terminal-backend abstraction and tmux/herdr implementations |
+| `src/cli_agent_orchestrator/backends/` | Terminal-backend abstraction and tmux/herdr/remote implementations |
+| `src/cli_agent_orchestrator/runner/` | Remote execution: the server-side runner hub, the `cao-runner` process, their wire protocol and token handling ([docs](docs/remote-runners.md)) |
 | `src/cli_agent_orchestrator/clients/` | SQLite and tmux clients used by services and backends |
 | `src/cli_agent_orchestrator/providers/` | Provider adapters for interactive agent CLIs |
 | `src/cli_agent_orchestrator/models/` | Pydantic domain and API models |
@@ -86,8 +90,12 @@ not a public provider recommendation.
 Terminal mechanics are abstracted by `backends/base.py` and selected through
 `backends/factory.py` and `backends/registry.py`. The tmux implementation uses
 `clients/tmux.py`; the herdr implementation integrates its own terminal
-backend. Provider logic should not assume a concrete backend when the base
-contract supplies the operation.
+backend. The remote implementation (`backends/remote_backend.py`) forwards each
+operation to a `cao-runner` over the runner hub (`runner/hub.py`, its own port
+and event loop), records the placement on the terminal row
+(`terminals.runner_id`), and leaves providers, status detection and the inbox
+on the server ([Remote runners](docs/remote-runners.md)). Provider logic should
+not assume a concrete backend when the base contract supplies the operation.
 
 ## Persistence and event flow
 

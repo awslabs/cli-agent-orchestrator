@@ -1,0 +1,32 @@
+# kind stand-in for a shared RWX workspace (EFS on EKS): every kind node
+# bind-mounts the same host directory at /cao-workspace (see kind-config.yaml),
+# so a hostPath volume there is the same files on every node. Runners need it
+# because a supervisor and the agents it assigns work in the same checkout.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: cao-remote-workspace
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: ["ReadWriteMany"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /cao-workspace/remote-runners
+    type: DirectoryOrCreate
+  claimRef:
+    namespace: cao-remote
+    name: cao-remote-workspace
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cao-remote-workspace
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: ""
+  volumeName: cao-remote-workspace
+  resources:
+    requests:
+      storage: 10Gi

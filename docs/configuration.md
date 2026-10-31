@@ -262,7 +262,13 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 }
 ```
 
-- `backend`: `"tmux"` (default) or `"herdr"` [EXPERIMENTAL].
+- `backend`: `"tmux"` (default), `"herdr"` [EXPERIMENTAL], or `"remote"`
+  [EXPERIMENTAL]. Under `"remote"`, cao-server runs no terminal itself: each one
+  is placed on a `cao-runner` that dialled in to it (#745). See
+  [the remote-runner example](../examples/cao-clusters/kubernetes/remote-runners/README.md).
+- `remote_providers`: comma-separated providers the remote backend will launch
+  (default `"claude_code,mock_cli"`). Others are refused, because their launch
+  reads or probes the server's filesystem rather than the runner's.
 - `herdr_session`: the herdr session name to connect to (default `"cao"`).
 - `spawn_mode`: `"window"` (default) or `"pane"` — where a terminal created by
   `assign` / `handoff` lands. See [Watching a fleet in one window](#watching-a-fleet-in-one-window).
@@ -450,6 +456,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_TERMINAL_SPAWN_MODE` | `terminal.spawn_mode` | str |
 | `CAO_TERMINAL_PANE_WINDOW` | `terminal.pane_window` | str |
 | `CAO_TERMINAL_PANE_LAYOUT` | `terminal.pane_layout` | str |
+| `CAO_TERMINAL_REMOTE_PROVIDERS` | `terminal.remote_providers` | str |
 | `CAO_MCP_APPS_ENABLED` | `apps.enabled` | bool |
 | `CAO_MCP_APPS_STATIC_DIR` | `apps.static_dir` | str |
 | `CAO_LOG_LEVEL` | `logging.level` | str |
@@ -516,6 +523,34 @@ The `cao fleet` / `cao worker` commands ([control planes](control-planes.md#remo
 |---|---|---|---|
 | `CAO_ELASTIC_BROKER_URL` | *(none)* | str (URL) | Base URL of the fleet's worker broker, e.g. `http://127.0.0.1:9890` after a port-forward. |
 | `CAO_ELASTIC_BROKER_TOKEN` | *(none)* | str | Shared secret sent as `X-CAO-Broker-Token`. It authorizes releasing workers and sending input to their agents, so treat it as a write credential. |
+
+The remote terminal backend ([`terminal.backend = "remote"`](#terminal-backend-terminal), #745) adds two groups, read directly in `api/main.py`, `backends/remote_backend.py`, `runner/token.py` and `runner/agent.py`. [Remote runners](remote-runners.md) covers what runs where, failure outcomes and restart semantics. The server reads these:
+
+| Env var | Default | Type | Purpose |
+|---|---|---|---|
+| `CAO_RUNNER_TOKEN_FILE` | *(none)* | str (path) | File holding the bearer token runners present to the runner hub, e.g. a mounted Secret. Takes precedence over `CAO_RUNNER_TOKEN`; if it is set but unreadable, there is no token (no fallback). |
+| `CAO_RUNNER_TOKEN` | *(none)* | str | The token itself, when no file is used. One of the two is required: the server refuses to start the remote backend without a token. Both variables are removed from the server's environment once read. |
+| `CAO_RUNNER_TLS_CERT` / `CAO_RUNNER_TLS_KEY` | *(none)* | str (path) | Serve the hub as `wss://` with this certificate chain and key. A key without a certificate is a startup error. Unset: plain `ws://` (terminate TLS at an ingress or mesh, or keep the hub on a trusted network). |
+| `CAO_RUNNER_BIND_HOST` | `127.0.0.1` | str | Address the runner hub listens on. Set `0.0.0.0` for runners in other pods or hosts. |
+| `CAO_RUNNER_PORT` | `9891` | int | Runner hub port, separate from the API port so network policy can scope it on its own. |
+| `CAO_RUNNER_AGENT_API_HOST` / `CAO_RUNNER_AGENT_API_PORT` | *(unset)* | str / int | The address an agent on a runner uses to reach this server. It is written into the agent's MCP config in place of the server's own bind address. |
+| `CAO_RUNNER_CALL_TIMEOUT` | `30` | float | Seconds to wait for a runner's reply before reporting the outcome as unknown. A timed-out call is never resubmitted. |
+| `CAO_RUNNER_PLACEMENT_TIMEOUT` | `60` | float | Seconds a new terminal waits for a runner with room to connect. |
+| `CAO_RUNNER_EXPIRY` | `600` | float | Seconds a disconnected runner stays a member. Until then, a terminal it may host is never reported absent. After that, its terminals are declared lost and are killed if the runner ever returns. Membership is kept in `CAO_HOME_DIR/runner-hub.json` so it survives a server restart. |
+| `CAO_RUNNER_RESERVED_SESSIONS` | *(none)* | comma-separated list | Session names only a claiming runner may host. A new session with one of these names waits for its claimant instead of landing on a pool runner. |
+
+The `cao-runner` process reads these:
+
+| Env var | Default | Type | Purpose |
+|---|---|---|---|
+| `CAO_RUNNER_SERVER_URL` | *(none, required)* | str (URL) | Runner hub URL, e.g. `ws://cao-server:9891`. |
+| `CAO_RUNNER_TOKEN_FILE` / `CAO_RUNNER_TOKEN` | *(one required)* | str (path) / str | The hub's token, the file taking precedence as on the server. Both are removed from the runner's environment before any pane starts, so agents never inherit them. |
+| `CAO_RUNNER_CA_FILE` | system trust store | str (path) | CA bundle that verifies a `wss://` hub's certificate. Ignored (with a warning) for `ws://`. |
+| `CAO_RUNNER_READY_FILE` | `CAO_HOME_DIR/runner-ready` | str (path) | Created when the handshake with the hub completes and removed when the connection drops or the runner exits; target of an exec `readinessProbe`. `''` disables it. |
+| `CAO_RUNNER_ID` | hostname | str | Stable id for this runner (`[a-z0-9-]`, at most 63 characters). |
+| `CAO_RUNNER_CLAIMS` | *(none)* | comma-separated list | Session names this runner hosts and no other runner may host. |
+| `CAO_RUNNER_ACCEPTS_UNCLAIMED` | `1` | bool | Whether this runner also takes unclaimed terminals (pool runner). |
+| `CAO_RUNNER_MAX_TERMINALS` | `1` | int | Terminals this runner hosts at most. |
 
 ## API Endpoints
 

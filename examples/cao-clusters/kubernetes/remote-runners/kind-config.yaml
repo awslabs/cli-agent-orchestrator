@@ -1,0 +1,41 @@
+# kind cluster for the remote-runner example: 1 control-plane + 2 workers.
+# Replace <host-workspace-dir> with an absolute host path; every node mounts it.
+#
+# - 1 control-plane + 2 workers, labelled name=worker-1 / name=worker-2.
+#   The node NAMES stay kind's defaults (cao-k8s-cluster-worker{,2}) on purpose.
+#   Renaming them with a JoinConfiguration patch (nodeRegistration.name:
+#   worker-1) does register the nodes as worker-1/worker-2 and they go Ready,
+#   but kindnetd takes its node name from os.Hostname() - the container name -
+#   and watches only pods with spec.nodeName equal to it. On a renamed node it
+#   sees no local pods, its podips nft set stays empty, and every NetworkPolicy
+#   is silently unenforced (verified: panel->broker:9890 got 200 despite the
+#   policies; after `hostname worker-1` in the node container and a kindnet
+#   restart the set filled and the same request was dropped). kind has no
+#   per-node container name/hostname setting, so labels are the clean option.
+# - Every node bind-mounts the same host directory at /cao-workspace. A hostPath
+#   PV on that path is the kind stand-in for the EKS EFS workspace (RWX across
+#   nodes): the supervisor and minted workers see the same files wherever they
+#   are scheduled.
+# - No extraPortMappings: the API server binds a random 127.0.0.1 port, so this
+#   cannot collide with the istio-* clusters. The panel is reached by port-forward.
+# - The default kindnet CNI is kept; it enforces NetworkPolicy (kube-network-policies).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: cao-k8s-cluster
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: <host-workspace-dir>
+        containerPath: /cao-workspace
+  - role: worker
+    extraMounts:
+      - hostPath: <host-workspace-dir>
+        containerPath: /cao-workspace
+    labels:
+      name: worker-1
+  - role: worker
+    extraMounts:
+      - hostPath: <host-workspace-dir>
+        containerPath: /cao-workspace
+    labels:
+      name: worker-2

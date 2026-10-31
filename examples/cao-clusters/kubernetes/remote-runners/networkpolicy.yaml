@@ -1,0 +1,79 @@
+# Default-deny, then exactly the paths this topology uses.
+#
+#   runner  -> cao-server:9891   the outbound execution channel
+#   runner  -> cao-server:9889   the agents' in-session MCP servers
+#   runner  -> public :443       model provider (Bedrock)
+#   nothing -> runner            a runner has no inbound interface at all
+#   cao-server -> (DNS only)     it never dials a runner
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-server-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-server
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: runner
+      ports:
+        - port: 9889
+        - port: 9891
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: cao-remote
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runner-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: runner
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-server
+      ports:
+        - port: 9889
+        - port: 9891
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+      ports:
+        - port: 443

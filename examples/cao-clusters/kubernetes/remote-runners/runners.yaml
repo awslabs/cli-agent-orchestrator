@@ -1,0 +1,217 @@
+# Execution-only runners. Each pod runs `cao-runner` — tmux plus whatever
+# provider CLI the server launches in it — and NO cao-server. A runner dials out
+# to the server's runner hub; nothing dials in, so there is no runner Service.
+#
+# Two kinds, differing only in what they will host:
+#   - the supervisor runner claims the session `cao-supervisor` and hosts
+#     nothing else, so the supervisor always lands here;
+#   - pool runners take any unclaimed terminal, one each. A supervisor's
+#     `assign` adds a window to its own session; the supervisor runner is full,
+#     so the new terminal is placed on a free pool runner in another pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cao-supervisor-runner
+  labels:
+    app.kubernetes.io/name: cao-supervisor-runner
+spec:
+  replicas: 1
+  # One runner id must never be live twice: the hub would route the same
+  # terminals to two pods.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-supervisor-runner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-supervisor-runner
+        app.kubernetes.io/component: runner
+        app.kubernetes.io/part-of: cao-remote
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: runner
+          image: cao-server:latest
+          imagePullPolicy: IfNotPresent
+          command: ["cao-runner"]
+          env:
+            - name: CAO_RUNNER_SERVER_URL
+              value: ws://cao-server.cao-remote.svc.cluster.local:9891
+            # A mounted file, not an env value: an env value stays readable in
+            # /proc/<pid>/environ for the life of the process.
+            - name: CAO_RUNNER_TOKEN_FILE
+              value: /var/run/cao-runner/token
+            # Present only while connected to the hub (the readinessProbe).
+            - name: CAO_RUNNER_READY_FILE
+              value: /home/cao/.cao/runner-ready
+            - name: CAO_RUNNER_ID
+              value: supervisor
+            - name: CAO_RUNNER_CLAIMS
+              value: cao-supervisor
+            - name: CAO_RUNNER_ACCEPTS_UNCLAIMED
+              value: "0"
+            - name: CAO_RUNNER_MAX_TERMINALS
+              value: "1"
+            # The agents' in-session MCP servers reach the central API here.
+            - name: CAO_API_HOST
+              value: cao-server.cao-remote.svc.cluster.local
+            - name: CAO_API_PORT
+              value: "9889"
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/runner
+            - name: CLAUDE_CODE_USE_BEDROCK
+              value: "1"
+            - name: AWS_REGION
+              value: us-east-1
+            - name: ANTHROPIC_MODEL
+              value: global.anthropic.claude-haiku-4-5-20251001-v1:0
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              value: global.anthropic.claude-haiku-4-5-20251001-v1:0
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              value: global.anthropic.claude-haiku-4-5-20251001-v1:0
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              value: global.anthropic.claude-haiku-4-5-20251001-v1:0
+          envFrom:
+            # AWS credentials for Bedrock, injected by the operator (see
+            # deploy-kind.sh). Only runner pods hold them; the server does not.
+            - secretRef:
+                name: cao-provider-credentials
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/home/cao/.cao/runner-ready"]
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /home/cao/workspace
+            - name: runtime
+              mountPath: /home/cao/.cao
+            - name: runner-token
+              mountPath: /var/run/cao-runner
+              readOnly: true
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cao-remote-workspace
+        - name: runtime
+          emptyDir: {}
+        - name: runner-token
+          secret:
+            secretName: cao-runner-token
+            defaultMode: 0440
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cao-pool-runner
+  labels:
+    app.kubernetes.io/name: cao-pool-runner
+spec:
+  # Operator-configured worker count; the server is still one process.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-pool-runner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-pool-runner
+        app.kubernetes.io/component: runner
+        app.kubernetes.io/part-of: cao-remote
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-pool-runner
+      containers:
+        - name: runner
+          image: cao-server:latest
+          imagePullPolicy: IfNotPresent
+          command: ["cao-runner"]
+          env:
+            - name: CAO_RUNNER_SERVER_URL
+              value: ws://cao-server.cao-remote.svc.cluster.local:9891
+            # A mounted file, not an env value: an env value stays readable in
+            # /proc/<pid>/environ for the life of the process.
+            - name: CAO_RUNNER_TOKEN_FILE
+              value: /var/run/cao-runner/token
+            # Present only while connected to the hub (the readinessProbe).
+            - name: CAO_RUNNER_READY_FILE
+              value: /home/cao/.cao/runner-ready
+            # The pod name: unique per replica and stable for the pod's life.
+            - name: CAO_RUNNER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CAO_RUNNER_MAX_TERMINALS
+              value: "1"
+            - name: CAO_API_HOST
+              value: cao-server.cao-remote.svc.cluster.local
+            - name: CAO_API_PORT
+              value: "9889"
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/runner
+            - name: CLAUDE_CODE_USE_BEDROCK
+              value: "1"
+            - name: AWS_REGION
+              value: us-east-1
+            - name: ANTHROPIC_MODEL
+              value: global.anthropic.claude-haiku-4-5-20251001-v1:0
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              value: global.anthropic.claude-haiku-4-5-20251001-v1:0
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              value: global.anthropic.claude-haiku-4-5-20251001-v1:0
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              value: global.anthropic.claude-haiku-4-5-20251001-v1:0
+          envFrom:
+            - secretRef:
+                name: cao-provider-credentials
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/home/cao/.cao/runner-ready"]
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /home/cao/workspace
+            - name: runtime
+              mountPath: /home/cao/.cao
+            - name: runner-token
+              mountPath: /var/run/cao-runner
+              readOnly: true
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cao-remote-workspace
+        - name: runtime
+          emptyDir: {}
+        - name: runner-token
+          secret:
+            secretName: cao-runner-token
+            defaultMode: 0440

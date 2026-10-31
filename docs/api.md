@@ -305,6 +305,17 @@ and `RunStepRequest` (`POST /terminals/run-step`).
   with `reuse_terminal_id` return `422` ("delegation fields cannot be combined
   with reuse_terminal_id").
 
+### Runners (remote terminal backend)
+
+- `GET /runners` lists the connected `cao-runner`s: id, claims, whether it
+  takes unclaimed terminals, `max_terminals`, the windows it hosts, pending
+  reservations and terminals queued for reaping. Other backends answer `404`.
+- Under the remote backend, the session and terminal routes that reach a
+  runner add three statuses: `503` (runner unavailable, nothing was sent),
+  `504` (sent, outcome unknown, never resent) and `502` (the runner reported a
+  failure). A terminal whose runner is out of reach reports status `unknown`.
+  See [Remote runners](remote-runners.md#failure-outcomes).
+
 ### Durable handoff results
 
 - `POST /terminals/run-step` runs one agent step and accepts an optional
