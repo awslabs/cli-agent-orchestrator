@@ -7,10 +7,11 @@ complete it before creating a backend session, database row, or provider.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers.kiro_v3_schema import (
@@ -148,6 +149,7 @@ def _run(
     engine: KiroEngine,
     *,
     stdin: Optional[int] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one bounded probe command and normalize execution failures."""
     try:
@@ -158,6 +160,8 @@ def _run(
         }
         if stdin is not None:
             kwargs["stdin"] = stdin
+        if env is not None:
+            kwargs["env"] = dict(env)
         result = runner(list(command), **kwargs)
     except FileNotFoundError as exc:
         raise KiroCapabilityError(
@@ -315,6 +319,8 @@ def probe_kiro_capabilities(
     timeout: float = 5.0,
     chat_help_timeout: float = 10.0,
     runner: ProbeRunner = subprocess.run,
+    executable: str = "kiro-cli",
+    env: Optional[Mapping[str, str]] = None,
 ) -> KiroCapabilities:
     """Probe the selected engine mechanism and each requested wrapper feature.
 
@@ -322,15 +328,22 @@ def probe_kiro_capabilities(
     receives a closed stdin so the probe cannot enter interactive mode, and its
     timeout is independently configurable because wrapper startup can be slower
     than the root command.
+
+    ``executable`` and ``env`` default to the PATH ``kiro-cli`` and the server
+    environment. An ephemeral helper passes the absolute kiro-cli it will type
+    into the pane and a CAO-owned ``KIRO_HOME``, so the binary probed is the
+    binary launched (#1167 Phase 2). Only help and the version run: no session
+    starts.
     """
-    root_help_result = _run(runner, ("kiro-cli", "--help"), timeout, engine)
+    root_help_result = _run(runner, (executable, "--help"), timeout, engine, env=env)
     root_help_output = (root_help_result.stdout or "") + "\n" + (root_help_result.stderr or "")
     chat_help_result = _run(
         runner,
-        ("kiro-cli", "chat", "--help"),
+        (executable, "chat", "--help"),
         chat_help_timeout,
         engine,
         stdin=subprocess.DEVNULL,
+        env=env,
     )
     chat_help_output = (chat_help_result.stdout or "") + "\n" + (chat_help_result.stderr or "")
     flags = _flags_from_help(root_help_output) | _flags_from_help(chat_help_output)
@@ -338,7 +351,7 @@ def probe_kiro_capabilities(
 
     version: Optional[str] = None
     try:
-        version_result = _run(runner, ("kiro-cli", "--version"), timeout, engine)
+        version_result = _run(runner, (executable, "--version"), timeout, engine, env=env)
         version_output = (version_result.stdout or "") + "\n" + (version_result.stderr or "")
         version_match = _VERSION_RE.search(version_output) or _VERSION_RE.search(
             root_help_output + "\n" + chat_help_output
@@ -419,7 +432,8 @@ def probe_kiro_capabilities(
 #: Removed from a v3 launch's environment (#1167): the variable that force-adds
 #: MCP servers whatever ``tools`` says, the upgrader's agent-directory
 #: override, an engine variable of unknown purpose, and any ``KIRO_HOME`` a
-#: pane's rc files export (v3 runs with the default Kiro home in Phase 1).
+#: pane's rc files export (an installed v3 agent runs with the default Kiro
+#: home). An ephemeral helper assigns its own ``KIRO_HOME`` instead of the last.
 KIRO_V3_UNSET_ENV = (
     "ASBX_KIRO_MANDATORY_MCPS",
     "KIRO_AGENT_CONFIG_DIR",
@@ -435,6 +449,8 @@ def build_kiro_command(
     model: Optional[str] = None,
     yolo: bool = False,
     effort: Optional[str] = None,
+    executable: str = "kiro-cli",
+    kiro_home: Optional[str] = None,
 ) -> list[str]:
     """Build a deterministic Kiro command without executing it.
 
@@ -443,6 +459,13 @@ def build_kiro_command(
     ``env`` is absolute so PATH order cannot swap it, and it execs kiro-cli, so
     the pane's exit-to-shell check is unchanged. Trust-all is always on for v3,
     and only together with the universal agent file's unconditional denies.
+
+    ``executable`` and ``kiro_home`` are for an ephemeral helper, on v3 only
+    (#1167 Phase 2). It names kiro-cli by the absolute path the server resolved
+    and probed, because the pane's login shell can reorder PATH, and in place
+    of ``-u KIRO_HOME`` it assigns ``KIRO_HOME=<home>``, which ``env`` applies
+    after any rc file's export. With both unset every installed command, v3 or
+    v2, is unchanged.
 
     There is deliberately no ``legacy_ui`` option, because ``--legacy-ui`` can
     no longer be combined with the engine CAO pins. kiro-cli rejects the pair
@@ -458,13 +481,23 @@ def build_kiro_command(
     auto-answered after launch instead; see
     ``KiroCliProvider._wait_ready_accepting_trust_dialog``.
     """
+    if engine != KiroEngine.V3 and (executable != "kiro-cli" or kiro_home is not None):
+        raise ValueError("a per-launch kiro-cli or KIRO_HOME is only for the v3 engine")
+    if (executable != "kiro-cli" and not os.path.isabs(executable)) or (
+        kiro_home is not None and not os.path.isabs(kiro_home)
+    ):
+        raise ValueError("a per-launch kiro-cli and KIRO_HOME must be absolute paths")
     if engine == KiroEngine.V3:
         command = ["/usr/bin/env"]
         for name in KIRO_V3_UNSET_ENV:
+            if name == "KIRO_HOME" and kiro_home is not None:
+                continue
             command.extend(["-u", name])
+        if kiro_home is not None:
+            command.append(f"KIRO_HOME={kiro_home}")
         command.extend(
             [
-                "kiro-cli",
+                executable,
                 "chat",
                 "--agent-engine",
                 KiroEngine.V3.value,
