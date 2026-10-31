@@ -1,8 +1,7 @@
-"""Kiro v3 engine selection across CAO's surfaces, with v3 still refused (#1167 Phase 1).
+"""Kiro v3 engine selection across CAO's surfaces (#1167 Phase 1).
 
 ``v3`` is the canonical engine value and ``kas`` an input alias stored as
-``v3`` (design D1). Every point that refused ``kas`` now refuses v3 with one
-``KiroV3UnavailableError`` before any allocation, ``cao launch`` shows the
+``v3`` (design D1). v3 now launches through its own checks (PR 1c), ``cao launch`` shows the
 server's refusal instead of "Failed to connect", and the wiki compiler's Kiro
 call pins ``--agent-engine v2`` (D16). The names, messages and the wiki pin are
 provisional choices of #1167.
@@ -24,8 +23,10 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
-    KiroV3UnavailableError,
+    KiroV3LaunchError,
 )
+from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
 from cli_agent_orchestrator.services import terminal_service
 
 _TS = "cli_agent_orchestrator.services.terminal_service"
@@ -89,7 +90,7 @@ def test_cao_launch_shows_the_servers_400_detail_not_a_connection_failure():
     """The 400 body reaches the operator (``Q8-3b`` showed "Failed to connect")."""
     from cli_agent_orchestrator.cli.commands.launch import launch
 
-    detail = str(KiroV3UnavailableError())
+    detail = str(KiroV3LaunchError("kiro_v3_unrestricted", "an unrestricted launch is refused"))
     with patch(
         "cli_agent_orchestrator.cli.commands.launch.api_http.post",
         return_value=_http_response(400, {"detail": detail}),
@@ -101,7 +102,7 @@ def test_cao_launch_shows_the_servers_400_detail_not_a_connection_failure():
     assert result.exit_code == 1
     assert "Failed to connect" not in result.output
     assert "refused the launch (400)" in result.output
-    assert "not available yet" in result.output
+    assert "kiro_v3_unrestricted" in result.output
 
 
 def test_cao_launch_falls_back_to_the_http_error_for_a_non_string_detail():
@@ -199,14 +200,16 @@ def test_step_call_fingerprint_carries_the_canonical_engine(spelling):
 
 
 # ---------------------------------------------------------------------------
-# Refusal points: v3 refuses after the probe and before any allocation
+# v3 is launchable now (#1167 PR 1c): it reaches its own pre-allocation checks,
+# restores, and is reused like any engine. tests in test_kiro_v3_launch.py cover
+# the launch checks themselves.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("spelling", V3_SPELLINGS)
-async def test_explicit_v3_probes_then_refuses_before_allocation(spelling):
-    probe = Mock(return_value=KiroCapabilities(version="2.35.1", flags=frozenset({"--v3"})))
+async def test_explicit_v3_probes_then_meets_its_checks_before_allocation(spelling):
+    probe = Mock(return_value=KiroCapabilities(version="2.35.1", flags=frozenset()))
     profile = AgentProfile(name="developer", description="d")
 
     with (
@@ -216,7 +219,8 @@ async def test_explicit_v3_probes_then_refuses_before_allocation(spelling):
         patch(f"{_TS}.fifo_manager") as fifo,
         patch(f"{_TS}.provider_manager") as providers,
     ):
-        with pytest.raises(KiroV3UnavailableError, match="not available yet"):
+        # Refused before allocation by a launch check (here: no installed agent).
+        with pytest.raises((KiroV3Refusal, KiroAgentIdentityError)):
             await terminal_service.create_terminal(
                 provider="kiro_cli",
                 agent_profile="developer",
@@ -235,8 +239,8 @@ async def test_explicit_v3_probes_then_refuses_before_allocation(spelling):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile_engine", ["v3", "kas"])
-async def test_profile_v3_refuses_and_agrees_with_an_explicit_alias(profile_engine):
-    probe = Mock(return_value=KiroCapabilities(version="2.35.1", flags=frozenset({"--v3"})))
+async def test_profile_v3_agrees_with_an_explicit_alias(profile_engine):
+    probe = Mock(return_value=KiroCapabilities(version="2.35.1", flags=frozenset()))
     profile = AgentProfile(name="developer", description="d", engine=profile_engine)
 
     with (
@@ -246,7 +250,7 @@ async def test_profile_v3_refuses_and_agrees_with_an_explicit_alias(profile_engi
     ):
         # ``kas`` explicit + ``v3`` profile (and vice versa) is agreement, not a conflict.
         explicit = "kas" if profile_engine == "v3" else "v3"
-        with pytest.raises(KiroV3UnavailableError):
+        with pytest.raises((KiroV3Refusal, KiroAgentIdentityError)) as excinfo:
             await terminal_service.create_terminal(
                 provider="kiro_cli",
                 agent_profile="developer",
@@ -254,69 +258,60 @@ async def test_profile_v3_refuses_and_agrees_with_an_explicit_alias(profile_engi
                 engine=explicit,
                 kiro_capability_probe=probe,
             )
-
+    assert "conflict" not in str(excinfo.value)
+    probe.assert_called_once()
     backend.return_value.create_window.assert_not_called()
     db_create.assert_not_called()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("spelling", ["v3", "kas"])
-async def test_reuse_with_a_v3_request_refuses_before_any_send(spelling):
-    from cli_agent_orchestrator.services.agent_step import _validate_reused_terminal
-
-    with patch(
-        f"{_STEP}.terminal_service.get_terminal_metadata",
-        return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
-    ):
-        with pytest.raises(KiroV3UnavailableError):
-            await _validate_reused_terminal("reuse99", "kiro_cli", spelling)
-
-
-@pytest.mark.asyncio
-async def test_reuse_mismatch_message_is_unchanged_and_canonical():
+async def test_reuse_accepts_a_v3_request_for_a_v3_terminal(spelling):
     from cli_agent_orchestrator.services.agent_step import _validate_reused_terminal
 
     with patch(
         f"{_STEP}.terminal_service.get_terminal_metadata",
         return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v3"},
     ):
-        with pytest.raises(ValueError) as excinfo:
-            await _validate_reused_terminal("reuse99", "kiro_cli", "v2")
-
-    assert str(excinfo.value) == (
-        "Kiro engine mismatch for reused terminal 'reuse99': requested 'v2', persisted 'v3'"
-    )
+        await _validate_reused_terminal("reuse99", "kiro_cli", spelling)
 
 
-def test_provider_construction_refuses_v3_through_the_manager():
+@pytest.mark.asyncio
+async def test_reuse_mismatch_message_is_unchanged_and_canonical():
+    from cli_agent_orchestrator.services.agent_step import _validate_reused_terminal
+
+    for requested, persisted in (("v2", "v3"), ("kas", "v2")):
+        with patch(
+            f"{_STEP}.terminal_service.get_terminal_metadata",
+            return_value={"id": "reuse99", "provider": "kiro_cli", "engine": persisted},
+        ):
+            with pytest.raises(ValueError) as excinfo:
+                await _validate_reused_terminal("reuse99", "kiro_cli", requested)
+        canonical = "v3" if requested == "kas" else requested
+        assert str(excinfo.value) == (
+            "Kiro engine mismatch for reused terminal 'reuse99': "
+            f"requested {canonical!r}, persisted {persisted!r}"
+        )
+
+
+def test_the_manager_builds_a_v3_provider():
     from cli_agent_orchestrator.providers.manager import ProviderManager
 
     with patch("cli_agent_orchestrator.providers.manager.KiroCliProvider") as provider_class:
-        with pytest.raises(KiroV3UnavailableError):
-            ProviderManager().create_provider(
-                "kiro_cli", "t1", "s1", "w1", "developer", engine=KiroEngine.V3
-            )
-    provider_class.assert_not_called()
+        ProviderManager().create_provider(
+            "kiro_cli", "t1", "s1", "w1", "developer", engine=KiroEngine.V3
+        )
+    assert provider_class.call_args.kwargs["engine"] is KiroEngine.V3
 
 
-def test_a_cached_v3_provider_is_never_handed_out():
+def test_a_cached_v3_provider_is_handed_out():
     from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
     from cli_agent_orchestrator.providers.manager import ProviderManager
 
     manager = ProviderManager()
-    manager._providers["t1"] = KiroCliProvider("t1", "s1", "w1", "developer", engine=KiroEngine.V3)
-    with pytest.raises(KiroV3UnavailableError):
-        manager.get_provider("t1")
-
-
-def test_direct_provider_initialize_refuses_v3():
-    from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
-
-    provider = KiroCliProvider("t1", "s1", "w1", "developer", engine=KiroEngine.V3)
-    with patch("cli_agent_orchestrator.providers.kiro_cli.get_backend") as backend:
-        with pytest.raises(KiroV3UnavailableError):
-            asyncio.run(provider.initialize())
-    backend.return_value.send_keys.assert_not_called()
+    cached = KiroCliProvider("t1", "s1", "w1", "developer", engine=KiroEngine.V3)
+    manager._providers["t1"] = cached
+    assert manager.get_provider("t1") is cached
 
 
 # ---------------------------------------------------------------------------

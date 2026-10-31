@@ -545,6 +545,15 @@ def launch(
                 )
             )
 
+        # Launch notes (#1167, provisional): today only a Kiro v3 launch that the
+        # operator's kiro.v3_allow_unverified_versions opt-in admitted on a
+        # kiro-cli version still pending verification. Said where the operator is.
+        notes = terminal.get("launch_notes") if isinstance(terminal, dict) else None
+        if isinstance(notes, list):
+            for note in notes:
+                if isinstance(note, str) and note:
+                    click.echo(click.style(f"  WARNING: {note}", fg="yellow"))
+
         # Attach to tmux session unless headless. Wait for the provider to
         # finish initializing first — otherwise tmux attach races with the
         # TUI's input handler wiring, resizes the pty mid-init, and the TUI

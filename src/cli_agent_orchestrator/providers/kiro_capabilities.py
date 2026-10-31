@@ -14,6 +14,7 @@ from typing import Callable, Iterable, Optional, Sequence
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers.kiro_v3_schema import (
+    KiroV3Refusal,
     KiroV3UnsupportedVersionError,
     kiro_v3_schema_for_cli_version,
 )
@@ -108,21 +109,20 @@ class KiroCapabilityError(ValueError):
         self.version = version
 
 
-class KiroV3UnavailableError(ValueError):
-    """Refuses every Kiro v3 launch, restore and reuse until CAO can run v3 (#1167).
+class KiroV3LaunchError(KiroV3Refusal):
+    """A Kiro v3 launch refused by one of CAO's own checks (#1167); nothing was typed.
 
-    Raised at each point that used to refuse ``kas``: on creation after the
-    capability probe and before any window, row, FIFO or provider; on restore
-    before a provider is built; on reuse and input before anything is typed.
+    ``code`` is provisional: ``kiro_v3_bad_effort``, ``kiro_v3_unrestricted``,
+    ``kiro_v3_home_unsupported``, ``kiro_v3_not_installed``,
+    ``kiro_v3_agent_unreadable`` and ``kiro_v3_bad_cwd`` refuse before allocation
+    (``kiro_v3_bad_cwd`` also at the workspace re-check after the header);
+    ``kiro_v3_trust_dialog`` and ``kiro_v3_startup_dialog`` after kiro-cli started,
+    with no key sent to the dialog.
     """
 
-    def __init__(self) -> None:
-        super().__init__(
-            "Kiro engine 'v3' (alias 'kas') is not available yet: CAO cannot yet "
-            "launch Kiro agents on the v3 engine with verified tool limits. "
-            "Retry with engine 'v2'."
-        )
-        self.engine = KiroEngine.V3
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
 
 
 @dataclass(frozen=True)

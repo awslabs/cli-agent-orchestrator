@@ -29,9 +29,18 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.kiro_attest import (
+    KiroAttestationError,
+    check_mcp_panel,
+    check_tools_panel,
+    palette_shows_only,
+    parse_mcp_panel,
+    parse_tools_panel,
+)
 from cli_agent_orchestrator.providers.kiro_capabilities import (
-    KiroV3UnavailableError,
+    KiroV3LaunchError,
     build_kiro_command,
+    kiro_effort,
 )
 from cli_agent_orchestrator.providers.kiro_identity import (
     PLAN_MODE_AGENT,
@@ -42,10 +51,13 @@ from cli_agent_orchestrator.providers.kiro_identity import (
     in_plan_mode,
     require_header_identity,
 )
+from cli_agent_orchestrator.providers.kiro_workspace import check_kiro_workspace
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.delegation import tools_exceeding
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+from cli_agent_orchestrator.utils.tool_mapping import granted_mcp_servers
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +211,118 @@ STARTUP_PROMPT_BOTTOM_LINES = 15
 # kiro-cli TUI change, say) is refused rather than trusted.
 IDENTITY_HEADER_READS = 5
 IDENTITY_HEADER_READ_INTERVAL_S = 0.5
+
+# =============================================================================
+# Kiro v3 dialogs (#1167). Used for v3 terminals only; v2 parsing is unchanged.
+# =============================================================================
+
+# Each dialog is matched as a whole block in the bottom of the screen (title,
+# every option, its own footer) with no idle prompt after it, so a reply that
+# quotes one cannot flip the status. The footers are the dialogs' own: v3's
+# generic list chrome ("esc to close · …") alone is never enough.
+V3_DIALOG_BOTTOM_LINES = 30
+_V3_APPROVAL_TITLE = re.compile(r"\S.*\brequires approval\s*$")
+_V3_APPROVAL_OPTIONS = (
+    re.compile(r"^\s*(?:❯\s*)?Allow once\s*$"),
+    re.compile(r"^\s*(?:❯\s*)?Deny once\s*$"),
+    re.compile(r"^\s*(?:❯\s*)?Create deny rule\b"),
+)
+_V3_APPROVAL_FOOTER = re.compile(r"^\s*esc to close · ↑↓ to navigate · ↵ to select\b")
+_V3_TRUST_TITLE = re.compile(r"^\s*Trust this workspace\?\s*$")
+_V3_TRUST_OPTIONS = (
+    re.compile(r"^\s*(?:❯\s*)?Trust, continue\s*$"),
+    re.compile(r"^\s*(?:❯\s*)?Don't trust, exit\s*$"),
+)
+_V3_TRUST_FOOTER = re.compile(r"^\s*esc to exit · ↑↓ to navigate · ↵ to select\s*$")
+_V3_TRUST_DECLINED = re.compile(r"Not trusted: .*Kiro exited without loading this folder")
+# v2's "Switch to V3" offer, which also rewrites agent files if accepted. A
+# pinned launch should never show it; if one does, nobody answers it.
+_V3_UPSELL_TITLE = re.compile(r"Switch to V3 today\.")
+_V3_UPSELL_OPTIONS = (
+    re.compile(r"^\s*(?:❯\s*)?Switch to V3 and upgrade my configs\s*$"),
+    re.compile(r"^\s*(?:❯\s*)?Remind me later\s*$"),
+    re.compile(r"^\s*(?:❯\s*)?Don't ask again\s*$"),
+)
+
+
+def _options_follow(lines: List[str], start: int, options: tuple, window: int = 8) -> Optional[int]:
+    """Index of the last option row when every option follows ``start`` in order."""
+    index = start
+    for option in options:
+        for candidate in range(index + 1, min(len(lines), index + 1 + window)):
+            if option.match(lines[candidate]):
+                index = candidate
+                break
+        else:
+            return None
+    return index
+
+
+def kiro_v3_dialog(output: str) -> Optional[str]:
+    """Which v3 dialog the bottom of ``output`` shows, if any.
+
+    ``approval`` (the per-call approval picker), ``trust`` (the workspace-trust
+    dialog), ``trust_declined`` (Kiro exited from it), ``upsell`` (v2's Switch
+    to V3 offer), or ``None``. A dialog with an idle prompt below it is history,
+    not a dialog.
+    """
+    lines = [line.rstrip() for line in strip_terminal_escapes(output).splitlines() if line.strip()]
+    lines = lines[-V3_DIALOG_BOTTOM_LINES:]
+
+    def after_has_idle(index: int) -> bool:
+        return any(re.search(NEW_TUI_IDLE_PATTERN, line) for line in lines[index + 1 :])
+
+    for title, options, footer, name in (
+        (_V3_APPROVAL_TITLE, _V3_APPROVAL_OPTIONS, _V3_APPROVAL_FOOTER, "approval"),
+        (_V3_TRUST_TITLE, _V3_TRUST_OPTIONS, _V3_TRUST_FOOTER, "trust"),
+    ):
+        titles = [i for i, line in enumerate(lines) if title.search(line)]
+        if not titles:
+            continue
+        last_option = _options_follow(lines, titles[-1], options)
+        if last_option is None:
+            continue
+        footers = [i for i in range(last_option + 1, len(lines)) if footer.match(lines[i])]
+        if not footers or after_has_idle(footers[0]):
+            continue
+        if name == "trust" and any(_V3_TRUST_DECLINED.search(l) for l in lines[footers[0] :]):
+            return "trust_declined"
+        return name
+    upsell = [i for i, line in enumerate(lines) if _V3_UPSELL_TITLE.search(line)]
+    if upsell:
+        last_option = _options_follow(lines, upsell[-1], _V3_UPSELL_OPTIONS)
+        if last_option is not None and not after_has_idle(last_option):
+            return "upsell"
+    return None
+
+
+# Any v3 selector's own footer: the approval picker's and the trust dialog's
+# (``esc to close`` / ``esc to exit``, then ``↑↓ to navigate · ↵ to select``).
+# At startup no selector is expected and CAO answers none (#1167).
+_V3_SELECTOR_FOOTER = re.compile(r"^\s*esc to (?:close|exit) · ↑↓ to navigate · ↵ to select\b")
+
+
+def kiro_v3_startup_selector(output: str) -> bool:
+    """Whether the bottom of ``output`` is a v3 selector with no idle prompt below it.
+
+    Covers dialogs CAO has no pattern for (the uncaptured v3 trust-all consent
+    is the expected one): the startup wait refuses on it instead of waiting out
+    the init timeout. Used at startup only; status parsing does not read it.
+    """
+    lines = [line.rstrip() for line in strip_terminal_escapes(output).splitlines() if line.strip()]
+    lines = lines[-V3_DIALOG_BOTTOM_LINES:]
+    footers = [i for i, line in enumerate(lines) if _V3_SELECTOR_FOOTER.match(line)]
+    if not footers:
+        return False
+    return not any(re.search(NEW_TUI_IDLE_PATTERN, line) for line in lines[footers[-1] + 1 :])
+
+
+# Reads of the pane during the v3 attestation (#1167): for the typed palette
+# and each panel, then for MCP servers still loading. Provisional, about 3 s
+# and 20 s.
+V3_ATTEST_READS = 6
+V3_ATTEST_READ_INTERVAL_S = 0.5
+V3_MCP_LOADING_READS = 40
 
 # =============================================================================
 # Error Detection
@@ -356,6 +480,18 @@ class KiroCliProvider(BaseProvider):
             return None
         return profile.model or None
 
+    def _get_profile_effort(self) -> Optional[str]:
+        """``kiroConfig.effort`` for a v3 launch's ``--effort`` (#1167), or None.
+
+        Best-effort like ``_get_profile_model``: a profile that cannot be read
+        sets no effort. Creation already probed the flag from the same profile.
+        """
+        try:
+            return kiro_effort(load_agent_profile(self._agent_profile))
+        except Exception as exc:  # noqa: BLE001 - a missing profile sets no effort
+            logger.debug("Profile '%s' sets no Kiro effort: %s", self._agent_profile, exc)
+            return None
+
     async def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
 
@@ -375,11 +511,7 @@ class KiroCliProvider(BaseProvider):
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        if self._engine == KiroEngine.V3:
-            # This defensive guard makes direct provider use fail closed too.
-            # Normal terminal creation has already probed and rejected v3 before
-            # a backend window or provider is allocated.
-            raise KiroV3UnavailableError()
+        v3 = self._engine == KiroEngine.V3
 
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
@@ -418,6 +550,7 @@ class KiroCliProvider(BaseProvider):
             self._agent_profile,
             model=model,
             yolo=True,
+            effort=self._get_profile_effort() if v3 else None,
         )
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
@@ -439,7 +572,12 @@ class KiroCliProvider(BaseProvider):
         # engine with no MCP tools — turning a loud timeout into an agent that
         # looks healthy and cannot orchestrate. Failing here is the honest
         # outcome.
-        if not await self._wait_ready_accepting_trust_dialog():
+        ready = (
+            await self._wait_ready_refusing_v3_dialogs()
+            if v3
+            else await self._wait_ready_accepting_trust_dialog()
+        )
+        if not ready:
             raise TimeoutError(
                 "Kiro CLI initialization timed out waiting for the agent prompt "
                 f"(engine={self._engine.value}, profile={self._agent_profile!r})"
@@ -448,6 +586,15 @@ class KiroCliProvider(BaseProvider):
         # Step 4: the prompt being ready does not mean the requested agent is
         # running. Nothing is typed into the pane until the header names it.
         await self._verify_agent_identity()
+
+        if v3:
+            # Step 5 (#1167): the header names the agent, not its tools. Hold
+            # the identity back until the workspace is re-checked and the pane's
+            # own /tools and /mcp panels match the installed grant.
+            self.identity_verified = False
+            await self._recheck_v3_workspace()
+            await self._attest_v3_tools_and_mcp()
+            self.identity_verified = True
 
         self._initialized = True
         return True
@@ -615,6 +762,191 @@ class KiroCliProvider(BaseProvider):
             timeout=remaining,
         )
 
+    async def _wait_ready_refusing_v3_dialogs(self) -> bool:
+        """Wait for a v3 prompt; refuse, sending no key, on any startup dialog (#1167).
+
+        ``--trust-workspace`` should skip the workspace-trust dialog; if it is on
+        screen anyway CAO never answers it, because "Trust, continue" would save
+        the folder as trusted in the user's Kiro home and "Don't trust, exit"
+        ends the session. No v3 trust-all consent text has been captured, so no
+        other startup dialog is answered either.
+        """
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        init_timeout = float(get_server_settings()["provider_init_timeout"])
+        # Every poll also reads the pane, so a dialog the status cannot express
+        # (an unrecognised selector reads PROCESSING, a declined trust dialog
+        # ERROR) refuses at once instead of waiting out the timeout.
+        ready = await wait_until_status(
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
+            timeout=init_timeout,
+            on_poll=self._refuse_v3_startup_screen,
+        )
+        if not ready:
+            return False
+        current = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
+        if current != TerminalStatus.WAITING_USER_ANSWER:
+            return True
+        await self._refuse_v3_startup_screen()
+        raise KiroV3LaunchError(
+            "kiro_v3_startup_dialog",
+            "kiro-cli is waiting for an answer at startup on a screen CAO does not "
+            "recognize for v3; it was not answered and no task was sent.",
+        )
+
+    async def _refuse_v3_startup_screen(self) -> None:
+        """Refuse, sending no key, if the pane shows any v3 dialog at startup (#1167).
+
+        ``kiro_v3_trust_dialog`` for the workspace-trust dialog (``--trust-workspace``
+        was not honoured), also once declined (Kiro exited); ``kiro_v3_startup_dialog``
+        for any other dialog or selector. The creation path then closes the window.
+        """
+        screen = await self._read_screen()
+        dialog = kiro_v3_dialog(screen)
+        if dialog == "trust":
+            raise KiroV3LaunchError(
+                "kiro_v3_trust_dialog",
+                "kiro-cli showed the workspace-trust dialog although CAO passed "
+                "--trust-workspace, so the flag was not honoured. CAO does not answer "
+                "it; no task was sent.",
+            )
+        if dialog == "trust_declined":
+            raise KiroV3LaunchError(
+                "kiro_v3_trust_dialog",
+                "kiro-cli showed the workspace-trust dialog although CAO passed "
+                "--trust-workspace, and it was declined, so Kiro exited. CAO never "
+                "answers that dialog; no task was sent.",
+            )
+        if dialog is not None or kiro_v3_startup_selector(screen):
+            raise KiroV3LaunchError(
+                "kiro_v3_startup_dialog",
+                "kiro-cli showed a startup dialog CAO does not answer on v3; it was not "
+                "answered and no task was sent.",
+            )
+
+    async def _read_screen(self) -> str:
+        screen = await asyncio.to_thread(
+            get_backend().get_history,
+            self.session_name,
+            self.window_name,
+            strip_escapes=True,
+            visible_only=True,
+        )
+        return screen if isinstance(screen, str) else ""
+
+    async def _recheck_v3_workspace(self) -> None:
+        """Run the workspace check again from the pane's own cwd, after the header (#1167)."""
+        cwd = await asyncio.to_thread(
+            get_backend().get_pane_working_directory, self.session_name, self.window_name
+        )
+        if not cwd:
+            raise KiroV3LaunchError(
+                "kiro_v3_bad_cwd", "the pane's working directory could not be read for the re-check"
+            )
+        await asyncio.to_thread(check_kiro_workspace, cwd)
+
+    async def _open_v3_panel(self, command: str) -> str:
+        """Type a slash command, confirm its palette, press Enter, and return the screen.
+
+        Typed key by key, never as a paste, and never followed by Tab: on
+        2.35.1 Tab after ``/tools`` selects ``trust-all``. Enter is pressed only
+        once the palette shows the plain completion for ``command``.
+        """
+        backend = get_backend()
+        for key in command:
+            backend.send_special_key(self.session_name, self.window_name, key)
+        for attempt in range(V3_ATTEST_READS):
+            if attempt:
+                await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+            if palette_shows_only(await self._read_screen(), command):
+                break
+        else:
+            backend.send_special_key(self.session_name, self.window_name, "Escape")
+            code = "kiro_v3_tools_mismatch" if command == "/tools" else "kiro_v3_mcp_not_ready"
+            raise KiroAttestationError(
+                code, f"the {command} palette did not appear; nothing was selected"
+            )
+        backend.send_special_key(self.session_name, self.window_name, "Enter")
+        return await self._read_screen()
+
+    async def _attest_v3_tools_and_mcp(self) -> None:
+        """Refuse unless ``/tools`` and ``/mcp list`` match the installed grant (#1167).
+
+        Runs after the header check and before the identity is recorded, so on
+        a refusal no task has been typed; the creation path then reclaims the
+        window. Slash commands cost no credits.
+
+        The file is read again here, after Kiro loaded it. Its grant must still
+        fit this launch's and name every server it configures, so a file
+        rewritten after the pre-allocation check can widen neither what the
+        panels are compared with nor which servers they may show.
+        """
+        from cli_agent_orchestrator.services.install_service import installed_kiro_v3_grant
+
+        launch = self._allowed_tools
+        if launch is None or "*" in launch:
+            raise KiroAttestationError(
+                "kiro_v3_tools_mismatch", "a v3 launch needs a restricted allowlist"
+            )
+        installed = installed_kiro_v3_grant(self._agent_profile)
+        if installed is None:
+            raise KiroAttestationError(
+                "kiro_v3_tools_mismatch", "the installed agent file is not a v3 universal file"
+            )
+        grant, servers = installed
+        exceeding = tools_exceeding(grant, launch)
+        if exceeding:
+            raise KiroAttestationError(
+                "kiro_v3_tools_mismatch",
+                f"the installed grant now exceeds this launch's: {exceeding}",
+            )
+        ungranted = sorted(set(servers) - set(granted_mcp_servers(grant, servers)))
+        if ungranted:
+            raise KiroAttestationError(
+                "kiro_v3_mcp_not_ready",
+                f"the installed file configures ungranted servers {ungranted}",
+            )
+        backend = get_backend()
+
+        screen = await self._open_v3_panel("/tools")
+        for attempt in range(V3_ATTEST_READS):
+            try:
+                panel = parse_tools_panel(screen)
+                break
+            except KiroAttestationError:
+                if attempt == V3_ATTEST_READS - 1:
+                    backend.send_special_key(self.session_name, self.window_name, "Escape")
+                    raise
+            await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+            screen = await self._read_screen()
+        backend.send_special_key(self.session_name, self.window_name, "Escape")
+        check_tools_panel(panel, grant)
+
+        screen = await self._open_v3_panel("/mcp")
+        try:
+            for attempt in range(V3_MCP_LOADING_READS):
+                try:
+                    if not check_mcp_panel(parse_mcp_panel(screen), servers):
+                        break
+                except KiroAttestationError:
+                    if attempt == V3_MCP_LOADING_READS - 1:
+                        raise
+                    if attempt >= V3_ATTEST_READS and "/mcp list" not in screen:
+                        raise
+                await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+                screen = await self._read_screen()
+            else:
+                raise KiroAttestationError("kiro_v3_mcp_not_ready", "MCP servers still loading")
+        finally:
+            backend.send_special_key(self.session_name, self.window_name, "Escape")
+        if not await wait_until_status(
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=float(get_server_settings()["provider_init_timeout"]),
+        ):
+            raise KiroAttestationError("kiro_v3_mcp_not_ready", "the prompt did not return")
+
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.
 
@@ -649,6 +981,17 @@ class KiroCliProvider(BaseProvider):
         # \r in-place redraws staying on the same logical line (see
         # ANSI_CODE_PATTERN). Do not switch this to strip_terminal_escapes.
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+
+        # Check 0 (v3 only, #1167): the approval picker, the workspace-trust
+        # dialog and v2's upsell wait for an answer, whatever startup or busy
+        # text is still in the buffer; never PROCESSING. A declined trust
+        # dialog means Kiro exited.
+        if self._engine == KiroEngine.V3:
+            dialog = kiro_v3_dialog(clean_output)
+            if dialog == "trust_declined":
+                return TerminalStatus.ERROR
+            if dialog is not None:
+                return TerminalStatus.WAITING_USER_ANSWER
 
         # Check 0a: Detect idle prompts early — required for the position-aware
         # processing checks below.

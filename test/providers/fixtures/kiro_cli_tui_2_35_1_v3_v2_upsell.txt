@@ -1,0 +1,50 @@
+You're using Kiro CLI V2. Switch to V3 today.
+V3 adds workflows, cloud sessions, and specs. To try it in a new session, run kiro-cli --v3. Learn more: https://kiro.dev/docs/cli/v3/
+❯ Switch to V3 and upgrade my configs
+  Remind me later
+  Don't ask again
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

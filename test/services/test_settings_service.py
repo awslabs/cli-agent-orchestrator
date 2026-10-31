@@ -935,3 +935,34 @@ def test_explain_enabled_read_error_keeps_default(monkeypatch):
 def test_explain_setting_rejects_non_bool():
     with pytest.raises(ValueError, match="must be a bool"):
         settings_service.set_memory_setting("explain_enabled", "false")
+
+
+class TestKiroV3AllowUnverifiedVersions:
+    """The operator-only ``kiro.v3_allow_unverified_versions`` opt-in (#1167, provisional)."""
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            (None, False),
+            ({}, False),
+            ({"kiro": {}}, False),
+            ({"kiro": {"v3_allow_unverified_versions": False}}, False),
+            ({"kiro": {"v3_allow_unverified_versions": "true"}}, False),
+            ({"kiro": {"v3_allow_unverified_versions": 1}}, False),
+            ({"kiro": ["v3_allow_unverified_versions"]}, False),
+            ({"v3_allow_unverified_versions": True}, False),
+            ({"kiro": {"v3_allow_unverified_versions": True}}, True),
+        ],
+    )
+    def test_only_json_true_in_the_kiro_block_opts_in(self, settings_file, content, expected):
+        if content is not None:
+            settings_file.write_text(json.dumps(content))
+        assert settings_service.kiro_v3_allow_unverified_versions() is expected
+
+    def test_an_unreadable_settings_file_reads_as_off(self, settings_file):
+        settings_file.write_text("{not json")
+        assert settings_service.kiro_v3_allow_unverified_versions() is False
+
+    def test_no_environment_variable_opts_in(self, settings_file, monkeypatch):
+        monkeypatch.setenv("CAO_KIRO_V3_ALLOW_UNVERIFIED_VERSIONS", "true")
+        assert settings_service.kiro_v3_allow_unverified_versions() is False

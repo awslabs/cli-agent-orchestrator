@@ -139,9 +139,9 @@ from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
-    KiroV3UnavailableError,
 )
 from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -4427,7 +4427,7 @@ async def create_terminal_in_session(
         # of the ValueError family can shadow it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
-        KiroV3UnavailableError,
+        KiroV3Refusal,
         KiroCapabilityError,
         KiroAgentPathError,
         KiroAgentIdentityError,
@@ -4560,7 +4560,7 @@ async def create_terminal_in_session_as_operator(
     except IdempotencyKeyConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
-        KiroV3UnavailableError,
+        KiroV3Refusal,
         KiroCapabilityError,
         KiroAgentPathError,
         KiroAgentIdentityError,
@@ -5616,7 +5616,7 @@ async def run_step(
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
     except (
-        KiroV3UnavailableError,
+        KiroV3Refusal,
         KiroCapabilityError,
         KiroAgentPathError,
         KiroAgentIdentityError,

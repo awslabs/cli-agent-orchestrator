@@ -1882,6 +1882,35 @@ def test_launch_prints_a_refused_memory_sidecar():
     assert "cao launch --memory" in result.output
 
 
+@pytest.mark.parametrize(
+    ("notes", "shown"),
+    [
+        (["kiro_v3_unverified_version_admitted: kiro-cli 2.36.0 is pending"], True),
+        (None, False),
+        ("not a list", False),
+    ],
+)
+def test_launch_prints_each_launch_note_as_a_warning(notes, shown):
+    """A Kiro v3 launch the operator opt-in admitted on a pending kiro-cli version
+    carries a note (#1167, provisional); the CLI says it where the operator is."""
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "0000a1b2",
+            "name": "test-terminal",
+            "launch_notes": notes,
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        result = runner.invoke(launch, ["--agents", "reviewer", "--headless", "--yolo"])
+    assert result.exit_code == 0, result.output
+    assert ("WARNING: kiro_v3_unverified_version_admitted" in result.output) is shown
+    assert "not a list" not in result.output
+
+
 def test_launch_is_quiet_about_a_scheduled_memory_sidecar():
     runner = CliRunner()
     with (

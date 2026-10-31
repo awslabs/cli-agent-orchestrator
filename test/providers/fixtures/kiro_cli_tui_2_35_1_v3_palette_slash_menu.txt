@@ -1,0 +1,50 @@
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+v3ro · auto · ◔ 1%                                                                                                                                                          /private/tmp/kv3.XXXXXX/repo
+
+› /
+/agent            List or switch agents (tab for sub-commands)
+/autonomous       Turn autonomous mode on or off (tab for sub-commands)
+/changelog        Show recent release notes
+/chat             Load a previous session, save, or start a new one (tab for sub-commands)
+/clear            Clear the conversation and start a fresh session
+/code             Code intelligence status, initialization, codebase overview, and documentation (tab for sub-commands)
+/compact          Compact conversation history to reduce context usage
+/config           View configured agents, MCP servers, powers, steering, skills, and hooks (tab for sub-commands)
+(+32 more)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ esc to cancel · ↑↓ to navigate · ↵ to select
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

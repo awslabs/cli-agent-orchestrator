@@ -1,0 +1,50 @@
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ /tools · 35 tags
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ search:   type to filter
+
+ Name                                    Source      Description
+ read                                    builtin     read-file, diagnostics, search tools
+ @cao-mcp-server/answer_user_prompt      mcp         Answer an active approval or clarify prompt in another terminal.
+ @cao-mcp-server/assign                  mcp         Assigns a task to another agent without blocking.
+ @cao-mcp-server/assign_elastic          mcp         Provision one elastic worker and assign one task to it.
+ @cao-mcp-server/complete_assignment     mcp         Deliver an elastic worker's final result, then release the worker itself.
+ @cao-mcp-server/delete_terminal         mcp         Delete a terminal that is no longer needed, freeing system resources.
+ @cao-mcp-server/emit_ui                 mcp         Render a generative-UI component to the operator's AG-UI dashboard.
+ @cao-mcp-server/find_profiles           mcp         Find installed agent profiles by keyword, ranked by relevance.
+ @cao-mcp-server/get_handoff_result      mcp         Retrieve a durably persisted handoff result by job_id (issue #447).
+ @cao-mcp-server/handoff                 mcp         Hand off a task to another agent via CAO terminal and wait for completion.
+ @cao-mcp-server/list_outcomes           mcp         List recorded workflow outcomes (retrospector read path).
+ @cao-mcp-server/list_siblings           mcp         Discover sibling terminals sharing a leading prefix of your own group.
+ @cao-mcp-server/load_skill              mcp         Retrieve the full Markdown body of an available skill from cao-server.
+ @cao-mcp-server/memory_forget           mcp         Remove a memory by key and scope.
+ @cao-mcp-server/memory_recall           mcp         Retrieve memories matching a query and optional filters.
+ @cao-mcp-server/memory_store            mcp         Store a persistent memory
+ @cao-mcp-server/report_outcome          mcp         Record the outcome of a unit of agent work (self-learning signal).
+ @cao-mcp-server/send_message            mcp         Send a message to another terminal's inbox.
+ @cao-mcp-server/store_lesson            mcp         Store a retrospective lesson in a target agent's scope (retrospector write path).
+ @cao-mcp-server/update_metadata         mcp         Update your own terminal's metadata, visible to siblings via list_siblings.
+ @cao-mcp-server/workflow_cancel         mcp         Cooperatively cancel a running workflow (issue #312, N5).
+ @cao-mcp-server/workflow_create         mcp         Create a NEW Python workflow spec (issue #583 FR-10).
+ @cao-mcp-server/workflow_events         mcp         Follow a run's live event stream, BOUNDED, and return a dict envelope (issue #505, U10).
+ @cao-mcp-server/workflow_get            mcp         Read back a workflow spec, including its source and ``content_hash`` (issue #583 FR-10).
+ @cao-mcp-server/workflow_list           mcp         List journaled workflow runs newest-first (issue #505, U6; FR-3.5).
+ @cao-mcp-server/workflow_plan_approval  mcp         Report a run's plan identifier and whether that plan is approved (issue #583 FR-8).
+ @cao-mcp-server/workflow_result         mcp         Return the complete retained result for a run (issue #505, U6; FR-7.2).
+ @cao-mcp-server/workflow_resume         mcp         Resume a crashed or failed workflow run from its durable journal (issue #312, N6).
+ @cao-mcp-server/workflow_return         mcp         Return a structured output for the current workflow step (issue #312, N4).
+ @cao-mcp-server/workflow_run            mcp         Run a workflow to completion and return the aggregated result (issue #312, N5).
+ @cao-mcp-server/workflow_start          mcp         Submit a workflow run ASYNCHRONOUSLY and return its handle immediately (issue #505, U6).
+ @cao-mcp-server/workflow_status         mcp         Return a point-in-time status snapshot for a run (issue #505, U6).
+ @cao-mcp-server/workflow_update         mcp         Replace an EXISTING spec's source, refusing a stale update (issue #583 FR-10, FR-8).
+ @cao-mcp-server/workflow_validate       mcp         Lint Python spec source WITHOUT creating anything (issue #583 FR-10).
+ @cao-mcp-server/workflow_wait           mcp         Follow a submitted run to a terminal state, then return its result (issue #505, U6).
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ esc to close
+
+
+
+
+
+

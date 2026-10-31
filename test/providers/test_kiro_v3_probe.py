@@ -20,7 +20,6 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KIRO_V3_UNSET_ENV,
     KiroCapabilityError,
-    KiroV3UnavailableError,
     build_kiro_command,
     kiro_effort,
     probe_kiro_capabilities,
@@ -33,7 +32,7 @@ HELP = {
         (FIXTURES / f"kiro_cli_{version.replace('.', '_')}_root_help.txt").read_text(),
         (FIXTURES / f"kiro_cli_{version.replace('.', '_')}_chat_help.txt").read_text(),
     )
-    for version in ("2.35.1", "2.36.0")
+    for version in ("2.35.1", "2.36.0", "2.37.0")
 }
 V3_REQUEST = {"profile", "trust", "trust_workspace"}
 
@@ -56,7 +55,7 @@ def _runner(version="2.35.1", *, chat=None, root=None, version_text=None):
     return run
 
 
-@pytest.mark.parametrize("version", ["2.35.1", "2.36.0"])
+@pytest.mark.parametrize("version", ["2.35.1", "2.36.0", "2.37.0"])
 def test_supported_releases_pass_the_v3_probe(version):
     caps = probe_kiro_capabilities(
         KiroEngine.V3, V3_REQUEST | {"model", "effort"}, runner=_runner(version)
@@ -69,7 +68,7 @@ def test_supported_releases_pass_the_v3_probe(version):
 
 
 @pytest.mark.parametrize(
-    "version_text", ["kiro-cli 2.37.0\n", "kiro-cli 2.35.0\n", "kiro-cli 3.0.0\n"]
+    "version_text", ["kiro-cli 2.38.0\n", "kiro-cli 2.35.0\n", "kiro-cli 3.0.0\n"]
 )
 def test_an_unknown_version_refuses_v3(version_text):
     with pytest.raises(KiroCapabilityError) as excinfo:
@@ -265,7 +264,9 @@ async def test_create_refuses_an_unsupported_version_before_allocation():
 
 
 @pytest.mark.asyncio
-async def test_a_supported_v3_create_still_refuses_as_unavailable():
+async def test_a_pending_version_refuses_v3_before_allocation():
+    """2.36.0 is allow-listed but pending operator verification (#1167): not admitted."""
+    from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3UnverifiedVersionError
     from cli_agent_orchestrator.services import terminal_service
 
     _TS = "cli_agent_orchestrator.services.terminal_service"
@@ -276,12 +277,12 @@ async def test_a_supported_v3_create_still_refuses_as_unavailable():
     with (
         patch(
             f"{_TS}.agent_profiles.load_agent_profile",
-            return_value=AgentProfile(name="r", description="d"),
+            return_value=AgentProfile(name="r", description="d", allowedTools=["fs_read"]),
         ),
         patch(f"{_TS}.get_backend") as backend,
         patch(f"{_TS}.db_create_terminal") as db_create,
     ):
-        with pytest.raises(KiroV3UnavailableError):
+        with pytest.raises(KiroV3UnverifiedVersionError, match="pending operator verification"):
             await terminal_service.create_terminal(
                 provider="kiro_cli",
                 agent_profile="r",

@@ -99,14 +99,18 @@ Every derived path resolves from this value, so one override moves everything â€
     "confidence_threshold": 0.7,
     "retention_days": 90
   },
-  "model_tiers": {}
+  "model_tiers": {},
+  "kiro": {
+    "v3_allow_unverified_versions": false
+  }
 }
 ```
 
 Every top-level key is optional â€” omit any section/key you don't want to override; `ConfigService` fills in built-in defaults.
-The `ephemeral`, `decisions` and `model_tiers` blocks are read outside `ConfigService`. See
+The `ephemeral`, `decisions`, `model_tiers` and `kiro` blocks are read outside `ConfigService`. See
 [Ephemeral agents (`ephemeral`)](#ephemeral-agents-ephemeral) below for every `ephemeral` key,
-and [Launch decisions](decisions.md#settings) for `decisions` and `model_tiers`.
+[Launch decisions](decisions.md#settings) for `decisions` and `model_tiers`, and
+[Kiro v3 (`kiro`)](#kiro-v3-kiro) for `kiro`.
 
 ## `cao config` CLI
 
@@ -168,6 +172,16 @@ Only JSON `true` enables the tool, and agent terminals must restart to see it.
 
 See [Ephemeral agents](ephemeral-agents.md) for policy limits, model tier and effort policy,
 and lifecycle cleanup. Keep the feature disabled outside testing.
+
+### Kiro v3 (`kiro`)
+
+Operator-only, read straight from `settings.json` (no environment override). Provisional (#1167).
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `v3_allow_unverified_versions` | `false` | Only JSON `true` lets a Kiro v3 launch run on a kiro-cli version still *pending operator verification*, so an operator can run the live checklist on it. It admits nothing else: an unlisted version still refuses, and every other v3 check still applies. Each admitted launch logs a warning and carries a `launch_notes` entry. Keep it off otherwise. |
+
+See [Kiro v3 (preview)](kiro-cli.md#pending-versions-operator-only).
 
 ### Skills (`skills`)
 
