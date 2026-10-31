@@ -14,8 +14,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
+import shutil
 import stat
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 from test.providers.kiro_helper_support import operator_home  # noqa: F401
 from test.services.test_ephemeral_claim import audit, claim  # noqa: F401
@@ -621,3 +626,265 @@ async def test_a_wrapper_without_effort_refuses_an_effort_launch_before_bind(kir
         await launch(kiro)
     assert err.value.capability == "--effort"
     assert_refused_before_bind(kiro)
+
+
+# --- the session environment ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_window_in_an_existing_session_never_touches_its_environment(kiro):
+    await launch(kiro)
+    kiro.backend.restore_session_env.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_new_session_never_persists_the_home(kiro):
+    kiro.backend.session_exists.return_value = False
+    await launch(kiro, session_name="cao-fresh", new_session=True, env_vars={"MARK": "1"})
+    assert kiro.seen["window_env"]["KIRO_HOME"] == str(home())
+    assert session_env.get_session_env("cao-fresh") == {"MARK": "1"}
+    kiro.backend.restore_session_env.assert_called_once_with("cao-fresh", "KIRO_HOME", str(home()))
+
+
+@pytest.mark.asyncio
+async def test_a_new_session_that_keeps_the_home_is_torn_down_and_the_launch_fails(kiro):
+    from cli_agent_orchestrator.backends.base import TerminalBackendError
+
+    kiro.backend.session_exists.return_value = False
+    kiro.backend.restore_session_env.side_effect = TerminalBackendError("still there")
+    with pytest.raises(TerminalBackendError):
+        await launch(kiro, session_name="cao-fresh", new_session=True)
+    kiro.backend.kill_session.assert_called_once_with("cao-fresh")
+    row = database.get_ephemeral_agent(kiro.name)
+    assert row["state"] == "gc" and row["gc_reason"] == "launch_failed"
+    assert database.get_terminal_metadata(CHILD) is None
+    assert not os.path.lexists(home())
+    kiro.factory.assert_not_called()
+
+
+_PANE_ENV_PROBE = """import json, os, sys
+keys = ("KIRO_HOME", "CAO_TERMINAL_ID")
+with open(sys.argv[1] + ".tmp", "w") as out:
+    json.dump({key: os.environ.get(key) for key in keys}, out)
+os.replace(sys.argv[1] + ".tmp", sys.argv[1])
+"""
+
+
+@pytest.fixture
+def private_tmux(kiro, monkeypatch):
+    """A real TmuxBackend on a private tmux server, under a scratch HOME and TMUX_TMPDIR.
+
+    Its default socket, so CAO's plain ``tmux`` calls reach this server too;
+    /bin/sh panes, so no rc file of the user's runs. The server is killed by
+    its own socket, and the scratch directory removed by its exact path.
+    """
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux is not installed")
+    import libtmux
+
+    from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+    from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+    # Short: pytest's tmp_path can exceed the AF_UNIX socket path limit on macOS.
+    scratch = Path(tempfile.mkdtemp(prefix="cao-p2-", dir="/tmp"))
+    (scratch / "tmux").mkdir(mode=0o700)
+    (scratch / "home").mkdir()
+    config = scratch / "tmux.conf"
+    config.write_text("set -g default-shell /bin/sh\n")
+    (scratch / "probe.py").write_text(_PANE_ENV_PROBE)
+    monkeypatch.setenv("TMUX_TMPDIR", str(scratch / "tmux"))
+    monkeypatch.setenv("HOME", str(scratch / "home"))
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    for name in ("TMUX", "TMUX_PANE", "KIRO_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    client = TmuxClient()
+    client.server = libtmux.Server(config_file=str(config))
+    backend = TmuxBackend(client=client)
+    monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+    socket = scratch / "tmux" / f"tmux-{os.getuid()}" / "default"
+
+    def tmux(*args):
+        return subprocess.run(
+            ["tmux", "-S", str(socket), *args], capture_output=True, text=True, check=True
+        ).stdout
+
+    def pane_env(target, label):
+        """Run the probe in the pane's own shell; the env its processes start with."""
+        out = scratch / f"{label}.json"
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(scratch / 'probe.py'))} {out}"
+        tmux("send-keys", "-t", target, command, "Enter")
+        deadline = time.monotonic() + 20
+        while not out.exists():
+            assert time.monotonic() < deadline, f"no probe output from {target}"
+            time.sleep(0.05)
+        return json.loads(out.read_text())
+
+    try:
+        yield SimpleEnv(backend=backend, tmux=tmux, pane_env=pane_env)
+    finally:
+        subprocess.run(["tmux", "-S", str(socket), "kill-server"], capture_output=True, check=False)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_new_tmux_session_keeps_the_home_out_of_its_environment(kiro, private_tmux):
+    """Real tmux: only the first window has the helper's KIRO_HOME (#1167 Phase 2)."""
+    terminal = await launch(
+        kiro, session_name="cao-fresh", new_session=True, env_vars={"MARK": "1"}
+    )
+    assert terminal.id == CHILD
+
+    session_env_lines = private_tmux.tmux("show-environment", "-t", "cao-fresh").splitlines()
+    # The read is real: the forwarded env and the terminal id are session state.
+    assert "MARK=1" in session_env_lines and f"CAO_TERMINAL_ID={CHILD}" in session_env_lines
+    assert not [line for line in session_env_lines if line.lstrip("-").startswith("KIRO_HOME")]
+
+    first = private_tmux.pane_env(f"cao-fresh:{terminal.name}", "first")
+    assert first == {"KIRO_HOME": str(home()), "CAO_TERMINAL_ID": CHILD}
+
+    # A later window, created the way create_terminal adds one to the session.
+    window = private_tmux.backend.create_window(
+        "cao-fresh",
+        "sibling",
+        "bbbbbbbb",
+        str(kiro.repo),
+        extra_env=session_env.get_session_env("cao-fresh"),
+    )
+    later = private_tmux.pane_env(f"cao-fresh:{window}", "later")
+    assert later == {"KIRO_HOME": None, "CAO_TERMINAL_ID": "bbbbbbbb"}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_new_tmux_session_gives_later_windows_the_servers_own_home(
+    kiro, private_tmux, monkeypatch, tmp_path
+):
+    """Real tmux: later windows keep the server's KIRO_HOME, never the helper's (#1167)."""
+    # The tmux server starts without KIRO_HOME, as an operator's server started
+    # apart from CAO would; then the CAO process gets its own.
+    private_tmux.backend.create_session("keep", "w", "cccccccc", str(kiro.repo))
+    global_env = private_tmux.tmux("show-environment", "-g").splitlines()
+    assert not [line for line in global_env if line.lstrip("-").startswith("KIRO_HOME")]
+    server_home = tmp_path / "server-kiro"
+    server_home.mkdir()
+    monkeypatch.setenv("KIRO_HOME", str(server_home))
+
+    # Control: a later window of any other new session gets the server's home.
+    private_tmux.backend.create_session("ctl", "w", "dddddddd", str(kiro.repo))
+    window = private_tmux.backend.create_window("ctl", "sib", "dddddd01", str(kiro.repo))
+    assert private_tmux.pane_env(f"ctl:{window}", "control")["KIRO_HOME"] == str(server_home)
+
+    terminal = await launch(kiro, session_name="cao-fresh", new_session=True)
+    session_env_lines = private_tmux.tmux("show-environment", "-t", "cao-fresh").splitlines()
+    assert f"KIRO_HOME={server_home}" in session_env_lines
+    assert not [line for line in session_env_lines if str(home()) in line]
+    first = private_tmux.pane_env(f"cao-fresh:{terminal.name}", "first")
+    assert first["KIRO_HOME"] == str(home())
+
+    window = private_tmux.backend.create_window(
+        "cao-fresh",
+        "sibling",
+        "bbbbbbbb",
+        str(kiro.repo),
+        extra_env=session_env.get_session_env("cao-fresh"),
+    )
+    later = private_tmux.pane_env(f"cao-fresh:{window}", "later")
+    assert later == {"KIRO_HOME": str(server_home), "CAO_TERMINAL_ID": "bbbbbbbb"}
+
+
+@pytest.fixture
+def private_herdr(kiro, monkeypatch):
+    """A real HerdrBackend on a private herdr server, under a scratch HOME.
+
+    Every HERDR_* variable is removed first, so no call can reach another
+    server. The server is started here, so its PID is known: it is stopped
+    through its own socket, then by that PID, and the scratch directory is
+    removed by its exact path.
+    """
+    if shutil.which("herdr") is None:
+        pytest.skip("herdr is not installed")
+    from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+    scratch = Path(tempfile.mkdtemp(prefix="cao-p2h-", dir="/tmp"))
+    config = scratch / "home" / ".config" / "herdr"
+    config.mkdir(parents=True)
+    (config / "config.toml").write_text(
+        'default_shell = "/bin/sh"\n[update]\nversion_check = false\nmanifest_check = false\n'
+    )
+    (scratch / "probe.py").write_text(_PANE_ENV_PROBE)
+    for name in [name for name in os.environ if name.startswith(("HERDR_", "XDG_"))]:
+        monkeypatch.delenv(name)
+    for name in ("TMUX", "TMUX_PANE", "KIRO_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(scratch / "home"))
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    session = "p2"
+    socket = config / "sessions" / session / "herdr.sock"
+    server = subprocess.Popen(
+        ["herdr", "--session", session, "server"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def herdr(*args):
+        return subprocess.run(
+            ["herdr", "--session", session, *args], capture_output=True, text=True, check=True
+        ).stdout
+
+    def pane_env(terminal_id, label):
+        out = scratch / f"{label}.json"
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(scratch / 'probe.py'))} {out}"
+        herdr("pane", "run", backend.get_pane_id(terminal_id), command)
+        deadline = time.monotonic() + 20
+        while not out.exists():
+            assert time.monotonic() < deadline, f"no probe output from {terminal_id}"
+            time.sleep(0.05)
+        return json.loads(out.read_text())
+
+    try:
+        deadline = time.monotonic() + 20
+        while not socket.exists():
+            assert server.poll() is None and time.monotonic() < deadline, "herdr did not start"
+            time.sleep(0.05)
+        backend = HerdrBackend(herdr_session=session)
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        yield SimpleEnv(backend=backend, pane_env=pane_env)
+    finally:
+        subprocess.run(
+            ["herdr", "--session", session, "server", "stop"], capture_output=True, check=False
+        )
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=10)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_on_herdr_only_the_launched_pane_has_the_home(kiro, private_herdr):
+    """Real herdr (provisional, #1167): ``--env`` is scoped to the pane it launches.
+
+    So herdr needs no session-env removal, and new-session Kiro helpers are not
+    refused there. If a herdr release makes the workspace keep the value, this
+    fails.
+    """
+    terminal = await launch(
+        kiro, session_name="cao-fresh", new_session=True, env_vars={"MARK": "1"}
+    )
+    assert terminal.id == CHILD
+    first = private_herdr.pane_env(CHILD, "first")
+    assert first == {"KIRO_HOME": str(home()), "CAO_TERMINAL_ID": CHILD}
+
+    private_herdr.backend.create_window(
+        "cao-fresh",
+        "sibling",
+        "bbbbbbbb",
+        str(kiro.repo),
+        extra_env=session_env.get_session_env("cao-fresh"),
+    )
+    later = private_herdr.pane_env("bbbbbbbb", "later")
+    assert later == {"KIRO_HOME": None, "CAO_TERMINAL_ID": "bbbbbbbb"}

@@ -1529,10 +1529,29 @@ def _add_kiro_home_to_window_env(env: Dict[str, str], kiro_launch: Optional[Kiro
     Kiro's shell integration runs ``kiro-cli init`` and ``pre-cmd`` in the pane
     with the pane's ``KIRO_HOME``; ``env_vars`` would persist into the session
     and reach every later window in it. The command assigns it as well, so an
-    rc file's export cannot change it.
+    rc file's export cannot change it. On a new session the window's env is
+    also the backend's session env, so ``_keep_kiro_home_out_of_session``
+    replaces it there once the session exists.
     """
     if kiro_launch is not None:
         env[kiro_launch_home.KIRO_HOME_ENV] = str(kiro_launch.home.home)
+
+
+def _keep_kiro_home_out_of_session(session_name: str, kiro_launch: Optional[KiroLaunch]) -> None:
+    """Give a session this launch just created back its own KIRO_HOME (#1167 Phase 2).
+
+    tmux's ``new-session -e`` makes the first window's env the session's own, so
+    every later window in the session would start with this helper's
+    ``KIRO_HOME``, and the release would stop those windows' processes as owners
+    of the home. The session gets back the ``KIRO_HOME`` it would have had
+    without the launch (the server's own, if CAO forwards one), and the first
+    pane keeps its value. Called inside the create's rollback guard: when the
+    backend cannot put it back, the session is torn down and the launch fails.
+    """
+    if kiro_launch is not None:
+        get_backend().restore_session_env(
+            session_name, kiro_launch_home.KIRO_HOME_ENV, str(kiro_launch.home.home)
+        )
 
 
 async def create_terminal(
@@ -2752,6 +2771,7 @@ async def _create_terminal_unguarded(
                 # caller's `except`.
                 try:
                     if created_session:
+                        _keep_kiro_home_out_of_session(session_name, kiro_launch)
                         # Drop rows a previous incarnation of this session name
                         # left behind. Inside the lock, so it can never race the
                         # row write of a concurrent create for the same name.

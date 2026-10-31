@@ -1153,6 +1153,23 @@ class TmuxClient:
     # Per-var value cap (PR #246) — keeps the full tmux ``new-session -e`` /
     # ``new-window -e`` argv under the kernel argv limit on busy hosts.
     _MAX_ENV_VALUE_BYTES = 2048
+    # Forwarded to every new session whatever their prefix.
+    _ESSENTIAL_ENV_KEYS = frozenset(
+        {
+            "HOME",
+            "PATH",
+            "SHELL",
+            "USER",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TERM",
+            "SSH_AUTH_SOCK",
+            "DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "DO_NOT_TRACK",
+        }
+    )
 
     @classmethod
     def _is_blocked_env_key(cls, key: str) -> bool:
@@ -1195,6 +1212,30 @@ class TmuxClient:
                 continue
             environment[key] = value
 
+    @classmethod
+    def _forwarded_server_env(cls) -> Dict[str, str]:
+        """The slice of this process's environment every new session is given.
+
+        Only essential env vars, to avoid tmux "command too long": the
+        essential keys, the provider allowlist, and unblocked ``CAO_``,
+        ``KIRO_``, ``MISE_`` and ``AWS_`` keys under the byte cap.
+        ``create_session`` forwards it, and ``restore_session_env`` puts a key
+        back from it, so the two cannot drift.
+        """
+        return {
+            k: v
+            for k, v in os.environ.items()
+            if (
+                k in cls._ESSENTIAL_ENV_KEYS
+                or k in cls._BLOCKED_PREFIX_ALLOWLIST
+                or (
+                    not cls._is_blocked_env_key(k)
+                    and k.startswith(("CAO_", "KIRO_", "MISE_", "AWS_"))
+                    and len(v.encode("utf-8")) < cls._MAX_ENV_VALUE_BYTES
+                )
+            )
+        }
+
     def create_session(
         self,
         session_name: str,
@@ -1216,34 +1257,7 @@ class TmuxClient:
 
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
-            # Only pass essential env vars to avoid tmux "command too long"
-            essential_keys = {
-                "HOME",
-                "PATH",
-                "SHELL",
-                "USER",
-                "LANG",
-                "LC_ALL",
-                "LC_CTYPE",
-                "TERM",
-                "SSH_AUTH_SOCK",
-                "DISPLAY",
-                "XDG_RUNTIME_DIR",
-                "DO_NOT_TRACK",
-            }
-            environment = {
-                k: v
-                for k, v in os.environ.items()
-                if (
-                    k in essential_keys
-                    or k in self._BLOCKED_PREFIX_ALLOWLIST
-                    or (
-                        not self._is_blocked_env_key(k)
-                        and k.startswith(("CAO_", "KIRO_", "MISE_", "AWS_"))
-                        and len(v.encode("utf-8")) < self._MAX_ENV_VALUE_BYTES
-                    )
-                )
-            }
+            environment = self._forwarded_server_env()
             # Operator-forwarded vars (from ``cao launch --env``) merge AFTER
             # the inherited slice and override on key collision, so an
             # explicit ``--env AWS_REGION=us-west-2`` wins over the inherited
@@ -1382,6 +1396,35 @@ class TmuxClient:
         except Exception as e:
             logger.error(f"Failed to create session {session_name}: {e}")
             raise
+
+    def restore_session_env(self, session_name: str, key: str, launch_value: str) -> None:
+        """Give the session back the ``key`` it would have had without ``launch_value``.
+
+        ``new-session -e`` makes every ``create_session`` env entry session
+        state, which every later window in the session inherits. The session's
+        ``key`` is set back to what ``create_session`` forwards from this
+        process's own environment, or removed (``set-environment -u``) when it
+        forwards none. The first pane keeps the value it started with. Read
+        back to confirm.
+
+        Raises:
+            ValueError: The session is gone, this process would forward
+                ``launch_value`` itself, or tmux reports another value for ``key``.
+        """
+        expected = self._forwarded_server_env().get(key)
+        if expected == launch_value:
+            raise ValueError(f"this process's own {key} is the value private to the first window")
+        session = self._find_session(session_name)
+        if not session:
+            raise ValueError(f"Session '{session_name}' not found")
+        if expected is None:
+            session.unset_environment(key)
+        else:
+            session.set_environment(key, expected)
+        if session.show_environment().get(key) != expected:
+            raise ValueError(
+                f"tmux reports a {key} for session '{session_name}' other than the forwarded one"
+            )
 
     def create_window(
         self,
