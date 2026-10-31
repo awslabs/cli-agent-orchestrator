@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import os
+from test.providers.kiro_helper_support import operator_home  # noqa: F401
 
 import pytest
 
-from cli_agent_orchestrator.providers.kiro_workspace import KiroWorkspaceError, check_kiro_workspace
+from cli_agent_orchestrator.providers.kiro_workspace import (
+    KiroWorkspaceError,
+    KiroWorkspaceHomeError,
+    check_kiro_helper_workspace,
+    check_kiro_workspace,
+)
 
 
 @pytest.fixture
@@ -148,3 +154,74 @@ def test_an_unreadable_kiro_directory_refuses(tree):
     finally:
         kiro.chmod(0o755)
     assert excinfo.value.code == "kiro_v3_workspace_config:unreadable"
+
+
+# --- ephemeral helpers: HOME's own rule (#1167 Phase 2, gate G21) --------------------
+
+
+class TestHelperWorkspace:
+    """A helper's Kiro home is its own, so ``~/.kiro`` is no longer Kiro's user scope.
+
+    Kiro drops a workspace folder only when its ``.kiro/agents`` is the user
+    agent directory, so a helper whose workspace folder is ``HOME`` would load
+    the operator's ``~/.kiro`` as trusted workspace configuration.
+    """
+
+    def _check(self, cwd, home):
+        check_kiro_helper_workspace(str(cwd), str(home))
+
+    def test_the_home_folder_itself_refuses(self, operator_home):  # noqa: F811
+        with pytest.raises(KiroWorkspaceHomeError) as excinfo:
+            self._check(operator_home.home, operator_home.home)
+        assert excinfo.value.code == "kiro_v3_workspace_config:home"
+        # One family with Phase 1's workspace refusals.
+        assert isinstance(excinfo.value, KiroWorkspaceError)
+        assert str(operator_home.home) not in str(excinfo.value)
+
+    def test_the_home_folder_reached_through_a_link_refuses(
+        self, operator_home, tmp_path
+    ):  # noqa: F811
+        link = tmp_path / "link-to-home"
+        link.symlink_to(operator_home.home)
+        with pytest.raises(KiroWorkspaceHomeError):
+            self._check(link, operator_home.home)
+
+    @pytest.mark.parametrize("kind", ["dir", "file", "symlink"])
+    def test_under_a_home_that_is_a_git_work_tree_refuses(self, operator_home, kind):  # noqa: F811
+        repo = operator_home.home / "Project" / "repo"
+        repo.mkdir(parents=True)
+        git = operator_home.home / ".git"
+        if kind == "dir":
+            git.mkdir()
+        elif kind == "file":
+            git.write_text("gitdir: /elsewhere\n")
+        else:
+            git.symlink_to(operator_home.home / "missing")
+        with pytest.raises(KiroWorkspaceHomeError):
+            self._check(repo, operator_home.home)
+
+    def test_under_home_without_git_passes_though_kiro_holds_configuration(
+        self, operator_home  # noqa: F811
+    ):
+        # The fixture's ~/.kiro holds agents/, settings/ and powers/; it is
+        # skipped as an ancestor, and only stat could reach it (G19b).
+        repo = operator_home.home / "Project" / "repo"
+        repo.mkdir(parents=True)
+        self._check(repo, operator_home.home)
+
+    def test_outside_home_the_phase_1_check_still_runs(self, operator_home, tmp_path):  # noqa: F811
+        repo = tmp_path / "elsewhere" / "repo"
+        (repo / ".kiro" / "hooks").mkdir(parents=True)
+        with pytest.raises(KiroWorkspaceError) as excinfo:
+            self._check(repo, operator_home.home)
+        assert excinfo.value.code == "kiro_v3_workspace_config:hooks"
+        (repo / ".kiro" / "hooks").rmdir()
+        (repo / ".kiro" / "steering").mkdir()
+        self._check(repo, operator_home.home)
+
+    def test_a_repository_kiro_under_home_still_refuses(self, operator_home):  # noqa: F811
+        repo = operator_home.home / "Project" / "repo"
+        (repo / ".kiro" / "agents").mkdir(parents=True)
+        with pytest.raises(KiroWorkspaceError) as excinfo:
+            self._check(repo, operator_home.home)
+        assert excinfo.value.code == "kiro_v3_workspace_config:agents"

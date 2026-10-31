@@ -239,6 +239,44 @@ def _kiro_install_prompt(profile: AgentProfile) -> Optional[str]:
     return profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
 
 
+def kiro_universal_agent_config(
+    *,
+    name: str,
+    description: str,
+    prompt: Optional[str],
+    allowed_tools: List[str],
+    mcp_servers: Optional[Dict[str, Any]],
+    resources: List[str],
+    model: Optional[str],
+) -> KiroAgentConfig:
+    """The universal Kiro agent file for one grant, unvalidated (#1167).
+
+    The one render core for ``cao install`` and for an ephemeral helper's
+    per-launch file, so their ``tools``, ``excludedTools`` and rules cannot
+    drift apart. Only granted MCP servers are configured, a server named only
+    by per-tool refs (``@server/tool``) included, each cao-mcp-server entry
+    with Kiro's raised tool-call timeout; the rules allow just the granted
+    tools and deny every other one. Callers validate the result before
+    writing it.
+    """
+    servers = _inject_kiro_mcp_timeout(mcp_servers) or {}
+    granted = set(kiro_v3_granted_mcp_servers(allowed_tools, servers))
+    configured = {server: config for server, config in servers.items() if server in granted}
+    return KiroAgentConfig(
+        name=name,
+        description=description,
+        tools=kiro_universal_tools(allowed_tools),
+        allowedTools=allowed_tools,
+        excludedTools=kiro_v3_excluded_tools(allowed_tools, pinned_kiro_v3_schemas()),
+        resources=resources,
+        prompt=prompt,
+        mcpServers=configured or None,
+        model=model,
+        includeMcpJson=False,
+        permissions={"rules": kiro_v3_rules(allowed_tools, sorted(configured))},
+    )
+
+
 def _render_kiro_universal_agent(
     profile: AgentProfile,
     allowed_tools: List[str],
@@ -276,21 +314,14 @@ def _render_kiro_universal_agent(
             "Kiro engine 'v3' install refused: an unrestricted ('*') policy is not rendered "
             "for the v3 engine. Restrict allowedTools, or install with --engine v2."
         )
-    servers = _inject_kiro_mcp_timeout(profile.mcpServers) or {}
-    granted = set(kiro_v3_granted_mcp_servers(allowed_tools, servers))
-    mcp_servers = {name: config for name, config in servers.items() if name in granted}
-    config = KiroAgentConfig(
+    config = kiro_universal_agent_config(
         name=profile.name,
         description=profile.description,
-        tools=kiro_universal_tools(allowed_tools),
-        allowedTools=allowed_tools,
-        excludedTools=kiro_v3_excluded_tools(allowed_tools, pinned_kiro_v3_schemas()),
-        resources=resources,
         prompt=prompt,
-        mcpServers=mcp_servers or None,
+        allowed_tools=allowed_tools,
+        mcp_servers=profile.mcpServers,
+        resources=resources,
         model=profile.model,
-        includeMcpJson=False,
-        permissions={"rules": kiro_v3_rules(allowed_tools, sorted(mcp_servers))},
     )
     text = config.model_dump_json(indent=2, exclude_none=True)
     require_valid_for_every_pinned_schema(

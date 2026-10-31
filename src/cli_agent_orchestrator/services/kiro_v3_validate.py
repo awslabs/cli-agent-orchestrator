@@ -45,6 +45,9 @@ from cli_agent_orchestrator.utils.tool_mapping import (
 #: Kiro's own loader would be the next reader; a file this large is not CAO's.
 MAX_AGENT_FILE_BYTES = 1024 * 1024
 
+#: The tool-less default agent of an ephemeral helper's per-launch home (#1167 Phase 2).
+SENTINEL_AGENT = "cao-null"
+
 #: The top-level keys CAO writes into a universal file.
 CAO_UNIVERSAL_KEYS = frozenset(
     {
@@ -265,6 +268,7 @@ def validate_kiro_v3_agent(
     expected_name: str,
     launch_allowlist: Optional[List[str]] = None,
     render_schemas: Optional[Iterable[KiroV3EngineSchema]] = None,
+    fallback_sentinel: bool = False,
 ) -> List[KiroV3Finding]:
     """Check one parsed universal file against ``schema``; empty means valid.
 
@@ -273,7 +277,21 @@ def validate_kiro_v3_agent(
     launch-only checks run too: the file's grant must fit it, and the effective
     v3 set under ``schema`` must equal the grant's exact set. ``render_schemas``
     are the schemas CAO renders ``excludedTools`` over (every pinned one).
+
+    ``fallback_sentinel`` is for an ephemeral helper's tool-less default agent
+    only (#1167 Phase 2): the fallback name ``cao-null`` is then the expected
+    one, and only for an empty grant (``allowedTools`` and ``launch_allowlist``
+    both ``[]``), so set equality makes the file render no tool and deny every
+    capability. Every other check is unchanged. Provisional (#1167).
     """
+    if fallback_sentinel and (
+        expected_name != SENTINEL_AGENT or launch_allowlist != [] or data.get("allowedTools") != []
+    ):
+        return [
+            KiroV3Finding(
+                "sentinel", f"only {SENTINEL_AGENT!r} with an empty grant is a sentinel file"
+            )
+        ]
     findings: List[KiroV3Finding] = []
     for key in FORBIDDEN_KEYS:
         if key in data:
@@ -302,6 +320,8 @@ def validate_kiro_v3_agent(
     name = data.get("name")
     if not isinstance(name, str):
         findings.append(KiroV3Finding("name", "name is not a string"))
+    elif fallback_sentinel and name == SENTINEL_AGENT:
+        pass
     elif name in KIRO_FALLBACK_AGENTS or name in schema.fallback_agents:
         findings.append(KiroV3Finding("fallback_name", f"name {name!r} is a fallback agent"))
     elif name != expected_name:
@@ -385,6 +405,7 @@ def validate_kiro_v3_agent_bytes(
     expected_name: str,
     launch_allowlist: Optional[List[str]] = None,
     render_schemas: Optional[Iterable[KiroV3EngineSchema]] = None,
+    fallback_sentinel: bool = False,
 ) -> List[KiroV3Finding]:
     """Parse and validate one agent file's bytes; empty means valid."""
     data, findings = parse_kiro_v3_agent_bytes(raw)
@@ -396,6 +417,7 @@ def validate_kiro_v3_agent_bytes(
         expected_name=expected_name,
         launch_allowlist=launch_allowlist,
         render_schemas=render_schemas,
+        fallback_sentinel=fallback_sentinel,
     )
 
 
@@ -414,6 +436,7 @@ __all__ = [
     "KiroV3Finding",
     "KiroV3InvalidAgentError",
     "MAX_AGENT_FILE_BYTES",
+    "SENTINEL_AGENT",
     "parse_kiro_v3_agent_bytes",
     "require_valid_for_every_pinned_schema",
     "validate_kiro_v3_agent",
