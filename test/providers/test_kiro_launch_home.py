@@ -141,6 +141,17 @@ class TestResolveKiroCli:
         resolved = k.resolve_kiro_cli(lambda _: str(link))
         assert resolved == k.ResolvedKiroCli(path=str(link), target=os.path.realpath(target))
 
+    def test_a_path_holding_equals_is_refused(self, tmp_path):
+        """/usr/bin/env would read ``…/dir=x/kiro-cli`` as an assignment, not a program."""
+        target = tmp_path / "dir=x" / "kiro-cli"
+        target.parent.mkdir()
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o755)
+        with pytest.raises(k.KiroLaunchRefusal) as err:
+            k.resolve_kiro_cli(lambda _: str(target))
+        assert err.value.rule == "kiro_cli_unresolved"
+        assert str(tmp_path) not in str(err.value)
+
     @pytest.mark.parametrize("mode", [0o775, 0o757, 0o644])
     def test_a_writable_or_non_executable_target_is_refused(self, tmp_path, mode):
         target = tmp_path / "kiro-cli"
@@ -371,6 +382,14 @@ class TestCreate:
         assert refusal(prepare) == "kiro_home_invalid:root"
         assert os.listdir(target) == [] and root.is_symlink()
         assert k.prepared_launch_home(TID) is None
+
+    @pytest.mark.parametrize("name", ["", ".", "..", "a/b", "../x", "a\0b", "a..b"])
+    def test_an_agent_name_that_is_not_a_plain_file_name_refuses(self, store, name):
+        payload = k.render_helper_agent(AGENT, PROFILE, grant_of(), TID)
+        with pytest.raises(k.KiroLaunchRefusal) as err:
+            k.create_launch_home(TID, name, payload, snapshot())
+        assert err.value.rule == "kiro_agent_invalid:name"
+        assert not os.path.lexists(k.kiro_homes_root())
 
     def test_a_home_the_root_cannot_take_refuses_as_create(self, store, monkeypatch):
         home, real = k.kiro_home_path(TID), os.mkdir
@@ -773,6 +792,23 @@ class TestGlobalHomeGuard:
         assert k.placeholder_is_listable(sealed) is True
         assert k.placeholder_is_listable(tmp_path / "missing") is True
 
+    @pytest.mark.parametrize("error", [PermissionError, OSError])
+    def test_a_source_that_cannot_be_stat_ed_counts_as_present(
+        self, store, operator_home, monkeypatch, error  # noqa: F811
+    ):
+        """An lstat error other than absence never reads as "no secret store"."""
+        probe = k.ensure_probe_home()
+        source = os.path.join(str(operator_home.home), ".kiro", "secrets.json")
+        real = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if os.fspath(path) == source:
+                raise error(13, "Permission denied", source)
+            return real(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", lstat)
+        assert refusal(k.check_kiro_global_home, probe) == "kiro_v3_global_home:secrets"
+
     @pytest.mark.parametrize("value", [None, "", "relative/home"])
     def test_a_server_without_an_absolute_home_refuses(self, store, monkeypatch, value):
         probe = k.ensure_probe_home()
@@ -1018,14 +1054,72 @@ class TestRemove:
         prepared = prepare()
         k.seal_launch_home(prepared)
         unsealed = []
-        real = k._unseal_placeholder
+        real = k._unseal
         monkeypatch.setattr(
-            k,
-            "_unseal_placeholder",
-            lambda home: unsealed.append(os.path.lexists(home)) or real(home),
+            k, "_unseal", lambda home: unsealed.append(os.path.lexists(home)) or real(home)
         )
         assert k.remove_kiro_home(TID, prepared.hashes(), stop_owners=lambda _: True) is True
         assert unsealed == [True] and not os.path.lexists(prepared.home)
+
+    @pytest.mark.parametrize("kind", ["file", "hard_link"])
+    def test_a_placeholder_that_is_not_a_directory_is_never_chmod_ed(
+        self, store, tmp_path, monkeypatch, kind
+    ):
+        """Only a directory is unsealed: a file, or a hard link to one outside, keeps its mode."""
+        prepared = prepare()
+        k.seal_launch_home(prepared)
+        powers = prepared.home / "powers"
+        powers.rmdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("keep")
+        outside.chmod(0o600)
+        if kind == "file":
+            powers.write_text("x")
+            powers.chmod(0o600)
+            watched = powers
+        else:
+            os.link(outside, powers)
+            watched = outside
+        before = stat.S_IMODE(os.lstat(watched).st_mode)
+        assert before == 0o600
+        modes = []
+        real = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if os.fspath(path) == "powers":
+                modes.append(mode)
+            return real(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "chmod", chmod)
+        assert k.remove_kiro_home(TID, prepared.hashes(), stop_owners=lambda _: True) is True
+        monkeypatch.undo()
+        assert modes == []  # never chmod-ed: not a directory
+        assert stat.S_IMODE(os.lstat(outside).st_mode) == 0o600
+        assert outside.read_text() == "keep"
+        # The home itself is gone: rmtree unlinks a file or link like any other entry.
+        assert not os.path.lexists(prepared.home)
+
+    def test_a_home_swapped_for_a_link_is_never_unsealed_through_it(self, store, tmp_path):
+        """The swap lands after the path checks: the unseal opens the home without following it."""
+        prepared = prepare()
+        k.seal_launch_home(prepared)
+        victim = tmp_path / "victim"
+        (victim / "agents").mkdir(parents=True)
+        (victim / "agents").chmod(0o500)
+        moved = tmp_path / "moved-home"
+
+        def swap(home):
+            home.rename(moved)
+            home.symlink_to(victim)
+            return True
+
+        assert k.remove_kiro_home(TID, prepared.hashes(), stop_owners=swap) is False
+        assert stat.S_IMODE(os.lstat(victim / "agents").st_mode) == 0o500
+        assert prepared.home.is_symlink()
+        prepared.home.unlink()
+        (victim / "agents").chmod(0o700)
+        _unseal_tree(moved)
+        (moved / "agents").chmod(0o700)
 
     def test_a_placeholder_swapped_for_a_link_is_never_followed(self, store, tmp_path):
         prepared = prepare()

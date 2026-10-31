@@ -293,7 +293,9 @@ def resolve_kiro_cli(which: Optional[Callable[[str], Optional[str]]] = None) -> 
     the command typed into it names this path, and the probe runs it too. The
     path is kept unresolved (a link such as ``~/.local/bin/kiro-cli`` survives
     Kiro's bundle updates); its target must be a regular executable file that
-    neither group nor others can write.
+    neither group nor others can write. A path holding ``=`` refuses:
+    ``/usr/bin/env`` would read it as an assignment and exec another program,
+    so the binary launched would not be the binary probed.
     """
     found = (which or shutil.which)(KIRO_CLI)
     if not found:
@@ -301,6 +303,11 @@ def resolve_kiro_cli(which: Optional[Callable[[str], Optional[str]]] = None) -> 
     if not os.path.isabs(found):
         raise KiroLaunchRefusal(
             "kiro_cli_unresolved", "kiro-cli resolved through a relative PATH entry"
+        )
+    if "=" in found:
+        raise KiroLaunchRefusal(
+            "kiro_cli_unresolved",
+            "kiro-cli's path holds '=', which /usr/bin/env would read as an assignment",
         )
     target = os.path.realpath(found)
     try:
@@ -734,17 +741,35 @@ def _make_placeholder(path: Path) -> PlaceholderDir:
         os.close(fd)
 
 
+def _plain_name(name: object) -> bool:
+    """One plain path component: not empty, no separator, NUL or ``..``."""
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and name != "."
+        and ".." not in name
+        and "/" not in name
+        and os.sep not in name
+        and "\0" not in name
+    )
+
+
 def create_launch_home(
     terminal_id: str, agent: str, agent_payload: bytes, global_home: KiroGlobalHome
 ) -> KiroLaunchHome:
     """Create, seed and fill one launch's home; it must not exist yet.
 
-    Kiro must honour the path as a ``KIRO_HOME`` (``kiro_home_invalid:ignored``
-    otherwise, before anything is made). The home is made by this call or not
+    ``agent`` must be a plain file name (``kiro_agent_invalid:name`` otherwise),
+    and Kiro must honour the path as a ``KIRO_HOME`` (``kiro_home_invalid:ignored``
+    otherwise), both before anything is made. The home is made by this call or not
     at all: an entry already at the path, of any type, refuses
     ``kiro_home_invalid:exists`` and is left untouched. On any later failure
     every entry this call created is removed again.
     """
+    if not _plain_name(agent):
+        raise KiroLaunchRefusal(
+            "kiro_agent_invalid:name", "the helper's name is not a plain file name"
+        )
     home = kiro_home_path(terminal_id)
     root = home.parent
     require_kiro_home_honoured(home)
@@ -1030,36 +1055,32 @@ def _modified(home: Path, names: Sequence[str], recorded: Mapping[str, str]) -> 
     return False
 
 
-def _unseal_placeholder(home: Path) -> None:
-    """Give ``powers/`` its owner bits back (0000 → 0700), so ``rmtree`` can enter it.
+def _unseal(home: Path) -> None:
+    """Give ``agents/`` and ``powers/`` their owner bits back (0700), so ``rmtree`` can empty them.
 
-    A mode-0000 directory cannot be opened, so its mode is set by name through
-    the home's own no-follow descriptor, refusing a link (``fchmodat`` with
-    ``AT_SYMLINK_NOFOLLOW``). Where the platform cannot refuse a link that way,
-    nothing is changed: ``rmtree`` then fails and the home is retained.
+    Both are changed by name through the home's own no-follow descriptor,
+    refusing a link (``fchmodat`` with ``AT_SYMLINK_NOFOLLOW``), so nothing in
+    removal works by path: ``powers/`` is mode 0000 and cannot be opened at
+    all, and a home swapped for a link after its checks is never entered. Only
+    a directory this user owns is changed. Where the platform cannot refuse a
+    link that way, nothing is changed: ``rmtree`` then fails and the home is
+    retained.
     """
     try:
         fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
         return  # Missing, or not a directory: rmtree decides, and refuses a link.
     try:
-        info = os.stat(POWERS_DIR, dir_fd=fd, follow_symlinks=False)
-        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid():
-            os.chmod(POWERS_DIR, 0o700, dir_fd=fd, follow_symlinks=False)
-    except (OSError, NotImplementedError, ValueError) as exc:
-        if not isinstance(exc, OSError) or exc.errno != errno.ENOENT:
-            logger.warning("Kiro home %s: powers/ could not be unsealed: %s", home, exc)
+        for name in ("agents", POWERS_DIR):
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid():
+                    os.chmod(name, 0o700, dir_fd=fd, follow_symlinks=False)
+            except (OSError, NotImplementedError, ValueError) as exc:
+                if not isinstance(exc, OSError) or exc.errno != errno.ENOENT:
+                    logger.warning("Kiro home %s: %s/ could not be unsealed: %s", home, name, exc)
     finally:
         os.close(fd)
-
-
-def _unseal(home: Path) -> None:
-    """Restore owner write on ``agents/`` and owner access on ``powers/``, without following links."""
-    try:
-        _set_mode_no_follow(home / "agents", 0o700, directory=True, expected=None)
-    except OSError:
-        pass  # Missing, or not a directory: rmtree decides, and refuses a link.
-    _unseal_placeholder(home)
 
 
 @dataclass(frozen=True)
