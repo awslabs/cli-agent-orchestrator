@@ -158,6 +158,8 @@ class ProviderManager:
                     allowed_tools,
                     model=model,
                 )
+                if provider_variant is not None:
+                    provider.restore_runtime_variant(provider_variant)
             elif provider_type == ProviderType.OMP.value:
                 provider = OmpProvider(
                     terminal_id,
@@ -300,6 +302,12 @@ class ProviderManager:
             engine=persisted_engine,
             provider_variant=metadata.get("provider_variant"),
         )
+        if isinstance(provider, OpenCodeCliProvider) and not metadata.get("provider_variant"):
+            try:
+                provider.restore_runtime_variant(None)
+            except Exception:
+                self._providers.pop(terminal_id, None)
+                raise
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since
         # launched — mark the provider as initialized so KiroCliProvider's

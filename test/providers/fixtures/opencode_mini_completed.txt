@@ -1,0 +1,11 @@
+▪ oc mini v2.2.3 · ~/dev/cli-agent-orchestrator
+
+› Reply with exactly CAO_V2_PROBE_OK. Do not use tools.
+
+CAO_V2_PROBE_OK
+
+developer · Big Pickle · 2.2s
+
+┃
+
+developer · Big Pickle · 7.8K (4%) · OpenCode · ctrl+p menu

@@ -13,6 +13,7 @@ from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.install import install
 from cli_agent_orchestrator.cli.commands.profile import profile as profile_cmd
+from cli_agent_orchestrator.utils.opencode_cli import detect_opencode_major
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -1067,8 +1068,13 @@ class TestOpencodeAgentListIntegration:
             "OPENCODE_CONFIG_DIR": str(tmp_path / "opencode_cli"),
             "OPENCODE_DISABLE_AUTOUPDATE": "1",
         }
+        major = detect_opencode_major()
         proc = subprocess.run(
-            ["opencode", "agent", "list"],
+            (
+                ["opencode", "debug", "agents", "--standalone"]
+                if major == 2
+                else ["opencode", "agent", "list"]
+            ),
             capture_output=True,
             text=True,
             env={**os.environ, **env},
