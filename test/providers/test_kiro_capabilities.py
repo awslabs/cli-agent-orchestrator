@@ -1,4 +1,4 @@
-"""Deterministic Phase 0 wrapper-probe and command tests."""
+"""Deterministic Kiro wrapper-probe and command tests."""
 
 import subprocess
 from pathlib import Path
@@ -116,9 +116,10 @@ def test_probe_rejects_required_flag_mentioned_only_in_prose():
     "flag",
     [
         "--agent-engine",
-        "--v3",
+        "--trust-workspace",
         "--agent",
         "--model",
+        "--effort",
         "--legacy-ui",
         "--trust-all-tools",
         "--require-mcp-startup",
@@ -136,7 +137,7 @@ def test_flags_from_help_rejects_short_bare_agent_engine_prose():
 @pytest.mark.parametrize(
     "flag",
     [
-        "--v3",
+        "--trust-workspace",
         "--legacy-ui",
         "--trust-all-tools",
         "--require-mcp-startup",
@@ -151,9 +152,10 @@ def test_flags_from_help_rejects_incompatible_bare_boolean_declarations(flag, su
     "flag",
     [
         "--agent-engine",
-        "--v3",
+        "--trust-workspace",
         "--agent",
         "--model",
+        "--effort",
         "--legacy-ui",
         "--trust-all-tools",
         "--require-mcp-startup",
@@ -169,8 +171,10 @@ def test_flags_from_help_accepts_formal_short_long_metavariable_alias_and_variad
             [
                 "--agent-engine <ENGINE>",
                 "--v3",
+                "--trust-workspace",
                 "--agent <AGENT>",
                 "--model MODEL",
+                "--effort <EFFORT>",
                 "--legacy-ui, --legacy",
                 "-a, --trust-all-tools",
                 "-v, --verbose...",
@@ -179,12 +183,14 @@ def test_flags_from_help_accepts_formal_short_long_metavariable_alias_and_variad
         )
     )
 
+    # ``--v3`` is declared but no longer requested (#1167, D2).
     assert flags == frozenset(
         {
             "--agent-engine",
-            "--v3",
+            "--trust-workspace",
             "--agent",
             "--model",
+            "--effort",
             "--legacy-ui",
             "--trust-all-tools",
             "--require-mcp-startup",
@@ -312,16 +318,25 @@ def test_probe_uses_bounded_root_chat_and_version_wrapper_contracts():
     ]
 
 
-def test_probe_rejects_unsupported_kas_selector_without_fallback():
-    def no_v3(command, **_kwargs):
-        output = "--agent-engine\n--agent\n" if command[-1] == "--help" else "kiro-cli 2.13.0"
+def test_probe_rejects_a_v3_wrapper_without_the_agent_engine_value_and_no_fallback():
+    """v3 is probed through ``--agent-engine v3`` (#1167, D2); ``--v3`` alone is not enough."""
+
+    def no_v3_value(command, **_kwargs):
+        output = (
+            "--agent-engine v2|v1\n--v3\n--agent NAME\n--trust-all-tools\n--trust-workspace\n"
+            if command[-1] == "--help"
+            else "kiro-cli 2.35.1"
+        )
         return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
 
-    with pytest.raises(KiroCapabilityError, match="--v3") as exc_info:
-        probe_kiro_capabilities(KiroEngine.KAS, {"profile"}, runner=no_v3)
+    with pytest.raises(KiroCapabilityError, match="--agent-engine") as exc_info:
+        probe_kiro_capabilities(
+            KiroEngine.V3, {"profile", "trust", "trust_workspace"}, runner=no_v3_value
+        )
 
     assert exc_info.value.kind == "unsupported_capability"
-    assert exc_info.value.engine == KiroEngine.KAS
+    assert exc_info.value.engine == KiroEngine.V3
+    assert exc_info.value.capability == "--agent-engine=v3"
 
 
 @pytest.mark.parametrize(
@@ -351,7 +366,7 @@ def test_probe_reports_distinct_execution_failures(runner, kind):
     assert exc_info.value.kind == kind
 
 
-def test_builds_explicit_v2_and_deterministic_kas_commands():
+def test_builds_explicit_v2_and_deterministic_v3_commands():
     assert build_kiro_command(KiroEngine.V2, "developer", model="fixture-model", yolo=True) == [
         "kiro-cli",
         "chat",
@@ -363,10 +378,22 @@ def test_builds_explicit_v2_and_deterministic_kas_commands():
         "--agent",
         "developer",
     ]
-    assert build_kiro_command(KiroEngine.KAS, "developer") == [
+    assert build_kiro_command(KiroEngine.V3, "developer") == [
+        "/usr/bin/env",
+        "-u",
+        "ASBX_KIRO_MANDATORY_MCPS",
+        "-u",
+        "KIRO_AGENT_CONFIG_DIR",
+        "-u",
+        "KIRO_AGENT_ENGINE",
+        "-u",
+        "KIRO_HOME",
         "kiro-cli",
-        "--v3",
         "chat",
+        "--agent-engine",
+        "v3",
+        "--trust-workspace",
+        "--trust-all-tools",
         "--agent",
         "developer",
     ]

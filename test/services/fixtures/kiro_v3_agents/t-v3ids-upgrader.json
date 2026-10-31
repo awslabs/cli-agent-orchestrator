@@ -1,0 +1,41 @@
+{
+  "name": "t-v3ids-upgrader",
+  "description": "KV3 tool-variant probe",
+  "prompt": "You are a KV3 probe agent for a CAO compatibility test. Answer briefly.",
+  "tools": [
+    "read_file",
+    "list_directory",
+    "file_search",
+    "grep_search",
+    "@cao-mcp-server"
+  ],
+  "includeMcpJson": false,
+  "includePowers": false,
+  "resources": [],
+  "mcpServers": {
+    "cao-mcp-server": {
+      "command": "cao-mcp-server",
+      "args": [],
+      "timeout": 1200000
+    }
+  },
+  "permissions": {
+    "rules": [
+      {
+        "capability": "fs_read",
+        "effect": "allow"
+      },
+      {
+        "capability": "mcp",
+        "match": [
+          "cao-mcp-server/*"
+        ],
+        "effect": "allow"
+      },
+      {
+        "capability": "skill",
+        "effect": "allow"
+      }
+    ]
+  }
+}

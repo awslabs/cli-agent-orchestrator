@@ -1,0 +1,121 @@
+{
+  "name": "developer",
+  "description": "Developer Agent in a multi-agent system",
+  "tools": [
+    "@cao-mcp-server",
+    "code",
+    "delete_file",
+    "execute_bash",
+    "file_search",
+    "fs_append",
+    "fs_read",
+    "fs_write",
+    "glob",
+    "goal",
+    "grep",
+    "grep_search",
+    "introspect",
+    "invoke_sub_agent",
+    "knowledge",
+    "list_directory",
+    "read_file",
+    "remote_web_search",
+    "shell",
+    "str_replace",
+    "subagent",
+    "todo_list",
+    "use_aws",
+    "web_fetch",
+    "web_search",
+    "write"
+  ],
+  "allowedTools": [
+    "@builtin",
+    "fs_*",
+    "execute_bash",
+    "web_fetch",
+    "@cao-mcp-server"
+  ],
+  "excludedTools": [
+    "knowledge"
+  ],
+  "includeMcpJson": false,
+  "resources": [
+    "file://<ROOT>/agent-context/developer.md",
+    "skill://<ROOT>/skills/**/SKILL.md",
+    "skill://<ROOT>/skills/*/SKILL.md"
+  ],
+  "mcpServers": {
+    "cao-mcp-server": {
+      "type": "stdio",
+      "command": "/fixture/bin/cao-mcp-server",
+      "args": [],
+      "timeout": 1200000
+    }
+  },
+  "permissions": {
+    "rules": [
+      {
+        "capability": "context",
+        "effect": "allow"
+      },
+      {
+        "capability": "diagnostics",
+        "effect": "allow"
+      },
+      {
+        "capability": "fs_read",
+        "effect": "allow"
+      },
+      {
+        "capability": "fs_write",
+        "effect": "allow"
+      },
+      {
+        "capability": "mcp",
+        "match": [
+          "cao-mcp-server/*"
+        ],
+        "effect": "allow"
+      },
+      {
+        "capability": "shell",
+        "effect": "allow"
+      },
+      {
+        "capability": "skill",
+        "effect": "allow"
+      },
+      {
+        "capability": "subagent",
+        "effect": "allow"
+      },
+      {
+        "capability": "web_fetch",
+        "effect": "allow"
+      },
+      {
+        "capability": "web_search",
+        "effect": "allow"
+      },
+      {
+        "capability": "mcp",
+        "match": [
+          "*"
+        ],
+        "exclude": [
+          "cao-mcp-server/*"
+        ],
+        "effect": "deny"
+      },
+      {
+        "capability": "power",
+        "effect": "deny"
+      },
+      {
+        "capability": "workflow",
+        "effect": "deny"
+      }
+    ]
+  }
+}

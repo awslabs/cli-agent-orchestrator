@@ -127,6 +127,12 @@ class AgentProfile(BaseModel):
     # `model` field still maps to `--model`.
     claudeConfig: Optional[Dict[str, Any]] = None
 
+    # Kiro CLI-only. Per-agent Kiro launch knobs: {"effort": "<level>"} ->
+    # `--effort <level>`, requested from the wrapper's help before launch.
+    # Defined exactly as #1074 defines it, so either change lands unchanged;
+    # the top-level `model` field still maps to `--model`.
+    kiroConfig: Optional[Dict[str, Any]] = None
+
     # Grok-only. Explicitly permits Grok's own subagents, workflows, and /goal
     # engine in this CAO terminal. Omission remains ``None`` so existing profile
     # API responses do not gain a new false-valued field; Grok resolves None as

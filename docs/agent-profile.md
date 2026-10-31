@@ -90,6 +90,9 @@ portable and make profile listings useful.
   "<low|medium|high|xhigh>"}` maps to `--effort <level>` and
   `{"fallback_model": "<model>"}` to `--fallback-model <model>`. The Claude
   analog of `codexConfig`; the top-level `model` field still maps to `--model`.
+- `kiroConfig` (object): Kiro CLI launch knobs; `{"effort": "<level>"}` is the
+  `--effort <level>` a Kiro v3 launch will pass, probed from the wrapper's help
+  first. No launch reads it yet.
 - `hermesProfile` (string): Hermes profile wrapper command.
 - `grokNativeWorkflows` (boolean): explicit Grok Build-native worker/workflow
   opt-in; defaults to `false`.

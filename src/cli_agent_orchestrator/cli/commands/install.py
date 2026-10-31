@@ -81,7 +81,20 @@ def _read_local_profile(agent_source: str) -> Optional[Tuple[str, str]]:
         "Repeatable: --env KEY=VALUE. Example: --env API_TOKEN=my-secret-token."
     ),
 )
-def install(agent_source: str, provider: Optional[str], env_vars: tuple[str, ...]) -> None:
+@click.option(
+    "--engine",
+    type=click.Choice(["v2", "v3", "kas"], case_sensitive=True),
+    default=None,
+    help=(
+        "Kiro engine the installed agent file is for (kiro_cli only; 'kas' is an alias "
+        "of 'v3'). 'v3' writes one universal file: the v2 fields plus v3 tool exclusions "
+        "and permission rules. 'v2' writes a v2-only file. Default: the profile's engine, "
+        "else the installed file's format."
+    ),
+)
+def install(
+    agent_source: str, provider: Optional[str], env_vars: tuple[str, ...], engine: Optional[str]
+) -> None:
     """
     Install an agent by name, file path, or URL.
 
@@ -102,6 +115,7 @@ def install(agent_source: str, provider: Optional[str], env_vars: tuple[str, ...
     Examples:
       cao install developer
       cao install ./service-agent.md --provider claude_code --env API_TOKEN=my-secret-token
+      cao install reviewer --provider kiro_cli --engine v3
     """
     try:
         parsed_env = dict(parse_env_assignment(env_assignment) for env_assignment in env_vars)
@@ -114,9 +128,11 @@ def install(agent_source: str, provider: Optional[str], env_vars: tuple[str, ...
     local_profile = _read_local_profile(agent_source)
     if local_profile is not None:
         stem, content = local_profile
-        result = install_agent(stem, provider, parsed_env or None, profile_content=content)
+        result = install_agent(
+            stem, provider, parsed_env or None, profile_content=content, engine=engine
+        )
     else:
-        result = install_agent(agent_source, provider, parsed_env or None)
+        result = install_agent(agent_source, provider, parsed_env or None, engine=engine)
 
     if not result.success:
         click.echo(f"Error: {result.message}", err=True)

@@ -134,6 +134,7 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.install_service import (
+    installed_kiro_agent_is_universal,
     installed_kiro_tools,
     installed_opencode_permission,
     kiro_install_predates_native_enforcement,
@@ -2020,7 +2021,10 @@ async def _create_terminal_unguarded(
             and allowed_tools is not None
             and "*" not in allowed_tools
         ):
-            from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
+            from cli_agent_orchestrator.utils.tool_mapping import (
+                kiro_agent_tools,
+                kiro_universal_tools,
+            )
 
             installed = installed_kiro_tools(agent_profile)
             if installed is None:
@@ -2041,7 +2045,14 @@ async def _create_terminal_unguarded(
                     child_profile=agent_profile,
                 )
             else:
-                permitted = set(kiro_agent_tools(allowed_tools))
+                # A v3-enabled install's universal file lists v3 tool ids next
+                # to the v2 names, so it is compared with the universal map, or
+                # those ids would read as wider than the row (#1167).
+                permitted = set(
+                    kiro_universal_tools(allowed_tools)
+                    if installed_kiro_agent_is_universal(agent_profile)
+                    else kiro_agent_tools(allowed_tools)
+                )
                 wider = [tool for tool in installed if tool not in permitted]
                 if wider:
                     raise InstalledPolicyExceedsAllowlistError(
