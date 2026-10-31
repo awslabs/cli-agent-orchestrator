@@ -8,6 +8,7 @@ from test.providers.kiro_helper_support import operator_home  # noqa: F401
 import pytest
 
 from cli_agent_orchestrator.providers.kiro_workspace import (
+    HELPER_REMEDY,
     KiroWorkspaceError,
     KiroWorkspaceHomeError,
     check_kiro_helper_workspace,
@@ -225,3 +226,29 @@ class TestHelperWorkspace:
         with pytest.raises(KiroWorkspaceError) as excinfo:
             self._check(repo, operator_home.home)
         assert excinfo.value.code == "kiro_v3_workspace_config:agents"
+
+
+class TestHelperRemedy:
+    """A helper runs on v3 only, so its refusal never suggests engine 'v2' (#1167 Phase 2)."""
+
+    def test_a_helper_refusal_keeps_the_code_and_drops_the_v2_remedy(self, tree):
+        home, repo = tree
+        (repo / ".kiro" / "hooks").mkdir(parents=True)
+        with pytest.raises(KiroWorkspaceError) as excinfo:
+            check_kiro_helper_workspace(str(repo), str(home))
+        assert excinfo.value.code == "kiro_v3_workspace_config:hooks"
+        assert "v2" not in str(excinfo.value)
+        assert str(excinfo.value).endswith(HELPER_REMEDY)
+
+    def test_the_installed_launch_message_is_unchanged(self, tree):
+        """Byte for byte what Phase 1 shipped (#1167): the helper remedy is not used here."""
+        home, repo = tree
+        (repo / ".kiro" / "hooks").mkdir(parents=True)
+        with pytest.raises(KiroWorkspaceError) as excinfo:
+            _check(repo, home)
+        assert str(excinfo.value) == (
+            "kiro_v3_workspace_config:hooks: a .kiro/ in the launch directory or one of its "
+            "parents holds Kiro workspace configuration (hooks), which Kiro v3 would load once "
+            "the workspace is trusted (the server log names the path). Remove it, launch from a "
+            "worktree without it, or retry with engine 'v2'."
+        )

@@ -464,7 +464,9 @@ def build_kiro_command(
     (#1167 Phase 2). It names kiro-cli by the absolute path the server resolved
     and probed, because the pane's login shell can reorder PATH, and in place
     of ``-u KIRO_HOME`` it assigns ``KIRO_HOME=<home>``, which ``env`` applies
-    after any rc file's export. With both unset every installed command, v3 or
+    after any rc file's export. A ``kiro_home`` needs an absolute
+    ``executable``, and an ``executable`` holding ``=`` refuses (``env`` would
+    take it as an assignment). With both unset every installed command, v3 or
     v2, is unchanged.
 
     There is deliberately no ``legacy_ui`` option, because ``--legacy-ui`` can
@@ -487,6 +489,12 @@ def build_kiro_command(
         kiro_home is not None and not os.path.isabs(kiro_home)
     ):
         raise ValueError("a per-launch kiro-cli and KIRO_HOME must be absolute paths")
+    if kiro_home is not None and not os.path.isabs(executable):
+        # A helper's command never resolves kiro-cli through the pane's PATH.
+        raise ValueError("a per-launch KIRO_HOME needs the absolute kiro-cli the probe ran")
+    if "=" in executable:
+        # env would read it as NAME=VALUE and exec the next word instead.
+        raise ValueError("a kiro-cli path holding '=' would be read by env as an assignment")
     if engine == KiroEngine.V3:
         command = ["/usr/bin/env"]
         for name in KIRO_V3_UNSET_ENV:

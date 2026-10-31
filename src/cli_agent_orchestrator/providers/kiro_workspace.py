@@ -34,12 +34,16 @@ CONTENT_DIRS = frozenset({"steering", "specs", "skills"})
 CONTENT_FILES = frozenset({"AGENTS.md"})
 #: Named for the refusal message; any entry outside the content lists refuses anyway.
 CONFIG_ENTRIES = frozenset({"agents", "hooks", "settings", "workflows", "extensions", "powers"})
+#: What an installed v3 launch can do about it.
+INSTALLED_REMEDY = "Remove it, launch from a worktree without it, or retry with engine 'v2'."
+#: An ephemeral helper runs on v3 only (#1167 Phase 2), so v2 is no remedy.
+HELPER_REMEDY = "Remove it, or launch the helper from a worktree without it."
 
 
 class KiroWorkspaceError(KiroV3Refusal):
     """A ``.kiro/`` that trusting the workspace would load; nothing was allocated or typed."""
 
-    def __init__(self, entry: str, path: str) -> None:
+    def __init__(self, entry: str, path: str, remedy: str = INSTALLED_REMEDY) -> None:
         self.code = f"kiro_v3_workspace_config:{entry}"
         self.entry = entry
         self.path = path
@@ -54,8 +58,7 @@ class KiroWorkspaceError(KiroV3Refusal):
         super().__init__(
             f"{self.code}: a .kiro/ in the launch directory or one of its parents holds "
             f"{kind} ({entry}), which Kiro v3 would load once the workspace is trusted "
-            "(the server log names the path). Remove it, launch from a worktree without "
-            "it, or retry with engine 'v2'."
+            f"(the server log names the path). {remedy}"
         )
 
 
@@ -165,7 +168,13 @@ def check_kiro_helper_workspace(cwd: str, home: str) -> None:
     ):
         logger.warning("Kiro helper workspace check refused %s: launched from home", real_cwd)
         raise KiroWorkspaceHomeError(str(real_cwd))
-    check_kiro_workspace(cwd, home=home)
+    try:
+        check_kiro_workspace(cwd, home=home)
+    except KiroWorkspaceHomeError:
+        raise
+    except KiroWorkspaceError as exc:
+        # The same code, with a remedy a helper can use.
+        raise KiroWorkspaceError(exc.entry, exc.path, remedy=HELPER_REMEDY) from None
 
 
 __all__ = [
