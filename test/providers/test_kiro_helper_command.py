@@ -163,14 +163,15 @@ def test_the_probe_runs_the_launch_binary_under_the_given_env():
     assert all(seen is None for _, seen in calls)
 
 
-def test_a_kiro_cli_path_holding_equals_is_refused(tmp_path):
+@pytest.mark.parametrize("kiro_home", [HOME, None], ids=["with_kiro_home", "executable_only"])
+def test_a_kiro_cli_path_holding_equals_is_refused(tmp_path, kiro_home):
     """env reads ``…/dir=x/kiro-cli`` as NAME=VALUE and would exec ``chat`` instead."""
     stand_in = tmp_path / "dir=x" / "kiro-cli"
     stand_in.parent.mkdir()
     stand_in.write_text("#!/bin/sh\necho launched\n")
     stand_in.chmod(0o700)
-    with pytest.raises(ValueError):
-        build_kiro_command(KiroEngine.V3, "a", executable=str(stand_in), kiro_home=HOME)
+    with pytest.raises(ValueError, match="'='"):
+        build_kiro_command(KiroEngine.V3, "a", executable=str(stand_in), kiro_home=kiro_home)
     # What the refusal prevents, on the real env: the stand-in never runs.
     argv = ["/usr/bin/env", f"KIRO_HOME={tmp_path}", str(stand_in), "chat"]
     run = subprocess.run(argv, env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True)
