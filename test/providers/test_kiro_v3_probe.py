@@ -32,7 +32,7 @@ HELP = {
         (FIXTURES / f"kiro_cli_{version.replace('.', '_')}_root_help.txt").read_text(),
         (FIXTURES / f"kiro_cli_{version.replace('.', '_')}_chat_help.txt").read_text(),
     )
-    for version in ("2.35.1", "2.36.0")
+    for version in ("2.35.1", "2.36.0", "2.37.0")
 }
 V3_REQUEST = {"profile", "trust", "trust_workspace"}
 
@@ -55,7 +55,7 @@ def _runner(version="2.35.1", *, chat=None, root=None, version_text=None):
     return run
 
 
-@pytest.mark.parametrize("version", ["2.35.1", "2.36.0"])
+@pytest.mark.parametrize("version", ["2.35.1", "2.36.0", "2.37.0"])
 def test_supported_releases_pass_the_v3_probe(version):
     caps = probe_kiro_capabilities(
         KiroEngine.V3, V3_REQUEST | {"model", "effort"}, runner=_runner(version)
@@ -68,7 +68,7 @@ def test_supported_releases_pass_the_v3_probe(version):
 
 
 @pytest.mark.parametrize(
-    "version_text", ["kiro-cli 2.37.0\n", "kiro-cli 2.35.0\n", "kiro-cli 3.0.0\n"]
+    "version_text", ["kiro-cli 2.38.0\n", "kiro-cli 2.35.0\n", "kiro-cli 3.0.0\n"]
 )
 def test_an_unknown_version_refuses_v3(version_text):
     with pytest.raises(KiroCapabilityError) as excinfo:

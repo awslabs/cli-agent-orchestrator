@@ -104,7 +104,8 @@ def test_a_measured_version_and_a_restricted_policy_are_admitted(opted_out):
     ("caps", "error"),
     [
         (_caps("2.36.0"), KiroV3UnverifiedVersionError),
-        (_caps("2.37.0"), KiroV3UnsupportedVersionError),
+        (_caps("2.37.0"), KiroV3UnverifiedVersionError),
+        (_caps("2.38.0"), KiroV3UnsupportedVersionError),
         (_caps(None), KiroV3UnsupportedVersionError),
         (Mock(), KiroV3UnsupportedVersionError),
     ],
@@ -116,21 +117,22 @@ def test_versions_outside_the_admitted_list_refuse(opted_out, caps, error):
     assert excinfo.value.code == error.code
 
 
-def test_the_opt_in_admits_a_pending_version_with_a_warning_and_a_note(opted_in, caplog):
+@pytest.mark.parametrize("version", ["2.36.0", "2.37.0"])
+def test_the_opt_in_admits_a_pending_version_with_a_warning_and_a_note(opted_in, caplog, version):
     with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.kiro_v3_launch"):
-        admission = require_kiro_v3_admissible(_caps("2.36.0"), GRANT)
+        admission = require_kiro_v3_admissible(_caps(version), GRANT)
     assert admission.schema is KAS_0_66_70
-    assert admission.unverified_version == "2.36.0"
+    assert admission.unverified_version == version
     (note,) = admission.launch_notes
-    assert note.startswith("kiro_v3_unverified_version_admitted: kiro-cli 2.36.0")
+    assert note.startswith(f"kiro_v3_unverified_version_admitted: kiro-cli {version}")
     assert "pending operator verification" in note
     assert "kiro.v3_allow_unverified_versions" in note
     (record,) = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert "2.36.0" in record.getMessage()
+    assert version in record.getMessage()
     assert "kiro.v3_allow_unverified_versions" in record.getMessage()
 
 
-@pytest.mark.parametrize("caps", [_caps("2.37.0"), _caps(None), _caps("v2.36.0"), Mock()])
+@pytest.mark.parametrize("caps", [_caps("2.38.0"), _caps(None), _caps("v2.37.0"), Mock()])
 def test_the_opt_in_never_admits_a_version_outside_the_allow_list(opted_in, caps):
     with pytest.raises(KiroV3UnsupportedVersionError):
         require_kiro_v3_admissible(caps, GRANT)
@@ -140,7 +142,7 @@ def test_the_opt_in_is_read_only_for_a_pending_version():
     with patch(_OPT_IN, side_effect=AssertionError("read for a non-pending version")):
         assert require_kiro_v3_admissible(_caps("2.35.1"), GRANT).schema is KAS_0_66_70
         with pytest.raises(KiroV3UnsupportedVersionError):
-            require_kiro_v3_admissible(_caps("2.37.0"), GRANT)
+            require_kiro_v3_admissible(_caps("2.38.0"), GRANT)
 
 
 @pytest.mark.parametrize("allowed", [None, ["*"]])
@@ -352,6 +354,7 @@ PROFILE = AgentProfile(name="reviewer", description="r", allowedTools=GRANT)
     ("setup", "kwargs", "code"),
     [
         ("file", {"version": "2.36.0"}, "kiro_v3_unverified_version"),
+        ("file", {"version": "2.37.0"}, "kiro_v3_unverified_version"),
         ("file", {"version": "2.40.0"}, "kiro_v3_unsupported_version"),
         ("file", {"allowed": ["*"]}, "kiro_v3_unrestricted"),
         ("file", {"env_vars": {"KIRO_HOME": "/elsewhere"}}, "kiro_v3_home_unsupported"),
@@ -483,11 +486,12 @@ async def test_the_opt_in_widens_no_other_pre_allocation_check(
 
 
 @pytest.mark.asyncio
-async def test_the_opt_in_lets_a_pending_create_reach_allocation(opted_in, agents, repo):
+@pytest.mark.parametrize("version", ["2.36.0", "2.37.0"])
+async def test_the_opt_in_lets_a_pending_create_reach_allocation(opted_in, agents, repo, version):
     (agents / "reviewer.json").write_text(_universal("reviewer"))
     seen: dict = {}
     with pytest.raises(Allocated):
-        await _create(PROFILE, repo, version="2.36.0", seen=seen)
+        await _create(PROFILE, repo, version=version, seen=seen)
     assert seen["session"] is True
 
 

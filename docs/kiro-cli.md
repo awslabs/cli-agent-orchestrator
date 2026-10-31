@@ -109,6 +109,7 @@ The launch command is:
 |---|---|---|
 | 2.35.1 | `@kiro/agent` 0.66.70 | measured |
 | 2.36.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
+| 2.37.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 
 Any other version refuses v3; v2 is not affected. A new kiro-cli release needs a
 CAO update before v3 runs on it.

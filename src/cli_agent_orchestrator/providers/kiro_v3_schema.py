@@ -231,6 +231,23 @@ SUPPORTED_KIRO_CLI_VERSIONS: Mapping[str, KiroCliVersionEntry] = MappingProxyTyp
                 "so it cannot widen the render, tags or rules; pending operator verification"
             ),
         ),
+        # PENDING OPERATOR VERIFICATION. Derived statically, never run, as for
+        # 2.36.0: this release's installed engine tree (@kiro/agent 0.66.70, 693
+        # files) is byte-identical to 2.35.1's, and its `chat --help` is
+        # identical too. The CLI now ships as one binary, and its root --help
+        # changed layout (the probe reads flags from both help screens). It
+        # reuses KAS_0_66_70 unchanged, so it cannot widen anything: the render,
+        # the tags and the rules are 2.35.1's. It only lets the v3 probe accept
+        # 2.37.0; a launch on it needs the operator opt-in (#1167).
+        "2.37.0": KiroCliVersionEntry(
+            cli_version="2.37.0",
+            schema=KAS_0_66_70,
+            pending_operator_verification=True,
+            basis=(
+                "static: engine bundle identical to 2.35.1's; reuses KAS_0_66_70 unchanged, "
+                "so it cannot widen the render, tags or rules; pending operator verification"
+            ),
+        ),
     }
 )
 
