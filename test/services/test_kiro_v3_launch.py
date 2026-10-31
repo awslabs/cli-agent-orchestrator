@@ -236,8 +236,22 @@ def test_a_workspace_with_kiro_settings_refuses(agents, repo):
 # --- no absolute server path in any refusal (#1074's contract; #1167 review) ------
 
 
-@pytest.mark.parametrize("state", ["missing", "directory", "symlink_loop"])
+def _denied_read(target):
+    """``Path.read_bytes`` raising ``PermissionError`` for ``target`` only, as a mode-000
+    file does for a non-root server (patched, so the test passes when run as root)."""
+    real_read_bytes = Path.read_bytes
+
+    def read_bytes(self):
+        if self == target:
+            raise PermissionError(13, "Permission denied", str(target))
+        return real_read_bytes(self)
+
+    return patch.object(Path, "read_bytes", read_bytes)
+
+
+@pytest.mark.parametrize("state", ["missing", "directory", "symlink_loop", "permission"])
 def test_an_absent_or_unreadable_agent_file_is_coded_and_names_no_path(agents, repo, caplog, state):
+    import contextlib
     import os
 
     target = agents / "reviewer.json"
@@ -245,12 +259,20 @@ def test_an_absent_or_unreadable_agent_file_is_coded_and_names_no_path(agents, r
         target.mkdir()
     elif state == "symlink_loop":
         os.symlink(target, target)
-    with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.kiro_v3_launch"):
+    elif state == "permission":
+        target.write_text(_universal("reviewer"))
+    denied = _denied_read(target) if state == "permission" else contextlib.nullcontext()
+    with (
+        denied,
+        caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.kiro_v3_launch"),
+    ):
         with pytest.raises(KiroV3LaunchError) as excinfo:
             _launchable(agents, repo)
     expected = "kiro_v3_not_installed" if state == "missing" else "kiro_v3_agent_unreadable"
     assert excinfo.value.code == expected
     message = str(excinfo.value)
+    if state == "permission":
+        assert "PermissionError" in message
     assert str(agents) not in message and os.path.realpath(agents) not in message
     assert "cao install reviewer --provider kiro_cli --engine v3" in message
     # The server log keeps the path for the operator.

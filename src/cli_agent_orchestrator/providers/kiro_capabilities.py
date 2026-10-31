@@ -112,8 +112,10 @@ class KiroCapabilityError(ValueError):
 class KiroV3LaunchError(KiroV3Refusal):
     """A Kiro v3 launch refused by one of CAO's own checks (#1167); nothing was typed.
 
-    ``code`` is provisional: ``kiro_v3_unrestricted``, ``kiro_v3_home_unsupported``,
-    ``kiro_v3_not_installed`` and ``kiro_v3_bad_cwd`` refuse before allocation;
+    ``code`` is provisional: ``kiro_v3_bad_effort``, ``kiro_v3_unrestricted``,
+    ``kiro_v3_home_unsupported``, ``kiro_v3_not_installed``,
+    ``kiro_v3_agent_unreadable`` and ``kiro_v3_bad_cwd`` refuse before allocation
+    (``kiro_v3_bad_cwd`` also at the workspace re-check after the header);
     ``kiro_v3_trust_dialog`` and ``kiro_v3_startup_dialog`` after kiro-cli started,
     with no key sent to the dialog.
     """

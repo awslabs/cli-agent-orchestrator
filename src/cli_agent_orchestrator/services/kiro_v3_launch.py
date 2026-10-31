@@ -13,8 +13,9 @@ exists, in this order:
    fitting this launch's allowlist; and the workspace's ``.kiro/`` must hold
    nothing v3 would load as configuration.
 
-Each refusal is a ``KiroV3Refusal`` naming its check and the remedy. Nothing
-here runs kiro-cli or writes anything.
+Each refusal is a ``KiroV3Refusal``, or #1074's ``fallback_agent``
+(``KiroAgentIdentityError``) for a fallback agent name, naming its check and
+the remedy. Nothing here runs kiro-cli or writes anything.
 """
 
 from __future__ import annotations

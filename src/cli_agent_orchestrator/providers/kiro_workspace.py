@@ -95,9 +95,6 @@ def check_kiro_workspace(cwd: str, home: Optional[str] = None) -> None:
     ``home`` is the user's home whose ``.kiro`` is skipped (default: this
     process's). Raises ``KiroWorkspaceError``.
     """
-    # The home directory itself is skipped, not whatever its ``.kiro`` resolves
-    # to: a user may keep ``~/.kiro`` as a symlink, while a workspace ``.kiro``
-    # that is a symlink (to ``~/.kiro`` or anywhere) still refuses.
     try:
         _check_workspace_dirs(cwd, home)
     except KiroWorkspaceError as exc:
@@ -106,6 +103,9 @@ def check_kiro_workspace(cwd: str, home: Optional[str] = None) -> None:
 
 
 def _check_workspace_dirs(cwd: str, home: Optional[str]) -> None:
+    # The home directory itself is skipped, not whatever its ``.kiro`` resolves
+    # to: a user may keep ``~/.kiro`` as a symlink, while a workspace ``.kiro``
+    # that is a symlink (to ``~/.kiro`` or anywhere) still refuses.
     user_home = Path(os.path.realpath(home or str(Path.home())))
     for directory in _workspace_dirs(cwd):
         if directory == user_home:
