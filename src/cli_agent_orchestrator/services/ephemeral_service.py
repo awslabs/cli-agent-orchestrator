@@ -53,6 +53,11 @@ from cli_agent_orchestrator.utils.ephemeral_capabilities import (
     ephemeral_providers,
     unsupported_atoms,
 )
+from cli_agent_orchestrator.utils.private_files import (
+    private_directory,
+    remove_owned,
+    write_exclusive,
+)
 
 logger = logging.getLogger(__name__)
 EPHEMERAL_DIR = CAO_HOME_DIR / "ephemeral"
@@ -471,40 +476,11 @@ def render_profile(
     ).encode("utf-8")
 
 
-def _directory(path: Path) -> None:
-    try:
-        path.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    value = path.lstat()
-    if not stat.S_ISDIR(value.st_mode) or stat.S_ISLNK(value.st_mode):
-        raise OSError("ephemeral store directory is unsafe")
-    path.chmod(0o700)
-
-
-def _write_exclusive(path: Path, payload: bytes, owned: list[tuple[Path, int, int]]) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
-    try:
-        info = os.fstat(fd)
-        owned.append((path, info.st_dev, info.st_ino))
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb", closefd=False) as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _cleanup(owned: list[tuple[Path, int, int]]) -> None:
-    for path, device, inode in reversed(owned):
-        try:
-            current = path.lstat()
-            if current.st_dev == device and current.st_ino == inode:
-                path.unlink()
-        except FileNotFoundError:
-            pass
+# The store's create-only writers live in utils/private_files.py, shared with the
+# per-launch Kiro homes. Module-level names, so a test can still patch them here.
+_directory = private_directory
+_write_exclusive = write_exclusive
+_cleanup = remove_owned
 
 
 def _safe_segment(value: Any) -> bool:

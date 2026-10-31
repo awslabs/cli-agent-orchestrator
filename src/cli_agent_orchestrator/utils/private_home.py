@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 # One inspection: a verified owner, ``False`` (not an owner), or ``None`` (uncertain).
 Inspection = psutil.Process | Literal[False] | None
 
+# The terminal id CAO gives every window's environment.
+TERMINAL_ID_ENV = "CAO_TERMINAL_ID"
+
 
 @dataclass(frozen=True)
 class HomeOwners:
@@ -52,8 +55,16 @@ class HomeOwners:
     verified_owner: Optional[Callable[[str, Sequence[str]], bool]] = None
 
 
-def inspect_home_process(pid: int, home: Path, owners: HomeOwners) -> Inspection:
-    """Return a verified, PID-reuse-safe process whose ``owners.env_key`` is ``home``."""
+def inspect_home_process(
+    pid: int, home: Path, owners: HomeOwners, *, terminal_id: Optional[str] = None
+) -> Inspection:
+    """Return a verified, PID-reuse-safe process whose ``owners.env_key`` is ``home``.
+
+    With ``terminal_id``, a process whose ``CAO_TERMINAL_ID`` names another
+    terminal is not an owner even when it carries ``home``: it belongs to that
+    terminal's window. A process without ``CAO_TERMINAL_ID`` is judged by
+    ``home`` alone.
+    """
 
     try:
         proc = psutil.Process(pid)
@@ -105,7 +116,11 @@ def inspect_home_process(pid: int, home: Path, owners: HomeOwners) -> Inspection
     except psutil.Error as exc:
         logger.warning("Cannot inspect process %s before %s cleanup: %s", pid, owners.label, exc)
         return None
-    return proc if environ.get(owners.env_key) == str(home) else False
+    if environ.get(owners.env_key) != str(home):
+        return False
+    if terminal_id is not None and environ.get(TERMINAL_ID_ENV, terminal_id) != terminal_id:
+        return False
+    return proc
 
 
 def pids_using_home(

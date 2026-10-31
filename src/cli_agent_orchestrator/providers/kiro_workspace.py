@@ -59,6 +59,29 @@ class KiroWorkspaceError(KiroV3Refusal):
         )
 
 
+class KiroWorkspaceHomeError(KiroWorkspaceError):
+    """An ephemeral helper launched from ``HOME``, or from under a ``HOME`` that is a git work tree.
+
+    A helper runs from its own ``KIRO_HOME``, so ``~/.kiro/agents`` is no longer
+    Kiro's user agent directory, and Kiro drops a workspace folder only when its
+    ``.kiro/agents`` is that directory. A helper whose workspace folder is
+    ``HOME`` would therefore load the operator's whole ``~/.kiro`` as trusted
+    workspace configuration (#1167 Phase 2). Provisional (#1167).
+    """
+
+    def __init__(self, path: str) -> None:
+        self.code = "kiro_v3_workspace_config:home"
+        self.entry = "home"
+        self.path = path
+        KiroV3Refusal.__init__(
+            self,
+            f"{self.code}: an ephemeral Kiro helper cannot launch from the home folder, or "
+            "from inside a home folder that is itself a git repository: Kiro would load "
+            "your own ~/.kiro there as trusted workspace configuration (the server log "
+            "names the path). Launch it from a repository folder, or use a worktree.",
+        )
+
+
 def _refuse_symlinks(root: str, entry: str) -> None:
     for directory, dirnames, filenames in os.walk(root, followlinks=False):
         for name in dirnames + filenames:
@@ -124,4 +147,30 @@ def _check_workspace_dirs(cwd: str, home: Optional[str]) -> None:
         _scan(str(kiro_dir))
 
 
-__all__ = ["KiroWorkspaceError", "check_kiro_workspace"]
+def check_kiro_helper_workspace(cwd: str, home: str) -> None:
+    """The workspace check for an ephemeral helper: ``HOME``'s own rule, then D11's.
+
+    Refuses ``kiro_v3_workspace_config:home`` when ``cwd`` is ``home`` (by
+    realpath), or lies inside it while ``home`` holds a ``.git`` entry of any
+    type (v3's workspace folder is the launch directory in every capture; a
+    git-root reading could only reach ``home`` that way). Otherwise ``home``'s
+    own ``.kiro`` is skipped as an ancestor, as for installed agents, and every
+    other ``.kiro/`` is checked as ``check_kiro_workspace`` does. Raises a
+    ``KiroV3Refusal``.
+    """
+    real_cwd = Path(os.path.realpath(cwd))
+    real_home = Path(os.path.realpath(home))
+    if real_cwd == real_home or (
+        real_home in real_cwd.parents and os.path.lexists(real_home / ".git")
+    ):
+        logger.warning("Kiro helper workspace check refused %s: launched from home", real_cwd)
+        raise KiroWorkspaceHomeError(str(real_cwd))
+    check_kiro_workspace(cwd, home=home)
+
+
+__all__ = [
+    "KiroWorkspaceError",
+    "KiroWorkspaceHomeError",
+    "check_kiro_helper_workspace",
+    "check_kiro_workspace",
+]
