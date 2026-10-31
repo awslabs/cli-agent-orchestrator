@@ -100,21 +100,21 @@ class KiroCapabilityError(ValueError):
         self.version = version
 
 
-class KiroPhase0KASError(ValueError):
-    """Raised after KAS capability probing, before runtime allocation."""
+class KiroV3UnavailableError(ValueError):
+    """Refuses every Kiro v3 launch, restore and reuse until CAO can run v3 (#1167).
 
-    def __init__(self, profile_has_v2_policy: bool) -> None:
-        profile_note = (
-            " The selected profile contains v2 allowedTools/toolsSettings that "
-            "cannot be translated to Cedar in Phase 0."
-            if profile_has_v2_policy
-            else ""
-        )
+    Raised at each point that used to refuse ``kas``: on creation after the
+    capability probe and before any window, row, FIFO or provider; on restore
+    before a provider is built; on reuse and input before anything is typed.
+    """
+
+    def __init__(self) -> None:
         super().__init__(
-            "Kiro engine 'kas' is not available in Phase 0: KAS profiles and Cedar "
-            "policy translation are not implemented. Retry with engine 'v2'." + profile_note
+            "Kiro engine 'v3' (alias 'kas') is not available yet: CAO cannot yet "
+            "launch Kiro agents on the v3 engine with verified tool limits. "
+            "Retry with engine 'v2'."
         )
-        self.engine = KiroEngine.KAS
+        self.engine = KiroEngine.V3
 
 
 @dataclass(frozen=True)
@@ -354,7 +354,7 @@ def probe_kiro_capabilities(
     for flag in required:
         if flag not in flags:
             detail = f" Detected wrapper version: {version}." if version else ""
-            retry = " Retry with engine 'v2'." if engine == KiroEngine.KAS else ""
+            retry = " Retry with engine 'v2'." if engine == KiroEngine.V3 else ""
             raise KiroCapabilityError(
                 "unsupported_capability",
                 engine,
@@ -415,7 +415,7 @@ def build_kiro_command(
     auto-answered after launch instead; see
     ``KiroCliProvider._wait_ready_accepting_trust_dialog``.
     """
-    if engine == KiroEngine.KAS:
+    if engine == KiroEngine.V3:
         command = ["kiro-cli", "--v3", "chat"]
     else:
         command = ["kiro-cli", "chat", "--agent-engine", KiroEngine.V2.value]

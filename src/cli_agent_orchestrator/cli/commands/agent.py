@@ -145,7 +145,11 @@ def agent():
     default=None,
     help="Working directory for the worker (defaults to the caller's cwd).",
 )
-@click.option("--engine", default=None, help="Explicit Kiro engine for the worker (v2 or kas).")
+@click.option(
+    "--engine",
+    default=None,
+    help="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3).",
+)
 @click.option(
     "--model", default=None, help="Model override for the worker (not honored by every provider)."
 )
@@ -218,7 +222,11 @@ def assign_cmd(
     default=None,
     help="Working directory for the worker (defaults to the caller's cwd).",
 )
-@click.option("--engine", default=None, help="Explicit Kiro engine for the worker (v2 or kas).")
+@click.option(
+    "--engine",
+    default=None,
+    help="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3).",
+)
 @click.option(
     "--model", default=None, help="Model override for the worker (not honored by every provider)."
 )

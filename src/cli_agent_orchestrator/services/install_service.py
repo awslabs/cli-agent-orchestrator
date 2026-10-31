@@ -2012,11 +2012,10 @@ def install_agent(
         )
 
         if provider == ProviderType.KIRO_CLI.value:
-            if profile.engine == KiroEngine.KAS:
+            if profile.engine == KiroEngine.V3:
                 raise ValueError(
-                    "Kiro KAS profiles cannot be installed in Phase 0: CAO cannot "
-                    "render KAS profiles or translate allowedTools/toolsSettings to Cedar. "
-                    "Set engine: v2 or wait for a later migration phase."
+                    "Kiro engine 'v3' profiles cannot be installed yet: CAO cannot yet "
+                    "render agent files for the Kiro v3 engine. Set engine: v2."
                 )
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
