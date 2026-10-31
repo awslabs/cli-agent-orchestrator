@@ -302,9 +302,9 @@ admin scope. The JSON body is the flat eight-field spec: `spec_version` (1), `pu
 `brief`, `description`, `provider`, `tools`, `model_tier`, and `effort`. Optional fields
 can be omitted or null. Extra fields are refused. The MCP tool forwards this same body.
 
-Providers are Claude Code by default, or Codex when explicitly enabled by the operator.
-`provider: "auto"` lets a decider choose between equivalent providers at launch (see
-[Provider `auto`](#provider-auto)).
+Providers are Claude Code by default, or Codex or Kiro when explicitly enabled by the
+operator. `provider: "auto"` lets a decider choose between equivalent providers at launch
+(see [Provider `auto`](#provider-auto)).
 Tools are restricted to `fs_read`, `fs_list`, `fs_write`, `execute_bash`, and `web_fetch`,
 within the creator's effective allowlist. `@cao-mcp-server` is required in the creator's
 list (or `*`) and appended to every child. With tools omitted, creation requests `fs_read`
@@ -318,7 +318,7 @@ its provider:
 | --- | --- | --- |
 | `claude_code` | `hard` | Claude Code refuses native tools outside the recorded list. |
 | `codex` | `advisory` | Codex is told the list but not prevented: it runs `--yolo` with a shell, and the MCP servers in the user's Codex config load. |
-| `kiro_cli` | — | Not offered: create refuses with `provider_unsupported`. |
+| `kiro_cli` | `hard` | On the v3 engine, from a per-launch agent file: Kiro exposes only the tools the file selects and does not exclude, the file denies every capability outside the grant, and CAO checks `/tools` and `/mcp list` before each task. See [Kiro helpers](#kiro-helpers). |
 
 `sandboxed` is reserved for a planned contained Codex launch (#1074), so treat a value
 you don't recognize as `advisory`. A provider may also be unable to run a tool atom
@@ -412,7 +412,66 @@ Claude Code enforces the recorded native-tool list through `--disallowedTools`. 
 contains the creator preamble, the honesty fence, and the brief; its generated MCP config
 contains only the CAO server. Codex is an operator opt-in: its tools are advisory, it runs
 `--yolo`, and its temporary developer-instructions file is removed on provider cleanup.
-Neither provider makes the creator brief a privilege boundary.
+No provider makes the creator brief a privilege boundary.
+
+### Kiro helpers
+
+Kiro is an operator opt-in: add `kiro_cli` to `ephemeral.allowed_providers`. When
+`max_tier` is set, map every tier for `kiro_cli` in `model_tiers` before allowing it.
+A Kiro helper runs on Kiro's **v3 engine only**, on a kiro-cli version CAO supports for
+v3 (see [Kiro v3](kiro-cli.md#kiro-v3-preview)). Each launch gets its own CAO-owned
+`KIRO_HOME`, `$CAO_HOME_DIR/ephemeral/kiro/<terminal_id>/`, never the operator's
+`~/.kiro` or the shared `KIRO_AGENTS_DIR`:
+
+- CAO creates it after the bind and before the terminal's window exists. It holds a
+  settings seed, a tool-less default agent `cao-null`, the agent file
+  `agents/<name>.json`, and two placeholders: an empty `powers/` folder no one can list,
+  and a `{}` `secrets.json`. The agent file is the same universal file
+  `cao install --engine v3` writes, rendered for the helper's tools plus
+  `@cao-mcp-server`, with `includeMcpJson: false` and only the `cao-mcp-server` MCP
+  server. Both agent files pass CAO's v3 validator from disk, and the files are sealed
+  read-only before kiro-cli starts.
+- **Kiro's legacy copies.** On a v3 session with another `KIRO_HOME`, Kiro copies
+  `~/.kiro/powers` (with its MCP servers) and `~/.kiro/secrets.json` (its secret store)
+  into that home, then writes a marker in `~/.kiro`. CAO never creates, opens, lists or
+  changes anything under `~/.kiro`; it only checks whether those two sources and their
+  markers exist. The unlistable `powers/` placeholder makes Kiro skip the powers copy
+  without writing its marker. A secret store Kiro has not marked as migrated can't be
+  stopped that way, so the helper is refused instead. After kiro-cli starts, a changed
+  placeholder or a marker that appeared refuses the launch before any task.
+- kiro-cli is resolved to an absolute path on the server's `PATH`. The capability probe
+  (help and version only, under a CAO-owned probe home) and the typed command run that
+  same binary:
+  `/usr/bin/env -u ASBX_KIRO_MANDATORY_MCPS -u KIRO_AGENT_CONFIG_DIR -u KIRO_AGENT_ENGINE KIRO_HOME=<home> <kiro-cli> chat --agent-engine v3 --trust-workspace --trust-all-tools … --agent <name>`.
+  The window's environment carries `KIRO_HOME` too, and later windows don't inherit it.
+  When the launch opens a new tmux session, tmux would make the first window's
+  environment the session's. So as soon as the session exists, CAO sets the session's
+  `KIRO_HOME` back to the server's own, the value it gives every other session, or
+  removes it when the server has none. The first window keeps its own copy, and later
+  windows get the server's `KIRO_HOME`, never the helper's. If CAO can't set it back,
+  the session is torn down and the launch fails. On herdr, `--env` reaches only the pane
+  it launches (measured on herdr 0.9.3).
+- The workspace check is Phase 1's: no `.kiro/` configuration in the launch directory or
+  its parents. A helper is also refused in your home folder itself, or under a home
+  folder that is a git repository, where Kiro would load your own `~/.kiro` as workspace
+  configuration.
+- The model tier becomes `--model`. Effort is written as `kiroConfig.effort` and becomes
+  `--effort`; the probe refuses a wrapper that does not declare `--effort`.
+
+Before any task is typed, CAO checks that the header names the agent, that the home and
+your `~/.kiro` markers are unchanged, and that `/tools` and `/mcp list` show only what
+the per-launch file grants and `cao-mcp-server`. Every refusal and its fix is in the
+[Kiro helper symptom table](kiro-cli.md#when-a-helper-is-refused). Refusals raised
+before the window are `ephemeral_policy` errors; the later ones are 400s with a message,
+and a deferred failure records the `rule`.
+
+On release, after the window is killed, CAO stops every process whose `KIRO_HOME` is the
+home (SIGTERM, then SIGKILL). A process whose `CAO_TERMINAL_ID` names another terminal is
+never stopped, even with that `KIRO_HOME`. CAO then records whether the agent file, the
+seeds, the secret-store placeholder or your `~/.kiro` markers changed, and removes the
+whole home, Kiro's session transcripts included. If a process cannot be inspected or does
+not exit, the terminal row and the home stay, and a later delete or the sweep retries. A
+gc row is kept while its home exists.
 
 The HTTP contract remains available for clients implementing their own launch path:
 
@@ -493,14 +552,17 @@ profile, including the inherited skill catalog; that launch consumes the name. O
 a claimed launch re-renders the pending profile with `skills: []`.
 
 Policy errors carry `{kind: "ephemeral_policy", rule, message}` and never echo creator text.
-Archives record claimed, finalized, decided, bound and released events, plus refusal counts. Archive updates
+Archives record claimed, finalized, decided, bound and released events, plus refusal counts. A Kiro
+helper adds `kiro_home_prepared` (the home, the kiro-cli path and version, the schema, the files'
+hashes, the placeholder's identity and what `~/.kiro` held), `kiro_attested` (the `/tools` tags, the
+MCP tool count and the header's model) and `kiro_home_removed` (whether anything changed). Archive updates
 are best-effort. Released rows keep their terminal identity, so a surviving terminal remains
 marked ephemeral and the existing delegation denial stays effective.
 
 ## Honesty statement
 
 > An ephemeral child's CAO-recorded allowlist is a subset of its creator's effective allowlist at creation time. Its generated profile declares only the CAO MCP server, no hooks or native agents, and `skills: []` so no skill catalog is inherited; named skills remain callable through `load_skill`; installed agent plugins' MCP servers are not added at launch; and CAO will not launch it with a wider list. An ephemeral child cannot create ephemerals. It cannot delegate or start or cancel workflows through CAO's MCP tools unless the operator sets `child_may_delegate`. That is all this guarantees. It does not guarantee:
-> 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro isn't supported yet. The create response's `enforcement` field reports this class: `hard` or `advisory`. A `provider: "auto"` child may run on any provider in its fallback's `ephemeral.provider_route` set, and while it does, the response, the registry row and the live profile still name the fallback.
+> 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. On Kiro, an operator opt-in, the child runs on the v3 engine from a per-launch agent file in a CAO-owned `KIRO_HOME`: Kiro exposes only the tools that file selects and does not exclude, and the file denies every capability outside the grant. Before each task, CAO checks that the header names the agent, and that `/tools` and `/mcp list` show only what the file grants and `cao-mcp-server`; it refuses the launch when it cannot read them. The child runs its tools without approval prompts (`--trust-all-tools`). A Kiro child has no OS sandbox: with `fs_read` it reads any file you can; with `execute_bash` it has an unbounded shell and subagents; with `fs_write` it can write anywhere you can. CAO makes its agent file read-only and records whether it changed. Workspace steering and `AGENTS.md` in the working directory load. CAO does not certify Kiro Crew's own state under `~/.kiro/crew/`. Kiro helpers are claimed only on kiro-cli versions that passed the operator checklist. The create response's `enforcement` field reports this class: `hard` or `advisory`. A `provider: "auto"` child may run on any provider in its fallback's `ephemeral.provider_route` set, and while it does, the response, the registry row and the live profile still name the fallback.
 > 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. MCP `send_message`, `answer_user_prompt` and `delete_terminal` bind targets to the caller's permitted terminal tree (#912). State-changing memory and metadata tools and workflow authoring (`workflow_create`/`workflow_update`; a changed spec needs a new plan approval, on by default) still use the coarse server grant (#671). With `child_may_delegate=true`, workflow cancellation also uses that grant, without run ownership binding.
 > 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself, edit `settings.json`, or read `ephemeral/live/`.
 > 4. **Per-tool MCP enforcement for installed profiles** (#671). Installed profiles ARE now bounded by their creator's recorded delegation ceiling through the same comparison (see [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance)); the remaining gap is the server-level `@cao-mcp-server` grant above.

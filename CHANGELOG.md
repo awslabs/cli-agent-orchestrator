@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro ephemeral helpers on v3** (#1167 Phase 2, #1074 phase 5; preview, pending the operator
+  checklist). `kiro_cli` can now be listed in `ephemeral.allowed_providers` (an operator opt-in; the
+  default stays `claude_code`), and a create reports `enforcement: "hard"`. Helpers run on the v3
+  engine only (`engine=v2` refuses), each from its own CAO-owned `KIRO_HOME` under
+  `$CAO_HOME_DIR/ephemeral/kiro/<terminal_id>/`, created after the bind and before the window. The
+  agent file is the same universal file `cao install --engine v3` writes, for the helper's tools plus
+  `@cao-mcp-server`, with a tool-less universal `cao-null` default; both pass CAO's v3 validator and
+  are sealed read-only. CAO never changes `~/.kiro`: it only checks whether Kiro's two legacy-copy
+  sources and their markers exist. An unlistable empty `powers/` placeholder stops Kiro's powers copy,
+  and a helper is refused when Kiro would copy an unmigrated secret store. After the header, a changed
+  placeholder or a new marker refuses before any task, and so does a workspace check that now also
+  refuses the home folder itself. `/tools` and `/mcp list` are held to the helper's own file. The
+  command assigns `KIRO_HOME` and runs one absolute kiro-cli, the one the probe ran. Release stops
+  every process whose `KIRO_HOME` is the home, records what changed, and removes the home, retrying
+  through the sweep when a process cannot be proven gone. Installed Kiro launches are unchanged.
+
 - **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
   API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one
   universal agent file with v3 tool exclusions and deny rules. A v3 launch is refused before

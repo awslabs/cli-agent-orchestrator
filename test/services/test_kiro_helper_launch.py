@@ -964,3 +964,34 @@ async def test_after_a_restart_delete_still_removes_the_home(real_provider):
     assert not os.path.lexists(home())
     removed = kiro_events(kiro)["kiro_home_removed"]
     assert removed["agent_modified"] is False and removed["global_home_changed"] is True
+
+
+# --- docs -------------------------------------------------------------------------
+
+
+def test_every_helper_refusal_code_is_in_the_kiro_docs():
+    """G26: each rule the helper path can raise has a row in the symptom table."""
+    import re
+
+    root = Path(__file__).parents[2]
+    sources = [
+        root / "src/cli_agent_orchestrator/providers/kiro_launch_home.py",
+        root / "src/cli_agent_orchestrator/providers/kiro_workspace.py",
+        root / "src/cli_agent_orchestrator/services/terminal_service.py",
+    ]
+    codes = set()
+    for source in sources:
+        text = source.read_text(encoding="utf-8")
+        codes |= set(re.findall(r'KiroLaunchRefusal\(\s*"([a-z0-9_:]+)"', text))
+        codes |= set(re.findall(r'self\.code = "(kiro_[a-z0-9_:]+)"', text))
+    assert {"kiro_v3_global_home:secrets", "kiro_ephemeral_engine:v2"} <= codes
+    docs = (root / "docs/kiro-cli.md").read_text(encoding="utf-8")
+    table = docs[docs.index("#### When a helper is refused") :]
+    table = table[: table.index("#### FAQ")]
+    rows = "\n".join(line for line in table.splitlines() if line.startswith("| `"))
+    missing = sorted(
+        code
+        for code in codes
+        if f"`{code}`" not in rows and f"`:{code.split(':', 1)[-1]}`" not in rows
+    )
+    assert not missing, f"no symptom-table row for {missing}"
