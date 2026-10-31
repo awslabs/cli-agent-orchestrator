@@ -79,6 +79,11 @@ _HERDR_ALLOWED_FLAGS = frozenset(
 )
 
 
+def herdr_arg_is_safe(value: str) -> bool:
+    """True when ``value`` passes the herdr argument sanitizer (``_SAFE_ARG_RE``)."""
+    return _SAFE_ARG_RE.fullmatch(value) is not None
+
+
 def _sanitize_herdr_args(args: List[str]) -> List[str]:
     """Validate herdr CLI arguments and return a shallow copy.
 

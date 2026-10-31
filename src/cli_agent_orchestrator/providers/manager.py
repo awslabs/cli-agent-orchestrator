@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Type
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers import kiro_launch_home
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
@@ -20,6 +21,7 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     UnsupportedKimiError,
 )
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_launch_home import KiroLaunch
 from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.omp import OmpProvider
@@ -72,12 +74,16 @@ class ProviderManager:
         resume_session_id: Optional[str] = None,
         provider_variant: Optional[str] = None,
         session_id: Optional[str] = None,
+        kiro_launch: Optional[KiroLaunch] = None,
     ) -> BaseProvider:
         """Create and store provider instance.
 
         ``session_id`` (issue #1082): a CAO-generated id for a FRESH claude_code
         launch, distinct from ``resume_session_id`` (which resumes a PRIOR one).
         Supported only by claude_code, same restriction as ``resume_session_id``.
+
+        ``kiro_launch`` is an ephemeral Kiro helper's per-launch home and
+        kiro-cli (#1167 Phase 2); only ``kiro_cli`` accepts it.
         """
         try:
             provider: BaseProvider
@@ -91,6 +97,8 @@ class ProviderManager:
                     "session_id is only supported by the claude_code provider "
                     f"(got provider '{provider_type}')"
                 )
+            if kiro_launch is not None and provider_type != ProviderType.KIRO_CLI.value:
+                raise ValueError("a per-launch Kiro home is only for the kiro_cli provider")
             if provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
@@ -103,6 +111,7 @@ class ProviderManager:
                     allowed_tools,
                     engine=resolved_engine,
                     model=model,
+                    launch=kiro_launch,
                 )
             elif provider_type == ProviderType.CLAUDE_CODE.value:
                 provider = ClaudeCodeProvider(
@@ -333,6 +342,14 @@ class ProviderManager:
             # home containing generated MCP config, so instantiate the small
             # cleanup-only adapter rather than leaking that directory.
             metadata = get_terminal_metadata(terminal_id)
+            if metadata is None or metadata.get("provider") == ProviderType.KIRO_CLI.value:
+                # An ephemeral Kiro helper's per-launch home (#1167 Phase 2). A
+                # failed create rolls back through here before (or without) its
+                # provider and row; the home still has its deterministic path.
+                # Installed Kiro rows have none.
+                if not self._cleanup_kiro_home(terminal_id):
+                    logger.warning("Cleanup deferred for Kiro home of terminal: %s", terminal_id)
+                    return False
             if metadata and metadata.get("provider") == ProviderType.GROK_CLI.value:
                 restored_grok_provider = GrokCliProvider(
                     terminal_id,
@@ -400,6 +417,22 @@ class ProviderManager:
         except Exception as e:
             logger.error(f"Failed to cleanup provider for terminal {terminal_id}: {e}")
             return False
+
+    @staticmethod
+    def _cleanup_kiro_home(terminal_id: str) -> bool:
+        """Remove a per-launch Kiro home with no live provider; False to retry later.
+
+        Only a home this process prepared is removed: an entry at the path that
+        CAO has no record of is left alone.
+        """
+        if not kiro_launch_home.valid_terminal_id(terminal_id):
+            return True
+        prepared = kiro_launch_home.prepared_launch_home(terminal_id)
+        if prepared is None:
+            return True
+        return kiro_launch_home.remove_kiro_home(
+            terminal_id, prepared.hashes(), global_home=prepared.global_home
+        )
 
     def list_providers(self) -> Dict[str, str]:
         """List all active providers (for debugging)."""

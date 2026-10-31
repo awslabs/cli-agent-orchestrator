@@ -22,6 +22,7 @@ import logging
 import re
 import shlex
 import time
+from dataclasses import dataclass
 from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -47,11 +48,23 @@ from cli_agent_orchestrator.providers.kiro_identity import (
     KiroAgentIdentityError,
     fallback_notice,
     header_agents,
+    header_model,
     identity_readable,
     in_plan_mode,
     require_header_identity,
 )
-from cli_agent_orchestrator.providers.kiro_workspace import check_kiro_workspace
+from cli_agent_orchestrator.providers.kiro_launch_home import (
+    CAO_MCP_SERVER,
+    KiroLaunch,
+    check_global_home_unchanged,
+    launch_agent_grant,
+    verify_launch_home,
+)
+from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
+from cli_agent_orchestrator.providers.kiro_workspace import (
+    check_kiro_helper_workspace,
+    check_kiro_workspace,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.delegation import tools_exceeding
@@ -324,6 +337,18 @@ V3_ATTEST_READS = 6
 V3_ATTEST_READ_INTERVAL_S = 0.5
 V3_MCP_LOADING_READS = 40
 
+
+@dataclass(frozen=True)
+class KiroAttestation:
+    """What a v3 pane's ``/tools`` and ``/mcp list`` showed once they passed (#1167)."""
+
+    tags: tuple[str, ...]
+    #: The tool count of each MCP server ``/mcp list`` showed running.
+    mcp_tools: tuple[tuple[str, int], ...]
+    #: The header's model column, audited and never enforced.
+    model: Optional[str]
+
+
 # =============================================================================
 # Error Detection
 # =============================================================================
@@ -365,6 +390,7 @@ class KiroCliProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         engine: Optional[KiroEngine] = None,
         model: Optional[str] = None,
+        launch: Optional[KiroLaunch] = None,
     ):
         """Initialize Kiro CLI provider with terminal context.
 
@@ -378,6 +404,9 @@ class KiroCliProvider(BaseProvider):
             model: Explicit per-call override for profile.model (see
                 _get_profile_model), e.g. a handoff/assign caller pinning a
                 specific model for one worker without a dedicated profile.
+            launch: An ephemeral helper's per-launch home and kiro-cli, prepared
+                by terminal creation before the window existed (#1167 Phase 2).
+                None for an installed agent. A helper runs on v3 only.
         """
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
@@ -393,6 +422,11 @@ class KiroCliProvider(BaseProvider):
         # terminal_service records it on the row before any task is typed.
         # initialize() returning is not evidence on its own.
         self.identity_verified = False
+        self._launch = launch
+        if launch is not None and self._engine != KiroEngine.V3:
+            raise ValueError("an ephemeral Kiro helper runs on the v3 engine only")
+        # What the v3 attestation read, once it passed; audited for a helper.
+        self.attestation: Optional[KiroAttestation] = None
 
         # Build dynamic prompt pattern based on agent profile
         # This pattern matches various Kiro prompt formats after ANSI stripping:
@@ -469,6 +503,9 @@ class KiroCliProvider(BaseProvider):
         """
         if self._model:
             return self._model
+        if self._launch is not None:
+            # A helper's name is reserved: load_agent_profile cannot read it.
+            return self._launch.model
         try:
             profile = load_agent_profile(self._agent_profile)
         except (FileNotFoundError, RuntimeError) as exc:
@@ -485,7 +522,10 @@ class KiroCliProvider(BaseProvider):
 
         Best-effort like ``_get_profile_model``: a profile that cannot be read
         sets no effort. Creation already probed the flag from the same profile.
+        A helper's effort comes from its launch object.
         """
+        if self._launch is not None:
+            return self._launch.effort
         try:
             return kiro_effort(load_agent_profile(self._agent_profile))
         except Exception as exc:  # noqa: BLE001 - a missing profile sets no effort
@@ -537,6 +577,11 @@ class KiroCliProvider(BaseProvider):
         # tools, so the agent could not assign/handoff/report_outcome at all.
         model = self._get_profile_model()
 
+        if self._launch is not None:
+            # Stage C (#1167 Phase 2): the sealed home must still be exactly what
+            # creation prepared before kiro-cli reads it.
+            await asyncio.to_thread(verify_launch_home, self._launch.home, sealed=True)
+
         # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
         # blocks MCP tool calls that spawn subagents (e.g. cao-mcp-server's
         # assign/handoff). Current CAO policy always bypasses Kiro's
@@ -551,6 +596,7 @@ class KiroCliProvider(BaseProvider):
             model=model,
             yolo=True,
             effort=self._get_profile_effort() if v3 else None,
+            **self._launch_command_options(),
         )
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
@@ -592,8 +638,11 @@ class KiroCliProvider(BaseProvider):
             # the identity back until the workspace is re-checked and the pane's
             # own /tools and /mcp panels match the installed grant.
             self.identity_verified = False
-            await self._recheck_v3_workspace()
-            await self._attest_v3_tools_and_mcp()
+            if self._launch is not None:
+                await self._recheck_helper_after_header(self._launch)
+            else:
+                await self._recheck_v3_workspace()
+            self.attestation = await self._attest_v3_tools_and_mcp()
             self.identity_verified = True
 
         self._initialized = True
@@ -846,6 +895,43 @@ class KiroCliProvider(BaseProvider):
             )
         await asyncio.to_thread(check_kiro_workspace, cwd)
 
+    def _launch_command_options(self) -> dict[str, str]:
+        """The absolute kiro-cli and the per-launch KIRO_HOME, for a helper only."""
+        if self._launch is None:
+            return {}
+        return {
+            "executable": self._launch.kiro_cli.path,
+            "kiro_home": str(self._launch.home.home),
+        }
+
+    async def _recheck_helper_after_header(self, launch: KiroLaunch) -> None:
+        """Stage D2 for a helper (#1167 Phase 2); raises before any task is typed.
+
+        The workspace check runs again from the pane's own cwd, ``HOME``'s rule
+        included; then the check after Kiro's legacy copies, which have run by
+        now (a changed placeholder or a new ``~/.kiro`` marker refuses
+        ``kiro_v3_global_home:changed``); then the home must still be exactly
+        what creation sealed.
+        """
+        try:
+            cwd = await asyncio.to_thread(
+                get_backend().get_pane_working_directory, self.session_name, self.window_name
+            )
+            if not cwd:
+                raise KiroV3LaunchError(
+                    "kiro_v3_bad_cwd",
+                    "the pane's working directory could not be read for the re-check",
+                )
+            user_home = launch.home.global_home.user_home
+            await asyncio.to_thread(check_kiro_helper_workspace, cwd, user_home)
+            await asyncio.to_thread(check_global_home_unchanged, launch.home)
+            await asyncio.to_thread(verify_launch_home, launch.home, sealed=True)
+        except KiroV3Refusal as exc:
+            logger.error(
+                "kiro_cli: terminal %s refused before any input: %s", self.terminal_id, exc
+            )
+            raise
+
     async def _open_v3_panel(self, command: str) -> str:
         """Type a slash command, confirm its palette, press Enter, and return the screen.
 
@@ -870,22 +956,21 @@ class KiroCliProvider(BaseProvider):
         backend.send_special_key(self.session_name, self.window_name, "Enter")
         return await self._read_screen()
 
-    async def _attest_v3_tools_and_mcp(self) -> None:
-        """Refuse unless ``/mcp list`` and ``/tools`` match the installed grant (#1167).
+    async def _attestation_grant(self) -> tuple[list[str], list[str], list[str]]:
+        """The grant and servers the panels are held to, and the launch's own allowlist.
 
-        Runs after the header check and before the identity is recorded, so on
-        a refusal no task has been typed; the creation path then reclaims the
-        window. Slash commands cost no credits.
-
-        The file is read again here, after Kiro loaded it. Its grant must still
-        fit this launch's and name every server it configures, so a file
-        rewritten after the pre-allocation check can widen neither what the
-        panels are compared with nor which servers they may show.
-
-        ``/mcp`` is read first, again until no server is still loading, and
-        only then ``/tools``: a loading server has no rows on ``/tools`` yet, so
-        a per-tool grant read before then would be checked against nothing.
+        An installed agent's come from its installed universal file. A
+        helper's come from its per-launch file, read again and hash-checked,
+        never from the installed store; its launch allowlist is the grant CAO
+        rendered, and its only server is cao-mcp-server (#1167 Phase 2).
         """
+        if self._launch is not None:
+            grant, servers = await asyncio.to_thread(launch_agent_grant, self._launch.home)
+            if servers != [CAO_MCP_SERVER]:
+                raise KiroAttestationError(
+                    "kiro_v3_mcp_not_ready", f"the helper's file configures {servers}"
+                )
+            return grant, servers, list(self._launch.grant)
         from cli_agent_orchestrator.services.install_service import installed_kiro_v3_grant
 
         launch = self._allowed_tools
@@ -898,7 +983,26 @@ class KiroCliProvider(BaseProvider):
             raise KiroAttestationError(
                 "kiro_v3_tools_mismatch", "the installed agent file is not a v3 universal file"
             )
-        grant, servers = installed
+        return installed[0], installed[1], list(launch)
+
+    async def _attest_v3_tools_and_mcp(self) -> KiroAttestation:
+        """Refuse unless ``/mcp list`` and ``/tools`` match the agent file's grant (#1167).
+
+        Runs after the header check and before the identity is recorded, so on
+        a refusal no task has been typed; the creation path then reclaims the
+        window. Slash commands cost no credits.
+
+        The file is read again here, after Kiro loaded it. Its grant must still
+        fit this launch's and name every server it configures, so a file
+        rewritten after the pre-allocation check can widen neither what the
+        panels are compared with nor which servers they may show. Returns what
+        the panels showed, for a helper's audit.
+
+        ``/mcp`` is read first, again until no server is still loading, and
+        only then ``/tools``: a loading server has no rows on ``/tools`` yet, so
+        a per-tool grant read before then would be checked against nothing.
+        """
+        grant, servers, launch = await self._attestation_grant()
         exceeding = tools_exceeding(grant, launch)
         if exceeding:
             raise KiroAttestationError(
@@ -912,12 +1016,15 @@ class KiroCliProvider(BaseProvider):
                 f"the installed file configures ungranted servers {ungranted}",
             )
         backend = get_backend()
+        model = header_model(await self._read_screen(), self._agent_profile)
 
         screen = await self._open_v3_panel("/mcp")
+        rows = {}
         try:
             for attempt in range(V3_MCP_LOADING_READS):
                 try:
-                    if not check_mcp_panel(parse_mcp_panel(screen), servers):
+                    rows = parse_mcp_panel(screen)
+                    if not check_mcp_panel(rows, servers):
                         break
                 except KiroAttestationError:
                     if attempt == V3_MCP_LOADING_READS - 1:
@@ -950,6 +1057,11 @@ class KiroCliProvider(BaseProvider):
             timeout=float(get_server_settings()["provider_init_timeout"]),
         ):
             raise KiroAttestationError("kiro_v3_mcp_not_ready", "the prompt did not return")
+        return KiroAttestation(
+            tags=tuple(sorted(panel.tags)),
+            mcp_tools=tuple(sorted((name, row.tools) for name, row in rows.items())),
+            model=model,
+        )
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.

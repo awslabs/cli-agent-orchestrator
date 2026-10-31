@@ -1729,6 +1729,15 @@ def _report_refusal(
         _audit_update(row, refusal=error.rule)
 
 
+def report_launch_refusal(name: str, caller_id: Optional[str], error: EphemeralPolicyError) -> None:
+    """Log and audit a refusal the launch path raised itself (#1167 Phase 2); never raises."""
+    try:
+        row = database.get_ephemeral_agent(name)
+    except Exception:
+        row = None
+    _report_refusal(name, caller_id, row, error)
+
+
 def refuse_unavailable(name: str, caller_id: Optional[str]) -> NoReturn:
     """Classify a missing live profile without echoing loader or creator text."""
     row = database.get_ephemeral_agent(name)
@@ -1894,6 +1903,33 @@ def release(terminal_id: str, reason: str) -> None:
             "live files may remain until collected",
             terminal_id,
             reason,
+            type(exc).__name__,
+        )
+
+
+def _launched_row(terminal_id: str) -> Optional[dict[str, Any]]:
+    """The registry row of the name bound to ``terminal_id``, whatever its state now."""
+    table = database.EphemeralAgentModel
+    with database.SessionLocal() as db:
+        record = db.query(table).filter(table.launched_terminal_id == terminal_id).first()
+        return _row(db, str(record.name)) if record is not None else None
+
+
+def record_kiro_event(terminal_id: str, event: str, **facts: Any) -> None:
+    """Append a Kiro helper event to the archive of the name bound to this terminal (#1167).
+
+    ``kiro_home_prepared``, ``kiro_attested`` and ``kiro_home_removed``. Never
+    raises: the archive records the launch, it does not control it.
+    """
+    try:
+        row = _launched_row(terminal_id)
+        if row is not None:
+            _audit_update(row, event, **facts)
+    except Exception as exc:
+        logger.warning(
+            "Ephemeral audit event %s for terminal %s not recorded: %s",
+            event,
+            terminal_id,
             type(exc).__name__,
         )
 
