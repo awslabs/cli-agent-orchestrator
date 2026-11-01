@@ -1,14 +1,16 @@
 ---
 name: cao-agent-plugin-audit
-description: Audit an existing Agent Plugins 1.0.0 package for conformance - check its plugin.json manifest and mcp.json against the schema bytes CAO vendors, and mechanically check every Agent Skill it ships against the name pattern, the 64-character name bound, folder-equals-name, the 1024-character description limit and the 500-line body limit, three of which CAO's own validator never checks. Use when the user says "audit this Agent Plugin", "is this package conformant", "check these skills against the Agent Skills limits", "cao plugin validate says loadable, is it really fine", "check the manifest", or "run gate 1 over skills/". Ships a validator script that needs no CAO install and no network. Not for authoring a new Agent Plugin (use cao-agent-plugin-creator). Not for CAO event plugins, the Python packages that react to cao-server lifecycle events (use cao-plugin). Not for auditing a client-specific agent plugin before migrating it (use migrate-agent-plugin).
+description: Audit an existing Agent Plugins 1.0.0 package - check its plugin.json manifest and mcp.json against CAO's vendored schemas, and mechanically check every Agent Skill it ships against the name pattern, the 64-character name bound, folder-equals-name, the 1024-character description limit and the 500-line body limit, four of which CAO's own validator never checks. Use when the user says "audit this Agent Plugin", "is this package conformant", "check these skills against the Agent Skills limits", "cao plugin validate says loadable, is it really fine", or "run gate 1 over skills/". Its validator script needs no CAO install and opens no network connection itself; its first run needs its three declared dependencies available. Not for authoring a new Agent Plugin (use cao-agent-plugin-creator). Not for CAO event plugins, the Python packages that react to cao-server lifecycle events (use cao-plugin). Not for auditing a client-specific agent plugin before migrating it (use migrate-agent-plugin).
 ---
 
 # Audit an Agent Plugin
 
 Check an existing Agent Plugins 1.0.0 package against two things: the vendored
 manifest schemas, and the Agent Skills limits. The second half is the reason this
-skill exists. **CAO's own validator does not check three of those limits, and no
-artifact CAO ships enforces them mechanically.**
+skill exists. **CAO's own validator does not check four of the five skill rules
+below (the name pattern, the 64-character name bound, the 1024-character
+description limit and the 500-line body limit), and no other artifact CAO ships
+enforces them mechanically.**
 
 This skill audits a package that already follows the Agent Plugins 1.0.0
 structure. It is not a pre-migration review of a client-specific agent plugin;
@@ -25,15 +27,22 @@ a skill for exactly three things:
 3. the folder name equals the frontmatter `name`
    (`src/cli_agent_orchestrator/utils/skills.py`).
 
-**It does not check the Agent Skills name pattern, the 1024-character description
-limit, or the 500-line body limit.** Nothing else CAO ships checks them either.
+**It does not check the Agent Skills name pattern, the 64-character name bound, the
+1024-character description limit, or the 500-line body limit.** Apart from this
+skill, nothing else CAO ships checks them either.
 
 What CAO does with a skill that breaks those limits was at first only inferred
 from `models/skill.py`. It has since been observed, in the over-limit experiment
 run for issue #1153 (task T3) and again when this skill was written: a package
 with one skill whose `description` is 2000 characters, or whose body is 600
 lines, validates as `"loadable": true` with `"findings": []` and exit 0, and the
-skill is loaded. Reproduce it in a temporary directory:
+skill is loaded. **That observation covers only the two length limits.** T3 did
+not test a skill that breaks the name pattern or the 64-character name bound, so
+what CAO does with one is **inferred, not observed**: it is read from
+`models/skill.py:12-19`, which checks only that `name` and `description` are not
+blank, and `utils/skills.py:66-69`, which checks only that the folder name equals
+`name`. Neither applies the pattern or the bound. Reproduce the length case in a
+temporary directory:
 
 ```bash
 W=$(mktemp -d); mkdir -p "$W/pkg/skills/long-desc"
@@ -45,8 +54,9 @@ rm -rf "$W"
 ```
 
 So a package that passes `cao plugin validate` has not been shown to meet the
-Agent Skills limits. Do not tell anyone CAO rejects an over-limit skill. It loads
-it.
+Agent Skills limits. Do not tell anyone CAO rejects an over-limit skill. A skill
+over either length limit is loaded (observed); a skill that breaks only the name
+pattern or the 64-character bound is, by reading the code, loaded too (inferred).
 
 ## Prior art: a checklist, by hand
 
@@ -83,12 +93,17 @@ The full rule set, every finding code and its severity are in
 
 ## Two validators, reported separately
 
-This skill uses two validators and never merges their verdicts.
+This skill uses two validators and keeps their findings apart: CAO's appear
+under their own `cao.` codes, never as the bundled validator's.
 
 **1. The bundled validator, `scripts/validate_agent_plugin.py`.** It is a single
 Python file with a PEP 723 block declaring `jsonschema` and `pyyaml`, both of which
-it imports. Run it with `uv run --script`. **It does not need CAO installed and it
-never opens a network connection.** It validates the manifest against a bundled
+it imports, plus `referencing`, the library `jsonschema` uses to resolve schema
+references, which it also imports. Run it with `uv run --script`. **It does not
+need CAO installed, and it opens no network connection itself**: schema references
+resolve only against the two bundled schemas and any other retrieval is refused.
+Its first run needs its three declared dependencies available, which means a uv
+cache that already holds them or a reachable package index. It validates the manifest against a bundled
 copy of the schema bytes under this skill's `schemas/1.0.0/`, and refuses to run
 (exit 2) unless those bytes hash to the sha256 values CAO records in
 `src/cli_agent_orchestrator/schemas/agent_plugins/1.0.0/PIN.json`. When it runs
@@ -123,7 +138,10 @@ If stdout parses, read `loadable` and `findings`. If it does not parse, you know
 only that this was not a FATAL report; do not conclude "the gate was unset" from
 the missing JSON alone. Report the stderr text you actually saw. The bundled
 validator does exactly that: no JSON from `cao plugin validate` while the gate is
-set stops the audit with exit 2 and quotes the first stderr line.
+set stops the audit with exit 2 and quotes the first stderr line. So does a run
+that does not finish within 120 seconds. When CAO's JSON does arrive, every
+finding in it is reported as a `WARNING` named `cao.<code>`, so a skill CAO
+skips changes the audit's exit status even while CAO still says loadable.
 
 ### Schema validation is not the same as an allowlist comparison
 
@@ -189,7 +207,7 @@ line is a summary with a count per severity and the exit status.
 |---|---|---|
 | `FATAL` | **yes** | CAO would reject the whole package. Almost always the manifest. |
 | `SKIPPED` | no | CAO would drop one skill, or MCP, and load the rest. |
-| `LIMIT` | no | Breaks an Agent Skills limit. CAO loads it anyway. |
+| `LIMIT` | no | Breaks an Agent Skills limit. CAO does not check these: a skill over a length limit is loaded (observed); one that breaks only the name pattern or the 64-character bound is loaded too, by reading the code (inferred). |
 | `WARNING` | no | CAO reports it and loads the package, for example an unrecognized top-level manifest key. |
 | `ADVISORY` | no | Input for a human judgement. Never changes the exit status. |
 
@@ -200,9 +218,10 @@ an unknown key inside `author`, is FATAL.
 
 ### The description listing is advisory, and only a listing
 
-In package mode the audit always emits one `ADVISORY` line,
-`manifest.description_listing`, that prints the manifest's declared `description`
-beside the names of the skills it discovered. A manifest can describe skills the
+In package mode, whenever it could read the manifest, the audit emits one
+`ADVISORY` line, `manifest.description_listing`. It prints the manifest's declared
+`description` beside the names of the skills that would load: a skill reported
+`SKIPPED` is left out of the list. A manifest can describe skills the
 package does not ship, and every mechanical check here still passes. **The audit
 does not judge whether the two correspond.** That is a question about meaning, and
 it is yours to answer by reading the line. The advisory alone never makes the

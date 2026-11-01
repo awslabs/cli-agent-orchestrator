@@ -16,7 +16,7 @@ Shipping repo-development skills inside the operator package would enlarge the
 prompt surface of every foreign agent that installs it with instructions it will
 never act on, so each package's skills all serve one story.
 
-Both packages are **generated and committed**, following the canonical-source +
+Every package is **generated and committed**, following the canonical-source +
 generated-mirror + ``--check`` pattern ``scripts/sync_skills.py`` already uses.
 Committing them is what makes ``cao plugin add ./agent-plugin/cao`` work from a
 clone with no build step, and what lets a foreign client point at the
@@ -26,7 +26,7 @@ tested.
 
 Usage::
 
-    python scripts/build_agent_plugin.py            # regenerate both packages
+    python scripts/build_agent_plugin.py            # regenerate every package
     python scripts/build_agent_plugin.py --check     # CI guard: exit 1 on drift
 
 Naming caveats, both deliberate and both recorded rather than silently resolved:
@@ -192,7 +192,8 @@ LIFECYCLE = PackageConfig(
         "from an empty directory (the plugin.json manifest, skills/ and an optional "
         "mcp.json), and audit an existing one against the vendored schemas and the "
         "Agent Skills limits that CAO's own validator does not check. The audit "
-        "skill bundles a validator that needs no CAO install and no network."
+        "skill bundles a validator that needs no CAO install and opens no network "
+        "connection itself; its first run needs its dependencies available."
     ),
     keywords=["cao", "agent-plugins", "authoring", "audit", "skills"],
     skills=[
@@ -350,8 +351,8 @@ def committed_package_version() -> Optional[str]:
     a ``CONTENT DIFFERS`` finding and reddens ``main`` and every open PR, before
     the job that exists to repin has had a chance to run (defect G1c).
 
-    Both packages carry the version, and they are written by the same pass, so
-    disagreement between them is itself drift. ``None`` means "cannot tell" -- a
+    Every package carries the version, and they are all written by the same pass,
+    so disagreement between any two of them is itself drift. ``None`` means "cannot tell" -- a
     missing, unreadable, or internally inconsistent set of packages -- and the
     caller then falls back to the ``pyproject`` version so the existing
     "package missing" / ``CONTENT DIFFERS`` diagnostics are what the operator

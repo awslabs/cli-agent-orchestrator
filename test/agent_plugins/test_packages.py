@@ -2,13 +2,14 @@
 
 **Validates: Requirements 1.1–1.6, 2.1–2.8, 3.1–3.5, 23.2**
 
-Both packages must validate as loadable with zero fatal findings, each
+Every package must validate as loadable with zero fatal findings, each
 allowlist must be enforced *independently*, and ``cao-contributing`` ships in
 the contributor package now that PR #448 has merged (#1120).
 """
 
 from __future__ import annotations
 
+import ast
 import itertools
 import json
 import sys
@@ -33,13 +34,18 @@ OPERATOR_DIR = PACKAGES_DIR / "cao"
 CONTRIBUTOR_DIR = PACKAGES_DIR / "cao-contributor"
 LIFECYCLE_DIR = PACKAGES_DIR / "cao-agent-plugin-lifecycle"
 ALL_PACKAGE_DIRS = [OPERATOR_DIR, CONTRIBUTOR_DIR, LIFECYCLE_DIR]
+ALL_CONFIGS = [builder.OPERATOR, builder.CONTRIBUTOR, builder.LIFECYCLE]
+AUDIT_SCRIPT = (
+    REPO_ROOT / "skills" / "cao-agent-plugin-audit" / "scripts" / "validate_agent_plugin.py"
+)
+PIN_JSON = REPO_ROOT / "src" / "cli_agent_orchestrator" / "schemas" / "agent_plugins" / "1.0.0" / "PIN.json"
 
 
 def manifest_of(package_dir: Path) -> dict:
     return json.loads((package_dir / "plugin.json").read_text(encoding="utf-8"))
 
 
-class TestBothPackagesAreConformant:
+class TestEveryPackageIsConformant:
     """Requirement 3.4 / 23.2 — the conformance half of the CI guard."""
 
     @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
@@ -213,8 +219,24 @@ class TestContributorPackage:
         assert "cao-future-skill" in report.skill_names
 
 
+def pinned_sha256_in(script: Path) -> dict:
+    """Read the audit validator's ``PINNED_SHA256`` literal without importing it."""
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            getattr(target, "id", None) == "PINNED_SHA256" for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{script}: no PINNED_SHA256 assignment")
+
+
 class TestLifecyclePackage:
     """The third package: the Agent Plugin authoring and audit skills (#1153)."""
+
+    def test_the_audit_validator_pins_the_same_hashes_as_pin_json(self):
+        """The validator refuses to run on a pin mismatch; no CI step runs it, so check here."""
+        recorded = {name: entry["sha256"] for name, entry in json.loads(PIN_JSON.read_text())["files"].items()}
+        assert pinned_sha256_in(AUDIT_SCRIPT) == recorded
 
     def test_name_is_cao_agent_plugin_lifecycle(self):
         assert manifest_of(LIFECYCLE_DIR)["name"] == "cao-agent-plugin-lifecycle"
@@ -252,10 +274,17 @@ class TestAllowlistsAreEnforcedIndependently:
     def test_discovered_skills_equal_the_allowlist(self, config, package_dir):
         assert sorted(validate_plugin(package_dir).skill_names) == sorted(config.skills)
 
+    def test_the_package_lists_here_are_the_builders(self):
+        """The literal lists this file parametrises over must be exactly PACKAGES.
+
+        Otherwise a fourth package would pass every test here without being covered.
+        """
+        assert ALL_CONFIGS == builder.PACKAGES
+        assert ALL_PACKAGE_DIRS == [PACKAGES_DIR / config.name for config in builder.PACKAGES]
+
     def test_the_allowlists_are_pairwise_disjoint(self):
         """The audience split is the point; overlap would defeat it."""
-        configs = [builder.OPERATOR, builder.CONTRIBUTOR, builder.LIFECYCLE]
-        for first, second in itertools.combinations(configs, 2):
+        for first, second in itertools.combinations(ALL_CONFIGS, 2):
             overlap = set(first.skills) & set(second.skills)
             assert not overlap, (first.name, second.name, overlap)
 
