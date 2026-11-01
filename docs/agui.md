@@ -250,9 +250,12 @@ clients expect.
 A client POSTs a `RunAgentInput` (required: `threadId`, `runId` and `messages`,
 where an empty array is valid; optional: `resume[]`) and
 receives a lifecycle-legal stream: `RUN_STARTED`, then `STATE_SNAPSHOT`, then
-`RUN_FINISHED`. The response body ends right after `RUN_FINISHED` (or
-`RUN_ERROR`), because a stock AG-UI client completes a run only when the body
-ends. If open approval interrupts exist, the outcome is
+`RUN_FINISHED`. `RUN_STARTED` carries `threadId`, `runId` and
+`protocolVersion: "1.0"`, the declaration AG-UI 1.0 requires of a producer. The
+value comes from the installed `ag-ui-protocol` SDK, which is why the `[agui]`
+extra needs `ag-ui-protocol>=1.0.0`. The response body ends right after
+`RUN_FINISHED` (or `RUN_ERROR`), because a stock AG-UI client completes a run
+only when the body ends. If open approval interrupts exist, the outcome is
 `{type: "interrupt", interrupts: [...]}`, and the client re-POSTs with a
 `resume[]` array to resolve them. Each entry is
 `{interruptId, status: "resolved" | "cancelled", payload: {approved: bool} | {editedArgs}}`;
