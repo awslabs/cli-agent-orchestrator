@@ -20,7 +20,8 @@ Content-Type: application/json
 `threadId`, `runId` and `messages` are required (an empty `messages` array is
 valid; it is not read). `resume[]` is optional. Each entry needs `interruptId`,
 `status` (`resolved` or `cancelled`, where `cancelled` is a deny) and a
-`payload` of `{"approved": true|false}` or `{"editedArgs": "..."}`. A body that
+`payload` of `{"approved": true|false}`, plus `"editedArgs": "..."` (the edited
+answer text) where the interrupt offers edit. A body that
 is not a valid `RunAgentInput` gets HTTP 422 before the stream starts.
 
 **Requires:** `CAO_AGUI_ENABLED=true`
@@ -36,7 +37,8 @@ stock AG-UI client completes a run only when the body ends):
 | Nothing pending | `RUN_STARTED`, `STATE_SNAPSHOT`, `RUN_FINISHED` (`outcome: success`) |
 | `resume[]` delivered, nothing left pending | `RUN_STARTED`, `STATE_SNAPSHOT`, `RUN_FINISHED` (`outcome: success`) |
 | `resume[]` delivered, other interrupts still pending | `RUN_STARTED`, `STATE_SNAPSHOT`, `RUN_FINISHED` (`outcome: interrupt`, the remaining ones) |
-| Resume failed (unknown id, bad payload, delivery failure) | `RUN_STARTED`, `RUN_ERROR` |
+| `resume[]` names an unknown or expired interrupt | That entry is skipped with a server-side warning; the run ends as one of the rows above |
+| Resume failed (bad payload, delivery failure) | `RUN_STARTED`, `RUN_ERROR` |
 | `resume[]` sent, but the server has no approval bridge | HTTP 404 "Approval bridge not initialized", no stream |
 
 A `success` after `resume[]` means the decision was delivered, not that the
@@ -86,10 +88,15 @@ interrupt carries:
     "properties": {
       "approved": {"type": "boolean"},
       "editedArgs": {"type": "string"}
-    }
+    },
+    "required": ["approved"]
   }
 }
 ```
+
+`responseSchema` is built per interrupt. `editedArgs` appears only when that
+interrupt offers `edit`, and it is the edited answer text typed into the
+agent's prompt, not replacement tool arguments.
 
 ### Resuming an interrupt
 
@@ -115,12 +122,14 @@ interrupt carries:
 ### Error handling
 
 - Delivery failure → `RUN_ERROR` frame (retryable)
-- Expired interrupt (terminal moved on) → the interrupt is already resolved, so
-  the entry is skipped like a repeat resume and the run ends with `RUN_FINISHED`
+- Expired interrupt (terminal moved on) → an answer for it is skipped with a
+  server-side warning, and a `status: "cancelled"` entry for it is skipped
+  quietly. Either way the run proceeds and ends with `RUN_FINISHED`
   (`success`, or `interrupt` if others are pending). There is no `expired`
   outcome. A resolved record is evicted when a later interrupt is raised after
   the record is 5 minutes old, or sooner if the registry is over its cap. From
-  then on the id is unknown and the run ends with `RUN_ERROR`.
+  then on the id is unknown: the entry is skipped with a server-side warning,
+  the run proceeds, and anything still pending is reported again.
 - Surface disabled → HTTP 404 (not 403)
 
 ## Replay Contract

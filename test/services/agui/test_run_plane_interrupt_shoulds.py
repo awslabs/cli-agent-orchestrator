@@ -1,0 +1,260 @@
+"""AG-UI 1.0 interrupt/resume SHOULDs on the run plane (#1191).
+
+Spec: ag-ui ``docs/spec/1.0/basic/patterns/interrupt-resume.mdx``.
+
+- "An unrecognised entry — one naming an interrupt the producer did not raise:
+  the run SHOULD proceed without the entry, and the producer SHOULD surface a
+  warning rather than fail a run over an answer it never asked for."
+- An interrupt CAO raised that has since expired can no longer be answered
+  (same page, "an interrupt the consumer judges expired can no longer be
+  *answered*"), so an answer for it is skipped with a warning too. It can still
+  be abandoned, which needs no warning.
+
+ag-ui ``docs/concepts/interrupts.mdx`` (guidance, outside ``spec/1.0``): the
+``responseSchema`` carries ``"required": ["approved"]``, and the presence of
+``editedArgs`` is the capability signal that edit UI may be offered. For CAO,
+``editedArgs`` is the edited answer text typed into the agent's prompt, so it
+is a string.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+import pytest
+
+from cli_agent_orchestrator.services.agui.base import RecordingUiEmitter
+from cli_agent_orchestrator.services.agui.handoff_approval import (
+    AgentHandoffWithApproval,
+    ApprovalDecision,
+)
+from cli_agent_orchestrator.services.agui.run_plane import run_plane_stream
+
+_RUN_PLANE_LOGGER = "cli_agent_orchestrator.services.agui.run_plane"
+
+# A selector-style permission dialog with no free-text field. Its reason has a
+# full-reason override in handoff_approval._REASON_OPTIONS that does NOT offer edit.
+_SELECTOR_PROMPT = ("claude_code", "\u2191/\u2193 to navigate")
+# Kiro CLI's y/n/t prompt: a permission_request that DOES offer edit.
+_KIRO_PROMPT = ("kiro_cli", "Allow this action? [y/n/t]:")
+
+
+def _run_input(resume: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    data: Dict[str, Any] = {
+        "threadId": "thread-1191",
+        "runId": "run-1191",
+        "state": {},
+        "messages": [],
+        "tools": [],
+        "context": [],
+        "forwardedProps": {},
+    }
+    if resume is not None:
+        data["resume"] = resume
+    return data
+
+
+async def _events(construct: AgentHandoffWithApproval, **input_kw: Any) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    async for frame in run_plane_stream(
+        input_data=_run_input(**input_kw), approval_construct=construct
+    ):
+        for line in frame.strip().split("\n"):
+            if line.startswith("data: "):
+                events.append(json.loads(line[len("data: ") :]))
+    return events
+
+
+def _construct() -> AgentHandoffWithApproval:
+    return AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
+
+
+def _raise(construct: AgentHandoffWithApproval, terminal_id: str, prompt: tuple) -> Any:
+    provider, raw = prompt
+    return construct.on_provider_waiting(
+        terminal_id=terminal_id, provider=provider, raw_prompt=raw, session_name="s-1"
+    )
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> List[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _RUN_PLANE_LOGGER and r.levelno == logging.WARNING
+    ]
+
+
+# ---------------------------------------------------------------------------
+# (a) unknown or expired resume entries: warn and proceed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unknown_entry_warns_and_run_proceeds(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger=_RUN_PLANE_LOGGER)
+    construct = _construct()
+
+    events = await _events(
+        construct,
+        resume=[
+            {"interruptId": "never-raised", "status": "resolved", "payload": {"approved": True}}
+        ],
+    )
+
+    types = [e["type"] for e in events]
+    assert "RUN_ERROR" not in types, events
+    assert types == ["RUN_STARTED", "RUN_FINISHED"]
+    assert events[-1]["outcome"] == {"type": "success"}
+    assert any("never-raised" in w for w in _warnings(caplog)), caplog.records
+
+
+@pytest.mark.asyncio
+async def test_unknown_entry_does_not_block_a_valid_entry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The run proceeds *without* the entry: later entries are still applied."""
+    caplog.set_level(logging.WARNING, logger=_RUN_PLANE_LOGGER)
+    construct = _construct()
+    known = _raise(construct, "t-1", _SELECTOR_PROMPT)
+
+    events = await _events(
+        construct,
+        resume=[
+            {"interruptId": "never-raised", "status": "resolved", "payload": {"approved": True}},
+            {"interruptId": known.id, "status": "resolved", "payload": {"approved": True}},
+        ],
+    )
+
+    assert [e["type"] for e in events] == ["RUN_STARTED", "RUN_FINISHED"]
+    assert events[-1]["outcome"] == {"type": "success"}
+    assert construct.get_interrupt(known.id).outcome == ApprovalDecision.APPROVE.value
+    assert any("never-raised" in w for w in _warnings(caplog))
+
+
+@pytest.mark.asyncio
+async def test_unknown_entry_re_reports_what_is_still_pending() -> None:
+    construct = _construct()
+    still_open = _raise(construct, "t-1", _SELECTOR_PROMPT)
+
+    events = await _events(
+        construct,
+        resume=[
+            {"interruptId": "never-raised", "status": "resolved", "payload": {"approved": True}}
+        ],
+    )
+
+    assert [e["type"] for e in events] == ["RUN_STARTED", "RUN_FINISHED"]
+    outcome = events[-1]["outcome"]
+    assert outcome["type"] == "interrupt"
+    assert [i["id"] for i in outcome["interrupts"]] == [still_open.id]
+
+
+@pytest.mark.asyncio
+async def test_answer_for_expired_interrupt_warns_and_run_proceeds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=_RUN_PLANE_LOGGER)
+    construct = _construct()
+    expired = _raise(construct, "t-1", _SELECTOR_PROMPT)
+    construct.expire("t-1")
+
+    events = await _events(
+        construct,
+        resume=[{"interruptId": expired.id, "status": "resolved", "payload": {"approved": True}}],
+    )
+
+    assert [e["type"] for e in events] == ["RUN_STARTED", "RUN_FINISHED"]
+    assert events[-1]["outcome"] == {"type": "success"}
+    # Nothing was delivered for it: the interrupt keeps its expired outcome.
+    assert construct.get_interrupt(expired.id).outcome == "expired"
+    assert any(expired.id in w and "expired" in w for w in _warnings(caplog)), caplog.records
+
+
+@pytest.mark.asyncio
+async def test_abandoning_an_expired_interrupt_is_quiet(caplog: pytest.LogCaptureFixture) -> None:
+    """Abandonment is how a thread moves past an expired interrupt; no warning."""
+    caplog.set_level(logging.WARNING, logger=_RUN_PLANE_LOGGER)
+    construct = _construct()
+    expired = _raise(construct, "t-1", _SELECTOR_PROMPT)
+    construct.expire("t-1")
+
+    events = await _events(
+        construct,
+        resume=[{"interruptId": expired.id, "status": "cancelled"}],
+    )
+
+    assert [e["type"] for e in events] == ["RUN_STARTED", "RUN_FINISHED"]
+    assert events[-1]["outcome"] == {"type": "success"}
+    assert _warnings(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_re_sent_answer_for_resolved_interrupt_is_quiet(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An entry for an interrupt already answered stays an idempotent, silent skip."""
+    caplog.set_level(logging.WARNING, logger=_RUN_PLANE_LOGGER)
+    construct = _construct()
+    answered = _raise(construct, "t-1", _SELECTOR_PROMPT)
+    entry = {"interruptId": answered.id, "status": "resolved", "payload": {"approved": True}}
+    await _events(construct, resume=[entry])
+    caplog.clear()
+
+    events = await _events(construct, resume=[entry])
+
+    assert [e["type"] for e in events] == ["RUN_STARTED", "RUN_FINISHED"]
+    assert _warnings(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# (b), (c) responseSchema built per interrupt
+# ---------------------------------------------------------------------------
+
+
+async def _pending_schemas(construct: AgentHandoffWithApproval) -> Dict[str, Dict[str, Any]]:
+    events = await _events(construct)
+    outcome = events[-1]["outcome"]
+    assert outcome["type"] == "interrupt"
+    return {i["metadata"]["terminalId"]: i["responseSchema"] for i in outcome["interrupts"]}
+
+
+@pytest.mark.asyncio
+async def test_response_schema_requires_approved_on_every_interrupt() -> None:
+    construct = _construct()
+    _raise(construct, "t-no-edit", _SELECTOR_PROMPT)
+    _raise(construct, "t-edit", _KIRO_PROMPT)
+
+    schemas = await _pending_schemas(construct)
+
+    assert set(schemas) == {"t-no-edit", "t-edit"}
+    for schema in schemas.values():
+        assert schema["type"] == "object"
+        assert schema["required"] == ["approved"]
+        assert schema["properties"]["approved"]["type"] == "boolean"
+
+
+@pytest.mark.asyncio
+async def test_response_schema_offers_edited_args_only_where_edit_is_offered() -> None:
+    construct = _construct()
+    no_edit = _raise(construct, "t-no-edit", _SELECTOR_PROMPT)
+    with_edit = _raise(construct, "t-edit", _KIRO_PROMPT)
+    # Guard the premise: the two prompts really do differ in whether edit is offered.
+    assert "edit" not in no_edit.options
+    assert "edit" in with_edit.options
+
+    schemas = await _pending_schemas(construct)
+
+    assert "editedArgs" not in schemas["t-no-edit"]["properties"]
+    assert "editedArgs" in schemas["t-edit"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_edited_args_is_typed_string() -> None:
+    construct = _construct()
+    _raise(construct, "t-edit", _KIRO_PROMPT)
+
+    schemas = await _pending_schemas(construct)
+
+    assert schemas["t-edit"]["properties"]["editedArgs"]["type"] == "string"

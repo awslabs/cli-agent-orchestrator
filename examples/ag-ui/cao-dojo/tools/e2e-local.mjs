@@ -7,7 +7,8 @@
 //   node e2e-local.mjs approve   card appears; Approve writes approved-by-dojo.txt
 //   node e2e-local.mjs reject    card appears; Reject leaves no file
 //   node e2e-local.mjs none      nothing pending: the run still finishes, no
-//                                pending card; an unknown interrupt is RUN_ERROR
+//                                pending card; a resume for an unknown interrupt
+//                                is skipped and the run still finishes
 //   node e2e-local.mjs page      no server: the page's own state handling, with a
 //                                scripted EventSource and a stubbed run
 //
@@ -186,7 +187,8 @@ try {
     await shot("2-settled");
     await hold();
 
-    // An unknown interrupt must surface as RUN_ERROR, not a hang.
+    // AG-UI 1.0: a resume entry for an interrupt CAO did not raise is skipped
+    // with a server-side warning, and the run proceeds instead of erroring.
     await page.evaluate(() =>
       window.__caoDojo.resume("00000000-0000-0000-0000-000000000000", {
         approved: true,
@@ -194,18 +196,19 @@ try {
     );
     check(await runsSettled(2), "the unknown-interrupt run ended");
     check(
-      runs[1]?.terminal === "RUN_ERROR",
-      "an unknown interrupt yields RUN_ERROR",
+      runs[1]?.terminal === "RUN_FINISHED" && runs[1]?.outcome === "success",
+      "an unknown interrupt is skipped: RUN_FINISHED with a success outcome",
     );
-    await page
-      .locator('[data-testid="run-result"][data-terminal="RUN_ERROR"]')
-      .first()
-      .waitFor({ timeout: SETTLE_MS })
-      .then(
-        () => check(true, "the page shows RUN_ERROR"),
-        () => check(false, "the page shows RUN_ERROR"),
-      );
-    await shot("3-run-error");
+    // Wait for the page to render this run's result before counting, so the
+    // no-RUN_ERROR check cannot pass just because nothing was drawn yet.
+    await results.nth(1).waitFor({ timeout: SETTLE_MS });
+    check(
+      (await page
+        .locator('[data-testid="run-result"][data-terminal="RUN_ERROR"]')
+        .count()) === 0,
+      "the page shows no RUN_ERROR",
+    );
+    await shot("3-unknown-interrupt-skipped");
     await hold();
   } else {
     // The card must come from the stream's cao.generative_ui frame, so

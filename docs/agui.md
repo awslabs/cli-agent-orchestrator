@@ -274,9 +274,20 @@ extra needs `ag-ui-protocol>=1.0.0`. The response body ends right after
 only when the body ends. If open approval interrupts exist, the outcome is
 `{type: "interrupt", interrupts: [...]}`, and the client re-POSTs with a
 `resume[]` array to resolve them. Each entry is
-`{interruptId, status: "resolved" | "cancelled", payload: {approved: bool} | {editedArgs}}`;
+`{interruptId, status: "resolved" | "cancelled", payload: {approved: bool, editedArgs?: string}}`;
 `status` is required, `cancelled` is treated as a deny, and a body that is not a
-valid `RunAgentInput` is rejected with HTTP 422 before the stream starts. A
+valid `RunAgentInput` is rejected with HTTP 422 before the stream starts.
+
+Each interrupt's `responseSchema` is built for that interrupt. It always lists
+`approved` (boolean) and has `"required": ["approved"]`. It lists `editedArgs`
+only when that interrupt offers `edit`; its presence is the signal that a
+client may show edit UI. For CAO, `editedArgs` is a **string: the edited answer
+text**, typed into the agent's prompt in place of a yes/no answer. It is not
+replacement tool arguments. A resume entry that names an interrupt CAO did not
+raise (or no longer retains), or that answers one that has expired, is skipped
+with a server-side warning and the run proceeds, as AG-UI 1.0 asks of a
+producer; whatever is still pending is reported again. Abandoning an expired
+interrupt (`status: "cancelled"`) is skipped without a warning. A
 non-empty `resume[]` gets HTTP 404 when the server has no approval bridge (the
 AG-UI surface was off when it started), as `POST /agui/v1/interrupts/{id}/resume`
 does. Once `resume[]` is delivered and nothing is

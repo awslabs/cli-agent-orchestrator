@@ -24,7 +24,7 @@ import json
 import logging
 import os
 import uuid
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from cli_agent_orchestrator.services.agui_stream import CAO_GENERATIVE_UI_EVENT_NAME
 
@@ -132,6 +132,27 @@ def _extract_edited_text(payload: Any) -> Optional[str]:
     return None
 
 
+def _response_schema(options: List[str]) -> Dict[str, Any]:
+    """Build one interrupt's ``responseSchema`` from the options it offers.
+
+    Follows ag-ui ``docs/concepts/interrupts.mdx``: ``approved`` is required,
+    and the presence of ``editedArgs`` is the capability signal that a client
+    may offer edit UI, so it appears only when the interrupt offers ``edit``.
+    For CAO, ``editedArgs`` is the edited answer text typed into the agent's
+    prompt in place of a yes/no answer, not replacement tool arguments, so it
+    is a string.
+    """
+    properties: Dict[str, Any] = {
+        "approved": {"type": "boolean", "description": "true=approve, false=deny"},
+    }
+    if "edit" in options:
+        properties["editedArgs"] = {
+            "type": "string",
+            "description": "edited answer text, typed into the agent's prompt in place of yes/no",
+        }
+    return {"type": "object", "properties": properties, "required": ["approved"]}
+
+
 # ---------------------------------------------------------------------------
 # Run plane stream generator
 # ---------------------------------------------------------------------------
@@ -224,19 +245,30 @@ async def run_plane_stream(
             interrupt_id = entry.interrupt_id
             interrupt = approval_construct.get_interrupt(interrupt_id)
             if interrupt is None:
-                # Unknown interrupt -> RUN_ERROR
-                err = RunErrorEvent(
-                    type="RUN_ERROR",
-                    thread_id=thread_id,
-                    run_id=run_id,
-                    message=f"Unknown interrupt: {interrupt_id}",
+                # AG-UI 1.0 interrupt-resume.mdx, "An unrecognised entry": the
+                # run SHOULD proceed without the entry, and the producer SHOULD
+                # surface a warning rather than fail the run. This also covers
+                # an interrupt CAO raised that has since been purged from the
+                # registry. Whatever is still pending is re-reported below.
+                logger.warning(
+                    "run_plane: ignoring resume entry for unknown interrupt %s "
+                    "(never raised, or no longer retained)",
+                    interrupt_id,
                 )
-                yield _emit(err)
-                finished = True
-                return
+                continue
 
             if interrupt.resolved:
-                # Already resolved (idempotent), skip
+                # An expired interrupt can no longer be answered (same page,
+                # "Resuming"), so an answer for it is dropped with a warning. It
+                # can still be abandoned (status "cancelled"), which is how a
+                # thread moves past it and needs no warning. Any other resolved
+                # interrupt is an idempotent re-send and is skipped quietly.
+                if interrupt.outcome == "expired" and entry.status != "cancelled":
+                    logger.warning(
+                        "run_plane: ignoring resume entry for expired interrupt %s; "
+                        "an expired interrupt can no longer be answered",
+                        interrupt_id,
+                    )
                 continue
 
             # Map payload to decision
@@ -311,8 +343,8 @@ async def run_plane_stream(
 
             # Convert CAO Interrupts to ag-ui Interrupts. The interior metadata
             # is camelCased (terminalId/sessionName) to match the stock ag-ui
-            # wire dialect, and response_schema advertises the accepted resume[]
-            # payload shape so a client knows how to answer (approve/deny/edit).
+            # wire dialect, and response_schema is built per interrupt from the
+            # options it offers, so a client knows how to answer it.
             ag_interrupts = []
             for p in pending:
                 meta = p.metadata or {}
@@ -327,19 +359,7 @@ async def run_plane_stream(
                     reason=p.reason,
                     message=p.message,
                     metadata=ag_meta,
-                    response_schema={
-                        "type": "object",
-                        "properties": {
-                            "approved": {
-                                "type": "boolean",
-                                "description": "true=approve, false=deny",
-                            },
-                            "editedArgs": {
-                                "type": "object",
-                                "description": "edited answer (only if 'edit' is offered)",
-                            },
-                        },
-                    },
+                    response_schema=_response_schema(p.options),
                 )
                 ag_interrupts.append(ag_intr)
 

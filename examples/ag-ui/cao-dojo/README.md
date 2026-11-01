@@ -77,7 +77,7 @@ pass it in the URL: `index.html?endpoint=http://127.0.0.1:9890`. The page accept
 |---|---|---|
 | Live (`EventSource`) | `GET /agui/v1/stream?since=<10 min ago>` | Fleet state and `CUSTOM` `cao.generative_ui` frames. `since` replays a card raised before the page opened. |
 | Run (`fetch`, SSE body) | `POST /agui/v1/run` with a `RunAgentInput` | Collects open approvals. Ends `RUN_FINISHED` with outcome `interrupt` (and the interrupts) or `success`. |
-| Run, resuming | same, plus `resume: [{interruptId, status: "resolved", payload: {approved: true \| false}}]` | Answers one approval. Ends `RUN_FINISHED` once CAO has delivered it: outcome `success` when nothing else is waiting, or `interrupt` listing the approvals still open. Ends `RUN_ERROR` for a resume CAO cannot process (for example an unknown interrupt). |
+| Run, resuming | same, plus `resume: [{interruptId, status: "resolved", payload: {approved: true \| false}}]` | Answers one approval. Ends `RUN_FINISHED` once CAO has delivered it: outcome `success` when nothing else is waiting, or `interrupt` listing the approvals still open. Ends `RUN_ERROR` for a resume CAO cannot process (for example a bad payload or a failed delivery). An entry for an interrupt CAO did not raise, or one that has expired, is skipped with a server-side warning and the run proceeds. |
 
 The run list can also show two results that are not AG-UI events, both raised by the
 page itself:
@@ -119,7 +119,8 @@ On either, or on `RUN_ERROR`, a card you just answered goes back to pending.
   (success) and the file is written;
 - **reject**: a fresh agent, Reject, `RUN_FINISHED` (success), no file;
 - **none**: nothing pending, the run ends `RUN_FINISHED` (success) with no pending card,
-  and a resume for an unknown interrupt shows `RUN_ERROR`.
+  and a resume for an unknown interrupt is skipped, so that run also ends
+  `RUN_FINISHED` (success).
 
 ```bash
 (cd examples/ag-ui/cao-dojo/tools && npm install && npx playwright install chromium)
