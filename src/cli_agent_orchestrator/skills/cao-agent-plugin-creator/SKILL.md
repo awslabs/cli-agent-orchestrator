@@ -184,19 +184,31 @@ SKILL=my-package/skills/first-skill
 SKILL="$SKILL" uv run --with pyyaml python - <<'PY'
 import os, pathlib, re, sys, yaml
 d = pathlib.Path(os.environ["SKILL"])
-_, fm, body = (d / "SKILL.md").read_text(encoding="utf-8").split("---", 2)
-meta = yaml.safe_load(fm)
-name, desc = meta["name"], meta["description"]
-lines = len(body.strip().splitlines())
+lines = (d / "SKILL.md").read_text(encoding="utf-8").splitlines()
+# The frontmatter runs from a first line that is exactly '---' to the next such
+# line, so a '---' inside a value does not end it.
+ends = [i for i, line in enumerate(lines) if line.strip() == "---"]
+if len(ends) < 2 or ends[0] != 0:
+    print("SKILL.md has no '---' ... '---' frontmatter block", file=sys.stderr); sys.exit(2)
+meta = yaml.safe_load("\n".join(lines[1:ends[1]])) or {}
+missing = [k for k in ("name", "description") if not str(meta.get(k) or "").strip()]
+if missing:
+    print("frontmatter is missing or blank: " + ", ".join(missing), file=sys.stderr); sys.exit(2)
+name, desc = str(meta["name"]).strip(), str(meta["description"]).strip()
+body_lines = len("\n".join(lines[ends[1] + 1:]).strip().splitlines())
 ok = (name == d.name and len(name) <= 64
       and re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name)
-      and len(desc) <= 1024 and lines <= 500)
-print(f"name={name} description_chars={len(desc)} body_lines={lines}")
+      and len(desc) <= 1024 and body_lines <= 500)
+print(f"name={name} description_chars={len(desc)} body_lines={body_lines}")
 sys.exit(0 if ok else 1)
 PY
 ```
 
-It exits 0 when every limit holds and 1 on any breach. For a whole package at once,
+It exits 0 when every limit holds and 1 on any breach. A SKILL.md it cannot
+measure, with no frontmatter or with `name` or `description` missing or blank,
+prints the reason and exits 2, so "cannot measure" is never mistaken for "over a
+limit". Like CAO, it strips surrounding whitespace from `name` and `description`
+before comparing them. For a whole package at once,
 load `cao-agent-plugin-audit`, whose bundled validator checks every skill in a
 package against all five rules (name pattern, name length, folder equals `name`,
 description length, body length) and also checks the manifest.
