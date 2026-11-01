@@ -5,7 +5,7 @@ tags: [case-study]
 description: Twelve days, 32 PRs, at least 18 independent reviews, and a Telegram bot that asked me one question at a time.
 ---
 
-I was on a family holiday in Bali, half watching the kids and half watching my phone, when it started buzzing about a Saturday back home.
+I was on a family holiday in Bali, half watching the kid and half watching my phone, when it started buzzing about a Saturday back home.
 
 CI had gone red on two new HIGH-severity Dependabot alerts in the docs site's dependencies. Dependabot had already opened its own fix for each one, and both were red — each fix failed the scanner on the *other* alert.
 
@@ -20,7 +20,7 @@ The fix was a scoped exemption, naming the exact advisory and the exact two file
 
 Three of those nits went out in the next push, folded into one short follow-up commit. Then one more catch, this time automated: the Code Quality check flagged a formatting slip in the new guard test, fixed with yet another small, approved push.
 
-By the time I'm writing this, every check is green — Security Scan included — and the pull request is waiting on a maintainer's review. Not merged yet. That part isn't mine to decide.
+By the time I'm writing this, every check is green — Security Scan included — and, after another contributor's review and approval, it's merged.
 
 That was one Saturday. Over twelve days, the same loop — [CAO](https://github.com/awslabs/cli-agent-orchestrator), the open-source CLI agent orchestrator, running a small team of agents against its own repo — shipped 32 pull requests, one tap, one question, at a time.
 
