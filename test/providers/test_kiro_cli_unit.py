@@ -2,6 +2,7 @@
 
 import re
 from pathlib import Path
+from typing import Optional
 from unittest.mock import Mock, patch
 
 import pytest
@@ -450,14 +451,19 @@ class TestKiroCliProviderInitialization:
 _LAUNCH_COMMAND = "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer"
 
 
-def _launch_screen(header: str) -> str:
+# kiro-cli 2.32.0's fallback notice for this launch: the requested agent was not loaded.
+_FALLBACK_NOTICE_ROW = '● agent "developer" not found, using "kiro_default"'
+
+
+def _launch_screen(header: str, notice: Optional[str] = None) -> str:
     """A screen in the layout measured on kiro-cli 2.32.0 after a ``--agent developer``
-    launch. The fallback warning and the echoed command both name the requested agent;
-    only the header row says which agent is running."""
+    launch. The echoed command names the requested agent; ``notice`` adds a fallback
+    notice row under it, as kiro-cli prints when an agent did not load."""
     rule = "─" * 60
-    rows = [
-        f"bash-3.2$ {_LAUNCH_COMMAND}",
-        '● agent "developer" not found, using "kiro_default"',
+    rows = [f"bash-3.2$ {_LAUNCH_COMMAND}"]
+    if notice is not None:
+        rows.append(notice)
+    rows += [
         rule,
         " Trust All Tools active, confirmations are off · /quit to exit",
         rule,
@@ -534,6 +540,36 @@ class TestKiroCliAgentIdentityGuard:
         assert len(self._identity_reads(launch)) == 1
         assert provider._initialized is False
         assert provider.identity_verified is False
+
+    @pytest.mark.asyncio
+    async def test_a_notice_for_the_requested_agent_refuses_under_its_header(self, launch):
+        """Fail closed (#1167): kiro-cli said it did not load ``developer``, so a
+        ``developer`` header beside that notice is not evidence that it runs."""
+        launch.get_history.return_value = _launch_screen(
+            "developer · auto · ◔ 3% · auth ok", notice=_FALLBACK_NOTICE_ROW
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            await provider.initialize()
+
+        assert (excinfo.value.kind, excinfo.value.observed) == ("identity_mismatch", "kiro_default")
+        launch.send_keys.assert_called_once_with("test-session", "window-0", _LAUNCH_COMMAND)
+        launch.send_special_key.assert_not_called()
+        assert provider._initialized is False
+        assert provider.identity_verified is False
+
+    @pytest.mark.asyncio
+    async def test_a_notice_for_another_agent_leaves_the_header_to_decide(self, launch):
+        """A notice naming a different agent does not refuse on its own (#1167)."""
+        launch.get_history.return_value = _launch_screen(
+            "developer · auto · ◔ 3% · auth ok",
+            notice='● agent "reviewer" not found, using "kiro_default"',
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        assert await provider.initialize() is True
+        assert provider.identity_verified is True
 
     @pytest.mark.asyncio
     async def test_a_screen_without_a_header_is_reread_then_refused(self, launch):

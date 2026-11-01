@@ -17,6 +17,7 @@ import json
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -1414,3 +1415,71 @@ class TestVerifiedTerminalsTakeInputAndKeys:
         pane.backend.send_special_key.assert_called_once_with(
             "cao-session", "developer-abcd", "Enter"
         )
+
+
+# The real kiro-cli 2.35.1 v2 screen with a pinned model and ``--effort low``,
+# renamed to the agent this module launches.
+_EFFORT_CAPTURE = (
+    Path(__file__).parents[1] / "providers" / "fixtures" / "kiro_cli_tui_2_35_1_v2_model_effort.txt"
+)
+
+
+def _effort_screen():
+    screen = _EFFORT_CAPTURE.read_text(encoding="utf-8")
+    assert "\nv2ro · claude-haiku-5.5 · low · ◔ 2%" in screen
+    return screen.replace("\nv2ro · ", "\ndeveloper · ", 1)
+
+
+class TestAV2HeaderWithAnEffortColumnLaunches:
+    """Regression (#1167): a v2 header with an effort column,
+    ``developer · claude-haiku-5.5 · low · ◔ 2%``, was refused as
+    ``header_not_found``. The launch now passes its check and takes its task."""
+
+    @pytest.mark.asyncio
+    async def test_a_synchronous_create_is_verified_and_typed_into(self, kiro_create, pane):
+        from fastapi.testclient import TestClient
+
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.plugins import PluginRegistry
+
+        pane.backend.get_history.return_value = _effort_screen()
+
+        terminal = await kiro_create.create()
+
+        assert terminal_service.get_terminal_metadata(terminal.id)["identity_verified"] is True
+        assert _failure(terminal.id) is None
+        app.state.plugin_registry = PluginRegistry()
+        with _a_typing_provider():
+            response = TestClient(app).post(
+                f"/terminals/{terminal.id}/input",
+                params={"message": "API-CANARY"},
+                headers={"Host": "localhost"},
+            )
+        assert response.status_code == 200
+        assert _typed(pane.backend) == [_LAUNCH, "API-CANARY"]
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_launch_is_verified_before_its_task(self, pane):
+        tid = _row(identity_verified=False)
+        pane.backend.get_history.return_value = _effort_screen()
+        _a_launched_kiro(pane.backend)
+        provider = KiroCliProvider(tid, "cao-session", "developer-abcd", "developer")
+        with (
+            _a_typing_provider(),
+            patch.object(
+                terminal_service, "inject_memory_context", side_effect=lambda m, *a, **k: m
+            ),
+            patch.object(
+                terminal_service,
+                "_confirm_worker_started_or_resubmit",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            task = terminal_service._schedule_deferred_init(
+                provider, tid, "TASK-CANARY do the work", None, None, delete_on_failure=False
+            )
+            await task
+
+        assert provider.identity_verified is True
+        assert _typed(pane.backend) == [_LAUNCH, "TASK-CANARY do the work"]
+        assert _failure(tid) is None
