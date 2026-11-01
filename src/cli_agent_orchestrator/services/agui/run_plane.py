@@ -35,6 +35,11 @@ logger = logging.getLogger(__name__)
 AG_UI_AVAILABLE = False
 
 try:
+    # The SDK's own declaration of the spec version it was generated from
+    # ("1.0" for ag-ui-protocol 1.0.x). AG-UI 1.0 requires a producer to send
+    # it on RUN_STARTED, and the SDK leaves RunStartedEvent.protocol_version
+    # unset by default, so the run plane passes it explicitly.
+    from ag_ui.core import PROTOCOL_VERSION
     from ag_ui.core.events import (
         CustomEvent,
     )
@@ -202,6 +207,7 @@ async def run_plane_stream(
         type="RUN_STARTED",
         thread_id=thread_id,
         run_id=run_id,
+        protocol_version=PROTOCOL_VERSION,
     )
     yield _emit(run_started)
 
