@@ -82,7 +82,7 @@ agui_types = st.one_of(
             "TEXT_MESSAGE_CONTENT",
             "STATE_DELTA",
             "STATE_SNAPSHOT",
-            "GENERATIVE_UI",
+            "CUSTOM",
             "RAW",
             "RUN_ERROR",
             "TOOL_CALL_START",

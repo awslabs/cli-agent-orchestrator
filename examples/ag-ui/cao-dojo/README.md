@@ -75,7 +75,7 @@ pass it in the URL: `index.html?endpoint=http://127.0.0.1:9890`. The page accept
 
 | Transport | Request | Used for |
 |---|---|---|
-| Live (`EventSource`) | `GET /agui/v1/stream?since=<10 min ago>` | Fleet state and `GENERATIVE_UI` frames. `since` replays a card raised before the page opened. |
+| Live (`EventSource`) | `GET /agui/v1/stream?since=<10 min ago>` | Fleet state and `CUSTOM` `cao.generative_ui` frames. `since` replays a card raised before the page opened. |
 | Run (`fetch`, SSE body) | `POST /agui/v1/run` with a `RunAgentInput` | Collects open approvals. Ends `RUN_FINISHED` with outcome `interrupt` (and the interrupts) or `success`. |
 | Run, resuming | same, plus `resume: [{interruptId, status: "resolved", payload: {approved: true \| false}}]` | Answers one approval. Ends `RUN_FINISHED` once CAO has delivered it: outcome `success` when nothing else is waiting, or `interrupt` listing the approvals still open. Ends `RUN_ERROR` for a resume CAO cannot process (for example an unknown interrupt). |
 
