@@ -717,7 +717,8 @@ in [`examples/agent-plugins/agent-plugins-dogfood/`](../examples/agent-plugins/a
 **`cao-agent-plugin-lifecycle` is not exercised by that recording**, which
 installs only `cao`. It is gated in CI by `make check-agent-plugin`, and it is
 **audited by a skill it carries**: the `cao-agent-plugin-audit` validator, run
-against the package, must report no fatal, limit or warning finding.
+against the package, reported no fatal, skipped, limit or warning finding at the
+commit that added the package. That audit is not run in CI; rerun it by hand.
 
 ```bash
 uv run --script skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py ./agent-plugin/cao-agent-plugin-lifecycle
@@ -725,8 +726,9 @@ uv run --script skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py .
 
 At the commit that added the package, this exits `0` and ends with
 `summary: 0 fatal, 0 skipped, 0 limit, 0 warning, 1 advisory; exit 0`. The
-advisory is the listing of the manifest's description beside the discovered
-skills, which the audit always prints for a reader to compare. On the same
+advisory is the listing of the manifest's description beside the skills that
+would load, which the audit prints whenever it reads a manifest, for a reader to
+compare. On the same
 package, `CAO_AGENT_PLUGINS_ENABLED=1 cao plugin validate
 ./agent-plugin/cao-agent-plugin-lifecycle --json` reports `"loadable": true` and
 no findings, exit `0`.
