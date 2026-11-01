@@ -9,6 +9,7 @@ the contributor package now that PR #448 has merged (#1120).
 
 from __future__ import annotations
 
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -30,6 +31,8 @@ import build_agent_plugin as builder  # noqa: E402
 
 OPERATOR_DIR = PACKAGES_DIR / "cao"
 CONTRIBUTOR_DIR = PACKAGES_DIR / "cao-contributor"
+LIFECYCLE_DIR = PACKAGES_DIR / "cao-agent-plugin-lifecycle"
+ALL_PACKAGE_DIRS = [OPERATOR_DIR, CONTRIBUTOR_DIR, LIFECYCLE_DIR]
 
 
 def manifest_of(package_dir: Path) -> dict:
@@ -39,7 +42,7 @@ def manifest_of(package_dir: Path) -> dict:
 class TestBothPackagesAreConformant:
     """Requirement 3.4 / 23.2 — the conformance half of the CI guard."""
 
-    @pytest.mark.parametrize("package_dir", [OPERATOR_DIR, CONTRIBUTOR_DIR])
+    @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
     def test_package_is_loadable_with_zero_fatals(self, package_dir):
         report = validate_plugin(package_dir)
 
@@ -47,11 +50,11 @@ class TestBothPackagesAreConformant:
         assert fatals == [], fatals
         assert report.loadable
 
-    @pytest.mark.parametrize("package_dir", [OPERATOR_DIR, CONTRIBUTOR_DIR])
+    @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
     def test_schema_is_pinned_to_the_vendored_version(self, package_dir):
         assert manifest_of(package_dir)["$schema"] == PLUGIN_SCHEMA_ID
 
-    @pytest.mark.parametrize("package_dir", [OPERATOR_DIR, CONTRIBUTOR_DIR])
+    @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
     def test_version_is_synced_from_cao_package_metadata(self, package_dir):
         """Requirement 3.2 — packages agree and may lag, but never lead, metadata."""
         committed = builder.committed_package_version()
@@ -64,7 +67,7 @@ class TestBothPackagesAreConformant:
         assert not (PACKAGES_DIR / "plugin.json").exists()
         assert not validate_plugin(PACKAGES_DIR).loadable
 
-    @pytest.mark.parametrize("package_dir", [OPERATOR_DIR, CONTRIBUTOR_DIR])
+    @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
     def test_the_claude_code_overlay_mirrors_the_root_manifest(self, package_dir):
         """The overlay is identity-only and cannot disagree with ``plugin.json``.
 
@@ -80,7 +83,7 @@ class TestBothPackagesAreConformant:
         assert set(overlay) == {"name", "version", "description"}
         assert all(overlay[key] == root[key] for key in overlay)
 
-    @pytest.mark.parametrize("package_dir", [OPERATOR_DIR, CONTRIBUTOR_DIR])
+    @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
     def test_skills_are_copies_not_symlinks(self, package_dir):
         """§4.1 permits a symlink resolving inside the root; ``../../skills/`` escapes it.
 
@@ -210,21 +213,53 @@ class TestContributorPackage:
         assert "cao-future-skill" in report.skill_names
 
 
+class TestLifecyclePackage:
+    """The third package: the Agent Plugin authoring and audit skills (#1153)."""
+
+    def test_name_is_cao_agent_plugin_lifecycle(self):
+        assert manifest_of(LIFECYCLE_DIR)["name"] == "cao-agent-plugin-lifecycle"
+
+    def test_it_ships_exactly_the_creator_and_audit_skills(self):
+        report = validate_plugin(LIFECYCLE_DIR)
+        assert set(report.skill_names) == {"cao-agent-plugin-creator", "cao-agent-plugin-audit"}
+        assert report.loadable
+        assert report.findings == ()
+
+    def test_it_never_ships_an_mcp_json(self):
+        """Both skills work on files through the host agent's own tools."""
+        assert not (LIFECYCLE_DIR / "mcp.json").exists()
+        assert not (LIFECYCLE_DIR / ".mcp.json").exists()
+
+    def test_the_audit_skill_carries_its_bundled_schema_bytes(self):
+        """The validator refuses to run without them, so the copy is not drift."""
+        bundled = LIFECYCLE_DIR / "skills" / "cao-agent-plugin-audit" / "schemas" / "1.0.0"
+        vendored = REPO_ROOT / "src" / "cli_agent_orchestrator" / "schemas" / "agent_plugins" / "1.0.0"
+        for name in ("plugin.schema.json", "mcp.schema.json"):
+            assert (bundled / name).read_bytes() == (vendored / name).read_bytes(), name
+
+
 class TestAllowlistsAreEnforcedIndependently:
     """Requirement 3.5 — one package's failure must not mask the other's."""
 
     @pytest.mark.parametrize(
         "config, package_dir",
-        [(builder.OPERATOR, OPERATOR_DIR), (builder.CONTRIBUTOR, CONTRIBUTOR_DIR)],
+        [
+            (builder.OPERATOR, OPERATOR_DIR),
+            (builder.CONTRIBUTOR, CONTRIBUTOR_DIR),
+            (builder.LIFECYCLE, LIFECYCLE_DIR),
+        ],
     )
     def test_discovered_skills_equal_the_allowlist(self, config, package_dir):
         assert sorted(validate_plugin(package_dir).skill_names) == sorted(config.skills)
 
-    def test_the_two_allowlists_are_disjoint(self):
+    def test_the_allowlists_are_pairwise_disjoint(self):
         """The audience split is the point; overlap would defeat it."""
-        assert not (set(builder.OPERATOR.skills) & set(builder.CONTRIBUTOR.skills))
+        configs = [builder.OPERATOR, builder.CONTRIBUTOR, builder.LIFECYCLE]
+        for first, second in itertools.combinations(configs, 2):
+            overlap = set(first.skills) & set(second.skills)
+            assert not overlap, (first.name, second.name, overlap)
 
-    def test_check_reports_both_packages_when_both_drift(self, tmp_path, monkeypatch, capsys):
+    def test_check_reports_every_package_when_all_drift(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(builder, "PACKAGES_DIR", tmp_path / "empty")
 
         assert builder.main(["--check"]) == 1
@@ -232,6 +267,7 @@ class TestAllowlistsAreEnforcedIndependently:
         error = capsys.readouterr().err
         assert "cao:" in error
         assert "cao-contributor:" in error
+        assert "cao-agent-plugin-lifecycle:" in error
 
     def test_check_reports_the_second_package_when_only_it_drifts(
         self, tmp_path, monkeypatch, capsys
@@ -309,7 +345,7 @@ class TestDriftGuard:
 class TestPackagesInstallThroughTheRealPipeline:
     """AC3: the contributor plugin validates and installs *the same way*."""
 
-    @pytest.mark.parametrize("package_dir", [OPERATOR_DIR, CONTRIBUTOR_DIR])
+    @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
     def test_the_package_installs_and_projects_its_skills(self, package_dir, store, skills_dir):
         outcome = install(
             PluginSource(kind="path", location=str(package_dir)),
@@ -323,9 +359,9 @@ class TestPackagesInstallThroughTheRealPipeline:
             validate_plugin(package_dir).skill_names
         )
 
-    def test_both_packages_install_side_by_side(self, store, skills_dir):
+    def test_all_packages_install_side_by_side(self, store, skills_dir):
         """Their disjoint allowlists mean no collision between them."""
-        for package_dir in (OPERATOR_DIR, CONTRIBUTOR_DIR):
+        for package_dir in ALL_PACKAGE_DIRS:
             install(
                 PluginSource(kind="path", location=str(package_dir)),
                 store=store,
@@ -333,7 +369,11 @@ class TestPackagesInstallThroughTheRealPipeline:
                 refresh_agents=False,
             )
 
-        assert {record.name for record in store.list_installed()} == {"cao", "cao-contributor"}
+        assert {record.name for record in store.list_installed()} == {
+            "cao",
+            "cao-contributor",
+            "cao-agent-plugin-lifecycle",
+        }
         collisions = [
             f for record in store.list_installed() for f in record.findings if "collision" in f.code
         ]

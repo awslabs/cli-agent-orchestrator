@@ -185,7 +185,32 @@ CONTRIBUTOR = PackageConfig(
     ),
 )
 
-PACKAGES: List[PackageConfig] = [OPERATOR, CONTRIBUTOR]
+LIFECYCLE = PackageConfig(
+    name="cao-agent-plugin-lifecycle",
+    description=(
+        "Skills for the Agent Plugins 1.0.0 package lifecycle: author a new package "
+        "from an empty directory (the plugin.json manifest, skills/ and an optional "
+        "mcp.json), and audit an existing one against the vendored schemas and the "
+        "Agent Skills limits that CAO's own validator does not check. The audit "
+        "skill bundles a validator that needs no CAO install and no network."
+    ),
+    keywords=["cao", "agent-plugins", "authoring", "audit", "skills"],
+    skills=[
+        # Authoring an Agent Plugin from scratch: the manifest contract, read from
+        # the vendored schema, and CAO's validation gate.
+        "cao-agent-plugin-creator",
+        # Auditing an existing package. Ships its validator script and a bundled,
+        # pin-checked copy of the vendored schema bytes it validates against.
+        "cao-agent-plugin-audit",
+    ],
+    excluded_note=(
+        "Excluded: every operator skill (in the `cao` package) and every contributor "
+        "skill (in `cao-contributor`). The event-plugin authoring skill is in "
+        "`cao-contributor`; it is unrelated to Agent Plugins."
+    ),
+)
+
+PACKAGES: List[PackageConfig] = [OPERATOR, CONTRIBUTOR, LIFECYCLE]
 
 
 class BuildError(RuntimeError):
