@@ -37,9 +37,7 @@ def test_every_entry_is_fully_scoped_and_attributable():
     entries = _entries()
     assert entries
     tracked = set(
-        subprocess.run(
-            ["git", "ls-files", "-z"], cwd=ROOT, check=True, capture_output=True
-        )
+        subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, check=True, capture_output=True)
         .stdout.decode()
         .split("\0")
     )
@@ -58,9 +56,7 @@ def test_both_trivy_steps_share_the_same_ignorefile():
     ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
     steps = ci["jobs"]["security"]["steps"]
     trivy_steps = [
-        step
-        for step in steps
-        if step.get("uses", "").startswith("aquasecurity/trivy-action@")
+        step for step in steps if step.get("uses", "").startswith("aquasecurity/trivy-action@")
     ]
     assert len(trivy_steps) == 2
     ignorefiles = {step["with"].get("trivyignores") for step in trivy_steps}
