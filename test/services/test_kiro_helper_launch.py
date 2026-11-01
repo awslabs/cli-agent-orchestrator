@@ -340,8 +340,16 @@ async def test_a_server_without_a_home_refuses_before_the_probe(kiro, monkeypatc
 
 @pytest.mark.asyncio
 async def test_a_cao_home_kiro_would_ignore_refuses_before_the_probe(kiro, monkeypatch):
-    monkeypatch.setenv("HOME", str(kiro_launch_home.kiro_probe_home() / "operator"))
-    assert await policy_rule(kiro) == "kiro_home_invalid:ignored"
+    user_home = str(kiro_launch_home.kiro_probe_home() / "operator")
+    monkeypatch.setenv("HOME", user_home)
+    with pytest.raises(kiro.service.EphemeralPolicyError) as err:
+        await launch(kiro)
+    assert err.value.rule == "kiro_home_invalid:ignored"
+    # The cause and the fix, and no server path: this is the 400 body.
+    detail = err.value.detail
+    assert detail.endswith("so that HOME is not under $CAO_HOME_DIR/ephemeral/")
+    for path in {str(kiro.cao_home), os.path.realpath(kiro.cao_home), user_home}:
+        assert path not in detail
     assert_refused_before_the_probe(kiro)
 
 
@@ -674,6 +682,16 @@ def test_a_helpers_remedy_replaces_only_the_v2_clause():
     # Refusals that suggest no engine are returned as they are.
     other = KiroCapabilityError("probe_failed", KiroEngine.V3, "kiro-cli --help failed")
     assert terminal_service._helper_capability_error(other) is other
+    # The same kind, with a capability, but not the missing-flag text: left as it is.
+    engine_value = KiroCapabilityError(
+        "unsupported_capability",
+        KiroEngine.V3,
+        "Kiro engine 'v3' requires '--agent-engine' to accept 'v3', but the wrapper did not "
+        "advertise that value. Detected wrapper version: 2.35.1.",
+        capability="--agent-engine=v3",
+        version="2.35.1",
+    )
+    assert terminal_service._helper_capability_error(engine_value) is engine_value
     unrestricted = KiroV3LaunchError("kiro_v3_unrestricted", "restrict the grant")
     assert terminal_service._helper_v3_refusal(unrestricted) is unrestricted
 
