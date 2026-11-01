@@ -65,17 +65,19 @@
         "Places the skill as an immediate child of skills/, with the folder name equal to the frontmatter name",
         "Does not say README.md, CHANGELOG.md or LICENSE is required by the schema",
         "The validation command sets CAO_AGENT_PLUGINS_ENABLED inline",
-        "Does not instruct running any script under skills/cao-skill-creator/"
+        "Does not instruct running any script at a path that does not exist in this repository"
       ]
     },
     {
       "id": 2,
       "prompt": "I ran cao plugin validate --json on my package and got exit 1 with nothing on stdout. Is my package broken?",
-      "expected_output": "An explanation that exit 1 with no JSON means the release gate is unset and the package was not evaluated, with the corrected command.",
+      "expected_output": "An explanation that exit 1 with no JSON is not a conformance result and says nothing about the package, that the cause cannot be inferred from the missing JSON alone, and that the stderr text says what happened; if it is the release-gate refusal, re-run with CAO_AGENT_PLUGINS_ENABLED set inline.",
       "assertions": [
-        "Identifies the unset CAO_AGENT_PLUGINS_ENABLED gate as the cause",
+        "Does not conclude the package is broken from exit 1 with no JSON",
+        "Does not infer the cause from the missing JSON alone, and points the reader at the stderr text",
+        "Names an unset CAO_AGENT_PLUGINS_ENABLED as one possible cause, identified by its stderr refusal text",
         "States that the value is stripped and lowercased and compared against 1, true and yes",
-        "States that an unset gate emits no JSON and is not a conformance result",
+        "States that an unset gate emits no JSON and no conformance result",
         "Gives the discriminator as whether stdout parses as JSON, not the exit status"
       ]
     },
