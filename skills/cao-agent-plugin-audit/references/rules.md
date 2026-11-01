@@ -35,7 +35,7 @@ The pinned values are the `PINNED_SHA256` constant in the script. They equal the
 | `manifest.unknown_field` | WARNING | yes | a top-level key outside the schema's properties; ignored, as CAO does |
 | `manifest.extensions_not_object` | WARNING | yes | `extensions` is not an object; ignored, as CAO does |
 | `manifest.invalid` | FATAL | yes | any other violation of the vendored schema: a missing `name`, a `name` outside the pattern or the 1-64 bound, a wrong type, an unknown key inside `author` |
-| `manifest.description_listing` | ADVISORY | no | always emitted when a manifest was read: the declared `description` beside the discovered skill names |
+| `manifest.description_listing` | ADVISORY | no | emitted whenever a manifest was read: the declared `description` beside the names of the skills that would load (a SKIPPED skill is left out) |
 
 `manifest.description_listing` lists two things side by side. It makes no
 judgement about whether they correspond, and no input changes its severity.
@@ -51,14 +51,23 @@ An absent `mcp.json` is not a finding.
 
 ## Skill discovery, package mode only
 
-Discovery mirrors CAO's: immediate children of `skills/`, never recursive; a child
-whose name starts with `.` is ignored; a regular file directly under `skills/` is
-ignored. An absent `skills/` is not a finding.
+Discovery mirrors CAO's top-level checks, in CAO's order: immediate children of
+`skills/`, never recursive; a child whose name starts with `.` is ignored; a child
+that resolves outside the package root is skipped; a regular file directly under
+`skills/` is ignored; a `SKILL.md` that resolves outside the root, through a
+symlink, is skipped; a missing `SKILL.md` is skipped. An absent `skills/` is not a
+finding.
+
+**Not mirrored:** CAO also walks every nested entry inside a skill and skips the
+skill if a nested symlink escapes the root, dangles or loops. The bundled walk does
+not repeat that. With `CAO_AGENT_PLUGINS_ENABLED` set, CAO's own findings are
+reported (see "CAO's verdict" below), so such a skill still changes the exit
+status; with the gate unset it is not detected.
 
 | Code | Severity | CAO | Condition |
 |---|---|---|---|
 | `skills.not_a_directory` | SKIPPED | yes | `skills` exists and is not a directory |
-| `skill.escapes_root` | SKIPPED | yes | the child resolves outside the package root |
+| `skill.escapes_root` | SKIPPED | yes | the child, or its `SKILL.md`, resolves outside the package root |
 | `skill.missing_skill_md` | SKIPPED | yes | the child has no `SKILL.md` |
 
 In `--skills-dir` mode, a child without a `SKILL.md` is not a finding: it is
@@ -91,7 +100,10 @@ Runs only when `CAO_AGENT_PLUGINS_ENABLED` is already set to `1`, `true` or
 
 | Code | Severity | Condition |
 |---|---|---|
+| `cao.<code>` | WARNING | one per finding in CAO's JSON, whatever CAO's own severity; the message names that severity |
 | `cao.not_loadable` | FATAL | `cao plugin validate --json` printed JSON whose `loadable` is not `true` |
 
-If `cao plugin validate --json` prints no JSON while the gate is set, the audit
-stops with exit 2 and quotes the first line of stderr. It does not infer why.
+The command runs with the package root resolved to an absolute path and a timeout
+of 120 seconds (`CAO_VALIDATE_TIMEOUT_SECONDS`). If it prints no JSON while the
+gate is set, or does not finish in time, the audit stops with exit 2 and, for no
+JSON, quotes the first line of stderr. It does not infer why.

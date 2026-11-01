@@ -3,6 +3,7 @@
 # dependencies = [
 #     "jsonschema>=4.18",
 #     "pyyaml>=6.0",
+#     "referencing>=0.28",
 # ]
 # ///
 """Audit an Agent Plugins 1.0.0 package, or a directory of Agent Skills.
@@ -12,9 +13,11 @@ Two modes, chosen by the arguments:
   validate_agent_plugin.py PACKAGE_ROOT
       PACKAGE_ROOT is an Agent Plugin root, the directory holding plugin.json.
       Checks the manifest against the bundled schema bytes, checks mcp.json if
-      present, discovers skills the way CAO's validator does, and checks every
+      present, discovers skills the way CAO's validator does at the top level
+      (the nested-link walk is left to CAO's own verdict), and checks every
       skill against the five Agent Skills rules. Also runs
-      `cao plugin validate --json` when CAO_AGENT_PLUGINS_ENABLED is set.
+      `cao plugin validate --json` when CAO_AGENT_PLUGINS_ENABLED is set, and
+      reports each finding CAO returns as a WARNING.
 
   validate_agent_plugin.py --skills-dir DIR
       Each immediate child of DIR that contains a SKILL.md is one skill, checked
@@ -27,10 +30,14 @@ after the closing frontmatter delimiter, stripped).
 
 Exit status: 0 = no finding above advisory; 1 = at least one finding;
 any other status = the audit itself failed (bad arguments, unreadable input,
-schema bytes that do not hash to the pin, or a crash).
+schema bytes that do not hash to the pin, a `cao plugin validate` that prints
+no JSON or does not finish within CAO_VALIDATE_TIMEOUT_SECONDS, or a crash).
 
-This script never reads stdin and never opens a network connection. The https
-string below is the $schema identifier, compared as text.
+This script never reads stdin and opens no network connection itself: schema
+references are resolved only against the two bundled schemas, and any other
+retrieval is refused. Running it with `uv run --script` needs its three declared
+dependencies available, which on a first run means a uv cache or a package index.
+The https string below is the $schema identifier, compared as text.
 """
 
 from __future__ import annotations
@@ -48,6 +55,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import jsonschema
 import yaml
+from referencing import Registry, Resource
+from referencing.exceptions import NoSuchResource
 
 PLUGIN_SCHEMA_ID = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
 
@@ -71,12 +80,14 @@ DESCRIPTION_MAX = 1024
 BODY_MAX = 500
 GATE_VAR = "CAO_AGENT_PLUGINS_ENABLED"
 GATE_TRUTHY = ("1", "true", "yes")
+# How long `cao plugin validate --json` may run before the audit gives up (exit 2).
+CAO_VALIDATE_TIMEOUT_SECONDS = 120
 
 # Severity order. Only ADVISORY leaves the exit status at 0.
 FATAL = "FATAL"  # the package is not loadable by CAO
 SKIPPED = "SKIPPED"  # CAO drops one skill, or MCP, and loads the rest
 LIMIT = "LIMIT"  # breaks an Agent Skills limit; CAO's loader does not check it
-WARNING = "WARNING"  # CAO reports it and loads the package anyway
+WARNING = "WARNING"  # CAO reports it (or a finding CAO returned) and the package still loads
 ADVISORY = "ADVISORY"  # input for a human judgement; never changes the exit status
 
 
@@ -107,10 +118,6 @@ class Report:
 # --- schemas -----------------------------------------------------------------
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _find_cao_pin() -> Optional[Path]:
     """Look for CAO's PIN.json above this script; present in a CAO checkout or wheel."""
     for ancestor in Path(__file__).resolve().parents:
@@ -127,10 +134,14 @@ def load_schemas(report: Report) -> Dict[str, Dict[str, Any]]:
         path = SCHEMA_DIR / filename
         if not path.is_file():
             raise AuditError(f"bundled schema missing: {path}")
-        actual = _sha256(path)
+        data = path.read_bytes()  # hash and parse the SAME bytes
+        actual = hashlib.sha256(data).hexdigest()
         if actual != pinned:
             raise AuditError(f"bundled {filename} hashes to {actual}, pin is {pinned}")
-        schemas[filename] = json.loads(path.read_text(encoding="utf-8"))
+        schemas[filename] = json.loads(data.decode("utf-8"))
+    _SCHEMA_RESOURCES[:] = [
+        (str(schema.get("$id", name)), Resource.from_contents(schema)) for name, schema in schemas.items()
+    ]
     report.info("schemas: bundled plugin.schema.json and mcp.schema.json hash to the pinned sha256")
 
     pin = _find_cao_pin()
@@ -150,11 +161,24 @@ def load_schemas(report: Report) -> Dict[str, Dict[str, Any]]:
     return schemas
 
 
+def _refuse_retrieval(uri: str) -> Resource:
+    """Registry hook that refuses every retrieval, as CAO's validator does.
+
+    The bundled schemas use only in-document "#/$defs" references. A reference to
+    anything else must fail loudly here rather than reach the network.
+    """
+    raise NoSuchResource(ref=uri)
+
+
+_SCHEMA_RESOURCES: List[Tuple[str, Resource]] = []
+
+
+def _registry() -> Registry:
+    return Registry(retrieve=_refuse_retrieval).with_resources(_SCHEMA_RESOURCES)
+
+
 def _schema_errors(schema: Dict[str, Any], instance: Any) -> List[str]:
-    # The bundled schemas use only local "#/$defs" references. jsonschema >= 4.18
-    # resolves those in-document and retrieves nothing remote unless a retrieval
-    # function is configured, and none is.
-    validator = jsonschema.Draft202012Validator(schema)
+    validator = jsonschema.Draft202012Validator(schema, registry=_registry())
     errors = sorted(validator.iter_errors(instance), key=lambda e: (list(map(str, e.absolute_path)), e.message))
     out = []
     for error in errors:
@@ -286,8 +310,23 @@ def check_skill(skill_dir: Path, report: Report) -> Optional[str]:
     return name if loadable else None
 
 
+def _within(real_root: Path, candidate: Path) -> bool:
+    """Whether ``candidate``, with every symlink resolved, is inside ``real_root``."""
+    try:
+        resolved = Path(os.path.realpath(candidate))
+    except OSError:
+        return False
+    return resolved == real_root or real_root in resolved.parents
+
+
 def discover_package_skills(root: Path, report: Report) -> List[str]:
-    """Mirror CAO's discovery: immediate, non-recursive children of skills/."""
+    """Mirror CAO's top-level discovery: immediate, non-recursive children of skills/.
+
+    The order of checks follows CAO's ``_discover_skills``: dot entries, the
+    child's containment, non-directories, the SKILL.md's containment, then its
+    presence. CAO's walk of every nested entry in a skill (``_validate_skill_tree``)
+    is not repeated here; with the gate set, CAO's own findings cover it.
+    """
     skills_dir = root / "skills"
     if not skills_dir.exists():
         report.info("skills/: absent (optional)")
@@ -295,13 +334,18 @@ def discover_package_skills(root: Path, report: Report) -> List[str]:
     if not skills_dir.is_dir():
         report.finding(SKIPPED, "skills.not_a_directory", "skills", "'skills' exists but is not a directory; CAO loads no skills")
         return []
-    real_root = root.resolve()
+    real_root = Path(os.path.realpath(root))
     loaded: List[str] = []
     for child in sorted(skills_dir.iterdir(), key=lambda p: p.name):
-        if child.name.startswith(".") or not child.is_dir():
+        if child.name.startswith("."):
             continue
-        if real_root not in child.resolve().parents:
+        if not _within(real_root, child):
             report.finding(SKIPPED, "skill.escapes_root", child.name, "resolves outside the package root; CAO would skip this skill")
+            continue
+        if not child.is_dir():
+            continue
+        if not _within(real_root, child / "SKILL.md"):
+            report.finding(SKIPPED, "skill.escapes_root", child.name, "SKILL.md resolves outside the package root; CAO would skip this skill")
             continue
         if not (child / "SKILL.md").is_file():
             report.finding(SKIPPED, "skill.missing_skill_md", child.name, "no SKILL.md; CAO would skip this directory")
@@ -329,13 +373,17 @@ def run_cao_validate(root: Path, report: Report) -> None:
     if cao is None:
         report.info("cao plugin validate: not run (no cao executable on PATH)")
         return
-    proc = subprocess.run(
-        [cao, "plugin", "validate", "--json", str(root)],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [cao, "plugin", "validate", "--json", str(root.resolve())],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=CAO_VALIDATE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AuditError(f"cao plugin validate --json did not finish within {CAO_VALIDATE_TIMEOUT_SECONDS}s") from exc
     try:
         verdict = json.loads(proc.stdout)
     except ValueError:
@@ -345,6 +393,18 @@ def run_cao_validate(root: Path, report: Report) -> None:
     loadable = verdict.get("loadable")
     findings = verdict.get("findings") or []
     report.info(f"cao plugin validate --json ({cao}): exit {proc.returncode}, loadable {loadable}, {len(findings)} findings")
+    # Each CAO finding is reported as a WARNING, so it changes the audit's exit
+    # status even when CAO still calls the package loadable (a SKIPPED skill, say).
+    for item in findings:
+        if not isinstance(item, dict):
+            continue
+        code = item.get("code", "unknown")
+        report.finding(
+            WARNING,
+            f"cao.{code}",
+            str(item.get("path") or "plugin.json"),
+            f"CAO reported {item.get('severity', '?')}: {item.get('message', '')}",
+        )
     if loadable is not True:
         report.finding(FATAL, "cao.not_loadable", "plugin.json", "CAO's own validator reports the package not loadable")
 
