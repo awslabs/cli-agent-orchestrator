@@ -509,7 +509,7 @@ def test_vendored_fork_retains_the_reviewed_registry_bytes_and_metadata():
         ("web", "source-map-js", "1.2.2"),
         ("docusaurus", "compression", "1.8.2"),
         ("docusaurus", "proxy-addr", "2.0.8"),
-        ("docusaurus", "joi", "17.13.8"),
+        ("docusaurus", "joi", "17.13.9"),
         ("docusaurus", "postcss-selector-parser", "7.1.6"),
         ("docusaurus", "tinypool", "2.1.2"),
     ],

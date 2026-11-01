@@ -50,6 +50,7 @@ run_trivy() {
     uv export --frozen --format requirements-txt > requirements.txt
     trivy fs \
         --ignore-unfixed \
+        --ignorefile .trivyignore.yaml \
         --exit-code 1 \
         . || exit_code=1
     rm -f requirements.txt
