@@ -472,7 +472,7 @@ sudo apt-get install trivy  # Ubuntu/Debian
 # this is what the CI gate actually does (see the note below).
 # `--frozen` matters: a plain `uv export` rewrites the tracked uv.lock.
 uv export --frozen --format requirements-txt > requirements.txt  # so Python deps are scanned
-trivy fs --ignore-unfixed --exit-code 1 .
+trivy fs --ignore-unfixed --ignorefile .trivyignore.yaml --exit-code 1 .
 rm -f requirements.txt
 ```
 
@@ -489,6 +489,15 @@ rm -f requirements.txt
 > log shows both `[vuln] Vulnerability scanning is enabled` and
 > `[secret] Secret scanning is enabled`. `--scanners vuln` would hide the
 > secret findings CI blocks on. (See issue #568.)
+
+Security Scan honours the scoped, expiring `.trivyignore.yaml` at the repo root
+(via the `trivyignores:` input on both Trivy steps); Dependency Security never
+reads it, so a HIGH or CRITICAL finding can't be exempted there. Each entry
+needs an advisory ID, its exact lockfile path(s), its exact purl(s), a
+statement explaining why it's not exploitable here and what ends the
+exemption, and an `expired_at` date — after which the finding fails CI again.
+Check each `.trivyignore.yaml` entry's exit condition, and before its `expired_at`
+either renew it with fresh evidence or remove it.
 
 The bundled wrapper runs the full dependency gate first, then other available
 local scanners:
