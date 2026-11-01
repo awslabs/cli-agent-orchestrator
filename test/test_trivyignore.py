@@ -1,6 +1,6 @@
 """Structural guard for the scoped, expiring Security Scan exemption file.
 
-``.trivyignore.yaml`` (ADR 269a §7.1) suppresses CVE-2026-118764 for Security
+``.trivyignore.yaml`` (see its header comment and SECURITY.md) suppresses CVE-2026-118764 for Security
 Scan only, at two exact lockfile paths and purls, until it expires. This test
 pins its shape — every entry stays scoped and attributable — and pins that
 both trivy-action steps in ci.yml see the same exemption file. It
@@ -27,6 +27,9 @@ _spec.loader.exec_module(_audit)
 
 def _entries():
     data = yaml.safe_load(TRIVYIGNORE.read_text())
+    # Any other top-level section (secrets, misconfigurations, licenses) is an
+    # unscoped exemption this guard does not check, so it must fail here.
+    assert set(data) == {"vulnerabilities"}, sorted(data)
     return data["vulnerabilities"]
 
 
