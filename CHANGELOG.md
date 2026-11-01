@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **The ambient AG-UI stream sends generative UI as `CUSTOM` `cao.generative_ui`, not
+  `GENERATIVE_UI`.** AG-UI 1.0 has no `GENERATIVE_UI` event type, and its processing rules say a
+  producer "MUST NOT emit an event type the protocol does not describe" (`CUSTOM` and `RAW` exist
+  for that). `GET /agui/v1/stream` now sends an allow-listed `emit_ui` component as `event: CUSTOM`
+  with a spec `CustomEvent` body, `{"type": "CUSTOM", "name": "cao.generative_ui", "value":
+  {component, props, event_id, terminal_id, session_name, timestamp, traceparent}}`, the same name
+  and value the run plane already used. There is no compatibility flag. A client that listened for
+  `GENERATIVE_UI` must listen for `CUSTOM` and read `value` when `name` is `cao.generative_ui`; the
+  in-tree consumers (the EventSource viewer, the CAO Dojo page and its e2e driver, and the dashboard
+  `showcase.sh` gate) are updated. Off-list components are still refused as `RAW` with
+  `rejected_component`. `docs/agui.md` no longer claims that any AG-UI client renders these frames.
 - **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3
   `Default` fallback** (#1167). A Kiro header with extra columns between the model and the context
   gauge, such as `<agent> · claude-haiku-5.5 · low · ◔ 2%` on the v2 engine with `--effort`, or

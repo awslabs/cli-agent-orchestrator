@@ -54,7 +54,7 @@ prompt as an interrupt. Live fleet activity is the ambient plane,
 | `TOOL_CALL_START` | An orchestration tool was invoked |
 | `TOOL_CALL_END` | Tool completed (with `closed_by` disposition) |
 | `TOOL_CALL_RESULT` | Tool output |
-| `GENERATIVE_UI` | Your `emit_ui` intents appear here |
+| `CUSTOM` (`name: "cao.generative_ui"`) | Your `emit_ui` intents, with `value` = `{component, props, ...}` |
 | `Interrupt` | Approval prompt — stream pauses until resumed |
 | `RUN_FINISHED` | Normal completion |
 | `RUN_ERROR` | Error (delivery failure, timeout, etc.) |

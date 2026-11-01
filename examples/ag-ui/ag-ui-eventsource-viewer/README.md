@@ -16,14 +16,15 @@ install.
   header; default `http://localhost:9889`). An optional **Access token** field
   attaches `?access_token=` for auth-enabled servers (held in memory only).
 - Listens for the named AG-UI events: `STATE_SNAPSHOT`, `STATE_DELTA`,
-  `GENERATIVE_UI`, `RUN_STARTED`, `RUN_FINISHED`, `STEP_STARTED`,
+  `CUSTOM`, `RUN_STARTED`, `RUN_FINISHED`, `STEP_STARTED`,
   `STEP_FINISHED`, `TOOL_CALL_START`, `TOOL_CALL_END`, `TEXT_MESSAGE_CONTENT`,
   `RUN_ERROR`.
 - Holds a **fleet projection**: hydrates from `STATE_SNAPSHOT` (`data.snapshot`)
   then applies RFC-6902 patches from `STATE_DELTA` (`data.delta`) with a tiny
   inline JSON-Patch applier (`add` / `replace` / `remove`) — no npm dependency.
   The sessions/terminals panel is derived from that projected state.
-- Renders `GENERATIVE_UI` components (`approval_card`, `choice_prompt`,
+- Renders generative-UI components, which arrive as `CUSTOM` events named
+  `cao.generative_ui` with the component in `value` (`approval_card`, `choice_prompt`,
   `diff_summary`, `progress`, `metric`, `agent_card`) from JSON props **only**,
   using DOM APIs (`textContent` / `createElement`) — **no `innerHTML`, no
   `eval`, no `dangerouslySetInnerHTML`**. It keeps a client-side mirror of the

@@ -208,7 +208,7 @@ try {
     await shot("3-run-error");
     await hold();
   } else {
-    // The card must come from the stream's GENERATIVE_UI frame, so
+    // The card must come from the stream's cao.generative_ui frame, so
     // wait for this interrupt's card before the page posts any run. Earlier
     // phases' cards replay too, hence matching on the id e2e-local.sh probed.
     const id = process.env.E2E_INTERRUPT_ID;
@@ -443,15 +443,26 @@ async function pagePhase() {
   };
   const emit = (type, data, id) =>
     page.evaluate(([t, d, i]) => window.__es.emit(t, d, i), [type, data, id]);
+  // A generative-UI frame as cao-server sends it: AG-UI CUSTOM named
+  // cao.generative_ui, the component in `value`. A string is spliced in raw so
+  // a test can send JSON that JSON.stringify cannot produce (e.g. 1e999).
+  const emitUi = (ui, id) =>
+    emit(
+      "CUSTOM",
+      typeof ui === "string"
+        ? `{"type":"CUSTOM","name":"cao.generative_ui","value":${ui}}`
+        : { type: "CUSTOM", name: "cao.generative_ui", value: ui },
+      id,
+    );
 
   try {
     await page.goto(`${origin}/index.html`);
     await connect();
 
     // 1. The 40-card cap never prunes a pending card.
-    await emit("GENERATIVE_UI", card("keep-me"), "e1");
+    await emitUi(card("keep-me"), "e1");
     for (let i = 0; i < 45; i++) {
-      await emit("GENERATIVE_UI", { component: "metric", props: { label: "m" + i, value: i } }, "m" + i);
+      await emitUi({ component: "metric", props: { label: "m" + i, value: i } }, "m" + i);
     }
     expect((await stateOf("keep-me")) === "pending", "a pending card survives the 40-item cap");
 
@@ -470,7 +481,7 @@ async function pagePhase() {
 
     // 3. A resolved card stays resolved when a reconnect replays its frame.
     await connect();
-    await emit("GENERATIVE_UI", card("done-1"), "d1");
+    await emitUi(card("done-1"), "d1");
     runBody = finished({ type: "success" });
     await page
       .locator('[data-interrupt-id="done-1"] [data-testid="approval-approve"]')
@@ -483,8 +494,8 @@ async function pagePhase() {
       "a stubbed RUN_FINISHED marks the card approved",
     );
     await connect();
-    await emit("GENERATIVE_UI", card("done-1"), "d1");
-    await emit("GENERATIVE_UI", card("done-1"), "d1-again");
+    await emitUi(card("done-1"), "d1");
+    await emitUi(card("done-1"), "d1-again");
     const replayed = await stateOf("done-1");
     expect(replayed !== null && replayed !== "pending", `a replayed resolved card is not pending (got ${replayed})`);
 
@@ -507,7 +518,7 @@ async function pagePhase() {
     expect((await page.locator('[data-testid="approval-card"]').count()) === 0, "connect() clears the cards");
 
     // 6. A non-finite progress value never renders "NaN%" or "Infinity%".
-    await emit("GENERATIVE_UI", '{"component":"progress","props":{"label":"p","value":1e999}}', "p1");
+    await emitUi('{"component":"progress","props":{"label":"p","value":1e999}}', "p1");
     const progress = await page.locator("#components").innerText();
     expect(!/NaN%|Infinity%/.test(progress), "a non-finite progress value is not shown as a percentage");
 
@@ -523,10 +534,10 @@ async function pagePhase() {
     const record = (n) => ({ component: "metric", props: { label: "rec-" + n, value: n } });
     for (const n of [1, 2, 3]) {
       if (n > 1) await page.evaluate(() => { window.__es.fail(0); window.__es.open(); });
-      await emit("GENERATIVE_UI", record(n), "evt-" + n);
+      await emitUi(record(n), "evt-" + n);
       await emit("STATE_SNAPSHOT", { snapshot: { sessions: [{ name: "conn-" + n, status: "idle" }], terminals: [] } });
       await emit("STATE_DELTA", { delta: [{ op: "add", path: "/sessions/-", value: { name: "delta-" + n, status: "idle" } }] });
-      if (n === 3) await emit("GENERATIVE_UI", record(2), "evt-2");
+      if (n === 3) await emitUi(record(2), "evt-2");
     }
     const fleet = await page.locator("#fleet .sname").allInnerTexts();
     expect(
@@ -540,13 +551,13 @@ async function pagePhase() {
     // while the run is in flight is newer than that list and must stay pending;
     // a card that was open when the run started and is not listed is settled.
     await connect();
-    await emit("GENERATIVE_UI", card("early"), "c-early");
+    await emitUi(card("early"), "c-early");
     let release;
     holdRun = new Promise((r) => { release = r; });
     runBody = finished({ type: "success" });
     await page.locator("#send").click();
     await page.waitForTimeout(200);
-    await emit("GENERATIVE_UI", card("late"), "c-late");
+    await emitUi(card("late"), "c-late");
     release();
     holdRun = null;
     await page
@@ -564,7 +575,7 @@ async function pagePhase() {
     // 10. Session-end closer frames have no id: line either. After a record
     // they report its id, and must still reach the log.
     await connect();
-    await emit("GENERATIVE_UI", record(10), "evt-10");
+    await emitUi(record(10), "evt-10");
     await emit("TOOL_CALL_END", { toolCallId: "t1", message: "closer-one" });
     await emit("TOOL_CALL_END", { toolCallId: "t2", message: "closer-two" });
     const logText = await page.locator("#log").innerText();

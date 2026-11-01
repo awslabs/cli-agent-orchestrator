@@ -26,6 +26,8 @@ import os
 import uuid
 from typing import Any, AsyncGenerator, Dict, Optional
 
+from cli_agent_orchestrator.services.agui_stream import CAO_GENERATIVE_UI_EVENT_NAME
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -74,7 +76,7 @@ _AGUI_STEP_STARTED = "STEP_STARTED"
 _AGUI_STEP_FINISHED = "STEP_FINISHED"
 _AGUI_TOOL_CALL_START = "TOOL_CALL_START"
 _AGUI_TOOL_CALL_END = "TOOL_CALL_END"
-_AGUI_GENERATIVE_UI = "GENERATIVE_UI"
+_AGUI_CUSTOM = "CUSTOM"
 _AGUI_TEXT_MESSAGE_CONTENT = "TEXT_MESSAGE_CONTENT"
 _AGUI_RAW = "RAW"
 _AGUI_RUN_STARTED = "RUN_STARTED"
@@ -510,13 +512,16 @@ def _translate_live_frame(
             )
             return encoder.encode(evt)
 
-        elif agui_type == _AGUI_GENERATIVE_UI:
+        elif agui_type == _AGUI_CUSTOM:
+            # Already a CUSTOM frame (the ambient mapping's generative-UI frame,
+            # ``name=CAO_GENERATIVE_UI_EVENT_NAME``): re-wrap it for this run
+            # with its own name and value, so the value is not nested twice.
             evt = CustomEvent(
                 type="CUSTOM",
                 thread_id=thread_id,
                 run_id=run_id,
-                name="cao.generative_ui",
-                value=data,
+                name=data.get("name") or CAO_GENERATIVE_UI_EVENT_NAME,
+                value=data.get("value"),
             )
             return encoder.encode(evt)
 

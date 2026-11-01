@@ -2266,8 +2266,9 @@ async def agui_stream(
     shares the exact same source as ``/events`` — the in-process ``SseBus`` fed
     by the ``EventLogPublisher`` — but re-maps each normalized six-primitive
     record onto AG-UI typed events via ``agui_stream.to_agui_event`` before it
-    hits the wire, so any AG-UI-compatible client renders CAO with no custom
-    adapter code.
+    hits the wire. Every frame is named by an AG-UI 1.0 event type; generative
+    UI rides on ``CUSTOM`` with ``name="cao.generative_ui"``, which a client
+    renders only if it knows that name.
 
     Each SSE frame is a *named* AG-UI event: ``event: <AGUI_TYPE>`` +
     ``data: <json>``. Message bodies are never carried (the ring buffer stores
@@ -2513,7 +2514,8 @@ async def agui_emit_ui(
     An agent — via the ``emit_ui`` MCP tool — declares a component from the
     frozen allow-list; the intent is validated **server-side** here and
     published onto the fleet event bus, where ``agui_stream.to_agui_event`` maps
-    it to a ``GENERATIVE_UI`` frame on ``/agui/v1/stream``. Off-list components
+    it to a ``CUSTOM`` frame named ``cao.generative_ui`` on ``/agui/v1/stream``
+    (AG-UI 1.0 defines no generative-UI event type). Off-list components
     and oversized/non-serializable props are rejected (400) so a bad intent
     never reaches the bus. Requires ``cao:write`` when auth is enabled.
     """

@@ -39,7 +39,7 @@ typed events:
 | a2a_delegation | `TOOL_CALL_START` | Cross-agent A2A task; closer also synthesizes `TOOL_CALL_RESULT` |
 | file modification | `STATE_DELTA` (RFC 6902) against a fleet `STATE_SNAPSHOT` | |
 | error | `RUN_ERROR` | |
-| agent-authored UI | `GENERATIVE_UI` | |
+| agent-authored UI | `CUSTOM` with `name: "cao.generative_ui"` | Off-list component: `RAW` with `rejected_component` |
 
 [1] **L1 Cleanup A (TOOL_CALL lifecycle):** Handoff records with
 `orchestration_type` of `handoff` or `assign` now map to `TOOL_CALL_START`
@@ -171,16 +171,32 @@ as the original stream -- no duplicate closers, no orphan frames.
 
 ## Generative UI
 
-Any agent in the fleet — regardless of provider — can author a UI intent and
-have it rendered uniformly by any AG-UI client. The safety model is what makes
+Any agent in the fleet — regardless of provider — can author a UI intent, and
+a client that knows CAO's `cao.generative_ui` event renders it the same way
+whichever provider wrote it. The safety model is what makes
 that shippable over *untrusted* agents: an agent may only emit a **closed
 allow-list of named components with JSON props** — no HTML, no script, no
 `eval`, no iframe. An off-list component is **refused, never rendered**.
 
 **Wire path.** An agent calls the `emit_ui` MCP tool (or
 `POST /agui/v1/emit_ui`) → the intent rides a CAO event as a `ui` block
-(`{component, props}`) → the AG-UI adapter maps it to a typed `GENERATIVE_UI`
-frame → `GET /agui/v1/stream` emits it → any AG-UI client renders it.
+(`{component, props}`) → the AG-UI adapter maps it to a `CUSTOM` event named
+`cao.generative_ui` → `GET /agui/v1/stream` emits it → a client that handles
+that name renders it.
+
+AG-UI 1.0 defines no generative-UI event type, and a producer "MUST NOT emit an
+event type the protocol does not describe" (`CUSTOM` and `RAW` exist for that).
+The frame is therefore a spec `CustomEvent`. A stock AG-UI client receives it
+and can ignore it; it renders nothing unless it handles `cao.generative_ui`.
+Both planes use the same name and value:
+
+```text
+event: CUSTOM
+data: {"type": "CUSTOM", "name": "cao.generative_ui",
+       "value": {"component": "progress", "props": {"label": "demo", "value": 0.5},
+                 "event_id": "...", "terminal_id": "...", "session_name": "...",
+                 "timestamp": "...", "traceparent": null}}
+```
 
 **Server-side validation** (`services/agui_stream.py`): the closed allow-list
 `GENERATIVE_UI_COMPONENTS = {approval_card, choice_prompt, diff_summary,
@@ -208,7 +224,7 @@ falling back to an inert placeholder for anything unknown.
 [`examples/ag-ui/ag-ui-dashboard/`](../examples/ag-ui/ag-ui-dashboard) is a credentials-free,
 runnable demonstration: `run.sh` starts a `cao-server` with the surface enabled
 and `showcase.sh` drives all six allow-listed components plus an off-list
-refusal through `emit_ui`, gating on the `GENERATIVE_UI` frames actually
+refusal through `emit_ui`, gating on the `CUSTOM` `cao.generative_ui` frames actually
 arriving on the live SSE stream (so it doubles as a deployment smoke test). Teach
 an agent the component vocabulary with the bundled
 [`agui-author`](../skills/agui-author/SKILL.md) skill.
@@ -230,7 +246,7 @@ wire dialect, consumer shape, and intended use:
 
 The **ambient plane** is the `GET /agui/v1/stream` SSE endpoint. It speaks
 CAO's own AG-UI dialect: `event:` + `data:` frames with UPPER_SNAKE event types
-(`STATE_SNAPSHOT`, `STATE_DELTA`, `STEP_STARTED`, `GENERATIVE_UI`, etc.) and an
+(`STATE_SNAPSHOT`, `STATE_DELTA`, `STEP_STARTED`, `CUSTOM`, etc.) and an
 `id:` cursor for replay. Any `EventSource`-compatible client (browser-native or
 library-based) connects, hydrates from the initial `STATE_SNAPSHOT`, then folds
 live frames into its projection.
