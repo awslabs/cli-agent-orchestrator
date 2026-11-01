@@ -23,6 +23,7 @@ import json
 import logging
 import re
 import shlex
+import time
 from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -73,6 +74,10 @@ PERMISSION_PROMPT_PATTERN = r"△\s+(?:Permission required|Always allow)\b"
 TOOL_CALL_IN_FLIGHT_PATTERN = r"^\s+[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+\S+"
 
 
+# Bound repeated pane-command lookups while a terminal is busy.
+EXIT_CHECK_INTERVAL_S = 2.0
+
+
 class OpenCodeCliProvider(BaseProvider):
     """Provider for OpenCode CLI integration.
 
@@ -120,6 +125,9 @@ class OpenCodeCliProvider(BaseProvider):
         self._model = model
         self._initialized = False
         self._cli_major = 1
+        self._exit_checked_at: Optional[float] = None
+        self._exited = False
+        self._startup_history = ""
         self._shell_baseline: Optional[str] = None
         self._dispatched_message: Optional[str] = None
 
@@ -168,21 +176,12 @@ class OpenCodeCliProvider(BaseProvider):
 
     @property
     def extraction_tail_lines(self) -> int:
-        """Capture extra scrollback for extraction (belt-and-braces).
+        """Capture up to 2000 lines for LAST-mode extraction.
 
-        Consumed by ``terminal_service.get_output`` via a ``getattr`` capability
-        check: providers that define this attribute opt in to a deeper
-        ``capture-pane`` for LAST-mode extraction.
-
-        OpenCode renders in alt-screen mode, so tmux's history_size stays near 2
-        and capture-pane returns only the current viewport (~41 lines) regardless
-        of the -S prefix. In current opencode releases this request is therefore
-        a no-op — extraction relies on the within-viewport fallback at
-        extract_last_message_from_script (see the ``first_indent`` branch).
-
-        The value is retained as belt-and-braces in case opencode ever switches
-        out of alt-screen mode (at which point the 2000-line capture would start
-        providing the extra scrollback the extraction loop originally expected).
+        Mini uses the normal screen buffer: this capture is the response source
+        and bounds the transcript that _extract_mini_response can validate.
+        V1 uses the alternate screen, where capture usually contains only the
+        viewport and extraction relies on its within-viewport fallback.
         """
         return 2000
 
@@ -210,6 +209,9 @@ class OpenCodeCliProvider(BaseProvider):
             get_backend().get_pane_current_command, self.session_name, self.window_name
         )
         command = self._build_launch_command()
+        self._startup_history = strip_terminal_escapes(
+            get_backend().get_history(self.session_name, self.window_name) or ""
+        )
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # 120s covers first-run npm install (5–30s) and concurrent multi-agent launches.
@@ -225,18 +227,46 @@ class OpenCodeCliProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def _exited_to_shell(self) -> bool:
-        return bool(
-            self._shell_baseline
-            and get_backend().get_pane_current_command(self.session_name, self.window_name)
-            == self._shell_baseline
-        )
+    def _exited_to_shell(self, *, fresh: bool = True) -> bool:
+        """Refresh ready verdicts immediately; throttle other tmux lookups."""
+        if not self._shell_baseline:
+            return False
+        now = time.monotonic()
+        if (
+            fresh
+            or self._exit_checked_at is None
+            or now - self._exit_checked_at >= EXIT_CHECK_INTERVAL_S
+        ):
+            self._exited = (
+                get_backend().get_pane_current_command(self.session_name, self.window_name)
+                == self._shell_baseline
+            )
+            self._exit_checked_at = now
+        return self._exited
+
+    def _guard_status(self, status: TerminalStatus) -> TerminalStatus:
+        # subset-ok: Only ready states permit dispatch; other states use the cached exit check.
+        ready = status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+        if self._initialized and self._exited_to_shell(fresh=ready):
+            return TerminalStatus.ERROR
+        return status
 
     async def _check_startup(self) -> None:
         output = await asyncio.to_thread(
             get_backend().get_history, self.session_name, self.window_name
         )
         clean = strip_terminal_escapes(output or "")
+        # Shell prompt text may be extended by the echoed launch command, and
+        # capture-pane may trim trailing blank rows. Remove unchanged leading
+        # rows rather than requiring the entire old capture to be a prefix.
+        before = self._startup_history.splitlines()
+        after = clean.splitlines()
+        common = 0
+        for old, new in zip(before, after):
+            if old.rstrip() != new.rstrip():
+                break
+            common += 1
+        clean = "\n".join(after[common:])
         if await asyncio.to_thread(self._exited_to_shell) or self._startup_error(clean):
             raise ProviderExitedError(
                 "OpenCode failed during initialization. Check the executable on PATH, "
@@ -314,17 +344,16 @@ class OpenCodeCliProvider(BaseProvider):
         if native is not None:
             return native
 
+        return self._guard_status(self._get_buffer_status(output))
+
+    def _get_buffer_status(self, output: str) -> TerminalStatus:
         # herdr never pushes a buffer (pipe_pane is a no-op there); read live
         # pane content instead of falling through to "no output" on every call.
         output = self._resolve_buffer(output)
-        if self._initialized and self._exited_to_shell():
-            return TerminalStatus.ERROR
         if not output:
             return TerminalStatus.UNKNOWN
 
         clean = re.sub(ANSI_CODE_PATTERN, "", output)
-        if not self._initialized and self._startup_error(clean):
-            return TerminalStatus.ERROR
         if self._cli_major == 2:
             return self._mini_status(strip_terminal_escapes(output))
 
@@ -399,8 +428,6 @@ class OpenCodeCliProvider(BaseProvider):
         self._dispatched_message = message
 
     def _mini_status(self, clean: str) -> TerminalStatus:
-        if not self._initialized and self._startup_error(clean):
-            return TerminalStatus.ERROR
         # Only the most recent footer can describe the current state. Mini
         # keeps completed turns in normal terminal scrollback.
         footers = list(re.finditer(r"(?m)^.*ctrl\+p\s+menu.*$", clean))
@@ -482,10 +509,9 @@ class OpenCodeCliProvider(BaseProvider):
         4. IDLE — idle footer present
         5. UNKNOWN — fallback
         """
-        if self._initialized and self._exited_to_shell():
-            return TerminalStatus.ERROR
-        if not self._initialized and self._startup_error("\n".join(screen_lines)):
-            return TerminalStatus.ERROR
+        return self._guard_status(self._get_screen_status(screen_lines))
+
+    def _get_screen_status(self, screen_lines: List[str]) -> TerminalStatus:
         if self._cli_major == 2:
             return self._mini_status("\n".join(screen_lines))
         rows = [ln.rstrip() for ln in screen_lines if ln.strip()]

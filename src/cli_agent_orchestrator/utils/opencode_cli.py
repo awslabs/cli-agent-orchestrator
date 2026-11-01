@@ -3,6 +3,9 @@
 import re
 import subprocess
 
+# Local give-up for one version/help probe; no outer budget bounds it.
+OPENCODE_PROBE_TIMEOUT_S = 15.0
+
 
 def detect_opencode_major() -> int:
     """Accept known generations only, and verify the flags CAO depends on.
@@ -14,7 +17,11 @@ def detect_opencode_major() -> int:
     def probe(*args: str) -> str:
         try:
             result = subprocess.run(
-                ["opencode", *args], capture_output=True, text=True, timeout=15, check=False
+                ["opencode", *args],
+                capture_output=True,
+                text=True,
+                timeout=OPENCODE_PROBE_TIMEOUT_S,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RuntimeError(f"Cannot probe OpenCode ({' '.join(args)}): {exc}") from exc

@@ -23,7 +23,7 @@ from cli_agent_orchestrator.utils.opencode_cli import detect_opencode_major
 
 
 @pytest.fixture
-def delegation_server(tmp_path):
+def delegation_server(tmp_path, require_codex, require_opencode):
     """Use the canonical module import so delegation sees the lifespan's app.
 
     The shared fixture currently uses ``-m api.main``; decision callbacks
@@ -40,6 +40,7 @@ def delegation_server(tmp_path):
         env=env,
         stdout=handle,
         stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
     stopped = [False]
     server = CaoServer(

@@ -118,8 +118,8 @@ def test_launch_agent_model_and_isolation(major):
             TerminalStatus.WAITING_USER_ANSWER,
         ),
         ("△ Always allow", TerminalStatus.WAITING_USER_ANSWER),
-        ("ERROR\nUnrecognized flag: --agent in command opencode", TerminalStatus.ERROR),
-        ("USAGE\nopencode mini [flags]", TerminalStatus.ERROR),
+        ("ERROR\nUnrecognized flag: --agent in command opencode", TerminalStatus.UNKNOWN),
+        ("USAGE\nopencode mini [flags]", TerminalStatus.UNKNOWN),
         ("", TerminalStatus.UNKNOWN),
         ("ctrl+p menu\n› new task", TerminalStatus.UNKNOWN),
     ],
@@ -248,8 +248,8 @@ async def test_unknown_cli_never_launches_worker():
 )
 def test_help_and_launch_errors_are_never_ready(major, output):
     p = provider(major)
-    assert p.get_status(output) == TerminalStatus.ERROR
-    assert p.get_status_from_screen(output.splitlines()) == TerminalStatus.ERROR
+    assert p.get_status(output) == TerminalStatus.UNKNOWN
+    assert p.get_status_from_screen(output.splitlines()) == TerminalStatus.UNKNOWN
 
 
 @pytest.mark.asyncio
@@ -410,3 +410,48 @@ def test_prompt_prefix_is_not_a_validated_full_echo():
         p.extract_last_message_from_script(
             "› task PRIVATE PROMPT CONTINUATION\n\nAnswer\ndeveloper · Model · 2s"
         )
+
+
+@pytest.mark.parametrize("major,footer", [(1, "ctrl+p commands"), (2, "ctrl+p menu")])
+def test_restored_uninitialized_answer_error_is_not_startup_error(major, footer):
+    p = provider(major)
+    frame = "Error: Cannot find module left-pad\n" + footer
+    assert p.get_status(frame) == TerminalStatus.IDLE
+    assert p.get_status_from_screen(frame.splitlines()) == TerminalStatus.IDLE
+
+
+@pytest.mark.asyncio
+async def test_startup_ignores_history_before_launch():
+    p = provider()
+    p._startup_history = "error: failed to refresh shell completions cache\n"
+    with patch("cli_agent_orchestrator.providers.opencode_cli.get_backend") as backend:
+        backend.return_value.get_history.return_value = p._startup_history + "ctrl+p menu"
+        await p._check_startup()
+        backend.return_value.get_history.return_value += "\nError: invalid credentials"
+        with pytest.raises(ProviderExitedError):
+            await p._check_startup()
+
+
+@pytest.mark.parametrize("screen", [False, True])
+def test_busy_exit_checks_cached_but_ready_checks_fresh(screen):
+    p = provider()
+    p._initialized = True
+    p._shell_baseline = "bash"
+    detect = (lambda text: p.get_status_from_screen(text.splitlines())) if screen else p.get_status
+    with (
+        patch("cli_agent_orchestrator.providers.opencode_cli.get_backend") as backend,
+        patch(
+            "cli_agent_orchestrator.providers.opencode_cli.time.monotonic", return_value=10
+        ) as clock,
+    ):
+        command = backend.return_value.get_pane_current_command
+        command.return_value = "opencode"
+        for _ in range(10):
+            assert detect("esc stop ctrl+p menu") == TerminalStatus.PROCESSING
+        assert command.call_count == 1
+        clock.return_value = 13
+        detect("esc stop ctrl+p menu")
+        assert command.call_count == 2
+        command.return_value = "bash"
+        assert detect("ctrl+p menu") == TerminalStatus.ERROR
+        assert command.call_count == 3

@@ -342,7 +342,8 @@ OPENCODE_CONFIG_DIR=~/.aws/opencode opencode --help
 
 Ensure the CAO server running on port 9889 is the **dev version**, not the pre-installed binary:
 ```bash
-# Start this checkout's editable source on an unused port if another server runs.
+# Stop the existing server on port 9889 first (Ctrl-C in its terminal,
+# or stop its service), then start this checkout's editable source.
 uv sync --group dev
 uv run python -c 'import cli_agent_orchestrator; print(cli_agent_orchestrator.__file__)'
 uv run cao-server --port 9889
