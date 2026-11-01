@@ -5,9 +5,24 @@ tags: [case-study]
 description: Twelve days, 32 PRs, at least 18 independent reviews, and a Telegram bot that asked me one question at a time.
 ---
 
-I was on a family holiday in Bali, half watching the kids and half watching my phone. It buzzed: "Push PR 2a?" One tap. Back home, an agent pushed the branch and opened the PR. I put the phone back in my pocket and kept watching the kids.
+I was on a family holiday in Bali, half watching the kids and half watching my phone, when it started buzzing about a Saturday back home.
 
-That's the shape of the last twelve days. [CAO](https://github.com/awslabs/cli-agent-orchestrator), the open-source CLI agent orchestrator, ran a small team of agents against its own repo, and I approved every push from wherever I happened to be, one question at a time. A CAO conductor agent planned the work, sized and delegated every task, and held the whole plan in its head. The question was never "what should we do" — it had already decided that and handed it to a worker. It was always "is it safe to do the thing we already agreed on."
+CI had gone red on two new HIGH-severity Dependabot alerts in the docs site's dependencies. Dependabot had already opened its own fix for each one, and both were red — each fix failed the scanner on the *other* alert.
+
+A combined fix landed in one pull request, and it still wasn't green. This time on two MEDIUM alerts, in a dependency called minimatch.
+
+CAO's architect — the agent whose job is to weigh security and policy calls, not just write code — looked into why a gate set for HIGH and CRITICAL severities was failing on a MEDIUM, and found the trap: the CI step that uploads the security report ignores its own severity filter once it switches to a certain output format. Then it proved both MEDIUM alerts were unreachable code in this repo — flagged, but never actually callable.
+
+The fix was a scoped exemption, naming the exact advisory and the exact two files, with an expiry date three months out so it can't be forgotten. An independent reviewer checked it against the exact advisory and the live gate, with no shortcuts: no blocking issues, four minor nits to tidy up.
+
+![A Telegram message from the Herdr bot, asking whether to push a fast-forward update, with a one-tap "Push it" button](./approval.png)
+*The moment of the tap: the Herdr bot asking whether to push #1184's formatting fix as a fast-forward.*
+
+Three of those nits went out in the next push, folded into one short follow-up commit. Then one more catch, this time automated: the Code Quality check flagged a formatting slip in the new guard test, fixed with yet another small, approved push.
+
+By the time I'm writing this, every check is green — Security Scan included — and the pull request is waiting on a maintainer's review. Not merged yet. That part isn't mine to decide.
+
+That was one Saturday. Over twelve days, the same loop — [CAO](https://github.com/awslabs/cli-agent-orchestrator), the open-source CLI agent orchestrator, running a small team of agents against its own repo — shipped 32 pull requests, one tap, one question, at a time.
 
 {/* truncate */}
 
@@ -29,11 +44,11 @@ At home, my Mac runs CAO's server and one conductor agent, inside [herdr](https:
 
 ![CAO's conductor plans and delegates at home; herdr-remote and its Telegram bot carry approvals to the phone](./workflow.svg)
 
-The one rule that makes this work on a phone: the conductor asks **one question at a time**. A Telegram message with three questions in it gets truncated, so every approval is its own message, most urgent first. I learned that rule the slow way, by watching a multi-question prompt arrive on my phone as half a question.
+The one rule that makes this work on a phone: the conductor asks **one question at a time**. A Telegram message with three questions in it gets truncated, so every approval is its own message, most urgent first. I learned that rule the slow way, by watching a multi-question prompt arrive on my phone as half a question. The question itself was never "what should we do" — the conductor had already decided that and handed it to a worker. It was always "is it safe to do the thing we already agreed on."
 
 Every task the conductor hands out is a file, not a chat message: the exact git commit to start from, the exact steps, the gates that must pass, and the one line a worker sends back when it's done. Workers report back through CAO's own inbox, and a message only lands when the receiver is free to read it — so the conductor sends one consolidated question per check-in, instead of three half-finished ones stacking up.
 
-## The cast
+## Who does what
 
 This is CAO's own agent model at work. The conductor never writes code; everything else is delegated to a role CAO defines:
 
@@ -47,27 +62,15 @@ This is CAO's own agent model at work. The conductor never writes code; everythi
 | Publisher | Pushes and opens PRs against an exact, checksum-pinned brief, never on its own judgment |
 | PR watcher | Tracks every open PR, and auto-merges only our own approved, all-green ones |
 
-## How CAO raises the bar
+## How CAO keeps the quality up
 
 Before anything gets pushed, a fresh reviewer agent gets the exact commit range and the developer's own test evidence — and doesn't take it on faith; it re-runs the tests itself. Findings come back ranked P1 (must fix), P2 (should fix), or P3 (nit), each with a file, a line, and a concrete way it could go wrong, and go back to the developer as one fix commit with its own short follow-up review.
 
 Part of every review is mutation testing: deliberately breaking the code in small, specific ways, then checking whether the tests notice — always against an unbroken "control" copy that has to pass cleanly first. A broken version the tests miss isn't a footnote. It becomes a new test.
 
-The numbers, from every review still on disk: at least 18 reviews of our own changes so far, with 0 P1s, 11 P2s, and 40 P3s between them. Nearly all of those are already fixed; the newest, on the fix in the story below, wrapped up today with four minor nits, three of which went out in the very next push.
+The numbers, from every review still on disk: at least 18 reviews of our own changes so far, with 0 P1s, 11 P2s, and 40 P3s between them. Nearly all of those are already fixed; the newest, on the Saturday alert's exemption above, wrapped up today with four minor nits, three of which went out in the very next push.
 
 Two catches worth naming. On the work to support Kiro CLI's newest engine, a reviewer found that a file path containing an `=` character would make a standard Unix tool misread it as a variable assignment and launch the wrong program — a real bug, caught before any human saw the code, fixed with a test. And across that track's second phase, three review rounds deliberately broke the isolation and launch code 111 separate ways. The tests caught all 111.
-
-## One story, end to end: the Saturday alert
-
-1. CI went red on two new HIGH-severity Dependabot alerts in the docs site's dependencies. Dependabot had already opened one PR for each, but both were red — each one's fix failed the scanner on the *other* alert.
-2. A combined fix landed in one PR, and it still wasn't green. This time on two MEDIUM alerts in a dependency called minimatch.
-3. CAO's architect role — the agent that weighs security and policy calls — looked into why a gate configured for HIGH and CRITICAL was failing on a MEDIUM, and found the trap: the CI step that uploads the security report ignores its own severity filter once it switches to a certain output format. Both MEDIUM alerts turned out to be unreachable code in this repo — flagged, but never actually callable.
-4. The fix is a scoped exemption, naming the exact advisory and the exact two files, with an expiry date three months out so it can't be forgotten. An independent reviewer checked it against the exact advisory and the live gate, with no shortcuts: no blocking issues, four minor nits to tidy up.
-
-![A Telegram message from the Herdr bot, asking whether to push a fast-forward update, with a one-tap "Push it" button](./approval.png)
-*One of those taps, caught on screen: the Herdr bot asking whether to push #1184's formatting fix as a fast-forward.*
-
-5. Three of those nits went out in the next push, folded into one short follow-up commit. Then one more catch, this time automated: the Code Quality check flagged a formatting slip in the new guard test, fixed with yet another small, approved push. By the time I'm writing this, every check is green, Security Scan included, and the PR is waiting on a maintainer's review — not merged yet. That part isn't mine to decide.
 
 ## What I never hand over
 
@@ -77,7 +80,7 @@ Four things stay with me, no matter how the rest is delegated: pushes, GitHub po
 
 In no particular order: the laptop slept and stalled an agent mid-task; a review scratch directory filled the disk; a callback arrived twice and nearly got acted on twice; and a local security check passed while CI failed, because the local run used the documented flags, not the ones CI actually runs with.
 
-## The punchline: CAO helped build CAO
+## Jev picked each helper's model size
 
 Partway through this, we ran a live test of CAO's decision platform: a feature that lets a small model decide how big a helper agent needs to be, instead of a human guessing every time. In a throwaway, disposable CAO instance built for exactly this kind of test, a third-party decider, Jev, sized three ephemeral helpers for three sample tasks — a docs typo, a bug fix, a security review. In shadow mode, where the platform watches but doesn't decide anything yet, Jev picked small, medium, and large, matching the answers those test cases expect — they're Jev's own routing cases, with expected sizes. Once switched on, CAO launched the three helpers on those tiers — haiku, sonnet, and opus — each decision landing in 279 to 501 milliseconds.
 
