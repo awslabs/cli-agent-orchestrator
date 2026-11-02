@@ -401,15 +401,40 @@ def _finalize_launch_best_effort(terminal_id: str, *, end_reason: str) -> None:
         logger.warning("Launch record finalize failed for %s", terminal_id, exc_info=True)
 
 
+def resolve_launch_provider(launch_plan: "LaunchPlan | None", provider: str) -> str:
+    """Resolve the CLI this launch runs on (#1099).
+
+    Only the engine sets ``launch_plan.provider``, for a claimed ephemeral launch that a
+    ``provider.route`` answer routed. The request's provider stays the claim's identity: the
+    idempotency fingerprint, the ephemeral launch checks and the bind compare it unchanged.
+    """
+    return launch_plan.provider if launch_plan and launch_plan.provider else provider
+
+
 def resolve_launch_model(
     model: Optional[str], profile: Optional[AgentProfile], launch_plan: "LaunchPlan | None" = None
 ) -> Optional[str]:
     """Resolve the model CAO passes to a provider for this launch."""
+    if launch_plan is not None and launch_plan.provider is not None:
+        # #1099: a routed launch's profile names the fallback provider's model id, so only
+        # the plan can name the model the decided provider runs.
+        return model or launch_plan.model
     return (
         model
         or (launch_plan.model if launch_plan else None)
         or (profile.model if profile else None)
     )
+
+
+def resolve_launch_effort(launch_plan: "LaunchPlan | None" = None) -> Optional[str]:
+    """Resolve the effort CAO passes to a provider for this launch (#1068 C, #1083).
+
+    Unlike the model, effort is never a per-call override or a profile-level default read
+    here: a provider falls back to its own profile config (``claudeConfig.effort``,
+    ``codexConfig.model_reasoning_effort``) when this is ``None``. A decided effort reaches
+    the provider only through the plan, never through a rewritten live profile.
+    """
+    return launch_plan.effort if launch_plan else None
 
 
 # Track terminals that have already received memory injection (first message only).
@@ -1828,8 +1853,22 @@ async def _create_terminal_unguarded(
         # accepting arbitrary attributes as configuration.
         if profile is not None and not isinstance(profile, AgentProfile):
             profile = None
+        if (
+            launch_plan is not None
+            and launch_plan.provider is not None
+            and (source is not agent_profiles.ProfileSource.EPHEMERAL or claim_id is None)
+        ):
+            # #1099: only the engine routes, and only a claimed ephemeral launch. Anything
+            # else is a bug, refused here before any resource is allocated.
+            raise RuntimeError("a launch plan routed a launch that is not a claimed ephemeral")
+        # The request's provider stays the claim's identity: the fingerprint and the ephemeral
+        # launch checks above used it, and the bind below compares it. Everything else that
+        # depends on which CLI runs uses the launch provider (#1099).
+        requested_provider = provider
+        provider = resolve_launch_provider(launch_plan, provider)
         decision_not_honored = False
         launch_model = resolve_launch_model(model, profile, launch_plan)
+        launch_effort = resolve_launch_effort(launch_plan)
         model_honored = ProviderManager.provider_class(provider).honors_model(
             agent_profile=agent_profile,
             profile=profile,
@@ -1864,7 +1903,14 @@ async def _create_terminal_unguarded(
             try:
                 await asyncio.to_thread(probe, resolved_engine, requested)
             except KiroCapabilityError:
-                if model or launch_plan is None or launch_plan.model is None:
+                # A routed launch is refused, never relaunched on the profile's model, which
+                # is the fallback provider's (#1099).
+                if (
+                    model
+                    or launch_plan is None
+                    or launch_plan.model is None
+                    or launch_plan.provider is not None
+                ):
                     raise
                 launch_model = resolve_launch_model(model, profile)
                 requested = requested_kiro_capabilities(
@@ -2126,10 +2172,11 @@ async def _create_terminal_unguarded(
                 agent_profile,
                 terminal_id,
                 caller_id,
-                provider,
+                requested_provider,
                 claim_id,
                 allowed_tools,
                 idempotency_key,
+                launched_provider=provider,
             )
             ephemeral_state.bound_terminal_id = terminal_id
 
@@ -2555,6 +2602,7 @@ async def _create_terminal_unguarded(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=launch_model,
+            effort=launch_effort,
             engine=resolved_engine,
             resume_session_id=resume_session_id,
             session_id=fresh_claude_session_id,
