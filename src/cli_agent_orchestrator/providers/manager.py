@@ -19,7 +19,7 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     KimiDialect,
     UnsupportedKimiError,
 )
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
@@ -95,8 +95,8 @@ class ProviderManager:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
                 resolved_engine = resolve_kiro_engine(persisted=engine)
-                if resolved_engine == KiroEngine.KAS:
-                    raise KiroPhase0KASError(profile_has_v2_policy=False)
+                if resolved_engine == KiroEngine.V3:
+                    raise KiroV3UnavailableError()
                 provider = KiroCliProvider(
                     terminal_id,
                     tmux_session,
@@ -257,9 +257,9 @@ class ProviderManager:
         if provider:
             if (
                 isinstance(provider, KiroCliProvider)
-                and getattr(provider, "_engine", None) == KiroEngine.KAS
+                and getattr(provider, "_engine", None) == KiroEngine.V3
             ):
-                raise KiroPhase0KASError(profile_has_v2_policy=False)
+                raise KiroV3UnavailableError()
             return provider
 
         # Try to create on-demand from database metadata
@@ -272,8 +272,8 @@ class ProviderManager:
             if metadata["provider"] == ProviderType.KIRO_CLI.value
             else None
         )
-        if persisted_engine == KiroEngine.KAS:
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
+        if persisted_engine == KiroEngine.V3:
+            raise KiroV3UnavailableError()
 
         # Kimi's two CLI families share one public provider id but disagree on
         # spinner/composer/transcript semantics.  A row created before variant

@@ -30,7 +30,7 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_e
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.kiro_capabilities import (
-    KiroPhase0KASError,
+    KiroV3UnavailableError,
     build_kiro_command,
 )
 from cli_agent_orchestrator.providers.kiro_identity import (
@@ -375,11 +375,11 @@ class KiroCliProvider(BaseProvider):
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        if self._engine == KiroEngine.KAS:
+        if self._engine == KiroEngine.V3:
             # This defensive guard makes direct provider use fail closed too.
-            # Normal terminal creation has already probed and rejected KAS before
+            # Normal terminal creation has already probed and rejected v3 before
             # a backend window or provider is allocated.
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
+            raise KiroV3UnavailableError()
 
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands

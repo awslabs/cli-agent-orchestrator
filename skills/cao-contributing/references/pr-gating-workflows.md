@@ -1,11 +1,11 @@
 # cao-contributing reference: the non-`ci.yml` PR gates
 
-Moved verbatim out of `SKILL.md`. The table now lives here, and
+Moved out of `SKILL.md`; the table is verbatim. It now lives here, and
 `test/test_cao_contributing_skill_accuracy.py` reads `SKILL.md` plus this
 directory, pinning every row to the workflow files themselves. Keep the rows
 byte-identical to what the workflows say.
 
-### Other workflows that gate a PR
+## Other workflows that gate a PR
 
 `ci.yml` is not the only workflow on a pull request. These run alongside it, and none sets
 job-level `continue-on-error`, so every check they run is blocking.

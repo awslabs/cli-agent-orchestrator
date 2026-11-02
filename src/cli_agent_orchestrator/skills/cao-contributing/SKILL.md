@@ -194,12 +194,13 @@ to rediscover.
    the base install, though, so find out where the package sits before you declare anything:
    `uv export --frozen --no-dev --no-hashes | grep -i '^<name>=='` (grep the PEP 503 normalised
    name — lowercase, `_` and `.` as `-` — which is how `uv export` prints it). A match means the
-   base install gets it, and a CVE fixed only by bumping it **transitively** in the lock also
-   needs a floor in `[project].dependencies`, with a comment naming the CVE and the dependency
-   path, as `cryptography` and `dnspython` do in `pyproject.toml`. No match? Re-run the export
-   with `--all-extras`: a match there means an extra, and the floor belongs in that extra's
-   `[project.optional-dependencies]` list, not in the base dependencies, which stay lean. Still
-   no match means dev-only, and the lock bump is the whole fix.
+   base install gets it (check its marker, if any), and a CVE fixed only by bumping it
+   **transitively** in the lock also needs a floor in `[project].dependencies`, with a comment
+   naming the CVE and the dependency path, as `cryptography` and `dnspython` do in
+   `pyproject.toml`. No match? Re-run the export with `--all-extras`: a match there means an
+   extra, and the floor belongs in that extra's `[project.optional-dependencies]` list, not in
+   the base dependencies, which stay lean. Still no match means dev-only, and the lock bump is
+   the whole fix.
 3. **Check the floor in the built wheel**, not the source: `uv build --wheel --clear`, then
    `unzip -p dist/*.whl '*.dist-info/METADATA' | grep Requires-Dist`. Keep the `--clear` (or
    build into a fresh `--out-dir`): a plain `uv build` leaves earlier wheels in place, the glob

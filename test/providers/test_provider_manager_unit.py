@@ -9,7 +9,7 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
 from cli_agent_orchestrator.providers.manager import ProviderManager
 from cli_agent_orchestrator.providers.omp import OmpProvider
 
@@ -443,8 +443,9 @@ def test_get_provider_marks_kiro_initialized_on_restore():
     assert provider._initialized is True
 
 
-def test_get_provider_rejects_persisted_kas_before_provider_construction():
-    """A persisted KAS terminal is never restored as a runnable provider."""
+@pytest.mark.parametrize("stored", ["v3", "kas"])
+def test_get_provider_rejects_persisted_v3_before_provider_construction(stored):
+    """A persisted v3 terminal (either spelling) is never restored as a runnable provider."""
     manager = ProviderManager()
 
     with (
@@ -455,14 +456,17 @@ def test_get_provider_rejects_persisted_kas_before_provider_construction():
                 "tmux_session": "s1",
                 "tmux_window": "w1",
                 "agent_profile": "developer",
-                "engine": "kas",
+                "engine": stored,
             },
         ),
         patch("cli_agent_orchestrator.providers.manager.KiroCliProvider") as provider_class,
+        patch.object(manager, "create_provider") as create_provider,
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
+        with pytest.raises(KiroV3UnavailableError, match="not available yet"):
             manager.get_provider("t1")
 
+    # Refused from the row itself, before restore reaches create_provider.
+    create_provider.assert_not_called()
     provider_class.assert_not_called()
     assert "t1" not in manager._providers
 

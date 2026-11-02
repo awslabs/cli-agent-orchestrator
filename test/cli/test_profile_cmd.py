@@ -109,12 +109,12 @@ class TestValidateFrontmatter:
         }
         assert _validate_frontmatter(meta) == []
 
-    @pytest.mark.parametrize("engine", ["v2", "kas"])
+    @pytest.mark.parametrize("engine", ["v2", "v3", "kas"])
     def test_valid_kiro_engine(self, engine):
         assert _validate_frontmatter({"name": "x", "engine": engine}) == []
 
     def test_invalid_kiro_engine(self):
-        msgs = _validate_frontmatter({"name": "x", "engine": "v3"})
+        msgs = _validate_frontmatter({"name": "x", "engine": "v4"})
         assert any("[error]" in msg and "engine" in msg for msg in msgs)
 
     def test_missing_name(self):

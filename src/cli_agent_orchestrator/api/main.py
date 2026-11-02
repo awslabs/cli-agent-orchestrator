@@ -139,7 +139,7 @@ from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
-    KiroPhase0KASError,
+    KiroV3UnavailableError,
 )
 from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
 from cli_agent_orchestrator.security.auth import (
@@ -773,7 +773,8 @@ class RunStepRequest(BaseModel):
         return self
 
     engine: Optional[KiroEngine] = Field(
-        default=None, description="Explicit Kiro engine for this child step"
+        default=None,
+        description="Explicit Kiro engine for this child step ('kas' is an alias of 'v3')",
     )
 
     job_id: Optional[str] = Field(
@@ -4426,7 +4427,7 @@ async def create_terminal_in_session(
         # of the ValueError family can shadow it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
-        KiroPhase0KASError,
+        KiroV3UnavailableError,
         KiroCapabilityError,
         KiroAgentPathError,
         KiroAgentIdentityError,
@@ -4559,7 +4560,7 @@ async def create_terminal_in_session_as_operator(
     except IdempotencyKeyConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
-        KiroPhase0KASError,
+        KiroV3UnavailableError,
         KiroCapabilityError,
         KiroAgentPathError,
         KiroAgentIdentityError,
@@ -5615,7 +5616,7 @@ async def run_step(
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
     except (
-        KiroPhase0KASError,
+        KiroV3UnavailableError,
         KiroCapabilityError,
         KiroAgentPathError,
         KiroAgentIdentityError,
