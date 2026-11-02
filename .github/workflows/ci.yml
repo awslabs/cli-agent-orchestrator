@@ -855,7 +855,7 @@ jobs:
       # SARIF is still produced and uploaded (see the next step's `if: always()`), so the
       # Security tab keeps its history even on a failing run.
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.69.3
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
@@ -864,6 +864,8 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           exit-code: '1'
+          # Scoped, expiring, purl-pinned exemptions; Security Scan only (see the file header).
+          trivyignores: '.trivyignore.yaml'
 
       # FR-8: the SARIF step above writes findings to a FILE, so a failing scan
       # logs an exit code and names nothing — diagnosing #568 took an out-of-band
@@ -889,6 +891,7 @@ jobs:
           format: 'table'
           ignore-unfixed: true
           exit-code: '0'
+          trivyignores: '.trivyignore.yaml'
 
       - name: Upload Trivy scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
