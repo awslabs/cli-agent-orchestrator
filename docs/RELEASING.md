@@ -87,7 +87,9 @@ daylight saving):
 
 1. Finds the previous release: the newest `vX.Y.Z` tag on `main`. Tags such as
    `v2.6.0rc1` are ignored.
-2. If nothing has merged since, it stops. The run is green and nothing is released.
+2. If nothing has merged since, it stops. The run is green and nothing is released. The
+   bot's own `chore(agent-plugin): repin packages to vX.Y.Z` commit, which the publish
+   pushes after every release, does not count as something merged.
 3. Works out the version bump from the commit messages
    ([Conventional Commits](https://www.conventionalcommits.org/)):
 

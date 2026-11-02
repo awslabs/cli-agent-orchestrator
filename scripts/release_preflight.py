@@ -19,7 +19,10 @@ WHAT A SCHEDULED RUN CHECKS
 1. The newest stable ``vMAJOR.MINOR.PATCH`` tag reachable from the release SHA is the
    previous release. No such tag is a refusal. Other tags (``v2.6.0rc1``, benchmark tags)
    are ignored, matching ``cliff.toml``'s ``tag_pattern``.
-2. No commits since that tag: skip the week (no empty releases).
+2. No commits since that tag: skip the week (no empty releases). The bot's repin of the
+   agent-plugin packages to that tag does not count (see ``is_previous_repin``):
+   ``publish-to-pypi.yml`` pushes it after every PyPI publish, so counting it would make
+   every week a release (review on #652, P2-1).
 3. The previous release must be a published GitHub Release and must be on PyPI. A release
    that stopped half way is recovered by a maintainer; a later schedule never skips it.
 4. ``ci.yml`` must have completed successfully for the exact release SHA. Missing, pending
@@ -66,6 +69,13 @@ PYPI = "https://pypi.org"
 BUMPS = ("patch", "minor", "major")
 MAIN_REF = "refs/heads/main"
 EVENTS = ("schedule", "workflow_dispatch")
+
+#: The commit ``publish-to-pypi.yml``'s ``regenerate-agent-plugin`` job pushes to ``main``
+#: after a PyPI publish. ``test_release_preflight.py`` pins these to that job's own
+#: ``git config`` and commit message, so the two cannot drift apart.
+REPIN_SUBJECT = "chore(agent-plugin): repin packages to {tag}"
+REPIN_AUTHOR = ("github-actions[bot]", "41898282+github-actions[bot]@users.noreply.github.com")
+REPIN_PATH = "agent-plugin/"
 
 #: Maintained allow-list of release-blocking workflows. Add a workflow file here only when
 #: release policy requires it; ``ci.yml`` is the one that runs on every push to ``main``.
@@ -219,6 +229,10 @@ class Probe(Protocol):
 
     def commits(self, base: str, sha: str) -> List[Commit]: ...
 
+    def commit_origin(self, sha: str) -> tuple[str, str, tuple[str, ...]]:
+        """(author name, author email, paths the commit changes)."""
+        ...
+
     def release_state(self, tag: str) -> str: ...
 
     def pypi_has(self, version: str) -> Optional[bool]: ...
@@ -240,6 +254,24 @@ class Decision:
     @property
     def refused(self) -> bool:
         return bool(self.problems)
+
+
+def is_previous_repin(commit: Commit, tag: str, probe: Probe) -> bool:
+    """True only for the bot's repin of the agent-plugin packages to ``tag`` itself.
+
+    All three must hold: the exact subject for THIS tag, the bot as author, and a change
+    that touches ``agent-plugin/`` and nothing else. A lookalike (another tag, a person, a
+    file elsewhere, a merge or empty commit) is an ordinary commit and is counted. Dropping
+    the real one can never hide a bump: a ``chore`` subject only ever derives ``patch``.
+    """
+    if commit.subject != REPIN_SUBJECT.format(tag=tag):
+        return False
+    name, email, paths = probe.commit_origin(commit.sha)
+    return (
+        (name, email) == REPIN_AUTHOR
+        and bool(paths)
+        and all(path.startswith(REPIN_PATH) for path in paths)
+    )
 
 
 def _check_prior_release(probe: Probe, tag: str) -> List[str]:
@@ -307,7 +339,13 @@ def decide(
         return decision
 
     commits = probe.commits(tag, sha)
+    repins = [c for c in commits if is_previous_repin(c, tag, probe)]
+    commits = [c for c in commits if c not in repins]
     decision.last_tag, decision.count = tag, len(commits)
+    decision.notes.extend(
+        f"not counted: `{c.sha[:8]}` {c.subject} (the bot's repin after {tag} was published)"
+        for c in repins
+    )
     if not commits and not manual:
         decision.notes.append(f"no commits since {tag}; skipping this scheduled release")
         return decision
@@ -402,6 +440,12 @@ class LiveProbe:
             commit_sha, _, message = record.partition("\n")
             commits.append(Commit(commit_sha.strip(), message))
         return commits
+
+    def commit_origin(self, sha: str) -> tuple[str, str, tuple[str, ...]]:
+        name, _, email = self._git("show", "-s", "--format=%an%x00%ae", sha).strip().partition("\0")
+        # --root so a root commit lists its files; a merge lists none, so it is never a repin.
+        listed = self._git("diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", sha)
+        return name, email, tuple(path for path in listed.split("\0") if path)
 
     def _gh(self, *args: str) -> "subprocess.CompletedProcess[str]":
         return self.run(["gh", *args], capture_output=True, text=True, check=False)

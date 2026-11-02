@@ -53,6 +53,9 @@ class FakeProbe:
     release: str = "published"
     on_pypi: Optional[bool] = True
     ci: str = "completed:success"
+    #: sha -> (author name, author email, changed paths); anything unlisted is a person's
+    #: ordinary change to a source file.
+    origins: Dict[str, Any] = field(default_factory=dict)
     asked: List[str] = field(default_factory=list)
 
     def stable_tags(self, sha: str) -> List[str]:
@@ -62,6 +65,10 @@ class FakeProbe:
     def commits(self, base: str, sha: str) -> List[Any]:
         self.asked.append(f"commits {base}")
         return list(self.history)
+
+    def commit_origin(self, sha: str) -> Any:
+        self.asked.append(f"origin {sha[:8]}")
+        return self.origins.get(sha, ("Someone", "someone@example.invalid", ("src/x.py",)))
 
     def release_state(self, tag: str) -> str:
         self.asked.append(f"release {tag}")
@@ -882,3 +889,152 @@ class TestABreakingCommitIsReportedOnce:
     def test_the_unclear_refusal_counts_its_commits(self):
         decision = rp.decide("schedule", SHA, FakeProbe(history=[commit(SQUASHED_BANG, "7" * 40)]))
         assert decision.problems[0].startswith("1 commit(s) (77777777) carry")
+
+
+# --------------------------------------------------------------------------------------
+# Review on #652, P2-1: the bot's repin commit is not a reason to release
+# --------------------------------------------------------------------------------------
+
+BOT = ("github-actions[bot]", "41898282+github-actions[bot]@users.noreply.github.com")
+REPIN_SHA = "5" * 40
+PLUGIN_FILES = ("agent-plugin/cao/mcp.json", "agent-plugin/cao/plugin.json")
+
+
+def repin(tag: str = "v2.5.4", sha: str = REPIN_SHA) -> Any:
+    return commit(f"chore(agent-plugin): repin packages to {tag}", sha=sha)
+
+
+class TestTheBotsRepinIsNotARelease:
+    """`publish-to-pypi.yml` pushes `chore(agent-plugin): repin packages to vX` after every
+    PyPI publish. Counted, it made every week a patch release, and every release made the
+    next repin: a loop of no-op releases (review on #652, P2-1)."""
+
+    def _probe(self, history, origin=(BOT[0], BOT[1], PLUGIN_FILES), sha=REPIN_SHA):
+        return FakeProbe(history=history, origins={sha: origin})
+
+    def test_a_window_holding_only_the_repin_is_skipped(self):
+        decision = rp.decide("schedule", SHA, self._probe([repin()]))
+        assert not decision.should_release and not decision.refused
+        assert decision.count == 0
+        assert any("not counted: `55555555`" in note for note in decision.notes)
+        assert any("no commits since v2.5.4" in note for note in decision.notes)
+
+    def test_the_repin_plus_a_fix_still_releases_a_patch(self):
+        decision = rp.decide("schedule", SHA, self._probe([repin(), commit("fix: a real bug")]))
+        assert decision.should_release and decision.bump == "patch"
+        assert decision.count == 1
+
+    def test_the_repin_does_not_hide_a_feature(self):
+        decision = rp.decide("schedule", SHA, self._probe([repin(), commit("feat: x")]))
+        assert decision.should_release and decision.bump == "minor"
+
+    def test_a_dispatch_counts_the_same_way(self):
+        decision = rp.decide(
+            "workflow_dispatch", SHA, self._probe([repin()]), "refs/heads/main", "patch"
+        )
+        assert decision.count == 0
+        assert any("no commits since v2.5.4" in warning for warning in decision.warnings)
+
+    @pytest.mark.parametrize(
+        "history,origin",
+        [
+            ([repin(tag="v2.5.3")], (BOT[0], BOT[1], PLUGIN_FILES)),
+            ([repin()], ("Some Maintainer", "someone@example.invalid", PLUGIN_FILES)),
+            ([repin()], (BOT[0], "github-actions[bot]@users.noreply.github.com", PLUGIN_FILES)),
+            ([repin()], (BOT[0], BOT[1], PLUGIN_FILES + ("README.md",))),
+            ([repin()], (BOT[0], BOT[1], ("agent-pluginX/cao/mcp.json",))),
+            ([repin()], (BOT[0], BOT[1], ())),
+        ],
+        ids=[
+            "another-tag",
+            "a-person",
+            "other-bot-email",
+            "a-file-outside",
+            "prefix-lookalike",
+            "no-files",
+        ],
+    )
+    def test_a_lookalike_is_counted(self, history, origin):
+        decision = rp.decide("schedule", SHA, self._probe(history, origin))
+        assert decision.should_release, "a lookalike must count as a commit"
+        assert decision.count == 1 and decision.bump == "patch"
+        assert not any("not counted" in note for note in decision.notes)
+
+    def test_a_subject_with_more_text_is_counted(self):
+        message = "chore(agent-plugin): repin packages to v2.5.4 and more"
+        decision = rp.decide("schedule", SHA, self._probe([commit(message, sha=REPIN_SHA)]))
+        assert decision.count == 1
+
+    def test_only_a_subject_match_costs_a_git_question(self):
+        probe = self._probe([commit("fix: x", sha="6" * 40), repin()])
+        rp.decide("schedule", SHA, probe)
+        assert [q for q in probe.asked if q.startswith("origin")] == ["origin 55555555"]
+
+
+class TestTheRepinFilterOnRealGit:
+    def _bot_commit(self, repo: Repo, message: str, files: Dict[str, str]) -> str:
+        for rel, text in files.items():
+            path = repo.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            repo.git("add", rel)
+        env = dict(repo.env, GIT_AUTHOR_NAME=BOT[0], GIT_AUTHOR_EMAIL=BOT[1])
+        subprocess.run(
+            ["git", "-C", str(repo.root), "commit", "-q", "-m", message],
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        return repo.git("rev-parse", "HEAD")
+
+    def _world(self, repo: Repo, live: Any) -> Any:
+        """Git answers from the real repository; GitHub, PyPI and CI answer healthy."""
+        fake = FakeProbe()
+        fake.stable_tags = live.stable_tags  # type: ignore[method-assign]
+        fake.commits = live.commits  # type: ignore[method-assign]
+        fake.commit_origin = live.commit_origin  # type: ignore[method-assign]
+        return fake
+
+    def test_the_real_bot_repin_after_a_tag_is_skipped(self, repo):
+        repo.commit("chore: init")
+        repo.git("tag", "v1.0.1")
+        sha = self._bot_commit(
+            repo,
+            "chore(agent-plugin): repin packages to v1.0.1",
+            {"agent-plugin/cao/mcp.json": '{"pin": "1.0.1"}\n'},
+        )
+        live = repo.probe()
+        assert live.commit_origin(sha) == (BOT[0], BOT[1], ("agent-plugin/cao/mcp.json",))
+        decision = rp.decide("schedule", sha, self._world(repo, live))
+        assert not decision.should_release and not decision.refused and decision.count == 0
+
+    def test_the_same_subject_touching_another_file_is_released(self, repo):
+        repo.commit("chore: init")
+        repo.git("tag", "v1.0.1")
+        sha = self._bot_commit(
+            repo,
+            "chore(agent-plugin): repin packages to v1.0.1",
+            {"agent-plugin/cao/mcp.json": "{}\n", "pyproject.toml": "tampered\n"},
+        )
+        live = repo.probe()
+        assert set(live.commit_origin(sha)[2]) == {"agent-plugin/cao/mcp.json", "pyproject.toml"}
+        decision = rp.decide("schedule", sha, self._world(repo, live))
+        assert decision.should_release and decision.count == 1
+
+
+def test_the_filter_matches_what_the_publish_workflow_actually_commits():
+    """The constants are the regenerate job's own identity and message, read from its YAML."""
+    import yaml
+
+    publish = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "publish-to-pypi.yml").read_text("utf-8")
+    )
+    job = publish["jobs"]["regenerate-agent-plugin"]
+    script = "\n".join(str(step.get("run", "")) for step in job["steps"])
+    assert f'git config user.name "{rp.REPIN_AUTHOR[0]}"' in script
+    assert f'git config user.email "{rp.REPIN_AUTHOR[1]}"' in script
+    assert 'git commit -m "chore(agent-plugin): repin packages to v${version}"' in script
+    assert rp.REPIN_SUBJECT.format(tag="v${version}") == (
+        "chore(agent-plugin): repin packages to v${version}"
+    )
+    assert "git add agent-plugin/" in script and rp.REPIN_PATH == "agent-plugin/"
