@@ -421,3 +421,32 @@ def test_the_evaluator_parses_every_condition_in_both_workflows(name):
     """A guard against the evaluator silently not covering a condition."""
     for condition in _iter_ifs(_load(name)):
         assert _tokens(condition), condition
+
+
+#: The files that describe the release path's ref policy and push rights.
+RELEASE_PATH_TEXTS = (
+    ".github/workflows/publish-to-pypi.yml",
+    ".github/workflows/release.yml",
+    "docs/RELEASING.md",
+    "scripts/assert_release_version.py",
+    "scripts/bump_version.py",
+    "scripts/release_commit.py",
+)
+
+
+@pytest.mark.parametrize("rel", RELEASE_PATH_TEXTS)
+def test_the_release_path_states_one_verified_fact(rel):
+    """Review of #652, P3-1: comments said both "pypi admits only `v*`" and "it also admits
+    `main`", and both "release.yml cannot push to main" and "the deploy key bypasses the
+    rulesets". Read 2026-11-02: the policy admits `main` and `v*` tags, and both main
+    rulesets list deploy keys as an `always` bypass actor."""
+    text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+    for stale in (
+        "is restricted to `v*` tags",
+        "only accepts `v*` tags",
+        "has not been able to push",
+        "cannot push to `main`",
+    ):
+        assert stale not in text.replace("``", "`"), f"{rel}: {stale!r}"
+    if "deployment policy" in text or "live policy" in text:
+        assert "`main`" in text and "`v*`" in text, rel

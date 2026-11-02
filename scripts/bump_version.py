@@ -90,12 +90,14 @@ def _without_lock_flags() -> dict[str, str]:
 def update_uv_lock(old_version: str, new_version: str, run: Optional[Runner] = None) -> None:
     """Re-lock with ``uv lock`` and refuse anything but the project's own version changing.
 
-    The release commit reaches ``main`` through the deploy key's ruleset bypass, with no PR
-    review, so it must be the mechanical bump and nothing else: a re-resolution riding along
-    would ship dependency changes nobody reviewed. A uv older or newer than the one that
-    wrote the lock can also rewrite markers and wheel lists: uv 0.9.4 on this repo's
-    revision-5 lock removed 9 lines and added 13, including ``revision = 3``. The
-    ``revision =`` line is kept as it was; any other difference restores the old lock and
+    The release commit is pushed to ``main`` with the release deploy key, and both rulesets
+    on ``main`` (``protect-main`` and ``branch protection``) list deploy keys as an
+    ``always`` bypass actor; the key is write-enabled (read 2026-11-02). So the commit lands
+    with no PR and no review, and it must be the mechanical bump and nothing else: a
+    re-resolution riding along would ship dependency changes nobody reviewed. A uv older or
+    newer than the one that wrote the lock can also rewrite markers and wheel lists: uv 0.9.4
+    on this repo's revision-5 lock removed 9 lines and added 13, including ``revision = 3``.
+    The ``revision =`` line is kept as it was; any other difference restores the old lock and
     fails.
     """
     runner = run or subprocess.run

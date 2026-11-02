@@ -70,6 +70,11 @@ In GitHub: **Settings → Environments**.
 - **Required reviewers:** add the maintainer team / usernames who can approve prod releases.
 - **Deployment branches and tags:** restrict to tags matching `v*` so only tagged releases can promote to prod.
 
+  > **The live setting differs (read 2026-11-02):** the `pypi` policy admits the `main`
+  > branch as well as `v*` tags. The `release` chain does not rely on it: its
+  > `verify-release-version` step refuses any ref that is not a tag. The `pypi` escape
+  > hatch below can run from `main`, where only the tree and PyPI are checked.
+
 ### 3. Verify Web UI build works in CI
 
 Nothing to configure — the `build` job runs `npm ci && npm run build` in `web/`
@@ -183,8 +188,9 @@ to retry the prod step:
 
 1. Actions → **Publish to PyPI** → "Run workflow"
 2. Select `environment: pypi`
-3. `verify-release-version` compares the tag with the tree (the `pypi` environment
-   only accepts `v*` tags) and checks the version is not already on PyPI. Then the
+3. Dispatch it from the `v*` tag. `verify-release-version` then compares the tag with the
+   tree (the `pypi` environment's live policy also admits `main`, where only the tree is
+   checked) and checks the version is not already on PyPI. Then the
    builds run, `publish-testpypi` + `smoke-test` are skipped (they already ran), and
    `publish-pypi` hits the maintainer approval gate.
 

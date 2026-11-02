@@ -15,9 +15,11 @@ neither.
 WHAT IS REFUSED BEFORE ANYTHING IS COMMITTED
 --------------------------------------------
 * A version that is not ``MAJOR.MINOR.PATCH``.
-* Any changed tracked file outside the release files. This commit reaches ``main`` through
-  the deploy key's ruleset bypass with no PR review, so it may carry the bump and nothing
-  else.
+* Any changed tracked file outside the release files. This commit is pushed to ``main``
+  with the release deploy key, and both rulesets on ``main`` (``protect-main`` and ``branch
+  protection``) list deploy keys as an ``always`` bypass actor; the key is write-enabled
+  (read 2026-11-02). So it lands with no PR and no review, and may carry the bump and
+  nothing else.
 * A run with nothing staged: a bump that changed nothing is a bug upstream, not a release.
 
 The push names ``HEAD:refs/heads/main`` explicitly and never forces, so if ``main`` moved

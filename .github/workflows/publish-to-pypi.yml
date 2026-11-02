@@ -73,8 +73,9 @@ jobs:
       # `400 File already exists` ~80 minutes from now. (Review on PR #947.)
       #
       # A `release` dispatch runs the release-event chain, so it gets the release-event check,
-      # and it must be dispatched from a TAG: the `pypi` environment also admits `main`, and
-      # a branch can be NAMED like a version, so the ref type is checked, not just its name.
+      # and it must be dispatched from a TAG. The `pypi` environment's deployment policy admits
+      # the `main` branch and `v*` tags (read 2026-11-02), and a branch can be NAMED like a
+      # version, so this GITHUB_REF_TYPE check is the workflow's own guard, not the policy's.
       - name: Refuse a release tag whose version the tree does not carry, or that an index already has
         if: github.event_name == 'release' || inputs.environment == 'release'
         run: |
@@ -90,8 +91,10 @@ jobs:
       # and a pypi dispatch must not be passed on test.pypi.org state. The index is selected
       # in `env:` and read from the environment; nothing from the event reaches `run:`.
       #
-      # The `pypi` environment is restricted to `v*` tags, so the PyPI escape hatch always
-      # runs on a tag ref; when it does, the tag gets the same comparison a release does.
+      # The `pypi` environment's deployment policy admits the `main` branch and `v*` tags
+      # (read 2026-11-02), so the PyPI escape hatch can run on either. From a tag, the tag
+      # gets the same comparison a release does; from `main`, only the tree and the target
+      # index are checked.
       - name: Manual dispatch; check the tree agrees with itself and the target index lacks the version
         if: github.event_name != 'release' && inputs.environment != 'release'
         env:

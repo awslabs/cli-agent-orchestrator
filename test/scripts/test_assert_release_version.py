@@ -441,8 +441,9 @@ class TestPublishWorkflowRunsTheGuardFirst:
         assert _index_args(step["run"]) == ['"$TARGET_INDEX"', '"$TARGET_INDEX"']
 
     def test_the_dispatch_step_compares_the_tag_when_dispatched_from_one(self):
-        """The pypi environment is restricted to v* tags, so the PyPI escape hatch always
-        runs on a tag ref; it must get the same tag/tree comparison a release does."""
+        """The pypi environment's policy admits `main` and `v*` tags (read 2026-11-02), so the
+        PyPI escape hatch may run on a tag; there it gets the tag/tree comparison a release
+        does."""
         run = _dispatch_step()["run"]
         assert '"$GITHUB_REF_TYPE" = "tag"' in run
         assert '--tag "$GITHUB_REF_NAME"' in run
