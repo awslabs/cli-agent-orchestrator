@@ -20,20 +20,18 @@ Four deliverables:
 
 **`Blog_Post` content structure is specified in `blog-outline.md`, not here.** This document specifies only its mechanically enforced properties (Requirement 12).
 
-### Charter deviation: only the audit half is dogfooded in this pull request (OQ-17 decided: deferred)
+### Charter deviation: only the audit half is dogfooded (OQ-17 dropped)
 
 Recorded explicitly for the user rather than left implicit, per `review-2.md`'s residual under **F-5**.
 
-The charter's second goal names **both** new skills as dogfooded. **`Audit_Skill` is dogfooded** — Requirement 8.10 and `tasks.md` T6 run it against the `Dogfood_Package` and record the findings, so that half is demonstrated by a command with an exit status.
+The charter's second goal names **both** new skills as dogfooded. **`Audit_Skill` is exercised on CAO's own packages** — Requirement 8.10 and `tasks.md` T6 run it against the `Dogfood_Package` and record the findings, so that half is demonstrated by a command with an exit status.
 
-**`Creator_Skill`'s half is deferred out of this pull request.** **OQ-17** decided in principle to dogfood it for real against harness-oss's `revive-oss-pr` package; Requirement 15 then sized that at **five implementation tasks plus two approval gates**. **On 2026-11-01 the user decided the scope: option (c), out of this pull request, to follow separately in harness-oss** (`decisions-oq17-n11.md` (the user's decision record of 2026-11-01, kept outside the repository)). Requirement 15, Criterion 7 is that deferral. **The deviation therefore stands:** `Creator_Skill` is not dogfooded within this pull request, and Criterion 7 forbids marking the deviation resolved. Deferring work does not make a skill dogfooded. It closes only when the harness-oss work is done.
+**`Creator_Skill` is not dogfooded on an external package, by decision.** **OQ-17** had chosen to dogfood it against an external package; **the user dropped that on 2026-11-02** (`decisions-oq17-n11.md` (the user's decision record, kept outside the repository; its "Update 2026-11-02" section)). No external work is planned, and nothing in this pull request promises or schedules it. **The deviation therefore stands**, and Requirement 15 forbids marking it resolved.
 
 **No task was invented to paper over this**, and two routes were available and rejected:
 
 - Claiming the package is "produced by" or "guided by" the skills it ships. `review-1.md` **F-5** caught the first as an overclaim, and the second would be the same error — `review-2.md` confirmed that rejecting "guided by" was right, because no task makes it true.
 - Adding a task that authors a throwaway package with `Creator_Skill` purely to have dogfooded it. That manufactures evidence for a claim rather than earning it, and the artifact would have no consumer.
-
-**One hard ordering, because it decides whether the claim can be made at all:** `cao-agent-plugin-creator` must exist from this feature's own wave 1 before anything in harness-oss can honestly be called "authored with the creator skill" (Requirement 15, Criterion 5). The claim is false if the tool post-dates the artifact.
 
 ### Criterion kinds
 
@@ -545,58 +543,21 @@ EOF
 
 ---
 
-### Requirement 15: Dogfooding the `Creator_Skill` on a real target
+### Requirement 15: The `Creator_Skill` is not dogfooded on an external package (OQ-17 dropped)
 
-**User Story:** As the reader of this specification, I want the creator skill to have authored something real, so that "dogfooded" names an event that happened rather than an intention.
+**User Story:** As the reader of this specification, I want to know whether the creator skill was dogfooded, so that "dogfooded" names an event that happened rather than an intention.
 
-**OQ-17 is decided: dogfood the `Creator_Skill` for real**, authoring the missing skills of harness-oss's `revive-oss-pr` Agent Plugin. **The work is five implementation tasks plus two approval gates, not one task**, and this requirement sizes it rather than trimming the dogfood to fit — which the go-ahead explicitly required ("report back rather than shrinking it silently"). **Its scope is decided as option (c): out of this pull request, following separately in harness-oss** (the user, 2026-11-01; `decisions-oq17-n11.md` (the user's decision record of 2026-11-01, kept outside the repository)). Criterion 7 records the deferral, and the criteria that govern doing the work (3–6) apply to that separate work, not to this pull request.
+**OQ-17 is dropped, by the user, 2026-11-02** (`decisions-oq17-n11.md` (the user's decision record, kept outside the repository; its "Update 2026-11-02" section)). The decision record says: "Dogfooding the creator skill on harness-oss is **dropped**, not deferred. In the user's words: working on a package other than CAO spreads the effort too thin, and the blog should present the cumulative CAO work (MCP Apps, AG-UI, Agent Plugins). Taking up work in an empty external package defeats that purpose." It continues: "No harness-oss work is planned. #1200 must not promise it. The creator skill is simply not dogfooded on an external package. The audit skill is still exercised on CAO's own packages."
 
-#### What is actually there, measured at harness-oss `c4225842`
-
-| Fact | Evidence |
-|---|---|
-| **harness-oss's repository root *is* the `revive-oss-pr` package**, which the plan specifies (§6). It carries `plugin.json` (`name: revive-oss-pr`, conformant), `mcp.json` with one stdio `github` server, `LICENSE`, `tools/validate-plugin.py` and `tests/schema/`. | `ls plugin.json mcp.json LICENSE`, `ls -d tests/schema`, exit 0; `cat mcp.json` |
-| Its `mcp.json` uses `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` — the expansion #573 places in **Increment 2**. | `cat mcp.json` |
-| **It ships one skill, `skills/aws-nx-scaffolding/`, unrelated to pull-request revival.** | `find skills -maxdepth 2 -name SKILL.md`, one result |
-| **The three planned skills exist on no ref**: `revive-stale-pr` (~300 `SKILL.md` lines), `harvest-pr-review-feedback` (~290), `check-pr-upstream-freshness` (~230). | `git log --all` over all three skill paths → empty, exit 0; plan `:19-30` |
-| **The package's own README discloses this.** Its status table reads "M1 — manifest, connector, validator | **done**, validator green" and "M2–M5 — skills | not started". | `README.md:16-17` |
-| **`tools/pr-env.sh` — the single source of truth the plan requires — does not exist.** `tools/` holds `validate-plugin.py`, `check-public-paths.py`, `shift-left-tests.py`. | `find . -maxdepth 3 -name 'pr-env.sh'` → no output |
-| The plan's estimate is **~1,900 repository lines** from a 454-line prompt, and it says to flag that "so the diff size is not a surprise". | plan `:56`, `:60` |
-| **Addendum A reverses the plan's "omit `mcp.json`"** and adds capability tiers T0–T3 and validator checks V-B10..V-B12, **of which only V-B10 is implemented**. | Parallel scoping report |
-
-#### Why this target is worth the work: it is a live specimen
-
-The package's `description` **names** the capability "revive stale fork-to-upstream pull requests: harvest blocking review feedback, verify upstream freshness, and produce a read-only execution plan for sign-off", and the skills that would deliver it are **not started** — the package ships `aws-nx-scaffolding`, which does none of that. **The manifest is fully conformant while describing planned skills, and the README discloses they are not started.**
-
-So the dogfood target is also a specimen of a gap class, and **nothing in this feature's gate ladder detects it**: not the vendored schema, for which `description` is a free string; not CAO's loader, which checks two non-blank fields and a folder name (`P-4`); not the three Agent Skills limits, which count characters and lines; and not harness-oss's own validator. A package can pass every mechanical check this feature adds and still describe skills it does not ship.
-
-**The honest limit, stated rather than glossed.** Closing that gap is **not** a mechanical check and `Audit_Skill` must not claim to make it one. Deciding whether a prose description matches a shipped skill set is a judgement about meaning, and a criterion asserting otherwise would be exactly the decorative-gate defect this specification has already had to fix repeatedly. What `Audit_Skill` can do is **surface the inputs for a human judgement** — list the declared `description` beside the discovered skill names — and classify any finding as **advisory**, never fatal. That is a real contribution and a smaller one than "the audit catches it".
-
-**A correction I owe to my own earlier wording.** An earlier revision of this requirement said the manifest "overclaims today". **That was unfair and is withdrawn.** The package's README states plainly that the skills are not started (`README.md:16-17`), so the gap between the manifest's description and what ships is **disclosed work-in-progress, not an overclaim.** The accurate statement is that M1 is done and M2–M5 are not, exactly as its own status table says.
-
-#### Honest sizing
-
-The plan's milestones give **five implementation tasks** — M2 environment contract, M3 harvest, M4 freshness, M5 orchestrator, M6 hardening — **plus two approval gates**: a live read-only `gh api` fixture capture, and M7's live parity run. Add three skills with their `references/` and `scripts/`, a vendored `tools/pr-env.sh` with a sync script and a copy-identity check, #448 fixtures, a golden findings ledger, and trigger evals.
-
-**That is a feature, not a task**, in a **different repository** with its own gates, its own `origin` (`plauzy`) and **no `upstream` remote**. For scale it is comparable to this entire specification.
-
-**The floor, labelled as a floor and not as the deliverable:** **M2 + M4** — the environment contract plus `check-pr-upstream-freshness`, which plan §1.2 calls independently usable and the highest-reuse fragment — authored with the `Creator_Skill`, passing harness-oss's own validator, and graded by parity assertions #1–#3 against frozen fixtures. **Two tasks, with a stated approval dependency** on the fixture-capture gate.
-
-**The user decided this on 2026-11-01: option (c), out of this pull request** (`decisions-oq17-n11.md` (the user's decision record of 2026-11-01, kept outside the repository)). Neither the floor nor the full scope is done here.
+**What this replaces.** Earlier revisions sized a dogfood of the `Creator_Skill` on an external package and, on 2026-11-01, deferred it out of this pull request. Those revisions carried a table of facts measured in that package, a sizing, a floor, and nine criteria governing the work. **All of that is retired**, because there is no such work. The criteria are not renumbered into new obligations; the three below replace them.
 
 #### Acceptance Criteria
 
-1. THE specification SHALL NOT describe the target as "filling in missing skills" without stating that **three** skills must be authored from nothing and that a required plugin-root tool is also absent. The phrase "the missing skills" **is** exact — the package exists and its skills do not.
-2. THE specification SHALL NOT shrink the dogfood to fit one task, and SHALL NOT substitute a smaller target without recording that substitution as a decision with its authority.
-3. WHERE the floor (M2 + M4) is adopted instead of the full scope, IT SHALL be labelled a **floor** and the unbuilt remainder named, so a reader cannot mistake partial delivery for the whole.
-4. WHERE work is done in harness-oss, IT SHALL be on a branch there and SHALL NOT be pushed; that repository has only an `origin` remote and no `upstream`.
-5. **THE `Creator_Skill` SHALL exist from this feature's own waves before any harness-oss skill is described as "authored with the creator skill".** This ordering is hard: the claim is false if the tool post-dates the artifact. **THE reference point SHALL be the sha of the commit that adds `skills/cao-agent-plugin-creator/`**, recorded when T1 commits; every harness-oss commit described as authored with the creator skill SHALL have a later commit date, and the T6 report SHALL cite both.
-6. THE evidence SHALL go in the record of the work that authors the skills, alongside the `Audit_Skill`'s findings on what was authored. Under the deferral in Criterion 7 that is the separate harness-oss work, not this pull request's T6 report.
-7. **Explicit deferral (OQ-17, option (c), the user, 2026-11-01).** Dogfooding the `Creator_Skill` on harness-oss is **out of this pull request** and follows separately in harness-oss. THIS requirement therefore records that the `Creator_Skill` is **not** dogfooded within this pull request, and the charter deviation SHALL stand unchanged rather than being quietly marked resolved. Criteria 3–6 govern that separate work; Criterion 5's reference point, T1's commit `c17045289260ca2fdc458579181adaa4aa54fabf`, still applies to it.
-8. THE specification SHALL NOT claim harness-oss's package is non-conformant, overclaiming, or **promising** what it does not ship. THE permitted neutral statement is: **"the description names planned skills; the README discloses they are not started."** Its README discloses its own milestone status, so any stronger word imputes concealment that is not there.
-9. WHERE the description-versus-planned-skills gap is cited as a reason to do this work, THE specification SHALL record that **no mechanical check in this feature detects it**. **THE obligation on `Audit_Skill` lives in Requirement 2, Criterion 12, with a task behind it** — an obligation stated only here would be one no task carries and therefore one that cannot fail, which is the defect class this document has had to fix repeatedly.
+1. THE `Creator_Skill` SHALL NOT be described as dogfooded on an external package, and THE specification and the pull request SHALL NOT promise, schedule or imply external dogfooding work. **No external work is planned** (OQ-17, dropped, the user, 2026-11-02).
+2. THE charter deviation SHALL stand, and SHALL NOT be marked resolved: the creator half is not dogfooded, by decision, and the audit half is exercised on CAO's own packages (Requirement 8.10).
+3. THE specification SHALL NOT substitute another target to claim the creator half dogfooded unless that substitution is recorded as a new decision with its authority.
 
-**Traceability:** OQ-17, decided (c) on 2026-11-01 (`decisions-oq17-n11.md` (the user's decision record of 2026-11-01, kept outside the repository)); the charter's second goal; `review-1.md` **F-5**, whose rejection of "guided by" is why this requirement insists the dogfood be real or be declared absent. Criterion 8 records a correction to this requirement's own earlier wording.
+**Traceability:** OQ-17, dropped on 2026-11-02 (`decisions-oq17-n11.md` (the user's decision record, kept outside the repository; its "Update 2026-11-02" section)); the charter's second goal; `review-1.md` **F-5**, whose rejection of "guided by" is why this requirement insists a dogfood be real or be declared absent.
 
 ---
 
@@ -638,7 +599,7 @@ on 2026-10-30; none of them is a maintainer answer, and none should be presented
 | **OQ-12** | The package is named **`cao-agent-plugin-lifecycle`**. It matches this specification's directory and issue #1153, so package, spec and issue share one string — the traceability argument that recommended it. `CODEBASE.md`'s `agent-plugin/` row must name it **exactly**. | User, adopting the recommendation |
 | **OQ-13** | A **`references/` directory for the `Audit_Skill`**; optional for the `Creator_Skill`. | User, adopting the recommendation |
 | **OQ-16** | **The implementation commits.** Signed (`-S`), author `plauzy`, **exactly two trailers** (`plauzy`, `Kiro Agent`). **It never pushes.** Work stops at "ready to push"; the push and the draft pull request are the supervisor's after the user's approval. Requirements 7.8 and 13.8 are rewritten accordingly — the bar is no longer "no commit", it is **commit yes, push no**. | User |
-| **OQ-17** | **Dogfood the `Creator_Skill` for real**, using it to author the missing skills of harness-oss's `revive-oss-pr` package. **This is larger than one task and is sized honestly in Requirement 15**, not trimmed to fit. **Scope decided 2026-11-01 as (c): out of this pull request** (Requirement 15.7). | User |
+| **OQ-17** | **Dropped.** The `Creator_Skill` is not dogfooded on an external package, and no external work is planned (Requirement 15). This replaces the 2026-10-30 decision to dogfood it and the 2026-11-01 decision to defer it. | User, 2026-11-02 |
 
 ### Deferred
 
@@ -652,7 +613,7 @@ on 2026-10-30; none of them is a maintainer answer, and none should be presented
 | Id | Question | Status |
 |---|---|---|
 | **OQ-1b** | **Does the maintainer reverse, narrow, or uphold #573 decision D4?** This is the question D4's author must answer, and **nothing in this document settles it.** **OQ-1a** decided only that the work proceeds and is presented. Requirement 14 states the outcome under each resolution; 14.1's is **withdrawal unmerged**. | **OPEN — gates the merge** |
-| **OQ-17 scope** | **Is the dogfood accepted at full scope, at the M2+M4 floor, or as its own feature?** **Decided by the user on 2026-11-01: (c), out of this pull request, to follow separately in harness-oss** (`decisions-oq17-n11.md` (the user's decision record of 2026-11-01, kept outside the repository)). Requirement 15.7 is the explicit deferral, and the charter deviation stands. Kept in this table so the earlier open state stays legible. | **Decided (c)** |
+| **OQ-17 scope** | **Was:** is the dogfood accepted at full scope, at the M2+M4 floor, or as its own feature? **Now dropped by the user, 2026-11-02** (`decisions-oq17-n11.md` (the user's decision record, kept outside the repository; its "Update 2026-11-02" section)): no external dogfood, and no external work planned. The charter deviation stands (Requirement 15). Kept in this table so the earlier open state stays legible. | **Dropped** |
 | **OQ-15** | Issue of record. **Resolved:** #1153, sub-issue of tracker #1154, sibling #1152. | Resolved |
 | **CI dogfood coverage** (no `OQ` id yet) | **Should `run.sh` be extended so the CI dogfood job covers the third package?** Today it reaches only `agent-plugin/cao` (`P-67`), so Requirement 8.12 limits the claim to "gated in CI by `make check-agent-plugin`". Extending it would be new scope, and `record-dogfood-demo.mjs` has not been read. Recorded, not added. | **Open — needs a user decision** |
 | **M1 / M2 / M4** (upstream, not ours) | #573's own open maintainer decisions. Requirement 10.6 declines to settle M1; Requirement 3.5 declines to assume M4; **OQ-12**'s chosen name sits in the namespace M2 may yet settle, which is recorded as a known risk rather than resolved. | Open upstream |
@@ -683,7 +644,7 @@ Correctness properties are defined in [`design.md`](design.md).
 | `Dogfood_Package` | Requirements 8, 9, 10 |
 | ~~`Blog_Post`~~ — deferred | Requirement 12, retained deferred-with-reason |
 | Cross-cutting gates and boundaries | Requirements 11, 13, 14 |
-| `Creator_Skill` dogfood on harness-oss | Requirement 15 |
+| ~~`Creator_Skill` dogfood on an external package~~ — dropped | Requirement 15 records the decision |
 | Vocabulary carried from the AG-UI reconciliation | Requirement 16 |
 
 | Open question | Referenced by (not resolved by) |
@@ -697,4 +658,4 @@ Correctness properties are defined in [`design.md`](design.md).
 | OQ-8, OQ-9, OQ-10, OQ-11, OQ-14 — blog details | Requirement 12 |
 | OQ-13 — `references/` layout | Requirements 1, 2, 9 |
 | OQ-16 — commit scope | Requirement 13 |
-| OQ-17 — dogfooding the creator skill, **decided (c): deferred out of this pull request** | Requirements 1, 8, 15 (Criterion 7 is the deferral); the charter-deviation section |
+| OQ-17 — dogfooding the creator skill, **dropped (the user, 2026-11-02)** | Requirements 1, 8, 15; the charter-deviation section |

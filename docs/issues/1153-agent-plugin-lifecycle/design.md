@@ -196,7 +196,7 @@ Two constraints follow from observed defects in the source skills: the PEP 723 b
 
 **One claim corrected after review.** An earlier revision said the package is "produced by the skills it carries". It is not — it is produced by `build_agent_plugin.py` (Requirement 8.1). `review-1.md` **F-5** caught the overclaim. The defensible version is **audited by** a skill it carries, which Requirement 8.10 now mandates as an actual task step rather than a description.
 
-**And the consequence, recorded rather than left implicit:** only the audit half is dogfooded **within this pull request's own artifacts**. `Audit_Skill` runs against the package in T6; `Creator_Skill`'s half is **deferred out of this pull request**: **OQ-17** is decided as (c), to follow separately in harness-oss (the user, 2026-11-01; Requirement 15.7). The charter's second goal names both, so the deviation stands — stated in full in `requirements.md`'s "Charter deviation: only the audit half is dogfooded in this pull request (OQ-17 decided: deferred)", together with the two papering-over routes that were available and rejected. `review-2.md` confirms that rejecting "guided by" was right, because no task makes it true; the same reasoning is why no task was invented to manufacture the creator half.
+**And the consequence, recorded rather than left implicit:** only the audit half is dogfooded **within this pull request's own artifacts**. `Audit_Skill` runs against the package in T6; `Creator_Skill` is **not dogfooded on an external package, by decision**: **OQ-17** is dropped (the user, 2026-11-02; Requirement 15), and no external work is planned. The charter's second goal names both, so the deviation stands — stated in full in `requirements.md`'s "Charter deviation: only the audit half is dogfooded (OQ-17 dropped)", together with the two papering-over routes that were available and rejected. `review-2.md` confirms that rejecting "guided by" was right, because no task makes it true; the same reasoning is why no task was invented to manufacture the creator half.
 
 **C is rejected**, carrying the conventions-recon trade-offs verbatim: outside every gate in the ladder, no `upstream` remote, and a pull request to awslabs would not contain the dogfood artifact at all. Plus its validator **cannot validate a CAO package** (`P-8`) — run from the CAO worktree with `agent-plugin/cao` as an argument, it still reported harness-oss's own package and exited 0.
 
@@ -473,7 +473,7 @@ Full statements and authority in `requirements.md`'s "Decisions, and what remain
 | **OQ-13** | A `references/` directory? | **Decided:** yes for `Audit_Skill` (`P-61`) |
 | **OQ-15** | Issue of record | **Resolved:** #1153 |
 | **OQ-16** | May the implementation phase commit? | **Decided:** commit, signed; never push |
-| **OQ-17** | Dogfood the `Creator_Skill` on harness-oss? | **Decided (c), 2026-11-01:** out of this pull request, following separately in harness-oss (Requirement 15.7). The charter deviation stands |
+| **OQ-17** | Dogfood the `Creator_Skill` on an external package? | **Dropped, the user, 2026-11-02:** no external dogfood and no external work planned (Requirement 15). The charter deviation stands |
 | CI dogfood coverage | Extend `run.sh` to the third package? | **Open**, a user decision (`P-67`, Requirement 8.12) |
 
 ## Decisions requiring maintainer sign-off
