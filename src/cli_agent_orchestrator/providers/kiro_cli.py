@@ -213,6 +213,16 @@ def _legacy_permission_prompt_spans(text: str) -> List[tuple[int, int]]:
         pos = end
 
 
+def has_single_line_permission_prompt(text: str) -> bool:
+    """True when one line of ``text`` holds a whole legacy permission prompt.
+
+    The reading without re.DOTALL: the question and every step up to "]:" on
+    the same line, which is how the AG-UI approval classifier has always
+    matched it. Linear, like _legacy_permission_prompt_spans, per line.
+    """
+    return any(_legacy_permission_prompt_spans(line) for line in text.split("\n"))
+
+
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
 # Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
 # Kiro 2.11 renders the same three-way choice with different wording for

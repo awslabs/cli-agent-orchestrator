@@ -157,3 +157,44 @@ class TestNewTuiHeader:
         for _ in range(20000):
             row = "".join(rng.choice(tokens) for _ in range(rng.randrange(0, 16)))
             assert bool(re.search(new, row)) == bool(re.search(self._old(profile), row)), repr(row)
+
+
+class TestSingleLinePermissionPrompt:
+    """The AG-UI approval classifier's reading: no re.DOTALL, so one line per prompt."""
+
+    def test_old_copy_is_flagged_and_grows_superlinearly(self):
+        assert structural_issues(OLD_PERMISSION_PROMPT, "search")
+        probe = pattern_probe(OLD_PERMISSION_PROMPT, "search")
+        assert first_superlinear(probe, input_shapes(OLD_PERMISSION_PROMPT))
+
+    def test_scan_reads_linearly_many_characters(self):
+        def probe(text: str) -> int:
+            return instrumented_steps(kiro_cli.has_single_line_permission_prompt, text, {})
+
+        shapes = input_shapes(OLD_PERMISSION_PROMPT)
+        assert nonlinear_shapes(probe, shapes) == []
+
+    def test_verdict_is_the_old_copy_verdict(self):
+        rng = random.Random(43)
+        tokens = ["Allow this action?", "Allow", "[", "]", ":", "]:", "y", "n", "t", "/", " "]
+        tokens += ["\n", "\n", "\r"]
+        for _ in range(20000):
+            text = "".join(rng.choice(tokens) for _ in range(rng.randrange(0, 30)))
+            assert kiro_cli.has_single_line_permission_prompt(text) == bool(
+                re.search(OLD_PERMISSION_PROMPT, text)
+            ), repr(text)
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("Allow this action? [y/n/t]:", "kiro:permission_request"),
+            ("Allow this action? Use 't' to trust. [y/n/t]:", "kiro:permission_request"),
+            # Split across lines: never matched without re.DOTALL, still does not.
+            ("Allow this action?\n[y/n/t]:", "kiro:unknown_prompt"),
+            ("Allow this action? [y/n/\nt]:", "kiro:unknown_prompt"),
+        ],
+    )
+    def test_classifier_reads_the_same(self, text, expected):
+        from cli_agent_orchestrator.services.agui.handoff_approval import classify_reason
+
+        assert classify_reason("kiro_cli", text) == expected
