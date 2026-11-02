@@ -206,7 +206,7 @@ class TestRunStepEndpoint:
 
     def test_invalid_engine_is_422(self, client):
         with patch(_RUN_STEP, new=AsyncMock()) as m_run:
-            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(engine="v3"))
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(engine="v4"))
 
         assert resp.status_code == 422
         m_run.assert_not_awaited()

@@ -337,7 +337,7 @@ class TestInstallAgent:
         result = install_agent("kas-agent", "kiro_cli")
 
         assert result.success is False
-        assert "Cedar" in result.message
+        assert "cannot be installed yet" in result.message
         assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
 
     def test_install_resolves_env_vars_before_parsing_and_persists_them_after_the_guard(

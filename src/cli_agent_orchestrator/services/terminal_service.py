@@ -92,7 +92,11 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
+from cli_agent_orchestrator.models.kiro_engine import (
+    KiroEngine,
+    canonical_kiro_engine,
+    resolve_kiro_engine,
+)
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     ProviderExitedInputBlockedError,
@@ -116,7 +120,7 @@ from cli_agent_orchestrator.providers.base import (
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroCapabilityError,
-    KiroPhase0KASError,
+    KiroV3UnavailableError,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
@@ -1155,11 +1159,13 @@ def _request_fingerprint(
       cannot yield materially different terminals. Same-shaped question as
       ``allowed_tools``, opposite verified answer -- which is why the resolver
       has to be read rather than the pattern matched.
-    - ``engine`` normalises through ``KiroEngine.value`` because the parameter
-      accepts the enum OR a plain string -- ``api/main.py`` forwards a query
-      string while ``parse_kiro_engine`` returns the member, and the same
-      logical request arriving by those two routes must produce ONE digest or
-      a legitimate retry 409s.
+    - ``engine`` normalises through ``canonical_kiro_engine`` because the
+      parameter accepts the enum OR a plain string -- ``api/main.py`` forwards
+      a query string while ``parse_kiro_engine`` returns the member, and the
+      same logical request arriving by those two routes must produce ONE digest
+      or a legitimate retry 409s. The ``kas`` alias canonicalises to ``v3`` for
+      the same reason: a retry spelled ``kas`` and one spelled ``v3`` are one
+      request (#1167).
 
     sha256 hexdigest rather than the joined text: the column stays a bounded
     64 chars regardless of path length, and filesystem paths and profile names
@@ -1182,6 +1188,8 @@ def _request_fingerprint(
     # decide whether that request is acceptable; the engine is validated below,
     # on the path that owns that decision. An invalid engine simply hashes as
     # itself and mismatches, which is all this function needs to be correct.
+    # `canonical_kiro_engine` is the pure half: it maps the `kas` alias to `v3`
+    # and leaves every other string as it is, so it validates nothing.
     # `KiroEngine` is a `str` Enum so joining a member happens to work, but
     # `.value` is the documented contract (`step_fingerprint`: "a KiroEngine
     # member's repr is not stable across versions") and an explicit branch
@@ -1193,7 +1201,7 @@ def _request_fingerprint(
     elif isinstance(engine, KiroEngine):
         engine_value = engine.value
     else:
-        engine_value = str(engine)
+        engine_value = canonical_kiro_engine(str(engine)) or ""
 
     # `None` and `{}` share one encoding, and that is VERIFIED rather than
     # assumed -- the opposite answer to `allowed_tools` above. Every use of
@@ -1802,7 +1810,7 @@ async def _create_terminal_unguarded(
     worktree_repo_root: Optional[str] = None
     try:
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
-        # resource. A KAS request must probe then fail closed with no window,
+        # resource. A v3 request must probe then fail closed with no window,
         # database row, FIFO, Herdr registration, or provider process.
         source = agent_profiles.ProfileSource.INSTALLED
         try:
@@ -1867,10 +1875,8 @@ async def _create_terminal_unguarded(
                 model_honored = ProviderManager.provider_class(provider).honors_model(
                     agent_profile=agent_profile, profile=profile, requested_model=launch_model
                 )
-            if resolved_engine == KiroEngine.KAS:
-                raise KiroPhase0KASError(
-                    bool(profile and (profile.allowedTools or profile.toolsSettings))
-                )
+            if resolved_engine == KiroEngine.V3:
+                raise KiroV3UnavailableError()
         else:
             if engine is not None:
                 raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
@@ -5247,9 +5253,9 @@ def dispatch_input(
 
         if (
             metadata.get("provider") == ProviderType.KIRO_CLI.value
-            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
+            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.V3
         ):
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
+            raise KiroV3UnavailableError()
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = _orchestration_value(orchestration_type)
