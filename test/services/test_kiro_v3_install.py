@@ -22,11 +22,14 @@ from cli_agent_orchestrator.services import install_service
 from cli_agent_orchestrator.services.install_service import (
     install_agent,
     installed_artifact_paths,
+    installed_kiro_agent_is_universal,
+    installed_kiro_v3_grant,
     refresh_installed_agents_for_plugin_mcp,
 )
 from cli_agent_orchestrator.services.kiro_v3_validate import validate_kiro_v3_agent_bytes
 
 GOLDENS = Path(__file__).parent / "fixtures" / "kiro_install_goldens"
+KIRO_V3_AGENTS = Path(__file__).parent / "fixtures" / "kiro_v3_agents"
 BUILT_IN_PROFILES = (
     "code_supervisor",
     "developer",
@@ -321,6 +324,68 @@ def test_g11_plan_identity_keeps_its_label_set(paths):
     assert _install("reviewer", engine="v3").success
     assert set(installed_artifact_paths("reviewer")) == v2_labels
     assert installed_artifact_paths("reviewer") == v2_paths
+
+
+@pytest.mark.parametrize("name", ["reviewer", "memory_manager"])
+def test_a_file_kiros_upgrader_rewrote_reinstalls_as_v2(paths, name):
+    """Kiro's upgrader adds ``permissions`` to a v2 file and marks it ``kiroUpgrade``.
+    That is not CAO's universal file, so a reinstall with no engine writes v2
+    again (maintainer review on #1178); ``memory_manager`` sets ``tools``, which
+    a v3 render refuses."""
+    assert _install(name).success
+    upgraded = (KIRO_V3_AGENTS / "upgraded-v2ro.json").read_text(encoding="utf-8")
+    (paths["kiro"] / f"{name}.json").write_text(upgraded, encoding="utf-8")
+    result = _install(name)
+    assert result.success, result.message
+    assert _text(paths, name) == (GOLDENS / "v2" / f"{name}.json").read_text(encoding="utf-8")
+
+
+def _without(key):
+    def mutate(data):
+        data.pop(key)
+
+    return mutate
+
+
+def _with_marker(data):
+    data["kiroUpgrade"] = {"revision": 2}
+
+
+@pytest.mark.parametrize(
+    ("source", "universal"),
+    [
+        ("cao", True),
+        ("upgraded-v2ro.json", False),
+        ("t-v3ids-upgrader.json", False),
+        ("v2ro.json", False),
+        (_with_marker, False),
+        (_without("excludedTools"), False),
+        (_without("permissions"), False),
+    ],
+    ids=[
+        "cao_render",
+        "kiro_upgraded_v2",
+        "kiro_universal_without_excluded_tools",
+        "v2",
+        "cao_render_with_upgrade_marker",
+        "cao_render_without_excluded_tools",
+        "cao_render_without_permissions",
+    ],
+)
+def test_only_cao_s_own_universal_render_counts_as_universal(paths, source, universal):
+    """``permissions`` alone is not enough: the file must have ``excludedTools``,
+    which every CAO render has and Kiro's upgrader does not write, and no
+    ``kiroUpgrade`` marker."""
+    assert _install("reviewer", engine="v3").success
+    target = paths["kiro"] / "reviewer.json"
+    if isinstance(source, str) and source != "cao":
+        target.write_text((KIRO_V3_AGENTS / source).read_text(encoding="utf-8"), encoding="utf-8")
+    elif callable(source):
+        data = json.loads(target.read_text(encoding="utf-8"))
+        source(data)
+        target.write_text(json.dumps(data), encoding="utf-8")
+    assert installed_kiro_agent_is_universal("reviewer") is universal
+    assert (installed_kiro_v3_grant("reviewer") is not None) is universal
 
 
 def test_an_unreadable_existing_file_reinstalls_as_v2_as_today(paths):

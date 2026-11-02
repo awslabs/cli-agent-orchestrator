@@ -340,7 +340,9 @@ def kiro_universal_install(tmp_path, monkeypatch):
     def _write(profile, allowed, extra=()):
         tools = kiro_universal_tools(allowed) + list(extra)
         (tmp_path / f"{profile}.json").write_text(
-            json.dumps({"tools": tools, "permissions": {"rules": []}})
+            json.dumps(
+                {"tools": tools, "excludedTools": ["knowledge"], "permissions": {"rules": []}}
+            )
         )
 
     return _write
@@ -382,6 +384,31 @@ async def test_kiro_universal_file_wider_than_the_row_is_still_refused(
             allowed_tools=["fs_read"],
         )
     assert set(excinfo.value.excess) == {"read", "execute_bash"}
+
+
+@pytest.mark.asyncio
+async def test_kiro_upgraded_v2_file_is_compared_with_the_v2_map(launch, kiro_universal_install):
+    """Kiro's upgrader adds ``permissions`` and a ``kiroUpgrade`` marker to a v2
+    file. It is still v2 names, so Step 0d compares it with the v2 map, and a
+    create bounded by the reviewer row is not refused for ``read`` (maintainer
+    review on #1178)."""
+    import shutil
+    from pathlib import Path
+
+    from cli_agent_orchestrator.services import install_service
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    upgraded = Path(__file__).parent / "fixtures" / "kiro_v3_agents" / "upgraded-v2ro.json"
+    shutil.copyfile(upgraded, Path(install_service.KIRO_AGENTS_DIR) / "developer.json")
+    child = await create_terminal(
+        "kiro_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        caller_id="0000beef",
+        allowed_tools=REVIEWER,
+    )
+    assert child.allowed_tools == REVIEWER
 
 
 @pytest.mark.asyncio

@@ -66,7 +66,10 @@ cao launch --agents reviewer --provider kiro_cli --engine v3
 ```
 
 `--engine v2` writes a v2-only file again. A reinstall without `--engine`, and
-an agent-plugin MCP refresh, keep whichever format is on disk.
+an agent-plugin MCP refresh, keep whichever format is on disk. A file that
+Kiro's own upgrader rewrote (it has a `kiroUpgrade` key) counts as v2 here, so
+it gets the v2 file again, and a bounded launch compares it with the v2 tool
+names.
 
 ### What CAO checks
 

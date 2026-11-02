@@ -1839,15 +1839,26 @@ def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
     return tools
 
 
+def _is_cao_universal_kiro_agent(data: Dict[str, Any]) -> bool:
+    """Whether a parsed Kiro agent file is CAO's own universal render (#1167).
+
+    ``permissions`` alone is not enough: Kiro's upgrader adds it to a v2 file
+    too, and marks the file with ``kiroUpgrade``. Every file CAO renders has
+    ``excludedTools`` (at least ``knowledge``), which the upgrader does not
+    write, and never that marker.
+    """
+    return "permissions" in data and "excludedTools" in data and "kiroUpgrade" not in data
+
+
 def installed_kiro_v3_grant(profile_name: str) -> Optional[Tuple[List[str], List[str]]]:
     """The grant and MCP server names a universal Kiro agent file records (#1167).
 
     ``(allowedTools, sorted mcpServers names)``, or ``None`` when the file is
-    absent, unreadable or not universal. The v3 launch attests the pane against
-    these after the file itself passed the validator.
+    absent, unreadable or not CAO's universal file. The v3 launch attests the
+    pane against these after the file itself passed the validator.
     """
     data = _installed_kiro_agent(profile_name)
-    if data is None or "permissions" not in data:
+    if data is None or not _is_cao_universal_kiro_agent(data):
         return None
     grant = data.get("allowedTools")
     servers = data.get("mcpServers") or {}
@@ -1857,13 +1868,15 @@ def installed_kiro_v3_grant(profile_name: str) -> Optional[Tuple[List[str], List
 
 
 def installed_kiro_agent_is_universal(profile_name: str) -> bool:
-    """True when the installed Kiro agent file is a v3-enabled universal file (#1167).
+    """True when the installed Kiro agent file is CAO's v3-enabled universal file (#1167).
 
-    Kiro's own universal format is the v2 fields plus ``permissions``, which a
-    v2-only file never has. An absent or unreadable file is not universal.
+    A file Kiro's upgrader rewrote is not: it is still v2 names plus
+    ``permissions`` (see ``_is_cao_universal_kiro_agent``), so a reinstall with
+    no engine writes v2 again and a bounded create compares it with the v2 map.
+    An absent or unreadable file is not universal.
     """
     data = _installed_kiro_agent(profile_name)
-    return data is not None and "permissions" in data
+    return data is not None and _is_cao_universal_kiro_agent(data)
 
 
 def require_kiro_agent_resolves(
