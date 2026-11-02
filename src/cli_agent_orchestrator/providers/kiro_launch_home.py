@@ -1067,32 +1067,48 @@ def _modified(home: Path, names: Sequence[str], recorded: Mapping[str, str]) -> 
     return False
 
 
-def _unseal(home: Path) -> None:
+def _unseal(home: Path) -> bool:
     """Give ``agents/`` and ``powers/`` their owner bits back (0700), so ``rmtree`` can empty them.
 
     Both are changed by name through the home's own no-follow descriptor,
     refusing a link (``fchmodat`` with ``AT_SYMLINK_NOFOLLOW``), so nothing in
     removal works by path: ``powers/`` is mode 0000 and cannot be opened at
     all, and a home swapped for a link after its checks is never entered. Only
-    a directory this user owns is changed. Where the platform cannot refuse a
-    link that way, nothing is changed: ``rmtree`` then fails and the home is
-    retained.
+    a directory this user owns is changed.
+
+    True when ``rmtree`` can then empty the home: each of the two is missing,
+    is not a directory (``rmtree`` unlinks it), or is now 0700. False when
+    either is still sealed: the platform cannot refuse a link that way, the
+    directory is another user's, or the home cannot be opened. ``rmtree`` would
+    then delete the other files before it failed, and the next removal would
+    find CAO's files gone and record that as tampering, so the caller keeps
+    the whole home instead.
     """
     try:
         fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError:
-        return  # Missing, or not a directory: rmtree decides, and refuses a link.
+    except FileNotFoundError:
+        return True  # Already gone: rmtree finds nothing.
+    except OSError as exc:
+        logger.warning("Kiro home %s could not be opened to unseal it: %s", home, exc)
+        return False
+    unsealed = True
     try:
         for name in ("agents", POWERS_DIR):
             try:
                 info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid():
-                    os.chmod(name, 0o700, dir_fd=fd, follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+                if info.st_uid != os.geteuid():
+                    raise OSError(errno.EPERM, "the directory is another user's")
+                os.chmod(name, 0o700, dir_fd=fd, follow_symlinks=False)
             except (OSError, NotImplementedError, ValueError) as exc:
-                if not isinstance(exc, OSError) or exc.errno != errno.ENOENT:
-                    logger.warning("Kiro home %s: %s/ could not be unsealed: %s", home, name, exc)
+                if isinstance(exc, OSError) and exc.errno == errno.ENOENT:
+                    continue
+                logger.warning("Kiro home %s: %s/ could not be unsealed: %s", home, name, exc)
+                unsealed = False
     finally:
         os.close(fd)
+    return unsealed
 
 
 @dataclass(frozen=True)
@@ -1128,8 +1144,9 @@ def remove_kiro_home(
     ``stop_kiro_home_processes``); False when any may remain. The hashes and,
     given ``global_home``, the ``~/.kiro`` markers are compared before removal
     and handed to ``on_removed`` once the directory is gone. Deletion is
-    ``shutil.rmtree`` only where it is fd-based and symlink-safe; elsewhere the
-    home is retained.
+    ``shutil.rmtree`` only where it is fd-based and symlink-safe, and only once
+    ``agents/`` and ``powers/`` are unsealed; otherwise the whole home is
+    retained and False is returned.
     """
     if not valid_terminal_id(terminal_id):
         return True
@@ -1177,7 +1194,9 @@ def remove_kiro_home(
             != global_home.markers
         ),
     )
-    _unseal(home)
+    if not _unseal(home):
+        logger.warning("Retaining Kiro home %s: it could not be unsealed for removal", home)
+        return False
     try:
         shutil.rmtree(home)
     except FileNotFoundError:

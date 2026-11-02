@@ -9,6 +9,7 @@ tests check which rule a refusal names, not its wording.
 from __future__ import annotations
 
 import errno
+import functools
 import hashlib
 import itertools
 import json
@@ -74,6 +75,30 @@ def _unseal_tree(root: Path) -> None:
             path = Path(directory) / name
             if not path.is_symlink() and stat.S_IMODE(os.lstat(path).st_mode) == 0:
                 path.chmod(0o700)
+
+
+def home_tree(root: Path) -> dict[str, tuple]:
+    """Every entry under ``root`` by lstat: type, mode and inode, and a file's bytes.
+
+    A directory this user cannot list (the 0000 placeholder) is recorded, not entered.
+    """
+    found: dict[str, tuple] = {}
+
+    def visit(path: Path, name: str) -> None:
+        info = os.lstat(path)
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISREG(info.st_mode):
+            found[name] = ("file", mode, info.st_ino, path.read_bytes())
+        elif stat.S_ISDIR(info.st_mode):
+            found[name] = ("dir", mode, info.st_ino)
+            if mode & stat.S_IRUSR and mode & stat.S_IXUSR:
+                for child in sorted(os.listdir(path)):
+                    visit(path / child, f"{name}/{child}")
+        else:
+            found[name] = ("other", mode, info.st_ino)
+
+    visit(root, ".")
+    return found
 
 
 @pytest.fixture
@@ -1179,6 +1204,63 @@ class TestRemove:
         assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o500 and victim.is_dir()
         assert not os.path.lexists(prepared.home)
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ValueError("chmod: follow_symlinks unavailable on this platform"),
+            NotImplementedError("chmod: follow_symlinks unavailable on this platform"),
+            OSError(errno.EOPNOTSUPP, "Operation not supported"),
+        ],
+        ids=["ValueError", "NotImplementedError", "EOPNOTSUPP"],
+    )
+    def test_a_home_that_cannot_be_unsealed_is_kept_whole(self, store, monkeypatch, error):
+        """No rmtree: it would delete the other files first, and the next try call that tampering."""
+        prepared = prepare()
+        k.seal_launch_home(prepared)
+        (prepared.home / "sessions" / "cli").mkdir(parents=True)
+        (prepared.home / "sessions" / "cli" / "0f0e.jsonl").write_text("{}")
+        before = home_tree(prepared.home)
+        removals = []
+        rmtree_calls = []
+        real_rmtree = shutil.rmtree
+
+        def chmod(*args, **kwargs):
+            raise error
+
+        @functools.wraps(real_rmtree)
+        def rmtree(path, *args, **kwargs):
+            rmtree_calls.append(os.fspath(path))
+            return real_rmtree(path, *args, **kwargs)
+
+        def remove():
+            return k.remove_kiro_home(
+                TID,
+                prepared.hashes(),
+                global_home=prepared.global_home,
+                stop_owners=lambda _: True,
+                on_removed=removals.append,
+            )
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "chmod", chmod)
+            m.setattr(shutil, "rmtree", rmtree)
+            assert remove() is False
+        assert home_tree(prepared.home) == before
+        assert rmtree_calls == []
+        assert removals == []
+        assert k.prepared_launch_home(TID) is prepared
+        # With chmod working again, the next removal finds every CAO file as it was made.
+        assert remove() is True
+        assert not os.path.lexists(prepared.home)
+        assert removals == [
+            k.HomeRemoval(
+                agent_modified=False,
+                settings_modified=False,
+                secrets_store_changed=False,
+                global_home_changed=False,
+            )
+        ]
+
     def test_a_home_whose_owners_may_remain_is_kept(self, store):
         prepared = prepare()
         assert k.remove_kiro_home(TID, prepared.hashes(), stop_owners=lambda _: False) is False
@@ -1255,3 +1337,40 @@ class TestRemove:
     def test_a_missing_home_is_already_removed(self, store):
         assert k.remove_kiro_home(TID, None) is True
         assert k.remove_kiro_home("not-a-tid", None) is True
+
+
+class TestUnseal:
+    """``_unseal`` says whether rmtree can now empty the home, and changes nothing it refuses."""
+
+    def test_a_sealed_home_is_unsealed(self, store):
+        prepared = prepare()
+        k.seal_launch_home(prepared)
+        assert k._unseal(prepared.home) is True
+        for name in ("agents", "powers"):
+            assert stat.S_IMODE(os.lstat(prepared.home / name).st_mode) == 0o700
+
+    def test_a_missing_home_or_placeholder_is_nothing_to_unseal(self, store, tmp_path):
+        prepared = prepare()
+        (prepared.home / "powers").rmdir()
+        assert k._unseal(prepared.home) is True
+        assert k._unseal(tmp_path / "gone") is True
+
+    def test_another_users_directory_is_left_sealed(self, store, monkeypatch):
+        prepared = prepare()
+        k.seal_launch_home(prepared)
+        before = home_tree(prepared.home)
+        euid = os.geteuid()
+        with monkeypatch.context() as m:
+            m.setattr(os, "geteuid", lambda: euid + 1)
+            assert k._unseal(prepared.home) is False
+        assert home_tree(prepared.home) == before
+
+    def test_a_home_that_cannot_be_opened_is_left_sealed(self, store, tmp_path):
+        victim = tmp_path / "victim"
+        (victim / "agents").mkdir(parents=True)
+        (victim / "agents").chmod(0o500)
+        link = tmp_path / "link"
+        link.symlink_to(victim)
+        assert k._unseal(link) is False
+        assert stat.S_IMODE(os.lstat(victim / "agents").st_mode) == 0o500
+        (victim / "agents").chmod(0o700)
