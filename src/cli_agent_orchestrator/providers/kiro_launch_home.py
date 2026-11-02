@@ -165,7 +165,11 @@ class PlaceholderDir:
         )
 
     def matches(self, info: os.stat_result) -> bool:
-        """Still the same directory, owner and mode, with no entry added since (its mtime)."""
+        """Still the same directory, owner and mode, with no entry added since (its mtime).
+
+        The mtime is zero when recorded (``_make_placeholder``), so a change in the
+        same clock tick as the creation still shows.
+        """
         return stat.S_ISDIR(info.st_mode) and PlaceholderDir.of(info) == self
 
     def record(self) -> dict[str, int]:
@@ -732,10 +736,18 @@ def _set_mode_no_follow(
 
 
 def _make_placeholder(path: Path) -> PlaceholderDir:
-    """Make the empty directory just created at ``path`` unlistable, through a no-follow fd."""
+    """Make the empty directory just created at ``path`` unlistable, through a no-follow fd.
+
+    Its times are set to zero before it is recorded. A file system stamps a
+    change with a coarse clock (one tick is some milliseconds on Linux), and
+    ext4 hands a freed inode out again at once, so an entry added, or the
+    directory made again, in the tick of its creation could leave the same
+    record. Any later change stamps the current time, which is never zero.
+    """
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fchmod(fd, 0)
+        os.utime(fd, ns=(0, 0))
         return PlaceholderDir.of(os.fstat(fd))
     finally:
         os.close(fd)
