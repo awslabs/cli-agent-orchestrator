@@ -1716,3 +1716,37 @@ class TestTheGithubSlugRule:
 # EVERY file in the skill directory -- a strict superset of a single ``SKILL.md``
 # text comparison. Removed rather than kept after confirming that test id is
 # collected; re-add only if cao-contributing ever leaves ``SHIPPED_SKILLS``.
+
+
+class TestThePackagedSkillRebuildStepKeepsThePin:
+    """Checklist item 7 is the one-command rebuild, not a hand-restore (#1152).
+
+    Before ``--keep-committed-pin`` existed the item told contributors to run
+    ``make agent-plugin`` and then restore the version strings by hand, a step
+    that moved ten version sites in #1121's replay. The item must name the
+    one command, and that command must be real.
+    """
+
+    def _item_seven(self) -> str:
+        match = re.search(r"^7\. .*?(?=^8\. )", _skill_text(), flags=re.S | re.M)
+        assert match, "Checklist item 7 was not found; update this test."
+        return match.group(0)
+
+    def test_item_seven_names_the_keep_pin_rebuild(self):
+        item = self._item_seven()
+        assert "make agent-plugin-keep-pin" in item
+        assert "--keep-committed-pin" in item
+
+    def test_item_seven_no_longer_tells_anyone_to_restore_versions_by_hand(self):
+        item = self._item_seven()
+        assert "restore the version strings" not in item
+        assert "No flag keeps it" not in item
+        assert not re.search(
+            r"`make agent-plugin`(?!-)", item
+        ), "Item 7 still tells contributors to run the pin-moving rebuild."
+
+    def test_the_quoted_make_target_exists_and_passes_the_flag(self):
+        makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+        recipe = re.search(r"^agent-plugin-keep-pin:\n\t(.+)$", makefile, flags=re.M)
+        assert recipe, "Makefile has no agent-plugin-keep-pin target."
+        assert "build_agent_plugin.py --keep-committed-pin" in recipe.group(1)

@@ -545,6 +545,16 @@ equality lives behind `--check --require-current-pin`, which that job runs after
 it has pushed, so a forgotten repin is still caught, just not on everyone
 else's PR.
 
+To rebuild after editing a packaged skill without moving the pin, run
+`make agent-plugin-keep-pin` (`scripts/build_agent_plugin.py --keep-committed-pin`).
+It renders every package at the version the committed packages already pin, contacts
+no PyPI, and
+refuses, writing nothing, when the committed manifests are missing, unreadable or
+disagree, naming each package and its version. `make agent-plugin` renders at
+`pyproject.toml`'s version and so moves the pin; that is the release job's step.
+When `make check-agent-plugin` cannot tell the committed pin, it says why before
+listing the drift that follows.
+
 ```bash
 # From a clone
 cao plugin add ./agent-plugin/cao
