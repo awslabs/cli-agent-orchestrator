@@ -850,14 +850,12 @@ def _node_paths(op: object, av: object, ctx: _Ctx, flags: int, source: str) -> l
                     )
                 ]
             ]
-        # Bounded: one or two consecutive passes through the body stand for its
-        # iterations (two, so that adjacent iterations are checked against each
-        # other), and an optional repeat can also be skipped.
+        # Bounded: one pass through the body stands for its iterations, and an
+        # optional repeat can also be skipped. Adjacent iterations are checked
+        # against each other by the nesting check, which treats a bounded repeat
+        # whose body can vary like an unbounded one (see _nested_issues).
         inner = _paths(sub, ctx, flags, source)
-        out = ([[]] if lo == 0 else []) + (inner if lo <= 1 else [])
-        if hi >= 2:
-            out += [a + b for a in inner for b in inner][:_MAX_PATHS]
-        return out[:_MAX_PATHS]
+        return (([[]] if lo == 0 else []) + inner)[:_MAX_PATHS]
     raise NotImplementedError(f"regex construct {op}")
 
 
