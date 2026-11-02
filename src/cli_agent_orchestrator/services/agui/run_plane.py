@@ -12,7 +12,8 @@ Interrupt lifecycle:
 - If ``resume[]`` is provided in RunAgentInput, each entry is resolved through
   the idempotent approval registry before streaming begins.
 - A resume entry for an unknown or expired interrupt is skipped with a
-  server-side warning and the run proceeds. A resume that fails (ambiguous
+  server-side warning and the run proceeds; RUN_FINISHED lists it in
+  ``result.skippedResume``. A resume that fails (ambiguous
   payload, delivery failure) produces RUN_ERROR. Interrupts still open after
   resume processing end the run with the ``interrupt`` outcome; none left ends
   it with ``success``. The body closes right after RUN_FINISHED or RUN_ERROR.
@@ -137,6 +138,23 @@ def _extract_edited_text(payload: Any) -> Optional[str]:
     return None
 
 
+def _skipped_result(skipped: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Keyword arguments that put skipped resume entries on ``RUN_FINISHED``.
+
+    AG-UI 1.0 ``interrupt-resume.mdx`` asks the producer to "surface a warning"
+    for an entry it cannot use, without naming a channel. CAO logs it and also
+    lists it here, as ``result = {"skippedResume": [{"interruptId", "reason"}]}``
+    (``reason`` is ``"unknown"`` or ``"expired"``; an evicted id is
+    ``"unknown"``, because the registry no longer holds it). ``result`` is the
+    spec's optional return value. Metadata only: ids and reasons, never prompt
+    text. With nothing skipped this returns no keyword at all, so the frame is
+    unchanged.
+    """
+    if not skipped:
+        return {}
+    return {"result": {"skippedResume": list(skipped)}}
+
+
 def _response_schema(options: List[str]) -> Dict[str, Any]:
     """Build one interrupt's ``responseSchema`` from the options it offers.
 
@@ -239,6 +257,11 @@ async def run_plane_stream(
     )
     yield _emit(run_started)
 
+    # Resume entries skipped because they could not be answered (unknown or
+    # evicted id, or an answer to an expired interrupt). Reported on
+    # RUN_FINISHED.result so the client sees the warning in-band too.
+    skipped_resume: List[Dict[str, str]] = []
+
     # ── 2. Process resume[] entries ─────────────────────────────────────
     if run_input.resume and approval_construct is not None:
         from cli_agent_orchestrator.services.agui.handoff_approval import (
@@ -260,6 +283,7 @@ async def run_plane_stream(
                     "(never raised, or no longer retained)",
                     interrupt_id,
                 )
+                skipped_resume.append({"interruptId": interrupt_id, "reason": "unknown"})
                 continue
 
             if interrupt.resolved:
@@ -274,6 +298,7 @@ async def run_plane_stream(
                         "an expired interrupt can no longer be answered",
                         interrupt_id,
                     )
+                    skipped_resume.append({"interruptId": interrupt_id, "reason": "expired"})
                 continue
 
             # Map payload to decision
@@ -378,6 +403,7 @@ async def run_plane_stream(
                 thread_id=thread_id,
                 run_id=run_id,
                 outcome=outcome,
+                **_skipped_result(skipped_resume),
             )
             yield _emit(run_finished)
             finished = True
@@ -451,6 +477,7 @@ async def run_plane_stream(
             thread_id=thread_id,
             run_id=run_id,
             outcome=outcome,
+            **_skipped_result(skipped_resume),
         )
         yield _emit(run_finished)
 

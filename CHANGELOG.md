@@ -24,7 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A `resume[]` entry for an unknown interrupt id now ends `RUN_FINISHED` instead of `RUN_ERROR`.**
   As AG-UI 1.0 asks, the run proceeds without the entry and CAO logs a server-side warning; an answer
   to an expired interrupt is skipped the same way. A client that used `RUN_ERROR` to detect a bad id
-  no longer gets one.
+  no longer gets one; it reads `RUN_FINISHED.result.skippedResume` instead, which lists each skipped
+  entry as `{interruptId, reason}` with `reason` `unknown` (also used for an evicted id) or
+  `expired`. The key is absent when nothing was skipped.
 - **`agui_stream.AGUI_GENERATIVE_UI` is removed from `__all__`**, and the constant itself is gone,
   because the `GENERATIVE_UI` event type it named is no longer sent. Use `AGUI_CUSTOM` and
   `CAO_GENERATIVE_UI_EVENT_NAME`.

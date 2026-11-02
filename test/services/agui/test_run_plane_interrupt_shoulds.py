@@ -310,3 +310,131 @@ async def test_approved_decides_and_edited_args_cannot_override_a_deny(
     assert events[-1]["outcome"] == {"type": "success"}
     assert construct.get_interrupt(interrupt.id).outcome == decision
     assert delivery.calls == [("input", "t-edit", delivered)]
+
+
+# ---------------------------------------------------------------------------
+# In-band report of skipped entries (#1198 review note "In-band warning"):
+# RUN_FINISHED.result = {"skippedResume": [{"interruptId", "reason"}]}
+# ---------------------------------------------------------------------------
+
+
+def _skipped(event: Dict[str, Any]) -> Any:
+    return (event.get("result") or {}).get("skippedResume")
+
+
+async def _raw_frames(construct: AgentHandoffWithApproval, **input_kw: Any) -> List[str]:
+    return [
+        frame
+        async for frame in run_plane_stream(
+            input_data=_run_input(**input_kw), approval_construct=construct
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unknown_entry_is_listed_on_run_finished() -> None:
+    construct = _construct()
+
+    events = await _events(
+        construct,
+        resume=[
+            {"interruptId": "never-raised", "status": "resolved", "payload": {"approved": True}}
+        ],
+    )
+
+    finished = events[-1]
+    assert finished["type"] == "RUN_FINISHED"
+    assert finished["outcome"] == {"type": "success"}
+    assert finished["result"] == {
+        "skippedResume": [{"interruptId": "never-raised", "reason": "unknown"}]
+    }
+
+
+@pytest.mark.asyncio
+async def test_answer_for_expired_interrupt_is_listed_on_run_finished() -> None:
+    construct = _construct()
+    expired = _raise(construct, "t-1", _SELECTOR_PROMPT)
+    construct.expire("t-1")
+
+    events = await _events(
+        construct,
+        resume=[{"interruptId": expired.id, "status": "resolved", "payload": {"approved": True}}],
+    )
+
+    assert _skipped(events[-1]) == [{"interruptId": expired.id, "reason": "expired"}]
+    # Metadata only: the listed entry carries exactly the id and the reason.
+    assert set(_skipped(events[-1])[0]) == {"interruptId", "reason"}
+
+
+@pytest.mark.asyncio
+async def test_unknown_plus_valid_lists_only_the_unknown_entry() -> None:
+    delivery = _RecordingDelivery()
+    construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=delivery)
+    known = _raise(construct, "t-edit", _KIRO_PROMPT)
+
+    events = await _events(
+        construct,
+        resume=[
+            {"interruptId": "never-raised", "status": "resolved", "payload": {"approved": True}},
+            {"interruptId": known.id, "status": "resolved", "payload": {"approved": True}},
+        ],
+    )
+
+    assert delivery.calls == [("input", "t-edit", "y")]
+    assert construct.get_interrupt(known.id).outcome == ApprovalDecision.APPROVE.value
+    assert events[-1]["outcome"] == {"type": "success"}
+    assert _skipped(events[-1]) == [{"interruptId": "never-raised", "reason": "unknown"}]
+
+
+@pytest.mark.asyncio
+async def test_skipped_entries_ride_the_interrupt_outcome_when_others_are_pending() -> None:
+    construct = _construct()
+    still_open = _raise(construct, "t-1", _SELECTOR_PROMPT)
+
+    events = await _events(
+        construct,
+        resume=[
+            {"interruptId": "never-raised", "status": "resolved", "payload": {"approved": True}}
+        ],
+    )
+
+    outcome = events[-1]["outcome"]
+    assert outcome["type"] == "interrupt"
+    assert [i["id"] for i in outcome["interrupts"]] == [still_open.id]
+    assert _skipped(events[-1]) == [{"interruptId": "never-raised", "reason": "unknown"}]
+
+
+@pytest.mark.asyncio
+async def test_nothing_skipped_leaves_run_finished_byte_identical() -> None:
+    """No skipped entry: no ``result`` key, and the frame is exactly today's."""
+    construct = _construct()
+    known = _raise(construct, "t-1", _SELECTOR_PROMPT)
+
+    frames = await _raw_frames(
+        construct,
+        resume=[{"interruptId": known.id, "status": "resolved", "payload": {"approved": True}}],
+    )
+
+    assert frames[-1] == (
+        'data: {"type":"RUN_FINISHED","threadId":"thread-1191","runId":"run-1191",'
+        '"outcome":{"type":"success"}}\n\n'
+    )
+
+
+@pytest.mark.asyncio
+async def test_quiet_skips_are_not_listed() -> None:
+    """Abandoning an expired interrupt and re-sending a resolved answer stay unlisted."""
+    construct = _construct()
+    expired = _raise(construct, "t-1", _SELECTOR_PROMPT)
+    construct.expire("t-1")
+    answered = _raise(construct, "t-2", _SELECTOR_PROMPT)
+    entry = {"interruptId": answered.id, "status": "resolved", "payload": {"approved": True}}
+    await _events(construct, resume=[entry])
+
+    events = await _events(
+        construct,
+        resume=[{"interruptId": expired.id, "status": "cancelled"}, entry],
+    )
+
+    assert events[-1]["outcome"] == {"type": "success"}
+    assert "result" not in events[-1]

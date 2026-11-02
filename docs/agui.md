@@ -286,14 +286,25 @@ text**, typed into the agent's prompt in place of a yes/no answer. It is not
 replacement tool arguments. A resume entry that names an interrupt CAO did not
 raise (or no longer retains), or that answers one that has expired, is skipped
 with a server-side warning and the run proceeds, as AG-UI 1.0 asks of a
-producer; whatever is still pending is reported again. Abandoning an expired
-interrupt (`status: "cancelled"`) is skipped without a warning. A
+producer; whatever is still pending is reported again. The run also lists each
+such entry on its `RUN_FINISHED`, in `result`:
+`{"skippedResume": [{"interruptId": "<id>", "reason": "unknown" | "expired"}]}`.
+`reason` is `unknown` for an id CAO never raised or no longer retains (an
+evicted interrupt is indistinguishable from one never raised), and `expired`
+for an answer to an interrupt that expired. The list carries ids and reasons
+only, never prompt text, and rides either outcome, `success` or `interrupt`.
+When nothing is skipped, `RUN_FINISHED` has no `result` key. `skippedResume`
+appears only on `RUN_FINISHED`; a run that exits with `RUN_ERROR` carries no
+list. Abandoning an
+expired interrupt (`status: "cancelled"`) and re-sending an answer for an
+interrupt that is already resolved are skipped without a warning and are not
+listed. A
 non-empty `resume[]` gets HTTP 404 when the server has no approval bridge (the
 AG-UI surface was off when it started), as `POST /agui/v1/interrupts/{id}/resume`
 does. Once `resume[]` is delivered and nothing is
 left pending, the outcome is `{type: "success"}`. That means every entry that
-named a pending interrupt was delivered; skipped entries are only logged. It
-does not mean the agent finished. If the agent prompts again, the
+named a pending interrupt was delivered; skipped entries are logged and listed
+in `result.skippedResume`. It does not mean the agent finished. If the agent prompts again, the
 next run returns the new interrupt. `messages[]` is not read. Live fleet
 activity (`STATE_DELTA`, `STEP_STARTED/FINISHED`, `TOOL_CALL_START/END`,
 `CUSTOM`) is on the ambient plane, `GET /agui/v1/stream`. Embedders that call

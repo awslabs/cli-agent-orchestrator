@@ -2671,7 +2671,8 @@ async def agui_run(
 
     After a ``resume[]`` run, ``RUN_FINISHED`` with outcome ``success`` means
     every entry that named a pending interrupt was delivered; skipped entries
-    are only logged. It does not mean the agent finished its work. A later
+    are logged and listed in ``result.skippedResume``. It does not mean the
+    agent finished its work. A later
     permission prompt arrives as an interrupt on the next run.
 
     Returns 501 when the ``ag-ui-protocol`` package is not installed (the

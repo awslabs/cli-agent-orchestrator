@@ -11,6 +11,10 @@
 //                                is skipped and the run still finishes
 //   node e2e-local.mjs page      no server: the page's own state handling, with a
 //                                scripted EventSource and a stubbed run
+//   node e2e-local.mjs skipped   no agent: a card for an id CAO never raised is
+//                                emitted through POST /agui/v1/emit_ui; Approve
+//                                is skipped, RUN_FINISHED.result lists the id,
+//                                and the card shows "answer not used"
 //
 // Environment (e2e-local.sh sets these):
 //   PAGE_URL        the served index.html (not used by the page phase)
@@ -39,8 +43,8 @@ try {
 }
 
 const phase = process.argv[2];
-if (!["approve", "reject", "none", "page"].includes(phase)) {
-  console.error("usage: node e2e-local.mjs <approve|reject|none|page>");
+if (!["approve", "reject", "none", "page", "skipped"].includes(phase)) {
+  console.error("usage: node e2e-local.mjs <approve|reject|none|page|skipped>");
   process.exit(2);
 }
 if (phase === "page") process.exit(await pagePhase());
@@ -130,12 +134,30 @@ page.on("requestfinished", async (r) => {
       ? "RUN_FINISHED"
       : null;
   r._run.outcome = body.match(/"outcome":\{"type":"(\w+)"/)?.[1] ?? null;
+  r._run.skipped = skippedOf(body);
   r._run.body = body;
   r._run.end = Date.now();
 });
 page.on("requestfailed", (r) => {
   if (r._run) r._run.end = Date.now();
 });
+
+// The interrupt ids RUN_FINISHED.result.skippedResume lists, read as JSON.
+function skippedOf(body) {
+  for (const line of body.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    let frame;
+    try {
+      frame = JSON.parse(line.slice(5));
+    } catch {
+      continue;
+    }
+    if (frame?.type !== "RUN_FINISHED") continue;
+    const list = frame.result?.skippedResume;
+    return Array.isArray(list) ? list.map((s) => s?.interruptId) : [];
+  }
+  return [];
+}
 
 async function agentStatus() {
   const res = await fetch(`${CAO_URL}/sessions/cao-dojo-demo/terminals`);
@@ -199,6 +221,11 @@ try {
       runs[1]?.terminal === "RUN_FINISHED" && runs[1]?.outcome === "success",
       "an unknown interrupt is skipped: RUN_FINISHED with a success outcome",
     );
+    check(
+      JSON.stringify(runs[1]?.skipped) ===
+        JSON.stringify(["00000000-0000-0000-0000-000000000000"]),
+      `RUN_FINISHED.result.skippedResume lists the id (got ${JSON.stringify(runs[1]?.skipped)})`,
+    );
     // Wait for the page to render this run's result before counting, so the
     // no-RUN_ERROR check cannot pass just because nothing was drawn yet.
     await results.nth(1).waitFor({ timeout: SETTLE_MS });
@@ -208,7 +235,83 @@ try {
         .count()) === 0,
       "the page shows no RUN_ERROR",
     );
+    check(
+      (await results.first().getAttribute("data-skipped")) ===
+        "00000000-0000-0000-0000-000000000000",
+      "the page's run result names the skipped id",
+    );
     await shot("3-unknown-interrupt-skipped");
+    await hold();
+  } else if (phase === "skipped") {
+    // A card whose interrupt CAO never raised. It arrives over the real stream
+    // (an allow-listed approval_card sent through POST /agui/v1/emit_ui), and
+    // answering it resumes an id the server does not know.
+    const id = `e2e-skipped-${Date.now()}`;
+    const emitted = await fetch(`${CAO_URL}/agui/v1/emit_ui`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        component: "approval_card",
+        props: {
+          interrupt_id: id,
+          reason: "kiro-cli:permission_request",
+          options: ["approve", "deny"],
+          provider: "kiro_cli",
+        },
+      }),
+    });
+    check(emitted.status === 200, `POST /agui/v1/emit_ui accepted the card (HTTP ${emitted.status})`);
+    const card = page.locator(
+      `[data-testid="approval-card"][data-interrupt-id="${id}"]`,
+    );
+    const streamed = await card
+      .and(pending)
+      .waitFor({ timeout: SETTLE_MS })
+      .then(
+        () => true,
+        () => false,
+      );
+    if (!check(streamed, "the card arrived over the stream, pending"))
+      throw new Error("no card");
+    await shot("1-card");
+    await hold();
+
+    await card.getByTestId("approval-approve").click();
+    check(await runsSettled(1), `the resume run ended within ${SETTLE_MS / 1000}s`);
+    check(
+      runs[0]?.resume && runs[0]?.terminal === "RUN_FINISHED" && runs[0]?.outcome === "success",
+      "the resume run ends RUN_FINISHED with a success outcome, not RUN_ERROR",
+    );
+    check(
+      JSON.stringify(runs[0]?.skipped) === JSON.stringify([id]),
+      `RUN_FINISHED.result.skippedResume lists the id (got ${JSON.stringify(runs[0]?.skipped)})`,
+    );
+    const state = await card
+      .and(page.locator('[data-state="skipped"]'))
+      .waitFor({ timeout: SETTLE_MS })
+      .then(
+        () => "skipped",
+        async () => card.getAttribute("data-state"),
+      );
+    check(state === "skipped", `the card is in the skipped state (got ${state})`);
+    const cardText = await card.innerText();
+    check(
+      /answer not used/.test(cardText) && /this prompt was no longer pending/.test(cardText),
+      `the card says the answer was not used and why (got ${JSON.stringify(cardText.split("\n").pop())})`,
+    );
+    check(
+      (await page
+        .locator(
+          `[data-interrupt-id="${id}"][data-state="approved"], [data-interrupt-id="${id}"][data-state="rejected"]`,
+        )
+        .count()) === 0,
+      "the card is not shown approved or rejected",
+    );
+    check(
+      (await results.first().getAttribute("data-skipped")) === id,
+      "the page's run result names the skipped id",
+    );
+    await shot("2-skipped");
     await hold();
   } else {
     // The card must come from the stream's cao.generative_ui frame, so
@@ -575,7 +678,36 @@ async function pagePhase() {
       "the late card's Approve stays enabled",
     );
 
-    // 10. Session-end closer frames have no id: line either. After a record
+    // 10. A RUN_FINISHED that lists the decided card in result.skippedResume
+    // puts it in the neutral skipped state, never approved or rejected.
+    await connect();
+    await emitUi(card("gone-1"), "g1");
+    runBody =
+      `data: ${JSON.stringify({ type: "RUN_STARTED" })}\n\n` +
+      `data: ${JSON.stringify({
+        type: "RUN_FINISHED",
+        result: { skippedResume: [{ interruptId: "gone-1", reason: "unknown" }] },
+        outcome: { type: "success" },
+      })}\n\n`;
+    await page
+      .locator('[data-interrupt-id="gone-1"] [data-testid="approval-reject"]')
+      .click();
+    expect(
+      await page
+        .locator('[data-interrupt-id="gone-1"][data-state="skipped"]')
+        .waitFor({ timeout: 5_000 })
+        .then(() => true, () => false),
+      "a skipped answer marks the card skipped, not rejected",
+    );
+    expect(
+      /this prompt was no longer pending/.test(
+        await page.locator('[data-interrupt-id="gone-1"]').innerText(),
+      ),
+      "the skipped card says the prompt was no longer pending",
+    );
+    runBody = finished({ type: "success" });
+
+    // 11. Session-end closer frames have no id: line either. After a record
     // they report its id, and must still reach the log.
     await connect();
     await emitUi(record(10), "evt-10");

@@ -37,13 +37,13 @@ stock AG-UI client completes a run only when the body ends):
 | Nothing pending | `RUN_STARTED`, `STATE_SNAPSHOT`, `RUN_FINISHED` (`outcome: success`) |
 | `resume[]` delivered, nothing left pending | `RUN_STARTED`, `STATE_SNAPSHOT`, `RUN_FINISHED` (`outcome: success`) |
 | `resume[]` delivered, other interrupts still pending | `RUN_STARTED`, `STATE_SNAPSHOT`, `RUN_FINISHED` (`outcome: interrupt`, the remaining ones) |
-| `resume[]` names an unknown or expired interrupt | That entry is skipped with a server-side warning; the run ends as one of the rows above |
+| `resume[]` names an unknown or expired interrupt | That entry is skipped with a server-side warning and listed in `RUN_FINISHED.result.skippedResume`; the run ends as one of the rows above |
 | Resume failed (bad payload, delivery failure) | `RUN_STARTED`, `RUN_ERROR` |
 | `resume[]` sent, but the server has no approval bridge | HTTP 404 "Approval bridge not initialized", no stream |
 
 A `success` after `resume[]` means every entry that named a pending interrupt
-was delivered; skipped entries are only logged. It does not mean the agent
-finished its work. If the agent prompts again, the next run returns that
+was delivered; skipped entries are logged and listed in
+`result.skippedResume`. It does not mean the agent finished its work. If the agent prompts again, the next run returns that
 prompt as an interrupt. Live fleet activity is the ambient plane,
 `GET /agui/v1/stream`.
 
@@ -131,6 +131,14 @@ agent's prompt, not replacement tool arguments.
   the record is 5 minutes old, or sooner if the registry is over its cap. From
   then on the id is unknown: the entry is skipped with a server-side warning,
   the run proceeds, and anything still pending is reported again.
+- Skipped entries are also reported in-band, on `RUN_FINISHED`:
+  `"result": {"skippedResume": [{"interruptId": "<id>", "reason": "unknown" | "expired"}]}`.
+  An evicted id is reported as `unknown`. Ids and reasons only, never prompt
+  text. With nothing skipped there is no `result` key. `skippedResume` appears
+  only on `RUN_FINISHED`; a run that exits with `RUN_ERROR` carries no list.
+  A `cancelled` entry for
+  an expired interrupt, and a re-sent answer for a resolved one, are not
+  listed.
 - Surface disabled → HTTP 404 (not 403)
 
 ## Replay Contract
