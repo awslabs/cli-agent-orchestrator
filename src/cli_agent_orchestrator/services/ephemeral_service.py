@@ -288,10 +288,11 @@ def _validate_provider_route(settings: dict[str, Any]) -> None:
     """#1099 (provisional): ``ephemeral.provider_route.equivalent`` lists disjoint provider sets.
 
     A decider may route an ``auto`` spec only within the set that holds its fallback. Each set
-    names two or more supported ephemeral providers, and none mixes an advisory provider with
-    a hard or sandboxed one: advisory is weaker for every tool set, so the sets can't let a
-    decider reading untrusted task text pick the weakest provider. Members need not be in
-    ``allowed_providers``; the launch's options drop those that aren't.
+    names two or more supported ephemeral providers whose capability row is ``routable``, and
+    none mixes an advisory provider with a hard or sandboxed one: advisory is weaker for every
+    tool set, so the sets can't let a decider reading untrusted task text pick the weakest
+    provider. Members need not be in ``allowed_providers``; the launch's options drop those
+    that aren't.
     """
 
     def refuse(detail: str) -> NoReturn:
