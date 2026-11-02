@@ -124,6 +124,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroV3LaunchError,
     kiro_effort,
+    kiro_effort_value,
     missing_flag_message,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
@@ -2193,12 +2194,19 @@ async def _create_terminal_unguarded(
             # Mirror the launch-time precedence (`model or profile.model`, see
             # _get_profile_model): probing the profile snapshot alone would let an
             # explicit override launch --model on a wrapper never probed for it.
-            # A v3 launch also passes kiroConfig.effort as --effort (#1167), so
-            # the probe asks for that flag too; v2's request is unchanged.
+            # A v3 launch also passes an effort as --effort (#1167), so the probe
+            # asks for that flag too; v2's request is unchanged.
+            # #1083: the plan's effort first, as for every provider (resolve_launch_effort),
+            # then the profile's kiroConfig.effort; v2 takes no effort.
+            planned_effort = launch_effort
             launch_effort = None
             if resolved_engine == KiroEngine.V3:
                 try:
-                    launch_effort = kiro_effort(profile)
+                    launch_effort = (
+                        kiro_effort_value(planned_effort)
+                        if planned_effort is not None
+                        else kiro_effort(profile)
+                    )
                 except ValueError as exc:
                     # A coded refusal, so every create route answers 400 (the
                     # in-session and run-step routes map a bare ValueError to 404).

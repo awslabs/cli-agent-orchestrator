@@ -6,15 +6,19 @@ the provider's own command builder.
 """
 
 import shlex
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
+from cli_agent_orchestrator.providers.kiro_capabilities import build_kiro_command
+from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_launch_home import KiroLaunch
 from cli_agent_orchestrator.providers.manager import ProviderManager
 
 DECLARED = {ProviderType.CLAUDE_CODE.value, ProviderType.CODEX.value}
@@ -90,12 +94,33 @@ def test_a_launch_without_a_profile_file_is_judged_like_honors_model():
     assert ClaudeCodeProvider.honors_model(None, None, None) is True
 
 
+def _kiro_helper_args(profile: AgentProfile, effort=None) -> list[str]:
+    """A Kiro helper's v3 argv: its effort is the launch object's, never the profile's."""
+    launch = KiroLaunch(
+        home=Mock(),
+        kiro_cli=Mock(),
+        grant=("@cao-mcp-server",),
+        working_directory="/w",
+        effort=effort,
+    )
+    with patch(
+        "cli_agent_orchestrator.providers.kiro_cli.load_agent_profile", return_value=profile
+    ):
+        provider = KiroCliProvider(
+            "tid", "sess", "win", "worker", engine=KiroEngine.V3, launch=launch
+        )
+        return build_kiro_command(
+            KiroEngine.V3, "worker", yolo=True, effort=provider._get_profile_effort()
+        )
+
+
 # A structural guard (#201a §2.2, §5.2): a capability row can't declare effort_config
 # without a per-launch path, since every ephemeral-capable provider is checked here.
 
 _ARGS_BY_PROVIDER = {
     ProviderType.CLAUDE_CODE.value: _claude_args,
     ProviderType.CODEX.value: _codex_args,
+    ProviderType.KIRO_CLI.value: _kiro_helper_args,
 }
 
 

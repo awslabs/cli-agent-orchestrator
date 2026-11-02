@@ -567,6 +567,18 @@ def requested_kiro_capabilities(
 _EFFORT_VALUE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 
+def kiro_effort_value(effort: object) -> str:
+    """An ``--effort`` value, checked: a lowercase level, never something read as a flag.
+
+    Passed through unchanged (kiro-cli checks it against the model's own
+    levels). Shared by a profile's ``kiroConfig.effort`` and a launch plan's
+    effort, so both are held to one rule.
+    """
+    if not isinstance(effort, str) or not _EFFORT_VALUE.fullmatch(effort):
+        raise ValueError("kiroConfig.effort must be a lowercase level such as low, medium or high")
+    return effort
+
+
 def kiro_effort(profile: object) -> Optional[str]:
     """The ``--effort`` value a profile's ``kiroConfig.effort`` sets, or None.
 
@@ -577,7 +589,4 @@ def kiro_effort(profile: object) -> Optional[str]:
     config = getattr(profile, "kiroConfig", None)
     if not isinstance(config, dict) or config.get("effort") is None:
         return None
-    effort = config["effort"]
-    if not isinstance(effort, str) or not _EFFORT_VALUE.fullmatch(effort):
-        raise ValueError("kiroConfig.effort must be a lowercase level such as low, medium or high")
-    return effort
+    return kiro_effort_value(config["effort"])

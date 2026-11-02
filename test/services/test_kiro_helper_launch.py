@@ -626,6 +626,20 @@ async def test_a_tier_and_an_effort_are_probed_and_reach_the_launch(kiro):
 
 
 @pytest.mark.asyncio
+async def test_a_planned_effort_reaches_the_launch_before_kiro_config(kiro):
+    """A launch plan's effort wins over the live profile's kiroConfig.effort, as for every
+    provider, so nothing between the plan and --effort can drop it."""
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
+    spec = {**SPEC, "purpose": "planned_triage", "provider": "kiro_cli", "effort": "medium"}
+    kiro.name = create(kiro.env, spec)["name"]
+    claimed = claim(kiro.env, kiro.name)["claim_id"]
+    await launch(kiro, claim_id=claimed, launch_plan=LaunchPlan(effort="high"))
+    assert "effort" in kiro.probe.call_args.args[1]
+    assert kiro.factory.call_args.kwargs["kiro_launch"].effort == "high"
+
+
+@pytest.mark.asyncio
 async def test_a_wrapper_without_effort_refuses_an_effort_launch_before_bind(kiro):
     spec = {**SPEC, "purpose": "effort_triage", "provider": "kiro_cli", "effort": "high"}
     kiro.name = create(kiro.env, spec)["name"]
