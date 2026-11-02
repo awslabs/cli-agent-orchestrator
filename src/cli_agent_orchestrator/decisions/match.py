@@ -194,7 +194,7 @@ def _break_tie(remaining: list[Candidate], inputs: MatchInputs) -> tuple[str, li
     return "order", [c for c in remaining if inputs.options.index(c.provider) == first]
 
 
-def explain_rows(result: MatchResult, inputs: MatchInputs) -> list[dict[str, Any]]:
+def explain_rows(result: MatchResult) -> list[dict[str, Any]]:
     """The candidate table ``cao decisions match explain`` prints, in candidate order."""
     return [
         {
@@ -202,7 +202,7 @@ def explain_rows(result: MatchResult, inputs: MatchInputs) -> list[dict[str, Any
             "model": c.model,
             "context_tokens": c.facts.context_tokens if c.facts else None,
             "cost": c.facts.cost if c.facts else None,
-            "covers": {need: bool(bit) for need, bit in zip(inputs.needs, c.cover)},
+            "covers": {need: bool(bit) for need, bit in zip(result.needs, c.cover)},
             "pick": result.picked and (c.provider, c.tier) == (result.provider, result.tier),
         }
         for c in result.candidates

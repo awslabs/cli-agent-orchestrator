@@ -114,7 +114,7 @@ def test_AC6_a_cli_outside_the_options_is_never_picked():
     result = match(inputs(cat, ("long_context",)))
     assert (result.rule, result.provider, result.tier) == ("no_cover", "claude_code", "medium")
     assert {c.provider for c in result.candidates} == {"claude_code"}
-    assert "codex" not in json.dumps(explain_rows(result, inputs(cat, ("long_context",))))
+    assert "codex" not in json.dumps(explain_rows(result))
 
 
 def test_AC7_a_ceiling_of_medium_never_picks_large():
@@ -362,7 +362,7 @@ def test_AC11_an_invalid_catalog_matches_nothing():
 def test_explain_rows_mark_only_the_pick():
     cat = catalog({"claude_code": {"cc-l": decl(1000000, "high")}})
     given_inputs = inputs(cat, ("long_context",))
-    rows = explain_rows(match(given_inputs), given_inputs)
+    rows = explain_rows(match(given_inputs))
     assert [(row["candidate"], row["pick"]) for row in rows] == [
         ("claude_code/medium", False),
         ("claude_code/large", True),
