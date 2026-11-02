@@ -188,6 +188,7 @@ from cli_agent_orchestrator.utils.enforcement import (
     enforcement_for,
     native_providers,
 )
+from cli_agent_orchestrator.utils.ephemeral_capabilities import capability_for
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -2139,6 +2140,17 @@ async def _create_terminal_unguarded(
             # #1099: only the engine routes, and only a claimed ephemeral launch. Anything
             # else is a bug, refused here before any resource is allocated.
             raise RuntimeError("a launch plan routed a launch that is not a claimed ephemeral")
+        if (
+            launch_plan is not None
+            and launch_plan.provider is not None
+            and not capability_for(launch_plan.provider).routable
+        ):
+            # A routed Kiro helper would drop its planned effort and escape the sweep's
+            # home retry, so it is refused before any resource or Kiro step (#1167).
+            raise RuntimeError(
+                f"a launch plan routed a launch to {launch_plan.provider}, "
+                "which provider.route cannot route to yet"
+            )
         # The request's provider stays the claim's identity: the fingerprint and the ephemeral
         # launch checks above used it, and the bind below compares it. Everything else that
         # depends on which CLI runs uses the launch provider (#1099).

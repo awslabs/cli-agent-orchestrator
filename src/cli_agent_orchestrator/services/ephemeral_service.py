@@ -315,6 +315,14 @@ def _validate_provider_route(settings: dict[str, Any]) -> None:
             refuse(where + " must name two or more distinct providers")
         if any(member not in ephemeral_providers() for member in members):
             refuse(where + " must contain supported providers: " + ", ".join(ephemeral_providers()))
+        unroutable = [member for member in members if not capability_for(member).routable]
+        if unroutable:
+            refuse(
+                where
+                + " names "
+                + ", ".join(unroutable)
+                + ", which provider.route cannot route to yet"
+            )
         if seen.intersection(members):
             refuse(where + " overlaps an earlier set; sets must be disjoint")
         seen.update(members)
@@ -1296,13 +1304,18 @@ def _route_refusal(
     """#1099 (provisional): the first rule that keeps ``provider`` from running this launch.
 
     One rule for the claim's options and the pre-bind recheck of a decided provider, so the
-    two can't drift apart: rule 8, support and the stored tools' atoms, then every tier the
-    launch can reach mapped in the provider's table, then an effort it can apply and
-    membership of the fallback's declared set.
+    two can't drift apart: rule 8, support and the stored tools' atoms, then whether
+    ``provider.route`` may route to it at all (the capability row's ``routable``), then every
+    tier the launch can reach mapped in the provider's table, then an effort it can apply and
+    membership of the fallback's declared set. Never applied to the fallback itself.
     """
     refusal = provider_refusal(provider, settings, row["effective_tools"])
     if refusal is not None:
         return refusal
+    if not capability_for(provider).routable:
+        return EphemeralPolicyError(
+            "provider_not_equivalent", f"{provider} cannot be routed to yet"
+        )
     table = settings["_model_tiers"].get(provider, {})
     unmapped = [tier for tier in tiers if not table.get(tier)]
     if unmapped:

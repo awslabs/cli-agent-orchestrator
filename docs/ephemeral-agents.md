@@ -62,9 +62,11 @@ untrusted task text can choose. Declaring a set is your consent that any task ma
 of its providers, with that vendor's model and credentials. The rules, all provisional
 (#1099):
 
-- every set names two or more distinct providers that support ephemeral agents, each with
-  the `enforcement` label listed under
-  [Create surface and stored files](#create-surface-and-stored-files) (Kiro is not one yet);
+- every set names two or more distinct providers that support ephemeral agents and that
+  `provider.route` can route to, each with the `enforcement` label listed under
+  [Create surface and stored files](#create-surface-and-stored-files). Today those are Claude
+  Code and Codex: Kiro helpers are `hard`, but a set naming `kiro_cli` refuses until routing to
+  Kiro is supported;
 - no provider appears in two sets;
 - a set never mixes an `advisory` provider with a `hard` or `sandboxed` one, since advisory is
   weaker for every tool set. Two advisory providers may share a set, and so may `hard` and
@@ -74,7 +76,8 @@ of its providers, with that vendor's model and credentials. The rules, all provi
 Members need not be in `allowed_providers`; a launch only ever routes to an allowed one. A block
 that breaks a rule refuses every create and claim with `policy_config_error:provider_route`, like
 any broken setting. With today's capability table (Claude Code `hard`, Codex `advisory`, Kiro
-refused) no set validates, so nothing is routed until a provider's class changes.
+`hard` but not routable) no set validates, so nothing is routed until Codex's class changes or
+routing to Kiro is supported.
 
 Creates take an inter-process `flock` lock under `CAO_HOME/locks/`. A create that can't take
 the lock within 10 seconds is refused with `store_busy` (503) and can be retried. If the lock
@@ -234,17 +237,20 @@ stored effort. The creator's launch note stays model-only, so an effort-only lau
 
 With `provider: "auto"`, the `provider.route` decision point chooses which CLI runs the
 child, at launch, so you don't have to name one for every child. It is off by default. With
-today's providers it routes nothing, because no `ephemeral.provider_route` set validates until
-a provider's enforcement class changes (see [Operator settings](#operator-settings)). This is
-provisional (#1099).
+today's providers it routes nothing, because no `ephemeral.provider_route` set validates (see
+[Operator settings](#operator-settings)), and no launch is routed to Kiro. This is provisional
+(#1099).
 
 At create, `auto` resolves to your own provider, the creator's, which is the fallback. Every
 create check runs on it, and the response's `provider` and `enforcement`, the registry row, the
 live profile and the archive all name it; the stored spec keeps `auto`, and the notes gain
 `provider: auto (decided at launch within ephemeral.provider_route.equivalent; fallback <provider>,
 the creator's provider)`. If your own provider can't run ephemeral agents, create refuses with
-`provider_unsupported` and asks you to set a provider explicitly. The lease must cover one more
-on-mode wait, so `n` in the `claim_lease_seconds` floor counts `provider: "auto"` too.
+`provider_unsupported` and asks you to set a provider explicitly. A Kiro creator's `auto`
+resolves to `kiro_cli`, which must be in `allowed_providers` (else `provider_not_allowed`), and
+runs as a Kiro helper: no set may name Kiro, so it has one option and is never routed. The lease
+must cover one more on-mode wait, so `n` in the `claim_lease_seconds` floor counts
+`provider: "auto"` too.
 
 An explicit provider is never routed, and the sets don't bind it: only `allowed_providers` does.
 An omitted provider behaves as before.

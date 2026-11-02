@@ -41,6 +41,9 @@ class EphemeralCapability:
     # The live-profile section and key that carry effort, e.g. Claude Code's
     # claudeConfig.effort; None when the provider has no effort mapping.
     effort_config: Optional[tuple[str, str]]
+    # Whether an ephemeral.provider_route set may name this provider, so a decider can
+    # route a provider "auto" launch to it (#1099). Off unless a row says so.
+    routable: bool = False
 
     def __post_init__(self) -> None:
         if self.enforcement not in ENFORCEMENT_CLASSES:
@@ -68,18 +71,24 @@ _REFUSED = EphemeralCapability(REFUSED, frozenset(), False, None)
 CAPABILITIES: dict[str, EphemeralCapability] = {
     # --disallowedTools; the MCP config holds only cao-mcp-server.
     "claude_code": EphemeralCapability(
-        HARD, frozenset(TOOL_ATOMS), True, ("claudeConfig", "effort")
+        HARD, frozenset(TOOL_ATOMS), True, ("claudeConfig", "effort"), routable=True
     ),
     # An operator opt-in that runs --yolo with network on, so every atom runs,
     # advisorily. The contained launch moves it to SANDBOXED without web_fetch.
     "codex": EphemeralCapability(
-        ADVISORY, frozenset(TOOL_ATOMS), True, ("codexConfig", "model_reasoning_effort")
+        ADVISORY,
+        frozenset(TOOL_ATOMS),
+        True,
+        ("codexConfig", "model_reasoning_effort"),
+        routable=True,
     ),
     # Hard on the v3 engine, from a per-launch universal agent file (#1167
     # Phase 2): v3 exposes only what the file selects minus what it excludes,
     # and denies every capability outside the grant; /tools and /mcp list are
     # checked before each task. The model reaches --model through the launch
-    # object, and effort goes in kiroConfig.effort and becomes --effort.
+    # object, and effort goes in kiroConfig.effort and becomes --effort. Not
+    # routable yet: a provider.route set may not name it until routing to a
+    # Kiro helper carries the planned effort and the sweep finds a routed home.
     "kiro_cli": EphemeralCapability(HARD, frozenset(TOOL_ATOMS), True, ("kiroConfig", "effort")),
 }
 
