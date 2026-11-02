@@ -744,12 +744,17 @@ def _shape(op: object, av: object, ctx: _Ctx, flags: int) -> _Shape:
 class _Item:
     """One element of a path through the pattern, for the walking checks."""
 
-    kind: str  # "token" | "repeat" | "lookbehind" | "anchor"
+    kind: str  # "token" | "repeat" | "lookbehind" | "lookahead" | "anchor"
     shape: _Shape
     label: str
     possessive: bool = False
     negative: bool = False
     look_chars: frozenset[str] = field(default_factory=frozenset)
+    #: lookahead only: the characters its body can start with, whether the body
+    #: can match empty, and the characters of the unbounded repeats inside it.
+    look_first: frozenset[str] = field(default_factory=frozenset)
+    look_nullable: bool = True
+    look_repeat_chars: frozenset[str] = field(default_factory=frozenset)
 
 
 _MAX_PATHS = 4096
@@ -778,8 +783,8 @@ def _node_paths(op: object, av: object, ctx: _Ctx, flags: int, source: str) -> l
         return [[_Item("anchor", _Shape(True, frozenset(), frozenset()), str(av))]]
     if op in (C.ASSERT, C.ASSERT_NOT):
         direction, sub = av  # type: ignore[misc]
+        sh = _shape_seq(sub, ctx, flags)
         if direction < 0:
-            sh = _shape_seq(sub, ctx, flags)
             return [
                 [
                     _Item(
@@ -791,7 +796,24 @@ def _node_paths(op: object, av: object, ctx: _Ctx, flags: int, source: str) -> l
                     )
                 ]
             ]
-        return [[]]
+        repeat_chars: set[str] = set()
+        for r_op, r_av, _depth in _repeats_in(list(sub)):
+            if _is_unbounded(r_av[1]):  # type: ignore[index]
+                repeat_chars |= _shape_seq(r_av[2], ctx, flags).chars  # type: ignore[index]
+        return [
+            [
+                _Item(
+                    "lookahead",
+                    _Shape(True, frozenset(), frozenset()),
+                    "negative lookahead" if op is C.ASSERT_NOT else "lookahead",
+                    negative=op is C.ASSERT_NOT,
+                    look_chars=sh.chars,
+                    look_first=sh.first,
+                    look_nullable=sh.nullable,
+                    look_repeat_chars=frozenset(repeat_chars),
+                )
+            ]
+        ]
     if op is C.BRANCH:
         out: list[list[_Item]] = []
         for alt in av[1]:  # type: ignore[index]
@@ -815,11 +837,33 @@ def _node_paths(op: object, av: object, ctx: _Ctx, flags: int, source: str) -> l
                 possessive=op is C.POSSESSIVE_REPEAT,
             )
             return [[item]]
-        # Bounded: one pass through the body stands for its iterations, and an
-        # optional repeat can also be skipped.
+        if op is C.POSSESSIVE_REPEAT and not _single_char_body(sub, flags):
+            # Atomic once matched: it can rescan, but nothing outside can make
+            # it re-split its own iterations.
+            return [
+                [
+                    _Item(
+                        "repeat",
+                        _Shape(lo == 0 or sh.nullable, sh.first, sh.chars),
+                        f"possessive bounded repeat over {_describe(sh.chars)}",
+                        possessive=True,
+                    )
+                ]
+            ]
+        # Bounded: one or two consecutive passes through the body stand for its
+        # iterations (two, so that adjacent iterations are checked against each
+        # other), and an optional repeat can also be skipped.
         inner = _paths(sub, ctx, flags, source)
-        return ([[]] if lo == 0 else []) + inner
+        out = ([[]] if lo == 0 else []) + (inner if lo <= 1 else [])
+        if hi >= 2:
+            out += [a + b for a in inner for b in inner][:_MAX_PATHS]
+        return out[:_MAX_PATHS]
     raise NotImplementedError(f"regex construct {op}")
+
+
+def _single_char_body(sub: object, flags: int) -> bool:
+    body = list(sub)  # type: ignore[call-overload]
+    return len(body) == 1 and _single_char_predicate(body[0][0], body[0][1], flags) is not None
 
 
 def _describe(chars: frozenset[str]) -> str:
@@ -855,9 +899,14 @@ def _nested_issues(nodes: Sequence[tuple[object, object]], ctx: _Ctx, flags: int
     issues: list[str] = []
     for op, av, _depth in _repeats_in(nodes):
         lo, hi, sub = av  # type: ignore[misc]
-        if op is C.POSSESSIVE_REPEAT or not _is_unbounded(hi):
+        if op is C.POSSESSIVE_REPEAT:
             continue
         body = list(sub)
+        # A bounded repeat that can run its body twice is as ambiguous as an
+        # unbounded one whenever the body itself can vary: (?:\w+\s?){1,20}:
+        # and (?:a|a){0,200}b are exponential.
+        if not _is_unbounded(hi) and not (hi >= 2 and _varies(body)):
+            continue
         # S2: alternation directly under the repeat
         for b_op, b_av in _flatten_groups(body):
             if b_op is C.BRANCH:
@@ -871,18 +920,20 @@ def _nested_issues(nodes: Sequence[tuple[object, object]], ctx: _Ctx, flags: int
                                 "alternation under a repeat has branches that can start "
                                 f"with the same character ({_describe(shapes[i].first & shapes[j].first)})"
                             )
-        # S1: unbounded repeats inside the body need a fence on both sides
-        for seq in _sequences_in(body):
+        # S1: unbounded repeats inside the body need a fence on both sides. A
+        # possessive inner repeat cannot be re-split across iterations, so it
+        # needs none. A sequence's neighbours in its parent (the token before a
+        # lookaround or a branch) fence its ends.
+        for seq, before, after in _sequences_in(body):
             for index, (i_op, i_av) in enumerate(seq):
-                if i_op not in (C.MAX_REPEAT, C.MIN_REPEAT, C.POSSESSIVE_REPEAT):
+                if i_op not in (C.MAX_REPEAT, C.MIN_REPEAT):
                     continue
                 if not _is_unbounded(i_av[1]):  # type: ignore[index]
                     continue
                 inner = _shape_seq(i_av[2], ctx, flags).chars  # type: ignore[index]
-                if not (
-                    _fence(seq, index - 1, inner, ctx, flags)
-                    and _fence(seq, index + 1, inner, ctx, flags)
-                ):
+                left = seq[index - 1] if index > 0 else before
+                right = seq[index + 1] if index + 1 < len(seq) else after
+                if not (_fence(left, inner, ctx, flags) and _fence(right, inner, ctx, flags)):
                     issues.append(
                         f"repeat over {_describe(inner)} nested in another repeat with no fence "
                         "on both sides"
@@ -898,36 +949,61 @@ def _flatten_groups(body: list[tuple[object, object]]) -> Iterator[tuple[object,
             yield op, av
 
 
-def _sequences_in(body: list[tuple[object, object]]) -> Iterator[list[tuple[object, object]]]:
-    yield body
-    for op, av in body:
+Node_ = tuple[object, object]
+
+
+def _sequences_in(
+    body: list[Node_], before: Optional[Node_] = None, after: Optional[Node_] = None
+) -> Iterator[tuple[list[Node_], Optional[Node_], Optional[Node_]]]:
+    """Every sequence in ``body``, with the nodes just outside its two ends."""
+    yield body, before, after
+    for index, (op, av) in enumerate(body):
+        left = body[index - 1] if index > 0 else before
+        right = body[index + 1] if index + 1 < len(body) else after
         if op is C.SUBPATTERN:
-            yield from _sequences_in(list(av[-1]))  # type: ignore[index]
+            yield from _sequences_in(list(av[-1]), left, right)  # type: ignore[index]
         elif op is C.BRANCH:
             for alt in av[1]:  # type: ignore[index]
-                yield from _sequences_in(list(alt))
+                yield from _sequences_in(list(alt), left, right)
         elif op in (C.ASSERT, C.ASSERT_NOT):
-            yield from _sequences_in(list(av[1]))  # type: ignore[index]
+            # Zero-width: the character before its body is the one ``left`` matched.
+            yield from _sequences_in(list(av[1]), left, None)  # type: ignore[index]
         elif op is C.ATOMIC_GROUP:
-            yield from _sequences_in(list(av))  # type: ignore[arg-type]
+            yield from _sequences_in(list(av), left, right)  # type: ignore[arg-type]
         elif op in (C.MAX_REPEAT, C.MIN_REPEAT, C.POSSESSIVE_REPEAT) and not _is_unbounded(av[1]):  # type: ignore[index]
-            yield from _sequences_in(list(av[2]))  # type: ignore[index]
+            yield from _sequences_in(list(av[2]), left, right)  # type: ignore[index]
 
 
-def _fence(
-    seq: list[tuple[object, object]], index: int, inner: frozenset[str], ctx: _Ctx, flags: int
-) -> bool:
-    if index < 0 or index >= len(seq):
+def _varies(body: list[Node_]) -> bool:
+    """The body holds an unbounded repeat or an alternation (at any depth)."""
+    for seq, _before, _after in _sequences_in(body):
+        for op, av in seq:
+            if op is C.BRANCH:
+                return True
+            if op in (C.MAX_REPEAT, C.MIN_REPEAT) and _is_unbounded(av[1]):  # type: ignore[index]
+                return True
+    return False
+
+
+def _fence(node: Optional[Node_], inner: frozenset[str], ctx: _Ctx, flags: int) -> bool:
+    if node is None:
         return False
-    op, av = seq[index]
+    op, av = node
     pred = _single_char_predicate(op, av, flags)
     if pred is None:
         return False
     return not (ctx.chars_of(pred) & inner)
 
 
-def _overlap_issues(paths: list[list[_Item]]) -> list[str]:
-    """S3: two repeats in a row over shared characters with no boundary-pinning token."""
+def _overlap_issues(paths: list[list[_Item]], word: frozenset[str]) -> list[str]:
+    """S3: two repeats in a row over shared characters with no boundary-pinning token.
+
+    Also: a backtracking repeat followed by a lookahead that re-scans the same
+    characters with a repeat of its own (each character the first repeat gives
+    back re-runs the lookahead's scan). A positive lookahead, or ``\\b``, that
+    demands a character the first repeat cannot consume pins the end of its run,
+    so nothing after it can be split against it.
+    """
     issues: set[str] = set()
     for path in paths:
         for i, first in enumerate(path):
@@ -935,7 +1011,29 @@ def _overlap_issues(paths: list[list[_Item]]) -> list[str]:
                 continue
             x = first.shape.chars
             between: list[frozenset[str]] = []
+            previous = x
             for later in path[i + 1 :]:
+                if later.kind == "lookahead":
+                    if (later.look_first & x) and (later.look_repeat_chars & x):
+                        issues.add(
+                            f"{first.label} is followed by a {later.label} that re-scans "
+                            f"its characters ({_describe(later.look_repeat_chars & x)})"
+                        )
+                    if not later.negative and not later.look_nullable:
+                        if not (later.look_first & x):
+                            break  # the next character cannot be in the run: pinned
+                    continue
+                if later.kind == "anchor":
+                    if later.label in ("AT_BOUNDARY", "AT_NON_BOUNDARY"):
+                        prev_word = previous <= word
+                        prev_nonword = not (previous & word)
+                        boundary = later.label == "AT_BOUNDARY"
+                        # After a word character \b demands a non-word one next.
+                        if boundary and prev_word and x <= word:
+                            break
+                        if boundary and prev_nonword and not (x & word):
+                            break
+                    continue
                 if later.kind == "repeat":
                     shared = x & later.shape.chars
                     if shared and all(t & shared for t in between):
@@ -947,10 +1045,12 @@ def _overlap_issues(paths: list[list[_Item]]) -> list[str]:
                         if not (later.shape.chars & x):
                             break
                         between.append(later.shape.chars)
+                        previous = later.shape.chars
                 elif later.kind == "token":
                     if not (later.shape.chars & x):
                         break
                     between.append(later.shape.chars)
+                    previous = later.shape.chars
     return sorted(issues)
 
 
@@ -972,13 +1072,18 @@ def _rescan_issues(paths: list[list[_Item]], multiline_start: bool) -> list[str]
             index = 1
         mandatory: list[frozenset[str]] = []
         blockers: list[_Item] = []
-        for item in path[index:]:
+        rest = path[index:]
+        for position, item in enumerate(rest):
             if item.kind == "lookbehind":
                 blockers.append(item)
                 continue
-            if item.kind == "anchor":
+            if item.kind in ("anchor", "lookahead"):
                 continue
-            if item.kind == "repeat":
+            # A repeat that ends the pattern cannot fail after scanning: either
+            # it reaches its minimum and the attempt succeeds, or it stops
+            # short within that minimum. Search resumes after a success.
+            terminal = position == len(rest) - 1
+            if item.kind == "repeat" and not terminal:
                 c = item.shape.chars
                 crosses = triggers is None or bool(c & triggers)
                 passable = all(t & c for t in mandatory)
@@ -1008,12 +1113,13 @@ def structural_issues(pattern: PatternLike, mode: str = "search", flags: int = 0
     ctx = _Ctx(flags, _alphabet(list(tree), flags))
     nodes = list(tree)
     issues = _nested_issues(nodes, ctx, flags)
+    word = ctx.chars_of(lambda ch: _is_word(ch, bool(flags & re.ASCII)))
     paths = _paths(nodes, ctx, flags, source)
-    issues += _overlap_issues(paths)
-    for seq in _sequences_in(nodes):
+    issues += _overlap_issues(paths, word)
+    for seq, _before, _after in _sequences_in(nodes):
         for op, av in seq:
             if op in (C.ASSERT, C.ASSERT_NOT):
-                issues += _overlap_issues(_paths(av[1], ctx, flags, source))  # type: ignore[index]
+                issues += _overlap_issues(_paths(av[1], ctx, flags, source), word)  # type: ignore[index]
     if mode in ("search", "finditer"):
         issues += _rescan_issues(paths, bool(flags & re.MULTILINE))
     return sorted(set(issues))

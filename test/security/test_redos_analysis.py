@@ -9,6 +9,7 @@ its counts grow the way CPython's backtracking does.
 import random
 import re
 from test.security.redos_analysis import (
+    BOUNDED_MAX,
     StepBudgetExceeded,
     count_steps,
     first_superlinear,
@@ -31,6 +32,16 @@ import pytest
         (r"[*][^\n]*x", "search"),  # unanchored: every '*' rescans the line
         (r"(?m)^\s*x", "search"),  # line-anchored, but \s carries into the next line
         (r"(?:\x1b\[[0-9;]*m)*x", "search"),  # fenced, but every ESC starts a rescan
+        # Bounded repeats are no safer when their body can run twice:
+        (r"(?:\s*){2}x", "match"),  # \s*\s*x written as a bounded repeat
+        (r"(?:[^\S\n]*){2}x", "match"),
+        (r"(?:a|a){0,200}b", "match"),  # exponential: ambiguous alternation, bounded
+        (r"(?:\w+\s?){1,20}:", "match"),  # exponential: nested, bounded outer repeat
+        # A backtracking repeat before a lookahead that re-scans what it gives back:
+        (r"x(?:ab)*(?!(?:ab)*c)\s", "match"),
+        (r"[⏺●](?:\x1b\[[0-9;]*m)*(?![ \t]*+(?:\x1b\[[0-9;]*m)*+\w)\s+", "match"),
+        # Unanchored, a possessive skip still restarts at every position:
+        (r"(?:[^\n…]++|…(?![ \t]+\())*+…[ \t]+\(", "search"),
     ],
 )
 def test_superlinear_shapes_are_flagged(pattern, mode):
@@ -47,6 +58,13 @@ def test_superlinear_shapes_are_flagged(pattern, mode):
         (r"(?m)^[^\S\n]*x", "search"),  # horizontal whitespace stops at the newline
         (r"(?<!\d)\d+ of", "search"),  # starts only where a digit run starts
         (r"[*][^\n]*x", "match"),  # one attempt: no rescans in match mode
+        (r"\w*ing\b.*x", "match"),  # \b after a word character pins the \w* run
+        (r"[\w-]*ing(?=…).*…", "match"),  # so does a lookahead the run cannot consume
+        (r"─{8,}", "search"),  # a repeat that ends the pattern cannot fail after scanning
+        (r"(?:a++|b)*c", "match"),  # a possessive inner repeat cannot be re-split
+        (r"(?:[ \t]*+\n){0,2}+x", "match"),  # nor can a possessive bounded group
+        # Line-anchored skip; the lookahead's repeat is fenced by the "…" before it.
+        (r"(?m)^(?:[^\n…]++|…(?![ \t]+\())*+…[ \t]+\(", "search"),
     ],
 )
 def test_linear_shapes_pass(pattern, mode):
@@ -70,6 +88,14 @@ def test_matcher_agrees_with_re(pattern, flags):
         text = "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 24)))
         for mode in ("search", "finditer", "match", "fullmatch"):
             count_steps(pattern, text, mode, flags)  # raises if a span disagrees
+
+
+def test_bounded_max_is_where_a_bound_stops_counting_as_unbounded():
+    # A repeat bounded at BOUNDED_MAX re-scans at most that many characters per
+    # attempt (linear with a constant); one past it is treated as unbounded.
+    assert BOUNDED_MAX == 256
+    assert structural_issues(r"[*][^\n]{0,256}x", "search") == []
+    assert structural_issues(r"[*][^\n]{0,257}x", "search")
 
 
 def test_budget_stops_runaway_backtracking():
