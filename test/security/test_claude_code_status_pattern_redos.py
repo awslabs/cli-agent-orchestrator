@@ -45,6 +45,18 @@ OLD_EXTRACTION_RESPONSE = (
     r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*(?![ \t]*" + _OLD_TAIL + r")\s+"
 )
 OLD_EFFORT_FOOTER_LINE = r"^[ \t]*[⏺●][ \t]*" + _OLD_TAIL
+OLD_COMPLETION_SUMMARY = r"[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s*s\b"
+OLD_AFTER_SUMMARY_SPINNER = r"[✶✢✽✻✳·*][ \t]+" + cc._SPINNER_VERB + r"[^\n]*…"
+OLD_SEPARATOR_WALK_SPINNER = r"[✶✢✽✻✳·][^\n]*\u2026"
+OLD_REDUCED_MOTION_SPINNER = (
+    r"^[ \t]*●[ \t]+[^\n]*…[ \t]+\("
+    r"(?:running[ \t][^)\n]*\bhooks?\b"
+    r"|\d+(?:\.\d+)?[smhd]\b"
+    r"|(?:[↓↑][ \t]*)?[\d.,]+[kmb]?[ \t]+tokens\b"
+    r"|thinking\b|thought[ \t]+for\b"
+    r"|esc[ \t]+to[ \t]+interrupt\b)"
+)
+OLD_COMPOSER_PROMPT = r"^[ \t]*[>❯](?:[ \t\xa0]+(.*)|[ \t\xa0]*)$"
 
 # (label, current pattern, old pattern, old flags, how callers run it)
 PATTERNS = [
@@ -63,6 +75,34 @@ PATTERNS = [
         OLD_EXTRACTION_RESPONSE,
         re.MULTILINE,
         "finditer",
+    ),
+    (
+        "COMPLETION_SUMMARY_PATTERN",
+        cc.COMPLETION_SUMMARY_PATTERN,
+        OLD_COMPLETION_SUMMARY,
+        0,
+        "search",
+    ),
+    (
+        "AFTER_SUMMARY_SPINNER_PATTERN",
+        cc.AFTER_SUMMARY_SPINNER_PATTERN,
+        OLD_AFTER_SUMMARY_SPINNER,
+        0,
+        "search",
+    ),
+    (
+        "SEPARATOR_WALK_SPINNER_PATTERN",
+        cc.SEPARATOR_WALK_SPINNER_PATTERN,
+        OLD_SEPARATOR_WALK_SPINNER,
+        0,
+        "search",
+    ),
+    (
+        "REDUCED_MOTION_SPINNER_PATTERN",
+        cc.REDUCED_MOTION_SPINNER_PATTERN,
+        OLD_REDUCED_MOTION_SPINNER,
+        re.MULTILINE,
+        "search",
     ),
 ]
 IDS = [p[0] for p in PATTERNS]
@@ -241,3 +281,78 @@ class TestInputBoxSpans:
             assert list(cc._iter_new_tui_boxes(text)) == spans, repr(text)
             match = cc.NEW_TUI_BOX_PATTERN.search(text)
             assert (match.span(1) if match else None) == (spans[0] if spans else None), repr(text)
+
+
+def _same_verdicts(new, old: str, old_flags: int, texts: list[str]) -> None:
+    old_re = re.compile(old, old_flags)
+    for text in texts:
+        assert bool(new.search(text)) == bool(old_re.search(text)), repr(text)
+
+
+class TestSpinnerAndSummaryVerdicts:
+    """These four are only ever asked whether they match: the verdict must not move."""
+
+    GLYPHS = ["✶", "✢", "✽", "✻", "✳", "·", "*"]
+
+    def test_completion_summary(self):
+        tokens = self.GLYPHS + ["for", " for ", "3", "3.5", "s", " ", "\t", "…", "\n", "x"]
+        new = re.compile(cc.COMPLETION_SUMMARY_PATTERN)
+        _same_verdicts(new, OLD_COMPLETION_SUMMARY, 0, _random_texts(1886, tokens, 20000, 25))
+
+    def test_after_summary_spinner(self):
+        tokens = self.GLYPHS + [" ", "\t", "Thinking", "ing", "Dilly-dallying", "Beboppin'"]
+        tokens += ["in’", "…", "\n", "x", "-", "'"]
+        _same_verdicts(
+            cc.AFTER_SUMMARY_SPINNER_PATTERN,
+            OLD_AFTER_SUMMARY_SPINNER,
+            0,
+            _random_texts(975, tokens, 20000, 20),
+        )
+
+    def test_separator_walk_spinner(self):
+        tokens = self.GLYPHS + ["…", "a", " ", "\n"]
+        _same_verdicts(
+            cc.SEPARATOR_WALK_SPINNER_PATTERN,
+            OLD_SEPARATOR_WALK_SPINNER,
+            0,
+            _random_texts(1218, tokens, 20000, 25),
+        )
+
+    def test_reduced_motion_spinner(self):
+        tokens = ["●", " ", "\t", "…", " (", "(", "running ", "running\t", "Stop", " hook"]
+        tokens += ["hooks", ")", "12s", "1.5m", "↓", " 300 tokens", "300k tokens", "thinking"]
+        tokens += ["thought for", "esc to interrupt", "x", "\n"]
+        _same_verdicts(
+            cc.REDUCED_MOTION_SPINNER_PATTERN,
+            OLD_REDUCED_MOTION_SPINNER,
+            re.MULTILINE,
+            _random_texts(908, tokens, 20000, 25),
+        )
+
+    def test_real_reduced_motion_rows_still_match(self):
+        for row in (
+            "● Leavening… (running UserPromptSubmit hook)",
+            "● Sublimating… (12s · ↓ 300 tokens)",
+            "● Running the test suite… (1m 3s · thinking)",
+            "● Beboppin'… (esc to interrupt)",
+            "● Waiting… (running Stop… hooks)",
+        ):
+            assert cc.REDUCED_MOTION_SPINNER_PATTERN.search(row), row
+        for row in (
+            "● Analyzing… the diff is fine",
+            "● Calling cao-mcp-server… (ctrl+o to expand)",
+        ):
+            assert not cc.REDUCED_MOTION_SPINNER_PATTERN.search(row), row
+
+
+class TestComposerPromptRow:
+    def test_current_form_is_clean(self):
+        assert structural_issues(cc.ClaudeCodeProvider._COMPOSER_PROMPT_RE, "match") == []
+
+    def test_match_and_text_are_unchanged(self):
+        old = re.compile(OLD_COMPOSER_PROMPT)
+        new = cc.ClaudeCodeProvider._COMPOSER_PROMPT_RE
+        tokens = [" ", "\t", "\xa0", "❯", ">", "x", "hi", "\n"]
+        for row in _random_texts(1842, tokens, 20000, 12):
+            a, b = old.match(row), new.match(row)
+            assert (a and (a.span(), a.group(1))) == (b and (b.span(), b.group(1))), repr(row)

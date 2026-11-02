@@ -209,7 +209,16 @@ IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # turn INSTEAD of the old ⏺ response marker, so it is the COMPLETED signal there.
 # The ``·`` glyph is intentionally excluded from the leading class so footer
 # lines like "high · /effort" cannot false-match.
-COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s*s\b"
+#
+# Anchored where a segment starts (a line start, or just after an ellipsis --
+# the two characters the body cannot cross) and skipping possessively to the
+# segment's first glyph. Unanchored, the search restarted at every glyph and
+# re-scanned the rest of the segment for "for Ns": quadratic (CWE-1333). A
+# summary after any later glyph in the segment is also after the first, so the
+# pattern matches exactly where it did; its one caller only asks whether it does.
+COMPLETION_SUMMARY_PATTERN = (
+    r"(?m)(?:^|(?<=…))[^✶✢✽✻✳\n…]*+[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s*s\b"
+)
 # get_status completion detection tolerates the duration being CLIPPED off by
 # the raw redraw ("✻ Crunched for " with no "Ns"): past-tense glyph + "for",
 # no ellipsis (so a live "…ing…" spinner never matches). · and * stay excluded
@@ -437,12 +446,26 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+" + 
 # no line-start anchor. Built from _SPINNER_VERB so the "-" / "'" default verbs
 # ("✢ Dilly-dallying…") are a live spinner here too; a plain "\w*ing\b" let
 # them read COMPLETED after "✻ Pondered for 8s" (PR #975 review, P3-4).
-AFTER_SUMMARY_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r"[^\n]*…")
+#
+# Anchored at the line start and skipping possessively past every glyph that is
+# NOT followed by a spinner verb: unanchored, the search restarted at every
+# glyph and re-scanned the rest of the line (CWE-1333). The first glyph that is
+# followed by a verb stands for every later one -- the verb cannot run past a
+# glyph, so a later spinner's "…" is also after the first one's verb -- so it
+# matches exactly where it did; its caller only asks whether it does.
+AFTER_SUMMARY_SPINNER_PATTERN = re.compile(
+    r"(?m)^(?:[^✶✢✽✻✳·*\n]++|[✶✢✽✻✳·*](?![ \t]+" + _SPINNER_VERB + r"))*+"
+    r"[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r"[^\n]*…"
+)
 # Any glyph + ellipsis, for get_status()'s walk back from the last separator:
 # deliberately loose (no verb, "·" included, "*" excluded) because it is applied
 # only to the lines between the last two separators, where the newest TUI
 # draws nothing but the live turn. Named so the busy-pattern guard sees it.
-SEPARATOR_WALK_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·][^\n]*\u2026")
+# Anchored at the line start, skipping possessively to the first glyph: an
+# ellipsis after any later glyph is also after the first, so it matches exactly
+# where the unanchored form did, without re-scanning the line from every glyph
+# (CWE-1333). Its caller only asks whether it matches.
+SEPARATOR_WALK_SPINNER_PATTERN = re.compile(r"(?m)^[^✶✢✽✻✳·\n]*+[✶✢✽✻✳·][^\n]*\u2026")
 # Live spinner under Claude Code's prefersReducedMotion setting (GH #908): the
 # animated glyph is replaced by a static "●", e.g. "● Leavening… (running
 # UserPromptSubmit hook)" or "● Sublimating… (12s · ↓ 300 tokens)". "●" is also
@@ -475,15 +498,31 @@ SEPARATOR_WALK_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·][^\n]*\u2026")
 # frame position cannot separate is a settled "●" status row directly above
 # the box with no summary painted; it reads PROCESSING, the #908 direction,
 # until a live capture of such a turn says otherwise.
+#
+# Two changes keep the scan linear (CWE-1333); the pattern matches exactly the
+# lines it did before, and every caller only asks whether it matches:
+# - The text before the "…" is skipped possessively, stopping at the first "…"
+#   that the status follows, instead of ``[^\n]*`` backtracking to every "…" on
+#   the line (and ``[ \t]+`` sharing its spaces with it).
+# - The hook gap stops where the next "… (running " starts. As ``[^)\n]*`` it ran
+#   on to the end of the line from every such fragment, so a line of them was
+#   quadratic. A hook word after a later fragment is still found, from that
+#   fragment.
+_REDUCED_MOTION_HOOK_GAP = r"(?:[^)\n…]|…(?![ \t]+\(running[ \t]))*"
 _REDUCED_MOTION_STATUS = (
-    r"(?:running[ \t][^)\n]*\bhooks?\b"
+    r"(?:running[ \t]" + _REDUCED_MOTION_HOOK_GAP + r"\bhooks?\b"
     r"|\d+(?:\.\d+)?[smhd]\b"
     r"|(?:[↓↑][ \t]*)?[\d.,]+[kmb]?[ \t]+tokens\b"
     r"|thinking\b|thought[ \t]+for\b"
     r"|esc[ \t]+to[ \t]+interrupt\b)"
 )
+_REDUCED_MOTION_AFTER_ELLIPSIS = r"[ \t]+\(" + _REDUCED_MOTION_STATUS
 REDUCED_MOTION_SPINNER_PATTERN = re.compile(
-    r"^[ \t]*●[ \t]+[^\n]*…[ \t]+\(" + _REDUCED_MOTION_STATUS, re.MULTILINE
+    r"^[ \t]*+●[ \t]++(?:[^\n…]++|…(?!"
+    + _REDUCED_MOTION_AFTER_ELLIPSIS
+    + r"))*+…"
+    + _REDUCED_MOTION_AFTER_ELLIPSIS,
+    re.MULTILINE,
 )
 
 
@@ -1805,7 +1844,9 @@ class ClaudeCodeProvider(BaseProvider):
     _COMPOSER_RAIL_RE = re.compile(r"─{8,}")
     # The prompt row inside the box: the glyph, then a space / NBSP (the TUI
     # renders "❯\xa0"), then the first row of the text; or the bare glyph.
-    _COMPOSER_PROMPT_RE = re.compile(r"^[ \t]*[>❯](?:[ \t\xa0]+(.*)|[ \t\xa0]*)$")
+    # The indent before the text is possessive: ``.*`` would take any blanks it
+    # gave back, so splitting them differently can never change the match.
+    _COMPOSER_PROMPT_RE = re.compile(r"^[ \t]*[>❯](?:[ \t\xa0]++(.*)|[ \t\xa0]*)$")
     # Placeholder the empty box shows: ❯ Try "fix typecheck errors"
     _COMPOSER_PLACEHOLDER_RE = re.compile(r'^Try "[^"]*"$')
 
