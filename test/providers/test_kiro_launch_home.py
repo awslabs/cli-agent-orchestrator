@@ -769,6 +769,16 @@ def _expected(powers, powers_marker, secrets, secrets_marker, listable):
     return None
 
 
+class BytesPath:
+    """An ``os.PathLike`` whose path is bytes."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = os.fsencode(path)
+
+    def __fspath__(self) -> bytes:
+        return self._path
+
+
 class TestGlobalKiroSpy:
     """G19b's spy is not vacuous: it sees every forbidden kind of touch, and allows stat."""
 
@@ -800,6 +810,35 @@ class TestGlobalKiroSpy:
             "shutil.rmtree",
         }
         operator_home.spy.touches.clear()
+
+    @pytest.mark.parametrize("form", ["str", "bytes", "pathlike", "bytes_pathlike"])
+    def test_a_path_counts_in_every_form_it_can_take(self, operator_home, form):  # noqa: F811
+        """A bytes path (psutil lists /proc that way on Linux) is compared, not a crash."""
+        as_form = {"str": str, "bytes": os.fsencode, "pathlike": Path, "bytes_pathlike": BytesPath}
+        to = as_form[form]
+        spy = operator_home.spy
+        kiro = operator_home.kiro
+        assert spy._under(to(kiro)) is True
+        assert spy._under(to(kiro / "agents" / "mine.json")) is True
+        assert spy._under(to(operator_home.home)) is False
+        assert spy._under(to(operator_home.home / ".kiro-other")) is False
+        os.listdir(to(operator_home.home))
+        assert spy.touches == []
+        os.listdir(to(kiro / "agents"))
+        assert spy.touches == [f"os.listdir({kiro / 'agents'})"]
+        spy.touches.clear()
+
+    def test_a_file_descriptor_is_not_a_path(self, operator_home):  # noqa: F811
+        spy = operator_home.spy
+        with operator_home.arranging():
+            fd = os.open(operator_home.kiro, os.O_RDONLY)
+        try:
+            assert spy._under(fd) is False
+            assert spy._under(None) is False
+            os.listdir(fd)  # by descriptor: no path to name, and no error
+        finally:
+            os.close(fd)
+        assert spy.touches == []
 
 
 class TestGlobalHomeGuard:
