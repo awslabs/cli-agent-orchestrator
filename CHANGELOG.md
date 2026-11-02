@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   placeholder or a new marker refuses before any task, and so does a workspace check that now also
   refuses the home folder itself. `/tools` and `/mcp list` are held to the helper's own file. The
   command assigns `KIRO_HOME` and runs one absolute kiro-cli, the one the probe ran. Release stops
-  every process whose `KIRO_HOME` is the home, records what changed, and removes the home, retrying
-  through the sweep when a process cannot be proven gone. Installed Kiro launches are unchanged.
+  every process whose `KIRO_HOME` is the home, records what changed, and removes the home. When a
+  process cannot be proven gone, the home stays and the operator retries the delete; the sweep
+  removes it only once the terminal row is gone. Installed Kiro launches are unchanged.
 
 - **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
   API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one

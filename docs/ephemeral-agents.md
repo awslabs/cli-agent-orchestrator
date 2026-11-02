@@ -472,8 +472,9 @@ home (SIGTERM, then SIGKILL). A process whose `CAO_TERMINAL_ID` names another te
 never stopped, even with that `KIRO_HOME`. CAO then records whether the agent file, the
 seeds, the secret-store placeholder or your `~/.kiro` markers changed, and removes the
 whole home, Kiro's session transcripts included. If a process cannot be inspected or does
-not exit, the terminal row and the home stay, and a later delete or the sweep retries. A
-gc row is kept while its home exists.
+not exit, the terminal row and the home stay; retry the delete yourself. The sweep does
+not retry this case — it only removes a home once its terminal row is gone. A gc row is
+kept while its home exists.
 
 The HTTP contract remains available for clients implementing their own launch path:
 
