@@ -121,7 +121,7 @@ jobs:
         run: |
           python scripts/bump_version.py "$BUMP"
           VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       # The check publish-to-pypi.yml's verify-release-version runs on the tag, run here
       # BEFORE anything is committed, tagged or pushed: a tree that job would refuse must
