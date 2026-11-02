@@ -1903,7 +1903,7 @@ async def _create_terminal_unguarded(
             # explicit override launch --model on a wrapper never probed for it.
             # A v3 launch also passes kiroConfig.effort as --effort (#1167), so
             # the probe asks for that flag too; v2's request is unchanged.
-            launch_effort: Optional[str] = None
+            launch_effort = None
             if resolved_engine == KiroEngine.V3:
                 try:
                     launch_effort = kiro_effort(profile)
