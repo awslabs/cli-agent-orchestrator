@@ -147,6 +147,11 @@ class OpenCodeCliProvider(BaseProvider):
             if v1 != v2:
                 self._cli_major = 1 if v1 else 2
                 return
+            # Before variant persistence, CAO launched v1 only. Its permission
+            # dialog hides the footer; recognize that known state on old rows.
+            if not v1 and not v2 and re.search(PERMISSION_PROMPT_PATTERN, clean):
+                self._cli_major = 1
+                return
             raise RuntimeError(
                 "Cannot determine the running OpenCode terminal's CLI generation. "
                 "Recreate the terminal; its launch generation was not persisted."
@@ -210,7 +215,8 @@ class OpenCodeCliProvider(BaseProvider):
         )
         command = self._build_launch_command()
         self._startup_history = strip_terminal_escapes(
-            get_backend().get_history(self.session_name, self.window_name) or ""
+            await asyncio.to_thread(get_backend().get_history, self.session_name, self.window_name)
+            or ""
         )
         get_backend().send_keys(self.session_name, self.window_name, command)
 
@@ -228,7 +234,7 @@ class OpenCodeCliProvider(BaseProvider):
         return True
 
     def _exited_to_shell(self, *, fresh: bool = True) -> bool:
-        """Refresh ready verdicts immediately; throttle other tmux lookups."""
+        """Refresh on demand; throttle busy-state tmux lookups."""
         if not self._shell_baseline:
             return False
         now = time.monotonic()
@@ -245,9 +251,11 @@ class OpenCodeCliProvider(BaseProvider):
         return self._exited
 
     def _guard_status(self, status: TerminalStatus) -> TerminalStatus:
-        # subset-ok: Only ready states permit dispatch; other states use the cached exit check.
-        ready = status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
-        if self._initialized and self._exited_to_shell(fresh=ready):
+        # UNKNOWN cannot replace a latched ready status in StatusMonitor, so
+        # exit frames need a fresh check too. Only PROCESSING can be throttled.
+        if self._initialized and self._exited_to_shell(
+            fresh=status is not TerminalStatus.PROCESSING
+        ):
             return TerminalStatus.ERROR
         return status
 

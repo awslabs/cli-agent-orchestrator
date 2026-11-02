@@ -361,9 +361,24 @@ CAO emits only `allow` or `deny` in the permission frontmatter, so `△ Permissi
 
 ### `Unrecognized flag: --agent` or Mini initialization failure
 
-Check `command -v opencode`, `opencode --version`, and `opencode mini --help`
-inside the worker's tmux shell. Ensure the CAO server runs the modified checkout
-as shown above. V2 must launch with `mini --standalone`; simply adding `mini`
+CAO probes the CLI using the server's `PATH`, then launches it using the worker
+shell's `PATH`. Run these checks both in the environment that starts `cao-server`
+(including its service environment, if applicable) and inside the worker's tmux shell:
+
+```bash
+printf '%s\n' "$PATH"
+command -v opencode
+opencode --version
+opencode --help
+# For v2:
+opencode mini --help
+```
+
+Both environments must resolve the same OpenCode executable and version. Align
+their `PATH` values if they differ, then restart the server and recreate the worker.
+A server finding v1 while the worker runs v2 can produce `Unrecognized flag: --agent`.
+Ensure the CAO server runs the modified checkout as shown above.
+V2 must launch with `mini --standalone`; simply adding `mini`
 while reusing a shared service can attach MCP servers to the wrong terminal.
 If initialization reports an exit, inspect the pane tail in the error for missing
 credentials, invalid models, missing installed agents, or configuration errors.

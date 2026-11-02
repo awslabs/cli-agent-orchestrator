@@ -3,6 +3,7 @@
 import json
 import shlex
 import subprocess
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
@@ -10,7 +11,7 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import OutputExtractionRejected, ProviderExitedError
-from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
+from cli_agent_orchestrator.providers.opencode_cli import EXIT_CHECK_INTERVAL_S, OpenCodeCliProvider
 from cli_agent_orchestrator.utils.opencode_cli import detect_opencode_major
 
 
@@ -121,6 +122,8 @@ def test_launch_agent_model_and_isolation(major):
         ("ERROR\nUnrecognized flag: --agent in command opencode", TerminalStatus.UNKNOWN),
         ("USAGE\nopencode mini [flags]", TerminalStatus.UNKNOWN),
         ("", TerminalStatus.UNKNOWN),
+        ("◆ Which option?", TerminalStatus.UNKNOWN),
+        ("◆ Which option?\nctrl+p menu", TerminalStatus.IDLE),
         ("ctrl+p menu\n› new task", TerminalStatus.UNKNOWN),
     ],
 )
@@ -449,9 +452,153 @@ def test_busy_exit_checks_cached_but_ready_checks_fresh(screen):
         for _ in range(10):
             assert detect("esc stop ctrl+p menu") == TerminalStatus.PROCESSING
         assert command.call_count == 1
-        clock.return_value = 13
+        clock.return_value = 10 + EXIT_CHECK_INTERVAL_S - 0.001
+        detect("esc stop ctrl+p menu")
+        assert command.call_count == 1
+        clock.return_value = 10 + EXIT_CHECK_INTERVAL_S
         detect("esc stop ctrl+p menu")
         assert command.call_count == 2
         command.return_value = "bash"
         assert detect("ctrl+p menu") == TerminalStatus.ERROR
         assert command.call_count == 3
+
+
+@pytest.mark.parametrize("screen", [False, True])
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("keep_footer", [False, True])
+def test_exit_after_ready_read_bypasses_busy_cache(screen, completed, keep_footer):
+    p = provider()
+    p._initialized = True
+    p._shell_baseline = "bash"
+    detect = (lambda text: p.get_status_from_screen(text.splitlines())) if screen else p.get_status
+    frame = "ctrl+p menu"
+    if completed:
+        frame = "› task\n\nDone\ndeveloper · Model · 2s\n" + frame
+    with (
+        patch("cli_agent_orchestrator.providers.opencode_cli.get_backend") as backend,
+        patch(
+            "cli_agent_orchestrator.providers.opencode_cli.time.monotonic", return_value=100
+        ) as clock,
+    ):
+        command = backend.return_value.get_pane_current_command
+        command.return_value = "opencode"
+        assert detect(frame) == (TerminalStatus.COMPLETED if completed else TerminalStatus.IDLE)
+        clock.return_value = 100.5
+        command.return_value = "bash"
+        exit_frame = (frame + "\n" if keep_footer else "") + "user@host ~ % "
+        assert detect(exit_frame) == TerminalStatus.ERROR
+        assert command.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("major", [1, 2])
+@pytest.mark.parametrize("failure", [False, True])
+async def test_initialize_captures_history_before_launch_off_event_loop(major, failure):
+    p = provider(major)
+    loop_thread = threading.get_ident()
+    launched = False
+    captures = []
+    old_history = "error: failed to refresh shell completions cache\nuser@host ~ % "
+    footer = "ctrl+p commands" if major == 1 else "ctrl+p menu"
+
+    def history(*args):
+        assert threading.get_ident() != loop_thread
+        captures.append(launched)
+        return old_history + (
+            "opencode\n" + ("Unrecognized flag: --agent\n" if failure else "") + footer
+            if launched
+            else ""
+        )
+
+    def launch(*args):
+        nonlocal launched
+        launched = True
+
+    async def wait_ready(*args, on_poll, **kwargs):
+        await on_poll()
+        return True
+
+    with (
+        patch("cli_agent_orchestrator.providers.opencode_cli.get_backend") as backend,
+        patch(
+            "cli_agent_orchestrator.providers.opencode_cli.wait_for_shell",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.opencode_cli.detect_opencode_major",
+            return_value=major,
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.opencode_cli.wait_until_status",
+            side_effect=wait_ready,
+        ),
+    ):
+        backend.return_value.get_history.side_effect = history
+        backend.return_value.send_keys.side_effect = launch
+        backend.return_value.get_pane_current_command.side_effect = lambda *args: (
+            "opencode" if launched else "bash"
+        )
+        if failure:
+            with pytest.raises(ProviderExitedError, match="Unrecognized flag"):
+                await p.initialize()
+            assert not p._initialized
+        else:
+            assert await p.initialize()
+            assert p._initialized
+        assert captures[0] is False
+        assert all(captures[1:])
+
+
+@pytest.mark.parametrize("ansi", [False, True])
+def test_manager_restores_legacy_permission_dialog(ansi):
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+    from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+    frame = (Path(__file__).parent / "fixtures/opencode_cli_permission.ansi.txt").read_text()
+    if not ansi:
+        frame = strip_terminal_escapes(frame)
+    metadata = {
+        "provider": "opencode_cli",
+        "tmux_session": "session",
+        "tmux_window": "worker",
+        "agent_profile": "developer",
+    }
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata", return_value=metadata
+        ),
+        patch("cli_agent_orchestrator.providers.opencode_cli.get_backend") as backend,
+    ):
+        backend.return_value.get_history.return_value = frame
+        restored = ProviderManager().get_provider("worker")
+    assert restored.runtime_variant == "opencode-v1"
+    assert restored.get_status(frame) == TerminalStatus.WAITING_USER_ANSWER
+    assert (
+        restored.get_status_from_screen(strip_terminal_escapes(frame).splitlines())
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+
+
+@pytest.mark.parametrize(
+    "task,body,error",
+    [
+        ("task", "Answer without a user marker", "No user message"),
+        (" \t\n", "› task\n\nAnswer", "Empty OpenCode Mini dispatched task"),
+        ("task", "› task\n\n", "does not match"),
+        ("long task", "› long", "does not match"),
+    ],
+)
+def test_mini_rejects_unverifiable_response_boundaries(task, body, error):
+    p = provider()
+    p.record_dispatched_message(task)
+    with pytest.raises(OutputExtractionRejected, match=error):
+        p.extract_last_message_from_script(body + "\ndeveloper · Model · 2s")
+
+
+def test_v2_footer_takes_precedence_over_old_permission_heading_on_restore():
+    p = provider()
+    with patch("cli_agent_orchestrator.providers.opencode_cli.get_backend") as backend:
+        backend.return_value.get_history.return_value = "△ Permission required\nctrl+p menu"
+        p.restore_runtime_variant(None)
+    assert p.runtime_variant == "opencode-v2"
+    assert p.get_status("△ Permission required\nctrl+p menu") == TerminalStatus.IDLE
