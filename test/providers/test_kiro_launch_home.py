@@ -100,6 +100,17 @@ def prepare(atoms=("fs_read", "fs_list"), terminal_id=TID):
     return k.create_launch_home(terminal_id, AGENT, payload, snapshot())
 
 
+def replace_with_same_bytes(path: Path) -> None:
+    """Put a new file with the same bytes at ``path``, by rename, so its inode differs.
+
+    Unlink and write again can get the freed inode back at once (ext4), and then
+    nothing the check can see has changed.
+    """
+    spare = path.with_name(path.name + ".spare")
+    spare.write_bytes(path.read_bytes())
+    os.replace(spare, path)
+
+
 def refusal(callable_, *args, **kwargs) -> str:
     with pytest.raises(k.KiroLaunchRefusal) as err:
         callable_(*args, **kwargs)
@@ -518,9 +529,7 @@ class TestVerifyAndSeal:
         elif change == "home_mode":
             home.chmod(0o755)
         elif change == "replaced":
-            data = prepared.agent_file.read_bytes()
-            prepared.agent_file.unlink()
-            prepared.agent_file.write_bytes(data)
+            replace_with_same_bytes(prepared.agent_file)
             prepared.agent_file.chmod(0o400)
         elif change == "powers_mode":
             powers.chmod(0o700)
@@ -540,12 +549,43 @@ class TestVerifyAndSeal:
 
     def test_a_file_replaced_before_the_seal_refuses_as_seal(self, store):
         prepared = prepare()
-        data = prepared.agent_file.read_bytes()
-        prepared.agent_file.unlink()
-        prepared.agent_file.write_bytes(data)  # same bytes, another inode
+        replace_with_same_bytes(prepared.agent_file)
         assert refusal(k.seal_launch_home, prepared) == "kiro_home_invalid:seal"
         # The replacement is not sealed on CAO's behalf.
         assert stat.S_IMODE(os.lstat(prepared.agent_file).st_mode) != 0o400
+
+    @pytest.mark.parametrize(
+        "check, rule",
+        [
+            ("verify", "kiro_home_invalid:modified"),
+            ("legacy_copy", "kiro_v3_global_home:changed"),
+        ],
+    )
+    def test_a_placeholder_filled_in_the_tick_it_was_made_still_refuses(
+        self, store, monkeypatch, check, rule
+    ):
+        """A coarse clock: the entry lands in the same tick as the placeholder's creation."""
+        made = {}
+        real_mkdir = os.mkdir
+
+        def mkdir(path, *args, **kwargs):
+            real_mkdir(path, *args, **kwargs)
+            if os.path.basename(os.fspath(path)) == "powers":
+                made["mtime_ns"] = os.lstat(path).st_mtime_ns
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "mkdir", mkdir)
+            prepared = prepare()
+        powers = prepared.home / "powers"
+        powers.chmod(0o700)
+        (powers / "installed.json").write_text("{}")
+        powers.chmod(0)
+        # Every stamp since the creation fell in the creation's tick.
+        os.utime(powers, ns=(made["mtime_ns"], made["mtime_ns"]))
+        if check == "verify":
+            assert refusal(k.verify_launch_home, prepared, sealed=False) == rule
+        else:
+            assert refusal(k.check_global_home_unchanged, prepared) == rule
 
     def test_a_home_swapped_for_a_symlink_refuses(self, store, tmp_path):
         prepared = prepare()
