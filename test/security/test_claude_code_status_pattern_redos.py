@@ -169,3 +169,75 @@ class TestSameMatchesAsBefore:
             assert [m.span() for m in cc.EFFORT_FOOTER_LINE_PATTERN.finditer(text)] == [
                 m.span() for m in old_footer.finditer(text)
             ], repr(text)
+
+
+_RULE = "─" * 12
+#: Input-box layouts with the spans the old ``NEW_TUI_BOX_PATTERN.finditer`` gave.
+#: Pinned literally (not only compared with the old pattern) so a broken resume
+#: position or start offset in ``_iter_new_tui_boxes`` fails here by name.
+BOX_LAYOUTS = {
+    "single box": (f"{_RULE}\n❯ \n{_RULE}\n", [(0, 28)]),
+    "box filling the buffer, no trailing newline": (f"{_RULE}\n❯ \n{_RULE}", [(0, 28)]),
+    "box after reply text": (f"reply text\n{_RULE}\n❯ \n{_RULE}\n", [(11, 39)]),
+    "stacked boxes sharing a rule": (f"{_RULE}\n❯ \n{_RULE}\n❯ \n{_RULE}\n", [(0, 28)]),
+    "adjacent boxes": (f"{_RULE}\n❯ \n{_RULE}\n{_RULE}\n❯ \n{_RULE}\n", [(0, 28), (29, 57)]),
+    "two blank rows above the prompt": (f"{_RULE}\n\n\n❯ \n{_RULE}\n", [(0, 30)]),
+    "three blank rows above the prompt": (f"{_RULE}\n\n\n\n❯ \n{_RULE}\n", []),
+    "two blank rows below the prompt": (f"{_RULE}\n❯ \n\n\n{_RULE}\n", [(0, 30)]),
+    "three blank rows below the prompt": (f"{_RULE}\n❯ \n\n\n\n{_RULE}\n", []),
+    "NBSP and tab blank rows": (f"{_RULE}\n\xa0\n \t\n❯\xa0\n\xa0\n{_RULE}\n", [(0, 35)]),
+    "CRLF rows": (f"{_RULE}\r\n❯ \r\n{_RULE}\r\n", []),
+    "second rule run on the bottom line": (
+        f"{_RULE}\n❯ \n{_RULE}  {_RULE}\n❯ \n{_RULE}\n",
+        [(0, 28), (30, 58)],
+    ),
+    "rule with text around it": (f"text {_RULE} more\n❯ \n  {_RULE}\n", [(5, 40)]),
+    "top rule with no newline": (f"text\n{_RULE}", []),
+    "partial box, no bottom rule": (f"{_RULE}\n❯ \nreply\n", []),
+    "seven-wide rule is not a rule": ("─" * 7 + f"\n❯ \n{_RULE}\n", []),
+    "prompt holding text is not an empty box": (f"{_RULE}\n❯ hello\n{_RULE}\n", []),
+}
+
+
+class TestInputBoxSpans:
+    @pytest.mark.parametrize("text,expected", BOX_LAYOUTS.values(), ids=BOX_LAYOUTS.keys())
+    def test_scan_reports_the_pinned_spans(self, text, expected):
+        assert list(cc._iter_new_tui_boxes(text)) == expected
+        assert [m.span() for m in re.finditer(OLD_NEW_TUI_BOX, text, re.MULTILINE)] == expected
+
+    @pytest.mark.parametrize("text,expected", BOX_LAYOUTS.values(), ids=BOX_LAYOUTS.keys())
+    def test_search_group_is_the_first_box(self, text, expected):
+        match = cc.NEW_TUI_BOX_PATTERN.search(text)
+        assert (match.span(1) if match else None) == (expected[0] if expected else None)
+
+    def test_spans_match_the_old_pattern_on_random_screens(self):
+        # Built from whole rows, so boxes, stacked boxes and near-misses are common.
+        old_re = re.compile(OLD_NEW_TUI_BOX, re.MULTILINE)
+        rows = [
+            "─" * 7,
+            "─" * 8,
+            "─" * 9,
+            _RULE,
+            f"{_RULE}  {_RULE}",
+            f"x {_RULE}",
+            "",
+            " ",
+            "\xa0",
+            " \t",
+            "❯ ",
+            "> ",
+            "❯\xa0",
+            "  ❯",
+            "❯ hi",
+            "reply",
+        ]
+        rng = random.Random(1325)
+        for _ in range(20000):
+            sep = "\r\n" if rng.random() < 0.1 else "\n"
+            text = sep.join(rng.choice(rows) for _ in range(rng.randrange(0, 12)))
+            if rng.random() < 0.5:
+                text += sep
+            spans = [m.span() for m in old_re.finditer(text)]
+            assert list(cc._iter_new_tui_boxes(text)) == spans, repr(text)
+            match = cc.NEW_TUI_BOX_PATTERN.search(text)
+            assert (match.span(1) if match else None) == (spans[0] if spans else None), repr(text)
