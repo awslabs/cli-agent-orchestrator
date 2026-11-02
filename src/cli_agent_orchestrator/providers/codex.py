@@ -167,9 +167,13 @@ _FOOTER_CLOCK = (
 )
 # The time is never left out: for a live turn without a saved time, Codex uses
 # the current time. So "Worked for 2s" with no time is reply text, not a footer.
+#
+# ``[^\n]*+`` after the date is possessive: the trailing ``[^\S\n]*$`` would
+# only re-take blanks it gave back, so splitting them differently can never
+# change the match.
 COMPLETION_FOOTER_PATTERN = (
     rf"^[^\S\n]*(?:Worked for {_FOOTER_DURATION}[^\S\n]*[•·][^\S\n]*)?{_FOOTER_CLOCK}"
-    rf"(?:[^\S\n]*[•·][^\n]*)?[^\S\n]*$"
+    rf"(?:[^\S\n]*[•·][^\n]*+)?[^\S\n]*$"
 )
 # The first release that draws the completion footer.
 COMPLETION_FOOTER_MIN_VERSION = (0, 155, 0)
@@ -200,6 +204,7 @@ TURN_ACTIVITY_PATTERN = r"^[^\S\n]*[•◦└■]"
 # interpolates absolute CODEX_HOME paths into it. Verified against codex-cli
 # 0.162.1 and 0.163.0.
 CONFIG_PROFILE_ERROR_PATTERN = r"cannot be used while.*contains legacy"
+_CONFIG_PROFILE_ERROR_LEAD = "cannot be used while"
 # The same phrase with every space removed, matched against text that has had
 # ALL its whitespace removed. tmux wraps codex's one-line message at the exact
 # pane column, inside words when that is where the column falls ("co" /
@@ -207,7 +212,18 @@ CONFIG_PROFILE_ERROR_PATTERN = r"cannot be used while.*contains legacy"
 # cannot know whether a wrap fell inside a word or on a space tmux then
 # trimmed. Comparing with no whitespace on either side makes detection
 # independent of the pane width.
-_CONFIG_PROFILE_ERROR_COMPACT = re.compile(CONFIG_PROFILE_ERROR_PATTERN.replace(" ", ""))
+#
+# Each attempt starts at a line start and skips to the line's FIRST occurrence of
+# the lead phrase: unanchored, the search restarted at every occurrence and
+# re-scanned the rest of the line for the second phrase (CWE-1333). A second
+# phrase after any later lead is also after the first, so it matches exactly
+# where it did; its caller only asks whether it matches.
+_CONFIG_PROFILE_ERROR_COMPACT = re.compile(
+    r"(?m)^(?:(?!"
+    + re.escape(_CONFIG_PROFILE_ERROR_LEAD.replace(" ", ""))
+    + r").)*+"
+    + CONFIG_PROFILE_ERROR_PATTERN.replace(" ", "")
+)
 # How many pane rows a rejection that still carries the pane's soft wraps may
 # span. Observed at 5 rows on an 80-column pane with a short CODEX_HOME. A
 # capture taken with get_history(join_wrapped=True) holds the message as ONE
@@ -286,7 +302,12 @@ STARTUP_PROMPT_BOTTOM_LINES = 15
 # 6 reads 0.5s apart give a redraw ~3s to complete -- generous for a TUI
 # write, and small next to provider_init_timeout.
 POST_READINESS_TRANSITIONAL_REREADS = 6
-STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+# The indent is horizontal whitespace only (possessive): with ``^\s*`` a
+# MULTILINE search began an attempt at every line of a blank run and re-scanned
+# the rest of the run from each (CWE-1333). Callers only ask whether it matches,
+# and a bullet the old ``\s*`` reached from a blank line above is still found
+# from its own line.
+STARTUP_ACTIVITY_PATTERN = r"^[^\S\n]*+•[^\S\n]+\S"
 # A turn's own structure, as opposed to a bare `•` bullet: the tree
 # continuation under a tool row, the dim secondary row, and the error cell that
 # ends a failed turn. Codex never draws any of these outside a turn, so unlike

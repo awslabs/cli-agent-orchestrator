@@ -117,3 +117,76 @@ class TestTuiProgress:
             "prior output\n• Starting script creation (10s • esc to interrupt)",
         ):
             assert re.search(codex.TUI_PROGRESS_PATTERN, row, re.MULTILINE), row
+
+
+OLD_STARTUP_ACTIVITY = r"^\s*•[^\S\n]+\S"
+OLD_CONFIG_PROFILE_ERROR_COMPACT = r"cannotbeusedwhile.*containslegacy"
+OLD_COMPLETION_FOOTER = (
+    rf"^[^\S\n]*(?:Worked for {codex._FOOTER_DURATION}[^\S\n]*[•·][^\S\n]*)?{codex._FOOTER_CLOCK}"
+    rf"(?:[^\S\n]*[•·][^\n]*)?[^\S\n]*$"
+)
+
+
+class TestStartupActivity:
+    def test_current_form_is_clean_and_grows_linearly(self):
+        new = codex.STARTUP_ACTIVITY_PATTERN
+        assert structural_issues(new, "search", re.MULTILINE) == []
+        shapes = sorted(
+            set(input_shapes(new, re.MULTILINE))
+            | set(input_shapes(OLD_STARTUP_ACTIVITY, re.MULTILINE))
+        )
+        assert nonlinear_shapes(pattern_probe(new, "search", re.MULTILINE), shapes) == []
+
+    def test_old_form_is_flagged_and_grows_superlinearly(self):
+        assert structural_issues(OLD_STARTUP_ACTIVITY, "search", re.MULTILINE)
+        probe = pattern_probe(OLD_STARTUP_ACTIVITY, "search", re.MULTILINE)
+        assert first_superlinear(probe, input_shapes(OLD_STARTUP_ACTIVITY, re.MULTILINE))
+
+    def test_matches_exactly_where_the_old_form_did(self):
+        tokens = ["•", " ", "\t", "\n", "\xa0", "\r", "x", "• x"]
+        for text in _random_texts(1253, tokens, 20000, 20):
+            assert bool(re.search(codex.STARTUP_ACTIVITY_PATTERN, text, re.MULTILINE)) == bool(
+                re.search(OLD_STARTUP_ACTIVITY, text, re.MULTILINE)
+            ), repr(text)
+
+
+class TestConfigProfileError:
+    def test_current_form_is_clean_and_grows_linearly(self):
+        new = codex._CONFIG_PROFILE_ERROR_COMPACT
+        assert structural_issues(new, "search") == []
+        shapes = sorted(
+            set(input_shapes(new)) | set(input_shapes(OLD_CONFIG_PROFILE_ERROR_COMPACT))
+        )
+        assert nonlinear_shapes(pattern_probe(new, "search"), shapes) == []
+
+    def test_old_form_is_flagged_and_grows_superlinearly(self):
+        assert structural_issues(OLD_CONFIG_PROFILE_ERROR_COMPACT, "search")
+        probe = pattern_probe(OLD_CONFIG_PROFILE_ERROR_COMPACT, "search")
+        assert first_superlinear(probe, input_shapes(OLD_CONFIG_PROFILE_ERROR_COMPACT))
+
+    def test_matches_exactly_where_the_old_form_did(self):
+        tokens = ["cannotbeusedwhile", "cannot", "beused", "containslegacy", "contains", "x", "\n"]
+        old = re.compile(OLD_CONFIG_PROFILE_ERROR_COMPACT)
+        for text in _random_texts(634, tokens, 20000, 12):
+            assert bool(codex._CONFIG_PROFILE_ERROR_COMPACT.search(text)) == bool(
+                old.search(text)
+            ), repr(text)
+
+
+class TestCompletionFooter:
+    TOKENS = ["Worked for ", "1m ", "5s", "<1s", " • ", " · ", "done ", "4:19", " PM", "16:19"]
+    TOKENS += ["Oct 3", ", 2026", " at ", " ", "\t", "x", "\n"]
+
+    def test_current_form_is_clean(self):
+        assert structural_issues(codex.COMPLETION_FOOTER_PATTERN, "match") == []
+        assert structural_issues(codex.COMPLETION_FOOTER_PATTERN, "search", re.MULTILINE) == []
+
+    def test_matches_exactly_where_the_old_form_did(self):
+        # Callers re.match one row; tests also re.search lines with re.MULTILINE.
+        for text in _random_texts(641, self.TOKENS, 20000, 10):
+            new = re.match(codex.COMPLETION_FOOTER_PATTERN, text)
+            old = re.match(OLD_COMPLETION_FOOTER, text)
+            assert (new and new.span()) == (old and old.span()), repr(text)
+            assert bool(re.search(codex.COMPLETION_FOOTER_PATTERN, text, re.MULTILINE)) == bool(
+                re.search(OLD_COMPLETION_FOOTER, text, re.MULTILINE)
+            ), repr(text)
