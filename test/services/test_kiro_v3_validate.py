@@ -207,6 +207,23 @@ def test_g11_a_reordered_but_equal_tools_list_still_passes():
     assert _codes(data) == set()
 
 
+PER_TOOL_GRANT = ["fs_read", "fs_list", "@cao-mcp-server/send_message"]
+
+
+def test_a_server_named_by_a_per_tool_ref_is_granted():
+    """The server behind ``@server/tool`` may be configured (maintainer review on #1178)."""
+    data = _render(grant=PER_TOOL_GRANT)
+    assert _codes(data) == set()
+    assert _codes(data, launch_allowlist=PER_TOOL_GRANT) == set()
+
+
+def test_a_server_beside_a_per_tool_ref_to_another_server_still_refuses():
+    data = _render(grant=PER_TOOL_GRANT)
+    data["mcpServers"]["decoy"] = {"command": "decoy"}
+    data["permissions"]["rules"] = kiro_v3_rules(PER_TOOL_GRANT, sorted(data["mcpServers"]))
+    assert _codes(data) == {"mcp_server_not_granted"}
+
+
 @pytest.mark.parametrize(
     ("raw", "code"),
     [

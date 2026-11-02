@@ -274,6 +274,46 @@ def test_an_ungranted_server_is_left_out_of_the_universal_file():
     } in (data["permissions"]["rules"])
 
 
+FACTORY_MANAGER = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "robotics"
+    / "hierarchical-factory"
+    / "factory_line_manager.md"
+)
+
+
+def test_a_server_granted_only_per_tool_is_configured_with_only_that_tool(paths):
+    """The factory manager grants ``@factory-sim`` and only ``send_message`` of
+    ``cao-mcp-server``. Both servers are in the v3 file; its rules allow just
+    that one CAO tool and deny the rest (maintainer review on #1178)."""
+    text = FACTORY_MANAGER.read_text(encoding="utf-8")
+    result = install_agent("factory_line_manager", "kiro_cli", engine="v3", profile_content=text)
+    assert result.success, result.message
+    raw = (paths["kiro"] / "factory_line_manager.json").read_bytes()
+    data = json.loads(raw)
+
+    assert data["allowedTools"] == ["@factory-sim", "@cao-mcp-server/send_message"]
+    assert set(data["mcpServers"]) == {"factory-sim", "cao-mcp-server"}
+    assert data["includeMcpJson"] is False
+    assert "@cao-mcp-server/send_message" in data["tools"]
+    assert "@factory-sim" in data["tools"]
+    assert "@cao-mcp-server" not in data["tools"]
+    mcp_rules = [rule for rule in data["permissions"]["rules"] if rule["capability"] == "mcp"]
+    assert mcp_rules == [
+        {"capability": "mcp", "match": ["cao-mcp-server/send_message"], "effect": "allow"},
+        {"capability": "mcp", "match": ["factory-sim/*"], "effect": "allow"},
+        {
+            "capability": "mcp",
+            "match": ["*"],
+            "exclude": ["cao-mcp-server/send_message", "factory-sim/*"],
+            "effect": "deny",
+        },
+    ]
+    for schema in pinned_kiro_v3_schemas():
+        assert validate_kiro_v3_agent_bytes(raw, schema, expected_name="factory_line_manager") == []
+
+
 def test_g11_plan_identity_keeps_its_label_set(paths):
     assert _install("reviewer").success
     v2_labels = set(installed_artifact_paths("reviewer"))

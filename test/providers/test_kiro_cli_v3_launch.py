@@ -9,9 +9,10 @@ Escape.
 
 from __future__ import annotations
 
+import re
 import shlex
 from pathlib import Path
-from typing import List
+from typing import Iterable, List
 from unittest.mock import patch
 
 import pytest
@@ -167,30 +168,115 @@ async def test_a_v3_launch_attests_tools_and_mcp_before_recording_identity(cwd):
     # Only the launch command is sent as text; the slash commands go key by
     # key, never with Tab, and each panel is closed.
     assert pane.texts == [pane.command]
-    assert pane.keys == [*"/tools", "Enter", "Escape", *"/mcp", "Enter", "Escape"]
+    assert pane.keys == [*"/mcp", "Enter", "Escape", *"/tools", "Enter", "Escape"]
     assert "Tab" not in pane.keys
 
 
+_MCP_LOADING = _screen("mcp_running").replace(
+    "● running       34 tools", "⠋ loading        0 tools"
+)
+_MCP_ROW_LINE = re.compile(r"^\s*(@\S+)\s{2,}mcp\b")
+
+
+def _tools_panel_with(mcp_tools: Iterable[str] = ()) -> str:
+    """The captured ``/tools`` panel with the ``read`` tag and only ``mcp_tools``."""
+    keep = set(mcp_tools)
+    lines = []
+    for line in _screen("tools_readonly_mcp").splitlines():
+        row = _MCP_ROW_LINE.match(line)
+        if row is None or row.group(1) in keep:
+            lines.append(line)
+    count = 1 + len(keep)
+    screen = "\n".join(lines).replace(
+        "/tools · 35 tags", f"/tools · {count} tag{'s' if count != 1 else ''}"
+    )
+    assert screen != _screen("tools_readonly_mcp")
+    return screen
+
+
+#: What ``/tools`` shows while ``cao-mcp-server`` is still loading: none of its tools.
+_TOOLS_WHILE_LOADING = _tools_panel_with()
+
+
+class LoadingPane(FakePane):
+    """A pane whose MCP server is still loading when the attestation starts.
+
+    The server finishes once the ``/mcp`` panel has been read more than
+    ``loading_reads`` times (CAO's re-reads stand in for the time passing).
+    Until then ``/mcp`` shows it loading and ``/tools`` shows none of its tools,
+    as one real pane would; afterwards ``/mcp`` shows it running and ``/tools``
+    shows ``loaded_tools``.
+    """
+
+    def __init__(self, cwd: str, *, loaded_tools: str, loading_reads: int = 2):
+        super().__init__(cwd)
+        self.loaded_tools = loaded_tools
+        self.loading_reads = loading_reads
+        self.mcp_reads = 0
+        self.tools_shown: List[str] = []
+
+    @property
+    def loaded(self) -> bool:
+        return self.mcp_reads > self.loading_reads
+
+    def send_special_key(self, session, window, key):
+        if key == "Enter" and self.buffer in ("/tools", "/mcp"):
+            self.keys.append(key)
+            if self.buffer == "/tools":
+                self.tools_shown.append("loaded" if self.loaded else "loading")
+                self.screen = _screen(self.loaded_tools if self.loaded else _TOOLS_WHILE_LOADING)
+            else:
+                self.screen = _screen("mcp_running") if self.loaded else _MCP_LOADING
+            return
+        super().send_special_key(session, window, key)
+
+    def get_history(self, *args, **kwargs):
+        if self.buffer == "/mcp" and "/mcp list" in self.screen:
+            self.mcp_reads += 1
+            if self.loaded:
+                self.screen = _screen("mcp_running")
+        return self.screen
+
+
+#: A grant that names one tool of ``cao-mcp-server`` and not the whole server.
+PER_TOOL = (["fs_read", "fs_list", "@cao-mcp-server/send_message"], ["cao-mcp-server"])
+
+
 @pytest.mark.asyncio
-async def test_mcp_servers_still_loading_are_read_again(cwd):
-    loading = _screen("mcp_running").replace("● running       34 tools", "⠋ loading        0 tools")
-    assert loading != _screen("mcp_running")
-    pane = FakePane(str(cwd), mcp=(loading,))
-    original = pane.get_history
-    reads = {"n": 0}
-
-    def redraw(*args, **kwargs):
-        # The panel redraws: two reads still loading, then running.
-        if pane.buffer == "/mcp" and "/mcp list" in pane.screen:
-            reads["n"] += 1
-            if reads["n"] > 2:
-                pane.screen = _screen("mcp_running")
-        return original(*args, **kwargs)
-
-    pane.get_history = redraw
+async def test_mcp_servers_still_loading_are_read_again_before_tools(cwd):
+    """``/mcp`` is read until no server is loading, and only then ``/tools``, so
+    the tools panel CAO checks is the one with the server's tools on it."""
+    pane = LoadingPane(str(cwd), loaded_tools="tools_readonly_mcp")
     provider = await _launch(pane)
     assert provider.identity_verified is True
-    assert reads["n"] >= 3
+    assert pane.mcp_reads >= 3
+    assert pane.tools_shown == ["loaded"]
+    assert pane.keys == [*"/mcp", "Enter", "Escape", *"/tools", "Enter", "Escape"]
+
+
+@pytest.mark.asyncio
+async def test_a_per_tool_grant_is_not_attested_on_a_tools_panel_read_while_loading(cwd):
+    """The blind case (maintainer review on #1179): had ``/tools`` been read while
+    the server was loading, it would have shown none of the server's tools and
+    passed. Read after loading, it shows tools the grant does not name."""
+    pane = LoadingPane(str(cwd), loaded_tools="tools_readonly_mcp")
+    provider = _provider(allowed=PER_TOOL[0])
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane, grant=PER_TOOL, provider=provider)
+    assert excinfo.value.code == "kiro_v3_tools_mismatch"
+    assert provider.identity_verified is False
+    assert pane.tools_shown == ["loaded"]
+    assert pane.texts == [pane.command]
+
+
+@pytest.mark.asyncio
+async def test_a_per_tool_grant_whose_pane_shows_only_that_tool_attests(cwd):
+    """The server a per-tool ref names is a granted server here too (#1178 review)."""
+    pane = LoadingPane(str(cwd), loaded_tools=_tools_panel_with(["@cao-mcp-server/send_message"]))
+    provider = _provider(allowed=PER_TOOL[0])
+    await _launch(pane, grant=PER_TOOL, provider=provider)
+    assert provider.identity_verified is True
+    assert pane.tools_shown == ["loaded"]
 
 
 @pytest.mark.asyncio
@@ -327,7 +413,8 @@ async def test_a_tools_panel_beyond_the_grant_refuses_and_types_no_task(cwd, too
         await _launch(pane, provider=provider)
     assert provider.identity_verified is False
     assert pane.texts == [pane.command]
-    assert pane.keys == [*"/tools", "Enter", "Escape"]  # /mcp was never typed
+    # /mcp is read first; the /tools refusal follows it.
+    assert pane.keys == [*"/mcp", "Enter", "Escape", *"/tools", "Enter", "Escape"]
 
 
 @pytest.mark.asyncio
@@ -335,7 +422,7 @@ async def test_the_tab_palette_is_never_entered(cwd):
     pane = FakePane(str(cwd), typed_tools="palette_tools_tab")
     with pytest.raises(KiroAttestationError, match="palette did not appear"):
         await _launch(pane)
-    assert pane.keys == [*"/tools", "Escape"]
+    assert pane.keys == [*"/mcp", "Enter", "Escape", *"/tools", "Escape"]
 
 
 @pytest.mark.asyncio
@@ -343,7 +430,7 @@ async def test_decoy_mcp_servers_refuse(cwd):
     pane = FakePane(str(cwd), mcp=("mcp_decoys_shown",))
     with pytest.raises(KiroAttestationError, match="extra"):
         await _launch(pane)
-    assert pane.keys[-1] == "Escape"
+    assert pane.keys == [*"/mcp", "Enter", "Escape"]  # /tools was never typed
     assert pane.texts == [pane.command]
 
 

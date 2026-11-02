@@ -87,9 +87,11 @@ After kiro-cli starts, and before any task is typed:
 - the header names the agent (as on v2);
 - the workspace check runs again;
 - CAO reads the agent file's grant again (it must still fit the launch), then
-  types `/tools` and `/mcp` and reads both panels: every tool tag must be one
-  that grant implies, every MCP tool must belong to a granted server, and
-  exactly the configured MCP servers must be running, each with a tool.
+  types `/mcp` and reads it until no server is still loading: exactly the
+  configured MCP servers must be running, each with a tool. Only then does it
+  type `/tools`, so a server's tools are on that panel when it is read: every
+  tool tag must be one that grant implies, and every MCP tool must be one the
+  grant names (`@server`, or `@server/tool` for a single tool).
 
 Only then does the terminal accept input. If any check fails, no task is typed
 and the window is closed.

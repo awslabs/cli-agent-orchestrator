@@ -5,10 +5,10 @@ with no tools, or a file that widened on load, still shows the right name. So
 before a v3 terminal is recorded as verified, CAO opens both panels in the
 verified pane and checks what the engine actually loaded:
 
-* every builtin tag is one the grant implies, and every MCP row belongs to a
-  granted server (and tool);
 * ``/mcp list`` shows exactly the configured servers, each running with at
-  least one tool.
+  least one tool; it is read first, again until no server is still loading;
+* then, on ``/tools``, every builtin tag is one the grant implies, and every MCP
+  row belongs to a granted server (and tool).
 
 The parsers are pure and fail closed: any layout they do not recognize
 (v2's per-tool panels, the slash palette, a clipped list) is a refusal, never

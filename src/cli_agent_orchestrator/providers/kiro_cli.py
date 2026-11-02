@@ -57,7 +57,7 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.delegation import tools_exceeding
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
-from cli_agent_orchestrator.utils.tool_mapping import granted_mcp_servers
+from cli_agent_orchestrator.utils.tool_mapping import kiro_v3_granted_mcp_servers
 
 logger = logging.getLogger(__name__)
 
@@ -871,7 +871,7 @@ class KiroCliProvider(BaseProvider):
         return await self._read_screen()
 
     async def _attest_v3_tools_and_mcp(self) -> None:
-        """Refuse unless ``/tools`` and ``/mcp list`` match the installed grant (#1167).
+        """Refuse unless ``/mcp list`` and ``/tools`` match the installed grant (#1167).
 
         Runs after the header check and before the identity is recorded, so on
         a refusal no task has been typed; the creation path then reclaims the
@@ -881,6 +881,10 @@ class KiroCliProvider(BaseProvider):
         fit this launch's and name every server it configures, so a file
         rewritten after the pre-allocation check can widen neither what the
         panels are compared with nor which servers they may show.
+
+        ``/mcp`` is read first, again until no server is still loading, and
+        only then ``/tools``: a loading server has no rows on ``/tools`` yet, so
+        a per-tool grant read before then would be checked against nothing.
         """
         from cli_agent_orchestrator.services.install_service import installed_kiro_v3_grant
 
@@ -901,27 +905,13 @@ class KiroCliProvider(BaseProvider):
                 "kiro_v3_tools_mismatch",
                 f"the installed grant now exceeds this launch's: {exceeding}",
             )
-        ungranted = sorted(set(servers) - set(granted_mcp_servers(grant, servers)))
+        ungranted = sorted(set(servers) - set(kiro_v3_granted_mcp_servers(grant, servers)))
         if ungranted:
             raise KiroAttestationError(
                 "kiro_v3_mcp_not_ready",
                 f"the installed file configures ungranted servers {ungranted}",
             )
         backend = get_backend()
-
-        screen = await self._open_v3_panel("/tools")
-        for attempt in range(V3_ATTEST_READS):
-            try:
-                panel = parse_tools_panel(screen)
-                break
-            except KiroAttestationError:
-                if attempt == V3_ATTEST_READS - 1:
-                    backend.send_special_key(self.session_name, self.window_name, "Escape")
-                    raise
-            await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
-            screen = await self._read_screen()
-        backend.send_special_key(self.session_name, self.window_name, "Escape")
-        check_tools_panel(panel, grant)
 
         screen = await self._open_v3_panel("/mcp")
         try:
@@ -940,6 +930,20 @@ class KiroCliProvider(BaseProvider):
                 raise KiroAttestationError("kiro_v3_mcp_not_ready", "MCP servers still loading")
         finally:
             backend.send_special_key(self.session_name, self.window_name, "Escape")
+
+        screen = await self._open_v3_panel("/tools")
+        for attempt in range(V3_ATTEST_READS):
+            try:
+                panel = parse_tools_panel(screen)
+                break
+            except KiroAttestationError:
+                if attempt == V3_ATTEST_READS - 1:
+                    backend.send_special_key(self.session_name, self.window_name, "Escape")
+                    raise
+            await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+            screen = await self._read_screen()
+        backend.send_special_key(self.session_name, self.window_name, "Escape")
+        check_tools_panel(panel, grant)
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},

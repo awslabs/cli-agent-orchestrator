@@ -375,7 +375,9 @@ its `read` tag also brings `code`, which can write files. So for v3:
 
 `tools` never holds the `read` tag; `excludedTools` removes everything the
 remaining entries could reach beyond the grant (`code` unless `fs_write` is
-granted, and always `knowledge`). Every capability outside the grant gets an
+granted, and always `knowledge`). The file configures only the MCP servers the
+grant names. A server named only by single tools (`@cao-mcp-server/send_message`)
+is configured too, and its rule allows just those tools. Every capability outside the grant gets an
 unconditional deny, and `power` and `workflow` are always denied. CAO checks
 the file on disk at every v3 launch and refuses one that differs, so
 enforcement on v3 is install-time plus a launch-time check, and the pane's own

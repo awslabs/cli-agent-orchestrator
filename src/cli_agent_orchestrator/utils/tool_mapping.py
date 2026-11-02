@@ -541,6 +541,33 @@ def kiro_v3_mcp_patterns(allowed: List[str], server_names: Iterable[str]) -> Lis
     return sorted(patterns)
 
 
+def kiro_v3_granted_mcp_servers(
+    allowed_tools: Iterable[str] | None, server_names: Iterable[str] | None
+) -> List[str]:
+    """The concrete MCP servers a v3 universal file configures for a grant.
+
+    :func:`granted_mcp_servers`, plus every server a per-tool ref
+    (``@server/tool``) names. The v3 file sets ``includeMcpJson: false``, so a
+    server it leaves out has no tools at all, and a grant of
+    ``@cao-mcp-server/send_message`` would lose ``send_message`` on v3 while v2
+    keeps it. The file's rules still allow only the named tools
+    (:func:`kiro_v3_mcp_patterns`) and deny every other one. A ref with an empty
+    tool part names no tool and configures nothing.
+
+    v3 only: OpenCode and Grok keep :func:`granted_mcp_servers`, which grants a
+    server only by a whole-server ref.
+    """
+    names = [name for name in (server_names or ()) if isinstance(name, str)]
+    allowed = [entry for entry in (allowed_tools or ()) if isinstance(entry, str)]
+    granted = set(granted_mcp_servers(allowed, names))
+    for entry in allowed:
+        reference = split_mcp_reference(entry)
+        if reference is None or not reference[1]:
+            continue
+        granted.update(granted_mcp_servers([f"@{reference[0]}"], names))
+    return sorted(granted)
+
+
 def kiro_v3_rules(allowed: List[str], server_names: Iterable[str]) -> List[Dict[str, Any]]:
     """The universal file's ``permissions.rules`` for a grant.
 

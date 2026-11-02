@@ -15,11 +15,13 @@ import pytest
 from cli_agent_orchestrator.providers.kiro_v3_schema import pinned_kiro_v3_schemas
 from cli_agent_orchestrator.utils.tool_mapping import (
     KIRO_V3_FORBIDDEN_SELECTORS,
+    granted_mcp_servers,
     kiro_agent_tools,
     kiro_universal_tools,
     kiro_v3_effective_tools,
     kiro_v3_exact_tools,
     kiro_v3_excluded_tools,
+    kiro_v3_granted_mcp_servers,
     kiro_v3_rules,
 )
 
@@ -224,3 +226,48 @@ def test_unrestricted_policies_are_refused_not_rendered():
         kiro_universal_tools(["*"])
     with pytest.raises(ValueError, match="unrestricted"):
         kiro_v3_rules(["*"], [])
+
+
+@pytest.mark.parametrize(
+    ("grant", "servers"),
+    [
+        (["@a"], ["a"]),
+        (["@b/tool"], ["b"]),
+        (["@b/one", "@b/two"], ["b"]),
+        (["@a", "@b/tool"], ["a", "b"]),
+        (["@plugin-*/tool"], ["plugin-a", "plugin-b"]),
+        (["@c/tool"], []),
+        (["@b/"], []),
+        (["@builtin"], []),
+        (["@builtin/tool"], []),
+        (["fs_read"], []),
+        (["*"], ["a", "b", "other", "plugin-a", "plugin-b"]),
+    ],
+)
+def test_v3_counts_a_server_named_by_a_per_tool_ref_as_granted(grant, servers):
+    """On v3 a server the grant names only through ``@server/tool`` refs is still
+    configured (maintainer review on #1178): its rules allow only those tools."""
+    names = ["a", "b", "other", "plugin-a", "plugin-b"]
+    assert kiro_v3_granted_mcp_servers(grant, names) == servers
+
+
+def test_the_shared_server_grant_is_unchanged_for_other_providers():
+    """OpenCode and Grok use ``granted_mcp_servers``: a per-tool ref grants no server there."""
+    assert granted_mcp_servers(["@b/tool"], ["b"]) == []
+    assert granted_mcp_servers(["@b"], ["b"]) == ["b"]
+
+
+def test_a_per_tool_grant_keeps_its_per_tool_allow_and_the_deny():
+    grant = ["@factory-sim", "@cao-mcp-server/send_message"]
+    servers = kiro_v3_granted_mcp_servers(grant, ["factory-sim", "cao-mcp-server"])
+    mcp = [rule for rule in kiro_v3_rules(grant, servers) if rule["capability"] == "mcp"]
+    assert mcp == [
+        {"capability": "mcp", "match": ["cao-mcp-server/send_message"], "effect": "allow"},
+        {"capability": "mcp", "match": ["factory-sim/*"], "effect": "allow"},
+        {
+            "capability": "mcp",
+            "match": ["*"],
+            "exclude": ["cao-mcp-server/send_message", "factory-sim/*"],
+            "effect": "deny",
+        },
+    ]

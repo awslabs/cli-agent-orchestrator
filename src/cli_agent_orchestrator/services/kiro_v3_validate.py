@@ -33,11 +33,11 @@ from cli_agent_orchestrator.utils.delegation import tools_exceeding
 from cli_agent_orchestrator.utils.tool_mapping import (
     KIRO_V3_FORBIDDEN_SELECTORS,
     TOOL_MAPPING,
-    granted_mcp_servers,
     kiro_universal_tools,
     kiro_v3_effective_tools,
     kiro_v3_exact_tools,
     kiro_v3_excluded_tools,
+    kiro_v3_granted_mcp_servers,
     kiro_v3_rules,
     split_mcp_reference,
 )
@@ -356,7 +356,7 @@ def validate_kiro_v3_agent(
     expected_rules = {_rule_key(rule) for rule in kiro_v3_rules(grant, server_names)}
     if {_rule_key(rule) for rule in rules} != expected_rules or len(rules) != len(expected_rules):
         findings.append(KiroV3Finding("render_mismatch", "permissions.rules differ from the grant"))
-    ungranted = sorted(set(server_names) - set(granted_mcp_servers(grant, server_names)))
+    ungranted = sorted(set(server_names) - set(kiro_v3_granted_mcp_servers(grant, server_names)))
     if ungranted:
         findings.append(KiroV3Finding("mcp_server_not_granted", f"servers {ungranted}"))
 

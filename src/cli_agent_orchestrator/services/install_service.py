@@ -78,6 +78,7 @@ from cli_agent_orchestrator.utils.tool_mapping import (
     kiro_agent_tools,
     kiro_universal_tools,
     kiro_v3_excluded_tools,
+    kiro_v3_granted_mcp_servers,
     kiro_v3_rules,
     resolve_allowed_tools,
 )
@@ -249,8 +250,9 @@ def _render_kiro_universal_agent(
 
     One file meant for both engines: the v2 fields plus ``excludedTools`` and
     ``permissions``, rendered from the resolved grant (``utils.tool_mapping``).
-    Only granted MCP servers are configured; the rules deny every other one.
-    Raises ``ValueError`` (``KiroV3InvalidAgentError`` for a failed check) and
+    Only granted MCP servers are configured, a server named only by per-tool
+    refs (``@server/tool``) included; the rules allow just the granted tools and
+    deny every other one. Raises ``ValueError`` (``KiroV3InvalidAgentError`` for a failed check) and
     writes nothing.
     """
     # Set at all, not truthy: an explicit empty ``tools: []`` is a deny-everything
@@ -275,7 +277,7 @@ def _render_kiro_universal_agent(
             "for the v3 engine. Restrict allowedTools, or install with --engine v2."
         )
     servers = _inject_kiro_mcp_timeout(profile.mcpServers) or {}
-    granted = set(granted_mcp_servers(allowed_tools, servers))
+    granted = set(kiro_v3_granted_mcp_servers(allowed_tools, servers))
     mcp_servers = {name: config for name, config in servers.items() if name in granted}
     config = KiroAgentConfig(
         name=profile.name,
