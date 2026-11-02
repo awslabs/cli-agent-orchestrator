@@ -258,3 +258,55 @@ async def test_edited_args_is_typed_string() -> None:
     schemas = await _pending_schemas(construct)
 
     assert schemas["t-edit"]["properties"]["editedArgs"]["type"] == "string"
+
+
+# ---------------------------------------------------------------------------
+# P2-1 (#1198 review): ``approved`` decides; ``editedArgs`` cannot override a deny
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDelivery:
+    """Records what would be typed into the agent's terminal."""
+
+    def __init__(self) -> None:
+        self.calls: List[tuple] = []
+
+    def send_input(self, terminal_id: str, text: str, **kwargs: Any) -> None:
+        self.calls.append(("input", terminal_id, text))
+
+    def send_special_key(self, terminal_id: str, key: str) -> bool:
+        self.calls.append(("key", terminal_id, key))
+        return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload, decision, delivered",
+    [
+        pytest.param({"approved": False, "editedArgs": "x"}, "deny", "n", id="deny-with-text"),
+        pytest.param({"approved": True, "editedArgs": ""}, "approve", "y", id="approve-blank"),
+        pytest.param({"approved": False, "editedArgs": ""}, "deny", "n", id="deny-blank"),
+        pytest.param({"approved": True, "editedArgs": "x"}, "edit", "x", id="approve-with-text"),
+        pytest.param({"editedArgs": "x"}, "edit", "x", id="legacy-bare-edit"),
+    ],
+)
+async def test_approved_decides_and_edited_args_cannot_override_a_deny(
+    payload: Dict[str, Any], decision: str, delivered: str
+) -> None:
+    """Every payload here is valid against the per-interrupt responseSchema
+    (``approved`` required, optional string ``editedArgs``), except the legacy
+    bare ``{editedArgs}`` form, which stays an edit for existing clients."""
+    delivery = _RecordingDelivery()
+    construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=delivery)
+    interrupt = _raise(construct, "t-edit", _KIRO_PROMPT)
+    assert "edit" in interrupt.options  # premise: this prompt offers edit
+
+    events = await _events(
+        construct,
+        resume=[{"interruptId": interrupt.id, "status": "resolved", "payload": payload}],
+    )
+
+    assert [e["type"] for e in events] == ["RUN_STARTED", "RUN_FINISHED"], events
+    assert events[-1]["outcome"] == {"type": "success"}
+    assert construct.get_interrupt(interrupt.id).outcome == decision
+    assert delivery.calls == [("input", "t-edit", delivered)]

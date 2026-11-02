@@ -92,13 +92,17 @@ _AGUI_RUN_ERROR = "RUN_ERROR"
 def _map_resume_payload(payload: Any) -> Optional[str]:
     """Map a resume entry payload to an ApprovalDecision string.
 
-    Mapping rules:
-    - {approved: true} or {approved: True} -> "approve"
-    - {approved: false} or {approved: False} -> "deny"
-    - {editedArgs: ...} or any dict with an "editedArgs"/"edited_args" key -> "edit"
-    - Non-dict payloads or dicts without an explicit boolean ``approved``
-      key and without ``editedArgs`` -> None (ambiguous; caller should treat
-      as an error).
+    ``approved`` decides, as the per-interrupt ``responseSchema`` documents
+    (``approved`` required, ``editedArgs`` an optional string). Mapping rules,
+    checked in this order:
+    - {approved: false, ...} -> "deny", whatever ``editedArgs`` holds
+    - non-blank ``editedArgs``/``edited_args`` -> "edit"; this covers
+      {approved: true, editedArgs: "..."} and the legacy bare
+      {editedArgs: "..."} with no ``approved`` key
+    - {approved: true} (``editedArgs`` absent or blank) -> "approve"
+    - Non-dict payloads, or dicts with no boolean ``approved`` and no
+      non-blank ``editedArgs`` -> None (ambiguous; caller should treat as an
+      error).
 
     Returns:
         Decision string ("approve", "deny", "edit") or None when the payload
@@ -107,16 +111,16 @@ def _map_resume_payload(payload: Any) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
 
-    if "editedArgs" in payload or "edited_args" in payload:
-        return "edit"
-
     approved = payload.get("approved")
-    if approved is True:
-        return "approve"
     if approved is False:
         return "deny"
+    edited = _extract_edited_text(payload)
+    if edited is not None and edited.strip():
+        return "edit"
+    if approved is True:
+        return "approve"
 
-    # No explicit boolean ``approved`` and no editedArgs -- ambiguous payload.
+    # No explicit boolean ``approved`` and no non-blank editedArgs -- ambiguous.
     return None
 
 
