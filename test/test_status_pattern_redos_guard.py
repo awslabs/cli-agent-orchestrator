@@ -1,81 +1,224 @@
-"""Root guard: registered provider status/extraction regexes stay free of ReDoS shapes.
+"""Root guard: provider regexes stay free of ReDoS shapes, including ones added later.
 
 Status detection and response extraction run regexes over text an agent CLI
 painted on its terminal, so a pattern whose backtracking is superlinear lets
 that text stall every status poll (CWE-1333). The provider-specific tests in
 test/security/ prove each fix (step growth, old-vs-new differential); this
-guard is the cheap, always-on half: every pattern registered below must pass
-``structural_issues`` (test/security/redos_analysis.py) in the mode its callers
-use, so an edit that reintroduces a rescanning or ambiguous shape fails here
-with the reason, before anyone measures anything.
+guard is the always-on half, and it does not rely on anyone remembering to
+list a new pattern:
 
-Scope is the registry, nothing more. It holds the patterns the tier-1 ReDoS
-fixes made linear (Kiro, Claude Code, Codex) plus Codex's #771 fixes. Other
-providers' patterns are not covered until the tier-2 fixes register them here:
-add ``(attribute, mode, flags)`` under the provider module. Code that does not
-use a regex (Kiro's legacy permission-prompt scan) is covered by its step-count
-test instead.
+* every regex in the modules below is DISCOVERED: module-level and class-level
+  ``re.Pattern`` objects and constant-named strings that compile, plus the
+  ``*_pattern``/``*_re`` attributes a provider builds per instance;
+* a discovered pattern that is in ``REGISTRY`` is checked in the mode its
+  callers use (``structural_issues``), and its backtracking steps must grow
+  linearly on inputs generated from its own structure;
+* any other discovered pattern is checked strictly (as a ``search`` with
+  re.MULTILINE, the mode with the most ways to be slow) and must be clean;
+* a pattern that fails the strict check without being slow where it is used
+  (a fragment that is only ever spliced into a registered pattern, a pattern
+  nothing applies) needs an entry in ``EXEMPT`` that says why. An exemption
+  that no longer applies -- the pattern is gone, or now passes -- fails too,
+  so the list cannot rot.
+
+Modules are covered once they are listed in ``MODULES``; providers not yet
+listed here are not covered. To add one, list it, run this file, and register
+or exempt what it reports.
 """
 
 import importlib
+import inspect
 import re
-from test.security.redos_analysis import MODES, structural_issues
+from test.security.redos_analysis import (
+    MODES,
+    input_shapes,
+    nonlinear_shapes,
+    pattern_probe,
+    structural_issues,
+)
+from typing import Union
 
 import pytest
 
-#: provider module -> (attribute path, how callers run it, flags they add)
-REGISTRY: dict[str, list[tuple[str, str, int]]] = {
-    "kiro_cli": [
-        ("TUI_INITIALIZING_PATTERN", "finditer", 0),
-        ("KiroCliProvider._COMPOSER_CHROME_RE", "search", 0),
-    ],
-    "claude_code": [
-        ("PROCESSING_PATTERN", "finditer", 0),
-        ("GET_STATUS_COMPLETION_PATTERN", "finditer", 0),
-        ("NEW_TUI_BOX_PATTERN", "search", 0),
-        ("_NEW_TUI_BOX_RULE_RUN", "search", 0),
-        ("_NEW_TUI_BOX_BELOW_TOP_RE", "match", 0),
-        ("EXTRACTION_RESPONSE_PATTERN", "finditer", 0),
-        ("EFFORT_FOOTER_LINE_PATTERN", "finditer", 0),
-    ],
-    "codex": [
-        ("IDLE_PROMPT_STRICT_PATTERN", "search", re.MULTILINE),
-        ("_IDLE_PROMPT_STRICT_RE", "search", 0),
-        ("TUI_PROGRESS_PATTERN", "search", re.MULTILINE),
-        ("TUI_FOOTER_PATTERN", "search", 0),
-        ("UPDATE_DIALOG_PATTERN", "search", 0),
-    ],
+#: Provider module -> how to build an instance whose per-instance patterns are discovered.
+MODULES = {
+    "claude_code": ("ClaudeCodeProvider", ("t", "s", "w")),
+    "codex": ("CodexProvider", ("t", "s", "w")),
+    "kiro_cli": ("KiroCliProvider", ("t", "s", "w", "developer")),
 }
 
-ENTRIES = [
-    pytest.param(module, attr, mode, flags, id=f"{module}.{attr}")
-    for module, attrs in REGISTRY.items()
-    for attr, mode, flags in attrs
-]
+#: Discovered name -> (how callers run it, the flags they add).
+REGISTRY: dict[str, tuple[str, int]] = {
+    # claude_code
+    "claude_code.PROCESSING_PATTERN": ("finditer", 0),
+    "claude_code.GET_STATUS_COMPLETION_PATTERN": ("finditer", 0),
+    "claude_code.COMPLETION_SUMMARY_PATTERN": ("search", 0),
+    "claude_code.NEW_TUI_BOX_PATTERN": ("search", 0),
+    "claude_code._NEW_TUI_BOX_RULE_RUN": ("search", 0),
+    "claude_code._NEW_TUI_BOX_BELOW_TOP_RE": ("match", 0),
+    "claude_code.EXTRACTION_RESPONSE_PATTERN": ("finditer", 0),
+    "claude_code.EFFORT_FOOTER_LINE_PATTERN": ("finditer", 0),
+    "claude_code.REDUCED_MOTION_SPINNER_PATTERN": ("search", 0),
+    "claude_code.AFTER_SUMMARY_SPINNER_PATTERN": ("search", 0),
+    "claude_code.SEPARATOR_WALK_SPINNER_PATTERN": ("search", 0),
+    "claude_code.NEW_TUI_BOX_SPINNER_PATTERN": ("search", 0),
+    "claude_code.ClaudeCodeProvider._COMPOSER_PROMPT_RE": ("match", 0),
+    "claude_code.ClaudeCodeProvider._COMPOSER_RAIL_RE": ("search", 0),
+    "claude_code.ClaudeCodeProvider._SOL_IDLE_RE": ("match", 0),
+    # codex
+    "codex.IDLE_PROMPT_STRICT_PATTERN": ("search", re.MULTILINE),
+    "codex._IDLE_PROMPT_STRICT_RE": ("search", 0),
+    "codex.TUI_PROGRESS_PATTERN": ("search", re.MULTILINE),
+    "codex.TUI_FOOTER_PATTERN": ("search", 0),
+    "codex.UPDATE_DIALOG_PATTERN": ("search", 0),
+    "codex.STARTUP_ACTIVITY_PATTERN": ("search", re.MULTILINE),
+    "codex._CONFIG_PROFILE_ERROR_COMPACT": ("search", 0),
+    "codex.COMPLETION_FOOTER_PATTERN": ("match", 0),
+    "codex.LAUNCH_COMMAND_PATTERN": ("match", 0),
+    "codex.STARTUP_IDLE_PLACEHOLDER_PATTERN": ("match", 0),
+    # kiro_cli
+    "kiro_cli.TUI_INITIALIZING_PATTERN": ("finditer", 0),
+    "kiro_cli.TUI_225_CHILD_ROW_PATTERN": ("search", 0),
+    "kiro_cli.KiroCliProvider._COMPOSER_CHROME_RE": ("search", 0),
+    "kiro_cli.KiroCliProvider._COMPOSER_PROMPT_RE": ("match", 0),
+    "kiro_cli.KiroCliProvider()._new_tui_header_pattern": ("search", 0),
+}
+
+_FRAGMENT = "A fragment, never applied on its own: it is spliced into {}, which is registered."
+_UNUSED = "Defined but applied nowhere. It is superlinear: fix it before anything uses it."
+
+#: Discovered name -> why it may fail the strict check.
+EXEMPT: dict[str, str] = {
+    "claude_code._EFFORT_FOOTER_TAIL": _FRAGMENT.format(
+        "EXTRACTION_RESPONSE_PATTERN and EFFORT_FOOTER_LINE_PATTERN, after the marker,"
+    ),
+    "claude_code._SPINNER_VERB": _FRAGMENT.format(
+        "NEW_TUI_BOX_SPINNER_PATTERN and AFTER_SUMMARY_SPINNER_PATTERN, after the glyph,"
+    ),
+    "claude_code._REDUCED_MOTION_STATUS": _FRAGMENT.format("REDUCED_MOTION_SPINNER_PATTERN"),
+    "claude_code._REDUCED_MOTION_AFTER_ELLIPSIS": _FRAGMENT.format(
+        "REDUCED_MOTION_SPINNER_PATTERN, after a '…',"
+    ),
+    "claude_code._NEW_TUI_BOX_BELOW_TOP": _FRAGMENT.format(
+        "NEW_TUI_BOX_PATTERN and _NEW_TUI_BOX_BELOW_TOP_RE (applied anchored, with .match)"
+    ),
+    "claude_code.THINKING_BEFORE_SEPARATOR_PATTERN": _UNUSED,
+    "claude_code.NEW_TUI_SPINNER_PATTERN": _UNUSED,
+    "codex._FOOTER_DURATION": _FRAGMENT.format("COMPLETION_FOOTER_PATTERN"),
+    "codex.CONFIG_PROFILE_ERROR_PATTERN": (
+        "The phrase template, never applied itself: _CONFIG_PROFILE_ERROR_COMPACT (registered) "
+        "is built from it with a line anchor and a skip to the first lead phrase."
+    ),
+    "kiro_cli.IDLE_PROMPT_PATTERN_LOG": (
+        "Returned by get_idle_pattern_for_log(), which no production code calls (only unit "
+        "tests do). It is superlinear: fix it before log scanning uses it."
+    ),
+}
+
+_CONSTANT = re.compile(r"^_?[A-Z][A-Z0-9_]*$")
+_INSTANCE = re.compile(r"_(?:pattern|re)$")
+
+Regex = Union[str, "re.Pattern[str]"]
 
 
-def _resolve(module: str, attr: str) -> object:
-    value: object = importlib.import_module(f"cli_agent_orchestrator.providers.{module}")
-    for part in attr.split("."):
-        value = getattr(value, part)
-    return value
+def _source(value: Regex) -> tuple[str, int]:
+    """The pattern text and the flags it carries itself (none, for a string)."""
+    if isinstance(value, re.Pattern):
+        return value.pattern, value.flags
+    return value, 0
 
 
-@pytest.mark.parametrize("module,attr,mode,flags", ENTRIES)
-def test_registered_pattern_has_no_redos_shape(module, attr, mode, flags):
-    pattern = _resolve(module, attr)
-    assert isinstance(pattern, (str, re.Pattern)), f"{module}.{attr} is not a regex"
-    issues = structural_issues(pattern, mode, flags)
+def _is_regex(value: object) -> bool:
+    if isinstance(value, re.Pattern):
+        return True
+    if isinstance(value, str):
+        try:
+            re.compile(value, re.MULTILINE)
+        except (re.error, OverflowError):  # not a regex: prose, a path, a fragment
+            return False
+        return True
+    return False
+
+
+def _discover() -> dict[str, Regex]:
+    """Every regex in MODULES, by name, as it is defined (a string or a compiled pattern)."""
+    found: dict[str, Regex] = {}
+
+    def take(name: str, value: object, named_like_a_regex: bool) -> None:
+        if isinstance(value, re.Pattern) or (named_like_a_regex and _is_regex(value)):
+            found[name] = value  # type: ignore[assignment]
+
+    for module_name, (class_name, args) in MODULES.items():
+        module = importlib.import_module(f"cli_agent_orchestrator.providers.{module_name}")
+        for name, value in vars(module).items():
+            if inspect.isclass(value) and value.__module__ == module.__name__:
+                for attr, attr_value in vars(value).items():
+                    take(f"{module_name}.{name}.{attr}", attr_value, bool(_CONSTANT.match(attr)))
+            else:
+                take(f"{module_name}.{name}", value, bool(_CONSTANT.match(name)))
+        instance = getattr(module, class_name)(*args)
+        for attr, value in vars(instance).items():
+            take(f"{module_name}.{class_name}().{attr}", value, bool(_INSTANCE.search(attr)))
+    return found
+
+
+DISCOVERED = _discover()
+
+
+def _strict_issues(value: Regex) -> list[str]:
+    source, flags = _source(value)
+    return structural_issues(source, "search", flags | re.MULTILINE)
+
+
+@pytest.mark.parametrize("name", sorted(REGISTRY))
+def test_registered_pattern_is_linear_where_it_is_used(name):
+    assert name in DISCOVERED, f"{name} is registered but no longer exists; update REGISTRY"
+    mode, call_flags = REGISTRY[name]
+    source, own_flags = _source(DISCOVERED[name])
+    flags = own_flags | call_flags
+    issues = structural_issues(source, mode, flags)
     assert issues == [], (
-        f"{module}.{attr} ({mode}) holds a shape that backtracks superlinearly on "
-        f"agent-controlled text: {issues}. See test/security/redos_analysis.py for what "
-        f"each finding means and test/security/test_*_status_pattern_redos.py for how "
-        f"the tier-1 fixes removed them."
+        f"{name} ({mode}) holds a shape that backtracks superlinearly on agent-controlled "
+        f"text: {issues}. test/security/redos_analysis.py explains each finding; the "
+        f"test/security/test_*_status_pattern_redos.py files show how the Kiro, Claude Code "
+        f"and Codex fixes removed them."
+    )
+    # Backstop for shapes the structure check cannot see: count the steps.
+    growth = nonlinear_shapes(pattern_probe(source, mode, flags), input_shapes(source, flags))
+    assert growth == [], f"{name} ({mode}) does not grow linearly on: {growth[:3]}"
+
+
+@pytest.mark.parametrize("name", sorted(set(DISCOVERED) - set(REGISTRY) - set(EXEMPT)))
+def test_unregistered_pattern_passes_the_strict_check(name):
+    issues = _strict_issues(DISCOVERED[name])
+    assert issues == [], (
+        f"{name} is a regex that fails the strict ReDoS check: {issues}. Fix it, register it "
+        f"in REGISTRY with the mode and flags its callers use (match/fullmatch skip the "
+        f"start-position checks), or, if it is never applied on its own, exempt it in EXEMPT "
+        f"with the reason."
     )
 
 
-def test_registry_entries_are_well_formed():
-    for module, attrs in REGISTRY.items():
-        assert attrs, f"{module} is registered with no patterns"
-        for attr, mode, _flags in attrs:
-            assert mode in MODES, f"{module}.{attr}: unknown mode {mode!r}"
+@pytest.mark.parametrize("name", sorted(EXEMPT))
+def test_exemption_still_applies(name):
+    assert name in DISCOVERED, f"{name} no longer exists; drop it from EXEMPT"
+    assert _strict_issues(DISCOVERED[name]), f"{name} passes now; drop it from EXEMPT"
+
+
+def test_registry_and_exemptions_are_well_formed():
+    assert not set(REGISTRY) & set(EXEMPT), "a pattern is both registered and exempt"
+    for name, (mode, _flags) in REGISTRY.items():
+        assert mode in MODES, f"{name}: unknown mode {mode!r}"
+    for name, reason in EXEMPT.items():
+        assert reason.strip(), f"{name}: an exemption needs a reason"
+
+
+def test_discovery_sees_every_kind_of_pattern():
+    """Module constants, class attributes and per-instance patterns are all found."""
+    for name in (
+        "claude_code.PROCESSING_PATTERN",
+        "claude_code.ClaudeCodeProvider._COMPOSER_RAIL_RE",
+        "kiro_cli.KiroCliProvider()._new_tui_header_pattern",
+        "kiro_cli.KiroCliProvider()._idle_prompt_pattern",
+    ):
+        assert name in DISCOVERED, f"{name} not discovered"

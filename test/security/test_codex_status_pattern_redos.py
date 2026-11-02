@@ -1,6 +1,6 @@
-"""ReDoS guards for Codex's status and extraction patterns (CWE-1333), tier 1.
+"""ReDoS guards for Codex's status and extraction patterns (CWE-1333).
 
-Two patterns backtracked superlinearly on agent-controlled text:
+These patterns backtracked superlinearly on agent-controlled text:
 
 * ``IDLE_PROMPT_STRICT_PATTERN`` (``^\\s*(?:❯|›|»|codex>)\\s*$``) is searched
   with re.MULTILINE over the response during extraction. Every line start in a
@@ -9,7 +9,10 @@ Two patterns backtracked superlinearly on agent-controlled text:
   ``_strict_idle_prompt_start`` recovers the old start offset;
 * ``TUI_PROGRESS_PATTERN`` restarted at every bullet glyph on a line and
   re-scanned the rest of the line for the spinner status: quadratic. It is now
-  anchored at the line start and skips to the line's first glyph.
+  anchored at the line start and skips to the line's first glyph;
+* ``STARTUP_ACTIVITY_PATTERN`` (``^\\s*•``) began an attempt at every line of a
+  blank run, and ``_CONFIG_PROFILE_ERROR_COMPACT`` restarted at every
+  occurrence of its lead phrase.
 
 Each fix is checked without a clock: the structure check, step growth at n, 4n
 and 16n on inputs generated from the OLD pattern's structure (the old form must

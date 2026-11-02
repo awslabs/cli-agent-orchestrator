@@ -1,7 +1,6 @@
-"""ReDoS guards for Kiro's status detection (CWE-1333), tier 1.
+"""ReDoS guards for Kiro's status detection and extraction (CWE-1333).
 
-Two of Kiro's status checks ran over the whole status buffer on every poll and
-backtracked superlinearly:
+These Kiro patterns backtracked superlinearly on agent-controlled text:
 
 * the legacy permission prompt ``Allow this action\\?.*?\\[.*?y.*?/.*?n.*?/.*?t.*?\\]:``
   (re.DOTALL). With the question in the buffer but no closing "]:" after it,
@@ -10,7 +9,11 @@ backtracked superlinearly:
   ``kiro_cli._legacy_permission_prompt_spans``;
 * ``TUI_INITIALIZING_PATTERN``'s ``\\d+ of \\d+ mcp servers ...`` restarted inside
   every run of digits and re-scanned the rest of the run: quadratic in the run.
-  A ``(?<!\\d)`` lookbehind now starts it only where a run starts.
+  A ``(?<!\\d)`` lookbehind now starts it only where a run starts;
+* ``_new_tui_header_pattern`` (extraction, one row at a time) restarted at every
+  occurrence of the agent name on a row. It now skips to the first one;
+* the AG-UI approval classifier kept its own copy of the permission regex (run
+  without re.DOTALL). It now calls ``kiro_cli.has_single_line_permission_prompt``.
 
 Each fix is checked three ways, none of them timed: the structure check (or,
 for the scan, a step count of the characters it reads), step growth at n, 4n

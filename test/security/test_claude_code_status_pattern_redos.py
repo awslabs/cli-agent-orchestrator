@@ -1,7 +1,7 @@
-"""ReDoS guards for Claude Code's status and extraction patterns (CWE-1333), tier 1.
+"""ReDoS guards for Claude Code's status and extraction patterns (CWE-1333).
 
-Four patterns ran over the whole status buffer on every poll, or over the whole
-capture during extraction, and backtracked superlinearly:
+These patterns ran over the whole status buffer on every poll, or over the
+whole capture during extraction, and backtracked superlinearly:
 
 * ``NEW_TUI_BOX_PATTERN`` restarted at every "─" of a rule row and tried every
   split of the row between ``─{8,}`` and ``[^\\n]*``: cubic in one long rule,
@@ -9,7 +9,11 @@ capture during extraction, and backtracked superlinearly:
 * ``GET_STATUS_COMPLETION_PATTERN`` and ``PROCESSING_PATTERN`` restarted at
   every spinner glyph and re-scanned the rest of the line: quadratic;
 * ``EXTRACTION_RESPONSE_PATTERN`` re-ran its effort-footer lookahead once per
-  SGR code the run after the marker gave back: quadratic in the run.
+  SGR code the run after the marker gave back: quadratic in the run;
+* ``COMPLETION_SUMMARY_PATTERN``, ``AFTER_SUMMARY_SPINNER_PATTERN`` and
+  ``SEPARATOR_WALK_SPINNER_PATTERN`` restarted at every glyph, and
+  ``REDUCED_MOTION_SPINNER_PATTERN`` backtracked to every "…" on a line and ran
+  its hook gap to the end of the line from every "… (running " fragment.
 
 Each fix is checked without a clock: the structure check, step growth at n, 4n
 and 16n on inputs generated from the OLD pattern's structure (the old form must
