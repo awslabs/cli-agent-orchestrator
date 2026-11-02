@@ -187,8 +187,11 @@ def derive_bump(commits: Sequence[Commit]) -> Derivation:
         if BANG_SUBJECT.match(parsed.subject) or any(
             BREAKING_FOOTER.match(line) for line in parsed.footer
         ):
+            # Already breaking: a marker in its body (a squash repeats its own `!` subject
+            # as the first bullet, as 93700ab4 does) adds nothing to report.
             breaking.append(c)
-        elif FEAT_SUBJECT.match(parsed.subject):
+            continue
+        if FEAT_SUBJECT.match(parsed.subject):
             features.append(c)
         unclear.extend((c, line.strip()) for line in parsed.body if UNCLEAR_MARKER.match(line))
     bump = "major" if breaking else "minor" if features else "patch"
@@ -333,16 +336,19 @@ def decide(
         decision.problems.extend(ci)
         if decision.bump == "major":
             decision.problems.append(major_refusal(tag, derivation))
-        if derivation.unclear:
+        elif derivation.unclear:
+            # Only when the window is not already a major: that refusal already sends the
+            # week to a person, and "otherwise bump=major" would be no choice at all.
             decision.problems.append(unclear_refusal(derivation))
     decision.should_release = not decision.refused
     return decision
 
 
 def unclear_refusal(derivation: Derivation) -> str:
-    shas = ", ".join(sorted({c.sha[:8] for c, _ in derivation.unclear}))
+    shas = sorted({c.sha[:8] for c, _ in derivation.unclear})
     return (
-        f"{shas} carry a breaking-change marker outside the subject and the footer. That "
+        f"{len(shas)} commit(s) ({', '.join(shas)}) "
+        "carry a breaking-change marker outside the subject and the footer. That "
         "is usually a quote, but in a squash merge it can be a real break from one of the "
         "squashed commits, and a scheduled run cannot tell which. Run the Release workflow "
         f"by hand: bump=major if it is breaking, otherwise bump={derivation.bump}"

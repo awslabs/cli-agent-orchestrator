@@ -848,3 +848,37 @@ class TestReleasingDocDescribesTheRealBehaviour:
     def test_it_documents_the_release_dispatch_mode(self):
         assert "environment: release" in self.TEXT
         assert "use workflow from the tag" in self.TEXT
+
+
+#: The shape of 93700ab4 on main (#1119): a `!` subject that the squash repeats as a bullet.
+REPEATED_BANG = """build(deps)!: require Python 3.11 so dnspython 2.9.0 clears CVE-2026-114605 (#1119)
+
+* build(deps)!: require Python 3.11 so dnspython 2.9.0 clears CVE-2026-114605
+
+Dependency Security has been red on main.
+
+---------
+
+Co-authored-by: Someone <someone@example.invalid>
+"""
+
+
+class TestABreakingCommitIsReportedOnce:
+    """Found replaying main (v2.5.4..ab9bbaab): 93700ab4 was refused twice, the second time
+    with the non-choice "otherwise bump=major"."""
+
+    def test_its_own_squash_bullet_is_not_also_unclear(self):
+        derivation = rp.derive_bump([commit(REPEATED_BANG)])
+        assert derivation.bump == "major"
+        assert derivation.unclear == ()
+
+    def test_a_major_window_gets_only_the_major_refusal(self):
+        history = [commit(REPEATED_BANG, sha="9" * 40), commit(SQUASHED_BANG, sha="8" * 40)]
+        decision = rp.decide("schedule", SHA, FakeProbe(history=history))
+        (problem,) = decision.problems
+        assert "never cuts a major" in problem and "99999999" in problem
+        assert len(decision.derivation.unclear) == 1, "still listed in the summary"
+
+    def test_the_unclear_refusal_counts_its_commits(self):
+        decision = rp.decide("schedule", SHA, FakeProbe(history=[commit(SQUASHED_BANG, "7" * 40)]))
+        assert decision.problems[0].startswith("1 commit(s) (77777777) carry")
