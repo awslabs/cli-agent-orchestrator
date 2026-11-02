@@ -154,11 +154,63 @@ TUI_PROCESSING_PATTERN = r"Kiro is working|Thinking\.\.\."
 #
 # kiro-cli 2.8.x also shows "Initializing · type to queue a message" during
 # boot (different from the "Initializing..." with three dots).
+#
+# ``(?<!\d)`` lets the server count start only where a run of digits starts.
+# Without it the search restarted inside every digit run and re-scanned the
+# rest of the run each time, so a long run of digits anywhere in the buffer
+# cost time quadratic in its length (CWE-1333). The matches are unchanged:
+# whenever a match exists inside a run, one exists from the run's first digit,
+# and the leftmost one wins.
 TUI_INITIALIZING_PATTERN = (
     r"Initializing\.\.\."
-    r"|\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"
+    r"|(?<!\d)\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"
     r"|Initializing\s*·\s*type to queue a message"
 )
+
+# Legacy permission prompt: "Allow this action? ... [y/n/t]:". The text between
+# the question and the bracketed choice varies by version ("Use 't' to trust
+# (always allow) this tool for the session."), so detection looks for the
+# question and then, in order, "[", "y", "/", "n", "/", "t" and "]:" anywhere
+# after it, across lines -- the subsequence the old regex
+# ``Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:`` (re.DOTALL) spelled
+# out with six lazy gaps. Run over the whole buffer on every status poll, that
+# regex tried every ordered combination of those characters whenever the
+# question was present without a closing "]:" after it: polynomial of degree
+# ~6 in the text that followed (CWE-1333). See _legacy_permission_prompt_spans.
+_PERMISSION_PROMPT_QUESTION = "Allow this action?"
+_PERMISSION_PROMPT_STEPS = ("[", "y", "/", "n", "/", "t")
+_PERMISSION_PROMPT_CLOSE = "]:"
+
+
+def _legacy_permission_prompt_spans(text: str) -> List[tuple[int, int]]:
+    """``(start, end)`` of every legacy permission prompt in ``text``, in order.
+
+    Returns the spans ``re.finditer`` returned for the old six-gap regex (see
+    ``_PERMISSION_PROMPT_QUESTION``), in one forward pass. Taking the EARLIEST
+    occurrence of each step finds exactly the regex's match, because an earlier
+    choice never leaves less text for the steps after it. When the steps fail
+    after one question they fail after every later question too (each later
+    search sees a suffix of the same text), so the scan can stop there instead
+    of retrying from each later question as the regex engine did.
+    """
+    spans: List[tuple[int, int]] = []
+    pos = 0
+    while True:
+        start = text.find(_PERMISSION_PROMPT_QUESTION, pos)
+        if start == -1:
+            return spans
+        cursor = start + len(_PERMISSION_PROMPT_QUESTION)
+        for step in _PERMISSION_PROMPT_STEPS:
+            cursor = text.find(step, cursor)
+            if cursor == -1:
+                return spans
+            cursor += len(step)
+        close = text.find(_PERMISSION_PROMPT_CLOSE, cursor)
+        if close == -1:
+            return spans
+        end = close + len(_PERMISSION_PROMPT_CLOSE)
+        spans.append((start, end))
+        pos = end
 
 
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
@@ -220,7 +272,6 @@ class KiroCliProvider(BaseProvider):
         window_name: Name of the tmux window for this terminal
         _agent_profile: Name of the Kiro agent profile to use
         _idle_prompt_pattern: Regex pattern for detecting IDLE state
-        _permission_prompt_pattern: Regex pattern for detecting permission prompts
     """
 
     @classmethod
@@ -280,7 +331,8 @@ class KiroCliProvider(BaseProvider):
         self._idle_prompt_pattern = (
             rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?(?:\u03bb\s*)?!?>\s*"
         )
-        self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
+        # The legacy "Allow this action? ... [y/n/t]:" prompt is found by
+        # _legacy_permission_prompt_spans (a linear scan, not a regex).
 
         # New TUI header pattern: "agent_name · model · ◔ N%"
         self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
@@ -746,13 +798,13 @@ class KiroCliProvider(BaseProvider):
         # Active prompt: 0-1 lines with idle prompt (CLI renders prompt on next line)
         # Stale prompt: 2+ lines with idle prompt (user answered, agent continued)
         # Line-based counting handles \r redraws (same line, no \n) correctly
-        perm_matches = list(re.finditer(self._permission_prompt_pattern, clean_output, re.DOTALL))
-        tui_perm_matches = list(re.finditer(TUI_PERMISSION_PATTERN, clean_output))
-        all_perm_matches = perm_matches + tui_perm_matches
+        perm_spans = _legacy_permission_prompt_spans(clean_output)
+        tui_perm_spans = [m.span() for m in re.finditer(TUI_PERMISSION_PATTERN, clean_output)]
+        all_perm_spans = perm_spans + tui_perm_spans
         # Sort by position so we use the last permission prompt regardless of type
-        all_perm_matches.sort(key=lambda m: m.start())
-        if all_perm_matches:
-            after_last_perm = clean_output[all_perm_matches[-1].end() :]
+        all_perm_spans.sort(key=lambda span: span[0])
+        if all_perm_spans:
+            after_last_perm = clean_output[all_perm_spans[-1][1] :]
             lines_after = after_last_perm.split("\n")
             idle_lines = sum(
                 1
