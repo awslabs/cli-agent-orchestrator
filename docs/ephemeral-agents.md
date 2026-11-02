@@ -295,6 +295,43 @@ whatever their values. All five tier and effort keys, including the new `min_tie
 validated. A previously accepted block, such as a ceiling without a default, can therefore
 refuse every ephemeral create and claim.
 
+### Task features
+
+A decider can size your helper, but it can't tell which of your models suits the task. With the
+`task.features` switch on, CAO also asks the decider four yes/no questions about the task: does it
+need a very large context, long careful reasoning, only reading, or the network? Then CAO matches
+the answers to the models you declared in `decisions.match`, locally. It's off by default, and
+provisional (#1199). The full guide, with the catalog, the rules and a worked example, is
+[Matching helpers to models](decisions.md#matching-helpers-to-models).
+
+**When it's asked.** For a claimed launch whose stored spec declared `provider: "auto"` or
+`model_tier: "auto"`, in one request beside `model.route`'s, and only of a decider package that
+declares all four feature points. Explicit specs and launches without a claim ask nothing.
+
+**What it can change**, in `on` mode only:
+
+- **The tier**, when `model.route` is on and gave a usable answer. The tier can rise from the
+  decider's size up to `max_tier` to cover a need, such as a very large context; it never goes
+  below the size. The `model.route` record shows both, for example `answer: medium`,
+  `applied_value: large`, `match_from: medium`, and the note says `matched long_context -> large`.
+- **The CLI**, when `provider.route` is bound to the built-in matcher
+  (`cao decisions set provider.route on --decider match`), within the options described under
+  [Provider `auto`](#provider-auto). With today's providers no set validates, so this half routes
+  nothing yet.
+
+Nothing else changes. The model is always `model_tiers[<provider>][<tier>]`, the tools are never
+read or changed, and the pre-bind recheck applies the matched CLI and tier exactly as it does a
+decided provider and tier. A policy change while the decider runs still collects the name.
+
+**Network is advisory.** A confident `needs_network: yes` for a helper whose grant has no
+`web_fetch` adds `the task may need network access, and this helper has no web_fetch` to your
+delegation note. It never grants a tool or moves the helper; grant `web_fetch` in the spec if the
+task really needs it.
+
+**Shadow and off.** In shadow the helper launches exactly as with the switch off, and the four
+answers and the would-be match are recorded. With the switch off, or after `cao decisions off`,
+nothing is asked.
+
 ## Create surface and stored files
 
 `POST /ephemeral-agents?caller_id=<terminal-id>` requires a registered creator and write or
