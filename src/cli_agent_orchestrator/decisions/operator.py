@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from cli_agent_orchestrator.clients.database import init_db
-from cli_agent_orchestrator.decisions import egress, settings
+from cli_agent_orchestrator.decisions import catalog, egress, settings
 from cli_agent_orchestrator.decisions.packages import installed_deciders
 from cli_agent_orchestrator.decisions.settings import load_settings
 from cli_agent_orchestrator.decisions.store import DecisionStore, read_decider_status
@@ -20,7 +20,9 @@ OFF_REENABLED_MESSAGE = (
 
 
 def _effective() -> dict[str, Any]:
-    result = asdict(load_settings())
+    snapshot = load_settings()
+    # The local model catalog is summarised, never printed (#1199).
+    result = catalog.status_view(asdict(snapshot), snapshot)
     result["halted"] = egress.is_halted()
     result["installed_deciders"] = installed_deciders()
     return result

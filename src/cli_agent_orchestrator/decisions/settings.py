@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from cli_agent_orchestrator.decisions.catalog import MatchCatalog, load_catalog
 from cli_agent_orchestrator.decisions.types import POINTS, ROUTE_POINTS, SWITCHES, PointState
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services import settings_service
@@ -46,6 +47,8 @@ class DecisionSettings:
     shadow_timeout_ms: int = 10000
     deciders: Mapping[str, Any] = field(default_factory=dict)
     model_tiers: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    # #1199: the local model declarations, validated from the same read as model_tiers (D5).
+    match_catalog: MatchCatalog = field(default_factory=MatchCatalog)
 
 
 def _block(value: object) -> dict[str, Any]:
@@ -117,6 +120,7 @@ def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSe
             name = ""
         points[point] = PointSettings(parsed, name, names)
     shadow = _block(block.get("shadow"))
+    model_tiers = load_model_tiers(raw)
     return DecisionSettings(
         points=points,
         on_timeout_ms=resolve_on_timeout_ms(raw, environment=env),
@@ -132,7 +136,8 @@ def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSe
             _number(shadow.get("timeout_ms", 10000), 10000, *SHADOW_TIMEOUT_MS_RANGE)
         ),
         deciders=_block(block.get("deciders")),
-        model_tiers=load_model_tiers(raw),
+        model_tiers=model_tiers,
+        match_catalog=load_catalog(raw, model_tiers),
     )
 
 
