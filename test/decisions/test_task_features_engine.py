@@ -272,8 +272,12 @@ def test_AC1_plans_and_records_match_1174_byte_for_byte(tmp_path):
             Path(__file__).resolve().parents[1] / "fixtures/decisions_1174_ac1_golden.json"
         ).read_text()
     )
-    assert json.loads(json.dumps(scenarios.run(tmp_path), default=list)) == golden
-    # The new columns exist and are NULL on every one of those rows.
+    result = scenarios.run(tmp_path, with_new_columns=True)
+    # The new columns are NULL on every one of those rows (11 rows in 6 scenarios).
+    new_rows = [row for scenario in result.values() for row in scenario.pop("new_columns")]
+    assert len(new_rows) == sum(len(scenario["rows"]) for scenario in result.values()) == 11
+    assert all(set(row.values()) == {None} and len(row) == 8 for row in new_rows)
+    assert json.loads(json.dumps(result, default=list)) == golden
     from cli_agent_orchestrator.clients.database import DecisionRecordModel
 
     added = scenarios.new_columns(tmp_path)

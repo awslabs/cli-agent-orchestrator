@@ -110,8 +110,12 @@ SCENARIOS = {
 }
 
 
-def run(directory: Path) -> dict[str, Any]:
-    """Each scenario's plan, records and requests, in a canonical, comparable form."""
+def run(directory: Path, *, with_new_columns: bool = False) -> dict[str, Any]:
+    """Each scenario's plan, records and requests, in a canonical, comparable form.
+
+    With ``with_new_columns``, each scenario also lists its rows' columns beyond #1174's (none on
+    the base), so a test can check them; the golden itself never includes them.
+    """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
@@ -192,6 +196,20 @@ def run(directory: Path) -> dict[str, Any]:
                 }
             ),
             "rows": [{column: row[column] for column in COLUMNS_1174} for row in rows],
+            **(
+                {
+                    "new_columns": [
+                        {
+                            column: value
+                            for column, value in row.items()
+                            if column not in COLUMNS_1174 and column not in VOLATILE
+                        }
+                        for row in rows
+                    ]
+                }
+                if with_new_columns
+                else {}
+            ),
             "requests": [
                 {
                     key: value
