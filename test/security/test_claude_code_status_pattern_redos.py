@@ -1,0 +1,171 @@
+"""ReDoS guards for Claude Code's status and extraction patterns (CWE-1333), tier 1.
+
+Four patterns ran over the whole status buffer on every poll, or over the whole
+capture during extraction, and backtracked superlinearly:
+
+* ``NEW_TUI_BOX_PATTERN`` restarted at every "─" of a rule row and tried every
+  split of the row between ``─{8,}`` and ``[^\\n]*``: cubic in one long rule,
+  and ~0.2 s per poll on an ordinary buffer of full-width rules;
+* ``GET_STATUS_COMPLETION_PATTERN`` and ``PROCESSING_PATTERN`` restarted at
+  every spinner glyph and re-scanned the rest of the line: quadratic;
+* ``EXTRACTION_RESPONSE_PATTERN`` re-ran its effort-footer lookahead once per
+  SGR code the run after the marker gave back: quadratic in the run.
+
+Each fix is checked without a clock: the structure check, step growth at n, 4n
+and 16n on inputs generated from the OLD pattern's structure (the old form must
+grow superlinearly, the new one linearly), and a differential test that the new
+form reports exactly the old matches -- spans, text and existence.
+"""
+
+import random
+import re
+from test.security.redos_analysis import (
+    first_superlinear,
+    input_shapes,
+    instrumented_steps,
+    nonlinear_shapes,
+    pattern_probe,
+    structural_issues,
+)
+
+import pytest
+
+from cli_agent_orchestrator.providers import claude_code as cc
+
+OLD_PROCESSING = r"[✶✢✽✻✳·*].*…"
+OLD_GET_STATUS_COMPLETION = r"[✶✢✽✻✳][^\n…]*\bfor\b"
+OLD_NEW_TUI_BOX = (
+    r"─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯][ \t\xa0]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}"
+)
+_OLD_ANSI = r"(?:\x1b\[[0-9;]*m)*"
+_OLD_TAIL = (
+    _OLD_ANSI + r"\w+" + _OLD_ANSI + r"[ \t]*·[ \t]*" + _OLD_ANSI + r"/effort" + _OLD_ANSI
+) + r"[ \t]*$"
+OLD_EXTRACTION_RESPONSE = (
+    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*(?![ \t]*" + _OLD_TAIL + r")\s+"
+)
+OLD_EFFORT_FOOTER_LINE = r"^[ \t]*[⏺●][ \t]*" + _OLD_TAIL
+
+# (label, current pattern, old pattern, old flags, how callers run it)
+PATTERNS = [
+    ("PROCESSING_PATTERN", cc.PROCESSING_PATTERN, OLD_PROCESSING, 0, "finditer"),
+    (
+        "GET_STATUS_COMPLETION_PATTERN",
+        cc.GET_STATUS_COMPLETION_PATTERN,
+        OLD_GET_STATUS_COMPLETION,
+        0,
+        "finditer",
+    ),
+    ("NEW_TUI_BOX_PATTERN", cc.NEW_TUI_BOX_PATTERN, OLD_NEW_TUI_BOX, re.MULTILINE, "search"),
+    (
+        "EXTRACTION_RESPONSE_PATTERN",
+        cc.EXTRACTION_RESPONSE_PATTERN,
+        OLD_EXTRACTION_RESPONSE,
+        re.MULTILINE,
+        "finditer",
+    ),
+]
+IDS = [p[0] for p in PATTERNS]
+
+
+def _random_texts(seed: int, tokens: list[str], count: int, length: int) -> list[str]:
+    rng = random.Random(seed)
+    return [
+        "".join(rng.choice(tokens) for _ in range(rng.randrange(0, length))) for _ in range(count)
+    ]
+
+
+class TestStructureAndGrowth:
+    @pytest.mark.parametrize("label,new,old,old_flags,mode", PATTERNS, ids=IDS)
+    def test_current_form_is_clean(self, label, new, old, old_flags, mode):
+        assert structural_issues(new, mode) == []
+
+    @pytest.mark.parametrize("label,new,old,old_flags,mode", PATTERNS, ids=IDS)
+    def test_old_form_is_flagged_and_grows_superlinearly(self, label, new, old, old_flags, mode):
+        assert structural_issues(old, mode, old_flags)
+        probe = pattern_probe(old, mode, old_flags)
+        assert first_superlinear(probe, input_shapes(old, old_flags)) is not None
+
+    @pytest.mark.parametrize("label,new,old,old_flags,mode", PATTERNS, ids=IDS)
+    def test_current_form_grows_linearly(self, label, new, old, old_flags, mode):
+        shapes = sorted(set(input_shapes(old, old_flags)) | set(input_shapes(new)))
+        assert nonlinear_shapes(pattern_probe(new, mode), shapes) == []
+
+    def test_effort_footer_line_pattern_is_clean(self):
+        # Shares the possessive _EFFORT_FOOTER_TAIL with EXTRACTION_RESPONSE_PATTERN.
+        assert structural_issues(cc.EFFORT_FOOTER_LINE_PATTERN, "finditer") == []
+
+    def test_box_scan_grows_linearly(self):
+        def probe(text: str) -> int:
+            return instrumented_steps(
+                lambda t: list(cc._iter_new_tui_boxes(t)),
+                text,
+                {cc: ["_NEW_TUI_BOX_RULE_RUN", "_NEW_TUI_BOX_BELOW_TOP_RE"]},
+            )
+
+        shapes = sorted(
+            set(input_shapes(OLD_NEW_TUI_BOX, re.MULTILINE))
+            | set(input_shapes(cc._NEW_TUI_BOX_BELOW_TOP_RE))
+        )
+        assert nonlinear_shapes(probe, shapes) == []
+
+
+class TestSameMatchesAsBefore:
+    SPINNER_TOKENS = ["✶", "✻", "✳", "·", "*", "a", " ", "…", "\n", "for", " for ", "Waiting"]
+
+    def test_processing_spinner_spans_match_the_old_pattern(self):
+        for text in _random_texts(974, self.SPINNER_TOKENS, 5000, 30):
+            old = [m.span() for m in re.finditer(OLD_PROCESSING, text)]
+            new = [
+                (m.start(), m.end()) for m in cc._iter_spinner_matches(cc.PROCESSING_PATTERN, text)
+            ]
+            assert new == old, text
+            # The busy-pattern guard and existence checks see the same verdict.
+            flags = re.MULTILINE | re.IGNORECASE
+            assert bool(re.search(cc.PROCESSING_PATTERN, text, flags)) == bool(
+                re.search(OLD_PROCESSING, text, flags)
+            )
+
+    def test_completion_summary_spans_and_text_match_the_old_pattern(self):
+        for text in _random_texts(392, self.SPINNER_TOKENS, 5000, 30):
+            old = [(m.span(), m.group(0)) for m in re.finditer(OLD_GET_STATUS_COMPLETION, text)]
+            new = [
+                ((m.start(), m.end()), m.group(0))
+                for m in cc._iter_spinner_matches(cc.GET_STATUS_COMPLETION_PATTERN, text)
+            ]
+            assert new == old, text
+            assert bool(re.search(cc.GET_STATUS_COMPLETION_PATTERN, text)) == bool(
+                re.search(OLD_GET_STATUS_COMPLETION, text)
+            )
+
+    def test_input_box_spans_and_existence_match_the_old_pattern(self):
+        old_re = re.compile(OLD_NEW_TUI_BOX, re.MULTILINE)
+        tokens = ["─" * 8, "─" * 20, "─" * 3, "─", " ", "\t", "\xa0", "\n", "❯", ">", "x"]
+        for text in _random_texts(459, tokens, 20000, 30):
+            assert list(cc._iter_new_tui_boxes(text)) == [m.span() for m in old_re.finditer(text)]
+            assert bool(cc.NEW_TUI_BOX_PATTERN.search(text)) == bool(old_re.search(text))
+
+    def test_response_marker_spans_match_the_old_patterns(self):
+        old_response = re.compile(OLD_EXTRACTION_RESPONSE, re.MULTILINE)
+        old_footer = re.compile(OLD_EFFORT_FOOTER_LINE, re.MULTILINE)
+        tokens = [
+            "⏺",
+            "●",
+            " ",
+            "\t",
+            "\n",
+            "\x1b[m",
+            "\x1b[38;5;246m",
+            "\x1b[39m",
+            "high",
+            "·",
+            "/effort",
+            "x",
+        ]
+        for text in _random_texts(908, tokens, 20000, 25):
+            assert [m.span() for m in cc.EXTRACTION_RESPONSE_PATTERN.finditer(text)] == [
+                m.span() for m in old_response.finditer(text)
+            ], repr(text)
+            assert [m.span() for m in cc.EFFORT_FOOTER_LINE_PATTERN.finditer(text)] == [
+                m.span() for m in old_footer.finditer(text)
+            ], repr(text)
