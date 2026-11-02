@@ -793,7 +793,8 @@ class TestTheReleaseJobCannotTagAVersionPublishWouldRefuse:
     def test_the_publish_check_runs_after_the_bump_and_before_anything_is_tagged(self):
         check = self._index(lambda s: "assert_release_version.py" in s.get("run", ""))
         bump = self._index(lambda s: "bump_version.py" in s.get("run", ""))
-        tag = self._index(lambda s: "git tag" in s.get("run", ""))
+        # The commit, the tag and the push all happen in scripts/release_commit.py.
+        tag = self._index(lambda s: "release_commit.py" in s.get("run", ""))
         assert bump < check < tag
         run = self._steps()[check]["run"]
         assert '--tag "v$VERSION"' in run
@@ -801,14 +802,18 @@ class TestTheReleaseJobCannotTagAVersionPublishWouldRefuse:
         assert "${{" not in run
 
     def test_the_release_commit_carries_every_version_file(self):
-        (step,) = [s for s in self._steps() if "git add" in s.get("run", "")]
-        for path in (
+        spec = importlib.util.spec_from_file_location(
+            "release_commit", REPO_ROOT / "scripts" / "release_commit.py"
+        )
+        assert spec is not None and spec.loader is not None
+        release_commit = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(release_commit)
+        assert set(release_commit.RELEASE_FILES) == {
             "pyproject.toml",
             "uv.lock",
             "CHANGELOG.md",
             ".devcontainer/features/cao/devcontainer-feature.json",
-        ):
-            assert path in step["run"].split("git add", 1)[1].split("\n", 1)[0], path
+        }
 
     def test_uv_runs_locked_everywhere_else(self):
         assert str(_workflow()["env"]["UV_LOCKED"]) == "1"

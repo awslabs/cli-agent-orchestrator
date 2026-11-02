@@ -132,14 +132,14 @@ jobs:
           python scripts/assert_release_version.py --tag "v$VERSION"
           --index https://test.pypi.org --index https://pypi.org
 
-      - name: Commit and tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml uv.lock CHANGELOG.md .devcontainer/features/cao/devcontainer-feature.json
-          git commit -m "chore: release v${{ steps.bump.outputs.version }}"
-          git tag "v${{ steps.bump.outputs.version }}"
-          git push && git push --tags
+      # One atomic push of the release commit to main AND its tag (review on #652, N2):
+      # `git push && git push --tags` could land the bump untagged, and the next schedule
+      # would then bump past the version that never got its tag. The script also refuses
+      # a commit carrying anything but the version files.
+      - name: Commit, tag and push atomically
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: python scripts/release_commit.py --version "$VERSION"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3

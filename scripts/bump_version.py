@@ -182,7 +182,7 @@ def main() -> None:
     )
     print(f"  2. git commit -m 'chore: release v{new}'")
     print(f"  3. git tag v{new}")
-    print("  4. git push && git push --tags")
+    print(f"  4. git push --atomic origin HEAD:main v{new}  (both refs or neither)")
 
 
 if __name__ == "__main__":
