@@ -87,6 +87,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -146,3 +148,59 @@ jobs:
         with:
           tag_name: v${{ steps.bump.outputs.version }}
           generate_release_notes: true
+
+      # A GitHub Release created with GITHUB_TOKEN does not emit `on: release`, so it does
+      # not start publish-to-pypi.yml. On a schedule, `start-publish` below dispatches it. A
+      # manual run leaves that to the maintainer, who is then the run's actor: the `pypi`
+      # environment's prevent_self_review keeps them from approving their own release, as
+      # it does when they create a GitHub Release by hand.
+      - name: Say how this release reaches PyPI
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          {
+            echo "## v$VERSION is tagged and has a GitHub Release"
+            echo
+            echo "To publish it: Actions -> Publish to PyPI -> Run workflow, use workflow from"
+            echo "tag \`v$VERSION\`, environment \`release\` (TestPyPI, smoke test, then the"
+            echo "maintainer-approved PyPI upload). Another maintainer approves the PyPI step."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Review on #652, N1: the scheduled path could never reach PyPI, because a GitHub Release
+  # created with GITHUB_TOKEN does not trigger `on: release` workflows; week 2 then failed
+  # its own prior-release check forever. A workflow_dispatch IS the documented exception:
+  # GITHUB_TOKEN may start one. So the schedule dispatches publish-to-pypi.yml's `release`
+  # mode on the tag it just pushed, which runs the release-event chain unchanged: verify,
+  # build, TestPyPI, smoke test, then the `pypi` environment's required reviewers. No new
+  # secret, no OIDC or environment change, and the trusted publisher is still
+  # publish-to-pypi.yml. This job holds only `actions: write`, checks nothing out and runs
+  # no third-party action.
+  start-publish:
+    needs: release
+    if: >-
+      github.repository == 'awslabs/cli-agent-orchestrator' &&
+      github.event_name == 'schedule' &&
+      needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the publish chain on the new tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the release job reported no MAJOR.MINOR.PATCH version ('$VERSION')"
+            exit 1
+          fi
+          gh workflow run publish-to-pypi.yml --repo "$GITHUB_REPOSITORY" \
+            --ref "v$VERSION" -f environment=release
+          {
+            echo "## Publishing v$VERSION"
+            echo
+            echo "Dispatched Publish to PyPI (\`release\`) on tag \`v$VERSION\`: TestPyPI, smoke"
+            echo "test, then the PyPI upload waits for a maintainer in the \`pypi\` environment."
+          } >> "$GITHUB_STEP_SUMMARY"
