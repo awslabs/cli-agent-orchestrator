@@ -25,6 +25,13 @@ on:
 permissions:
   contents: read
 
+env:
+  # As in every workflow that runs uv: nothing may silently rewrite uv.lock. The bump is
+  # the one step MEANT to change it, so scripts/bump_version.py lifts the flag for its
+  # single `uv lock`, refuses any change beyond the project's own version line, and
+  # re-checks the result with `uv lock --locked`.
+  UV_LOCKED: "1"
+
 # Never cancel an in-flight release; queue manual and scheduled releases.
 concurrency:
   group: release
@@ -96,6 +103,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      # The same uv CI uses, so the lock it re-writes is the one CI already accepts.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+
+      # Bumps pyproject.toml, uv.lock and the devcontainer feature together, then the
+      # changelog. publish-to-pypi.yml refuses a tag unless all three agree; release.yml
+      # used to skip uv.lock, which is why 2.5.3 and 2.5.4 were bumped by hand (#899, #946).
       - name: Bump version and generate changelog
         id: bump
         env:
@@ -107,11 +121,22 @@ jobs:
           VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      # The check publish-to-pypi.yml's verify-release-version runs on the tag, run here
+      # BEFORE anything is committed, tagged or pushed: a tree that job would refuse must
+      # never become a tag and a GitHub Release. It also refuses a version either index
+      # already serves.
+      - name: Refuse a version the publish workflow would refuse
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: >-
+          python scripts/assert_release_version.py --tag "v$VERSION"
+          --index https://test.pypi.org --index https://pypi.org
+
       - name: Commit and tag
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml CHANGELOG.md .devcontainer/features/cao/devcontainer-feature.json
+          git add pyproject.toml uv.lock CHANGELOG.md .devcontainer/features/cao/devcontainer-feature.json
           git commit -m "chore: release v${{ steps.bump.outputs.version }}"
           git tag "v${{ steps.bump.outputs.version }}"
           git push && git push --tags

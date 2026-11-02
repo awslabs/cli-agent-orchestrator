@@ -773,3 +773,42 @@ class TestReleaseWorkflow:
         job = _workflow()["jobs"]["release"]
         assert job["needs"] == "preflight"
         assert "needs.preflight.outputs.should_release == 'true'" in job["if"]
+
+
+class TestTheReleaseJobCannotTagAVersionPublishWouldRefuse:
+    """`verify-release-version` refuses a tag whose tree disagrees; the release job must not
+    be able to produce one. 2.5.3 and 2.5.4 went out by hand because it could (#899, #946)."""
+
+    def _steps(self) -> List[Dict[str, Any]]:
+        return _workflow()["jobs"]["release"]["steps"]
+
+    def _index(self, predicate) -> int:
+        return next(i for i, s in enumerate(self._steps()) if predicate(s))
+
+    def test_uv_is_set_up_before_the_bump(self):
+        uv = self._index(lambda s: "astral-sh/setup-uv@" in s.get("uses", ""))
+        bump = self._index(lambda s: "bump_version.py" in s.get("run", ""))
+        assert uv < bump
+
+    def test_the_publish_check_runs_after_the_bump_and_before_anything_is_tagged(self):
+        check = self._index(lambda s: "assert_release_version.py" in s.get("run", ""))
+        bump = self._index(lambda s: "bump_version.py" in s.get("run", ""))
+        tag = self._index(lambda s: "git tag" in s.get("run", ""))
+        assert bump < check < tag
+        run = self._steps()[check]["run"]
+        assert '--tag "v$VERSION"' in run
+        assert "--index https://test.pypi.org --index https://pypi.org" in run
+        assert "${{" not in run
+
+    def test_the_release_commit_carries_every_version_file(self):
+        (step,) = [s for s in self._steps() if "git add" in s.get("run", "")]
+        for path in (
+            "pyproject.toml",
+            "uv.lock",
+            "CHANGELOG.md",
+            ".devcontainer/features/cao/devcontainer-feature.json",
+        ):
+            assert path in step["run"].split("git add", 1)[1].split("\n", 1)[0], path
+
+    def test_uv_runs_locked_everywhere_else(self):
+        assert str(_workflow()["env"]["UV_LOCKED"]) == "1"
