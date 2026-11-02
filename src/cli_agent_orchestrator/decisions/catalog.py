@@ -306,12 +306,12 @@ def check(
         if reached:
             lines.append(("ok", f"{provider}: {', '.join(reached)} declared and reachable"))
         for tier in TIERS:
-            model = table.get(tier)
-            if model is not None and model not in declared:
+            mapped = table.get(tier)
+            if mapped is not None and mapped not in declared:
                 lines.append(
                     (
                         "note",
-                        f"{provider}/{tier} maps {model}, which has no declaration, so it "
+                        f"{provider}/{tier} maps {mapped}, which has no declaration, so it "
                         "covers nothing",
                     )
                 )

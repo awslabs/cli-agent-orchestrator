@@ -25,8 +25,11 @@ from typing import Any, Mapping
 from cli_agent_orchestrator.decisions.catalog import COSTS, MatchCatalog, ModelFacts
 from cli_agent_orchestrator.decisions.types import ROUTING_FEATURES
 from cli_agent_orchestrator.services.model_tiers import TIERS
-from cli_agent_orchestrator.utils.ephemeral_capabilities import ADVISORY
+from cli_agent_orchestrator.utils.ephemeral_capabilities import ADVISORY, enforcement_label
 
+# The reserved answerer name for provider.route, never resolved through the registry.
+MATCH_DECIDER = "match"
+MATCH_DECIDER_VERSION = "match-1"
 MATCH_RULES = ("none_needed", "covered", "no_cover", "no_features", "catalog_invalid", "rejected")
 TIEBREAKS = ("only", "cost", "tier", "fallback", "order")
 
@@ -40,12 +43,14 @@ class MatchInputs:
     labels: Mapping[str, str]
     fallback: str
     # The band: tiers in order, from max(size, floor) to the ceiling, or the launch's one tier.
-    tiers: tuple[str, ...]
+    tiers: tuple[str | None, ...]
     # The tier the launch runs without a match: the size answer, or the launch's tier.
-    size: str
+    size: str | None
     needs: tuple[str, ...]
     model_tiers: Mapping[str, Mapping[str, str]]
     catalog: MatchCatalog
+    # False when the decider gave no usable feature reply at all: the rule is no_features.
+    answered: bool = True
 
 
 @dataclass(frozen=True)
@@ -63,7 +68,7 @@ class MatchResult:
     needs: tuple[str, ...]
     # What the launch runs: the pick when the rule is covered, otherwise the default.
     provider: str
-    tier: str
+    tier: str | None
     covered: tuple[str, ...] = ()
     tiebreak: str | None = None
     candidates: tuple[Candidate, ...] = field(default=(), compare=False)
@@ -87,14 +92,14 @@ def routing_needs(yes: frozenset[str] | set[str], catalog: MatchCatalog) -> tupl
 
 
 def band(
-    size: str, floor: str | None, ceiling: str | None, *, raise_allowed: bool
-) -> tuple[str, ...]:
+    size: str | None, floor: str | None, ceiling: str | None, *, raise_allowed: bool
+) -> tuple[str | None, ...]:
     """The tiers a match may choose from.
 
     With a raise allowed (an on-mode size answer), from max(size, floor) up to the ceiling;
     otherwise, or with no ceiling, only the size itself. Never below the size.
     """
-    if not raise_allowed or ceiling is None or size not in TIERS or ceiling not in TIERS:
+    if size is None or size not in TIERS or not raise_allowed or ceiling not in TIERS:
         return (size,)
     start = max(TIERS.index(size), TIERS.index(floor) if floor in TIERS else 0)
     end = TIERS.index(ceiling)
@@ -115,6 +120,8 @@ def candidates(inputs: MatchInputs) -> tuple[Candidate, ...]:
     for provider in inputs.options:
         table = inputs.model_tiers.get(provider, {})
         for tier in inputs.tiers:
+            if tier is None:
+                continue
             model = table.get(tier)
             if not model:
                 continue
@@ -134,6 +141,8 @@ def match(inputs: MatchInputs) -> MatchResult:
     """Pick a (CLI, tier) for the needs, or say why the launch runs its default."""
     if not inputs.catalog.valid:
         return _default("catalog_invalid", inputs, ())
+    if not inputs.answered:
+        return _default("no_features", inputs, ())
     needs = inputs.needs
     if not needs:
         return _default("none_needed", inputs, needs)
@@ -198,3 +207,70 @@ def explain_rows(result: MatchResult, inputs: MatchInputs) -> list[dict[str, Any
         }
         for c in result.candidates
     ]
+
+
+def match_launch(
+    settings: Any,
+    options: tuple[str, ...],
+    labels: Mapping[str, str] | None,
+    fallback: str,
+    tiers: tuple[str | None, ...],
+    size: str | None,
+    yes: frozenset[str] | None,
+) -> MatchResult:
+    """One launch's match from its DecisionSettings snapshot, the only catalog it reads.
+
+    ``labels`` defaults to the capability table's, for a match on one CLI. ``yes`` is the
+    features answered a usable yes, or None when the decider gave no usable reply.
+    """
+    catalog: MatchCatalog = settings.match_catalog
+    return match(
+        MatchInputs(
+            options=options,
+            labels=(
+                labels
+                if labels is not None
+                else {provider: enforcement_label(provider) for provider in options}
+            ),
+            fallback=fallback,
+            tiers=tiers,
+            size=size,
+            needs=routing_needs(yes, catalog) if yes is not None else (),
+            model_tiers=settings.model_tiers,
+            catalog=catalog,
+            answered=yes is not None,
+        )
+    )
+
+
+def match_none(settings: Any, fallback: str, rule: str) -> MatchResult:
+    """A match that never ran (no_features), unless the catalog is invalid, which says so."""
+    catalog: MatchCatalog = settings.match_catalog
+    return MatchResult("catalog_invalid" if not catalog.valid else rule, (), fallback, None)
+
+
+def match_decider() -> dict[str, str]:
+    """The decider columns of a provider.route row answered by the matcher."""
+    return {"decider": MATCH_DECIDER, "decider_version": MATCH_DECIDER_VERSION}
+
+
+def record_columns(
+    result: MatchResult, settings: Any, *, size: str | None = None, model_row: bool = False
+) -> dict[str, Any]:
+    """The match columns of one record: closed vocabularies, plus the catalog's text to hash.
+
+    The store hashes ``catalog_canonical`` under the records' key and never stores it.
+    """
+    catalog: MatchCatalog = settings.match_catalog
+    columns: dict[str, Any] = dict(
+        match_rule=result.rule,
+        match_needs=list(result.needs),
+        match_covered=list(result.covered),
+        match_tiebreak=result.tiebreak,
+        match_pick=result.pick_label(),
+        catalog_version=catalog.version,
+        catalog_canonical=catalog.canonical(),
+    )
+    if model_row:
+        columns["match_from"] = size
+    return columns

@@ -68,6 +68,8 @@ FEATURE_POINTS = (
     TASK_READ_ONLY.name,
     TASK_NEEDS_NETWORK.name,
 )
+# Each feature point's name in the closed feature vocabulary, as the records and matcher use it.
+FEATURE_NAMES = {point: point.removeprefix("task.") for point in FEATURE_POINTS}
 # The features the matcher may route on, in its fixed order of importance. needs_network is
 # advisory only: it adds a hint to the delegation note and never routes.
 ROUTING_FEATURES = ("long_context", "deep_reasoning", "read_only")
