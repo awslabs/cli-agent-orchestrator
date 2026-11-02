@@ -124,3 +124,36 @@ class TestTuiInitializing:
         # _COMPOSER_CHROME_RE splices TUI_INITIALIZING_PATTERN into a larger
         # alternation; the fix has to survive the splice.
         assert structural_issues(kiro_cli.KiroCliProvider._COMPOSER_CHROME_RE, "search") == []
+
+
+class TestNewTuiHeader:
+    """``_new_tui_header_pattern`` filters header rows out of extracted content."""
+
+    PROFILES = ("developer", "code_supervisor")
+
+    @staticmethod
+    def _old(profile: str) -> str:
+        return rf"{re.escape(profile)}\s+·\s+.*·\s+◔\s*\d+%"
+
+    @pytest.mark.parametrize("profile", PROFILES)
+    def test_current_form_is_clean_and_grows_linearly(self, profile):
+        new = kiro_cli.KiroCliProvider("t", "s", "w", profile)._new_tui_header_pattern
+        assert structural_issues(new, "search") == []
+        shapes = sorted(set(input_shapes(new)) | set(input_shapes(self._old(profile))))
+        assert nonlinear_shapes(pattern_probe(new, "search"), shapes) == []
+
+    @pytest.mark.parametrize("profile", PROFILES)
+    def test_old_form_is_flagged_and_grows_superlinearly(self, profile):
+        old = self._old(profile)
+        assert structural_issues(old, "search")
+        assert first_superlinear(pattern_probe(old, "search"), input_shapes(old))
+
+    @pytest.mark.parametrize("profile", PROFILES)
+    def test_rows_match_exactly_where_they_did(self, profile):
+        # Applied to one row at a time (rows come from split("\n")).
+        new = kiro_cli.KiroCliProvider("t", "s", "w", profile)._new_tui_header_pattern
+        tokens = [profile, profile[:3], " ", "\t", "\xa0", "\r", "·", "◔", "5%", "50", "%", "m"]
+        rng = random.Random(profile)
+        for _ in range(20000):
+            row = "".join(rng.choice(tokens) for _ in range(rng.randrange(0, 16)))
+            assert bool(re.search(new, row)) == bool(re.search(self._old(profile), row)), repr(row)

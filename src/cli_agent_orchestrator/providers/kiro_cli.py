@@ -334,8 +334,18 @@ class KiroCliProvider(BaseProvider):
         # The legacy "Allow this action? ... [y/n/t]:" prompt is found by
         # _legacy_permission_prompt_spans (a linear scan, not a regex).
 
-        # New TUI header pattern: "agent_name · model · ◔ N%"
-        self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
+        # New TUI header pattern: "agent_name · model · ◔ N%", applied to one
+        # row at a time. The attempt starts at the row start and skips to the
+        # FIRST "agent_name ·" on it: unanchored, the search restarted at every
+        # occurrence of the name and re-scanned the rest of the row from each,
+        # and ``\s+.*`` could split the blanks after "·" every way (CWE-1333).
+        # A later header on the row is reachable from the first, so a row
+        # matches exactly when it did; ``\s++`` is equivalent because ``.*``
+        # takes back any blanks it gave up.
+        agent = re.escape(self._agent_profile)
+        self._new_tui_header_pattern = (
+            rf"(?m)^(?:(?!{agent}\s+·\s)[^\n])*+{agent}\s+·\s++.*·\s+◔\s*\d+%"
+        )
 
     @property
     def paste_enter_count(self) -> int:
