@@ -117,6 +117,9 @@ EPHEMERAL_DEFAULTS = {
     "min_effort": None,
     "max_effort": None,
     "default_effort": None,
+    # #1099 (provisional): disjoint sets of providers a decider may route between; none by
+    # default, so nothing is asked until the operator declares one.
+    "provider_route": {"equivalent": []},
     # Lifecycle cleanup (#1079); every default here awaits maintainer confirmation.
     "max_live_per_session": 0,  # No cap; operators opt in.
     "launch_grace_seconds": 600,

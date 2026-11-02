@@ -23,12 +23,23 @@ assign or handoff from inside that step remains an ordinary delegation.
 | --- | --- | --- |
 | `model.route` | `small`, `medium`, `large` | Choose a model size |
 | `effort.route` | `low`, `medium`, `high` | Choose reasoning effort for an ephemeral `effort: "auto"` spec |
+| `provider.route` | CAO provider IDs, narrowed for each launch | Choose the CLI for an ephemeral `provider: "auto"` spec |
 
 Each point also accepts `unsure`. `off` asks nothing and writes no record.
 `shadow` records what the decider would choose without waiting for it or changing
 the launch model. `on` waits up to the configured timeout, then uses a confident
 answer or a deterministic fallback. An explicit caller value skips the decider.
 The installed profile model is a fallback and may be overridden in on mode.
+
+`provider.route` has no order, ceiling, floor or default. CAO computes its
+options for each launch, always including the fallback, and sends them as the
+request's `options`, with `facts.provider` set to the fallback. An answer outside
+them, even another known provider ID, falls back as `invalid_answer`. A launch
+with one option asks nothing and records `single_option`. Its fallback is the
+creator's provider (`fallback_source: creator`). It is asked before any other
+point of the same launch, and every ask of that launch shares one request and
+one `request_id`; the later points see the provider it resolved to in
+`facts.provider`, its tier table and whether it honors the model and effort.
 
 The fallback order is the installed profile default, the policy default, then
 the provider default. A required policy tier must map to a model; otherwise the
@@ -82,8 +93,8 @@ Settings are read fresh for each call, except the shadow limits
 `shadow.max_concurrent` and `shadow.max_pending`, which the server reads once at
 startup. Point-state precedence is:
 
-1. `CAO_DECISION_MODEL_ROUTE` and `CAO_DECISION_EFFORT_ROUTE` in the server's
-   environment. A repeatable `cao-server --decision model.route=shadow` flag sets
+1. `CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE` and `CAO_DECISION_PROVIDER_ROUTE`
+   in the server's environment. A repeatable `cao-server --decision model.route=shadow` flag sets
    the matching variable for that server process, replacing an inherited value.
 2. `decisions.points.<point>.state` in `settings.json`.
 3. `off`.
@@ -147,7 +158,9 @@ looks up profile first, then role, and returns probability 1.0; a miss gives no
 answer. It is a decider, never part of fallback resolution. A claimed ephemeral
 `effort: "auto"` launch reads the `effort.route` table this way too, but its
 request carries no profile or role fact, so a profile- or role-keyed entry never
-matches it; every other launch leaves those entries unread. Shadow defaults to
+matches it; every other launch leaves those entries unread. The same holds for
+`provider.route` entries: only a claimed ephemeral launch asks that point, so a
+table entry for it never matches and the table records `no_answer`. Shadow defaults to
 four concurrent and 64 pending tasks, with a 10000 ms decider timeout. These have
 no CLI setter; values in `settings.json` are clamped, with a warning, to 1–1024
 concurrent, 0–100000 pending and 50–60000 ms. Overflow is recorded as `shadow_dropped`;
@@ -194,6 +207,13 @@ launch in shadow or on. Records include `state`, `decider` and `decider_version`
 capped candidate (`candidate_value`, `candidate_model`), `applied_value`, `outcome`,
 `latency_ms`, `reason`, `terminal_id`, `launched_model` and whether it was honored
 (`model_honored`). They also hold `message_hash`, `hash_key_id` and `message_bytes`.
+A `provider.route` record also holds `options`, the launch's options as a JSON
+list, and the enforcement labels of the fallback (`fallback_enforcement`) and of
+the applied provider (`applied_enforcement`); these three columns are null on
+every other record. On a `provider.route` record, `provider` is the provider the
+launch runs on and `fallback_value` is the creator's; the same launch's
+`model.route` and `effort.route` records name the provider it runs on. The
+upgrade adds the three columns and does not backfill them.
 `cao decisions list` prints every column as JSON. `target_kind` is
 `installed`, `ephemeral` or `workflow`; `workflow` marks a script workflow's own
 step. Records written before the column existed keep `target_kind` null: the
@@ -291,7 +311,7 @@ reason warns again, at most once a minute for each decider, point and reason;
 a failure that is still there after that minute is warned about then. The next
 answer logs one `Decision decider recovered` line, if a warning was logged.
 `unsure`, `low_confidence` and `tier_unmapped` are answers, so they end a
-failure. `not_honored` never asks the decider and changes nothing.
+failure. `not_honored` and `single_option` never ask the decider and change nothing.
 
 These lines hold labels only: never the task message, description, purpose,
 profile, decider configuration or exception text. A decider name with
@@ -361,6 +381,13 @@ disclosure and key handling belong to the decider package. Core redacts messages
 descriptions and purposes before every call; redaction removes common credential
 shapes using patterns and is not a guarantee. Decision records hold no task content.
 Review the package's disclosure to learn exactly what it sends and where it sends it.
+
+The request also carries `options`. It is null except on a `provider.route`
+ask, so a decider that sends the whole request now sends one more `"options":
+null` key on model and effort asks. `CONTRACT_VERSION` is unchanged. A decider
+that declares every point, such as `frozenset(POINTS)`, is now also asked
+`provider.route` where that point is on; an answer outside the options falls
+back as `invalid_answer`.
 
 CAO asks a decider once per eligible delegation request, before the server's own launch checks. A
 request the server then refuses, for example because it exceeds the creator's delegation ceiling,
@@ -439,7 +466,7 @@ need an interactive terminal. CAO's own agent-facing tools offer no consent.
 - Terminal records expose the launched model and whether it was honored, independently of decision state; decision fields stay in operator records.
 - If a policy tightens between a launch and `create_terminal`'s own idempotent retry, the retry can be refused before replaying the existing terminal. This does not occur with an identity policy. Each replayed delegation create writes its own `not_launched` row; in shadow or on the decider is asked again.
 - A direct API delegation to a reserved ephemeral name without a claim, carrying a per-call model, is refused at the delegation site with HTTP 400 "set the tier in the spec instead of a per-call model". The response names no reason code and no decision record is written. The ephemeral launch policy never sees the request, so it does not log the refusal either. Assign and handoff refuse reserved names before sending any request. A claimed launch with a per-call model asks no decider and is refused, and logged, by the ephemeral policy itself.
-- A claimed ephemeral launch asks `model.route` only when its stored spec declared `model_tier: "auto"` (see [Ephemeral agents](ephemeral-agents.md#model-tier-auto)). Explicit and omitted tiers, and launches without a claim, ask nothing and write no record. The decided model applies through the launch plan only; the ephemeral archive stores the record ids. `effort.route` is asked the same way, only when the stored spec declared `effort: "auto"`, after `model.route` when both are declared; the decided effort applies through the launch plan only, like the decided model, and the live profile keeps the stored effort (see [Effort `auto`](ephemeral-agents.md#effort-auto)).
+- A claimed ephemeral launch asks `model.route` only when its stored spec declared `model_tier: "auto"` (see [Ephemeral agents](ephemeral-agents.md#model-tier-auto)). Explicit and omitted tiers, and launches without a claim, ask nothing and write no record. The decided model applies through the launch plan only; the ephemeral archive stores the record ids. `effort.route` is asked the same way, only when the stored spec declared `effort: "auto"`, after `model.route` when both are declared; the decided effort applies through the launch plan only, like the decided model, and the live profile keeps the stored effort (see [Effort `auto`](ephemeral-agents.md#effort-auto)). `provider.route` is asked only when the stored spec declared `provider: "auto"`, before every other point; the decided provider applies through the launch plan only, and the registry row and live profile keep the creator's provider (see [Provider `auto`](ephemeral-agents.md#provider-auto)).
 - A delegation is decided before the server applies the creator's delegation ceiling. A launch
   the ceiling refuses (403) has still been decided: in shadow or on, the decider was asked once
   with the redacted message, and in on mode the refusal waits for that answer. Its records are

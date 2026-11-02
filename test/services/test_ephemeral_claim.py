@@ -55,6 +55,7 @@ def test_claim_finalizes_identical_profile_and_shared_clock(claimed_store):
         provider="claude_code",
         effective_tools=["fs_read", "@cao-mcp-server"],
         replayed=False,
+        provider_auto=False,
     )
     row = database.get_ephemeral_agent(name)
     assert row["state"] == "claimed" and row["claim_expires_at"] == NOW + timedelta(seconds=60)

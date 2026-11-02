@@ -115,14 +115,16 @@ class PolicyBounds:
     # #1083 Q2 (provisional): an optional effort floor, following #1068's tier floor.
     min_effort: Effort | None = None
 
+    # Explicit per point: provider.route has no ceiling, floor or default (#1099), so
+    # validate skips it, cap leaves its answer alone and resolve_fallback names the creator.
     def ceiling_for(self, point: str) -> str | None:
-        return self.max_tier if point == "model.route" else self.max_effort
+        return {"model.route": self.max_tier, "effort.route": self.max_effort}.get(point)
 
     def floor_for(self, point: str) -> str | None:
-        return self.min_tier if point == "model.route" else self.min_effort
+        return {"model.route": self.min_tier, "effort.route": self.min_effort}.get(point)
 
     def default_for(self, point: str) -> str | None:
-        return self.default_tier if point == "model.route" else self.default_effort
+        return {"model.route": self.default_tier, "effort.route": self.default_effort}.get(point)
 
     def validate(self, model_tiers: ModelTiers) -> None:
         for point, spec in POINTS.items():
@@ -205,6 +207,9 @@ def resolve_fallback(
     tiers: Mapping[str, str],
     provider: str,
 ) -> Fallback | MissingTier:
+    if point == "provider.route":
+        # #1099 (provisional): v1 always falls back to the creator's provider.
+        return Fallback(provider, "creator")
     if point == "model.route" and profile is not None and profile.model:
         return Fallback(profile.model, "profile")
     default = policy.default_for(point)
