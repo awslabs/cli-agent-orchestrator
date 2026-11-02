@@ -471,11 +471,89 @@ class TestNoUnattendedMajor:
             assert decision.should_release and decision.bump == bump
 
 
+def dispatch(probe: Any, bump: str = "patch", ref: str = "refs/heads/main") -> Any:
+    return rp.decide("workflow_dispatch", SHA, probe, ref, bump)
+
+
 class TestManualDispatch:
-    def test_a_manual_dispatch_releases_without_asking_anything(self):
-        probe = FakeProbe()
-        decision = rp.decide("workflow_dispatch", SHA, probe)
-        assert decision.should_release and probe.asked == []
+    """Review on #652 (haofeif): `workflow_dispatch` used to bypass every gate.
+
+    `main` has no required status checks, so without this a person could cut a release from
+    a commit whose CI is red or still running. The checks that protect what ships are now
+    enforced on a dispatch too; the ones a person can judge are warnings.
+    """
+
+    @pytest.mark.parametrize("bump", ["patch", "minor", "major"])
+    def test_releases_the_chosen_bump_when_ci_is_green(self, bump):
+        probe = FakeProbe(history=[commit("fix: x")])
+        decision = dispatch(probe, bump)
+        assert decision.should_release and decision.bump == bump
+        assert "ci ci.yml" in probe.asked
+
+    @pytest.mark.parametrize("state", ["missing", "in_progress:none", "completed:failure"])
+    def test_red_or_pending_ci_refuses_a_dispatch_too(self, state):
+        decision = dispatch(FakeProbe(ci=state))
+        assert decision.refused and not decision.should_release
+        assert decision.problems == [f"ci.yml is '{state}' at {SHA}; refusing to release"]
+
+    @pytest.mark.parametrize("bump", ["", "huge", "Major"])
+    def test_a_bump_outside_the_three_choices_refuses(self, bump):
+        decision = dispatch(FakeProbe(), bump)
+        assert decision.refused
+        assert "the bump must be one of patch, minor, major" in decision.problems[0]
+
+    def test_an_incomplete_previous_release_is_a_warning_not_a_refusal(self):
+        decision = dispatch(FakeProbe(release="draft", on_pypi=False))
+        assert decision.should_release and not decision.refused
+        assert len(decision.warnings) == 2
+        assert "v2.5.4 is not a published GitHub Release" in decision.warnings[0]
+
+    def test_a_bump_that_differs_from_the_derived_one_is_a_warning(self):
+        probe = FakeProbe(history=[commit("feat!: drop a flag")])
+        decision = dispatch(probe, "patch")
+        assert decision.should_release and decision.bump == "patch"
+        assert decision.warnings == [
+            "the commits since v2.5.4 call for a major bump; this " "dispatch chose patch"
+        ]
+
+    def test_a_major_can_be_cut_by_hand(self):
+        probe = FakeProbe(history=[commit("feat!: drop a flag")])
+        decision = dispatch(probe, "major")
+        assert decision.should_release and decision.bump == "major" and not decision.warnings
+
+    def test_an_unclear_marker_is_a_warning_on_a_dispatch(self):
+        probe = FakeProbe(history=[commit(SQUASHED_BANG)])
+        decision = dispatch(probe, "minor")
+        assert decision.should_release
+        assert any("outside a subject or footer" in w for w in decision.warnings)
+
+    def test_an_empty_window_is_a_warning_on_a_dispatch(self):
+        decision = dispatch(FakeProbe(history=[]))
+        assert decision.should_release and decision.count == 0
+        assert "no commits since v2.5.4" in decision.warnings[0]
+
+    def test_no_previous_tag_still_enforces_ci(self):
+        decision = dispatch(FakeProbe(tags=[], ci="completed:failure"))
+        assert decision.refused
+        assert "no stable" in decision.warnings[0]
+
+
+class TestReleasesComeFromMain:
+    @pytest.mark.parametrize("ref", ["refs/heads/feature", "refs/tags/v2.5.4", "refs/heads/v9.9.9"])
+    @pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
+    def test_any_other_ref_refuses(self, event, ref):
+        decision = rp.decide(event, SHA, FakeProbe(history=[commit("fix: x")]), ref, "patch")
+        assert decision.refused and not decision.should_release
+        assert f"releases are cut from refs/heads/main only; this run is on '{ref}'" in (
+            decision.problems
+        )
+
+    @pytest.mark.parametrize("event", ["push", "release", ""])
+    def test_an_event_the_workflow_does_not_declare_refuses(self, event):
+        decision = rp.decide(event, SHA, FakeProbe())
+        assert decision.refused and "runs on schedule or workflow_dispatch only" in (
+            decision.problems[0]
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -568,7 +646,7 @@ def _run_main(tmp_path: Path, monkeypatch, argv: List[str], probe: Any):
     return code, dict(line.split("=", 1) for line in lines), lines, summ.read_text("utf-8")
 
 
-BASE_ARGS = ["--sha", SHA, "--repo", "owner/name"]
+BASE_ARGS = ["--sha", SHA, "--repo", "owner/name", "--ref", "refs/heads/main"]
 
 
 class TestCommandLine:
@@ -605,9 +683,36 @@ class TestCommandLine:
         assert "Skipped" in report
 
     def test_a_short_sha_is_a_usage_error(self):
+        argv = [
+            "--event",
+            "schedule",
+            "--sha",
+            "abc123",
+            "--repo",
+            "o/n",
+            "--ref",
+            "refs/heads/main",
+        ]
         with pytest.raises(SystemExit) as exc:
-            rp.main(["--event", "schedule", "--sha", "abc123", "--repo", "o/n"], probe=FakeProbe())
+            rp.main(argv, probe=FakeProbe())
         assert exc.value.code == 2
+
+    def test_the_ref_is_required(self):
+        with pytest.raises(SystemExit) as exc:
+            rp.main(["--event", "schedule", "--sha", SHA, "--repo", "o/n"], probe=FakeProbe())
+        assert exc.value.code == 2
+
+    def test_a_dispatch_outputs_the_chosen_bump(self, tmp_path, monkeypatch):
+        argv = ["--event", "workflow_dispatch", *BASE_ARGS, "--requested-bump", "major"]
+        code, values, _, report = _run_main(tmp_path, monkeypatch, argv, FakeProbe())
+        assert code == 0
+        assert values == {
+            "bump": "major",
+            "count": "1",
+            "last_tag": "v2.5.4",
+            "should_release": "true",
+        }
+        assert "chosen by the dispatch" in report
 
 
 # --------------------------------------------------------------------------------------
@@ -643,8 +748,22 @@ class TestReleaseWorkflow:
         steps = _workflow()["jobs"]["preflight"]["steps"]
         (step,) = [s for s in steps if "release_preflight.py" in s.get("run", "")]
         assert "${{" not in step["run"]
-        for flag in ('--event "$GITHUB_EVENT_NAME"', '--sha "$GITHUB_SHA"'):
+        for flag in (
+            '--event "$GITHUB_EVENT_NAME"',
+            '--ref "$GITHUB_REF"',
+            '--sha "$GITHUB_SHA"',
+            '--requested-bump "$REQUESTED_BUMP"',
+        ):
             assert flag in step["run"]
+        assert step["env"]["REQUESTED_BUMP"] == "${{ inputs.bump }}"
+
+    def test_the_bump_comes_from_the_preflight_for_both_events(self):
+        """The dispatch input is validated by the preflight, then read from its output."""
+        steps = _workflow()["jobs"]["release"]["steps"]
+        (step,) = [s for s in steps if "bump_version.py" in s.get("run", "")]
+        assert step["env"]["BUMP"] == "${{ needs.preflight.outputs.bump }}"
+        assert 'bump_version.py "$BUMP"' in step["run"]
+        assert "inputs.bump" not in step["run"]
 
     def test_the_preflight_job_cannot_write(self):
         permissions = _workflow()["jobs"]["preflight"]["permissions"]

@@ -13,8 +13,9 @@ version. It used to be ~90 lines of shell inside the workflow, where nothing cou
 the reviews on PR #652 found its bugs by replaying it by hand against ``main``. Here every
 decision is a function with fixtures in ``test/scripts/test_release_preflight.py``.
 
-WHAT A SCHEDULED RUN CHECKS (a manual dispatch skips all of it)
----------------------------------------------------------------
+WHAT A SCHEDULED RUN CHECKS
+---------------------------
+0. The run is on ``refs/heads/main``. Releases are cut from the trunk only.
 1. The newest stable ``vMAJOR.MINOR.PATCH`` tag reachable from the release SHA is the
    previous release. No such tag is a refusal. Other tags (``v2.6.0rc1``, benchmark tags)
    are ignored, matching ``cliff.toml``'s ``tag_pattern``.
@@ -33,6 +34,14 @@ WHAT A SCHEDULED RUN CHECKS (a manual dispatch skips all of it)
    required reviewers), so the run goes red, lists the breaking commits, and leaves the
    major to a maintainer: run Release by hand with ``bump=major``. Capping it to ``minor``
    was rejected: shipping breaking changes under a minor breaks everyone pinned ``<3``.
+
+WHAT A MANUAL DISPATCH CHECKS (review on #652: it used to skip everything)
+--------------------------------------------------------------------------
+A person chose the bump, and may be deliberately superseding a broken release, so only the
+checks that protect what ships are enforced: the run is on ``main``, the bump is one of
+``patch``/``minor``/``major``, and ``ci.yml`` is green at the exact SHA (``main`` has no
+required status checks of its own). The previous-release check, an empty window, and a
+derived bump that differs from the chosen one are WARNINGS in the summary.
 
 Every failed check is reported, not just the first, and any failure exits 1 so the run is
 red. Exit 0 means the outputs say what to do (release, or skip an empty week).
@@ -55,6 +64,8 @@ from typing import Callable, List, Optional, Protocol, Sequence
 PACKAGE = "cli-agent-orchestrator"
 PYPI = "https://pypi.org"
 BUMPS = ("patch", "minor", "major")
+MAIN_REF = "refs/heads/main"
+EVENTS = ("schedule", "workflow_dispatch")
 
 #: Maintained allow-list of release-blocking workflows. Add a workflow file here only when
 #: release policy requires it; ``ci.yml`` is the one that runs on every push to ``main``.
@@ -256,32 +267,74 @@ def _check_ci(probe: Probe, sha: str) -> List[str]:
     return problems
 
 
-def decide(event: str, sha: str, probe: Probe) -> Decision:
-    if event != "schedule":
-        return Decision(should_release=True, bump="patch", notes=["manual dispatch"])
-
-    tag = latest_stable_tag(probe.stable_tags(sha))
-    if tag is None:
+def decide(
+    event: str,
+    sha: str,
+    probe: Probe,
+    ref: str = MAIN_REF,
+    requested_bump: str = "",
+) -> Decision:
+    if event not in EVENTS:
         return Decision(
             should_release=False,
             bump="patch",
-            problems=[f"no stable v<major>.<minor>.<patch> tag is reachable from {sha}"],
+            problems=[f"release.yml runs on {' or '.join(EVENTS)} only, not {event!r}"],
         )
+    manual = event == "workflow_dispatch"
+    decision = Decision(should_release=False, bump="patch")
+    if ref != MAIN_REF:
+        decision.problems.append(f"releases are cut from {MAIN_REF} only; this run is on {ref!r}")
+    if manual:
+        if requested_bump in BUMPS:
+            decision.bump = requested_bump
+        else:
+            decision.problems.append(
+                f"the bump must be one of {', '.join(BUMPS)}, not {requested_bump!r}"
+            )
 
-    commits = probe.commits(tag, sha)
-    decision = Decision(should_release=False, bump="patch", last_tag=tag, count=len(commits))
-    if not commits:
-        decision.notes.append(f"no commits since {tag}; skipping this scheduled release")
+    tag = latest_stable_tag(probe.stable_tags(sha))
+    if tag is None:
+        missing = f"no stable v<major>.<minor>.<patch> tag is reachable from {sha}"
+        if not manual:
+            decision.problems.append(missing)
+            return decision
+        decision.warnings.append(missing)
+        decision.problems.extend(_check_ci(probe, sha))
+        decision.should_release = not decision.refused
         return decision
 
-    decision.derivation = derive_bump(commits)
-    decision.bump = decision.derivation.bump
-    decision.problems.extend(_check_prior_release(probe, tag))
-    decision.problems.extend(_check_ci(probe, sha))
-    if decision.bump == "major":
-        decision.problems.append(major_refusal(tag, decision.derivation))
-    if decision.derivation.unclear:
-        decision.problems.append(unclear_refusal(decision.derivation))
+    commits = probe.commits(tag, sha)
+    decision.last_tag, decision.count = tag, len(commits)
+    if not commits and not manual:
+        decision.notes.append(f"no commits since {tag}; skipping this scheduled release")
+        return decision
+    if not commits:
+        decision.warnings.append(f"no commits since {tag}; this repeats its tree as a new version")
+
+    derivation = derive_bump(commits)
+    decision.derivation = derivation
+    prior = _check_prior_release(probe, tag)
+    ci = _check_ci(probe, sha)
+    if manual:
+        decision.problems.extend(ci)
+        decision.warnings.extend(prior)
+        if requested_bump in BUMPS and derivation.bump != requested_bump:
+            decision.warnings.append(
+                f"the commits since {tag} call for a {derivation.bump} bump; "
+                f"this dispatch chose {requested_bump}"
+            )
+        if derivation.unclear:
+            decision.warnings.append(
+                "breaking-change markers outside a subject or footer; see the list below"
+            )
+    else:
+        decision.bump = derivation.bump
+        decision.problems.extend(prior)
+        decision.problems.extend(ci)
+        if decision.bump == "major":
+            decision.problems.append(major_refusal(tag, derivation))
+        if derivation.unclear:
+            decision.problems.append(unclear_refusal(derivation))
     decision.should_release = not decision.refused
     return decision
 
@@ -418,17 +471,16 @@ class LiveProbe:
 # --------------------------------------------------------------------------------------
 
 
-def outputs(decision: Decision, event: str) -> dict[str, str]:
-    manual = event != "schedule"
+def outputs(decision: Decision) -> dict[str, str]:
     values = {
         "bump": decision.bump,
-        "count": "manual" if manual else str(decision.count if decision.count is not None else 0),
-        "last_tag": "manual" if manual else decision.last_tag,
+        "count": str(decision.count if decision.count is not None else 0),
+        "last_tag": decision.last_tag,
         "should_release": "true" if decision.should_release and not decision.refused else "false",
     }
     assert values["bump"] in BUMPS
-    assert values["count"] == "manual" or values["count"].isdigit()
-    assert values["last_tag"] in ("manual", "") or STABLE_TAG.match(values["last_tag"])
+    assert values["count"].isdigit()
+    assert values["last_tag"] == "" or STABLE_TAG.match(values["last_tag"])
     return values
 
 
@@ -437,7 +489,8 @@ def summary(decision: Decision, event: str, sha: str) -> str:
     if decision.refused:
         lines.append("**Refused.** Nothing was bumped, tagged or published.")
     elif decision.should_release:
-        lines.append(f"**Releasing** with a `{decision.bump}` bump.")
+        chosen = "chosen by the dispatch" if event == "workflow_dispatch" else "derived"
+        lines.append(f"**Releasing** with a `{decision.bump}` bump ({chosen}).")
     else:
         lines.append("**Skipped.** Nothing to release.")
     if decision.last_tag:
@@ -478,6 +531,10 @@ def main(argv: Optional[Sequence[str]] = None, probe: Optional[Probe] = None) ->
     parser.add_argument("--event", required=True, help="GITHUB_EVENT_NAME")
     parser.add_argument("--sha", required=True, help="GITHUB_SHA, the commit being released")
     parser.add_argument("--repo", required=True, help="GITHUB_REPOSITORY, owner/name")
+    parser.add_argument("--ref", required=True, help="GITHUB_REF; releases come from main")
+    parser.add_argument(
+        "--requested-bump", default="", help="inputs.bump on a manual dispatch (else empty)"
+    )
     parser.add_argument("--repo-root", type=Path, default=Path.cwd(), help="the git checkout")
     parser.add_argument("--pypi", default=PYPI, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -486,9 +543,9 @@ def main(argv: Optional[Sequence[str]] = None, probe: Optional[Probe] = None) ->
         parser.error(f"--sha must be a full 40-character commit SHA, got {args.sha!r}")
 
     live = probe or LiveProbe(repo=args.repo, repo_root=args.repo_root, pypi=args.pypi)
-    decision = decide(args.event, args.sha, live)
+    decision = decide(args.event, args.sha, live, args.ref, args.requested_bump)
 
-    values = outputs(decision, args.event)
+    values = outputs(decision)
     _append("GITHUB_OUTPUT", "".join(f"{k}={v}\n" for k, v in values.items()))
     report = summary(decision, args.event, args.sha)
     _append("GITHUB_STEP_SUMMARY", report)

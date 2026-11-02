@@ -55,15 +55,22 @@ jobs:
       # test/scripts/test_release_preflight.py can exercise every decision. It only
       # reads: git history, the GitHub Release and CI state (gh), and PyPI. Inputs come
       # from the environment, never `${{ }}` inside `run:`.
-      - name: Evaluate scheduled release policy
+      #
+      # Both events are gated: a manual dispatch must also be on main with ci.yml green
+      # at the exact SHA (main has no required status checks of its own). On a schedule
+      # the script derives the bump; on a dispatch it validates the one chosen.
+      - name: Evaluate release policy
         id: policy
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_BUMP: ${{ inputs.bump }}
         run: >-
           python scripts/release_preflight.py
           --event "$GITHUB_EVENT_NAME"
+          --ref "$GITHUB_REF"
           --sha "$GITHUB_SHA"
           --repo "$GITHUB_REPOSITORY"
+          --requested-bump "$REQUESTED_BUMP"
 
   release:
     needs: preflight
@@ -93,8 +100,10 @@ jobs:
         id: bump
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Validated by the preflight for both events: one of patch, minor, major.
+          BUMP: ${{ needs.preflight.outputs.bump }}
         run: |
-          python scripts/bump_version.py ${{ inputs.bump || needs.preflight.outputs.bump }}
+          python scripts/bump_version.py "$BUMP"
           VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
