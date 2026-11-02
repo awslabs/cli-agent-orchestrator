@@ -93,8 +93,10 @@ After kiro-cli starts, and before any task is typed:
   types `/mcp` and reads it until no server is still loading: exactly the
   configured MCP servers must be running, each with a tool. Only then does it
   type `/tools`, so a server's tools are on that panel when it is read: every
-  tool tag must be one that grant implies, and every MCP tool must be one the
-  grant names (`@server`, or `@server/tool` for a single tool).
+  tool tag must be one that the grant's tools carry, and every MCP tool must be
+  one the grant names (`@server`, or `@server/tool` for a single tool). The
+  tags come from the pinned engine schema: `fs_write` gives the `code` tool,
+  which carries `read` as well as `write`, so a write-only grant shows both.
 
 Only then does the terminal accept input. If any check fails, no task is typed
 and the window is closed.

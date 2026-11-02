@@ -7,7 +7,9 @@ table gives its verdict here; v2's panels and the slash palette refuse.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -21,6 +23,7 @@ from cli_agent_orchestrator.providers.kiro_attest import (
     parse_mcp_panel,
     parse_tools_panel,
 )
+from cli_agent_orchestrator.providers.kiro_v3_schema import KAS_0_66_70
 
 FIXTURES = Path(__file__).parent / "fixtures"
 READ_ONLY_MCP = ["fs_read", "fs_list", "@cao-mcp-server"]
@@ -137,16 +140,51 @@ def test_a_missing_expected_server_refuses():
     [
         (READ_ONLY_MCP, {"read"}),
         (["@cao-mcp-server"], {"read"}),
-        (["fs_write"], {"write"}),
+        # ``code`` comes with fs_write and carries read as well as write.
+        (["fs_write"], {"read", "write"}),
+        (["fs_write", "execute_bash"], {"read", "write", "shell", "subagent"}),
         (["fs_*"], {"read", "write"}),
         (["execute_bash"], {"shell", "subagent"}),
         (["web_fetch"], {"web"}),
-        (["@builtin"], set()),
+        # ``introspect`` carries read.
+        (["@builtin"], {"read"}),
         ([], set()),
     ],
 )
 def test_granted_tags(grant, tags):
+    """The tags of the grant's exact v3 tools, read from the pinned schema
+    (maintainer review on #1179)."""
     assert granted_tags(grant) == tags
+
+
+def _schema(engine, **changed):
+    tags = {tag: frozenset(ids) for tag, ids in KAS_0_66_70.tags.items()}
+    tags.update({tag: frozenset(ids) for tag, ids in changed.items()})
+    return replace(KAS_0_66_70, engine=engine, tags=MappingProxyType(tags))
+
+
+def test_granted_tags_follow_the_schema_not_a_second_table():
+    plain_read = KAS_0_66_70.tags["read"] - {"code", "introspect"}
+    schema = _schema("kas-test-plain-read", read=plain_read)
+    assert granted_tags(["fs_write"], [schema]) == {"write"}
+    assert granted_tags(["@builtin"], [schema]) == set()
+    assert granted_tags(["fs_read"], [schema]) == {"read"}
+
+
+def test_engines_that_disagree_allow_only_the_tags_every_one_implies():
+    plain_read = _schema("kas-test-plain-read", read=KAS_0_66_70.tags["read"] - {"code"})
+    assert granted_tags(["fs_write"], [KAS_0_66_70, plain_read]) == {"write"}
+    assert granted_tags(["fs_write"], [KAS_0_66_70]) == {"read", "write"}
+
+
+def test_a_write_grant_without_a_read_atom_passes_the_read_tag_code_brings():
+    """Measured: a file whose tools bring ``code`` shows its read and write tags."""
+    panel = parse_tools_panel(_screen("tools_read_tag_write"))
+    assert panel.tags == {"read", "write"}
+    check_tools_panel(panel, ["fs_write", "execute_bash"])
+    with pytest.raises(KiroAttestationError) as excinfo:
+        check_tools_panel(panel, ["execute_bash"])
+    assert excinfo.value.code == "kiro_v3_tools_mismatch"
 
 
 def test_the_typed_palettes_are_recognized_and_tab_is_not():

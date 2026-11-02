@@ -22,8 +22,16 @@ import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
-from cli_agent_orchestrator.utils.tool_mapping import mcp_reference_covers, split_mcp_reference
+from cli_agent_orchestrator.providers.kiro_v3_schema import (
+    KiroV3EngineSchema,
+    KiroV3Refusal,
+    pinned_kiro_v3_schemas,
+)
+from cli_agent_orchestrator.utils.tool_mapping import (
+    kiro_v3_exact_tools,
+    mcp_reference_covers,
+    split_mcp_reference,
+)
 
 _SEPARATOR = re.compile(r"^\s*─{20,}\s*$")
 _TOOLS_TITLE = re.compile(r"^\s*/tools · (\d+) tags?\s*$")
@@ -50,16 +58,6 @@ _TYPED_TOOLS = re.compile(r"^\s*/tools\s{2,}List available tools\b")
 _TYPED_MCP = re.compile(r"^\s*/mcp\s{2,}Show MCP server status\s*$")
 _PALETTE_SELECTED = re.compile(r"^\s*❯\s")
 _PALETTE_FOOTER = re.compile(r"^\s*esc to cancel · ↵ to select\s*$")
-
-#: Builtin tags each CAO atom implies. MCP disclosure tools carry ``read``, so
-#: any MCP grant implies it too.
-_TAGS_BY_ATOM = {
-    "fs_read": {"read"},
-    "fs_list": {"read"},
-    "fs_write": {"write"},
-    "execute_bash": {"shell", "subagent"},
-    "web_fetch": {"web"},
-}
 
 
 class KiroAttestationError(KiroV3Refusal):
@@ -165,22 +163,41 @@ def parse_mcp_panel(screen: str) -> Dict[str, McpServerRow]:
     return servers
 
 
-def granted_tags(grant: Iterable[str]) -> frozenset[str]:
-    """The builtin tags a CAO grant may show in ``/tools``."""
-    tags: Set[str] = set()
-    for entry in grant:
-        if entry == "fs_*":
-            tags.update({"read", "write"})
-        elif entry in _TAGS_BY_ATOM:
-            tags.update(_TAGS_BY_ATOM[entry])
-        elif split_mcp_reference(entry) is not None:
-            tags.add("read")
+def granted_tags(
+    grant: Iterable[str], schemas: Optional[Iterable[KiroV3EngineSchema]] = None
+) -> frozenset[str]:
+    """The builtin tags a CAO grant may show in ``/tools``.
+
+    ``/tools`` shows one row for each tag that an exposed built-in carries: a
+    file whose ``tools`` bring ``code`` shows both ``read`` and ``write``. The
+    exposed built-ins are the grant's exact v3 tools, so the tags are read from
+    each pinned schema's tag map (``schema.tags``), not kept in a second table.
+    Where the given engines disagree, only tags that every one implies are
+    allowed. Any MCP reference also implies ``read``: the MCP disclosure tools
+    carry it.
+    """
+    entries = list(grant)
+    exact = kiro_v3_exact_tools(entries)
+    per_engine = [
+        frozenset(tag for tag, tools in schema.tags.items() if tools & exact)
+        for schema in (pinned_kiro_v3_schemas() if schemas is None else schemas)
+    ]
+    tags: Set[str] = set(frozenset.intersection(*per_engine)) if per_engine else set()
+    if any(split_mcp_reference(entry) is not None for entry in entries):
+        tags.add("read")
     return frozenset(tags)
 
 
-def check_tools_panel(panel: ToolsPanel, grant: List[str]) -> None:
-    """Refuse a tag outside the grant's tags, or an MCP tool of an ungranted server."""
-    extra_tags = sorted(panel.tags - granted_tags(grant))
+def check_tools_panel(
+    panel: ToolsPanel,
+    grant: List[str],
+    schemas: Optional[Iterable[KiroV3EngineSchema]] = None,
+) -> None:
+    """Refuse a tag outside the grant's tags, or an MCP tool of an ungranted server.
+
+    ``schemas`` defaults to every pinned engine schema (see ``granted_tags``).
+    """
+    extra_tags = sorted(panel.tags - granted_tags(grant, schemas))
     if extra_tags:
         raise KiroAttestationError("kiro_v3_tools_mismatch", f"tags beyond the grant: {extra_tags}")
     refs = [entry for entry in grant if split_mcp_reference(entry) is not None]
