@@ -116,7 +116,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-// Local launch-decision controls add twelve hidden commands.
+// Local launch-decision controls add fifteen hidden commands.
 const COMMAND_COUNT: usize = 112;
 
 /// What the TUI does with a command.

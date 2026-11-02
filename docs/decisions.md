@@ -307,7 +307,7 @@ matcher (`cao decisions set provider.route on --decider match`) and these declar
 }
 ```
 
-`cao decisions match explain` shows the choice the launch made:
+Once Codex is `sandboxed`, `cao decisions match explain` prints:
 
 ```text
 $ cao decisions match explain --needs long_context,read_only --size medium --tier-auto --options claude_code,codex
@@ -323,8 +323,12 @@ codex/large         gpt-5.5-pro        2000000  medium  yes           yes       
 rule: covered (long_context, read_only) · tie-break: only · pick: codex/large
 ```
 
-The helper runs `codex --model gpt-5.5-pro`, with only its granted tools, and the note says
+The helper then runs `codex --model gpt-5.5-pro`, with only its granted tools, and the note says
 `ran on gpt-5.5-pro (auto: medium 0.90, matched long_context+read_only -> codex large)`.
+
+**Today** the same command prints `codex (advisory)` and
+`rule: rejected · runs the default: claude_code/medium`, because Codex is `advisory` and the match
+never pairs an advisory CLI with a hard one.
 
 ### The catalog: `decisions.match`
 

@@ -172,6 +172,20 @@ def test_explain_prints_the_candidate_table_and_the_pick(home):
     assert lines[-1] == "rule: covered (long_context) · tie-break: only · pick: claude_code/large"
 
 
+def test_explain_on_todays_table_rejects_an_advisory_codex_pick(home):
+    # docs/decisions.md says so: on the real capability table Codex is advisory, so the match
+    # refuses to pair it with hard Claude Code and the default runs.
+    args = ["explain", "--needs", "long_context,read_only", "--size", "medium", "--tier-auto"]
+    args += ["--options", "claude_code,codex"]
+    result = run(*args)
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[1].startswith("options: claude_code (hard), codex (advisory) · ")
+    assert lines[-1] == "rule: rejected · runs the default: claude_code/medium"
+    data = json.loads(run(*args, "--json").output)
+    assert (data["rule"], data["pick"], data["runs"]) == ("rejected", None, "claude_code/medium")
+
+
 def test_explain_without_tier_auto_keeps_the_size(home):
     data = json.loads(
         run(
