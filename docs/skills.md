@@ -26,6 +26,8 @@ python-testing/
 └── SKILL.md
 ```
 
+A skill may also carry a `references/` folder of Markdown pages that `SKILL.md` links to, for detail the agent reads only when it needs it. `cao-provider`, `cao-plugin` and `cao-contributing` are built-in skills that do this. `cao skills add` copies the whole folder, so these pages install with the skill.
+
 `SKILL.md` has two required frontmatter fields — `name` and `description` — followed by the skill content in Markdown:
 
 ```markdown

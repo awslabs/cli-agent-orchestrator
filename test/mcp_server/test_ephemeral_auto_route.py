@@ -42,6 +42,7 @@ from cli_agent_orchestrator.utils import orchestration
 
 TIERS = {"claude_code": {t: "model-" + t for t in ("small", "medium", "large")}}
 BOUNDS = {"min_tier": "small", "default_tier": "medium", "max_tier": "large"}
+EFFORT_BOUNDS = {"min_effort": "low", "default_effort": "medium", "max_effort": "high"}
 DESCRIPTION = "Reviewer of synthetic logs."
 BRIEF = "CREATOR_BRIEF_IS_NEVER_SENT"
 PATHS = ["assign", "early", "default", "nowait"]
@@ -57,6 +58,8 @@ def create_store(_create_store, case):
     config = _create_store[4]
     config["model_tiers"] = case.get("tiers", TIERS)
     config["ephemeral"].update(BOUNDS if case.get("tier") == "auto" else {})
+    # #1083: an effort case declares the spec's effort; auto also sets both effort bounds.
+    config["ephemeral"].update(EFFORT_BOUNDS if case.get("effort") == "auto" else {})
     config["ephemeral"].update(case.get("policy", {}))
     return _create_store
 
@@ -67,6 +70,8 @@ def claimed_store(create_store, case, monkeypatch):
     spec = {**SPEC, "description": DESCRIPTION, "brief": BRIEF}
     if case.get("tier"):
         spec["model_tier"] = case["tier"]
+    if case.get("effort"):
+        spec["effort"] = case["effort"]
     name = create(create_store, spec)["name"]
     tokens = iter(range(1, 100))
     monkeypatch.setattr(create_store[0].secrets, "token_hex", lambda n: f"{next(tokens):0{n * 2}x}")
@@ -76,10 +81,10 @@ def claimed_store(create_store, case, monkeypatch):
 class Decider:
     name = "e5_test"
     version = "1"
-    points = frozenset({"model.route"})
+    points = frozenset({"model.route", "effort.route"})
 
-    def __init__(self, answer, confidence, failure):
-        self.answer, self.confidence, self.failure = answer, confidence, failure
+    def __init__(self, answers, confidence, failures):
+        self.answers, self.confidence, self.failures = answers, confidence, failures
         self.requests = []
         self.during = None
         self.gate = None
@@ -90,15 +95,19 @@ class Decider:
             self.during()
         if self.gate is not None:
             await self.gate.wait()
-        if self.failure == "cancelled":
+        failures = {self.failures.get(point) for point in request.points}
+        if "cancelled" in failures:
             raise asyncio.CancelledError()
-        if self.failure == "error":
+        if "error" in failures:
             raise ValueError("synthetic decider failure")
-        if self.failure == "timeout":
+        if "timeout" in failures:
             await asyncio.sleep(1)
-        if self.failure == "no_answer":
+        if "no_answer" in failures:
             return None
-        return {"model.route": DecisionAnswer(self.answer, {self.answer: self.confidence})}
+        return {
+            point: DecisionAnswer(self.answers[point], {self.answers[point]: self.confidence})
+            for point in request.points
+        }
 
 
 @pytest.fixture
@@ -109,8 +118,17 @@ def e5(launch_http, case, monkeypatch, tmp_path):
     # Bind and provider construction stay real; the fake provider's deferred start is not.
     monkeypatch.setattr(terminal_service, "_schedule_deferred_init", lambda *a, **kw: None)
     env, name, backend, factory = launch_http[0]
+    # "failure" fails every point asked; "failures" names the point (#1083).
+    failures = case.get(
+        "failures", dict.fromkeys(("model.route", "effort.route"), case.get("failure"))
+    )
     decider = Decider(
-        case.get("answer", "large"), case.get("confidence", 0.91), case.get("failure")
+        {
+            "model.route": case.get("answer", "large"),
+            "effort.route": case.get("effort_answer", "high"),
+        },
+        case.get("confidence", 0.91),
+        failures,
     )
     # A file of its own, so each thread gets its own connection. On the shared in-memory
     # StaticPool connection, another thread's session close rolls back the shadow write
@@ -124,10 +142,16 @@ def e5(launch_http, case, monkeypatch, tmp_path):
         sessionmaker(bind=decisions_db), env[2] / "decision-hash.key", emit=lambda _: None
     )
     runner = ShadowRunner(store)
+    state = case.get("state", "on")
     settings = DecisionSettings(
-        points={"model.route": PointSettings(PointState(case.get("state", "on")), decider.name)},
+        points={
+            "model.route": PointSettings(PointState(state), decider.name),
+            "effort.route": PointSettings(
+                PointState(case.get("effort_state", state)), decider.name
+            ),
+        },
         model_tiers=case.get("tiers", TIERS),
-        on_timeout_ms=50 if case.get("failure") == "timeout" else 1000,
+        on_timeout_ms=50 if "timeout" in failures.values() else 1000,
     )
     engine = DecisionEngine(
         DeciderRegistry({decider.name: lambda: decider}),
@@ -712,6 +736,44 @@ async def test_an_unreadable_record_still_rechecks_the_launched_tier(e5, path, m
     assert_read_failure_logged_without_content(caplog, record)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+@pytest.mark.parametrize(
+    "case",
+    [{"tier": "auto", "answer": "large", "effort": "auto", "effort_answer": "high"}],
+    indirect=True,
+)
+async def test_an_unreadable_record_still_rechecks_the_launched_effort(
+    e5, path, monkeypatch, caplog
+):
+    # The tier's record read fails (#1068 P3-1), so the tier is recovered from the plan's
+    # model. That must not skip the effort check: both run against the one snapshot the
+    # recheck validates (#1083).
+    make_records_unreadable(e5, monkeypatch)
+    service = e5.env[0]
+    real, reads = service.read_settings, []
+
+    def read_settings():
+        reads.append(1)
+        return real()
+
+    monkeypatch.setattr(service, "read_settings", read_settings)
+    e5.decider.during = lambda: (
+        reads.clear(),
+        operator_edit(e5, {"max_effort": "medium", "default_effort": "medium"}),
+    )
+    with caplog.at_level(logging.WARNING):
+        result = await invoke(path, e5.name)
+    assert not result["success"]
+    assert result["rule"] == "policy_changed_since_create:effort_exceeds_policy"
+    assert len(reads) == 1
+    e5.factory.assert_not_called()
+    row = database.get_ephemeral_agent(e5.name)
+    assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
+    for record in e5.store.list():
+        assert_read_failure_logged_without_content(caplog, record)
+
+
 @pytest.mark.parametrize("site", ["terminal", "step"])
 @pytest.mark.parametrize("change,key", BROKEN_BLOCKS)
 @pytest.mark.parametrize("case", [{"tier": "auto", "answer": "unsure"}], indirect=True)
@@ -1122,27 +1184,92 @@ def test_a_provider_dropped_before_the_decision_collects_without_asking(
     e5.factory.assert_not_called()
 
 
+# #1083: the same provider-capability rules apply when effort is also (or only) auto, at
+# every point `_recheck_policy` runs — claim, before the decision, and before the bind — and
+# the provider check still precedes the effort check.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+@pytest.mark.parametrize("rule", PROVIDER_RULES)
 @pytest.mark.parametrize(
-    "reason,rule,state",
+    "case",
     [
-        ("above_ceiling", "policy_changed_since_create:tier_exceeds_policy", "gc"),
-        ("below_floor", "policy_changed_since_create:tier_below_policy", "gc"),
-        ("explicit_unmapped", "policy_changed_since_create:tier_unmapped", "gc"),
-        ("provider_not_allowed", "policy_changed_since_create:provider_not_allowed", "gc"),
-        ("policy_invalid", "policy_config_error:model_tiers", "pending"),
-        ("default_unmapped", "policy_config_error:model_tiers", "pending"),
-        ("model_override_not_allowed", "model_override_not_allowed", "pending"),
-        ("something_new", "unexpected_failure", "pending"),
-        (None, "unexpected_failure", "pending"),
+        {"tier": "auto", "answer": "large", "effort": "auto", "effort_answer": "high"},
+        {"effort": "auto", "effort_answer": "high"},
+    ],
+    indirect=True,
+)
+async def test_a_provider_dropped_during_an_effort_decision_collects_before_the_bind(
+    e5, path, rule, monkeypatch
+):
+    e5.decider.during = lambda: drop_provider_support(e5, monkeypatch, rule)
+    result = await invoke(path, e5.name)
+    assert not result["success"] and result["rule"] == rule
+    e5.backend.create_window.assert_not_called()
+    e5.factory.assert_not_called()
+    row = database.get_ephemeral_agent(e5.name)
+    assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
+    assert decided_events(e5.name) == []
+
+
+@pytest.mark.parametrize("site", ["claim", "terminal", "step"])
+@pytest.mark.parametrize("rule", PROVIDER_RULES)
+@pytest.mark.parametrize(
+    "case", [{"effort": "auto"}, {"tier": "auto", "effort": "auto"}], indirect=True
+)
+def test_a_provider_dropped_before_an_effort_decision_collects_without_asking(
+    e5, site, rule, monkeypatch
+):
+    if site == "claim":
+        drop_provider_support(e5, monkeypatch, rule)
+        with pytest.raises(e5.env[0].EphemeralPolicyError) as err:
+            claim(e5.env, e5.name)
+        assert err.value.rule == rule
+    else:
+        token = claim(e5.env, e5.name)["claim_id"]
+        drop_provider_support(e5, monkeypatch, rule)
+        response = raw_launch(e5, site, token)
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"]["rule"] == rule
+    row = database.get_ephemeral_agent(e5.name)
+    assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
+    assert e5.decider.requests == [] and e5.store.list() == []
+    e5.factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "reason,point,rule,state",
+    [
+        ("above_ceiling", None, "policy_changed_since_create:tier_exceeds_policy", "gc"),
+        ("below_floor", None, "policy_changed_since_create:tier_below_policy", "gc"),
+        ("explicit_unmapped", None, "policy_changed_since_create:tier_unmapped", "gc"),
+        ("provider_not_allowed", None, "policy_changed_since_create:provider_not_allowed", "gc"),
+        ("policy_invalid", None, "policy_config_error:model_tiers", "pending"),
+        ("default_unmapped", None, "policy_config_error:model_tiers", "pending"),
+        ("model_override_not_allowed", None, "model_override_not_allowed", "pending"),
+        ("something_new", None, "unexpected_failure", "pending"),
+        (None, None, "unexpected_failure", "pending"),
+        # #1083 (provisional): a bound names the field of the point it bounds.
+        ("above_ceiling", "model.route", "policy_changed_since_create:tier_exceeds_policy", "gc"),
+        ("below_floor", "model.route", "policy_changed_since_create:tier_below_policy", "gc"),
+        (
+            "above_ceiling",
+            "effort.route",
+            "policy_changed_since_create:effort_exceeds_policy",
+            "gc",
+        ),
+        ("below_floor", "effort.route", "policy_changed_since_create:effort_below_policy", "gc"),
+        ("policy_invalid", "effort.route", "policy_config_error:model_tiers", "pending"),
     ],
 )
 @pytest.mark.parametrize("case", [{"tier": "auto"}], indirect=True)
-def test_M1_engine_refusals_map_onto_ephemeral_rules(e5, monkeypatch, reason, rule, state):
+def test_M1_engine_refusals_map_onto_ephemeral_rules(e5, monkeypatch, reason, point, rule, state):
     from cli_agent_orchestrator.api import main
 
     async def refuse(req):
         error = DecisionInputError("private-engine-text")
-        error.reason = reason
+        error.reason, error.point = reason, point
         raise error
 
     monkeypatch.setattr(main, "prepare_launch", refuse)
@@ -1167,6 +1294,9 @@ def test_M1_reason_map_covers_every_engine_reason():
     mapped = set(service._DECISION_TIGHTENED) | set(service._DECISION_REVERTED)
     assert mapped == POLICY_REJECTION_REASONS
     assert not set(service._DECISION_TIGHTENED) & set(service._DECISION_REVERTED)
+    # #1083: the effort overrides only rename tightening reasons, each to an effort rule.
+    assert set(service._EFFORT_TIGHTENED) <= set(service._DECISION_TIGHTENED)
+    assert all(rule.startswith("effort_") for rule in service._EFFORT_TIGHTENED.values())
 
 
 @pytest.mark.asyncio

@@ -121,6 +121,9 @@ class DecisionStore:
                 data["message_bytes"] = len(message.encode("utf-8"))
             if isinstance(data.get("probabilities"), dict):
                 data["probabilities"] = json.dumps(data["probabilities"])
+            # #1099: provider.route's per-launch options, as a JSON list.
+            if isinstance(data.get("options"), (list, tuple)):
+                data["options"] = json.dumps(list(data["options"]))
             with self.sessions() as db:
                 row = database.DecisionRecordModel(**data)
                 db.add(row)
@@ -152,6 +155,8 @@ class DecisionStore:
         }
         if data["probabilities"] is not None:
             data["probabilities"] = json.loads(data["probabilities"])
+        if data["options"] is not None:
+            data["options"] = json.loads(data["options"])
         for key in ("created_at", "updated_at"):
             if isinstance(data[key], datetime):
                 data[key] = data[key].isoformat()
