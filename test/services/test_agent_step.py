@@ -14,7 +14,7 @@ import pytest
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
 from cli_agent_orchestrator.services.agent_step import (
     StepExecutionError,
     run_agent_step,
@@ -277,7 +277,7 @@ class TestHappyPath:
                 f"{_MODULE}.terminal_service.get_terminal_metadata",
                 return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
             ),
-            pytest.raises(KiroPhase0KASError, match="Phase 0"),
+            pytest.raises(KiroV3UnavailableError, match="not available yet"),
         ):
             asyncio.run(
                 run_agent_step(

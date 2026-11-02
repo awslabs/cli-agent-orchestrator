@@ -79,8 +79,9 @@ portable and make profile listings useful.
   is accepted on input only); unset means `false`.
 - `model` (string): provider model selection.
 - `engine` (string): Kiro CLI engine selection, either `v2` (the default) or
-  `kas`. Valid only for the `kiro_cli` provider; an explicit `--engine` at
-  launch must agree with this value. See [Kiro CLI](kiro-cli.md).
+  `v3` (`kas` is accepted as an alias and read as `v3`). Valid only for the
+  `kiro_cli` provider; an explicit `--engine` at launch must agree with this
+  value. See [Kiro CLI](kiro-cli.md).
 - `permissionMode` (string): Claude Code permission mode.
 - `native_agent` (string): Claude Code native-agent name.
 - `codexProfile` (string): named Codex configuration profile.
