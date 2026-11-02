@@ -67,7 +67,34 @@ MCP_TOOL_CALL_PATTERN = r"^[^\S\n]*•\s+Called\s+[\w-]+\.[\w-]+\("
 USER_PREFIX_PATTERN = r"^(?:You\b|[›»][^\S\n]*\S)"
 # Strict idle prompt pattern for extraction: matches empty prompt lines only.
 # Distinguishes "› " (idle) from "› user message" (user input with text).
-IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|»|codex>)\s*$"
+#
+# The indent is horizontal whitespace only (``[^\S\n]*+``, possessive). It was
+# ``^\s*``: searched over a whole response with re.MULTILINE, every line start
+# in a run of blank lines began an attempt whose ``\s*`` re-scanned the rest of
+# the run -- quadratic in the run's length (CWE-1333). On a single line (the
+# re.match callers) the two forms are identical. A MULTILINE search now starts
+# at the prompt's own line rather than at the first blank line above it; use
+# _strict_idle_prompt_start for the old start offset.
+IDLE_PROMPT_STRICT_PATTERN = r"^[^\S\n]*+(?:❯|›|»|codex>)\s*$"
+_IDLE_PROMPT_STRICT_RE = re.compile(IDLE_PROMPT_STRICT_PATTERN, re.MULTILINE)
+
+
+def _strict_idle_prompt_start(text: str) -> Optional[int]:
+    """Where ``re.search(r"^\\s*(?:❯|›|»|codex>)\\s*$", text, re.MULTILINE)`` matched.
+
+    The old pattern's ``\\s*`` let a match start at the first line of the blank
+    run above the prompt. Find the prompt line with the linear pattern, then walk
+    back over that run once: the old match started at the first line start after
+    the last non-whitespace character before the prompt (or at 0).
+    """
+    match = _IDLE_PROMPT_STRICT_RE.search(text)
+    if match is None:
+        return None
+    content_end = len(text[: match.start()].rstrip())
+    if content_end == 0:
+        return 0
+    return text.index("\n", content_end) + 1
+
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
@@ -111,7 +138,16 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d{1,3}%\s+left|·\s+[
 # between the bullet and the following text either way. [^\n]* already
 # tolerates zero-or-more characters before the "(", so the only gap was the
 # glyph itself.
-TUI_PROGRESS_PATTERN = r"[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
+#
+# Anchored at the line start, skipping possessively to the line's FIRST glyph:
+# unanchored, the search restarted at every "•"/"◦" on a line and re-scanned the
+# rest of it for the "(… esc to interrupt)" status, quadratic in the line's
+# length (CWE-1333). A status after any later glyph is also after the first, so
+# the pattern matches exactly the text it matched before; every caller only
+# asks whether it matches.
+TUI_PROGRESS_PATTERN = (
+    r"(?m)^[^•◦\n]*+[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
+)
 
 # Codex 0.155 and later end each successful turn with a dim completion footer
 # below the final message: the time at which the turn ended, after "Worked for
@@ -2912,13 +2948,9 @@ class CodexProvider(BaseProvider):
             # Find extraction boundary: empty idle prompt or TUI footer area.
             # With --no-alt-screen, the TUI footer (› hint + status bar) has no
             # empty idle prompt. Use cutoff_pos as the boundary when TUI is present.
-            idle_after = re.search(
-                IDLE_PROMPT_STRICT_PATTERN,
-                clean_output[response_start:],
-                re.MULTILINE,
-            )
-            if idle_after:
-                end_pos = response_start + idle_after.start()
+            idle_after = _strict_idle_prompt_start(clean_output[response_start:])
+            if idle_after is not None:
+                end_pos = response_start + idle_after
             elif tui_footer_detected:
                 end_pos = cutoff_pos
             else:
@@ -2959,12 +2991,8 @@ class CodexProvider(BaseProvider):
         last_match = matches[-1]
         start_pos = last_match.end()
 
-        idle_after = re.search(
-            IDLE_PROMPT_STRICT_PATTERN,
-            clean_output[start_pos:],
-            re.MULTILINE,
-        )
-        end_pos = start_pos + idle_after.start() if idle_after else len(clean_output)
+        idle_after = _strict_idle_prompt_start(clean_output[start_pos:])
+        end_pos = start_pos + idle_after if idle_after is not None else len(clean_output)
 
         final_answer = self._strip_completion_footer(clean_output[start_pos:end_pos])
 
