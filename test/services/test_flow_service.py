@@ -167,7 +167,7 @@ Prompt.
 name: invalid-engine-flow
 schedule: "0 * * * *"
 agent_profile: developer
-engine: v3
+engine: v4
 ---
 
 Prompt.
@@ -368,7 +368,7 @@ class TestListFlows:
         flows = []
         for name, engine in (
             ("v2-flow", "v2"),
-            ("invalid-flow", "v3"),
+            ("invalid-flow", "v4"),
             ("kas-flow", "kas"),
         ):
             file_path = tmp_path / f"{name}.md"
@@ -390,7 +390,7 @@ class TestListFlows:
         assert [(flow.name, flow.engine) for flow in result] == [
             ("v2-flow", KiroEngine.V2),
             ("invalid-flow", None),
-            ("kas-flow", KiroEngine.KAS),
+            ("kas-flow", KiroEngine.V3),
         ]
         assert "Ignoring invalid engine metadata for flow invalid-flow" in caplog.text
 

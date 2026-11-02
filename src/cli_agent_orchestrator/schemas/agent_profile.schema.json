@@ -37,8 +37,8 @@
     },
     "engine": {
       "type": "string",
-      "enum": ["v2", "kas"],
-      "description": "Kiro engine selection."
+      "enum": ["v2", "v3", "kas"],
+      "description": "Kiro engine selection. 'kas' is an alias of 'v3' and is stored as 'v3'."
     },
     "allowedTools": {
       "type": "array",

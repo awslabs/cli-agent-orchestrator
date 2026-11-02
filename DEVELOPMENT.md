@@ -305,7 +305,7 @@ Create a pull request on GitHub. CI will automatically run tests and code qualit
 Runs on all pushes to `main` and all PRs targeting `main`:
 - **Unit tests**: Python 3.11, 3.12 matrix with coverage
 - **Code quality**: black, isort, ruff, mypy — all blocking; mypy via a per-file ratchet (see [SKILL.md](skills/cao-contributing/SKILL.md))
-- **Security scan**: Trivy filesystem scan — fails on a finding of **any** severity (see [SECURITY.md](SECURITY.md#running-security-scans-locally) for why the workflow's `CRITICAL,HIGH` input is ignored)
+- **Security scan**: Trivy filesystem scan — fails on a committed secret of any severity, or on a fixable CRITICAL, HIGH or UNKNOWN (not yet scored) vulnerability; fixable MEDIUM and LOW vulnerabilities are uploaded to the Security tab without failing (see [SECURITY.md](SECURITY.md#running-security-scans-locally))
 - **Dependency Security**: Full locked npm, Bun, uv, and Cargo graphs, including dev dependencies and unfixed advisories; every HIGH/CRITICAL finding or scan error blocks. Also verifies the installed dependency mitigations. The Python 3.12 unit job runs a real-Trivy dev-inventory regression; see [SECURITY.md](SECURITY.md#full-dependency-gate).
 - **Dependency review**: License and vulnerability checks on PRs
 

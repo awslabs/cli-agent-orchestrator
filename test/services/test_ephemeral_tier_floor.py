@@ -161,6 +161,7 @@ def test_MF6_known_block_is_silent(floor_store, monkeypatch, caplog):
     raw["ephemeral"].update(
         min_tier="small", default_tier="medium", max_tier="large", child_may_delegate=True
     )
+    raw["ephemeral"].update(min_effort="low", default_effort="medium", max_effort="high")
     # Every defaulted key is known, including the sweep, cap and retention keys.
     raw["ephemeral"].update(
         {key: value for key, value in EPHEMERAL_DEFAULTS.items() if key not in raw["ephemeral"]}

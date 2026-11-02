@@ -92,7 +92,11 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
+from cli_agent_orchestrator.models.kiro_engine import (
+    KiroEngine,
+    canonical_kiro_engine,
+    resolve_kiro_engine,
+)
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     ProviderExitedInputBlockedError,
@@ -116,7 +120,7 @@ from cli_agent_orchestrator.providers.base import (
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroCapabilityError,
-    KiroPhase0KASError,
+    KiroV3UnavailableError,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
@@ -397,15 +401,40 @@ def _finalize_launch_best_effort(terminal_id: str, *, end_reason: str) -> None:
         logger.warning("Launch record finalize failed for %s", terminal_id, exc_info=True)
 
 
+def resolve_launch_provider(launch_plan: "LaunchPlan | None", provider: str) -> str:
+    """Resolve the CLI this launch runs on (#1099).
+
+    Only the engine sets ``launch_plan.provider``, for a claimed ephemeral launch that a
+    ``provider.route`` answer routed. The request's provider stays the claim's identity: the
+    idempotency fingerprint, the ephemeral launch checks and the bind compare it unchanged.
+    """
+    return launch_plan.provider if launch_plan and launch_plan.provider else provider
+
+
 def resolve_launch_model(
     model: Optional[str], profile: Optional[AgentProfile], launch_plan: "LaunchPlan | None" = None
 ) -> Optional[str]:
     """Resolve the model CAO passes to a provider for this launch."""
+    if launch_plan is not None and launch_plan.provider is not None:
+        # #1099: a routed launch's profile names the fallback provider's model id, so only
+        # the plan can name the model the decided provider runs.
+        return model or launch_plan.model
     return (
         model
         or (launch_plan.model if launch_plan else None)
         or (profile.model if profile else None)
     )
+
+
+def resolve_launch_effort(launch_plan: "LaunchPlan | None" = None) -> Optional[str]:
+    """Resolve the effort CAO passes to a provider for this launch (#1068 C, #1083).
+
+    Unlike the model, effort is never a per-call override or a profile-level default read
+    here: a provider falls back to its own profile config (``claudeConfig.effort``,
+    ``codexConfig.model_reasoning_effort``) when this is ``None``. A decided effort reaches
+    the provider only through the plan, never through a rewritten live profile.
+    """
+    return launch_plan.effort if launch_plan else None
 
 
 # Track terminals that have already received memory injection (first message only).
@@ -1155,11 +1184,13 @@ def _request_fingerprint(
       cannot yield materially different terminals. Same-shaped question as
       ``allowed_tools``, opposite verified answer -- which is why the resolver
       has to be read rather than the pattern matched.
-    - ``engine`` normalises through ``KiroEngine.value`` because the parameter
-      accepts the enum OR a plain string -- ``api/main.py`` forwards a query
-      string while ``parse_kiro_engine`` returns the member, and the same
-      logical request arriving by those two routes must produce ONE digest or
-      a legitimate retry 409s.
+    - ``engine`` normalises through ``canonical_kiro_engine`` because the
+      parameter accepts the enum OR a plain string -- ``api/main.py`` forwards
+      a query string while ``parse_kiro_engine`` returns the member, and the
+      same logical request arriving by those two routes must produce ONE digest
+      or a legitimate retry 409s. The ``kas`` alias canonicalises to ``v3`` for
+      the same reason: a retry spelled ``kas`` and one spelled ``v3`` are one
+      request (#1167).
 
     sha256 hexdigest rather than the joined text: the column stays a bounded
     64 chars regardless of path length, and filesystem paths and profile names
@@ -1182,6 +1213,8 @@ def _request_fingerprint(
     # decide whether that request is acceptable; the engine is validated below,
     # on the path that owns that decision. An invalid engine simply hashes as
     # itself and mismatches, which is all this function needs to be correct.
+    # `canonical_kiro_engine` is the pure half: it maps the `kas` alias to `v3`
+    # and leaves every other string as it is, so it validates nothing.
     # `KiroEngine` is a `str` Enum so joining a member happens to work, but
     # `.value` is the documented contract (`step_fingerprint`: "a KiroEngine
     # member's repr is not stable across versions") and an explicit branch
@@ -1193,7 +1226,7 @@ def _request_fingerprint(
     elif isinstance(engine, KiroEngine):
         engine_value = engine.value
     else:
-        engine_value = str(engine)
+        engine_value = canonical_kiro_engine(str(engine)) or ""
 
     # `None` and `{}` share one encoding, and that is VERIFIED rather than
     # assumed -- the opposite answer to `allowed_tools` above. Every use of
@@ -1802,7 +1835,7 @@ async def _create_terminal_unguarded(
     worktree_repo_root: Optional[str] = None
     try:
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
-        # resource. A KAS request must probe then fail closed with no window,
+        # resource. A v3 request must probe then fail closed with no window,
         # database row, FIFO, Herdr registration, or provider process.
         source = agent_profiles.ProfileSource.INSTALLED
         try:
@@ -1820,8 +1853,22 @@ async def _create_terminal_unguarded(
         # accepting arbitrary attributes as configuration.
         if profile is not None and not isinstance(profile, AgentProfile):
             profile = None
+        if (
+            launch_plan is not None
+            and launch_plan.provider is not None
+            and (source is not agent_profiles.ProfileSource.EPHEMERAL or claim_id is None)
+        ):
+            # #1099: only the engine routes, and only a claimed ephemeral launch. Anything
+            # else is a bug, refused here before any resource is allocated.
+            raise RuntimeError("a launch plan routed a launch that is not a claimed ephemeral")
+        # The request's provider stays the claim's identity: the fingerprint and the ephemeral
+        # launch checks above used it, and the bind below compares it. Everything else that
+        # depends on which CLI runs uses the launch provider (#1099).
+        requested_provider = provider
+        provider = resolve_launch_provider(launch_plan, provider)
         decision_not_honored = False
         launch_model = resolve_launch_model(model, profile, launch_plan)
+        launch_effort = resolve_launch_effort(launch_plan)
         model_honored = ProviderManager.provider_class(provider).honors_model(
             agent_profile=agent_profile,
             profile=profile,
@@ -1856,7 +1903,14 @@ async def _create_terminal_unguarded(
             try:
                 await asyncio.to_thread(probe, resolved_engine, requested)
             except KiroCapabilityError:
-                if model or launch_plan is None or launch_plan.model is None:
+                # A routed launch is refused, never relaunched on the profile's model, which
+                # is the fallback provider's (#1099).
+                if (
+                    model
+                    or launch_plan is None
+                    or launch_plan.model is None
+                    or launch_plan.provider is not None
+                ):
                     raise
                 launch_model = resolve_launch_model(model, profile)
                 requested = requested_kiro_capabilities(
@@ -1867,10 +1921,8 @@ async def _create_terminal_unguarded(
                 model_honored = ProviderManager.provider_class(provider).honors_model(
                     agent_profile=agent_profile, profile=profile, requested_model=launch_model
                 )
-            if resolved_engine == KiroEngine.KAS:
-                raise KiroPhase0KASError(
-                    bool(profile and (profile.allowedTools or profile.toolsSettings))
-                )
+            if resolved_engine == KiroEngine.V3:
+                raise KiroV3UnavailableError()
         else:
             if engine is not None:
                 raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
@@ -2120,10 +2172,11 @@ async def _create_terminal_unguarded(
                 agent_profile,
                 terminal_id,
                 caller_id,
-                provider,
+                requested_provider,
                 claim_id,
                 allowed_tools,
                 idempotency_key,
+                launched_provider=provider,
             )
             ephemeral_state.bound_terminal_id = terminal_id
 
@@ -2549,6 +2602,7 @@ async def _create_terminal_unguarded(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=launch_model,
+            effort=launch_effort,
             engine=resolved_engine,
             resume_session_id=resume_session_id,
             session_id=fresh_claude_session_id,
@@ -5247,9 +5301,9 @@ def dispatch_input(
 
         if (
             metadata.get("provider") == ProviderType.KIRO_CLI.value
-            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
+            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.V3
         ):
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
+            raise KiroV3UnavailableError()
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = _orchestration_value(orchestration_type)
