@@ -817,3 +817,34 @@ class TestTheReleaseJobCannotTagAVersionPublishWouldRefuse:
 
     def test_uv_runs_locked_everywhere_else(self):
         assert str(_workflow()["env"]["UV_LOCKED"]) == "1"
+
+
+class TestReleasingDocDescribesTheRealBehaviour:
+    """The PR title said "weekly patch release" long after the bump was derived (review on
+    #652); the operator doc must say what Monday actually does, and how to answer a refusal."""
+
+    TEXT = (REPO_ROOT / "docs" / "RELEASING.md").read_text(encoding="utf-8")
+
+    def test_it_describes_the_schedule_and_the_derived_bump(self):
+        assert "every Monday at 09:17 UTC" in self.TEXT
+        assert "release.yml (manual)" not in self.TEXT
+        for bump in ("major", "minor", "patch"):
+            assert f"| {bump}" in self.TEXT or f"**{bump}**" in self.TEXT
+
+    def test_it_says_a_major_is_never_cut_unattended_and_what_to_do(self):
+        assert "a scheduled run never cuts a major release" in self.TEXT
+        assert "`bump=major`" in self.TEXT
+
+    def test_every_refusal_the_preflight_prints_has_a_row(self):
+        for phrase in (
+            "a scheduled run never cuts a major release",
+            "carry a breaking-change marker outside the subject and the footer",
+            "is not a published GitHub Release",
+            "not verifiably on PyPI",
+        ):
+            assert phrase in self.TEXT, phrase
+            assert phrase in SCRIPT.read_text(encoding="utf-8"), phrase
+
+    def test_it_documents_the_release_dispatch_mode(self):
+        assert "environment: release" in self.TEXT
+        assert "use workflow from the tag" in self.TEXT
