@@ -306,18 +306,83 @@ async def test_AC2_feature_request_equals_model_route_request_but_points(h):
     assert feature.options is None and feature.request_id == model.request_id
 
 
+# A second catalog for the same model_tiers and the same reachable model ids, with every
+# declared fact different: costs (a different set of cost words), windows, strengths, the
+# long_context threshold, and one extra unreachable declaration. The needs still pick the same
+# CLI and tier, so any difference in what the deciders are sent can only be the catalog leaking.
+CATALOG_B = {
+    "version": 1,
+    "long_context_tokens": 800000,
+    "models": {
+        "claude_code": {
+            "claude-sonnet-5-5": {
+                "context_tokens": 150000,
+                "cost": "high",
+                "good_for": ["deep_reasoning"],
+            },
+            "claude-opus-5-5": {"context_tokens": 900000, "cost": "medium", "good_for": []},
+        },
+        "codex": {
+            "gpt-5.5": {
+                "context_tokens": 300000,
+                "cost": "medium",
+                "good_for": ["read_only", "deep_reasoning"],
+            },
+            "gpt-5.5-pro": {"context_tokens": 3000000, "cost": "high", "good_for": ["read_only"]},
+            "gpt-old": {"context_tokens": 7777777, "cost": "high", "good_for": ["read_only"]},
+        },
+    },
+}
+
+
+def _strings(value):
+    """Every string inside a request's asdict, keys and values, at any depth."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _strings(key)
+            yield from _strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _strings(item)
+
+
 @pytest.mark.asyncio
-async def test_AC2_no_catalog_fact_in_any_request(h):
-    features(h, long_context="yes", read_only="yes")
-    await h.launch()
-    sent = json.dumps([dataclasses.asdict(r) for r in h.decider.requests], default=list)
-    for word in ("claude-opus-5-5", "gpt-5.5-pro", "gpt-5.5", "claude-sonnet-5-5"):
-        assert word not in sent
-    for number in ("200000", "256000", "500000", "1000000", "2000000"):
-        assert number not in sent
+async def test_AC2_no_catalog_fact_in_any_request(tmp_path):
+    import re
+
+    from cli_agent_orchestrator.decisions.catalog import COSTS
+
+    sent, plans = {}, {}
+    for name, catalog in (("a", CATALOG), ("b", CATALOG_B)):
+        h = Harness(tmp_path, name)
+        h.configure(catalog=catalog)
+        features(h, long_context="yes", read_only="yes")
+        plans[name] = plan_values(await h.launch())
+        sent[name] = [
+            {k: v for k, v in dataclasses.asdict(r).items() if k != "request_id"}
+            for r in h.decider.requests
+        ]
+    # The same launch under both catalogs: the comparison below is about the requests only.
+    assert plans["a"] == plans["b"] == ("gpt-5.5-pro", "codex", "high", ())
+    asked = {tuple(r["points"]) for r in sent["a"]}
+    assert asked == {FEATURE_POINTS, ("model.route",), ("effort.route",)}
+    # Every request to every point is identical whatever the catalog declares.
+    assert sent["a"] == sent["b"]
+    words = {
+        w for r in sent["a"] for text in _strings(r) for w in re.findall(r"[a-z0-9]+", text.lower())
+    }
+    assert words.isdisjoint(COSTS), words & set(COSTS)
+    text = json.dumps(sent["a"], default=list)
+    for catalog in (CATALOG, CATALOG_B):
+        assert str(catalog["long_context_tokens"]) not in text
+        for entries in catalog["models"].values():
+            for model, facts in entries.items():
+                assert model not in text
+                assert str(facts["context_tokens"]) not in text
     for key in ("context_tokens", "cost", "good_for", "long_context_tokens", "match"):
-        assert key not in sent
-    assert {"high", "low"} & set(json.loads(sent)[0]["message"].split()) == set()
+        assert key not in words
 
 
 @pytest.mark.asyncio
