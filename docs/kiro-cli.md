@@ -79,6 +79,11 @@ Before anything is allocated:
 - the agent is not unrestricted (`*`);
 - the profile's `kiroConfig.effort`, if set, is a plain level such as `high`;
 - no `KIRO_HOME` other than `~/.kiro` reaches the launch;
+- `cao install` writes Kiro agents to `~/.kiro/agents`, the only place v3
+  loads them from. With `CAO_AGENTS_DIR` set to another directory, the file CAO
+  checks would not be the file Kiro runs, so a v3 launch is refused
+  (`kiro_v3_agents_dir_unsupported`). This check is stricter than v2's, which
+  still allows `CAO_AGENTS_DIR`;
 - the installed agent file on disk is exactly what `cao install --engine v3`
   writes for its grant, and that grant fits the launch;
 - the launch directory and its parents have no `.kiro/` configuration v3 would
@@ -157,6 +162,7 @@ The message never names a path on the server (it may be a shared server); the se
 | `kiro_v3_unverified_version` | the version is listed but not yet operator-verified | `--engine v2` until it is verified (operators running the checklist: see *Pending versions*) |
 | `kiro_v3_unrestricted` | the agent or launch allows every tool (`*`) | restrict `allowedTools` |
 | `kiro_v3_home_unsupported` | `KIRO_HOME` points somewhere other than `~/.kiro` | unset it for the launch |
+| `kiro_v3_agents_dir_unsupported` | `CAO_AGENTS_DIR` makes `cao install` write Kiro agents somewhere other than `~/.kiro/agents`, which is where v3 loads them from | unset `CAO_AGENTS_DIR` for `cao-server` and `cao install`, then `cao install <name> --provider kiro_cli --engine v3`; or `--engine v2` |
 | `kiro_v3_not_installed` | no agent file for this agent | `cao install <name> --provider kiro_cli --engine v3` |
 | `kiro_v3_agent_unreadable` | something that can't be read as a file is where the agent file goes (a directory, a symlink loop, no permission) | remove it, then `cao install <name> --provider kiro_cli --engine v3` |
 | `kiro_v3_bad_effort` | the profile's `kiroConfig.effort` is not a plain level such as `low`, `medium` or `high` | fix `kiroConfig.effort`, or `--engine v2` |

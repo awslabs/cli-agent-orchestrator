@@ -497,6 +497,7 @@ class TestTerminalCreationWithWorkingDirectory:
 
         agents = tmp_path / "server-home" / ".kiro" / "agents"
         agents.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(tmp_path / "server-home"))
         monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", agents)
         target = agents / f"{agent}.json"
         if state == "directory":

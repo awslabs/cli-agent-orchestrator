@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one
   universal agent file with v3 tool exclusions and deny rules. A v3 launch is refused before
   anything is allocated unless the kiro-cli version is supported, the agent file on disk is CAO's
-  own render for its grant, `KIRO_HOME` is the default and the workspace's `.kiro/` holds no
-  configuration; after the header, CAO reads `/tools` and `/mcp` before any task. **Not yet a
+  own render for its grant, `KIRO_HOME` is the default, `CAO_AGENTS_DIR` (if set) is
+  `~/.kiro/agents`, and the workspace's `.kiro/` holds no configuration; after the header, CAO reads `/tools` and `/mcp` before any task. **Not yet a
   supported configuration:** v3 support is claimed only once the live operator checklist has passed.
   A kiro-cli version still pending operator verification (2.36.0, 2.37.0) refuses unless the operator sets
   `kiro.v3_allow_unverified_versions: true` (provisional, for running the checklist on it); such a

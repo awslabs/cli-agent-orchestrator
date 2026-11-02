@@ -56,11 +56,22 @@ def _universal(name: str, grant=GRANT) -> str:
 
 
 @pytest.fixture
-def agents(tmp_path, monkeypatch):
+def fake_home(tmp_path, monkeypatch):
+    """A fake HOME, so ``~/.kiro`` is never the real one."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+@pytest.fixture
+def agents(fake_home, monkeypatch):
+    """The directory ``cao install`` writes: the fake home's ``.kiro/agents``,
+    the only one a v3 launch accepts."""
     from cli_agent_orchestrator.services import install_service
 
-    directory = tmp_path / "kiro-agents"
-    directory.mkdir()
+    directory = fake_home / ".kiro" / "agents"
+    directory.mkdir(parents=True)
     monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", directory)
     return directory
 
@@ -449,10 +460,50 @@ async def test_a_bad_kiro_effort_refuses_before_the_probe_with_its_code(agents, 
     backend.return_value.create_session.assert_not_called()
 
 
-def test_the_module_reads_the_agents_dir_install_writes(agents):
+# --- the agents directory: Kiro v3 reads only ~/.kiro/agents ----------------------
+
+
+@pytest.fixture
+def elsewhere(tmp_path, fake_home, monkeypatch):
+    """``CAO_AGENTS_DIR`` set to a directory other than ``~/.kiro/agents``, holding
+    a valid file, while ``~/.kiro/agents`` (what Kiro reads) is left empty."""
     from cli_agent_orchestrator.services import install_service
 
-    assert Path(install_service.KIRO_AGENTS_DIR) == agents
+    directory = tmp_path / "cao-agents-dir"
+    directory.mkdir()
+    (directory / "reviewer.json").write_text(_universal("reviewer"))
+    monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", directory)
+    return directory
+
+
+def test_an_agents_dir_other_than_kiros_refuses_naming_no_path(elsewhere, repo, caplog):
+    """The v3 command makes Kiro read ``~/.kiro/agents``, so a file checked
+    anywhere else is not the file Kiro loads (maintainer review on #1179)."""
+    with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.kiro_v3_launch"):
+        with pytest.raises(KiroV3LaunchError) as excinfo:
+            _launchable(elsewhere, repo)
+    assert excinfo.value.code == "kiro_v3_agents_dir_unsupported"
+    message = str(excinfo.value)
+    assert "CAO_AGENTS_DIR" in message
+    assert str(elsewhere) not in message
+    assert any(str(elsewhere) in record.getMessage() for record in caplog.records)
+
+
+def test_the_default_agents_dir_passes_by_name_or_through_a_link(agents, repo, tmp_path):
+    (agents / "reviewer.json").write_text(_universal("reviewer"))
+    _launchable(agents, repo)
+    link = tmp_path / "link-to-kiro-agents"
+    link.symlink_to(agents, target_is_directory=True)
+    _launchable(link, repo)
+
+
+@pytest.mark.asyncio
+async def test_a_create_with_another_agents_dir_allocates_nothing(elsewhere, repo):
+    seen: dict = {}
+    with pytest.raises(KiroV3LaunchError) as excinfo:
+        await _create(PROFILE, repo, seen=seen)
+    assert excinfo.value.code == "kiro_v3_agents_dir_unsupported"
+    assert seen == {"session": False, "other": False}
 
 
 @pytest.mark.parametrize(

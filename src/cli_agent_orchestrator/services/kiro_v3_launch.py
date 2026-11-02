@@ -8,7 +8,9 @@ exists, in this order:
    ``kiro.v3_allow_unverified_versions`` opt-in on, and the policy must not be
    unrestricted (``*``);
 2. at Step 1c, from the final launch directory: no ``KIRO_HOME`` other than the
-   default home may reach the launch; the installed agent file on disk must
+   default home may reach the launch; the directory ``cao install`` writes
+   (``CAO_AGENTS_DIR``) must be ``~/.kiro/agents``, the one Kiro reads; the
+   installed agent file on disk must
    pass the validator against the probed engine's schema, with its grant
    fitting this launch's allowlist; and the workspace's ``.kiro/`` must hold
    nothing v3 would load as configuration.
@@ -140,6 +142,32 @@ def require_default_kiro_home(environments: Iterable[Optional[Mapping[str, str]]
             )
 
 
+def require_default_kiro_agents_dir(agents_dir: Path) -> None:
+    """Refuse when ``cao install`` writes Kiro agents anywhere but ``~/.kiro/agents``.
+
+    The v3 command unsets ``KIRO_HOME`` and ``KIRO_AGENT_CONFIG_DIR``, so
+    kiro-cli loads ``~/.kiro/agents/<name>.json``. With ``CAO_AGENTS_DIR`` set
+    elsewhere, the file Step 1c validates would not be the file Kiro loads,
+    and an older file of the same name there would run unchecked. Compared by
+    ``realpath``, so a link to the default directory passes.
+    """
+    default = os.path.realpath(os.path.join(_default_kiro_home(), "agents"))
+    if os.path.realpath(agents_dir) != default:
+        logger.warning(
+            "Kiro v3 launch refused: cao install writes Kiro agents to %s, not %s",
+            agents_dir,
+            default,
+        )
+        raise KiroV3LaunchError(
+            "kiro_v3_agents_dir_unsupported",
+            "CAO_AGENTS_DIR makes `cao install` write Kiro agent files to a directory "
+            "other than ~/.kiro/agents (the server log names it), but Kiro engine 'v3' "
+            "loads agents only from ~/.kiro/agents, so the file CAO checks would not be "
+            "the one Kiro runs. Unset CAO_AGENTS_DIR for cao-server and `cao install`, "
+            "reinstall the agent with --engine v3, or retry with engine 'v2'.",
+        )
+
+
 def require_kiro_v3_launchable(
     agent_profile: str,
     working_directory: Optional[str],
@@ -160,6 +188,7 @@ def require_kiro_v3_launchable(
         # one the validator refuses.
         require_kiro_agent_defined(agent_profile, [])
     require_default_kiro_home([os.environ, launch_env])
+    require_default_kiro_agents_dir(agents_dir)
 
     agent_file = Path(agents_dir) / f"{stem}.json"
     install = f"`cao install {agent_profile} --provider kiro_cli --engine v3`"
@@ -201,6 +230,7 @@ def require_kiro_v3_launchable(
 __all__ = [
     "KiroV3Admission",
     "reinstall_remedy",
+    "require_default_kiro_agents_dir",
     "require_default_kiro_home",
     "require_kiro_v3_admissible",
     "require_kiro_v3_launchable",
