@@ -657,7 +657,7 @@
   }
   function onRunFinished(data, decided, openAtStart) {
     var outcome = data.outcome && data.outcome.type;
-    if (decided) setCardState(decided.card, decided.approved ? "approved" : "rejected", "RUN_FINISHED");
+    if (decided) setCardState(decided.card, decided.approved ? "approved" : "rejected", "answer sent");
     if (outcome === "interrupt") {
       var open = (data.outcome.interrupts || []).map(function (intr) {
         var card = addApprovalCard(interruptToProps(intr));
@@ -669,7 +669,7 @@
     } else {
       reconcile([], openAtStart);
       addRunResult("RUN_FINISHED", outcome || "—", decided
-        ? (decided.approved ? "approval delivered to the agent" : "rejection delivered to the agent")
+        ? (decided.approved ? "approval sent" : "rejection sent")
         : "nothing is waiting for approval");
     }
   }

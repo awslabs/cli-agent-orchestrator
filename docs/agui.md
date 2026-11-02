@@ -291,8 +291,9 @@ interrupt (`status: "cancelled"`) is skipped without a warning. A
 non-empty `resume[]` gets HTTP 404 when the server has no approval bridge (the
 AG-UI surface was off when it started), as `POST /agui/v1/interrupts/{id}/resume`
 does. Once `resume[]` is delivered and nothing is
-left pending, the outcome is `{type: "success"}`. That means the decision
-reached the agent, not that the agent finished. If the agent prompts again, the
+left pending, the outcome is `{type: "success"}`. That means every entry that
+named a pending interrupt was delivered; skipped entries are only logged. It
+does not mean the agent finished. If the agent prompts again, the
 next run returns the new interrupt. `messages[]` is not read. Live fleet
 activity (`STATE_DELTA`, `STEP_STARTED/FINISHED`, `TOOL_CALL_START/END`,
 `CUSTOM`) is on the ambient plane, `GET /agui/v1/stream`. Embedders that call

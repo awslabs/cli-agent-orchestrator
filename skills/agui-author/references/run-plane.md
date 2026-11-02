@@ -41,8 +41,9 @@ stock AG-UI client completes a run only when the body ends):
 | Resume failed (bad payload, delivery failure) | `RUN_STARTED`, `RUN_ERROR` |
 | `resume[]` sent, but the server has no approval bridge | HTTP 404 "Approval bridge not initialized", no stream |
 
-A `success` after `resume[]` means the decision was delivered, not that the
-agent finished its work. If the agent prompts again, the next run returns that
+A `success` after `resume[]` means every entry that named a pending interrupt
+was delivered; skipped entries are only logged. It does not mean the agent
+finished its work. If the agent prompts again, the next run returns that
 prompt as an interrupt. Live fleet activity is the ambient plane,
 `GET /agui/v1/stream`.
 

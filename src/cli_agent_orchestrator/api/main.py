@@ -2669,9 +2669,9 @@ async def agui_run(
     mutating interrupt state). Otherwise ``cao:read`` is the floor.
 
     After a ``resume[]`` run, ``RUN_FINISHED`` with outcome ``success`` means
-    the decision was delivered to the terminal, not that the agent finished
-    its work. A later permission prompt arrives as an interrupt on the next
-    run.
+    every entry that named a pending interrupt was delivered; skipped entries
+    are only logged. It does not mean the agent finished its work. A later
+    permission prompt arrives as an interrupt on the next run.
 
     Returns 501 when the ``ag-ui-protocol`` package is not installed (the
     [agui] optional extra was not included at install time).

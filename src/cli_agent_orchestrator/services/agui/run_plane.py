@@ -11,10 +11,11 @@ Interrupt lifecycle:
   ``interrupt`` outcome and closes the stream.
 - If ``resume[]`` is provided in RunAgentInput, each entry is resolved through
   the idempotent approval registry before streaming begins.
-- A resume that fails (unknown id, ambiguous payload, delivery failure) produces
-  RUN_ERROR. Interrupts still open after resume processing end the run with the
-  ``interrupt`` outcome; none left ends it with ``success``. The body closes
-  right after RUN_FINISHED or RUN_ERROR.
+- A resume entry for an unknown or expired interrupt is skipped with a
+  server-side warning and the run proceeds. A resume that fails (ambiguous
+  payload, delivery failure) produces RUN_ERROR. Interrupts still open after
+  resume processing end the run with the ``interrupt`` outcome; none left ends
+  it with ``success``. The body closes right after RUN_FINISHED or RUN_ERROR.
 """
 
 from __future__ import annotations
