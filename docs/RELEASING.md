@@ -6,8 +6,9 @@ via GitHub Actions. The pipeline is designed so every release goes to
 the production publish.
 
 A release starts one of two ways: **every Monday at 09:17 UTC on its own**, when
-something has merged since the last release, or **by hand**. Either way, nothing reaches
-PyPI until a maintainer approves it.
+something has merged since the last release, or **by hand**. Either way it stops at a
+tagged GitHub Release. Publishing to PyPI always takes **two maintainers**: one starts
+**Publish to PyPI** from the tag, and a different one approves the PyPI upload.
 
 ## Pipeline overview
 
@@ -16,11 +17,12 @@ release.yml (weekly schedule, or manual)
   ├─► preflight      (scripts/release_preflight.py: on main, ci.yml green at the exact
   │                   commit, previous release complete, bump derived from the commits;
   │                   a scheduled run REFUSES a major and hands it to a person)
-  ├─► release        (bump pyproject.toml + uv.lock + devcontainer feature + changelog,
-  │                   run the same version check publish runs, then commit + tag + ONE
-  │                   atomic push, then a GitHub Release)
-  └─► start-publish  (schedule only: dispatch publish-to-pypi.yml `release` on the new tag)
-        └─► publish-to-pypi.yml (a `release` dispatch, or a GitHub Release a person published)
+  └─► release        (bump pyproject.toml + uv.lock + devcontainer feature + changelog,
+                      run the same version check publish runs, then commit + tag + ONE
+                      atomic push, then a GitHub Release; the run summary says how to
+                      publish it)
+
+publish-to-pypi.yml (a maintainer dispatches `release` from the tag, or publishes a Release)
               ├─► verify-release-version (seconds: tag == pyproject.toml == uv.lock ==
               │                           devcontainer feature, and the version is on
               │                           neither TestPyPI nor PyPI; fails BEFORE the builds)
@@ -102,8 +104,14 @@ daylight saving):
    Only the **subject** and the **footer** count, which is where the spec puts these
    markers. A `BREAKING CHANGE:` quoted in the middle of a description, in a code block
    or after `>`, does not make a release major.
-4. Releases, then starts **Publish to PyPI** on the new tag. TestPyPI and the smoke test
-   run, and the PyPI upload waits for a maintainer's approval as always.
+4. Releases: bumps, tags and creates the GitHub Release, then **stops**. The run summary
+   says how to publish it: a maintainer dispatches **Publish to PyPI** from the new tag
+   with `environment: release` (TestPyPI, the smoke test, then the PyPI upload), and a
+   **different** maintainer approves the upload. The `pypi` environment will not let the
+   one who dispatched approve their own run.
+
+   Until that release is on PyPI, the next Monday refuses ("not verifiably on PyPI"), so
+   an unpublished release is never skipped over.
 
 **When it refuses** (the run is red and nothing is bumped, tagged or published):
 
@@ -112,7 +120,7 @@ daylight saving):
 | `a scheduled run never cuts a major release` | A commit since the last release is marked breaking. A major is never cut with nobody watching. | If it really is breaking, run **Release** by hand with `bump=major`. Every scheduled run refuses until then. |
 | `carry a breaking-change marker outside the subject and the footer` | A body line looks like a breaking marker. In a squash merge it can be a real break from one of the squashed commits, so the schedule cannot tell. | Read the line in the run summary. Run **Release** by hand: `bump=major` if it is breaking, otherwise the bump the summary shows. |
 | `ci.yml is '…' at <sha>` | CI is missing, still running, or red for that exact commit. | Wait for CI or fix `main`. The next Monday tries again. |
-| `the previous release vX.Y.Z is not a published GitHub Release` / `not verifiably on PyPI` | The last release stopped half way. The schedule never skips past it. | Finish that release (see the escape hatches below), or supersede it by hand. |
+| `the previous release vX.Y.Z is not a published GitHub Release` / `not verifiably on PyPI` | The last release has not been published to PyPI yet, or stopped half way. The schedule never skips past it. | Dispatch **Publish to PyPI** with `environment: release` from that tag, and have another maintainer approve; or finish or supersede it by hand. |
 
 ## Cutting a release by hand
 
@@ -148,9 +156,10 @@ daylight saving):
 
 Runs exactly what a published GitHub Release runs: `verify-release-version` (tag, tree
 and both indexes), the builds, `publish-testpypi`, `smoke-test`, then `publish-pypi`
-behind the maintainer approval gate. The scheduled release dispatches this mode on the
-tag it pushed. Dispatched from a branch instead of a `v*` tag, it fails in
-`verify-release-version`.
+behind the maintainer approval gate. This is how both the weekly release and a hand-cut
+release reach PyPI: a maintainer dispatches it from the `v*` tag `release.yml` pushed,
+and another maintainer approves. Dispatched from a branch instead of a `v*` tag, it fails
+in `verify-release-version`.
 
 ### Manual TestPyPI-only publish (no release)
 

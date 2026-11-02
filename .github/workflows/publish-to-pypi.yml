@@ -9,8 +9,9 @@ on:
       # `release` runs the SAME chain a `release` event runs, from a v* tag:
       # verify -> build -> TestPyPI -> smoke test -> maintainer-approved PyPI. It exists
       # because a GitHub Release created by release.yml under GITHUB_TOKEN never emits
-      # `on: release`, while a workflow_dispatch sent with GITHUB_TOKEN does start a run;
-      # release.yml's scheduled path dispatches this mode on the tag it just pushed.
+      # `on: release`. A maintainer dispatches it on the tag release.yml pushed (release.yml
+      # itself never dispatches anything), so prevent_self_review on the `pypi` environment
+      # makes a second maintainer approve the upload.
       environment:
         description: 'testpypi or pypi alone, or release: the full chain from a v* tag'
         required: true

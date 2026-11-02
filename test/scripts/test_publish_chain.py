@@ -1,10 +1,15 @@
 """Which publish jobs run on which trigger, decided by EVALUATING the workflows' ``if:``s.
 
 Review on PR #652, N1: a GitHub Release created by ``release.yml`` under ``GITHUB_TOKEN``
-never emits ``on: release``, so the scheduled path could never reach PyPI. The fix is a
-``release`` mode for ``publish-to-pypi.yml``'s dispatch, which ``GITHUB_TOKEN`` CAN start.
-It must run the release-event chain with every gate in it: the version check, TestPyPI,
-the smoke test, and the ``pypi`` environment's required reviewers.
+never emits ``on: release``, so a release it cut never reached PyPI. The fix is a
+``release`` mode for ``publish-to-pypi.yml``'s dispatch, which a MAINTAINER starts from the
+tag. It must run the release-event chain with every gate in it: the version check,
+TestPyPI, the smoke test, and the ``pypi`` environment's required reviewers.
+
+Nothing in ``release.yml`` may start it (independent review, P2-2, and the user's ruling
+"Keep two people"): a dispatch by ``GITHUB_TOKEN`` has the bot as its actor, so
+``prevent_self_review`` would exclude nobody and ONE maintainer could ship. With a person
+dispatching, a second maintainer must approve.
 
 Substring checks over ``if:`` expressions cannot show that, so this file parses the GitHub
 expression subset these workflows use and simulates the job graph, including GitHub's
@@ -296,10 +301,32 @@ class TestTheGatesAreUnchanged:
 
 
 # --------------------------------------------------------------------------------------
-# release.yml starts the chain on a schedule, and only there
+# release.yml stops at the GitHub Release; nothing in it can start a workflow
 # --------------------------------------------------------------------------------------
 
 RELEASE = _load("release.yml")
+RELEASE_TEXT = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+
+#: Every action release.yml may use. A new one (a "workflow-dispatch" action, say) has to be
+#: added here on purpose, in review.
+RELEASE_ACTIONS = {
+    "actions/checkout",
+    "actions/setup-python",
+    "astral-sh/setup-uv",
+    "taiki-e/install-action",
+    "softprops/action-gh-release",
+}
+
+#: Ways a workflow can start another run: the CLI, the REST dispatch endpoints, or a
+#: repository_dispatch event.
+DISPATCH_PATTERNS = (
+    r"\bgh\s+workflow\s+run\b",
+    r"\bgh\s+api\b",
+    r"/dispatches\b",
+    r"repository_dispatch",
+    r"api\.github\.com",
+    r"publish-to-pypi\.yml",
+)
 
 
 def release_context(event: str, should_release: str = "true") -> Dict[str, Optional[str]]:
@@ -310,59 +337,74 @@ def release_context(event: str, should_release: str = "true") -> Dict[str, Optio
     }
 
 
-class TestTheScheduleStartsThePublish:
-    def test_a_scheduled_release_dispatches_the_publish_chain(self):
-        results = simulate(RELEASE, release_context("schedule"))
-        assert results["start-publish"] == "success"
+def _effective_permissions(job: Mapping[str, Any]) -> Any:
+    return job.get("permissions", RELEASE.get("permissions"))
 
-    def test_a_manual_release_leaves_the_publish_to_the_maintainer(self):
-        """So the maintainer is the publish run's actor, and prevent_self_review holds."""
-        results = simulate(RELEASE, release_context("workflow_dispatch"))
-        assert results["release"] == "success"
-        assert results["start-publish"] == "skipped"
 
-    @pytest.mark.parametrize("failing", ["preflight", "release"])
-    def test_nothing_is_dispatched_after_a_failure(self, failing):
-        results = simulate(RELEASE, release_context("schedule"), {failing: "failure"})
-        assert results["start-publish"] == "skipped"
+class TestNoJobCanDispatchAWorkflow:
+    """The structural guard for "Keep two people". Starting a workflow needs a token with
+    `actions: write` and a call to a dispatch API; release.yml has neither, anywhere."""
 
-    def test_nothing_is_dispatched_when_the_preflight_declines(self):
+    @pytest.mark.parametrize("job", sorted(RELEASE["jobs"]))
+    def test_no_job_can_hold_actions_write(self, job):
+        permissions = _effective_permissions(RELEASE["jobs"][job])
+        assert isinstance(permissions, dict), f"{job}: permissions must be an explicit map"
+        assert permissions.get("actions") in (None, "read", "none"), job
+
+    def test_the_workflow_default_grants_no_write_but_contents_read(self):
+        assert RELEASE["permissions"] == {"contents": "read"}
+
+    @pytest.mark.parametrize("pattern", DISPATCH_PATTERNS)
+    def test_no_step_calls_a_dispatch_api(self, pattern):
+        for name, job in RELEASE["jobs"].items():
+            for step in job.get("steps") or []:
+                run = str(step.get("run", ""))
+                assert not re.search(pattern, run), f"{name}: {pattern!r} in a run: block"
+
+    def test_only_the_known_actions_are_used(self):
+        used = {
+            step["uses"].split("@", 1)[0]
+            for job in RELEASE["jobs"].values()
+            for step in job.get("steps") or []
+            if "uses" in step
+        }
+        assert used == RELEASE_ACTIONS
+
+    def test_the_jobs_are_exactly_preflight_and_release(self):
+        assert set(RELEASE["jobs"]) == {"preflight", "release"}
+
+    def test_no_new_secret_is_introduced(self):
+        assert set(re.findall(r"secrets\.(\w+)", RELEASE_TEXT)) == {
+            "RELEASE_DEPLOY_KEY",
+            "GITHUB_TOKEN",
+        }
+
+
+class TestBothEventsStopAtTheGitHubRelease:
+    @pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
+    def test_a_release_runs_preflight_and_release_only(self, event):
+        assert _ran(simulate(RELEASE, release_context(event))) == {"preflight", "release"}
+
+    def test_nothing_runs_past_a_declined_preflight(self):
         results = simulate(RELEASE, release_context("schedule", should_release="false"))
         assert results["release"] == "skipped"
-        assert results["start-publish"] == "skipped"
 
     def test_a_fork_does_nothing(self):
         context = release_context("schedule")
         context["github.repository"] = "someone/fork"
         assert _ran(simulate(RELEASE, context)) == set()
 
-    def _job(self) -> Dict[str, Any]:
-        return RELEASE["jobs"]["start-publish"]
-
-    def test_the_dispatch_targets_the_new_tag_in_release_mode(self):
-        (step,) = self._job()["steps"]
+    def test_the_summary_tells_both_events_how_to_publish(self):
+        steps = RELEASE["jobs"]["release"]["steps"]
+        (step,) = [s for s in steps if s.get("name") == "Say how this release reaches PyPI"]
+        assert "if" not in step, "the scheduled run needs the same instructions"
         run = step["run"]
-        assert "gh workflow run publish-to-pypi.yml" in run
-        assert '--ref "v$VERSION"' in run
-        assert "-f environment=release" in run
+        for phrase in ("Publish to PyPI", "tag \\`v$VERSION\\`", "environment \\`release\\`"):
+            assert phrase in run, phrase
+        assert "Another maintainer approves the PyPI step." in run
         assert "${{" not in run
-        assert step["env"]["VERSION"] == "${{ needs.release.outputs.version }}"
-        assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
-        assert RELEASE["jobs"]["release"]["outputs"]["version"] == (
-            "${{ steps.bump.outputs.version }}"
-        )
-
-    def test_the_dispatching_job_holds_only_actions_write_and_runs_no_action(self):
-        job = self._job()
-        assert job["permissions"] == {"actions": "write"}
-        assert all("uses" not in step for step in job["steps"])
-
-    def test_no_new_secret_is_introduced(self):
-        text = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
-        assert set(re.findall(r"secrets\.(\w+)", text)) == {"RELEASE_DEPLOY_KEY", "GITHUB_TOKEN"}
-
-    def test_the_release_job_cannot_start_workflows_itself(self):
-        assert "actions" not in RELEASE["jobs"]["release"]["permissions"]
+        assert step["env"]["VERSION"] == "${{ steps.bump.outputs.version }}"
+        assert steps.index(step) == len(steps) - 1, "it is the release job's last step"
 
 
 def _iter_ifs(workflow: Mapping[str, Any]) -> Iterable[str]:

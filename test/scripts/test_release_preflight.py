@@ -856,6 +856,13 @@ class TestReleasingDocDescribesTheRealBehaviour:
         assert "environment: release" in self.TEXT
         assert "use workflow from the tag" in self.TEXT
 
+    def test_it_says_publishing_takes_two_maintainers_on_every_path(self):
+        """Review of #652, P2-2, and the user's ruling "Keep two people"."""
+        assert "two maintainers" in self.TEXT
+        assert "**different** maintainer approves" in self.TEXT
+        assert "start-publish" not in self.TEXT
+        assert "as always" not in self.TEXT
+
 
 #: The shape of 93700ab4 on main (#1119): a `!` subject that the squash repeats as a bullet.
 REPEATED_BANG = """build(deps)!: require Python 3.11 so dnspython 2.9.0 clears CVE-2026-114605 (#1119)
