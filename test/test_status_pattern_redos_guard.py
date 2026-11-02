@@ -22,7 +22,8 @@ list a new pattern:
   so the list cannot rot.
 
 Modules are covered once they are listed in ``MODULES``; providers not yet
-listed here are not covered. To add one, list it, run this file, and register
+listed here are not covered (an inlined ``re.search(r"...")`` literal is not a
+discovered pattern either). To add one, list it, run this file, and register
 or exempt what it reports.
 """
 
@@ -36,15 +37,18 @@ from test.security.redos_analysis import (
     pattern_probe,
     structural_issues,
 )
-from typing import Union
+from typing import Optional, Union
 
 import pytest
 
-#: Provider module -> how to build an instance whose per-instance patterns are discovered.
-MODULES = {
-    "claude_code": ("ClaudeCodeProvider", ("t", "s", "w")),
-    "codex": ("CodexProvider", ("t", "s", "w")),
-    "kiro_cli": ("KiroCliProvider", ("t", "s", "w", "developer")),
+#: Module (under cli_agent_orchestrator) -> the provider class to instantiate, and its
+#: arguments, so its per-instance patterns are discovered too (None: module level only).
+MODULES: dict[str, Optional[tuple[str, tuple[str, ...]]]] = {
+    "providers.claude_code": ("ClaudeCodeProvider", ("t", "s", "w")),
+    "providers.codex": ("CodexProvider", ("t", "s", "w")),
+    "providers.kiro_cli": ("KiroCliProvider", ("t", "s", "w", "developer")),
+    # Classifies the same providers' prompts, with their patterns.
+    "services.agui.handoff_approval": None,
 }
 
 #: Discovered name -> (how callers run it, the flags they add).
@@ -148,14 +152,18 @@ def _discover() -> dict[str, Regex]:
         if isinstance(value, re.Pattern) or (named_like_a_regex and _is_regex(value)):
             found[name] = value  # type: ignore[assignment]
 
-    for module_name, (class_name, args) in MODULES.items():
-        module = importlib.import_module(f"cli_agent_orchestrator.providers.{module_name}")
+    for module_path, instance_spec in MODULES.items():
+        module = importlib.import_module(f"cli_agent_orchestrator.{module_path}")
+        module_name = module_path.rsplit(".", 1)[-1]
         for name, value in vars(module).items():
             if inspect.isclass(value) and value.__module__ == module.__name__:
                 for attr, attr_value in vars(value).items():
                     take(f"{module_name}.{name}.{attr}", attr_value, bool(_CONSTANT.match(attr)))
             else:
                 take(f"{module_name}.{name}", value, bool(_CONSTANT.match(name)))
+        if instance_spec is None:
+            continue
+        class_name, args = instance_spec
         instance = getattr(module, class_name)(*args)
         for attr, value in vars(instance).items():
             take(f"{module_name}.{class_name}().{attr}", value, bool(_INSTANCE.search(attr)))
