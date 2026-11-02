@@ -19,8 +19,8 @@ def test_engine_round_trip_and_legacy_kiro_default(tmp_path, monkeypatch):
         "developer",
         engine="kas",
     )
-    assert created["engine"] == "kas"
-    assert db_mod.get_terminal_metadata("newkiro1")["engine"] == "kas"
+    assert created["engine"] == "v3"
+    assert db_mod.get_terminal_metadata("newkiro1")["engine"] == "v3"
 
     db_mod.create_terminal("legacy01", "cao-session", "old", "kiro_cli", "developer")
     assert db_mod.get_terminal_metadata("legacy01")["engine"] == "v2"

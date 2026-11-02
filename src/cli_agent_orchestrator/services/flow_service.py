@@ -96,7 +96,7 @@ def add_flow(file_path: str) -> Flow:
             raise ValueError(f"Invalid cron expression '{schedule}': {e}")
 
         # Construct the model before persisting the registration so front-matter
-        # engine values receive Pydantic's canonical v2/kas validation.
+        # engine values receive Pydantic's canonical v2/v3 validation (kas is read as v3).
         validated_flow = Flow(
             name=name,
             file_path=str(path),

@@ -48,6 +48,7 @@ properties are asserted here that prose review kept missing:
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -57,6 +58,8 @@ from typing import NamedTuple
 
 import pytest
 import yaml
+
+from cli_agent_orchestrator.utils import markdown_links
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -1141,17 +1144,28 @@ DEPENDENCY_SECURITY_ACTION = (
 )
 
 
-def _dependency_section() -> str:
+def _dependency_section() -> str | None:
+    """The dependency section's text, or ``None`` if its heading is gone.
+
+    Returns ``None`` instead of raising because the parametrize below calls this
+    at COLLECTION time. ``str.index`` raised ``ValueError`` there, so a renamed
+    heading errored the whole module and none of its other tests ran. Now the
+    parametrize collects nothing and ``test_the_section_exists`` fails by name.
+    A section that runs to the end of the file is accepted rather than raising
+    for the same reason.
+    """
     text = _skill_text()
-    start = text.index(DEPENDENCY_SECTION_HEADING)
-    end = text.index("\n## ", start + len(DEPENDENCY_SECTION_HEADING))
-    return text[start:end]
+    start = text.find(DEPENDENCY_SECTION_HEADING)
+    if start == -1:
+        return None
+    end = text.find("\n## ", start + len(DEPENDENCY_SECTION_HEADING))
+    return text[start:] if end == -1 else text[start:end]
 
 
 def _dependency_section_paths() -> set[str]:
     """Repo paths the dependency section names, read out of its backtick spans."""
     paths: set[str] = set()
-    for span in re.findall(_BACKTICK_SPAN_PATTERN, _dependency_section()):
+    for span in re.findall(_BACKTICK_SPAN_PATTERN, _dependency_section() or ""):
         span = span.strip()
         if span in DEPENDENCY_SECTION_BARE_FILE_NAMES:
             paths.add(span)
@@ -1159,11 +1173,35 @@ def _dependency_section_paths() -> set[str]:
     return paths
 
 
+TRIVY_SETUP_ACTION = "aquasecurity/setup-trivy@"
+
+
+def _pinned_trivy_version(action_text: str) -> str | None:
+    """The ``with.version`` of the step that installs Trivy, without its ``v``.
+
+    Read from that step rather than from the first ``version:`` in the file,
+    which would pick up any other step's pin listed above it.
+    """
+    action = yaml.safe_load(action_text) or {}
+    steps = (action.get("runs") or {}).get("steps") or []
+    for step in steps:
+        if not str(step.get("uses", "")).startswith(TRIVY_SETUP_ACTION):
+            continue
+        match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", str((step.get("with") or {}).get("version", "")))
+        return match.group(1) if match else None
+    return None
+
+
 class TestDependencySectionMatchesTheRepo:
     """#1120: the lockfile and CVE-floor rules must point at real files and versions."""
 
     def test_the_section_exists(self):
-        assert DEPENDENCY_SECTION_HEADING in _skill_text()
+        assert _dependency_section() is not None, (
+            f"{SKILL.relative_to(REPO_ROOT)} has no {DEPENDENCY_SECTION_HEADING!r} heading. "
+            "If it was renamed, update DEPENDENCY_SECTION_HEADING and the "
+            "(#dependency-and-lockfile-changes) anchor that links to it; until then "
+            "the path checks below collect nothing."
+        )
 
     def test_the_pre_pr_checklist_links_to_it(self):
         assert "(#dependency-and-lockfile-changes)" in _skill_text()
@@ -1194,13 +1232,36 @@ class TestDependencySectionMatchesTheRepo:
         assert path.exists(), f"{quoted!r} is named but does not exist"
 
     def test_security_md_names_the_trivy_version_ci_pins(self):
-        pinned = re.search(r"version:\s*v?(\d+\.\d+\.\d+)", DEPENDENCY_SECURITY_ACTION.read_text())
+        pinned = _pinned_trivy_version(DEPENDENCY_SECURITY_ACTION.read_text(encoding="utf-8"))
         assert pinned, "the dependency-security action no longer pins a Trivy version"
         security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
-        assert f"Trivy {pinned.group(1)}" in security, (
+        assert f"Trivy {pinned}" in security, (
             f"the skill sends readers to SECURITY.md for the Trivy version, but SECURITY.md "
-            f"does not name the pinned {pinned.group(1)}"
+            f"does not name the pinned {pinned}"
         )
+
+    def test_the_trivy_version_is_read_from_the_trivy_step(self):
+        """Another step's ``version:`` must not be mistaken for Trivy's.
+
+        The real action happens to list the Trivy step first, so the tree alone
+        cannot show the difference. This puts a different step's ``version:``
+        ahead of it.
+        """
+        action = (
+            "runs:\n"
+            "  using: composite\n"
+            "  steps:\n"
+            "    - name: Set up something else\n"
+            "      uses: example/setup-tool@0000000000000000000000000000000000000000\n"
+            "      with:\n"
+            "        version: v9.9.9\n"
+            "    - name: Install Trivy\n"
+            "      uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567\n"
+            "      with:\n"
+            "        version: v0.70.0\n"
+        )
+        assert _pinned_trivy_version(action) == "0.70.0"
+        assert _pinned_trivy_version(action.replace("aquasecurity/setup-trivy", "x/y")) is None
 
 
 # --- Absolute self-links, which CI's link checker does not see ----------------
@@ -1266,26 +1327,91 @@ def _skill_markdown_files(skill_dir: Path) -> list[Path]:
 def _absolute_self_links(skill_dir: Path = CONTRIBUTING_SKILL_DIR) -> list[AbsoluteSelfLink]:
     links: list[AbsoluteSelfLink] = []
     for path in _skill_markdown_files(skill_dir):
-        text = path.read_text(encoding="utf-8")
-        for match in _ABSOLUTE_SELF_LINK_PATTERN.finditer(text):
-            links.append(
-                AbsoluteSelfLink(
-                    path=match.group("path"),
-                    anchor=match.group("anchor"),
-                    source=path.name,
-                )
-            )
+        links.extend(_absolute_self_links_in(path, source=path.name))
     return links
+
+
+def _absolute_self_links_in(path: Path, source: str) -> list[AbsoluteSelfLink]:
+    text = path.read_text(encoding="utf-8")
+    return [
+        AbsoluteSelfLink(path=match.group("path"), anchor=match.group("anchor"), source=source)
+        for match in _ABSOLUTE_SELF_LINK_PATTERN.finditer(text)
+    ]
+
+
+# --- The same links in the generated agent-plugin/ packages ------------------
+#
+# ``scripts/build_agent_plugin.py`` writes absolute links into each package's
+# README.md and CHANGELOG.md, and the validator skips those for the same reason
+# (#1168, also listed on #1154). Two kinds point back at this repo: a
+# ``blob/main`` link, checked exactly like the skill's, and a
+# ``releases/tag/v<version>`` link to the release notes. A tag cannot be
+# checked offline, so the check is that it names the version the package
+# itself declares in plugin.json; a link to any other release is wrong even if
+# that release exists.
+
+AGENT_PLUGIN_DIR = REPO_ROOT / "agent-plugin"
+GENERATED_PLUGIN_DOCS = ("README.md", "CHANGELOG.md")
+RELEASE_TAG_PREFIX = "https://github.com/awslabs/cli-agent-orchestrator/releases/tag/"
+_RELEASE_TAG_LINK_PATTERN = re.compile(re.escape(RELEASE_TAG_PREFIX) + r"(?P<tag>[^)\s#]+)")
+
+
+class ReleaseTagLink(NamedTuple):
+    """One release-notes link: its tag, the version its package declares, and its file."""
+
+    tag: str
+    package_version: str
+    source: str
+
+
+def _plugin_package_dirs() -> list[Path]:
+    return sorted(path.parent for path in AGENT_PLUGIN_DIR.glob("*/plugin.json"))
+
+
+def _generated_plugin_docs(package_dir: Path) -> list[tuple[Path, str]]:
+    """Each generated doc that exists, paired with its repo-relative path."""
+    docs = [package_dir / name for name in GENERATED_PLUGIN_DOCS]
+    return [(path, path.relative_to(REPO_ROOT).as_posix()) for path in docs if path.is_file()]
+
+
+def _generated_plugin_self_links() -> list[AbsoluteSelfLink]:
+    links: list[AbsoluteSelfLink] = []
+    for package_dir in _plugin_package_dirs():
+        for path, source in _generated_plugin_docs(package_dir):
+            links.extend(_absolute_self_links_in(path, source=source))
+    return links
+
+
+def _generated_plugin_release_tag_links() -> list[ReleaseTagLink]:
+    links: list[ReleaseTagLink] = []
+    for package_dir in _plugin_package_dirs():
+        manifest = json.loads((package_dir / "plugin.json").read_text(encoding="utf-8"))
+        version = str(manifest.get("version", ""))
+        for path, source in _generated_plugin_docs(package_dir):
+            for match in _RELEASE_TAG_LINK_PATTERN.finditer(path.read_text(encoding="utf-8")):
+                links.append(ReleaseTagLink(match.group("tag"), version, source))
+    return links
+
+
+def _release_tag_problem(link: ReleaseTagLink) -> str | None:
+    if link.tag == f"v{link.package_version}":
+        return None
+    return (
+        f"{link.source} links to the release notes for {link.tag!r}, but its package "
+        f"declares version {link.package_version!r} in plugin.json, so the link should "
+        f"name 'v{link.package_version}'"
+    )
 
 
 def _github_heading_slugs(markdown: str) -> set[str]:
     """The anchors GitHub generates for a Markdown file's ATX headings.
 
-    Mirrors ``github-slugger``, which is what GitHub runs: take the heading's
-    rendered text, lowercase it, drop every character that is not a letter,
-    digit, space, hyphen or underscore, then replace spaces with hyphens. A
-    repeated slug gets ``-1``, ``-2``, ... appended, so the second
-    ``## Notes`` is reachable as ``#notes-1``.
+    The slug rule itself is ``markdown_links._github_slug``, the one
+    ``scripts/validate_markdown_links.py`` uses, so the two checkers cannot
+    drift on unicode or whitespace (#1168). This function only finds the
+    headings and approximates their rendered text. A repeated slug gets
+    ``-1``, ``-2``, ... appended, so the second ``## Notes`` is reachable as
+    ``#notes-1``.
 
     Fenced blocks are skipped. A ``# comment`` inside a ``bash`` fence is not a
     heading, and admitting it would invent slugs -- which would make a WRONG
@@ -1306,7 +1432,7 @@ def _github_heading_slugs(markdown: str) -> set[str]:
         text = heading.group(2)
         text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)  # a link contributes its text
         text = text.replace("`", "")
-        slug = re.sub(r"[^\w\- ]", "", text.lower()).replace(" ", "-")
+        slug = markdown_links._github_slug(text)
         if not slug:
             continue
         occurrence = seen.get(slug, 0)
@@ -1364,8 +1490,6 @@ class TestAbsoluteSelfLinksResolve:
         rather than leaving two checkers with different rules.
         """
         from markdown_it import MarkdownIt
-
-        from cli_agent_orchestrator.utils import markdown_links
 
         unresolvable = f"{BLOB_MAIN_PREFIX}NO_SUCH_FILE_ANYWHERE.md#no-such-anchor"
         skipped = markdown_links._validate_destination(
@@ -1427,6 +1551,57 @@ class TestAbsoluteSelfLinksResolve:
             f"{problem}. These links are invisible to scripts/validate_markdown_links.py, "
             "so nothing else in CI will catch this."
         )
+
+    def test_every_generated_plugin_package_has_links_to_check(self):
+        """Floor for the two parametrizes below: each package contributes both kinds."""
+        packages = {path.relative_to(REPO_ROOT).as_posix() for path in _plugin_package_dirs()}
+        assert packages, f"no */plugin.json found under {AGENT_PLUGIN_DIR.relative_to(REPO_ROOT)}"
+        with_self_link = {link.source.rsplit("/", 1)[0] for link in _generated_plugin_self_links()}
+        with_tag_link = {
+            link.source.rsplit("/", 1)[0] for link in _generated_plugin_release_tag_links()
+        }
+        assert packages <= with_self_link, (
+            f"No {BLOB_MAIN_PREFIX}... link in the generated docs of "
+            f"{sorted(packages - with_self_link)}. build_agent_plugin.py writes one into every "
+            "README.md; if it stopped, lower this floor deliberately."
+        )
+        assert packages <= with_tag_link, (
+            f"No {RELEASE_TAG_PREFIX}... link in the generated docs of "
+            f"{sorted(packages - with_tag_link)}. build_agent_plugin.py writes one into every "
+            "CHANGELOG.md; if it stopped, lower this floor deliberately."
+        )
+
+    @pytest.mark.parametrize(
+        "link", _generated_plugin_self_links(), ids=lambda link: f"{link.source}:{link.path}"
+    )
+    def test_every_generated_plugin_self_link_resolves(self, link: AbsoluteSelfLink):
+        problem = _absolute_link_problem(link)
+        assert problem is None, (
+            f"{problem}. The link is written by scripts/build_agent_plugin.py; fix it there "
+            "and regenerate, since make check-agent-plugin rejects a hand edit."
+        )
+
+    @pytest.mark.parametrize(
+        "link", _generated_plugin_release_tag_links(), ids=lambda link: f"{link.source}:{link.tag}"
+    )
+    def test_every_generated_release_notes_link_names_the_package_version(
+        self, link: ReleaseTagLink
+    ):
+        problem = _release_tag_problem(link)
+        assert problem is None, problem
+
+    @pytest.mark.parametrize(
+        "link,broken",
+        [
+            (ReleaseTagLink("v2.5.3", "2.5.3", "agent-plugin/cao/CHANGELOG.md"), False),
+            (ReleaseTagLink("v2.5.2", "2.5.3", "agent-plugin/cao/CHANGELOG.md"), True),
+            (ReleaseTagLink("2.5.3", "2.5.3", "agent-plugin/cao/CHANGELOG.md"), True),
+        ],
+    )
+    def test_the_release_tag_check_distinguishes_right_from_wrong(
+        self, link: ReleaseTagLink, broken: bool
+    ):
+        assert (_release_tag_problem(link) is not None) is broken
 
     @pytest.mark.parametrize(
         "link,expected_fragment",
@@ -1507,6 +1682,30 @@ class TestTheGithubSlugRule:
             "SECURITY.md no longer has a heading that slugs to 'full-dependency-gate'. "
             "The skill links there with that anchor; fix one or the other."
         )
+
+    @pytest.mark.parametrize(
+        "markdown",
+        [
+            pytest.param("## A\u00a0B", id="no-break-space"),
+            pytest.param("## Tab\tinside", id="tab"),
+            pytest.param("## Caf\u00e9 r\u00e9sum\u00e9", id="accented"),
+            pytest.param("## \uff26ull width", id="full-width"),
+        ],
+    )
+    def test_it_agrees_with_the_link_validator(self, markdown: str, tmp_path: Path):
+        """The two sluggers must not drift on unicode or whitespace (#1168).
+
+        ``scripts/validate_markdown_links.py`` checks relative anchors with
+        ``markdown_links._heading_slugs``; this module checks absolute ones. If
+        the two disagreed, the same anchor would pass one check and fail the
+        other.
+        """
+        from markdown_it import MarkdownIt
+
+        page = tmp_path / "page.md"
+        page.write_text(markdown, encoding="utf-8")
+        expected = markdown_links._heading_slugs(page, MarkdownIt("commonmark"))
+        assert _github_heading_slugs(markdown) == expected
 
 
 # NOTE: there is deliberately no test here that the packaged mirror matches

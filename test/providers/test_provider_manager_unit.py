@@ -9,7 +9,7 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
 from cli_agent_orchestrator.providers.manager import ProviderManager
 from cli_agent_orchestrator.providers.omp import OmpProvider
 
@@ -443,8 +443,9 @@ def test_get_provider_marks_kiro_initialized_on_restore():
     assert provider._initialized is True
 
 
-def test_get_provider_rejects_persisted_kas_before_provider_construction():
-    """A persisted KAS terminal is never restored as a runnable provider."""
+@pytest.mark.parametrize("stored", ["v3", "kas"])
+def test_get_provider_rejects_persisted_v3_before_provider_construction(stored):
+    """A persisted v3 terminal (either spelling) is never restored as a runnable provider."""
     manager = ProviderManager()
 
     with (
@@ -455,14 +456,17 @@ def test_get_provider_rejects_persisted_kas_before_provider_construction():
                 "tmux_session": "s1",
                 "tmux_window": "w1",
                 "agent_profile": "developer",
-                "engine": "kas",
+                "engine": stored,
             },
         ),
         patch("cli_agent_orchestrator.providers.manager.KiroCliProvider") as provider_class,
+        patch.object(manager, "create_provider") as create_provider,
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
+        with pytest.raises(KiroV3UnavailableError, match="not available yet"):
             manager.get_provider("t1")
 
+    # Refused from the row itself, before restore reaches create_provider.
+    create_provider.assert_not_called()
     provider_class.assert_not_called()
     assert "t1" not in manager._providers
 
@@ -580,3 +584,63 @@ def test_create_provider_session_id_rejected_for_other_providers():
             agent_profile=None,
             session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
         )
+
+
+# A decided per-launch effort (#1068 C, #1083 ruling) reaches only the two providers that
+# honor it; every other provider still constructs with the parameter ignored.
+
+
+def test_create_provider_effort_reaches_claude_code():
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value,
+        terminal_id="t-effort-cc",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        effort="high",
+    )
+
+    assert isinstance(provider, ClaudeCodeProvider)
+    assert provider._effort == "high"
+
+
+def test_create_provider_effort_reaches_codex():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CODEX.value,
+        terminal_id="t-effort-codex",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        effort="high",
+    )
+
+    assert isinstance(provider, CodexProvider)
+    assert provider._effort == "high"
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [
+        ProviderType.COPILOT_CLI.value,
+        ProviderType.HERMES.value,
+        ProviderType.OMP.value,
+        ProviderType.MOCK_CLI.value,
+    ],
+)
+def test_create_provider_effort_is_ignored_by_other_providers(provider_type):
+    # None of these providers declare an effort config; passing effort must not raise.
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        provider_type,
+        terminal_id="t-effort-other",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        effort="high",
+    )
+
+    assert manager.get_provider("t-effort-other") is provider

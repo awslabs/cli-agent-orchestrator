@@ -45,7 +45,8 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 - `POST /ephemeral-agents/{name}/claim?caller_id=<creator-terminal-id>` claims it under a lease,
   rechecks policy and finalizes the profile. Its body accepts optional `idempotency_key`,
   `claim_id` and `model`; per-call models refuse. It returns the claim, provider and stored tools,
-  or a matching launched terminal with `replayed: true`.
+  and `provider_auto` (whether the spec declared `provider: "auto"`), or a matching launched
+  terminal with `replayed: true`.
 - `POST /sessions/{session}/terminals` launches it with `agent_profile`, `caller_id`, `provider`
   and optional `claim_id` query parameters. Claims are 32 lowercase hexadecimal characters.
   `POST /sessions` has no caller or claim parameter and refuses a created, pending ephemeral

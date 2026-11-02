@@ -1,6 +1,7 @@
 # Design Document: cao-agent-plugins
 
 > **Issue of record:** [awslabs/cli-agent-orchestrator#573](https://github.com/awslabs/cli-agent-orchestrator/issues/573) — "[Feat] Agent Plugins 1.0 support — package the CAO ecosystem as portable plugins + a plugin install/marketplace surface" (labels `enhancement`, `feature`).
+> **Frozen as history:** this record describes the tree as it stood when #573 was designed and is not kept current. Where it calls `cao-contributing` conditional on #448 or not present, that has since changed: #448 merged, and #1121 added the skill to the `cao-contributor` package.
 > **Maintainer decisions:** **M1 is decided — Option A, `cao plugin` for agent plugins**
 > (recorded in [Naming and Namespacing](#naming-and-namespacing) and in the
 > [decisions table](#decisions-requiring-maintainer-sign-off)). **M2**–**M4** remain
