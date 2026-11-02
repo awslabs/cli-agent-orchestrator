@@ -265,6 +265,25 @@ TIEBREAK_CASES = [
         dict(options=TWO, fallback="codex"),
         ("codex", "large"),
     ),
+    # The steps' order: cost before tier. The cheaper candidate is at the higher tier, so a tier
+    # step run first would pick claude_code/medium instead.
+    (
+        "cost",
+        {"claude_code": {"cc-m": decl(1000000, "high")}, "codex": {"cx-l": decl(1000000, "low")}},
+        dict(options=TWO),
+        ("codex", "large"),
+    ),
+    # Tier before the fallback. The creator's candidate is at the higher tier, so a fallback
+    # step run first would pick claude_code/large instead.
+    (
+        "tier",
+        {
+            "claude_code": {"cc-l": decl(1000000, "medium")},
+            "codex": {"cx-m": decl(1000000, "medium")},
+        },
+        dict(options=TWO),
+        ("codex", "medium"),
+    ),
     (
         "order",
         {
