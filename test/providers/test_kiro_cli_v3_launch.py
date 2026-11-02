@@ -270,6 +270,27 @@ async def test_a_per_tool_grant_is_not_attested_on_a_tools_panel_read_while_load
 
 
 @pytest.mark.asyncio
+async def test_a_server_that_never_finishes_loading_refuses_before_tools_is_read(cwd):
+    """The ``/mcp`` re-reads end in a refusal, never in a ``/tools`` read: with a
+    per-tool grant, a ``/tools`` panel read while the server loads would show
+    none of its tools and pass blind."""
+    from cli_agent_orchestrator.providers import kiro_cli
+
+    pane = LoadingPane(
+        str(cwd),
+        loaded_tools="tools_readonly_mcp",
+        loading_reads=kiro_cli.V3_MCP_LOADING_READS + 1,
+    )
+    provider = _provider(allowed=PER_TOOL[0])
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane, grant=PER_TOOL, provider=provider)
+    assert excinfo.value.code == "kiro_v3_mcp_not_ready"
+    assert provider.identity_verified is False
+    assert pane.tools_shown == []
+    assert pane.keys == [*"/mcp", "Enter", "Escape"]
+
+
+@pytest.mark.asyncio
 async def test_a_per_tool_grant_whose_pane_shows_only_that_tool_attests(cwd):
     """The server a per-tool ref names is a granted server here too (#1178 review)."""
     pane = LoadingPane(str(cwd), loaded_tools=_tools_panel_with(["@cao-mcp-server/send_message"]))

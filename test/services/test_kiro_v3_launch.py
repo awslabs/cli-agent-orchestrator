@@ -463,14 +463,19 @@ async def test_a_bad_kiro_effort_refuses_before_the_probe_with_its_code(agents, 
 # --- the agents directory: Kiro v3 reads only ~/.kiro/agents ----------------------
 
 
-@pytest.fixture
-def elsewhere(tmp_path, fake_home, monkeypatch):
+@pytest.fixture(
+    params=[("cao-agents-dir",), ("other", ".kiro", "agents")],
+    ids=["plain-dir", "another-kiro-agents-dir"],
+)
+def elsewhere(request, tmp_path, fake_home, monkeypatch):
     """``CAO_AGENTS_DIR`` set to a directory other than ``~/.kiro/agents``, holding
-    a valid file, while ``~/.kiro/agents`` (what Kiro reads) is left empty."""
+    a valid file, while ``~/.kiro/agents`` (what Kiro reads) is left empty. The
+    second case is another ``.kiro/agents`` (a project's, or another home's): only
+    this ``HOME``'s passes, not any directory that looks like Kiro's."""
     from cli_agent_orchestrator.services import install_service
 
-    directory = tmp_path / "cao-agents-dir"
-    directory.mkdir()
+    directory = tmp_path.joinpath(*request.param)
+    directory.mkdir(parents=True)
     (directory / "reviewer.json").write_text(_universal("reviewer"))
     monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", directory)
     return directory

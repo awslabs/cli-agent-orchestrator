@@ -377,12 +377,12 @@ its `read` tag also brings `code`, which can write files. So for v3:
 remaining entries could reach beyond the grant (`code` unless `fs_write` is
 granted, and always `knowledge`). The file configures only the MCP servers the
 grant names. A server named only by single tools (`@cao-mcp-server/send_message`)
-is configured too, and its rule allows just those tools. Every capability outside the grant gets an
-unconditional deny, and `power` and `workflow` are always denied. CAO checks
-the file on disk at every v3 launch and refuses one that differs, so
-enforcement on v3 is install-time plus a launch-time check, and the pane's own
-`/tools` and `/mcp` panels are read before the first task. See
-[Kiro v3 (preview)](kiro-cli.md#kiro-v3-preview).
+is configured too, and its rule allows just those tools. Every capability
+outside the grant gets an unconditional deny, and `power` and `workflow` are
+always denied. CAO checks the file on disk at every v3 launch and refuses one
+that differs, so enforcement on v3 is install-time plus a launch-time check,
+and the pane's own `/tools` and `/mcp` panels are read before the first task.
+See [Kiro v3 (preview)](kiro-cli.md#kiro-v3-preview).
 
 **Copilot CLI** — Adds `--deny-tool` flags that override `--allow-all`:
 ```bash
