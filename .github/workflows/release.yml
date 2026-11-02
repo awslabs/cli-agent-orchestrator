@@ -12,11 +12,14 @@ on:
           - minor
           - major
   schedule:
-    # Weekly release, Monday 09:17 UTC. Scheduled runs fail closed if CI for
-    # the exact release SHA is missing or incomplete, or if the prior release
-    # did not reach both GitHub Releases and PyPI. A post-tag publishing failure
-    # requires maintainer recovery of that exact version; a later schedule will
-    # not skip over it.
+    # Weekly release, Monday 09:17 UTC (UTC only; cron does not follow DST).
+    # The bump is derived from Conventional Commits: feat -> minor, else patch.
+    # Scheduled runs fail closed if CI for the exact release SHA is missing or
+    # incomplete, if the prior release did not reach both GitHub Releases and
+    # PyPI, or if the commits call for a MAJOR: a major is never cut
+    # unattended, so the run goes red and a maintainer dispatches bump=major.
+    # A post-tag publishing failure requires maintainer recovery of that exact
+    # version; a later schedule will not skip over it.
     - cron: '17 9 * * 1'
 
 permissions:

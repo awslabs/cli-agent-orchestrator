@@ -25,6 +25,11 @@ WHAT A SCHEDULED RUN CHECKS (a manual dispatch skips all of it)
    or cancelled is a refusal: an unverified release is worse than a late one.
 5. The bump is derived from Conventional Commits: a breaking marker selects ``major``,
    ``feat`` selects ``minor``, anything else ``patch``.
+6. A derived ``major`` is a refusal, never a release. Nothing between the cron and a public
+   tag, GitHub Release and TestPyPI upload involves a person (only the final PyPI step has
+   required reviewers), so the run goes red, lists the breaking commits, and leaves the
+   major to a maintainer: run Release by hand with ``bump=major``. Capping it to ``minor``
+   was rejected: shipping breaking changes under a minor breaks everyone pinned ``<3``.
 
 Every failed check is reported, not just the first, and any failure exits 1 so the run is
 red. Exit 0 means the outputs say what to do (release, or skip an empty week).
@@ -184,15 +189,24 @@ def decide(event: str, sha: str, probe: Probe) -> Decision:
         decision.notes.append(f"no commits since {tag}; skipping this scheduled release")
         return decision
 
-    decision.problems.extend(_check_prior_release(probe, tag))
-    decision.problems.extend(_check_ci(probe, sha))
-    if decision.refused:
-        return decision
-
     decision.derivation = derive_bump(commits)
     decision.bump = decision.derivation.bump
-    decision.should_release = True
+    decision.problems.extend(_check_prior_release(probe, tag))
+    decision.problems.extend(_check_ci(probe, sha))
+    if decision.bump == "major":
+        decision.problems.append(major_refusal(tag, decision.derivation))
+    decision.should_release = not decision.refused
     return decision
+
+
+def major_refusal(tag: str, derivation: Derivation) -> str:
+    shas = ", ".join(c.sha[:8] for c in derivation.breaking)
+    return (
+        f"{len(derivation.breaking)} commit(s) since {tag} carry a breaking-change marker "
+        f"({shas}); a scheduled run never cuts a major release. If the change is breaking, "
+        "run the Release workflow by hand with bump=major; until then every scheduled run "
+        "refuses"
+    )
 
 
 # --------------------------------------------------------------------------------------

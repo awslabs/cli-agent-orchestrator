@@ -272,6 +272,52 @@ class TestScheduledDecision:
         assert len(decision.problems) == 3
 
 
+class TestNoUnattendedMajor:
+    """Review on #652: as written, the next scheduled run would have cut v3.0.0 unattended.
+
+    The tag, the GitHub Release and the TestPyPI upload all happen before the first person
+    (the `pypi` approver) is involved, so a major must be refused, not merely flagged.
+    """
+
+    BREAKING = [
+        commit("feat(cli)!: drop the --json flag", sha="1" * 40),
+        commit("fix: x\n\nbody\n\nBREAKING CHANGE: the API moved\n", sha="2" * 40),
+    ]
+
+    @pytest.mark.parametrize("breaking", BREAKING, ids=["bang-subject", "footer"])
+    def test_a_derived_major_is_refused(self, breaking):
+        probe = FakeProbe(history=[commit("feat: ok"), breaking])
+        decision = rp.decide("schedule", SHA, probe)
+        assert decision.refused and not decision.should_release
+        assert decision.bump == "major"
+        (problem,) = decision.problems
+        assert "never cuts a major" in problem
+        assert breaking.sha[:8] in problem
+        assert "bump=major" in problem
+
+    def test_the_refusal_is_red_and_lists_the_breaking_commits(self, tmp_path, monkeypatch):
+        code, values, _, report = _run_main(
+            tmp_path,
+            monkeypatch,
+            ["--event", "schedule", *BASE_ARGS],
+            FakeProbe(history=list(self.BREAKING)),
+        )
+        assert code == 1
+        assert values["should_release"] == "false"
+        assert values["bump"] == "major"
+        assert "### Breaking" in report
+        assert "drop the --json flag" in report
+
+    def test_a_major_is_reported_alongside_the_other_gates(self):
+        decision = rp.decide("schedule", SHA, FakeProbe(history=self.BREAKING[:1], ci="missing"))
+        assert len(decision.problems) == 2
+
+    def test_minor_and_patch_windows_still_release_unattended(self):
+        for history, bump in (([commit("feat: a")], "minor"), ([commit("fix: a")], "patch")):
+            decision = rp.decide("schedule", SHA, FakeProbe(history=history))
+            assert decision.should_release and decision.bump == bump
+
+
 class TestManualDispatch:
     def test_a_manual_dispatch_releases_without_asking_anything(self):
         probe = FakeProbe()
