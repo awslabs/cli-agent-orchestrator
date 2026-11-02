@@ -220,6 +220,159 @@ class TestDeriveBump:
         assert rp.derive_bump([]).bump == "patch"
 
 
+#: The shape of e2e6318 on main (#525), abridged: a genuine footer that is NOT the last
+#: paragraph, because a GitHub squash appends a rule and its own trailers after it.
+E2E6318_SHAPE = """feat(workflow): async run submit, discovery, and live event following (#505) (#525)
+
+* feat(workflow): async run submit
+
+Records both breaking changes in the CHANGELOG.
+
+BREAKING CHANGE: `cao workflow run --json` emits `{run_id, state}` rather
+than the full WorkflowRunResult. Use `cao workflow result <id>`
+for full detail; per-step outputs are unaffected.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>
+"""
+
+#: The shape of 4f1b8f16 on main (#634): a squashed commit's `!` subject inside the body.
+SQUASHED_BANG = """feat(cli): add cao agent CLI commands for in-session orchestration (#616) (#634)
+
+* feat(cli): add cao agent CLI commands
+
+* feat(cli)!: drop --idempotency-key; keep the substrate for the run record
+
+---------
+
+Co-authored-by: Someone <someone@example.invalid>
+"""
+
+
+class TestWhereAMarkerCounts:
+    """Review on #652, N3: only the subject and the footer carry Conventional Commits markers."""
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "feat: x\n\nbody text\n\nBREAKING CHANGE: the --json shape changed\n",
+            "fix: x\n\nBREAKING CHANGE: one paragraph body that is the footer\n",
+            "fix: x\n\nbody\n\nRefs: #12\nBREAKING-CHANGE: the synonym spelling\n",
+            "fix: x\n\nbody\n\nbreaking change: lower case still reads as breaking\n",
+            "fix: x\n\nbody\n\nBREAKING CHANGE: real\n\nSigned-off-by: A <a@example.invalid>\n",
+            E2E6318_SHAPE,
+        ],
+        ids=["footer", "only-paragraph", "synonym", "lower-case", "then-trailers", "e2e6318"],
+    )
+    def test_a_breaking_change_footer_is_a_major(self, message):
+        derivation = rp.derive_bump([commit(message)])
+        assert derivation.bump == "major"
+        assert derivation.unclear == ()
+
+    @pytest.mark.parametrize(
+        "subject", ["feat(cli)!: drop a flag", "fix!: x", "FIX!: shouted", "build(deps)!: py3.11"]
+    )
+    def test_a_bang_subject_is_a_major(self, subject):
+        assert rp.derive_bump([commit(subject)]).bump == "major"
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "docs: explain footers\n\n> BREAKING CHANGE: an example in a quote\n\nMore prose.\n",
+            "docs: explain footers\n\n```\nBREAKING CHANGE: an example\n\nfix!: another\n```\n",
+            "docs: x\n\nSee the guide.\n\n```text\nBREAKING CHANGE: example\n```\n\nDone.\n",
+            "docs: x\n\nThe `BREAKING CHANGE:` footer is documented here.\n",
+        ],
+        ids=["markdown-quote", "fenced-last", "fenced-middle", "inline-code"],
+    )
+    def test_a_quoted_breaking_change_is_not_a_major_and_not_unclear(self, message):
+        derivation = rp.derive_bump([commit(message)])
+        assert derivation.bump == "patch"
+        assert derivation.breaking == () and derivation.unclear == ()
+
+    def test_a_revert_subject_quoting_a_bang_is_not_a_major(self):
+        assert rp.derive_bump(
+            [commit('Revert "feat!: drop a flag"\n\nThis reverts abc.')]
+        ).bump == ("patch")
+
+    def test_a_marker_in_the_middle_of_a_body_does_not_change_the_bump(self):
+        message = "fix: x\n\nBREAKING CHANGE: quoted from the issue\n\nThis paragraph is prose.\n"
+        derivation = rp.derive_bump([commit(message)])
+        assert derivation.bump == "patch"
+        assert [line for _, line in derivation.unclear] == [
+            "BREAKING CHANGE: quoted from the issue"
+        ]
+
+    def test_a_squashed_commits_bang_subject_is_unclear_not_major(self):
+        derivation = rp.derive_bump([commit(SQUASHED_BANG)])
+        assert derivation.bump == "minor"
+        assert [line for _, line in derivation.unclear] == [
+            "* feat(cli)!: drop --idempotency-key; keep the substrate for the run record"
+        ]
+
+    def test_feat_counts_only_in_the_subject(self):
+        message = "fix: y\n\nfeat: this line only mentions a feature\n\nMore prose.\n"
+        assert rp.derive_bump([commit(message)]).bump == "patch"
+
+    @pytest.mark.parametrize("subject", ["feat: x", "feat(tui): x", "Feat: x"])
+    def test_a_feat_subject_is_a_minor(self, subject):
+        assert rp.derive_bump([commit(subject)]).bump == "minor"
+
+    def test_an_unterminated_fence_does_not_hide_a_footer(self):
+        message = "fix: x\n\n```\nnever closed\n\nBREAKING CHANGE: real\n"
+        assert rp.derive_bump([commit(message)]).bump == "major"
+
+    def test_the_footer_stops_at_the_first_prose_paragraph(self):
+        parsed = rp.parse_message(E2E6318_SHAPE)
+        assert parsed.footer[0].startswith("BREAKING CHANGE:")
+        assert parsed.footer[-1].startswith("Co-authored-by:")
+        assert "Records both breaking changes in the CHANGELOG." in parsed.body
+        assert "---------" in parsed.footer
+
+    def test_an_empty_week_derives_nothing(self):
+        derivation = rp.derive_bump([])
+        assert (derivation.bump, derivation.breaking, derivation.unclear) == ("patch", (), ())
+
+    def test_real_git_messages_parse_the_same_way(self, repo):
+        repo.commit("chore: init")
+        repo.git("tag", "v1.0.0")
+        repo.commit(E2E6318_SHAPE)
+        repo.commit("docs: x\n\n> BREAKING CHANGE: quoted\n")
+        head = repo.git("rev-parse", "HEAD")
+        derivation = rp.derive_bump(repo.probe().commits("v1.0.0", head))
+        assert derivation.bump == "major"
+        assert [c.subject for c in derivation.breaking] == [E2E6318_SHAPE.split("\n", 1)[0]]
+
+
+class TestUnclearMarkersOnASchedule:
+    def test_an_unclear_marker_hands_the_week_to_a_person(self):
+        probe = FakeProbe(history=[commit(SQUASHED_BANG, sha="4" * 40)])
+        decision = rp.decide("schedule", SHA, probe)
+        assert decision.refused and not decision.should_release
+        (problem,) = decision.problems
+        assert "44444444" in problem
+        assert "bump=major if it is breaking, otherwise bump=minor" in problem
+
+    def test_the_summary_shows_the_line(self, tmp_path, monkeypatch):
+        code, _, _, report = _run_main(
+            tmp_path,
+            monkeypatch,
+            ["--event", "schedule", *BASE_ARGS],
+            FakeProbe(history=[commit(SQUASHED_BANG)]),
+        )
+        assert code == 1
+        assert "### Markers outside a subject or footer" in report
+        assert "drop --idempotency-key" in report
+
+    def test_a_quoted_marker_releases_normally(self):
+        message = "docs: explain\n\n> BREAKING CHANGE: an example\n\nMore prose.\n"
+        decision = rp.decide("schedule", SHA, FakeProbe(history=[commit(message)]))
+        assert decision.should_release and decision.bump == "patch"
+
+
 # --------------------------------------------------------------------------------------
 # The scheduled decision
 # --------------------------------------------------------------------------------------

@@ -23,8 +23,11 @@ WHAT A SCHEDULED RUN CHECKS (a manual dispatch skips all of it)
    that stopped half way is recovered by a maintainer; a later schedule never skips it.
 4. ``ci.yml`` must have completed successfully for the exact release SHA. Missing, pending
    or cancelled is a refusal: an unverified release is worse than a late one.
-5. The bump is derived from Conventional Commits: a breaking marker selects ``major``,
-   ``feat`` selects ``minor``, anything else ``patch``.
+5. The bump is derived from Conventional Commits, reading only where the spec puts the
+   markers: a ``!`` subject or a ``BREAKING CHANGE:`` footer selects ``major``, a ``feat``
+   subject ``minor``, anything else ``patch``. A marker elsewhere in a body (a quote, a
+   pasted commit list) never changes the bump; on a schedule it is a refusal instead, since
+   a squash merge can carry a real break in a squashed commit's footer.
 6. A derived ``major`` is a refusal, never a release. Nothing between the cron and a public
    tag, GitHub Release and TestPyPI upload involves a person (only the final PyPI step has
    required reviewers), so the run goes red, lists the breaking commits, and leaves the
@@ -60,9 +63,22 @@ REQUIRED_WORKFLOWS = ("ci.yml",)
 STABLE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
-# The derivation the workflow shell used: every line of every message, subject or body.
-BREAKING_LINE = re.compile(r"^[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:")
-FEAT_LINE = re.compile(r"^feat(\([^)]*\))?:")
+# WHERE A MARKER COUNTS (review on #652, N3). The shell matched every line of every message,
+# so a body that quoted `BREAKING CHANGE:` or pasted `fix!:` escalated the bump. This repo
+# squash-merges, so bodies routinely carry PR descriptions and nested commit lists.
+# Conventional Commits puts `!` and the type in the SUBJECT and `BREAKING CHANGE:` in the
+# FOOTER, so only those two places are read. See `parse_message` for what "footer" means.
+BANG_SUBJECT = re.compile(r"^[A-Za-z]+(?:\([^)]*\))?!:")
+FEAT_SUBJECT = re.compile(r"^feat(?:\([^)]*\))?!?:", re.IGNORECASE)
+FOOTER_START = re.compile(r"^(?:BREAKING[ -]CHANGE|[A-Za-z][A-Za-z0-9-]*)(?::\s|\s#)", re.I)
+BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:", re.IGNORECASE)
+DASH_RULE = re.compile(r"^\s*-{3,}\s*$")
+FENCE = re.compile(r"^\s*(?:```|~~~)")
+# A marker anywhere else in the body. It does not change the bump, but a scheduled run cannot
+# tell a quote from a real break inside a squashed commit, so it hands the week to a person.
+UNCLEAR_MARKER = re.compile(
+    r"^\s*(?:BREAKING[ -]CHANGE\b|(?:[*-]\s+)?[A-Za-z]+(?:\([^)]*\))?!:)", re.IGNORECASE
+)
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -78,25 +94,94 @@ class Commit:
 
 
 @dataclass(frozen=True)
+class Parsed:
+    subject: str
+    footer: tuple[str, ...]
+    body: tuple[str, ...]
+
+
+def _unfence(lines: Sequence[str]) -> List[str]:
+    """Drop fenced code blocks, keeping one prose line in their place.
+
+    An example inside ``` is not a footer and not a marker. An UNTERMINATED fence is left
+    as text: swallowing the rest of a message could hide a real footer after it.
+    """
+    openers = [i for i, line in enumerate(lines) if FENCE.match(line)]
+    if len(openers) % 2:
+        openers = openers[:-1]
+    fenced: set[int] = set()
+    for start, stop in zip(openers[0::2], openers[1::2]):
+        fenced.update(range(start + 1, stop + 1))
+    return [
+        "(fenced block)" if i in openers[0::2] else line
+        for i, line in enumerate(lines)
+        if i not in fenced
+    ]
+
+
+def parse_message(message: str) -> Parsed:
+    """Split a commit message into its subject, its footer lines and the rest of the body.
+
+    The footer is the trailing run of paragraphs whose first line is a ``Token: value`` or
+    ``Token #value`` footer (``BREAKING CHANGE`` included), walking back from the end. A
+    paragraph that is only a dash rule is stepped over, because a GitHub squash ends with
+    ``---------`` and a ``Co-authored-by:`` paragraph AFTER the real footer. That is the
+    shape of e2e6318 on main, whose genuine ``BREAKING CHANGE:`` footer is followed by a
+    ``Co-Authored-By`` paragraph, the rule and the squash trailers: reading only the last
+    paragraph would miss it. The first paragraph that is not footer-shaped ends the footer.
+    """
+    lines = message.replace("\r\n", "\n").strip("\n").split("\n")
+    subject = lines[0].strip()
+    paragraphs: List[List[str]] = []
+    current: List[str] = []
+    for line in _unfence(lines[1:]):
+        if line.strip():
+            current.append(line.rstrip())
+        elif current:
+            paragraphs.append(current)
+            current = []
+    if current:
+        paragraphs.append(current)
+
+    footer_at = len(paragraphs)
+    for index in range(len(paragraphs) - 1, -1, -1):
+        first = paragraphs[index][0]
+        if len(paragraphs[index]) == 1 and DASH_RULE.match(first):
+            continue
+        if not FOOTER_START.match(first):
+            break
+        footer_at = index
+    footer = tuple(line for p in paragraphs[footer_at:] for line in p)
+    body = tuple(line for p in paragraphs[:footer_at] for line in p)
+    return Parsed(subject, footer, body)
+
+
+@dataclass(frozen=True)
 class Derivation:
     bump: str
     breaking: tuple[Commit, ...] = ()
     features: tuple[Commit, ...] = ()
+    #: (commit, line) pairs: a marker outside the subject and the footer.
+    unclear: tuple[tuple[Commit, str], ...] = ()
 
 
 def derive_bump(commits: Sequence[Commit]) -> Derivation:
-    """``major`` if any line carries a breaking marker, ``minor`` on a ``feat``, else patch."""
-    breaking = tuple(
-        c for c in commits if any(BREAKING_LINE.match(line) for line in c.message.splitlines())
-    )
-    features = tuple(
-        c for c in commits if any(FEAT_LINE.match(line) for line in c.message.splitlines())
-    )
-    if breaking:
-        return Derivation("major", breaking, features)
-    if features:
-        return Derivation("minor", breaking, features)
-    return Derivation("patch", breaking, features)
+    """``major`` on a ``!`` subject or a ``BREAKING CHANGE`` footer, ``minor`` on a ``feat``
+    subject, else ``patch``. Markers elsewhere in a body never change the bump."""
+    breaking: List[Commit] = []
+    features: List[Commit] = []
+    unclear: List[tuple[Commit, str]] = []
+    for c in commits:
+        parsed = parse_message(c.message)
+        if BANG_SUBJECT.match(parsed.subject) or any(
+            BREAKING_FOOTER.match(line) for line in parsed.footer
+        ):
+            breaking.append(c)
+        elif FEAT_SUBJECT.match(parsed.subject):
+            features.append(c)
+        unclear.extend((c, line.strip()) for line in parsed.body if UNCLEAR_MARKER.match(line))
+    bump = "major" if breaking else "minor" if features else "patch"
+    return Derivation(bump, tuple(breaking), tuple(features), tuple(unclear))
 
 
 def latest_stable_tag(tags: Sequence[str]) -> Optional[str]:
@@ -195,8 +280,20 @@ def decide(event: str, sha: str, probe: Probe) -> Decision:
     decision.problems.extend(_check_ci(probe, sha))
     if decision.bump == "major":
         decision.problems.append(major_refusal(tag, decision.derivation))
+    if decision.derivation.unclear:
+        decision.problems.append(unclear_refusal(decision.derivation))
     decision.should_release = not decision.refused
     return decision
+
+
+def unclear_refusal(derivation: Derivation) -> str:
+    shas = ", ".join(sorted({c.sha[:8] for c, _ in derivation.unclear}))
+    return (
+        f"{shas} carry a breaking-change marker outside the subject and the footer. That "
+        "is usually a quote, but in a squash merge it can be a real break from one of the "
+        "squashed commits, and a scheduled run cannot tell which. Run the Release workflow "
+        f"by hand: bump=major if it is breaking, otherwise bump={derivation.bump}"
+    )
 
 
 def major_refusal(tag: str, derivation: Derivation) -> str:
@@ -360,6 +457,12 @@ def summary(decision: Decision, event: str, sha: str) -> str:
             if commits:
                 lines.extend(["", f"### {title}", ""])
                 lines.extend(f"- `{c.sha[:8]}` {c.subject}" for c in commits)
+        if derivation.unclear:
+            lines.extend(["", "### Markers outside a subject or footer", ""])
+            lines.extend(
+                f"- `{c.sha[:8]}` {c.subject}: `{line[:120].replace('`', chr(39))}`"
+                for c, line in derivation.unclear
+            )
     return "\n".join(lines) + "\n"
 
 
