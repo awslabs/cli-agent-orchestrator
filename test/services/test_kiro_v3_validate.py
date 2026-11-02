@@ -16,7 +16,11 @@ from types import MappingProxyType
 
 import pytest
 
-from cli_agent_orchestrator.providers.kiro_v3_schema import KAS_0_66_70, pinned_kiro_v3_schemas
+from cli_agent_orchestrator.providers.kiro_v3_schema import (
+    KAS_0_66_70,
+    KiroV3Refusal,
+    pinned_kiro_v3_schemas,
+)
 from cli_agent_orchestrator.services.kiro_v3_validate import (
     MAX_AGENT_FILE_BYTES,
     KiroV3InvalidAgentError,
@@ -315,6 +319,10 @@ def test_g11_kiros_upgraded_file_refuses_with_the_reinstall_remedy():
             remedy="Reinstall: `cao install v2ro --provider kiro_cli --engine v3`.",
         )
     assert "kiro_v3_invalid:forbidden_key" in excinfo.value.codes
+    # The first finding is the error's code and leads its message (#1167 1c).
+    assert excinfo.value.code == excinfo.value.codes[0]
+    assert str(excinfo.value).startswith(f"{excinfo.value.code}: ")
+    assert isinstance(excinfo.value, KiroV3Refusal)
     assert "kiroUpgrade" in str(excinfo.value)
     assert "cao install v2ro --provider kiro_cli --engine v3" in str(excinfo.value)
 

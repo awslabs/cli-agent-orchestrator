@@ -26,6 +26,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from cli_agent_orchestrator.providers.kiro_identity import KIRO_FALLBACK_AGENTS
 from cli_agent_orchestrator.providers.kiro_v3_schema import (
     KiroV3EngineSchema,
+    KiroV3Refusal,
     pinned_kiro_v3_schemas,
 )
 from cli_agent_orchestrator.utils.delegation import tools_exceeding
@@ -107,16 +108,17 @@ class KiroV3Finding:
         return f"kiro_v3_invalid:{self.code}"
 
 
-class KiroV3InvalidAgentError(ValueError):
+class KiroV3InvalidAgentError(KiroV3Refusal):
     """A Kiro v3 agent file failed validation; carries every finding."""
 
     def __init__(self, agent: str, findings: Sequence[KiroV3Finding], remedy: str) -> None:
         self.agent = agent
         self.findings = tuple(findings)
         self.codes = tuple(finding.refusal for finding in self.findings)
+        self.code = self.codes[0] if self.codes else "kiro_v3_invalid"
         details = "; ".join(f"{f.refusal}: {f.detail}" for f in self.findings)
         super().__init__(
-            f"{self.codes[0] if self.codes else 'kiro_v3_invalid'}: the Kiro v3 agent file "
+            f"{self.code}: the Kiro v3 agent file "
             f"for '{agent}' failed validation ({details}). {remedy}"
         )
 

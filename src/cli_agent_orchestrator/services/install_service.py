@@ -1837,6 +1837,23 @@ def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
     return tools
 
 
+def installed_kiro_v3_grant(profile_name: str) -> Optional[Tuple[List[str], List[str]]]:
+    """The grant and MCP server names a universal Kiro agent file records (#1167).
+
+    ``(allowedTools, sorted mcpServers names)``, or ``None`` when the file is
+    absent, unreadable or not universal. The v3 launch attests the pane against
+    these after the file itself passed the validator.
+    """
+    data = _installed_kiro_agent(profile_name)
+    if data is None or "permissions" not in data:
+        return None
+    grant = data.get("allowedTools")
+    servers = data.get("mcpServers") or {}
+    if not isinstance(grant, list) or not isinstance(servers, dict):
+        return None
+    return [str(entry) for entry in grant], sorted(str(name) for name in servers)
+
+
 def installed_kiro_agent_is_universal(profile_name: str) -> bool:
     """True when the installed Kiro agent file is a v3-enabled universal file (#1167).
 

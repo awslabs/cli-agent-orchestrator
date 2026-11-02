@@ -231,11 +231,39 @@ SUPPORTED_KIRO_CLI_VERSIONS: Mapping[str, KiroCliVersionEntry] = MappingProxyTyp
                 "so it cannot widen the render, tags or rules; pending operator verification"
             ),
         ),
+        # PENDING OPERATOR VERIFICATION. Derived statically, never run, as for
+        # 2.36.0: this release's installed engine tree (@kiro/agent 0.66.70, 693
+        # files) is byte-identical to 2.35.1's, and its `chat --help` is
+        # identical too. The CLI now ships as one binary, and its root --help
+        # changed layout (the probe reads flags from both help screens). It
+        # reuses KAS_0_66_70 unchanged, so it cannot widen anything: the render,
+        # the tags and the rules are 2.35.1's. It only lets the v3 probe accept
+        # 2.37.0; a launch on it needs the operator opt-in (#1167).
+        "2.37.0": KiroCliVersionEntry(
+            cli_version="2.37.0",
+            schema=KAS_0_66_70,
+            pending_operator_verification=True,
+            basis=(
+                "static: engine bundle identical to 2.35.1's; reuses KAS_0_66_70 unchanged, "
+                "so it cannot widen the render, tags or rules; pending operator verification"
+            ),
+        ),
     }
 )
 
 
-class KiroV3UnsupportedVersionError(ValueError):
+class KiroV3Refusal(ValueError):
+    """Base of every Kiro v3 launch refusal; ``code`` is its provisional string.
+
+    Each is raised before any task is typed: before allocation for the version,
+    environment, agent-file and workspace checks, and after the header for the
+    pane checks. The API maps every one to 400.
+    """
+
+    code = "kiro_v3_refused"
+
+
+class KiroV3UnsupportedVersionError(KiroV3Refusal):
     """The probed kiro-cli version has no pinned v3 engine schema."""
 
     code = "kiro_v3_unsupported_version"
@@ -257,6 +285,38 @@ def kiro_v3_schema_for_cli_version(version: Optional[str]) -> KiroV3EngineSchema
     if entry is None:
         raise KiroV3UnsupportedVersionError(version)
     return entry.schema
+
+
+class KiroV3UnverifiedVersionError(KiroV3Refusal):
+    """The probed kiro-cli version is allow-listed but not yet operator-verified."""
+
+    code = "kiro_v3_unverified_version"
+
+    def __init__(self, version: str) -> None:
+        super().__init__(
+            f"{self.code}: kiro-cli {version}'s v3 engine schema was derived statically and "
+            "is pending operator verification, so CAO does not launch v3 on it. "
+            "Retry with engine 'v2'."
+        )
+        self.version = version
+
+
+def require_launchable_kiro_v3_version(
+    version: Optional[str], *, allow_unverified: bool = False
+) -> KiroCliVersionEntry:
+    """The allow-list entry a v3 launch on ``version`` runs under.
+
+    A version absent from the allow-list refuses whatever ``allow_unverified``
+    says: it has no pinned schema. An entry still pending operator verification
+    refuses unless ``allow_unverified`` is set, which only the operator's
+    ``kiro.v3_allow_unverified_versions`` opt-in passes. Provisional (#1167).
+    """
+    entry = SUPPORTED_KIRO_CLI_VERSIONS.get(version or "")
+    if entry is None:
+        raise KiroV3UnsupportedVersionError(version)
+    if entry.pending_operator_verification and not allow_unverified:
+        raise KiroV3UnverifiedVersionError(entry.cli_version)
+    return entry
 
 
 def pinned_kiro_v3_schemas() -> Tuple[KiroV3EngineSchema, ...]:
