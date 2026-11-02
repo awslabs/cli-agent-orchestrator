@@ -589,7 +589,11 @@ class CountingPattern:
 
 
 class CountingStr(str):
-    """A ``str`` whose ``find``/``index`` charge the characters they scan."""
+    """A ``str`` whose ``find`` charges the characters it scans.
+
+    ``split`` charges one pass and returns counted parts, so a scan that works
+    line by line is still counted.
+    """
 
     counter: _Counter
 
@@ -604,6 +608,10 @@ class CountingStr(str):
         stop = (len(self) if end is None else end) if result == -1 else result + len(sub)
         self.counter.add(max(1, stop - begin))
         return result
+
+    def split(self, sep: Optional[str] = None, maxsplit: int = -1) -> list[str]:  # type: ignore[override]
+        self.counter.add(max(1, len(self)))
+        return [CountingStr(part, self.counter) for part in super().split(sep, maxsplit)]
 
 
 def instrumented_steps(
@@ -1278,6 +1286,8 @@ class Growth:
         a, b, c = self.steps
         if a is None or b is None or c is None:
             return False
+        if not a:
+            raise AssertionError(f"no steps counted on {self.shape!r}: the probe measures nothing")
         return b <= 6 * a and c <= 6 * b
 
 
