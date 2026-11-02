@@ -38,7 +38,15 @@ ALL_CONFIGS = [builder.OPERATOR, builder.CONTRIBUTOR, builder.LIFECYCLE]
 AUDIT_SCRIPT = (
     REPO_ROOT / "skills" / "cao-agent-plugin-audit" / "scripts" / "validate_agent_plugin.py"
 )
-PIN_JSON = REPO_ROOT / "src" / "cli_agent_orchestrator" / "schemas" / "agent_plugins" / "1.0.0" / "PIN.json"
+PIN_JSON = (
+    REPO_ROOT
+    / "src"
+    / "cli_agent_orchestrator"
+    / "schemas"
+    / "agent_plugins"
+    / "1.0.0"
+    / "PIN.json"
+)
 
 
 def manifest_of(package_dir: Path) -> dict:
@@ -235,7 +243,10 @@ class TestLifecyclePackage:
 
     def test_the_audit_validator_pins_the_same_hashes_as_pin_json(self):
         """The validator refuses to run on a pin mismatch; no CI step runs it, so check here."""
-        recorded = {name: entry["sha256"] for name, entry in json.loads(PIN_JSON.read_text())["files"].items()}
+        recorded = {
+            name: entry["sha256"]
+            for name, entry in json.loads(PIN_JSON.read_text())["files"].items()
+        }
         assert pinned_sha256_in(AUDIT_SCRIPT) == recorded
 
     def test_name_is_cao_agent_plugin_lifecycle(self):
@@ -255,7 +266,9 @@ class TestLifecyclePackage:
     def test_the_audit_skill_carries_its_bundled_schema_bytes(self):
         """The validator refuses to run without them, so the copy is not drift."""
         bundled = LIFECYCLE_DIR / "skills" / "cao-agent-plugin-audit" / "schemas" / "1.0.0"
-        vendored = REPO_ROOT / "src" / "cli_agent_orchestrator" / "schemas" / "agent_plugins" / "1.0.0"
+        vendored = (
+            REPO_ROOT / "src" / "cli_agent_orchestrator" / "schemas" / "agent_plugins" / "1.0.0"
+        )
         for name in ("plugin.schema.json", "mcp.schema.json"):
             assert (bundled / name).read_bytes() == (vendored / name).read_bytes(), name
 

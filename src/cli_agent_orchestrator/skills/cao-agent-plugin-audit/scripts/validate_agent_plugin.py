@@ -140,16 +140,21 @@ def load_schemas(report: Report) -> Dict[str, Dict[str, Any]]:
             raise AuditError(f"bundled {filename} hashes to {actual}, pin is {pinned}")
         schemas[filename] = json.loads(data.decode("utf-8"))
     _SCHEMA_RESOURCES[:] = [
-        (str(schema.get("$id", name)), Resource.from_contents(schema)) for name, schema in schemas.items()
+        (str(schema.get("$id", name)), Resource.from_contents(schema))
+        for name, schema in schemas.items()
     ]
     report.info("schemas: bundled plugin.schema.json and mcp.schema.json hash to the pinned sha256")
 
     pin = _find_cao_pin()
     if pin is None:
-        report.info("schemas: no CAO PIN.json found above this script; checked against the embedded pin only")
+        report.info(
+            "schemas: no CAO PIN.json found above this script; checked against the embedded pin only"
+        )
         return schemas
     try:
-        recorded = {name: entry["sha256"] for name, entry in json.loads(pin.read_text())["files"].items()}
+        recorded = {
+            name: entry["sha256"] for name, entry in json.loads(pin.read_text())["files"].items()
+        }
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise AuditError(f"CAO PIN.json at {pin} is unreadable: {exc}") from exc
     if recorded != PINNED_SHA256:
@@ -167,19 +172,26 @@ def _refuse_retrieval(uri: str) -> Resource:
     The bundled schemas use only in-document "#/$defs" references. A reference to
     anything else must fail loudly here rather than reach the network.
     """
-    raise NoSuchResource(ref=uri)
+    # referencing's exceptions and Registry have attrs-generated __init__ signatures
+    # that mypy reads wrongly; ref= and retrieve= are correct (CAO's validation.py
+    # carries the same two ignores).
+    raise NoSuchResource(ref=uri)  # type: ignore[call-arg]
 
 
 _SCHEMA_RESOURCES: List[Tuple[str, Resource]] = []
 
 
 def _registry() -> Registry:
-    return Registry(retrieve=_refuse_retrieval).with_resources(_SCHEMA_RESOURCES)
+    return Registry(retrieve=_refuse_retrieval).with_resources(  # type: ignore[call-arg]
+        _SCHEMA_RESOURCES
+    )
 
 
 def _schema_errors(schema: Dict[str, Any], instance: Any) -> List[str]:
     validator = jsonschema.Draft202012Validator(schema, registry=_registry())
-    errors = sorted(validator.iter_errors(instance), key=lambda e: (list(map(str, e.absolute_path)), e.message))
+    errors = sorted(
+        validator.iter_errors(instance), key=lambda e: (list(map(str, e.absolute_path)), e.message)
+    )
     out = []
     for error in errors:
         location = ".".join(str(p) for p in error.absolute_path)
@@ -204,20 +216,34 @@ def _read_json(path: Path) -> Tuple[Optional[Any], Optional[str]]:
 def check_manifest(root: Path, schema: Dict[str, Any], report: Report) -> Optional[Dict[str, Any]]:
     path = root / "plugin.json"
     if not path.is_file():
-        report.finding(FATAL, "manifest.missing", "plugin.json", "no plugin.json at the package root")
+        report.finding(
+            FATAL, "manifest.missing", "plugin.json", "no plugin.json at the package root"
+        )
         return None
     data, problem = _read_json(path)
     if problem:
         report.finding(FATAL, "manifest.invalid_json", "plugin.json", problem)
         return None
     if not isinstance(data, dict):
-        report.finding(FATAL, "manifest.not_an_object", "plugin.json", "the manifest must be a JSON object")
+        report.finding(
+            FATAL, "manifest.not_an_object", "plugin.json", "the manifest must be a JSON object"
+        )
         return None
 
     if "$schema" not in data:
-        report.finding(FATAL, "manifest.schema_missing", "plugin.json", f"$schema is required and must be {PLUGIN_SCHEMA_ID}")
+        report.finding(
+            FATAL,
+            "manifest.schema_missing",
+            "plugin.json",
+            f"$schema is required and must be {PLUGIN_SCHEMA_ID}",
+        )
     elif data["$schema"] != PLUGIN_SCHEMA_ID:
-        report.finding(FATAL, "manifest.schema_unsupported", "plugin.json", f"$schema is {data['$schema']!r}; expected {PLUGIN_SCHEMA_ID}")
+        report.finding(
+            FATAL,
+            "manifest.schema_unsupported",
+            "plugin.json",
+            f"$schema is {data['$schema']!r}; expected {PLUGIN_SCHEMA_ID}",
+        )
 
     # CAO's two tolerances, mirrored so the verdict matches CAO's: an unrecognized
     # top-level key and a non-object `extensions` are WARNINGs and are dropped
@@ -226,7 +252,12 @@ def check_manifest(root: Path, schema: Dict[str, Any], report: Report) -> Option
     if "extensions" in sanitized:
         extensions = sanitized.pop("extensions")
         if not isinstance(extensions, dict):
-            report.finding(WARNING, "manifest.extensions_not_object", "plugin.json", "'extensions' must be an object; CAO ignores it and loads the package")
+            report.finding(
+                WARNING,
+                "manifest.extensions_not_object",
+                "plugin.json",
+                "'extensions' must be an object; CAO ignores it and loads the package",
+            )
     known = set(schema.get("properties", {}))
     for key in sorted(set(sanitized) - known):
         sanitized.pop(key)
@@ -248,11 +279,21 @@ def check_mcp(root: Path, schema: Dict[str, Any], report: Report) -> None:
         return
     data, problem = _read_json(path)
     if problem:
-        report.finding(SKIPPED, "mcp.invalid_json", "mcp.json", f"{problem}; CAO disables MCP for this package and still loads its skills")
+        report.finding(
+            SKIPPED,
+            "mcp.invalid_json",
+            "mcp.json",
+            f"{problem}; CAO disables MCP for this package and still loads its skills",
+        )
         return
     errors = _schema_errors(schema, data)
     for message in errors:
-        report.finding(SKIPPED, "mcp.invalid", "mcp.json", f"{message}; CAO drops what fails and still loads the skills")
+        report.finding(
+            SKIPPED,
+            "mcp.invalid",
+            "mcp.json",
+            f"{message}; CAO drops what fails and still loads the skills",
+        )
     if not errors:
         report.info("mcp.json: valid against the bundled mcp.schema.json")
 
@@ -280,33 +321,70 @@ def check_skill(skill_dir: Path, report: Report) -> Optional[str]:
         report.finding(SKIPPED, "skill.unparseable", folder, f"{exc}; CAO would skip this skill")
         return None
     if not isinstance(meta, dict):
-        report.finding(SKIPPED, "skill.unparseable", folder, "frontmatter is not a mapping; CAO would skip this skill")
+        report.finding(
+            SKIPPED,
+            "skill.unparseable",
+            folder,
+            "frontmatter is not a mapping; CAO would skip this skill",
+        )
         return None
 
     name, description = meta.get("name"), meta.get("description")
     loadable = True
     for field, value in (("name", name), ("description", description)):
         if not isinstance(value, str) or not value.strip():
-            report.finding(SKIPPED, "skill.blank_field", folder, f"frontmatter {field} is missing or blank; CAO would skip this skill")
+            report.finding(
+                SKIPPED,
+                "skill.blank_field",
+                folder,
+                f"frontmatter {field} is missing or blank; CAO would skip this skill",
+            )
             loadable = False
     if not isinstance(name, str) or not isinstance(description, str):
         return None
     name, description = name.strip(), description.strip()
 
     body_lines = len(body.strip().splitlines())
-    report.info(f"skill {folder}: name {len(name)} chars, description {len(description)} chars, body {body_lines} lines")
+    report.info(
+        f"skill {folder}: name {len(name)} chars, description {len(description)} chars, body {body_lines} lines"
+    )
 
     if name != folder:
-        report.finding(SKIPPED, "skill.folder_name", folder, f"folder name {folder!r} differs from frontmatter name {name!r}; CAO would skip this skill")
+        report.finding(
+            SKIPPED,
+            "skill.folder_name",
+            folder,
+            f"folder name {folder!r} differs from frontmatter name {name!r}; CAO would skip this skill",
+        )
         loadable = False
     if not SKILL_NAME_RE.fullmatch(name):
-        report.finding(LIMIT, "skill.name_pattern", folder, f"name {name!r} fails the Agent Skills pattern ^[a-z0-9]+(-[a-z0-9]+)*$")
+        report.finding(
+            LIMIT,
+            "skill.name_pattern",
+            folder,
+            f"name {name!r} fails the Agent Skills pattern ^[a-z0-9]+(-[a-z0-9]+)*$",
+        )
     if len(name) > NAME_MAX:
-        report.finding(LIMIT, "skill.name_length", folder, f"name is {len(name)} characters; the limit is {NAME_MAX}")
+        report.finding(
+            LIMIT,
+            "skill.name_length",
+            folder,
+            f"name is {len(name)} characters; the limit is {NAME_MAX}",
+        )
     if len(description) > DESCRIPTION_MAX:
-        report.finding(LIMIT, "skill.description_length", folder, f"description is {len(description)} characters; the limit is {DESCRIPTION_MAX}")
+        report.finding(
+            LIMIT,
+            "skill.description_length",
+            folder,
+            f"description is {len(description)} characters; the limit is {DESCRIPTION_MAX}",
+        )
     if body_lines > BODY_MAX:
-        report.finding(LIMIT, "skill.body_length", folder, f"body is {body_lines} lines after the frontmatter; the limit is {BODY_MAX}")
+        report.finding(
+            LIMIT,
+            "skill.body_length",
+            folder,
+            f"body is {body_lines} lines after the frontmatter; the limit is {BODY_MAX}",
+        )
     return name if loadable else None
 
 
@@ -332,7 +410,12 @@ def discover_package_skills(root: Path, report: Report) -> List[str]:
         report.info("skills/: absent (optional)")
         return []
     if not skills_dir.is_dir():
-        report.finding(SKIPPED, "skills.not_a_directory", "skills", "'skills' exists but is not a directory; CAO loads no skills")
+        report.finding(
+            SKIPPED,
+            "skills.not_a_directory",
+            "skills",
+            "'skills' exists but is not a directory; CAO loads no skills",
+        )
         return []
     real_root = Path(os.path.realpath(root))
     loaded: List[str] = []
@@ -340,15 +423,30 @@ def discover_package_skills(root: Path, report: Report) -> List[str]:
         if child.name.startswith("."):
             continue
         if not _within(real_root, child):
-            report.finding(SKIPPED, "skill.escapes_root", child.name, "resolves outside the package root; CAO would skip this skill")
+            report.finding(
+                SKIPPED,
+                "skill.escapes_root",
+                child.name,
+                "resolves outside the package root; CAO would skip this skill",
+            )
             continue
         if not child.is_dir():
             continue
         if not _within(real_root, child / "SKILL.md"):
-            report.finding(SKIPPED, "skill.escapes_root", child.name, "SKILL.md resolves outside the package root; CAO would skip this skill")
+            report.finding(
+                SKIPPED,
+                "skill.escapes_root",
+                child.name,
+                "SKILL.md resolves outside the package root; CAO would skip this skill",
+            )
             continue
         if not (child / "SKILL.md").is_file():
-            report.finding(SKIPPED, "skill.missing_skill_md", child.name, "no SKILL.md; CAO would skip this directory")
+            report.finding(
+                SKIPPED,
+                "skill.missing_skill_md",
+                child.name,
+                "no SKILL.md; CAO would skip this directory",
+            )
             continue
         name = check_skill(child, report)
         if name:
@@ -383,16 +481,22 @@ def run_cao_validate(root: Path, report: Report) -> None:
             timeout=CAO_VALIDATE_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
-        raise AuditError(f"cao plugin validate --json did not finish within {CAO_VALIDATE_TIMEOUT_SECONDS}s") from exc
+        raise AuditError(
+            f"cao plugin validate --json did not finish within {CAO_VALIDATE_TIMEOUT_SECONDS}s"
+        ) from exc
     try:
         verdict = json.loads(proc.stdout)
     except ValueError:
         stderr = proc.stderr.strip().splitlines()
         seen = stderr[0] if stderr else "(stderr was empty)"
-        raise AuditError(f"cao plugin validate --json exited {proc.returncode} and printed no JSON; stderr: {seen}")
+        raise AuditError(
+            f"cao plugin validate --json exited {proc.returncode} and printed no JSON; stderr: {seen}"
+        )
     loadable = verdict.get("loadable")
     findings = verdict.get("findings") or []
-    report.info(f"cao plugin validate --json ({cao}): exit {proc.returncode}, loadable {loadable}, {len(findings)} findings")
+    report.info(
+        f"cao plugin validate --json ({cao}): exit {proc.returncode}, loadable {loadable}, {len(findings)} findings"
+    )
     # Each CAO finding is reported as a WARNING, so it changes the audit's exit
     # status even when CAO still calls the package loadable (a SKIPPED skill, say).
     for item in findings:
@@ -406,7 +510,12 @@ def run_cao_validate(root: Path, report: Report) -> None:
             f"CAO reported {item.get('severity', '?')}: {item.get('message', '')}",
         )
     if loadable is not True:
-        report.finding(FATAL, "cao.not_loadable", "plugin.json", "CAO's own validator reports the package not loadable")
+        report.finding(
+            FATAL,
+            "cao.not_loadable",
+            "plugin.json",
+            "CAO's own validator reports the package not loadable",
+        )
 
 
 # --- entry points --------------------------------------------------------------
@@ -437,7 +546,9 @@ def audit_skills_dir(directory: Path) -> Report:
     report = Report()
     report.info(f"cao-agent-plugin-audit: skills directory {directory}")
     if (directory / "plugin.json").exists():
-        report.info("ignored: plugin.json at the top of the directory (--skills-dir reads no manifest)")
+        report.info(
+            "ignored: plugin.json at the top of the directory (--skills-dir reads no manifest)"
+        )
     for child in sorted(directory.iterdir(), key=lambda p: p.name):
         if not child.is_dir():
             continue
@@ -463,8 +574,15 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
             "status the audit itself failed. Never reads stdin."
         ),
     )
-    parser.add_argument("package_root", nargs="?", type=Path, help="Agent Plugin root, the directory holding plugin.json")
-    parser.add_argument("--skills-dir", type=Path, help="audit each immediate child holding a SKILL.md as one skill")
+    parser.add_argument(
+        "package_root",
+        nargs="?",
+        type=Path,
+        help="Agent Plugin root, the directory holding plugin.json",
+    )
+    parser.add_argument(
+        "--skills-dir", type=Path, help="audit each immediate child holding a SKILL.md as one skill"
+    )
     args = parser.parse_args(argv)
     if (args.package_root is None) == (args.skills_dir is None):
         parser.error("give exactly one of PACKAGE_ROOT or --skills-dir")
