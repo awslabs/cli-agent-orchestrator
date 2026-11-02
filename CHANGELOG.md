@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-tree consumers (the EventSource viewer, the CAO Dojo page and its e2e driver, and the dashboard
   `showcase.sh` gate) are updated. Off-list components are still refused as `RAW` with
   `rejected_component`. `docs/agui.md` no longer claims that any AG-UI client renders these frames.
+- **The `[agui]` extra now needs `ag-ui-protocol>=1.0.0`** (was `>=0.1.19`), because the run plane
+  declares `protocolVersion` on `RUN_STARTED` from the SDK's 1.0 constant. An install that pins an
+  older SDK now gets a resolver conflict, or HTTP 501 from `POST /agui/v1/run`.
+- **A `resume[]` entry for an unknown interrupt id now ends `RUN_FINISHED` instead of `RUN_ERROR`.**
+  As AG-UI 1.0 asks, the run proceeds without the entry and CAO logs a server-side warning; an answer
+  to an expired interrupt is skipped the same way. A client that used `RUN_ERROR` to detect a bad id
+  no longer gets one.
+- **`agui_stream.AGUI_GENERATIVE_UI` is removed from `__all__`**, and the constant itself is gone,
+  because the `GENERATIVE_UI` event type it named is no longer sent. Use `AGUI_CUSTOM` and
+  `CAO_GENERATIVE_UI_EVENT_NAME`.
 - **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3
   `Default` fallback** (#1167). A Kiro header with extra columns between the model and the context
   gauge, such as `<agent> · claude-haiku-5.5 · low · ◔ 2%` on the v2 engine with `--effort`, or
