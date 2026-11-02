@@ -6,7 +6,7 @@ from typing import Any, Callable
 import click
 
 from cli_agent_orchestrator.decisions import operator, packages, settings
-from cli_agent_orchestrator.decisions.types import POINTS
+from cli_agent_orchestrator.decisions.types import POINTS, ROUTE_POINTS, SWITCHES
 from cli_agent_orchestrator.services.model_tiers import TIERS
 
 
@@ -38,7 +38,7 @@ def status() -> None:
 
 
 @decisions.command(name="set")
-@click.argument("point", type=click.Choice(tuple(POINTS)))
+@click.argument("point", type=click.Choice(SWITCHES))
 @click.argument("state", type=click.Choice(settings.STATES))
 @click.option("--decider", default=None)
 def set_point(point: str, state: str, decider: str | None) -> None:
@@ -59,7 +59,7 @@ def tier(provider: str, tier: str, model: str | None, unset: bool) -> None:
 
 
 @decisions.command()
-@click.argument("point", type=click.Choice(tuple(POINTS)))
+@click.argument("point", type=click.Choice(ROUTE_POINTS))
 @click.option("--profile", default=None)
 @click.option("--role", default=None)
 @click.argument("option")

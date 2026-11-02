@@ -34,6 +34,7 @@ from cli_agent_orchestrator.decisions.targets import TargetKind, profile_source
 from cli_agent_orchestrator.decisions.types import (
     CONTRACT_VERSION,
     POINTS,
+    ROUTE_POINTS,
     Decider,
     DecisionAnswer,
     DecisionFacts,
@@ -271,7 +272,8 @@ class DecisionEngine:
         }
         if target == TargetKind.INSTALLED and not active:
             return None
-        if any(point not in POINTS for point in fields):
+        # #1199: the task-feature points are never launch fields; only the engine asks them.
+        if any(point not in ROUTE_POINTS for point in fields):
             raise DecisionInputError("unknown decision point")
         for point, value in fields.items():
             if value != "auto" and value not in POINTS[point].options:
