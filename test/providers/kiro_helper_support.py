@@ -67,8 +67,10 @@ class GlobalKiroSpy:
         return tuple({os.path.abspath(self.kiro), os.path.realpath(self.kiro)})
 
     def _under(self, value: Any) -> bool:
+        # fsdecode, not fspath: a bytes path (psutil lists /proc that way on
+        # Linux) must compare as text, not raise inside the call it wraps.
         try:
-            path = os.path.abspath(os.fspath(value))
+            path = os.path.abspath(os.fsdecode(value))
         except TypeError:
             return False  # A file descriptor, or no path at all.
         return any(path == root or path.startswith(root + os.sep) for root in self._roots())
@@ -80,7 +82,7 @@ class GlobalKiroSpy:
             if self.armed and not kwargs.get("dir_fd"):
                 for value in args[:2]:
                     if self._under(value):
-                        self.touches.append(f"{name}({os.fspath(value)!s})")
+                        self.touches.append(f"{name}({os.fsdecode(value)})")
             return real(*args, **kwargs)
 
         return spy
