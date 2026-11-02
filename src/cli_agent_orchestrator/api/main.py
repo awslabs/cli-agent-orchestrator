@@ -3818,6 +3818,8 @@ async def _prepare_delegation(
                 purpose=inputs.purpose,
                 description=inputs.description,
                 provider_options=inputs.provider_options,
+                launch_tier=inputs.launch_tier,
+                network_granted=inputs.network_granted,
             )
         )
         # The operator may have changed the policy while the decider ran: recheck the
