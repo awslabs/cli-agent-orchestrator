@@ -44,92 +44,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      # The whole policy lives in scripts/release_preflight.py, where
+      # test/scripts/test_release_preflight.py can exercise every decision. It only
+      # reads: git history, the GitHub Release and CI state (gh), and PyPI. Inputs come
+      # from the environment, never `${{ }}` inside `run:`.
       - name: Evaluate scheduled release policy
         id: policy
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          if [ "$GITHUB_EVENT_NAME" != "schedule" ]; then
-            echo "bump=patch" >> "$GITHUB_OUTPUT"
-            echo "count=manual" >> "$GITHUB_OUTPUT"
-            echo "last_tag=manual" >> "$GITHUB_OUTPUT"
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          LAST_TAG=$(
-            git tag --merged "$GITHUB_SHA" --list 'v[0-9]*' --sort=-v:refname |
-              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
-              head -n 1
-          )
-          if [ -z "$LAST_TAG" ]; then
-            echo "No stable v<major>.<minor>.<patch> tag is reachable from $GITHUB_SHA"
-            exit 1
-          fi
-
-          COUNT=$(git rev-list "${LAST_TAG}..${GITHUB_SHA}" --count)
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
-          if [ "$COUNT" -eq 0 ]; then
-            echo "No commits since $LAST_TAG; skipping this scheduled release."
-            echo "bump=patch" >> "$GITHUB_OUTPUT"
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          gh release view "$LAST_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
-          VERSION=${LAST_TAG#v}
-          python - "$VERSION" <<'PY'
-          import json
-          import sys
-          import urllib.error
-          import urllib.request
-
-          version = sys.argv[1]
-          url = f"https://pypi.org/pypi/cli-agent-orchestrator/{version}/json"
-          try:
-              with urllib.request.urlopen(url, timeout=30) as response:
-                  json.load(response)
-          except (urllib.error.URLError, json.JSONDecodeError) as exc:
-              raise SystemExit(
-                  f"Prior release v{version} is not verifiably published on PyPI: {exc}"
-              )
-          PY
-
-          # Maintained allow-list of release-blocking workflows. Add another
-          # workflow file here only when release policy requires it.
-          REQUIRED_WORKFLOWS=(ci.yml)
-          for workflow in "${REQUIRED_WORKFLOWS[@]}"; do
-            STATE=$(
-              gh run list \
-                --repo "$GITHUB_REPOSITORY" \
-                --commit "$GITHUB_SHA" \
-                --workflow "$workflow" \
-                --limit 10 \
-                --json conclusion,headSha,status \
-                --jq 'map(select(.headSha == env.GITHUB_SHA)) | first |
-                  if . == null then "missing"
-                  else "\(.status):\(.conclusion // "none")"
-                  end'
-            )
-            if [ "$STATE" != "completed:success" ]; then
-              echo "$workflow is '$STATE' at $GITHUB_SHA; refusing to release"
-              exit 1
-            fi
-          done
-
-          COMMITS=$(git log "${LAST_TAG}..${GITHUB_SHA}" --format='%s%n%b')
-          if grep -Eq '(^[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:)' <<<"$COMMITS"; then
-            BUMP=major
-          elif grep -Eq '^feat(\([^)]*\))?:' <<<"$COMMITS"; then
-            BUMP=minor
-          else
-            BUMP=patch
-          fi
-          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
-          echo "should_release=true" >> "$GITHUB_OUTPUT"
+        run: >-
+          python scripts/release_preflight.py
+          --event "$GITHUB_EVENT_NAME"
+          --sha "$GITHUB_SHA"
+          --repo "$GITHUB_REPOSITORY"
 
   release:
     needs: preflight
