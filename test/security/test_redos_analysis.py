@@ -37,6 +37,7 @@ import pytest
         (r"(?:[^\S\n]*){2}x", "match"),
         (r"(?:a|a){0,200}b", "match"),  # exponential: ambiguous alternation, bounded
         (r"(?:\w+\s?){1,20}:", "match"),  # exponential: nested, bounded outer repeat
+        (r"(?:\S+\s*)*x", "match"),  # an optional delimiter fences nothing
         # A backtracking repeat before a lookahead that re-scans what it gives back:
         (r"x(?:ab)*(?!(?:ab)*c)\s", "match"),
         (r"[⏺●](?:\x1b\[[0-9;]*m)*(?![ \t]*+(?:\x1b\[[0-9;]*m)*+\w)\s+", "match"),
@@ -62,6 +63,8 @@ def test_superlinear_shapes_are_flagged(pattern, mode):
         (r"[\w-]*ing(?=…).*…", "match"),  # so does a lookahead the run cannot consume
         (r"─{8,}", "search"),  # a repeat that ends the pattern cannot fail after scanning
         (r"(?:a++|b)*c", "match"),  # a possessive inner repeat cannot be re-split
+        (r"(?:\S+\s+)*x", "match"),  # each repeat is fenced by the other's class
+        (r"Press \S+(?:[^\S\n]+\S+){0,14} to", "search"),
         (r"(?:[ \t]*+\n){0,2}+x", "match"),  # nor can a possessive bounded group
         # Line-anchored skip; the lookahead's repeat is fenced by the "…" before it.
         (r"(?m)^(?:[^\n…]++|…(?![ \t]+\())*+…[ \t]+\(", "search"),

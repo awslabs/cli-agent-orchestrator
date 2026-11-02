@@ -923,8 +923,10 @@ def _nested_issues(nodes: Sequence[tuple[object, object]], ctx: _Ctx, flags: int
         # S1: unbounded repeats inside the body need a fence on both sides. A
         # possessive inner repeat cannot be re-split across iterations, so it
         # needs none. A sequence's neighbours in its parent (the token before a
-        # lookaround or a branch) fence its ends.
-        for seq, before, after in _sequences_in(body):
+        # lookaround or a branch) fence its ends; the body's own ends meet the
+        # neighbouring iterations, so its last element fences its first and
+        # its first fences its last.
+        for seq, before, after in _sequences_in(body, body[-1], body[0]):
             for index, (i_op, i_av) in enumerate(seq):
                 if i_op not in (C.MAX_REPEAT, C.MIN_REPEAT):
                     continue
@@ -986,9 +988,16 @@ def _varies(body: list[Node_]) -> bool:
 
 
 def _fence(node: Optional[Node_], inner: frozenset[str], ctx: _Ctx, flags: int) -> bool:
+    """``node`` must consume at least one character the inner repeat cannot."""
     if node is None:
         return False
     op, av = node
+    if op in (C.MAX_REPEAT, C.MIN_REPEAT, C.POSSESSIVE_REPEAT):
+        lo, _hi, sub = av  # type: ignore[misc]
+        body = list(sub)
+        if lo < 1 or len(body) != 1:
+            return False
+        op, av = body[0]
     pred = _single_char_predicate(op, av, flags)
     if pred is None:
         return False
