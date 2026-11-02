@@ -215,7 +215,9 @@ With both fields `auto`, the server asks `model.route` and then `effort.route`, 
 request with the same request id and facts, so an on-mode launch can wait up to twice
 `decisions.on_timeout_ms`. Neither request sees the other's answer, and one point's failure
 doesn't affect the other. A provider that can't apply an effort is never asked: the record
-says `not_honored`. Claude Code (outside a native agent) and Codex apply it.
+says `not_honored`. Claude Code (outside a native agent) and Codex apply it. A Kiro helper
+doesn't yet: with `effort: "auto"` its record says `not_honored` and it runs the stored effort,
+as `kiroConfig.effort` and `--effort`.
 
 The decided effort applies to that launch only, through its launch plan, the same way as the
 decided model: CAO passes it to the provider at launch, as Claude Code's `--effort` or Codex's
@@ -462,7 +464,9 @@ v3 (see [Kiro v3](kiro-cli.md#kiro-v3-preview)). Each launch gets its own CAO-ow
   itself, or under a home folder that is a git repository, where Kiro would load your own
   `~/.kiro` as workspace configuration.
 - The model tier becomes `--model`. Effort is written as `kiroConfig.effort` and becomes
-  `--effort`; the probe refuses a wrapper that does not declare `--effort`.
+  `--effort`; the probe refuses a wrapper that does not declare `--effort`. A Kiro helper is
+  never a `provider.route` target yet, and `effort: "auto"` runs the stored effort (see
+  [Effort `auto`](#effort-auto)).
 
 Before any task is typed, CAO checks that the header names the agent, that the home and
 your `~/.kiro` markers are unchanged, and that `/tools` and `/mcp list` show only what

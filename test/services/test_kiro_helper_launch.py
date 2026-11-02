@@ -640,6 +640,27 @@ async def test_a_planned_effort_reaches_the_launch_before_kiro_config(kiro):
 
 
 @pytest.mark.asyncio
+async def test_an_auto_effort_helper_runs_its_stored_effort(kiro):
+    """effort.route is never asked for a Kiro helper yet: effort "auto" falls back to the
+    stored effort, and the launch plan the recheck builds carries it to --effort."""
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
+    kiro.env[4]["ephemeral"].update(min_effort="low", default_effort="medium", max_effort="high")
+    spec = {**SPEC, "purpose": "auto_effort_triage", "provider": "kiro_cli", "effort": "auto"}
+    created = create(kiro.env, spec)
+    assert created["effort"] == "medium"
+    assert created["notes"][-1] == (
+        "effort: auto (decided at launch; fallback effort medium, ephemeral.default_effort)"
+    )
+    kiro.name = created["name"]
+    claimed = claim(kiro.env, kiro.name)["claim_id"]
+    decided = kiro.service.recheck_decided(kiro.name, claimed, CALLER, None, None, None)
+    assert decided.effort == "medium"
+    await launch(kiro, claim_id=claimed, launch_plan=LaunchPlan(effort=decided.effort))
+    assert kiro.factory.call_args.kwargs["kiro_launch"].effort == "medium"
+
+
+@pytest.mark.asyncio
 async def test_a_wrapper_without_effort_refuses_an_effort_launch_before_bind(kiro):
     spec = {**SPEC, "purpose": "effort_triage", "provider": "kiro_cli", "effort": "high"}
     kiro.name = create(kiro.env, spec)["name"]

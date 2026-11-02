@@ -314,7 +314,9 @@ async def test_a_provider_that_cannot_apply_effort_is_never_asked(scripted, stat
 @pytest.mark.asyncio
 async def test_the_default_declaration_comes_from_the_provider_class(scripted):
     engine, req, decider, store, _ = scripted
-    # Kiro declares no effort mapping, so it keeps the base class's False.
+    # Kiro's row applies a stored effort (kiroConfig.effort), but its class declares no
+    # decided-effort path, so it keeps the base class's False: effort "auto" on a Kiro
+    # helper falls back to the stored effort.
     plan = await launch(engine, replace(req, provider="kiro_cli"))
     assert decider.requests == []
     (record,) = store.list()

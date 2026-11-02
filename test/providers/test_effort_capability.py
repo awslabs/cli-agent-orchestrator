@@ -88,6 +88,17 @@ def test_codex_honors_effort_and_its_command_carries_it():
     assert CodexProvider.honors_effort("worker", profile) is True
 
 
+def test_kiro_applies_a_stored_effort_but_is_never_asked_for_one_yet():
+    """Kiro's capability row writes a stored effort to kiroConfig.effort, which
+    becomes --effort, but its class declares no decided-effort path, so
+    effort.route is never asked for a Kiro helper (it records not_honored)."""
+    from cli_agent_orchestrator.utils.ephemeral_capabilities import capability_for
+
+    assert capability_for("kiro_cli").effort_config == ("kiroConfig", "effort")
+    assert KiroCliProvider.honors_effort("worker", _profile(kiroConfig={"effort": "high"})) is False
+    assert KiroCliProvider.honors_effort(None, None) is False
+
+
 def test_a_launch_without_a_profile_file_is_judged_like_honors_model():
     # As with honors_model, no profile means no native agent to drop claudeConfig.
     assert ClaudeCodeProvider.honors_effort(None, None) is True
