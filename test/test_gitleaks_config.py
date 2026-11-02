@@ -40,10 +40,18 @@ def _rand(n: int) -> str:
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG = _REPO_ROOT / ".gitleaks.toml"
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("gitleaks") is None,
-    reason="gitleaks binary not on PATH (Go tool; absent in the pip-only test job)",
-)
+# Two marks, and both are load-bearing. The skipif keeps the pip-only Unit Tests
+# job green (no Go toolchain there); must_run("gitleaks") makes that same skip a
+# failure in secret-scan.yml's gitleaks-config-tests job, which installs the
+# pinned binary and is the only place these rules are ever actually exercised.
+# Without it, dropping the install step would silently retire the whole module.
+pytestmark = [
+    pytest.mark.skipif(
+        shutil.which("gitleaks") is None,
+        reason="gitleaks binary not on PATH (Go tool; absent in the pip-only test job)",
+    ),
+    pytest.mark.must_run("gitleaks"),
+]
 
 
 def _scan(content: str) -> int:

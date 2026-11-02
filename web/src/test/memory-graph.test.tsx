@@ -14,21 +14,19 @@ type AnyHandler = (payload: any) => void
 
 const { FakeSigma, getLastSigma, resetLastSigma } = vi.hoisted(() => {
   let last: any
-  // Fake camera records enable/disable calls so drag tests can assert the
+  // Fake camera counts writes to `enabled` so drag tests can assert the
   // camera was disabled during a drag and re-enabled after.
   class FakeCamera {
-    enabled = true
+    private isEnabled = true
     enableCalls = 0
     disableCalls = 0
-    enable() {
-      this.enabled = true
-      this.enableCalls++
-      return this
+    get enabled() {
+      return this.isEnabled
     }
-    disable() {
-      this.enabled = false
-      this.disableCalls++
-      return this
+    set enabled(value: boolean) {
+      this.isEnabled = value
+      if (value) this.enableCalls++
+      else this.disableCalls++
     }
   }
   class FakeSigmaImpl {
@@ -72,7 +70,7 @@ const { FakeSigma, getLastSigma, resetLastSigma } = vi.hoisted(() => {
   }
 })
 
-vi.mock('sigma', () => ({ default: FakeSigma }))
+vi.mock('sigma', () => ({ default: FakeSigma, DEFAULT_STYLES: { nodes: {}, edges: {} } }))
 
 // eslint-disable-next-line import/first
 import { MemoryPanel } from '../components/MemoryPanel'
@@ -285,7 +283,7 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
     expect(exportBody).toEqual({ options: {}, sink: 'obsidian', dest: 'global-vault' })
   })
 
-  it('dragging a node updates its x/y, toggles the camera, and does NOT read the memory', async () => {
+  it('dragging a node updates its x/y, toggles the camera and drag cursor, and does NOT read the memory', async () => {
     routeFetch(url => {
       if (url.startsWith('/graph/')) return { status: 200, body: GRAPH }
       return { status: 200, body: [] }
@@ -307,6 +305,9 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
     // fight the node move.
     expect(sigma.camera.enabled).toBe(false)
     expect(sigma.camera.disableCalls).toBe(1)
+    // Sigma v4 rewrites the inline cursor on hover changes, so the drag cursor
+    // is a container class (index.css) that stays for the whole drag.
+    expect(sigma.container.classList.contains('cao-graph-dragging')).toBe(true)
 
     sigma.emit('moveBody', {
       event: {
@@ -325,11 +326,13 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
     expect(sigmaDefaultPrevented).toBe(true)
     expect(original.preventDefault).toHaveBeenCalled()
     expect(original.stopPropagation).toHaveBeenCalled()
+    expect(sigma.container.classList.contains('cao-graph-dragging')).toBe(true)
 
     sigma.emit('upStage', { event: { x: 123, y: 456 } })
-    // Camera re-enabled after the drag ends.
+    // Camera re-enabled and drag cursor removed after the drag ends.
     expect(sigma.camera.enabled).toBe(true)
     expect(sigma.camera.enableCalls).toBe(1)
+    expect(sigma.container.classList.contains('cao-graph-dragging')).toBe(false)
 
     // A trailing clickNode after a drag must NOT open the topic (no read).
     sigma.emit('clickNode', { node: 'hub1' })
@@ -360,11 +363,33 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
     // downNode + upNode with NO moveBody in between = a click, not a drag.
     const sigma = getLastSigma()!
     sigma.emit('downNode', { node: 'hub1' })
+    expect(sigma.container.classList.contains('cao-graph-dragging')).toBe(true)
     sigma.emit('upNode', { node: 'hub1' })
+    expect(sigma.container.classList.contains('cao-graph-dragging')).toBe(false)
     sigma.emit('clickNode', { node: 'hub1' })
 
     expect(await screen.findByText('PLAIN CLICK CONTENT')).toBeInTheDocument()
     expect(mockFetch.mock.calls.some(c => String(c[0]) === '/memory/hub1?scope=global')).toBe(true)
+  })
+
+  it('unmounting during a node drag removes the drag cursor class', async () => {
+    routeFetch(url => {
+      if (url.startsWith('/graph/')) return { status: 200, body: GRAPH }
+      return { status: 200, body: [] }
+    })
+    const { unmount } = render(<MemoryPanel />)
+    await screen.findByText('No memories stored.')
+    fireEvent.click(screen.getByRole('tab', { name: /graph/i }))
+    selectGlobalScope()
+    await waitFor(() => expect(getLastSigma()).toBeDefined())
+
+    // No upNode/upStage arrives; the Sigma teardown must still clear the class.
+    const sigma = getLastSigma()!
+    sigma.emit('downNode', { node: 'hub1' })
+    expect(sigma.container.classList.contains('cao-graph-dragging')).toBe(true)
+    unmount()
+    expect(sigma.killed).toBe(true)
+    expect(sigma.container.classList.contains('cao-graph-dragging')).toBe(false)
   })
 
   it('project scope sends scope_id on the graph fetch', async () => {

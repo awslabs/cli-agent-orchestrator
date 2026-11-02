@@ -187,10 +187,12 @@ for a tool that grants one — **there deliberately isn't one.** An agent that c
 just wrote would make the check decorative in exactly the case it exists for. Approving is a human act
 at a human's terminal.
 
-Once approved, run again and it proceeds. Approval binds the script, its inputs and the working
-directory's state: change any of them and the next run needs its own approval. Edits to agent profiles
-or CAO memory don't change the `plan_id`, so a later run of the same plan uses them without asking
-again. Tell the user whenever you change either.
+Once approved, run again and it proceeds. Approval binds the script, its inputs, the working
+directory's state and the installed agent profile set: change any of them and the next run needs its
+own approval. Editing or installing ANY agent profile changes the `plan_id` of every plan, not just
+the plans that name it. Edits to CAO memory, to managed `.env` values a profile references, to
+installed skills or to plugin MCP servers do not change the `plan_id`, so a later run of the same plan
+uses them without asking again. Tell the user whenever you change any of these.
 
 > **This pause is not a defect, and it does not fail FR-10.** The requirement's failure condition is
 > *asking the user to choose a format* — which never happens, since Python is the format. A human
@@ -477,11 +479,11 @@ cao workflow create summarize_dir --from-file ./summarize_dir.py
 
 # d. attempt the run — refused, because this plan is new
 cao workflow run summarize_dir --run-id sum-1 --input target_dir=./reports
-#   -> Plan 'plan-v1:9f3c…' needs human approval before it can run: an operator approves it with `cao workflow approve plan-v1:9f3c…`, then runs it again. …
+#   -> Plan 'plan-v2:9f3c…' needs human approval before it can run: an operator approves it with `cao workflow approve plan-v2:9f3c…`, then runs it again. …
 #      Approval is a human decision; an agent must not grant it.
 
 # the USER approves (you must not; no tool does):
-cao workflow approve plan-v1:9f3c…
+cao workflow approve plan-v2:9f3c…
 
 # e. run for real, with the run-id announced first
 cao workflow run summarize_dir --run-id sum-1 --input target_dir=./reports --detach

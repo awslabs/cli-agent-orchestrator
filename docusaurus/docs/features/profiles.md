@@ -57,7 +57,7 @@ You are the Developer Agent. Write high-quality, maintainable code.
 | `model` | string | All | AI model to use |
 | `permissionMode` | string | Claude Code | `"default"`, `"acceptEdits"`, `"plan"`, `"auto"`, `"bypassPermissions"` |
 | `native_agent` | string | Claude Code | Name of a native Claude Code agent (thin-wrapper mode) |
-| `codexProfile` | string | Codex | Names a `[profiles.<name>]` block in `~/.codex/config.toml` |
+| `codexProfile` | string | Codex | Names a `$CODEX_HOME/<name>.config.toml` file (not a `[profiles.<name>]` table in `config.toml`, which codex rejects) |
 | `codexConfig` | object | Codex | Inline config overrides passed as `-c key=value` |
 | `hermesProfile` | string | Hermes | Hermes profile wrapper command |
 

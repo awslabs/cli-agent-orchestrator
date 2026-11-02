@@ -1313,7 +1313,9 @@ class TestDeleteSession:
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
         # Registry rows are reconciled after kill_session confirms the session
         # is gone — scoped to the incarnation's ids, not the whole session name.
-        mock_delete_terminals_by_ids.assert_called_once_with(["terminal1", "terminal2"])
+        mock_delete_terminals_by_ids.assert_called_once_with(
+            ["terminal1", "terminal2"], end_reason="session_teardown"
+        )
         # Snapshots are captured while the panes still exist ...
         assert mock_capture.call_count == 2
         mock_capture.assert_any_call("terminal1")
@@ -1323,8 +1325,12 @@ class TestDeleteSession:
         mock_dismantle.assert_any_call("terminal1", ANY, kill_window=False)
         mock_dismantle.assert_any_call("terminal2", ANY, kill_window=False)
         assert mock_delete_row.call_count == 2
-        mock_delete_row.assert_any_call("terminal1", ANY, registry=ANY)
-        mock_delete_row.assert_any_call("terminal2", ANY, registry=ANY)
+        mock_delete_row.assert_any_call(
+            "terminal1", ANY, registry=ANY, end_reason="session_teardown"
+        )
+        mock_delete_row.assert_any_call(
+            "terminal2", ANY, registry=ANY, end_reason="session_teardown"
+        )
 
     @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
@@ -1403,7 +1409,9 @@ class TestDeleteSession:
             "current-live",
             "current-failed",
         ]
-        mock_delete_terminals_by_ids.assert_called_once_with(["current-live", "current-failed"])
+        mock_delete_terminals_by_ids.assert_called_once_with(
+            ["current-live", "current-failed"], end_reason="session_teardown"
+        )
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
@@ -1432,8 +1440,12 @@ class TestDeleteSession:
         mock_get_backend.return_value.kill_session.assert_not_called()
         mock_capture.assert_called_once_with("terminal1")
         mock_dismantle.assert_called_once_with("terminal1", ANY, kill_window=False)
-        mock_delete_row.assert_called_once_with("terminal1", ANY, registry=ANY)
-        mock_delete_terminals_by_ids.assert_called_once_with(["terminal1"])
+        mock_delete_row.assert_called_once_with(
+            "terminal1", ANY, registry=ANY, end_reason="session_teardown"
+        )
+        mock_delete_terminals_by_ids.assert_called_once_with(
+            ["terminal1"], end_reason="session_teardown"
+        )
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
@@ -1462,7 +1474,7 @@ class TestDeleteSession:
         mock_capture.assert_not_called()
         mock_dismantle.assert_not_called()
         mock_delete_row.assert_not_called()
-        mock_delete_terminals_by_ids.assert_called_once_with([])
+        mock_delete_terminals_by_ids.assert_called_once_with([], end_reason="session_teardown")
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -1521,10 +1533,12 @@ class TestDeleteSession:
         assert mock_dismantle.call_count == 3
         assert mock_delete_row.call_count == 3
         mock_dismantle.assert_any_call("terminal1", None, kill_window=False)
-        mock_delete_row.assert_any_call("terminal1", None, registry=ANY)
+        mock_delete_row.assert_any_call(
+            "terminal1", None, registry=ANY, end_reason="session_teardown"
+        )
         # The by-id sweep still backstops any row a failed delete left behind.
         mock_delete_terminals_by_ids.assert_called_once_with(
-            ["terminal1", "terminal2", "terminal3"]
+            ["terminal1", "terminal2", "terminal3"], end_reason="session_teardown"
         )
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
@@ -1565,7 +1579,7 @@ class TestDeleteSession:
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-grok")
         # The retry handle survives both row-deletion paths.
         mock_delete_row.assert_not_called()
-        mock_delete_terminals_by_ids.assert_called_once_with([])
+        mock_delete_terminals_by_ids.assert_called_once_with([], end_reason="session_teardown")
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
@@ -1602,7 +1616,7 @@ class TestDeleteSession:
         for tid in ("term-aaa", "term-bbb", "term-ccc", "term-ddd"):
             mock_capture.assert_any_call(tid)
             mock_dismantle.assert_any_call(tid, ANY, kill_window=False)
-            mock_delete_row.assert_any_call(tid, ANY, registry=ANY)
+            mock_delete_row.assert_any_call(tid, ANY, registry=ANY, end_reason="session_teardown")
 
 
 def test_list_sessions_reports_the_creator_as_owner(real_session_db, monkeypatch):

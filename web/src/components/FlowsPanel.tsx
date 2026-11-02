@@ -250,7 +250,7 @@ export function FlowsPanel() {
                     {/* Delete */}
                     <button
                       onClick={e => { e.stopPropagation(); setPendingDelete(f) }}
-                      className="p-1.5 text-gray-500 hover:text-red-400 transition-colors rounded"
+                      className="p-1.5 text-gray-500 hover:text-red-400 transition-colors rounded-sm"
                       title="Delete flow"
                     >
                       <Trash2 size={14} />
@@ -297,7 +297,7 @@ export function FlowsPanel() {
       {/* Create Flow Modal */}
       {showCreateModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setShowCreateModal(false)} />
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-xs" onClick={() => setShowCreateModal(false)} />
           <div className="relative bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl shadow-black/50 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
             {/* Modal header */}
             <div className="flex items-center justify-between p-5 border-b border-gray-700/50">
@@ -324,7 +324,7 @@ export function FlowsPanel() {
                   value={name}
                   onChange={e => setName(e.target.value)}
                   placeholder="my-daily-review"
-                  className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-none"
+                  className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-hidden"
                   autoFocus
                 />
               </div>
@@ -351,7 +351,7 @@ export function FlowsPanel() {
                     value={schedule}
                     onChange={e => setSchedule(e.target.value)}
                     placeholder="*/30 * * * *"
-                    className="w-full mt-2 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-none"
+                    className="w-full mt-2 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-hidden"
                     autoFocus
                   />
                 )}
@@ -382,7 +382,7 @@ export function FlowsPanel() {
                       value={agentProfile}
                       onChange={e => setAgentProfile(e.target.value)}
                       placeholder="e.g. developer"
-                      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-none"
+                      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-hidden"
                     />
                   )}
                 </div>
@@ -409,7 +409,7 @@ export function FlowsPanel() {
                   onChange={e => setPromptTemplate(e.target.value)}
                   placeholder="Describe what this flow should do..."
                   rows={5}
-                  className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-none resize-y"
+                  className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-hidden resize-y"
                 />
               </div>
             </div>

@@ -72,6 +72,8 @@ def test_workflow_run_columns(patched_db):
         "manifest_json",
         "error",
         "kind",
+        # delegation ceiling (PR #948): the starting terminal, nullable.
+        "caller_id",
     }
     # run_id is the primary key; the nullable columns are current_step_id/finished_at.
     assert cols["run_id"][5] == 1
@@ -103,6 +105,9 @@ def test_workflow_run_columns(patched_db):
     assert cols["kind"][2] == "TEXT"
     assert cols["kind"][3] == 0
     assert cols["kind"][4] == "NULL"
+    assert cols["caller_id"][2] == "TEXT"
+    assert cols["caller_id"][3] == 0
+    assert cols["caller_id"][4] == "NULL"
 
 
 def test_workflow_run_no_loop_columns(patched_db):
@@ -307,6 +312,7 @@ def test_workflow_run_indexes_do_not_change_columns(patched_db):
         "manifest_json",
         "error",
         "kind",
+        "caller_id",
     }
 
 

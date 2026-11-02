@@ -25,7 +25,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
 )
 
-pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+pytestmark = pytest.mark.usefixtures("isolated_memory_db", "kiro_agent_store_not_under_test")
 
 
 def _registry_mock() -> MagicMock:
@@ -159,7 +159,9 @@ class TestSessionPluginEvents:
 
         mock_capture.side_effect = record_snapshot
         mock_dismantle.side_effect = lambda *_args, **_kwargs: call_order.append("dismantle")
-        mock_db_delete_terminal.side_effect = lambda *_: call_order.append("db_delete") or True
+        mock_db_delete_terminal.side_effect = (
+            lambda *_, **__: call_order.append("db_delete") or True
+        )
         registry.dispatch.side_effect = record_dispatch
 
         result = delete_session("cao-demo", registry=registry)
@@ -404,7 +406,7 @@ class TestSessionPluginEvents:
             "agent_profile": "developer",
         }
         # The first terminal's row delete fails transiently; the peer's works.
-        mock_db_delete.side_effect = lambda tid: (
+        mock_db_delete.side_effect = lambda tid, **_: (
             (_ for _ in ()).throw(RuntimeError("database is locked")) if tid == "aaaa1111" else True
         )
         mock_sweep.return_value = None  # the sweep succeeds
@@ -512,6 +514,7 @@ class TestTerminalPluginEvents:
             side_effect=lambda: call_order.append("provider_initialize")
         )
         provider.shell_baseline = None
+        provider.identity_verified = True  # a healthy Kiro launch (#1074)
         mock_provider_manager.create_provider.return_value = provider
 
         log_path = MagicMock()
@@ -620,10 +623,12 @@ class TestTerminalPluginEvents:
             "agent_profile": "developer",
         }
         mock_provider_manager.cleanup_provider.side_effect = lambda *_: call_order.append("cleanup")
-        mock_db_delete_terminal.side_effect = lambda *_: call_order.append("db_delete") or True
+        mock_db_delete_terminal.side_effect = (
+            lambda *_, **__: call_order.append("db_delete") or True
+        )
         registry.dispatch.side_effect = record_dispatch
 
-        deleted = delete_terminal("abcd1234", registry=registry)
+        deleted = delete_terminal("abcd1234", registry=registry, end_reason="deleted")
 
         assert deleted is True
         assert call_order[-2:] == ["db_delete", "dispatch"]
@@ -651,7 +656,7 @@ class TestTerminalPluginEvents:
         mock_db_delete_terminal.side_effect = RuntimeError("db delete failed")
 
         with pytest.raises(RuntimeError, match="db delete failed"):
-            delete_terminal("abcd1234", registry=registry)
+            delete_terminal("abcd1234", registry=registry, end_reason="deleted")
 
         registry.dispatch.assert_not_awaited()
 
@@ -773,9 +778,16 @@ class TestMessagePluginEvents:
         # Status is sourced from the event-driven StatusMonitor, not the provider.
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
 
-        inbox_service.deliver_pending("abcd1234", registry=registry)
+        # status_monitor is mocked bare here with no status_observation()
+        # configured, so the default-on submit confirmation (#78) would poll
+        # it forever and burn the real 8s timeout; this test is about event
+        # attribution, not that confirmation path.
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False
+        ):
+            inbox_service.deliver_pending("abcd1234", registry=registry)
 
-        mock_terminal_service.send_input.assert_called_once_with(
+        mock_terminal_service.dispatch_input.assert_called_once_with(
             "abcd1234",
             "Please review this",
             registry=registry,

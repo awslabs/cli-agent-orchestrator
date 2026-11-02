@@ -65,6 +65,7 @@ A supervisor pod in a CAO cluster already has both set, which is why
 | `CAO_API_PORT` | Port for cao-server | `9889` |
 | `CAO_PYTE_STATUS` | Enable pyte-rendered status detection | `true` |
 | `CAO_EAGER_INBOX_DELIVERY` | Deliver inbox messages during PROCESSING for capable providers | `false` |
+| `CAO_INBOX_SUBMIT_CONFIRMATION` | After each inbox delivery, wait for the receiver to start processing it and recover a swallowed Enter (issue #78). Adds up to 8s per recovery attempt on a dropped delivery, for that terminal only. Set `false` to restore paste-and-forget delivery | `true` |
 | `CAO_ENABLE_WORKING_DIRECTORY` | Enable `working_directory` parameter on orchestration tools | `false` |
 | `CAO_ENABLE_SENDER_ID_INJECTION` | Auto-append supervisor terminal ID to assign messages | `true` |
 

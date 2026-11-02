@@ -24,7 +24,7 @@ For contributors working on the frontend:
 # Terminal 1 -- backend
 cao-server
 
-# Terminal 2 -- frontend dev server (requires Node.js 18+)
+# Terminal 2 -- frontend dev server (requires Node.js 22.22.2 or later)
 cd web/
 npm install        # first time only
 npm run dev        # starts on http://localhost:5173

@@ -181,6 +181,7 @@ def _register_script_run(run_id: str, *, generation: str = "1") -> ScriptRunReco
         {
             "source": "",
             "launch_guard": {
+                "scheme": launch_guard.GUARD_SCHEME,
                 "profiles": {
                     "developer": launch_guard._profile_digest("developer"),
                 },

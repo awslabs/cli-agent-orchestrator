@@ -21,7 +21,7 @@ interface ProfileEditorModalProps {
 }
 
 const inputClass =
-  'w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-emerald-600'
+  'w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600'
 
 /**
  * Raw document editor over `GET /agents/profiles/{name}/source`. Deliberately
@@ -131,12 +131,12 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
   }
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center" role="dialog" aria-label={mode === 'edit' ? 'Edit profile' : 'Clone profile'}>
+    <div className="fixed inset-0 z-60 flex items-center justify-center" role="dialog" aria-label={mode === 'edit' ? 'Edit profile' : 'Clone profile'}>
       {/* Backdrop close is gated on !saving: Cancel is already disabled
           during a save, and an overlay click mid-flight would unmount the
           modal while the request resolves — success snackbar with no modal,
           setState on an unmounted tree. */}
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={saving ? undefined : onClose} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-xs" onClick={saving ? undefined : onClose} />
       <div className="relative bg-gray-900 border border-gray-700/50 rounded-2xl shadow-2xl w-full max-w-3xl mx-4 max-h-[85vh] flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center gap-3 p-5 pb-3 border-b border-gray-800">
@@ -149,7 +149,7 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
           {/* Gated like Cancel and the backdrop: closing mid-save unmounts
               the modal, so a late 400 rejection lands nowhere and the user
               believes the save succeeded (#692 review). */}
-          <button onClick={saving ? undefined : onClose} disabled={saving} aria-label="Close" className="p-1 text-gray-500 hover:text-white rounded transition-colors disabled:opacity-50">
+          <button onClick={saving ? undefined : onClose} disabled={saving} aria-label="Close" className="p-1 text-gray-500 hover:text-white rounded-sm transition-colors disabled:opacity-50">
             <X size={16} />
           </button>
         </div>
@@ -204,7 +204,7 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
               rows={18}
               spellCheck={false}
               className={`${inputClass} font-mono text-xs leading-relaxed${
-                findings.some(f => f.severity === 'error') ? ' border-2 !border-red-500 ring-2 ring-red-500/30' : ''
+                findings.some(f => f.severity === 'error') ? ' border-2 border-red-500! ring-2 ring-red-500/30' : ''
               }`}
             />
           )}

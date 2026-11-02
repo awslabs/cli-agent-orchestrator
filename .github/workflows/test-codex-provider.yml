@@ -20,7 +20,12 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/codex.py'
-      - 'test/providers/test_codex_provider_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Codex test outside test_codex_provider_unit.py (the completion-footer
+      # suite, the #739 startup-chrome invariant) was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_codex_*.py'
       - 'test/providers/fixtures/codex_*.txt'
       - 'pyproject.toml'
       - '.github/workflows/test-codex-provider.yml'
@@ -28,7 +33,12 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/codex.py'
-      - 'test/providers/test_codex_provider_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Codex test outside test_codex_provider_unit.py (the completion-footer
+      # suite, the #739 startup-chrome invariant) was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_codex_*.py'
       - 'test/providers/fixtures/codex_*.txt'
       - 'pyproject.toml'
       - '.github/workflows/test-codex-provider.yml'
@@ -39,14 +49,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -59,7 +69,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          uv run pytest test/providers/test_codex_provider_unit.py \
+          uv run pytest test/providers/test_codex_*.py \
             --cov=src/cli_agent_orchestrator/providers/codex.py \
             --cov-report=xml \
             --cov-report=term-missing \
@@ -84,7 +94,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"

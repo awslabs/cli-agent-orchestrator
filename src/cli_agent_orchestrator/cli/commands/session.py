@@ -267,7 +267,9 @@ def send(session_name, message, terminal_id, is_async, timeout):
 
         status_resp = api_http.get(f"{API_BASE_URL}/terminals/{target_id}")
         status_resp.raise_for_status()
-        current_status = status_resp.json().get("status")
+        status_payload = status_resp.json()
+        status_payload = status_payload if isinstance(status_payload, dict) else {}
+        current_status = status_payload.get("status")
         # "completed" is a valid pre-send state: the terminal has finished its
         # previous task and is ready to accept a new message.
         if current_status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
@@ -280,18 +282,28 @@ def send(session_name, message, terminal_id, is_async, timeout):
             params={"message": message},
         )
         response.raise_for_status()
-    except api_http.exceptions.RequestException as e:
+        # The dispatch boundary names the turn we just started, so the wait below
+        # can refuse a status earned before it — otherwise the previous turn's
+        # COMPLETED, still on screen, ends the wait at once and we print its
+        # answer or a half-drawn frame (#735). An older cao-server omits it; then
+        # we fall back to the flat sleep and the frame-based wait.
+        input_payload = response.json()
+        input_payload = input_payload if isinstance(input_payload, dict) else {}
+        boundary = input_payload.get("dispatch_boundary")
+        boundary = boundary if isinstance(boundary, int) else None
+    except (api_http.exceptions.RequestException, ValueError) as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
     if is_async:
         click.echo(f"Message sent to terminal {target_id}")
         return
 
-    time.sleep(3)
+    if boundary is None:
+        time.sleep(3)
     effective_timeout = timeout if timeout is not None else _DEFAULT_SEND_TIMEOUT
     interrupted = False
     try:
-        poll_until_done(target_id, effective_timeout)
+        poll_until_done(target_id, effective_timeout, min_generation=boundary)
     except KeyboardInterrupt:
         interrupted = True
 

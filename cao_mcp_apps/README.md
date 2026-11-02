@@ -115,11 +115,14 @@ package:
 
 ### Coverage ratchet
 
-`scripts/coverage-ratchet.mjs` reads the line-coverage floors from the
-repo-root [`.coverage-baseline.json`](../.coverage-baseline.json) and fails CI if
-either the Python or the frontend coverage drops below its floor (a `null` floor
-is record-only). Frontend coverage comes from Vitest's `coverage-summary.json`
-(`provider: "v8"`), scoped to the `coverage.include` globs in `vitest.config.ts`.
+`scripts/coverage-ratchet.mjs` reads the coverage floors from the repo-root
+[`.coverage-baseline.json`](../.coverage-baseline.json) and fails CI if the
+Python line coverage or the frontend line coverage drops below its floor (a
+`null` floor is record-only). Python branch coverage is also collected and
+reported as its own `python_branch` metric, seeded with a `null` floor until a
+full-suite run establishes a baseline, so it is record-only today. Frontend
+coverage comes from Vitest's `coverage-summary.json` (`provider: "v8"`),
+scoped to the `coverage.include` globs in `vitest.config.ts`.
 
 > **Note on the V8 coverage number.** Vitest 4 / `@vitest/coverage-v8` 4 compute
 > V8 line coverage via AST-based remapping (replacing the older, less accurate

@@ -25,7 +25,12 @@ UNICODE_PARENT_ALIASES = [
 
 
 def _large_source(label: str) -> str:
-    return f"INPUTS = {{}}\nVALUE = {label!r}\n# {label}" + ("x" * 180_000) + "\n"
+    # Padded well past a trivial file so the write/publish these tests race against
+    # takes long enough to actually land a race, but kept comfortably under
+    # SCRIPT_LINT_MAX_SOURCE_CHARS (128 KiB, #969/#970) -- a padded spec this size is
+    # a test fixture, not a real workflow script, so it must stay inside the real
+    # linter's cap or every write here is refused before the race ever starts.
+    return f"INPUTS = {{}}\nVALUE = {label!r}\n# {label}" + ("x" * 100_000) + "\n"
 
 
 def _create_worker(

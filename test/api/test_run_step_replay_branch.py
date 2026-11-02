@@ -190,6 +190,7 @@ def _guarded_snapshot(agent: str = "developer") -> str:
         {
             "source": "",
             "launch_guard": {
+                "scheme": launch_guard.GUARD_SCHEME,
                 "profiles": {agent: launch_guard._profile_digest(agent)},
                 "memory_enabled": settings_service.is_memory_enabled(),
             },

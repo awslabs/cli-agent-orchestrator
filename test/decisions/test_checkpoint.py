@@ -1,11 +1,12 @@
-import asyncio
 import json
 import os
 import re
 import sys
 import time
 from dataclasses import replace
-from test.decisions.test_engine import setup_engine
+from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
+    setup_engine,
+)
 from types import SimpleNamespace
 from unittest.mock import Mock
 

@@ -16,9 +16,6 @@ testing them directly is the only way to hold them to their contract.
 
 from __future__ import annotations
 
-import errno
-import logging
-import shutil
 from pathlib import Path
 
 import pytest

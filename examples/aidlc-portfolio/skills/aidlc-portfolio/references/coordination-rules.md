@@ -42,6 +42,9 @@ Before dispatch:
 7. Confirm no pending human question packet exists for the child.
 8. Run `harness verify` for the exact project and intent.
 9. Pass only the relevant business, component, contract, and dependency slice.
+10. Recall promoted learnings in the supervisor's own memory scope and render
+    the assignment with `dispatch message`, which delivers only the reviewed
+    learnings that apply to this project.
 
 Use non-blocking CAO assignment for independent work and pass the registered
 absolute worktree as `working_directory`. Do not use CAO's inherited supervisor
@@ -59,31 +62,64 @@ Generated AI-DLC questions are immutable, human-owned decision points.
    packets are rejected and the session becomes `waiting`.
 2. The supervisor offers Guide, Edit Markdown, or Chat.
 3. The supervisor writes human answers verbatim without changing question text.
-4. `question answer` verifies question integrity and complete answers, records
-   the interaction mode and human decision maker, then returns the session to
-   `active`.
-5. The runner resumes only after observing the answered packet.
+4. The human actions CAO's human-approval surface, which mints an approval
+   record bound to the packet and carrying the human's identity. No
+   agent-facing `portfolio.ts` subcommand mints an approval record.
+5. `question answer --approval-id <id>` verifies question integrity and complete
+   answers, then binds the resolution to that approval: the answerer identity
+   comes FROM the approval record, not from a caller-supplied argument. A
+   packet with no matching, unconsumed, human-surface approval is refused, so
+   the agent cannot resolve a packet by asserting an identity through the
+   `question answer` flag. A replayed answer stops at the packet's status
+   gate, because an answered packet is no longer `pending`; the approval's
+   consumed flag is a second, defense-in-depth check.
+6. The runner resumes only after observing the answered packet.
 
-Neither permission bypass nor runner autonomy authorizes self-answering.
+In this sample the approval record is a JSON file in `portfolio/approvals/`,
+the same tree the agent's own filesystem tools can already write to. The real
+boundary here is narrower than it looks: no `portfolio.ts` subcommand lets an
+agent mint an approval, but nothing stops an agent with raw file access from
+writing an approval record directly and then calling `question answer` with
+its id. The sample demonstrates the protocol *shape* — packet-bound, single-use,
+identity read from the record rather than a free-text argument — which is a
+real improvement over `--answered-by`. Enforcing that boundary against an
+agent that can write anywhere in its own worktree requires the approval record
+to live outside the agent's write reach (CAO's real human-approval surface) or
+be signed with a key the agent does not hold. The "never answer on the human's
+behalf" prompt rule stays in the profiles as the practical guardrail in this
+sample; treat it as defense-in-depth, not as something the file-based stand-in
+makes structurally unbreakable.
 
 ## Shared Memory
 
-The supervisor is the sole approval authority for durable project and team
-memory. The utility is the sole physical writer to canonical memory.
+Durable portfolio knowledge lives in CAO native memory, written and read
+through the `memory_store` / `memory_recall` MCP tools. The supervisor is the
+sole authority that promotes a learning into that memory.
 
-1. `dispatch check` captures the canonical SHA-256 baseline.
-2. Runners treat worktree memory writes as temporary and submit structured
-   proposals with evidence and the supplied baseline.
-3. `learning approve` serializes writes under the portfolio lock.
-4. A stale proposal cannot apply until the supervisor reviews current memory
-   and records a `learning reconcile` note.
-5. Equivalent rules are idempotent and do not append duplicate text.
-6. The runner cleans worktree memory back to Git `HEAD` using its exact
-   inspected revision.
-7. Session completion is blocked while project or team memory remains in the
-   feature diff.
+1. Runners treat worktree `project.md`/`team.md` as LOCAL scratch and submit
+   durable learnings as structured proposals with evidence (`learning propose`).
+   There is no dispatch SHA-256 baseline and no canonical-file compare-and-swap.
+2. The supervisor reviews proposals (`learning list`) for duplication,
+   contradiction, and scope.
+3. To accept, the supervisor writes the rule into CAO memory with `memory_store`
+   (scope project, memory_type feedback), then records that promotion with
+   `learning promote --promoted-by <supervisor> --memory-key <key>`, using the
+   key `memory_store` returned. To decline, use `learning reject`.
+4. A proposal is reviewed once; a promoted or rejected proposal cannot be
+   re-promoted.
+5. Integration completion blocks while any proposal is still `pending`.
+6. Promoted learnings reach runners in the assignment. CAO resolves a project
+   memory scope per terminal, and each runner's worktree resolves its own
+   repository's scope, so a runner's `memory_recall` does not return what the
+   supervisor promoted. The supervisor recalls in its own scope at dispatch and
+   `dispatch message` places the relevant learnings, labelled as data, in the
+   runner message. A runner may still recall its own repository's scope.
 
-Do not merge shared-memory changes opportunistically from feature branches.
+Per-space worktree memory files no longer block session completion and are not
+merged from feature branches. Durable knowledge is inspected with
+`memory_recall` in the supervisor's scope, not a git diff. See
+[shared-memory.md](shared-memory.md) for the delivery rules and the
+`CAO_PROJECT_ID` alternative.
 
 ## Contract Changes
 

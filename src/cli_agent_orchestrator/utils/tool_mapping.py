@@ -8,7 +8,7 @@ given a set of allowed CAO tools.
 
 import fnmatch
 import logging
-from typing import Dict, Iterable, List, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +287,81 @@ def granted_mcp_servers(
             name for name in names if name == pattern or fnmatch.fnmatchcase(name, pattern)
         )
     return sorted(granted)
+
+
+def split_mcp_reference(entry: str) -> Optional[Tuple[str, Optional[str]]]:
+    """``@server`` -> ``("server", None)``; ``@server/tool`` -> ``("server", "tool")``.
+
+    ``None`` for anything that is not an MCP server reference: a bare tool name,
+    an empty ``@``, or a vocabulary selector such as ``@builtin`` (which names a
+    provider's own built-in set and grants nothing by itself). Both halves may be
+    globs, read with the same case-sensitive ``fnmatchcase`` rule
+    :func:`granted_mcp_servers` applies to server names.
+    """
+    if not isinstance(entry, str) or not entry.startswith("@"):
+        return None
+    body = entry[1:]
+    if not body:
+        return None
+    server, sep, tool = body.partition("/")
+    if not server or server in _MCP_REF_VOCABULARY:
+        return None
+    return server, (tool if sep else None)
+
+
+def mcp_reference_covers(grant: str, requested: str) -> bool:
+    """Whether MCP reference ``grant`` authorizes MCP reference ``requested``.
+
+    The ONE rule for comparing two references, shared by the provider resolvers
+    (through :func:`granted_mcp_servers`, which matches concrete names the same
+    way) and by the delegation-ceiling comparator (``utils/delegation.py``), so
+    what ``@plugin-*`` grants at launch is exactly what it covers when a parent
+    delegates it. A grant covers a request when the request's server matches the
+    grant's server pattern (exact or ``fnmatchcase``) and either the grant names
+    the whole server (no ``/tool`` part) or its tool pattern matches the request's
+    tool. A whole-server request is never covered by a per-tool grant. Patterns
+    on the requested side match only a grant pattern that matches them
+    literally-as-a-name (so ``@*`` covers ``@plugin-*``; ``@plugin-*`` does not
+    cover ``@*``). ``@builtin`` is not a reference on either side.
+    """
+    granted = split_mcp_reference(grant)
+    wanted = split_mcp_reference(requested)
+    if granted is None or wanted is None:
+        return False
+    g_server, g_tool = granted
+    w_server, w_tool = wanted
+    if not _part_covers(g_server, w_server):
+        return False
+    if g_tool is None:
+        return True
+    if w_tool is None:
+        return False
+    return _part_covers(g_tool, w_tool)
+
+
+_GLOB_META = frozenset("*?[")
+
+
+def _part_covers(grant_part: str, requested_part: str) -> bool:
+    """One reference component (server or tool) of a grant covering a request.
+
+    A CONCRETE requested name is covered when it equals the grant or matches the
+    grant pattern (``fnmatchcase``). A PATTERN-SHAPED request (any of ``*``,
+    ``?``, ``[``) is a language, not a name, and ``fnmatchcase`` would match it
+    as literal text: ``@plugin-?`` would cover ``@plugin-*`` because the
+    one-character ``*`` fits ``?``, and the child would then store a ceiling
+    wider than its parent's. Pattern inclusion is only decided in the two cases
+    that are certain: the grant is the bare ``*`` (every language is a subset)
+    or the grant is byte-identical text. Anything else is refused; the operator
+    can widen the grant explicitly.
+    """
+    if requested_part == grant_part:
+        return True
+    if grant_part == "*":
+        return True
+    if _GLOB_META & set(requested_part):
+        return False
+    return fnmatch.fnmatchcase(requested_part, grant_part)
 
 
 #: Kiro built-ins that ``@builtin`` grants on the ``tools`` axis: the ones that

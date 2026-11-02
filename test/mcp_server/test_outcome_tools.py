@@ -61,6 +61,7 @@ def _report(**overrides):
         agent_profile=None,
         score=None,
         friction_notes="",
+        terminal_id=None,
     )
     kwargs.update(overrides)
     return report_outcome(**kwargs)

@@ -141,7 +141,7 @@ export function WorkflowTimeline({
                 <li
                   data-testid="timeline-gap"
                   aria-label={`${GAP_CUE.sr}: ${gap.missing_count} event(s) missing between seq ${gap.after_seq} and ${gap.before_seq}, reason ${gap.reason}`}
-                  className="flex items-center gap-2 my-1 px-3 py-1.5 rounded border border-yellow-600/40 text-xs text-yellow-300 bg-[repeating-linear-gradient(45deg,rgba(250,204,21,0.12),rgba(250,204,21,0.12)_6px,transparent_6px,transparent_12px)]"
+                  className="flex items-center gap-2 my-1 px-3 py-1.5 rounded-sm border border-yellow-600/40 text-xs text-yellow-300 bg-[repeating-linear-gradient(45deg,rgba(250,204,21,0.12),rgba(250,204,21,0.12)_6px,transparent_6px,transparent_12px)]"
                 >
                   <GAP_CUE.Icon size={14} aria-hidden="true" className={GAP_CUE.color} />
                   <span className="font-medium">Declared gap</span>
@@ -180,7 +180,7 @@ export function WorkflowTimeline({
             key={`trailing-${gap.before_seq}`}
             data-testid="timeline-trailing-gap"
             aria-label={`${GAP_CUE.sr}: ${gap.missing_count} event(s) lost after seq ${gap.after_seq}; the run ended before they were recorded, reason ${gap.reason}`}
-            className="flex items-center gap-2 my-1 px-3 py-1.5 rounded border border-yellow-600/40 text-xs text-yellow-300 bg-[repeating-linear-gradient(45deg,rgba(250,204,21,0.12),rgba(250,204,21,0.12)_6px,transparent_6px,transparent_12px)]"
+            className="flex items-center gap-2 my-1 px-3 py-1.5 rounded-sm border border-yellow-600/40 text-xs text-yellow-300 bg-[repeating-linear-gradient(45deg,rgba(250,204,21,0.12),rgba(250,204,21,0.12)_6px,transparent_6px,transparent_12px)]"
           >
             <GAP_CUE.Icon size={14} aria-hidden="true" className={GAP_CUE.color} />
             <span className="font-medium">Trailing gap</span>

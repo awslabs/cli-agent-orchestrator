@@ -214,6 +214,27 @@ def test_boundary_scan_rejects_changes_and_new_vocabulary(mutation):
         assert_agent_boundary(tools, base)
 
 
+def test_decisions_status_tool_docstring_mentions_last_outcome_and_counts():
+    """#1076 note 3: an agent sees only the tool's own docstring when it
+    selects a tool, so it must say that decisions_status also returns each
+    decider's last outcome and 24-hour counts, not just settings."""
+    from cli_agent_orchestrator.ops_mcp_server.decision_tools import register_decision_tools
+
+    class Surface:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self, fn):
+            self.tools[fn.__name__] = fn
+            return fn
+
+    surface = Surface()
+    register_decision_tools(surface)
+    doc = surface.tools["decisions_status"].__doc__ or ""
+    assert "last outcome" in doc
+    assert "24" in doc
+
+
 @pytest.mark.asyncio
 async def test_ops_controls_and_local_record_queries(tmp_path, monkeypatch):
     from sqlalchemy import create_engine
@@ -325,7 +346,7 @@ def test_decision_catalog_help_and_group_order():
 
     text = (ROOT / "tui/src/catalog.rs").read_text()
     rows = re.findall(r"CommandId::Decisions\w+ => Command \{(.*?)\n        \},", text, re.S)
-    assert len(rows) == 8
+    assert len(rows) == 12
     for row in rows:
         leaf = re.search(r'leaf_name: "([^"]+)"', row).group(1)
         summary = re.search(r'summary: "([^"]+)"', row).group(1)
@@ -333,10 +354,14 @@ def test_decision_catalog_help_and_group_order():
     display = text.split("pub(crate) const DISPLAY_ORDER:", 1)[1].split("];", 1)[0]
     names = re.findall(r"CommandId::(\w+)", display)
     expected = [
+        "DecisionsDisable",
+        "DecisionsEnable",
         "DecisionsExclude",
         "DecisionsList",
+        "DecisionsOff",
         "DecisionsPurge",
         "DecisionsSet",
+        "DecisionsShow",
         "DecisionsStatus",
         "DecisionsTable",
         "DecisionsTier",

@@ -170,7 +170,6 @@ class TestU17PlanCases:
         # Drive a store() through MemoryService and confirm wiki_compiler.compile
         # is NOT invoked. We do not need to wire SQLite — just exercise the
         # branch in store() that consults compile_mode.
-        from datetime import datetime, timezone
 
         from sqlalchemy import create_engine
 

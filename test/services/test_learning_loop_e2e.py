@@ -108,12 +108,11 @@ def test_full_learning_loop(stack: Any) -> None:
             )
 
         # ---- Stage 2: retrospector reads outcomes and distills ONE lesson.
-        # This runs the REAL retrospector path: the store_lesson MCP tool
-        # called from a RETROSPECTOR terminal context, targeting the
-        # transformer profile. (A prior version of this test called
-        # MemoryService.store() with a synthetic transformer context, which
-        # masked lessons landing under the retrospector's own scope — PR
-        # #515 review finding.)
+        # This runs the REAL retrospector path: a RETROSPECTOR terminal's
+        # lesson write targeting the transformer profile. (A prior version of
+        # this test called MemoryService.store() with a synthetic transformer
+        # context, which masked lessons landing under the retrospector's own
+        # scope — PR #515 review finding.)
         recorded = outcomes.list_outcomes(session_name="ssis-batch-1")
         assert len(recorded) == 3
         failures = [o for o in recorded if not o["success"]]
@@ -124,28 +123,43 @@ def test_full_learning_loop(stack: Any) -> None:
         "partial cache; direct join emission produced invalid Glue code in "
         "CustomerETL and OrdersETL. Applies when: converting Lookup components."
     )
-    from cli_agent_orchestrator.mcp_server import server as srv
-    from cli_agent_orchestrator.mcp_server.server import store_lesson
+    # The write goes through POST /lessons, which is where the gate, the
+    # caller-identity lookup and the capability check live since #744. The
+    # route function is driven directly rather than over TestClient so this
+    # test keeps its "no server required" property; the store_lesson tool's
+    # HTTP hop and its status translation are covered in
+    # test/mcp_server/test_lesson_tool.py.
+    from cli_agent_orchestrator.api.main import LessonCreateBody, create_lesson_endpoint
 
-    retro_ctx = _ctx(agent="retrospector")  # the CALLER is the retrospector
+    # The CALLER is the retrospector; only its terminal ID crosses the wire.
+    retro_record = {
+        "id": "term-e2e",
+        "tmux_session": "ssis-batch-1",
+        "provider": "claude_code",
+        "agent_profile": "retrospector",
+    }
     with (
         MEMORY_ON,
         patch(
             "cli_agent_orchestrator.services.settings_service.is_learning_enabled",
             return_value=True,
         ),
-        patch.object(srv, "_get_terminal_context_from_env", return_value=retro_ctx),
+        patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=retro_record),
         patch(
-            "cli_agent_orchestrator.services.memory_service.MemoryService",
-            return_value=mem,
+            "cli_agent_orchestrator.utils.agent_profiles.profile_declares_capability",
+            return_value=True,
         ),
+        patch("cli_agent_orchestrator.api.main._get_memory_service", return_value=mem),
     ):
         result = asyncio.run(
-            store_lesson(
-                target_agent_profile="transformer",
-                content=lesson_text,
-                key="lookup-partial-cache-broadcast",
-                tags=None,
+            create_lesson_endpoint(
+                LessonCreateBody(
+                    target_agent_profile="transformer",
+                    content=lesson_text,
+                    key="lookup-partial-cache-broadcast",
+                    source_terminal_id="term-e2e",
+                ),
+                _scopes=[],
             )
         )
     assert result["success"] is True, result

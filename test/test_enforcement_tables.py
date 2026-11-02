@@ -5,7 +5,6 @@ module is what the launch gate and the server act on. This test is the only
 thing that keeps them the same.
 """
 
-import re
 from pathlib import Path
 
 import pytest

@@ -1,12 +1,11 @@
-import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from test.decisions.test_engine import setup_engine
+from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
+    setup_engine,
+)
 from unittest.mock import Mock
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
 
 @pytest.mark.asyncio
@@ -252,7 +251,7 @@ async def test_redaction_before_builtin_and_facts(setup_engine, caplog):
         role="not a bounded role",
         model="model-y",
     )
-    plan = await engine.prepare_launch(replace(req, message="sentinel-body " + token))
+    _plan = await engine.prepare_launch(replace(req, message="sentinel-body " + token))
     seen = decider.requests[0]
     assert token not in seen.message and description_token not in seen.profile_description
     assert seen.facts.profile_role is None and seen.facts.profile == "worker"

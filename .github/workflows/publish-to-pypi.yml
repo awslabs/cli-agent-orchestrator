@@ -54,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -197,13 +197,13 @@ jobs:
       # explicit keeps one convention instead of two, and does not depend on which image
       # happens to ship a `python` shim. It cannot affect the wheels — cibuildwheel ignores
       # the host interpreter when selecting build Pythons. (#321)
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
       # The Web UI is built here too so each platform wheel carries it. Without this the
       # web_ui/** artifacts glob resolves empty and hatchling silently omits it (defect D1).
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -246,7 +246,7 @@ jobs:
       # (`[tool.cibuildwheel] test-command`) installs the wheel and RUNS `cao tui`, so a
       # wheel whose binary is missing, non-executable, or built for the wrong architecture
       # fails HERE rather than on an operator's machine (SR-1).
-      - uses: pypa/cibuildwheel@adba99c781d3746d38b3a09b1cf797965bcb7fe6  # v4.3.0
+      - uses: pypa/cibuildwheel@8c2dcd2e96041a619f5ff03c9638d7941e2553a4  # v4.3.3
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
           # See `macos-target` in the matrix: this is what keeps delocate from rejecting a
@@ -272,7 +272,7 @@ jobs:
             python scripts/build_tui.py check --wheel "$w" --max-binary-bytes 10485760
           done
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           # Per-platform artifact names, merged by the publish jobs via `pattern:` +
           # `merge-multiple:`. A shared name would make the legs race each other.
@@ -291,7 +291,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -303,12 +303,12 @@ jobs:
           npm ci
           npm run build
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa  # v10.3.1
 
       - name: Build sdist
         run: uv build --sdist
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: dist-sdist
           path: dist/*.tar.gz
@@ -336,7 +336,7 @@ jobs:
       # UNCHECKED. Worst on `publish-pypi`: a PyPI filename cannot be re-uploaded.
       # Found by the §12a reviewer for `wheel-matrix`. (#321)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: dist-*
           merge-multiple: true
@@ -350,7 +350,7 @@ jobs:
       - name: Assert the full platform set is present and none is tagged 'any'
         run: python scripts/assert_wheel_matrix.py --dist dist/
 
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
           repository-url: https://test.pypi.org/legacy/
 
@@ -375,7 +375,7 @@ jobs:
           # matrix in step with that one is what makes "every wheel we ship is installed and
           # executed by CI" true rather than aspirational.
     steps:
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -464,7 +464,7 @@ jobs:
       # UNCHECKED. Worst on `publish-pypi`: a PyPI filename cannot be re-uploaded.
       # Found by the §12a reviewer for `wheel-matrix`. (#321)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: dist-*
           merge-multiple: true
@@ -477,9 +477,9 @@ jobs:
 
       # SHA-pinned (SR-2, interview Q10). `release/v1` is a mutable BRANCH, and this action
       # holds the OIDC credential path to PyPI — the highest-consequence supply-chain
-      # exposure in this workflow. dc37677b is the commit that `release/v1` and the v1.14.2
+      # exposure in this workflow. 7245906f is the commit that `release/v1` and the v1.14.3
       # tag both pointed at when this was pinned; verified by dereferencing the annotated tag.
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
 
   # Closes review 5222539218 item 8 on #584. The committed `agent-plugin/cao/mcp.json`
   # pins an exact published version, so the pin can only ever name a release that already
@@ -516,7 +516,7 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa  # v10.3.1
 
       - name: Install the project
         run: uv sync --locked --all-extras --dev

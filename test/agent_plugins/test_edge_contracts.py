@@ -15,7 +15,6 @@ Three themes, all stated guarantees rather than incidental branches:
 
 from __future__ import annotations
 
-import json
 import shutil
 
 import pytest

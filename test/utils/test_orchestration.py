@@ -344,6 +344,11 @@ def test_remote_assignment_description_payload(description):
         patch.dict(os.environ, {"CAO_ADVERTISED_URL": "http://supervisor:9889"}),
         patch.object(orch, "_resolve_target_base_url", return_value="http://remote:9889"),
         patch.object(orch, "_wait_remote_ready"),
+        # Remote placement first probes the target's /health for the delegation
+        # ceiling feature and reads the caller's own recorded ceiling (PR #948);
+        # neither exists in this unit, so stub both as test_remote_target.py does.
+        patch.object(orch, "_require_remote_delegation_ceiling", return_value=None),
+        patch.object(orch, "_own_delegation_ceiling", return_value=["*"]),
         patch.object(
             orch.requests,
             "post",
@@ -383,6 +388,11 @@ async def test_handoff_description_run_step_payload(description, remote):
         ),
         patch.object(orch, "_resolve_target_base_url", return_value="http://remote:9889"),
         patch.object(orch, "_resolve_remote_provider", return_value="kiro_cli"),
+        # The target_host arm probes the remote /health for the delegation ceiling
+        # feature and sends the caller's own ceiling (PR #948); stubbed as in
+        # test_remote_target.py. Harmless on the local (remote=False) arm.
+        patch.object(orch, "_require_remote_delegation_ceiling", return_value=None),
+        patch.object(orch, "_own_delegation_ceiling", return_value=["*"]),
         patch.object(
             orch.requests,
             "post",

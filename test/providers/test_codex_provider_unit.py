@@ -11,6 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+try:  # py3.11+; the project still supports 3.10 (pyproject requires-python)
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - 3.10 only
+    import tomli as tomllib  # type: ignore[no-redef]
+
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
@@ -18,15 +23,18 @@ from cli_agent_orchestrator.providers.codex import (
     LOGIN_MENU_FOOTER,
     LOGIN_MENU_PATTERN,
     POST_READINESS_TRANSITIONAL_REREADS,
+    STARTUP_ACTIVITY_PATTERN,
     STARTUP_PROMPT_BOTTOM_LINES,
     TRUST_PROMPT_PATTERN,
     TRUST_PROMPT_PATTERN_V2,
     CodexProvider,
     ProviderError,
+    _find_config_rejection,
     _find_response_marker,
     _has_approval_modal_in_bottom,
     _has_approval_prompt_in_bottom,
     _has_startup_idle_composer,
+    _is_pre_turn_startup_frame,
     _live_startup_block,
     _toml_override,
     _toml_scalar,
@@ -67,6 +75,30 @@ def frames(*sequence: str):
         return remaining.pop(0) if len(remaining) > 1 else remaining[0]
 
     return _next
+
+
+def pane_commands(*commands: str):
+    """A ``get_pane_current_command`` side effect that yields ``commands`` then repeats the last.
+
+    Same shape as ``frames``: a bare list exhausted inside ``asyncio.to_thread``
+    hangs the test instead of failing it.
+    """
+    remaining = list(commands)
+
+    def _next(*_args, **_kwargs):
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    return _next
+
+
+def codex_launched(mock_backend, shell: str = "zsh", cli: str = "codex") -> None:
+    """Model the pane's foreground process across ``initialize()`` (#1018).
+
+    The baseline read sees the shell; every read after the launch sees codex.
+    ``initialize()`` now compares the two during startup, so a MagicMock that
+    answers the same object to both reads looks like a codex that exited.
+    """
+    mock_backend.return_value.get_pane_current_command.side_effect = pane_commands(shell, cli)
 
 
 SETTLED = "OpenAI Codex (v0.98.0)\n› "
@@ -119,6 +151,7 @@ class TestCodexProviderInitialization:
         self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
     ):
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         # A settled frame (idle composer): the handler returns on its first poll.
         # A banner-only frame would make it poll, with real sleeps, to the 60s cap.
@@ -160,6 +193,7 @@ class TestCodexProviderInitialization:
         self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
     ):
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = False
         mock_tmux.return_value.get_history.return_value = SETTLED
 
@@ -311,7 +345,7 @@ class TestCodexBuildCommand:
         mock_profile.codexProfile = None
         mock_load_profile.return_value = mock_profile
         # Simulate the resolver returning a PATH-independent absolute path.
-        mock_resolve.side_effect = lambda cfg: {
+        mock_resolve.side_effect = lambda cfg, **kwargs: {
             **cfg,
             "command": "/home/u/.local/bin/cao-mcp-server",
             "args": [],
@@ -339,7 +373,7 @@ class TestCodexBuildCommand:
         mock_profile.codexProfile = None
         mock_load_profile.return_value = mock_profile
         # Simulate a resolved path containing a backslash and a quote.
-        mock_resolve.side_effect = lambda cfg: {
+        mock_resolve.side_effect = lambda cfg, **kwargs: {
             **cfg,
             "command": r'/tmp/we"ird\path/cao-mcp-server',
             "args": [],
@@ -511,6 +545,7 @@ class TestCodexBuildCommand:
         self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status, mock_sleep, tmp_path
     ):
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         # A settled frame: on the bare banner the handler polls to its cap --
         # which, with a MagicMock profile, is float(MagicMock()) == 1.0, so the
@@ -851,6 +886,497 @@ class TestCodexProviderCodexProfile:
         assert "do NOT apply" in text or "not apply" in text
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def toml_blocks(markdown: str) -> list[str]:
+    """Every ```toml fenced block in a markdown document, in order."""
+    return re.findall(r"^```toml\n(.*?)^```", markdown, re.MULTILINE | re.DOTALL)
+
+
+class TestCodexProfileDocumentedForm:
+    """#967: pin the profile layout codex actually accepts.
+
+    ``codexProfile`` is the ONLY route to a sandboxed Codex worker under CAO --
+    every other launch is ``--yolo`` -- and the docs had it pointing at a
+    ``[profiles.<name>]`` table in ``config.toml``, which codex-cli 0.162
+    rejects outright. The argv CAO builds (``--profile <name>``) is unchanged
+    and so stayed green through that break; these tests cover the layout the
+    flag reads, which nothing else in the suite looks at.
+    """
+
+    def test_docs_profile_example_is_a_standalone_profile_config_file(self):
+        """The worked example must parse as a profile config file, not a table."""
+        docs = (REPO_ROOT / "docs" / "codex-cli.md").read_text(encoding="utf-8")
+        assert "cao_reviewer.config.toml" in docs, (
+            "the worked example no longer names a <name>.config.toml file; codex "
+            "0.162+ loads profile settings only from $CODEX_HOME/<name>.config.toml"
+        )
+
+        example = next(
+            (
+                block
+                for block in toml_blocks(docs)
+                if "sandbox_mode" in block and "approval_policy" in block
+            ),
+            None,
+        )
+        assert example is not None, "the codexProfile worked example disappeared from the docs"
+
+        parsed = tomllib.loads(example)
+        # Top-level keys, because codex layers the whole file over the base
+        # config. A [profiles.*] header here is the exact shape codex refuses.
+        assert parsed.get("sandbox_mode") == "read-only"
+        assert parsed.get("approval_policy") == "never"
+        assert "profiles" not in parsed, (
+            "the example wraps the settings in a [profiles.*] table; codex 0.162 exits with "
+            "'--profile <name> cannot be used while ... contains legacy ... config'"
+        )
+
+    @pytest.mark.parametrize("doc", ["codex-cli.md", "hermes.md"])
+    def test_no_doc_offers_a_legacy_profiles_table_to_copy(self, doc):
+        """Prose may warn about the legacy table; no copyable block may contain it."""
+        docs = (REPO_ROOT / "docs" / doc).read_text(encoding="utf-8")
+        for block in toml_blocks(docs):
+            offenders = [
+                line for line in block.splitlines() if line.strip().startswith("[profiles.")
+            ]
+            assert not offenders, (
+                f"docs/{doc} still has a copy-pasteable legacy profile table {offenders}; "
+                "profile settings belong at the top level of $CODEX_HOME/<name>.config.toml"
+            )
+
+    def test_codex_profile_field_comment_names_the_profile_config_file(self):
+        """The field's own comment is where a contributor looks first."""
+        source = (
+            REPO_ROOT / "src" / "cli_agent_orchestrator" / "models" / "agent_profile.py"
+        ).read_text(encoding="utf-8")
+        field_index = source.index("codexProfile: Optional[str]")
+        comment = source[max(0, field_index - 800) : field_index]
+        assert "<name>.config.toml" in comment, (
+            "the codexProfile field comment no longer names the profile config file "
+            "codex actually reads"
+        )
+
+    def test_default_yolo_log_points_at_the_profile_config_file(self, caplog):
+        """The INFO line operators read must not send them to the rejected layout."""
+        provider = CodexProvider("tid", "sess", "win", None)
+        with caplog.at_level(logging.INFO):
+            provider._build_codex_command()
+
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "codexProfile" in text
+        assert "<name>.config.toml" in text, "the log still does not name the file to create"
+        assert (
+            "[profiles." not in text
+        ), "the log still tells operators to write a [profiles.<name>] block"
+
+
+# Real captures of codex's config rejection. tmux 3.8, `new-session -x <W> -y 50`,
+# `capture-pane -e -p -S -200` (CAO's own path, clients/tmux.py get_history) with
+# and without `-J`, escape-stripped, blank rows dropped. bash with
+# PS1='op@devbox:~/repo$ ' (CAO does not forward PS1, so a pane shows the
+# operator's own, prefixed, prompt) and a `codex` on PATH that prints
+# codex-cli 0.163.0's one-line rejection verbatim to stderr and exits 1. The
+# real binary, pointed at a CODEX_HOME holding a `[profiles.cao_reviewer]`
+# table, printed the identical line and wrapped identically at 220 columns.
+CONFIG_REJECTION_LAUNCH_ROW = (
+    "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot"
+)
+CONFIG_REJECTION_LINE = (
+    "Error: --profile `cao_reviewer` cannot be used while /home/op/.codex/config.toml "
+    'contains legacy `profile = "cao_reviewer"` or `[profiles.cao_reviewer]` config; '
+    "move those settings into /home/op/.codex/cao_reviewer.config.toml and remove the "
+    "legacy profile selector/table. See "
+    "https://developers.openai.com/codex/config-advanced#profiles for more information."
+)
+CONFIG_REJECTION_EXIT_PROMPT = "op@devbox:~/repo$ "
+# `capture-pane -J`, which _find_startup_config_error asks for: tmux rejoins its
+# own soft wraps, so each logical line is ONE row at any pane width. Identical
+# at 220 and at 80 columns.
+CONFIG_REJECTION_PANE = "\n".join(
+    [CONFIG_REJECTION_LAUNCH_ROW, CONFIG_REJECTION_LINE, CONFIG_REJECTION_EXIT_PROMPT]
+)
+# The same pane WITHOUT -J, as tmux renders it: hard-wrapped at the exact column
+# (inside a word when that is where the column falls), trailing spaces trimmed,
+# leading spaces kept. 220 is CAO's default pane width (clients/tmux.py); an
+# operator attaching from a smaller terminal shrinks the window to theirs.
+CONFIG_REJECTION_PANE_WRAPPED = {
+    220: (
+        "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot\n"
+        "Error: --profile `cao_reviewer` cannot be used while /home/op/.codex/config.toml "
+        'contains legacy `profile = "cao_reviewer"` or `[profiles.cao_reviewer]` config; '
+        "move those settings into /home/op/.codex/cao_reviewer.confi\n"
+        "g.toml and remove the legacy profile selector/table. See "
+        "https://developers.openai.com/codex/config-advanced#profiles for more information.\n"
+        "op@devbox:~/repo$"
+    ),
+    120: (
+        "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot\n"
+        "Error: --profile `cao_reviewer` cannot be used while /home/op/.codex/config.toml "
+        'contains legacy `profile = "cao_reviewe\n'
+        'r"` or `[profiles.cao_reviewer]` config; move those settings into '
+        "/home/op/.codex/cao_reviewer.config.toml and remove th\n"
+        "e legacy profile selector/table. See "
+        "https://developers.openai.com/codex/config-advanced#profiles for more information.\n"
+        "op@devbox:~/repo$"
+    ),
+    80: (
+        "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_s\n"
+        "napshot\n"
+        "Error: --profile `cao_reviewer` cannot be used while /home/op/.codex/config.toml\n"
+        ' contains legacy `profile = "cao_reviewer"` or `[profiles.cao_reviewer]` config;\n'
+        " move those settings into /home/op/.codex/cao_reviewer.config.toml and remove th\n"
+        "e legacy profile selector/table. See https://developers.openai.com/codex/config-\n"
+        "advanced#profiles for more information.\n"
+        "op@devbox:~/repo$"
+    ),
+}
+# Two more real unjoined captures: a macOS-style home split at the dot, and a
+# short home at 80 columns where the wrap lands INSIDE the distinguishing
+# phrase ("co" / "ntains legacy") -- the shape the first detector missed.
+CONFIG_REJECTION_PANE_WRAPPED_MAC_HOME_220 = (
+    "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot\n"
+    "Error: --profile `cao_reviewer` cannot be used while "
+    "/Users/firstname.lastname/.codex/config.toml contains legacy "
+    '`profile = "cao_reviewer"` or `[profiles.cao_reviewer]` config; move those settings '
+    "into /Users/firstname.\n"
+    "lastname/.codex/cao_reviewer.config.toml and remove the legacy profile selector/table. "
+    "See https://developers.openai.com/codex/config-advanced#profiles for more information.\n"
+    "op@devbox:~/repo$"
+)
+CONFIG_REJECTION_PANE_WRAPPED_ROOT_HOME_80 = (
+    "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_s\n"
+    "napshot\n"
+    "Error: --profile `cao_reviewer` cannot be used while /root/.codex/config.toml co\n"
+    'ntains legacy `profile = "cao_reviewer"` or `[profiles.cao_reviewer]` config; mo\n'
+    "ve those settings into /root/.codex/cao_reviewer.config.toml and remove the lega\n"
+    "cy profile selector/table. See https://developers.openai.com/codex/config-advanc\n"
+    "ed#profiles for more information.\n"
+    "op@devbox:~/repo$"
+)
+
+
+def _tmux_hard_wrap(logical_line: str, width: int) -> list[str]:
+    """The rows tmux's default capture returns for one logical line at ``width``.
+
+    Split at the exact column, trailing spaces trimmed, leading spaces kept.
+    ``test_wrap_model_reproduces_the_real_captures`` pins this to the real
+    tmux output above, so the width sweep below is grounded, not assumed.
+    """
+    return [logical_line[i : i + width].rstrip() for i in range(0, len(logical_line), width)]
+
+
+def _render_wrapped_pane(logical_lines: list[str], width: int) -> str:
+    return "\n".join(row for line in logical_lines for row in _tmux_hard_wrap(line, width))
+
+
+def _rejection_pane_for(home: str, name: str) -> list[str]:
+    """Codex's rejection as logical lines for another CODEX_HOME and profile name."""
+    return [
+        CONFIG_REJECTION_LAUNCH_ROW.replace("cao_reviewer", name),
+        CONFIG_REJECTION_LINE.replace("/home/op", home).replace("cao_reviewer", name),
+        CONFIG_REJECTION_EXIT_PROMPT,
+    ]
+
+
+class TestCodexConfigRejectionDiagnostic:
+    """#967: a rejected config must not surface as a generic init timeout."""
+
+    def test_joined_capture_yields_the_whole_line_and_not_the_prompt(self):
+        """The production capture (-J): the message is codex's line, exactly."""
+        message = _find_config_rejection(CONFIG_REJECTION_PANE)
+
+        assert message == CONFIG_REJECTION_LINE
+        # The actionable half is at the far end of the line; a detector that
+        # returned only a wrapped row would drop or split it.
+        assert "/home/op/.codex/cao_reviewer.config.toml" in message
+        # Must not swallow the (prefixed) shell prompt codex exits back to.
+        assert "op@devbox" not in message
+
+    @pytest.mark.parametrize("width", sorted(CONFIG_REJECTION_PANE_WRAPPED))
+    def test_wrapped_capture_is_detected_without_the_prompt_at_every_width(self, width):
+        """A capture that kept tmux's soft wraps still detects, and still stops
+        at the prefixed prompt. The path in it is context only (it is split at
+        220 columns); the operator-facing text names the file from CAO's data."""
+        message = _find_config_rejection(CONFIG_REJECTION_PANE_WRAPPED[width])
+
+        assert message is not None, f"not detected at {width} columns"
+        assert message.startswith("Error:")
+        assert "op@devbox" not in message, f"prompt absorbed at {width} columns: {message!r}"
+        assert "for more information." in message, "the message was cut short"
+
+    @pytest.mark.parametrize(
+        "pane",
+        [CONFIG_REJECTION_PANE_WRAPPED_MAC_HOME_220, CONFIG_REJECTION_PANE_WRAPPED_ROOT_HOME_80],
+        ids=["mac-home-220", "root-home-80-wrap-inside-phrase"],
+    )
+    def test_wrap_inside_the_phrase_or_the_home_path_still_detects(self, pane):
+        message = _find_config_rejection(pane)
+
+        assert message is not None
+        assert "op@devbox" not in message
+
+    @pytest.mark.parametrize("width", sorted(CONFIG_REJECTION_PANE_WRAPPED))
+    def test_wrap_model_reproduces_the_real_captures(self, width):
+        """Grounds the sweep below: the simulated wrap IS what tmux 3.8 returned."""
+        rendered = _render_wrapped_pane(
+            [CONFIG_REJECTION_LAUNCH_ROW, CONFIG_REJECTION_LINE, CONFIG_REJECTION_EXIT_PROMPT],
+            width,
+        )
+        assert rendered == CONFIG_REJECTION_PANE_WRAPPED[width]
+
+    @pytest.mark.parametrize("width", range(40, 241))
+    def test_detection_and_prompt_exclusion_hold_at_every_pane_width(self, width):
+        """The class, not the instance: at ANY width an attached terminal can
+        impose, for several CODEX_HOME shapes and profile names, the unjoined
+        capture is detected and never absorbs the prompt. A wrap can land
+        anywhere -- inside the phrase, the path or the prompt glyph's word."""
+        for home in (
+            "/home/op",
+            "/root",
+            "/Users/firstname.lastname",
+            "/data/projects/team-alpha/agents/.config/codex-home",
+        ):
+            for name in ("cao_reviewer", "r", "a-very-long-profile-name_for_the_sweep"):
+                pane = _render_wrapped_pane(_rejection_pane_for(home, name), width)
+                message = _find_config_rejection(pane)
+                assert message is not None, f"not detected: width={width} home={home} name={name}"
+                assert message.startswith("Error:"), (width, home, name, message)
+                assert (
+                    "op@devbox" not in message
+                ), f"prompt absorbed: width={width} home={home} name={name}: {message!r}"
+
+    def test_clean_startup_pane_is_not_flagged(self):
+        assert _find_config_rejection(SETTLED) is None
+
+    def test_unrelated_error_is_not_flagged(self):
+        pane = "Error: something else entirely went wrong\n$ "
+        assert _find_config_rejection(pane) is None
+
+    def test_rejection_is_found_without_a_tty(self):
+        """codex 0.162.1 prefixes the same rejection "Error loading config.toml:"
+        when its stdout is not a terminal; the detector must still anchor on it."""
+        pane = (
+            "Error loading config.toml: --profile `cao_reviewer` cannot be used while\n"
+            '/home/op/.codex/config.toml contains legacy `profile = "cao_reviewer"` or\n'
+            "`[profiles.cao_reviewer]` config; move those settings into\n"
+            "/home/op/.codex/cao_reviewer.config.toml and remove the legacy profile\n"
+            "selector/table.\n"
+        )
+
+        message = _find_config_rejection(pane)
+
+        assert message is not None
+        assert "cao_reviewer.config.toml" in message
+
+    def test_stale_scrollback_rejection_does_not_shadow_the_current_one(self):
+        """tmux retains history: an old rejection must not outrank the latest one."""
+        pane = (
+            CONFIG_REJECTION_PANE.replace("cao_reviewer", "stale_profile")
+            + "\n"
+            + CONFIG_REJECTION_PANE
+        )
+
+        message = _find_config_rejection(pane)
+
+        assert message is not None
+        assert "cao_reviewer.config.toml" in message
+        assert "stale_profile" not in message
+
+    def test_stale_rejection_does_not_shadow_a_later_unrelated_failure(self):
+        """A fixed config rejected in the past must not be blamed for a later,
+        unrelated startup failure (e.g. a network error) on the next launch."""
+        pane = (
+            CONFIG_REJECTION_PANE
+            + "\n"
+            + "$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot\n"
+            "Error: could not connect to model provider\n"
+            "$ "
+        )
+
+        message = _find_config_rejection(pane)
+
+        assert message is None, "the stale config rejection must not be reported here"
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "operator@host:/repo$ ",
+            "operator@host /repo % ",
+            "❯ ",
+        ],
+        ids=["bash-default", "zsh", "starship"],
+    )
+    def test_launch_boundary_is_found_behind_a_prefixed_prompt(self, prompt):
+        """The launch row CAO types is normally `user@host:/path$ codex ...`, not a bare `$`.
+        The boundary must still be found, or the bounding is inert for every real shell."""
+        pane = (
+            CONFIG_REJECTION_PANE
+            + "\n"
+            + prompt
+            + "codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot\n"
+            "Error: could not connect to model provider\n" + prompt
+        )
+
+        message = _find_config_rejection(pane)
+
+        assert message is None, f"stale rejection reported behind prompt {prompt!r}"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_unresolved_startup_reports_the_rejection_not_a_bare_timeout(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
+        """Codex that exits draws no prompt and no banner: the handler gives up.
+
+        That used to fall through to the readiness wait and surface as
+        ``Codex initialization timed out after 60s``, which pointed an operator
+        at host slowness rather than at the config line they had to move.
+        """
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = CONFIG_REJECTION_PANE
+
+        provider = CodexProvider("tid", "sess", "win", None)
+
+        with patch.object(
+            provider, "_handle_trust_prompt", new=AsyncMock(return_value="unresolved")
+        ):
+            with pytest.raises(ProviderError) as excinfo:
+                await provider.initialize()
+
+        message = str(excinfo.value)
+        assert "cao_reviewer.config.toml" in message, "the file to create is not reported"
+        assert "codexProfile" in message, "the CAO-side cause is not named"
+        assert "timed out" not in message
+        mock_wait_status.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_readiness_timeout_reports_the_rejection_when_the_pane_has_it(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
+        """Second path to the same symptom: the readiness wait expires instead."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = False
+        mock_tmux.return_value.get_history.return_value = CONFIG_REJECTION_PANE
+
+        provider = CodexProvider("tid", "sess", "win", None)
+
+        with patch.object(provider, "_handle_trust_prompt", new=AsyncMock(return_value="settled")):
+            with pytest.raises(ProviderError) as excinfo:
+                await provider.initialize()
+
+        assert "cao_reviewer.config.toml" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_startup_check_asks_the_backend_for_joined_rows(self, mock_tmux):
+        """tmux wraps codex's one-line rejection at the exact pane column, often
+        inside the path the operator needs; only tmux itself can rejoin it."""
+        mock_tmux.return_value.get_history.return_value = CONFIG_REJECTION_PANE
+        provider = CodexProvider("tid", "sess", "win", None)
+
+        await provider._find_startup_config_error()
+
+        mock_tmux.return_value.get_history.assert_called_once_with("sess", "win", join_wrapped=True)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_message_names_the_file_from_codex_profile_not_from_the_pane(
+        self, mock_tmux, mock_load, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
+        """A backend that hands back unjoined rows splits the path mid-word
+        (``cao_reviewer.confi`` / ``g.toml`` at 220 columns). The instruction
+        must still name the right file, from the codexProfile CAO launched
+        with; the pane text is quoted as context after it."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = CONFIG_REJECTION_PANE_WRAPPED[220]
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = "cao_reviewer"
+        mock_profile.provider_init_timeout = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "reviewer")
+
+        with patch.object(
+            provider, "_handle_trust_prompt", new=AsyncMock(return_value="unresolved")
+        ):
+            with pytest.raises(ProviderError) as excinfo:
+                await provider.initialize()
+
+        message = str(excinfo.value)
+        instruction, _, context = message.partition("Codex said:")
+        assert "$CODEX_HOME/cao_reviewer.config.toml" in instruction, message
+        assert "--profile cao_reviewer" in instruction
+        assert "op@devbox" not in message, "the shell prompt leaked into the operator message"
+        assert context.lstrip().startswith("Error:"), "codex's own text is not quoted"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_message_without_a_launched_profile_names_the_placeholder(self, mock_tmux):
+        mock_tmux.return_value.get_history.return_value = CONFIG_REJECTION_PANE
+        provider = CodexProvider("tid", "sess", "win", None)
+
+        detail = await provider._find_startup_config_error()
+
+        assert detail is not None
+        assert "$CODEX_HOME/<name>.config.toml" in detail
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_an_ordinary_readiness_timeout_still_reports_a_timeout(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
+        """The diagnostic must not swallow the failure it does not explain."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = False
+        mock_tmux.return_value.get_history.return_value = SETTLED
+
+        provider = CodexProvider("tid", "sess", "win", None)
+
+        with patch.object(provider, "_handle_trust_prompt", new=AsyncMock(return_value="settled")):
+            with pytest.raises(TimeoutError, match="Codex initialization timed out"):
+                await provider.initialize()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_a_capture_failure_does_not_replace_the_original_timeout(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
+        """A transient backend error must not mask the failure it was meant to explain."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = False
+        mock_tmux.return_value.get_history.side_effect = RuntimeError("capture failed")
+
+        provider = CodexProvider("tid", "sess", "win", None)
+
+        with patch.object(provider, "_handle_trust_prompt", new=AsyncMock(return_value="settled")):
+            with pytest.raises(TimeoutError, match="Codex initialization timed out"):
+                await provider.initialize()
+
+
 class TestTomlScalar:
     """Tests for ``_toml_scalar`` TOML-literal serialization."""
 
@@ -993,6 +1519,63 @@ class TestMcpKeyValidation:
         command = provider._build_codex_command()
         assert "mcp_servers.cao-mcp-server.command=" in command
         assert 'mcp_servers.cao-mcp-server.env={ "API_KEY" = "v" }' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_bundled_server_is_told_this_cao_address(self, mock_load, monkeypatch):
+        """Codex inherits only the names in env_vars, so the port must travel in env."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        mock_load.return_value = self._profile_with(
+            {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_bundled_server_default_cao_is_unchanged(self, mock_load, monkeypatch):
+        """A default CAO (none of the three address vars set) writes exactly the
+        same command as before this fix: no ``.env=`` override for the bundled
+        server beyond what ``env_vars`` already adds."""
+        for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        mock_load.return_value = self._profile_with(
+            {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert "mcp_servers.cao-mcp-server.env=" not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_uvx_launched_entry_named_cao_mcp_server_gets_the_address(self, mock_load, monkeypatch):
+        """#1075 P3-1: an entry started through ``uvx`` is still the CAO server
+        when its own entry name is ``cao-mcp-server``, even though ``command``
+        is ``uvx`` rather than the bare console script."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        mock_load.return_value = self._profile_with(
+            {
+                "cao-mcp-server": {
+                    "command": "uvx",
+                    "args": ["--from", "cli-agent-orchestrator", "cao-mcp-server"],
+                }
+            }
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_non_cao_server_never_gets_the_address(self, mock_load, monkeypatch):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        mock_load.return_value = self._profile_with(
+            {"my-server": {"command": "uvx", "args": ["--from", "pkg", "my-server"]}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert "mcp_servers.my-server.env=" not in command
 
 
 class TestCodexProviderCodexConfig:
@@ -2859,6 +3442,7 @@ class TestCodexProviderTrustPrompt:
     async def test_initialize_with_trust_prompt(self, mock_tmux, mock_wait_shell, mock_wait_status):
         """Test that initialize handles trust prompt during startup."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         # The dialog is gone from the frame after its Enter. A frame that never
         # changed would (correctly) run the handler to its cap and fail init.
@@ -2884,6 +3468,7 @@ class TestCodexProviderTrustPrompt:
     ):
         """Test that initialize handles v2 trust prompt (git worktree variant)."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.side_effect = frames(
             "Note: You're in a subdirectory of a Git project. Trusting will apply\n"
@@ -2897,7 +3482,6 @@ class TestCodexProviderTrustPrompt:
             "Press enter to continue\n",
             SETTLED,
         )
-        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         with patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock):
@@ -3046,6 +3630,7 @@ class TestCodexProviderTrustPrompt:
         "the session doesn't even start" symptom) before anyone had a real chance to open
         the session and complete login. WAITING_USER_ANSWER must be in the target set."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = SETTLED
 
@@ -3670,6 +4255,7 @@ class TestCodexProviderUpdateDialog:
     ):
         """initialize() sees the update dialog, sends '3'+Enter, then reaches ready."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         # frames(), not a bare list: initialize() now reads the pane once more
         # after the readiness wait to check no startup dialog is up, and a list
@@ -4996,19 +5582,47 @@ class TestCodexProviderExitDetection:
         assert status == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    def test_get_status_skips_exit_check_before_init(self, mock_tmux):
-        """Exit check skipped before initialization (avoids false ERROR on launch)."""
+    def test_get_status_ready_verdict_before_init_is_vetoed_by_the_pane_command(self, mock_tmux):
+        """A ready-looking frame on a pane whose foreground process is the shell is ERROR.
+
+        This test used to assert the opposite ("exit check gated on
+        _initialized"), and that gate is how #1018 happened: a codex that died
+        during startup left `› Error: ...` above the shell prompt, the `›` read
+        as an idle composer, and nothing could veto it until initialization --
+        which that very verdict completed -- so the task was typed into bash.
+        """
+        mock_tmux.return_value.get_native_status.return_value = None
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = False
+        provider._launched = True  # the codex command has been sent
+        provider.shell_baseline = "zsh"
+        output = "OpenAI Codex (v0.98.0)\n› \n"
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_skips_exit_check_before_init_for_non_ready_verdicts(self, mock_tmux):
+        """Before codex is exec'd the pane IS the shell; a non-ready frame does not read it.
+
+        The gate that remains: between ``send_keys("codex ...")`` and codex's
+        exec the pane command still matches the baseline, and a PROCESSING or
+        UNKNOWN verdict is not one anyone acts on, so it costs no tmux round
+        trip and cannot produce a false ERROR on launch.
+        """
         mock_tmux.return_value.get_native_status.return_value = None
         mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         provider._initialized = False
         provider.shell_baseline = "zsh"
-        output = "OpenAI Codex (v0.98.0)\n› \n"
+        output = "echo ready\nready\n% codex --yolo --no-alt-screen\n"
         status = provider.get_status(output)
 
-        # Should NOT be ERROR — exit check gated on _initialized
-        assert status == TerminalStatus.IDLE
+        assert status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.ERROR)
+        mock_tmux.return_value.get_pane_current_command.assert_not_called()
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_skips_exit_check_without_baseline(self, mock_tmux):
@@ -5035,9 +5649,9 @@ class TestCodexProviderExitDetection:
     ):
         """Initialize captures shell_baseline for exit detection."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = SETTLED
-        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider.initialize()
@@ -5302,6 +5916,7 @@ class TestCodexInitConfiguredTimeouts:
         # BaseProvider.get_init_timeout reads settings_service directly.
         mock_base_settings.return_value = mock_settings.return_value
         mock_wait_shell.return_value = True
+        codex_launched(mock_backend)
         mock_wait_status.return_value = True
         mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
@@ -5341,6 +5956,7 @@ class TestCodexInitConfiguredTimeouts:
         # BaseProvider.get_init_timeout reads settings_service directly.
         mock_base_settings.return_value = mock_settings.return_value
         mock_wait_shell.return_value = True
+        codex_launched(mock_backend)
         mock_wait_status.return_value = False  # never reaches a ready status
         mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
@@ -5590,6 +6206,7 @@ class TestCodexInitHonoursProfileTimeout:
         profile.codexProfile = None
         mock_load_profile.return_value = profile
         mock_wait_shell.return_value = True
+        codex_launched(mock_backend)
         mock_wait_status.return_value = True
         mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
@@ -6012,6 +6629,7 @@ class TestOuterCapWithADialogUpFailsInitialization:
             "Press enter to continue\n"
         )
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = update
 
@@ -6037,6 +6655,7 @@ class TestOuterCapWithADialogUpFailsInitialization:
             "  Press enter to continue\n"
         )
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = login
 
@@ -6124,6 +6743,7 @@ class TestTransitionalIsAStartupOnlyState:
         start the handler's own loop would have ridden out.
         """
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.side_effect = frames(
             self._LOGIN_HEADER_ONLY, self._LOGIN_COMPLETE
@@ -6145,6 +6765,7 @@ class TestTransitionalIsAStartupOnlyState:
         start, exactly as before -- just judged on the last re-read, not the
         first."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = self._LOGIN_HEADER_ONLY
 
@@ -6157,3 +6778,162 @@ class TestTransitionalIsAStartupOnlyState:
         assert (
             mock_tmux.return_value.get_history.call_count == 1 + POST_READINESS_TRANSITIONAL_REREADS
         )
+
+
+class TestCodexAccountNoticeAtStartup:
+    """#739: a `•` account notice in the startup chrome blocked every launch.
+
+    Codex prints account/product notices as ordinary bullets between the
+    welcome banner and the idle composer:
+
+        • You have 1 usage limit reset available. Run /usage to use one.
+
+    Reported against a live codex-cli 0.153.2 and reproduced on 0.153.4. Two
+    independent failures on one glyph:
+
+    1. ``_has_startup_idle_composer``'s activity veto refused readiness on a
+       pane sitting at its idle composer, so ``_handle_trust_prompt`` could
+       only ever end at its ``provider_init_timeout`` outer cap and log "no
+       prompt or welcome banner detected" about a fully started Codex.
+    2. ``get_status`` took the "reply whose › user marker was evicted" branch
+       off the same bullet and answered COMPLETED for a worker that had never
+       been given a task -- the direction the code's own comment calls "the
+       dangerous case -- it tells the conductor the agent is free".
+
+    Both now go through ``_is_pre_turn_startup_frame``: a frame still showing
+    the welcome banner with no submitted user cell above the footer cutoff has
+    run no turn, so its bullets are chrome. Nothing about the notice copy is
+    matched, so the next notice Codex invents is covered too.
+    """
+
+    # The reporter's capture (issue body), 0.153.2.
+    _NOTICE_PANE = (
+        "╭──────────────────────────────────────────────────────────╮\n"
+        "│ >_ OpenAI Codex (v0.153.2)                               │\n"
+        "│ model:       gpt-5.6-sol   /model to change              │\n"
+        "│ directory:   /tmp/cao/work                               │\n"
+        "│ permissions: YOLO mode                                   │\n"
+        "╰──────────────────────────────────────────────────────────╯\n"
+        "\n"
+        "  Tip: Use /copy or press Ctrl+O to copy the latest agent response as Markdown.\n"
+        "\n"
+        "• You have 1 usage limit reset available. Run /usage to use one.\n"
+        "\n"
+        "› Ask Codex to do anything\n"
+        "\n"
+        "  gpt-5.6-sol default · /tmp/cao/work\n"
+    )
+    # @mastash3ff's capture, 0.153.4: the 0.149+ `»` composer glyph, a
+    # different Tip line, the plural notice, and a `model · path` footer.
+    _NOTICE_PANE_V2 = (
+        "╭───────────────────────────────────────────────────╮\n"
+        "│ >_ OpenAI Codex (v0.153.4)                        │\n"
+        "╰───────────────────────────────────────────────────╯\n"
+        "  Tip: [tui.keymap] in ~/.codex/config.toml lets you rebind supported shortcuts.\n"
+        "• You have 3 usage limit resets available. Run /usage to use one.\n"
+        "» Ask Codex to do anything\n"
+        "  gpt-6-astra ultra · ~/pa\n"
+    )
+
+    @pytest.mark.parametrize("pane", [_NOTICE_PANE, _NOTICE_PANE_V2])
+    def test_notice_bullet_does_not_veto_startup_readiness(self, pane):
+        # The precondition the bug rested on: the bullet IS still an
+        # STARTUP_ACTIVITY_PATTERN match in the bottom window, so this asserts
+        # the new classification and not a changed capture.
+        tail = "\n".join(pane.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        assert re.search(STARTUP_ACTIVITY_PATTERN, tail, re.MULTILINE) is not None
+        assert _is_pre_turn_startup_frame(pane) is True
+        assert _has_startup_idle_composer(pane) is True
+
+    @pytest.mark.parametrize("pane", [_NOTICE_PANE, _NOTICE_PANE_V2])
+    def test_notice_bullet_is_not_a_model_reply(self, pane):
+        """IDLE, not COMPLETED: the worker is ready and has nothing to report."""
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(pane) == TerminalStatus.IDLE
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_startup_handler_settles_on_a_notice_pane(self, mock_tmux, mock_sleep):
+        """End to end through the handler: "settled", not the outer cap.
+
+        On the unfixed head this loop ran the full ``outer_timeout`` and
+        returned "unresolved".
+        """
+        mock_tmux.return_value.get_history.side_effect = frames(self._NOTICE_PANE)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        outcome = await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
+
+        assert outcome == "settled"
+        backend = mock_tmux.return_value
+        assert [
+            call[0] for call in backend.mock_calls if call[0] in ("send_keys", "send_special_key")
+        ] == []
+
+    # ---- the veto still vetoes everything it was introduced for ----
+
+    def test_a_live_spinner_still_vetoes(self):
+        pane = self._NOTICE_PANE.replace(
+            "› Ask Codex to do anything",
+            "• Working (3s • esc to interrupt)\n\n› Ask Codex to do anything",
+        )
+        assert _has_startup_idle_composer(pane) is False
+
+    def test_a_turn_tree_row_still_vetoes(self):
+        pane = self._NOTICE_PANE.replace(
+            "› Ask Codex to do anything",
+            "• Ran ls -la\n  └ src test\n\n› Ask Codex to do anything",
+        )
+        assert _has_startup_idle_composer(pane) is False
+
+    def test_an_error_cell_still_vetoes(self):
+        pane = self._NOTICE_PANE.replace(
+            "› Ask Codex to do anything",
+            "■ stream error: request failed\n\n› Ask Codex to do anything",
+        )
+        assert _has_startup_idle_composer(pane) is False
+
+    def test_a_bullet_under_a_submitted_user_cell_still_vetoes(self):
+        """A dispatched turn is not a pre-turn frame, banner in view or not."""
+        pane = self._NOTICE_PANE.replace(
+            "› Ask Codex to do anything",
+            "› summarize the repo\n• Here is the summary you asked for.\n\n"
+            "› Ask Codex to do anything",
+        )
+        assert _is_pre_turn_startup_frame(pane) is False
+        assert _has_startup_idle_composer(pane) is False
+
+    def test_a_reply_whose_user_marker_was_evicted_is_still_completed(self):
+        """The COMPLETED branch #739 touches keeps its reason for existing.
+
+        A transcript long enough to evict its › user marker has pushed the
+        welcome banner out of the rolling buffer too, so the gate does not fire.
+        """
+        pane = (
+            "• I finished the refactor and all the tests pass.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/cao/work\n"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(pane) == TerminalStatus.COMPLETED
+
+    def test_a_reply_that_merely_names_the_product_is_still_completed(self):
+        """A reply mentioning "OpenAI Codex" must not read as the startup banner.
+
+        ``_is_pre_turn_startup_frame`` anchors on BANNER_VERSION_PATTERN, not
+        the bare "OpenAI Codex" substring: the versioned banner line is
+        startup chrome the model does not render into a reply, so a reply
+        that merely names the product does not flip this COMPLETED to IDLE.
+        """
+        pane = (
+            "• Sure, I'm OpenAI Codex and I finished the refactor.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/cao/work\n"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(pane) == TerminalStatus.COMPLETED

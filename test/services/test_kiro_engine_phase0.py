@@ -24,6 +24,17 @@ _MODULE = "cli_agent_orchestrator.services.terminal_service"
 pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 
 
+@pytest.fixture
+def installed_developer(tmp_path, monkeypatch):
+    """``developer`` installed for Kiro: a v2 launch needs an agent kiro-cli loads (#1074)."""
+    from cli_agent_orchestrator.services import install_service
+
+    agents = tmp_path / "kiro-agents"
+    agents.mkdir()
+    (agents / "developer.json").write_text('{"name": "developer"}', encoding="utf-8")
+    monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", agents)
+
+
 @pytest.mark.asyncio
 async def test_capability_probe_does_not_block_event_loop():
     """A synchronous capability probe runs in a worker while async work advances."""
@@ -145,6 +156,7 @@ async def test_explicit_and_profile_engines_conflict_before_probe_or_allocation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("installed_developer")
 async def test_omitted_engine_launches_as_explicitly_pinned_v2():
     """Callers that omit engine still create a Kiro provider pinned to v2."""
     probe = Mock(
@@ -155,6 +167,7 @@ async def test_omitted_engine_launches_as_explicitly_pinned_v2():
     )
     provider = MagicMock()
     provider.initialize = AsyncMock(return_value=True)
+    provider.identity_verified = True  # a healthy Kiro launch (#1074)
     provider.shell_baseline = None
 
     with (
@@ -164,6 +177,7 @@ async def test_omitted_engine_launches_as_explicitly_pinned_v2():
         ),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal") as db_create,
+        patch(f"{_MODULE}.mark_terminal_identity_verified", return_value=True),
         patch(f"{_MODULE}.delete_terminals_by_session"),
         patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,
@@ -190,6 +204,7 @@ async def test_omitted_engine_launches_as_explicitly_pinned_v2():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("installed_developer")
 async def test_explicit_model_override_is_probed_even_when_profile_has_none():
     """An override reaching --model must first be probed for the model capability.
 
@@ -204,6 +219,7 @@ async def test_explicit_model_override_is_probed_even_when_profile_has_none():
     )
     provider = MagicMock()
     provider.initialize = AsyncMock(return_value=True)
+    provider.identity_verified = True  # a healthy Kiro launch (#1074)
     provider.shell_baseline = None
 
     with (
@@ -213,6 +229,7 @@ async def test_explicit_model_override_is_probed_even_when_profile_has_none():
         ),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal"),
+        patch(f"{_MODULE}.mark_terminal_identity_verified", return_value=True),
         patch(f"{_MODULE}.delete_terminals_by_session"),
         patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,
@@ -238,6 +255,7 @@ async def test_explicit_model_override_is_probed_even_when_profile_has_none():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("installed_developer")
 async def test_v2_launches_on_a_wrapper_that_does_not_advertise_legacy_ui():
     """A wrapper without --legacy-ui is fully usable and must not be rejected.
 
@@ -262,12 +280,14 @@ async def test_v2_launches_on_a_wrapper_that_does_not_advertise_legacy_ui():
     profile = AgentProfile(name="developer", description="Developer")
     provider = MagicMock()
     provider.initialize = AsyncMock(return_value=True)
+    provider.identity_verified = True  # a healthy Kiro launch (#1074)
     provider.shell_baseline = None
 
     with (
         patch(f"{_MODULE}.agent_profiles.load_agent_profile", return_value=profile),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal"),
+        patch(f"{_MODULE}.mark_terminal_identity_verified", return_value=True),
         patch(f"{_MODULE}.delete_terminals_by_session"),
         patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,

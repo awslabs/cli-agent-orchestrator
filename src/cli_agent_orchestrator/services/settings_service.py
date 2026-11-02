@@ -4,10 +4,10 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
-from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, RETENTION_DAYS
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite, locked_atomic_write
 from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
@@ -111,23 +111,33 @@ EPHEMERAL_DEFAULTS = {
     "pending_ttl_seconds": 900,
     "claim_lease_seconds": 60,
     "max_depth": 1,
+    "min_tier": None,
+    "max_tier": None,
+    "default_tier": None,
+    "max_effort": None,
+    "default_effort": None,
+    # Lifecycle cleanup (#1079); every default here awaits maintainer confirmation.
+    "max_live_per_session": 0,  # No cap; operators opt in.
+    "launch_grace_seconds": 600,
+    "sweep_interval_seconds": 300,
+    "retention_days": RETENTION_DAYS,
 }
 
 
 def get_ephemeral_settings() -> Dict[str, Any]:
     """Read the operator-only block strictly, without environment overrides."""
+    from cli_agent_orchestrator.services.model_tiers import load_model_tiers
+
     settings = _load_or_raise()
     block = settings.get("ephemeral", {})
     if not isinstance(block, dict):
         block = {}
     result = {**EPHEMERAL_DEFAULTS, **block}
-    result["_ignored_policy"] = [
-        "ephemeral." + key
-        for key in ("max_tier", "default_tier", "max_effort", "default_effort")
-        if block.get(key) is not None
-    ]
-    if settings.get("model_tiers") is not None:
-        result["_ignored_policy"].append("model_tiers")
+    result["_model_tiers"] = load_model_tiers(settings)
+    # #1068 A15: an auto spec's lease floor reads the on-mode timeout from this same snapshot.
+    result["_decisions"] = settings.get("decisions")
+    # child_may_delegate() reads its own key from the same block.
+    result["_unknown_keys"] = sorted(set(block) - set(EPHEMERAL_DEFAULTS) - {"child_may_delegate"})
     return result
 
 
@@ -170,6 +180,55 @@ def _save(data: Dict[str, Any]) -> None:
     """
     CAO_HOME_DIR.mkdir(parents=True, exist_ok=True)
     locked_atomic_write(SETTINGS_FILE, json.dumps(data, indent=2), mode=0o600)
+
+
+class _NoWrite(Exception):
+    """Internal: the mutation decided nothing needs persisting."""
+
+
+def _mutate(update: Callable[[Dict[str, Any]], bool]) -> Dict[str, Any]:
+    """Fail-closed, locked read-modify-write of settings.json (GH #737).
+
+    Every writer used to do ``_load()`` / edit / ``_save()``. ``_load()`` is
+    lenient: a settings.json that is PRESENT but cannot be read or parsed —
+    one trailing comma is enough — comes back as ``{}``, the writer then adds
+    its own section to that empty dict, and ``_save`` publishes the result as
+    the new truth. Every other setting is gone, the command exits 0, and the
+    only trace is a ``logger.warning`` that is invisible at the default level.
+    The load and the write were also two separate lock acquisitions, so a
+    second writer that read before the first published lost its own section.
+
+    ``update`` receives the parsed settings while the file's inter-process
+    lock is held, mutates them in place, and returns True to persist or False
+    to leave the file untouched. Absent still loads as ``{}`` — defaults are
+    the right answer for a file that was never written. A present file that
+    cannot be read or parsed raises :class:`SettingsUnreadableError` BEFORE
+    ``update`` runs, so no writer can replace unknown state with its own
+    fragment. Returns the settings as they stand after the call.
+    """
+    settings: Dict[str, Any] = {}
+
+    def compute(_existing: str) -> str:
+        # Re-read through _load_or_raise rather than parsing ``_existing``:
+        # that helper is the one place that tells "absent" from "unreadable",
+        # and locked_atomic_rewrite hands us "" for both.
+        nonlocal settings
+        settings = _load_or_raise()
+        if not update(settings):
+            raise _NoWrite
+        return json.dumps(settings, indent=2)
+
+    try:
+        locked_atomic_rewrite(SETTINGS_FILE, compute, mode=0o600)
+    except _NoWrite:
+        pass
+    except (OSError, UnicodeDecodeError) as e:
+        # locked_atomic_rewrite reads the file itself before calling compute,
+        # so undecodable bytes or OS-level read failures (permission denied,
+        # the path being a directory, ...) surface from there, ahead of our
+        # own read.
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
+    return settings
 
 
 def get_agent_dirs() -> Dict[str, str]:
@@ -281,26 +340,29 @@ def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
     legacy flat key (``agent_dirs``) for backward compatibility with older
     CAO versions that may still read it.
     """
-    settings = _load()
-    # Read current from nested first, fall back to flat
-    nested = settings.get("agents", {})
-    if isinstance(nested, dict) and "dirs" in nested and isinstance(nested["dirs"], dict):
-        current = nested["dirs"]
-    else:
-        current = settings.get("agent_dirs", {})
-    for provider, path in dirs.items():
-        if provider in _DEFAULTS:
-            current[provider] = path
-    # Write nested format
-    agents_section = settings.get("agents", {})
-    if not isinstance(agents_section, dict):
-        agents_section = {}
-    agents_section["dirs"] = current
-    settings["agents"] = agents_section
-    # Also write flat key for backward compat
-    settings["agent_dirs"] = current
-    _save(settings)
-    logger.info(f"Updated agent directories: {current}")
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Read current from nested first, fall back to flat
+        nested = settings.get("agents", {})
+        if isinstance(nested, dict) and "dirs" in nested and isinstance(nested["dirs"], dict):
+            current = nested["dirs"]
+        else:
+            current = settings.get("agent_dirs", {})
+        for provider, path in dirs.items():
+            if provider in _DEFAULTS:
+                current[provider] = path
+        # Write nested format
+        agents_section = settings.get("agents", {})
+        if not isinstance(agents_section, dict):
+            agents_section = {}
+        agents_section["dirs"] = current
+        settings["agents"] = agents_section
+        # Also write flat key for backward compat
+        settings["agent_dirs"] = current
+        return True
+
+    settings = _mutate(update)
+    logger.info(f"Updated agent directories: {settings.get('agent_dirs')}")
     return get_agent_dirs()
 
 
@@ -357,16 +419,19 @@ def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
         if configured is not None and configured not in seen:
             seen.add(configured)
             cleaned.append(configured)
-    settings = _load()
-    # Write nested format
-    agents_section = settings.get("agents", {})
-    if not isinstance(agents_section, dict):
-        agents_section = {}
-    agents_section["disabled_dirs"] = cleaned
-    settings["agents"] = agents_section
-    # Also write flat key for backward compat
-    settings["disabled_agent_dirs"] = cleaned
-    _save(settings)
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Write nested format
+        agents_section = settings.get("agents", {})
+        if not isinstance(agents_section, dict):
+            agents_section = {}
+        agents_section["disabled_dirs"] = cleaned
+        settings["agents"] = agents_section
+        # Also write flat key for backward compat
+        settings["disabled_agent_dirs"] = cleaned
+        return True
+
+    _mutate(update)
     logger.info(f"Disabled agent dirs: {cleaned}")
     return cleaned
 
@@ -556,6 +621,9 @@ def get_memory_settings() -> Dict[str, Any]:
         "lint_enabled": True,
         "learning_enabled": False,
         "instruction_promotion_enabled": False,
+        "explain_enabled": True,
+        "non_accessing_inspection": False,
+        "lifecycle": {"enabled": False},
     }
     saved = settings.get("memory", {})
     if not isinstance(saved, dict):
@@ -571,6 +639,23 @@ def get_memory_settings() -> Dict[str, Any]:
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
     if env_enabled is not None and env_enabled.strip() != "":
         result["enabled"] = env_enabled.strip().lower() in ("1", "true", "yes")
+
+    env_lifecycle = os.environ.get("CAO_MEMORY_LIFECYCLE_ENABLED")
+    if env_lifecycle is not None and env_lifecycle.strip():
+        lifecycle = result.get("lifecycle", {})
+        result["lifecycle"] = {
+            **(lifecycle if isinstance(lifecycle, dict) else {}),
+            "enabled": env_lifecycle.strip().lower() in ("1", "true", "yes"),
+        }
+
+    env_inspection = os.environ.get("CAO_MEMORY_NON_ACCESSING_INSPECTION")
+    if env_inspection is not None and env_inspection.strip():
+        result["non_accessing_inspection"] = env_inspection.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_EXPLAIN_ENABLED beats settings.json.
+    env_explain = os.environ.get("CAO_MEMORY_EXPLAIN_ENABLED")
+    if env_explain is not None and env_explain.strip() != "":
+        result["explain_enabled"] = env_explain.strip().lower() in ("1", "true", "yes")
 
     # Env-var overlay: CAO_MEMORY_LEARNING_ENABLED beats settings.json
     env_learning = os.environ.get("CAO_MEMORY_LEARNING_ENABLED")
@@ -608,8 +693,15 @@ def get_memory_settings() -> Dict[str, Any]:
     return result
 
 
-def get_vault_config():
-    """Load the validated ``memory.vault`` object with a disable-only env gate."""
+def get_vault_config(*, canonicalize: bool = True):
+    """Load the validated ``memory.vault`` object with a disable-only env gate.
+
+    Schema validation is pure. With ``canonicalize`` (the default for every
+    runtime consumer) project mapping ids are then resolved through the
+    persisted alias table, which fails closed when the database is unavailable.
+    Introspection surfaces such as ``cao config list`` pass ``canonicalize=False``
+    so they can show the configured document on a home that has no database yet.
+    """
     from cli_agent_orchestrator.services.vault.config import VaultConfig
 
     settings = _load()
@@ -618,6 +710,10 @@ def get_vault_config():
     if not isinstance(raw_vault, dict):
         raise ValueError("memory.vault must be an object")
     config = VaultConfig.model_validate(raw_vault)
+    if canonicalize:
+        from cli_agent_orchestrator.services.vault.binding import canonicalize_vault_config
+
+        config = canonicalize_vault_config(config)
 
     # This operational override may only reduce exposure. In particular, an
     # env value of true never enables a file-disabled or absent configuration.
@@ -671,6 +767,42 @@ def is_memory_lint_enabled(settings: Optional[Dict[str, Any]] = None) -> bool:
     except Exception as e:
         logger.warning(f"Failed to read memory.lint_enabled, defaulting to True: {e}")
         return True
+
+
+def is_non_accessing_inspection_enabled() -> bool:
+    """Opt-in operator inspection: env > file > False; read errors stay off."""
+    try:
+        return bool(get_memory_settings().get("non_accessing_inspection", False))
+    except Exception:
+        logger.warning("Failed to read memory.non_accessing_inspection; defaulting to False")
+        return False
+
+
+def is_memory_lifecycle_enabled() -> bool:
+    """Opt-in lifecycle: env > nested file value > False; invalid/read error is off."""
+    env = os.environ.get("CAO_MEMORY_LIFECYCLE_ENABLED")
+    if env is not None and env.strip():
+        return env.strip().lower() in ("1", "true", "yes")
+    try:
+        memory = _load().get("memory", {})
+        lifecycle = memory.get("lifecycle", {}) if isinstance(memory, dict) else {}
+        if not isinstance(lifecycle, dict) or not isinstance(lifecycle.get("enabled", False), bool):
+            logger.warning("Invalid memory.lifecycle.enabled; defaulting to False")
+            return False
+        return bool(lifecycle.get("enabled", False))
+    except Exception:
+        logger.warning("Failed to read memory.lifecycle.enabled; defaulting to False")
+        return False
+
+
+def is_memory_explain_enabled() -> bool:
+    """On-demand explain: env > file > True; read errors retain the default."""
+    try:
+        value = get_memory_settings().get("explain_enabled", True)
+    except Exception as e:
+        logger.warning(f"Failed to read memory.explain_enabled, defaulting to True: {e}")
+        return True
+    return bool(value)
 
 
 def is_memory_enabled() -> bool:
@@ -954,6 +1086,9 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
 
     Supported keys:
         ``enabled`` (bool) — master switch for the memory subsystem.
+        ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
+        ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
+        ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
         ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
@@ -968,38 +1103,44 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``workflow_journal_retention_count`` (int ≥ 0) — most-recent run-count
             retention bound (U7; default 100, NFR-SEC-3).
     """
-    settings = _load()
-    memory = settings.get("memory", {})
-    if not isinstance(memory, dict):
-        memory = {}
-
+    # Validate BEFORE taking the file lock: a rejected value must not wait on,
+    # let alone rewrite, settings.json.
+    coerced: Any
     if key == "enabled":
         if not isinstance(value, bool):
             raise ValueError(f"enabled must be a bool, got {type(value).__name__}")
-        memory[key] = value
+        coerced = value
     elif key == "lint_enabled":
         if not isinstance(value, bool):
             raise ValueError(f"lint_enabled must be a bool, got {type(value).__name__}")
-        memory[key] = value
+        coerced = value
     elif key == "learning_enabled":
         if not isinstance(value, bool):
             raise ValueError(f"learning_enabled must be a bool, got {type(value).__name__}")
-        memory[key] = value
+        coerced = value
     elif key == "instruction_promotion_enabled":
         if not isinstance(value, bool):
             raise ValueError(
                 f"instruction_promotion_enabled must be a bool, got {type(value).__name__}"
             )
-        memory[key] = value
+        coerced = value
+    elif key == "lifecycle.enabled":
+        if not isinstance(value, bool):
+            raise ValueError("lifecycle.enabled must be a bool")
+        coerced = value
+    elif key in {"explain_enabled", "non_accessing_inspection"}:
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
+        coerced = value
     elif key == "flush_threshold":
         fval = float(value)
         if not (0.0 < fval <= 1.0):
             raise ValueError(f"flush_threshold must be between 0.0 and 1.0, got {fval}")
-        memory[key] = fval
+        coerced = fval
     elif key in _WORKFLOW_JOURNAL_BOOL_KEYS:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
-        memory[key] = value
+        coerced = value
     elif key in _WORKFLOW_JOURNAL_INT_KEYS:
         # bool is an int subclass — reject it so True/False can't masquerade as 1/0.
         if isinstance(value, bool) or not isinstance(value, int):
@@ -1007,13 +1148,26 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         min_value = 1 if key == "workflow_journal_output_cap_bytes" else 0
         if value < min_value:
             raise ValueError(f"{key} must be >= {min_value}, got {value}")
-        memory[key] = value
+        coerced = value
     else:
         raise ValueError(f"Unknown memory setting: {key}")
 
-    settings["memory"] = memory
-    _save(settings)
-    logger.info(f"Updated memory setting: {key}={memory[key]}")
+    def update(settings: Dict[str, Any]) -> bool:
+        memory = settings.get("memory", {})
+        if not isinstance(memory, dict):
+            memory = {}
+        if key == "lifecycle.enabled":
+            lifecycle = memory.get("lifecycle", {})
+            if not isinstance(lifecycle, dict):
+                lifecycle = {}
+            memory["lifecycle"] = {**lifecycle, "enabled": coerced}
+        else:
+            memory[key] = coerced
+        settings["memory"] = memory
+        return True
+
+    _mutate(update)
+    logger.info(f"Updated memory setting: {key}={coerced}")
     return get_memory_settings()
 
 
@@ -1044,17 +1198,20 @@ def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     Writes to nested schema (``agents.extra_dirs``) and legacy flat key
     (``extra_agent_dirs``) for backward compatibility.
     """
-    settings = _load()
     extra_agent_dirs = [d for d in dirs if d.strip()]
-    # Write nested format
-    agents_section = settings.get("agents", {})
-    if not isinstance(agents_section, dict):
-        agents_section = {}
-    agents_section["extra_dirs"] = extra_agent_dirs
-    settings["agents"] = agents_section
-    # Also write flat key for backward compat
-    settings["extra_agent_dirs"] = extra_agent_dirs
-    _save(settings)
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Write nested format
+        agents_section = settings.get("agents", {})
+        if not isinstance(agents_section, dict):
+            agents_section = {}
+        agents_section["extra_dirs"] = extra_agent_dirs
+        settings["agents"] = agents_section
+        # Also write flat key for backward compat
+        settings["extra_agent_dirs"] = extra_agent_dirs
+        return True
+
+    _mutate(update)
     # Prune disabled entries that no longer point at any configured directory —
     # otherwise removing an extra dir leaves a stale disabled entry behind, and
     # re-adding that path later would come back silently pre-disabled.
@@ -1118,13 +1275,16 @@ def set_skill_projection_mode(mode: str) -> str:
     normalized = (mode or "").strip().lower()
     if normalized not in ("symlink", "copy"):
         raise ValueError(f"projection_mode must be 'symlink' or 'copy', got {mode!r}")
-    settings = _load()
-    skills_section = settings.get("skills", {})
-    if not isinstance(skills_section, dict):
-        skills_section = {}
-    skills_section["projection_mode"] = normalized
-    settings["skills"] = skills_section
-    _save(settings)
+
+    def update(settings: Dict[str, Any]) -> bool:
+        skills_section = settings.get("skills", {})
+        if not isinstance(skills_section, dict):
+            skills_section = {}
+        skills_section["projection_mode"] = normalized
+        settings["skills"] = skills_section
+        return True
+
+    _mutate(update)
     return normalized
 
 
@@ -1134,15 +1294,18 @@ def set_extra_skill_dirs(dirs: List[str]) -> List[str]:
     Writes to nested schema (``skills.extra_dirs``) and legacy flat key
     (``extra_skill_dirs``) for backward compatibility.
     """
-    settings = _load()
     extra_skill_dirs = [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
-    # Write nested format
-    skills_section = settings.get("skills", {})
-    if not isinstance(skills_section, dict):
-        skills_section = {}
-    skills_section["extra_dirs"] = extra_skill_dirs
-    settings["skills"] = skills_section
-    # Also write flat key for backward compat
-    settings["extra_skill_dirs"] = extra_skill_dirs
-    _save(settings)
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Write nested format
+        skills_section = settings.get("skills", {})
+        if not isinstance(skills_section, dict):
+            skills_section = {}
+        skills_section["extra_dirs"] = extra_skill_dirs
+        settings["skills"] = skills_section
+        # Also write flat key for backward compat
+        settings["extra_skill_dirs"] = extra_skill_dirs
+        return True
+
+    _mutate(update)
     return extra_skill_dirs

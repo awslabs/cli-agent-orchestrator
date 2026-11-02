@@ -984,7 +984,7 @@ async def test_provider_error_retries_do_not_leak_terminals(monkeypatch):
     monkeypatch.setattr(
         ts,
         "delete_terminal",
-        MagicMock(side_effect=lambda tid, registry=None: deleted.append(tid)),
+        MagicMock(side_effect=lambda tid, registry=None, end_reason=None: deleted.append(tid)),
     )
     monkeypatch.setattr(agent_step, "wait_until_status", AsyncMock(return_value=True))
     monkeypatch.setattr(

@@ -121,7 +121,15 @@ export function GraphView({
       return;
     }
     const graph = buildGraph(snapshot);
-    const sigma = new Sigma(graph, containerRef.current);
+    const sigma = new Sigma(graph, containerRef.current, {
+      settings: {
+        // Sigma v4 defaults to "positions"; keep node sizes in pixels.
+        itemSizesReference: "screen",
+        // Sigma v4 rotates the camera on right-drag and blocks the context
+        // menu by default; keep the Sigma v3 right-click behavior.
+        enableCameraMouseRotation: false,
+      },
+    });
     sigma.on("clickNode", ({ node }) => {
       onOpenTopic?.(node, graph.getNodeAttributes(node));
     });

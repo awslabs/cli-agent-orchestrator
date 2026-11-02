@@ -31,7 +31,7 @@ handle (wrong token, wrong scopes, expired).
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import requests
 from requests import Response, exceptions  # noqa: F401  (re-exported for the commands)

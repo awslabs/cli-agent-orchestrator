@@ -171,6 +171,11 @@ def send(worker_id, message, is_async, timeout):
     try:
         # Same done-detection as a local send, reading status through the broker.
         # Duplicating that logic here would mean a kiro worker looked hung.
+        # The broker's terminal_status route reports a status string only, so
+        # the read_status override cannot carry a generation and this wait runs
+        # on the frame-based rules; closing that needs a broker route change
+        # (the #735 follow-up, not fixed here).
+        # staleness-ok: remote read_status override; the broker names no generation
         poll_until_done(
             terminal_id,
             timeout if timeout is not None else _DEFAULT_SEND_TIMEOUT,
@@ -251,6 +256,7 @@ def attach(worker_id):
         client.send_input(worker_id, terminal_id, message)
         time.sleep(3)
         try:
+            # staleness-ok: same remote read_status override as `cao worker send`
             poll_until_done(
                 terminal_id,
                 _DEFAULT_SEND_TIMEOUT,

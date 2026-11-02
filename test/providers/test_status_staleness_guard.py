@@ -18,8 +18,6 @@ sliding -S -200 window), so the guard uses content hashing, not length.
 
 from unittest.mock import patch
 
-import pytest
-
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 

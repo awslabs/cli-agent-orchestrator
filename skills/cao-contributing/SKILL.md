@@ -3,20 +3,22 @@ name: cao-contributing
 description: Contribute changes to the CAO (CLI Agent Orchestrator) codebase — the local
   dev loop, the CI gate map, and the pre-PR checklist. Use when the user says "open a PR",
   "why did CI fail", "run the checks before I push", "the mypy/Code Quality job is red",
-  "add a test and verify coverage", or when making any code change intended to land on a
-  branch/PR. Covers uv-based build/test/lint, the ci.yml jobs and their pass/fail
-  semantics, and the golden rules that stop a green-locally / red-in-CI surprise. Not for
-  authoring agent skills, building providers/plugins/MCP-apps, or operating running
-  sessions.
+  "add a test and verify coverage", "bump a dependency", "the uv.lock diff is noisy",
+  "a CVE blocks the dependency gate", or when making any code change intended to land on a
+  branch/PR. Covers uv-based build/test/lint, lockfile and CVE-floor rules, the ci.yml jobs
+  and their pass/fail semantics, and the golden rules that stop a green-locally / red-in-CI
+  surprise. Not for authoring agent skills, building providers/plugins/MCP-apps, or
+  operating running sessions.
 ---
 
 # Contributing to CAO
 
 How to make a change to the **cli-agent-orchestrator** codebase and get it through CI
 cleanly. Read this before pushing a branch or opening a PR. The canonical human docs are
-[`DEVELOPMENT.md`](../../DEVELOPMENT.md), [`CONTRIBUTING.md`](../../CONTRIBUTING.md), and
-[`CODEBASE.md`](../../CODEBASE.md) — this skill is the operational checklist that mirrors what
-CI actually enforces.
+[`DEVELOPMENT.md`](https://github.com/awslabs/cli-agent-orchestrator/blob/main/DEVELOPMENT.md),
+[`CONTRIBUTING.md`](https://github.com/awslabs/cli-agent-orchestrator/blob/main/CONTRIBUTING.md), and
+[`CODEBASE.md`](https://github.com/awslabs/cli-agent-orchestrator/blob/main/CODEBASE.md) —
+this skill is the operational checklist that mirrors what CI actually enforces.
 
 ## Golden rules (read these first)
 
@@ -34,7 +36,7 @@ CI actually enforces.
    including CI/workflow/config files** (`.github/workflows/*.yml`, `pyproject.toml`,
    `mypy.ini`) — before concluding the cause is pre-existing or external. The signal is
    often in your own diff (`git diff <base>..HEAD -- .github/`). A displaced one-line
-   workflow key (see the mypy note below) can turn a tolerated warning into a hard failure.
+   workflow key can turn a tolerated warning into a hard failure, or the reverse.
 4. **Never mark a task complete while a required CI gate is red.** A red gate means *not
    done*; investigate, don't rationalize.
 5. **Match the repo, don't reshape it.** Don't bundle unrelated fixes (e.g. repo-wide type
@@ -48,7 +50,9 @@ uv sync --all-extras --dev          # install (mirrors what CI does)
 uv run pytest test/path/to/test_x.py   # run targeted tests while iterating
 uv run black src/ test/             # format (CI checks --check)
 uv run isort src/ test/             # import order (CI checks --check-only)
-uv run mypy src/                    # type check (see the mypy note below)
+uv run ruff check src/ test/ examples/   # dead code -- BLOCKING, and green on main
+uv run python scripts/mypy_ratchet.py  # type check -- the gate CI runs (see note below)
+uv run mypy src/                    # the raw mypy output, if you want to read it
 ```
 
 Write tests **RED-first**: add a test that reproduces the bug/behavior and fails, then
@@ -68,9 +72,9 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 
 | Job | Runs | Blocking? |
 |-----|------|-----------|
-| **Unit Tests** (3.10 / 3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-report=term-missing` | **Yes** |
+| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-report=term-missing` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
-| **Code Quality** | black `--check`, isort `--check-only`, then `uv run mypy src/` | black/isort **yes**; **mypy is non-blocking** (`continue-on-error: true`) |
+| **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check src/ test/ examples/`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all four; the mypy step's `continue-on-error` was removed in issue #1005) |
 | **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |
 | **AG-UI construct demos (shift-left recordings)** | same pattern for the L2 construct library | **Yes** |
 | **AG-UI stock-client live (AC3)** | drives a real third-party AG-UI client against the surface | **Yes** |
@@ -96,13 +100,16 @@ required check without an actual job is not a running scan.
 Dependency Security also runs weekly and on manual dispatch through
 `dependency-security.yml`, using the same action as CI. A passing local-patch
 check does not exempt an open HIGH/CRITICAL advisory. See
-[`SECURITY.md`](../../SECURITY.md#full-dependency-gate) for inventory artifacts,
+[`SECURITY.md`](https://github.com/awslabs/cli-agent-orchestrator/blob/main/SECURITY.md#full-dependency-gate) for inventory artifacts,
 failure states, and the required-status rollout after the workflow lands.
 
 > **The `-m "not e2e"` on the CI command replaces your local `addopts` — it does not
-> compose with it.** So a local run that *also* deselects `integration` is a strict subset
-> of CI's selection and can be green while CI is red. Compare deselected counts, not just
-> pass counts.
+> compose with it.** Since #1005 the two agree: `addopts` is `-m 'not e2e'`, so a default
+> local run uses the same marker expression CI does — the path differences below are what
+> still separates the two populations. Before that change, `addopts` read
+> `-m 'not e2e and not integration'`, a strictly narrower marker than CI's, and a local
+> run could be green while CI was red. If you override `-m` yourself, compare deselected
+> counts, not just pass counts.
 >
 > **CI's selection is narrower than the marker alone implies.** The same command passes
 > `--ignore=test/providers/test_kiro_cli_integration.py` and `--ignore=test/e2e`, and
@@ -110,42 +117,35 @@ failure states, and the required-status rollout after the workflow lands.
 > and **never runs in CI**. So *most* `integration`-marked tests do run in CI — but not
 > that one, and nothing in CI covers it. If you change it, you have to run it yourself.
 
-> **mypy is intentionally non-blocking.** The repo has **known, pre-existing, repo-wide
-> mypy errors** (historically in `services/agent_scaffold.py`, `cli/commands/profile.py`,
-> `services/memory_service.py` / `api/main.py` `MemoryArchiveBackend` call-arg, and a
-> `jsonschema` stub). CI tolerates them via `continue-on-error: true` on the mypy step.
-> Therefore:
-> - **Do not** make mypy blocking, and **do not** bundle those unrelated type-fixes into a
->   feature PR (they belong in a dedicated cleanup PR).
-> - **Your change must add zero *new* mypy errors** — check the delta, not the raw count.
-> - **When you insert a new job/step near the `lint` job, keep `continue-on-error: true`
->   attached to the mypy step.** A mis-insertion once displaced that line onto the next
->   job's step, silently turning mypy into a hard gate and failing the build for
->   unrelated, pre-existing errors.
+> **mypy is blocking, via a ratchet** (issue #1005). The repo has **known, pre-existing,
+> repo-wide mypy errors** — 177 of them in 22 files when the ratchet landed, concentrated in
+> `services/agui/run_plane.py`, `utils/agent_profiles.py`, `utils/orchestration.py`,
+> `mcp_server/server.py`, and `services/vault/reader.py`.
+> They are frozen in [`mypy-baseline.json`](https://github.com/awslabs/cli-agent-orchestrator/blob/main/mypy-baseline.json) per file and per error
+> code, and `scripts/mypy_ratchet.py` fails only when a count **rises**. Therefore:
+> - **Your change must add zero *new* mypy errors.** Check the delta, not the raw count —
+>   which is exactly what `uv run python scripts/mypy_ratchet.py` reports. A new error in one
+>   file does not cancel out a fix in another; the comparison is per file per code.
+> - **Do not** bundle unrelated repo-wide type-fixes into a feature PR (they belong in a
+>   dedicated cleanup PR) — but if you *do* fix some, run
+>   `uv run python scripts/mypy_ratchet.py --update` and commit the lowered baseline.
+> - **Raising the baseline needs a reviewer's explicit OK.** `--update` will write a higher
+>   number without complaint, so nothing but the review stops you. Prefer a
+>   `# type: ignore[code]` with a reason on the offending line, which is visible where the
+>   problem is.
+> - **Do not add `continue-on-error` to the mypy step.** That key is the whole difference
+>   between a gate and a decoration, and `test/scripts/test_mypy_ratchet.py` asserts it stays
+>   absent from the Code Quality job.
+> - `mypy.ini` at the repo root is the config mypy actually loads. The `[tool.mypy]` section
+>   in `pyproject.toml` is shadowed by it and has no effect — including its `strict = true`.
 
 ### Other workflows that gate a PR
 
-`ci.yml` is not the only workflow on a pull request. These run alongside it, and none sets
-job-level `continue-on-error`, so every check they run is blocking. The same accuracy test
-pins this table to the workflow files.
-
-| Workflow | Checks on the PR | Runs on | Blocking? |
-|----------|------------------|---------|-----------|
-| **Secret Scan** (`secret-scan.yml`) | `gitleaks`, `gitleaks config tests` | every PR to `main` | **Yes** — the config tests run locally as `uv run pytest test/test_gitleaks_config.py`; the scan itself is `gitleaks detect --config .gitleaks.toml` over the PR's commits |
-| **cargo-deny** (`cargo-deny.yml`) | `cargo-deny (advisories, licenses, bans, sources)` | every PR to `main` | **Yes** — locally, `cargo deny --manifest-path tui/Cargo.toml --locked check` (global flags before the subcommand, as the action passes them) |
-| **Test Antigravity CLI Provider** (`test-antigravity-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
-| **Test Claude Code Provider** (`test-claude-code-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test, `pyproject.toml`, or the workflow | **Yes** |
-| **Test Codex CLI Provider** (`test-codex-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
-| **Test Kiro CLI Provider** (`test-kiro-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
-| **Robotics transport example** (`robotics-transport.yml`) | `Transport simulator` | only PRs touching the cross-zone transport example, agent-profile schema, CAO provider list, or the workflow | **Yes** — real MuJoCo and authenticated MCP tests; locally, `uv --directory examples/robotics/cross-zone-transport run --locked pytest` |
-| **Docs site** (`gh-pages.yml`) | `build` | only PRs touching `docusaurus/**`, `patches/**`, `vendor/**`, `scripts/test-braces-security.cjs`, `examples/robotics/cross-zone-transport/images/**`, or the workflow | **Yes** — `deploy` is push-only and never runs on a PR |
-| **Actions Security** (`zizmor.yml`) | `zizmor` | every PR to `main` | **Yes** — zizmor 1.30.1 over `.github/` at Medium or higher; locally, `uvx zizmor==1.30.1 --collect=all --min-severity medium --offline --config .github/zizmor.yml .github/`. Accepted findings and their reasons live in `.github/zizmor.yml`; fix the workflow or add a reasoned entry there, never an inline ignore |
-
-> **Two checks can share a name.** Each provider workflow has its own `Unit Tests` and
-> `Code Quality`, so a PR that touches `pyproject.toml` shows those names more than once.
-> Read the workflow name next to a failing check before assuming it is the CI one —
-> `gh pr checks <number>` lists every workflow, whereas `gh run list --workflow CI` sees
-> only `ci.yml`.
+`ci.yml` is not the only workflow on a pull request: secret scanning, cargo-deny, the
+per-provider suites, the two robotics examples, the docs site and zizmor gate too, and none of
+them tolerates a failure. The full table, with the local command for each and the warning that
+two checks can share a name, is in
+[`references/pr-gating-workflows.md`](references/pr-gating-workflows.md).
 
 ## Testing gotchas
 
@@ -156,32 +156,10 @@ pins this table to the workflow files.
   full suite, though** — it excludes `test/e2e` and the Kiro provider integration test by
   path (see the callout above), so those two are only ever covered by someone running them
   deliberately.
-- **A test that touches CAO's own state can pass only on your machine.** If a code path
-  reaches the real database, config dir, or a live session, it will be green on a
-  developer box that has an initialised CAO install and red on a clean runner with
-  `sqlite3.OperationalError: no such table: terminals`. Mock the store/DB seam explicitly;
-  when a test exercises a service function, check what that function calls *today* — a
-  rebase can introduce a new unmocked DB write into a path your test already covered.
-  Verify by running under a throwaway `HOME` **and** a throwaway `CAO_HOME_DIR` —
-  `HOME` alone is not enough, because `constants.py` prefers an exported
-  `CAO_HOME_DIR` and derives the database and every other state path from it, so an
-  absolute value you already export keeps the initialised store this is meant to
-  exclude:
-  ```bash
-  TMPH=$(mktemp -d)
-  ( trap 'rm -rf "$TMPH"' EXIT              # cleans up on every path
-    HOME="$TMPH" CAO_HOME_DIR="$TMPH/cao" \
-      uv run pytest test/path/to/test_x.py
-    rc=$?                                   # not `status`: read-only in zsh
-    echo "exit=$rc"                         # pytest's status, not rm's
-    exit "$rc" )                            # ...and the block returns it too
-  ```
-  Keep the trap-in-a-subshell shape, and keep the diagnostic *inside* it. Cleaning up
-  with `; rm -rf "$TMPH"` returns `rm`'s status instead of pytest's, so a failing run
-  reports success; switching to `&&` fixes the status but leaks the temp directory on
-  exactly the failures you wanted isolated. A trailing `echo "exit=$?"` *after* the
-  subshell prints the right number but is itself the block's last command, so the block
-  returns 0 and a script or agent checking `$?` still reads a failing run as a pass.
+- **A test that touches CAO's own state can pass only on your machine.** Run it under a
+  throwaway `HOME` **and** a throwaway `CAO_HOME_DIR` — `HOME` alone is not enough. The recipe,
+  and why its exact shape decides whether a failing run reports success, is in
+  [`references/test-isolation.md`](references/test-isolation.md).
 - **Local green and CI green are different claims, in both directions.** A local suite can
   hide real failures (see above) *and* invent ones CI never sees (macOS-only, missing
   optional binaries). When they disagree, CI is authoritative — read the job log rather
@@ -196,20 +174,76 @@ pins this table to the workflow files.
   in CI, so you don't have to run it locally to land a change. The construct-demo recorder
   is the sibling at `examples/ag-ui/ag-ui-construct-demos/tools`.
 
+## Dependency and lockfile changes
+
+A lockfile change should contain only the change you meant. These rules come from
+[#1119](https://github.com/awslabs/cli-agent-orchestrator/pull/1119), where each one cost time
+to rediscover.
+
+1. **Relock with the uv CI uses, not an older local one.** CI's `setup-uv` installs the latest
+   release and nothing pins a version, so run `uvx uv@latest lock` in every project whose
+   lockfile you change — `git ls-files '*uv.lock'` lists them, and it is more than the root one.
+   If `git diff uv.lock` changes the `revision =` header or the markers of packages you did not
+   touch, suspect your uv first: a local 0.12.20 once rewrote `revision = 5` to `3`, where
+   0.13.6 changed only the 4 intended lines. Confirm `uvx uv@latest --version` is really the
+   newest uv release. If that uv still rewrites the header, keep the change and say so in the
+   PR — an older uv (Dependabot's, say) wrote the committed lock, and no uv version gives a
+   quieter diff.
+2. **A lockfile pin does not protect `pip install` — for the base install.** `uv.lock` governs
+   `uv sync`, not what pip resolves from the published metadata. The gate scans far more than
+   the base install, though, so find out where the package sits before you declare anything:
+   `uv export --frozen --no-dev --no-hashes | grep -i '^<name>=='` (grep the PEP 503 normalised
+   name — lowercase, `_` and `.` as `-` — which is how `uv export` prints it). A match means the
+   base install gets it, and a CVE fixed only by bumping it **transitively** in the lock also
+   needs a floor in `[project].dependencies`, with a comment naming the CVE and the dependency
+   path, as `cryptography` and `dnspython` do in `pyproject.toml`. No match? Re-run the export
+   with `--all-extras`: a match there means an extra, and the floor belongs in that extra's
+   `[project.optional-dependencies]` list, not in the base dependencies, which stay lean. Still
+   no match means dev-only, and the lock bump is the whole fix.
+3. **Check the floor in the built wheel**, not the source: `uv build --wheel --clear`, then
+   `unzip -p dist/*.whl '*.dist-info/METADATA' | grep Requires-Dist`. Keep the `--clear` (or
+   build into a fresh `--out-dir`): a plain `uv build` leaves earlier wheels in place, the glob
+   then expands to several, and `unzip` reads the first while treating the rest as member names.
+   It exits 11, but the pipe reports `grep`'s status, so a floor read off a stale wheel looks
+   like a pass.
+4. **Run the dependency gate locally** with the Trivy version CI pins (see `SECURITY.md`):
+   `uv run python scripts/dependency_security.py`. Every HIGH or CRITICAL finding blocks, and
+   local mitigations are not exemptions.
+
 ## Pre-PR checklist
 
 1. `uv run black src/ test/ && uv run isort src/ test/` (or `--check` to verify).
-2. `uv run mypy src/` — confirm **no *new* errors** vs the base (pre-existing ones are OK).
-3. `uv run pytest <targeted files>` green; add/keep tests for changed behavior.
-4. If you touched **any** `.md`, run `uv run python scripts/validate_markdown_links.py` —
+2. `uv run ruff check src/ test/ examples/` — must be **clean**. Blocking, like the mypy
+   ratchet, but with no tolerated backlog at all, so any finding is yours. Do not reach for
+   `--fix` on a pytest fixture re-import: ruff cannot see that pytest injects the name,
+   and removing it breaks collection (it turned `test/decisions` into 113 errors once).
+   Use `# noqa: F401  # <reason>` there. Selected rules and the deferred ones (F811, ARG,
+   B) are documented in `pyproject.toml`.
+3. `uv run python scripts/mypy_ratchet.py` — must print `PASS`. This is the blocking gate;
+   pre-existing errors are fine, new ones are not. If it reports improvements, run it again
+   with `--update` and commit `mypy-baseline.json`.
+4. `uv run pytest <targeted files>` green; add/keep tests for changed behavior.
+5. If you touched **any** `.md`, run `uv run python scripts/validate_markdown_links.py` —
    a dead relative link fails the Unit Tests job, and `skills/` is in scope. CAO has no
    root `AGENTS.md`; the contributor map is `CODEBASE.md`.
-5. If you touched `skills/`, run `uv run python scripts/sync_skills.py` so the packaged mirror
-   stays in lockstep (`test/test_skill_packaging_parity.py` enforces it).
-6. **Commits:** only when asked; sign if the repo expects it; keep the subject concise and
+6. If you touched `pyproject.toml` or a uv lockfile, follow
+   [Dependency and lockfile changes](#dependency-and-lockfile-changes) first. For npm, Bun or
+   Cargo lockfiles only rule 4, the dependency gate, applies — the rest of that section is
+   uv-specific.
+7. If you touched `skills/`, run `uv run python scripts/sync_skills.py` so the packaged mirror
+   stays in lockstep (`test/test_skill_packaging_parity.py` enforces it). A skill that also
+   ships in a plugin package under `agent-plugin/` has a *third* copy: rebuild it with
+   `make agent-plugin` and commit `agent-plugin/`, or the Unit Tests job's
+   `make check-agent-plugin` step goes red. The rebuild pins the version in `pyproject.toml`,
+   which can run ahead of the pin the committed packages carry; the release workflow's
+   `regenerate-agent-plugin` job moves that pin after publishing, so a contributor PR should
+   not. No flag keeps it, so read `git diff agent-plugin/` — if the only change beyond your
+   skill edit is the version moving, restore the version strings — and finish with
+   `make check-agent-plugin`.
+8. **Commits:** only when asked; sign if the repo expects it; keep the subject concise and
    Conventional-Commits style; never force-push to `main`.
-7. **Open the PR, then watch its CI run to completion** and fix any red gate before calling
-   it done (rule #2 and #4). Use `gh pr create` / `gh pr checks`.
+9. **Open the PR, then watch its CI run to completion** and fix any red gate before calling
+   it done (Golden rules #2 and #4). Use `gh pr create` / `gh pr checks`.
 
 ## Not what you want?
 

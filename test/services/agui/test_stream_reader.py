@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 from typing import Iterator
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 import requests
 
 from cli_agent_orchestrator.services.agui.stream_reader import AguiStreamReader

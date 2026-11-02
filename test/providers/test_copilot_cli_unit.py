@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -1544,7 +1545,7 @@ class TestCopilotCliProviderMisc:
     def test_build_runtime_mcp_config_resolves_bundled_command(self):
         """The bundled cao-mcp-server is resolved to a PATH-independent
         invocation (wiring guard: a refactor that drops the
-        resolve_cao_mcp_command call must fail this test)."""
+        resolve_mcp_server_config call must fail this test)."""
         provider = CopilotCliProvider("abc12345", "test-session", "window-0")
         MOD = "cli_agent_orchestrator.utils.mcp_resolution"
         with (
@@ -1553,6 +1554,33 @@ class TestCopilotCliProviderMisc:
         ):
             runtime_cfg = json.loads(provider._build_runtime_mcp_config())
         assert runtime_cfg["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
+
+    def test_build_runtime_mcp_config_forwards_this_cao_address_and_home(self, monkeypatch):
+        """Copilot CLI passes an MCP subprocess only the env a config entry sets
+        (just like Codex), so a CAO on a non-default port/home must carry its
+        address and home in that entry's env."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-b")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.mcp_resolution.CAO_HOME_DIR", Path("/srv/cao-b")
+        )
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        provider = CopilotCliProvider("abc12345", "test-session", "window-0")
+        runtime_cfg = json.loads(provider._build_runtime_mcp_config())
+        server_env = runtime_cfg["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env["CAO_API_PORT"] == "9899"
+        assert server_env["CAO_HOME_DIR"] == "/srv/cao-b"
+        assert "CAO_API_HOST" not in server_env
+
+    def test_build_runtime_mcp_config_adds_nothing_for_a_default_cao(self, monkeypatch):
+        """A default CAO (none of the three address vars set) writes exactly the
+        same runtime MCP config as before this fix."""
+        for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        provider = CopilotCliProvider("abc12345", "test-session", "window-0")
+        runtime_cfg = json.loads(provider._build_runtime_mcp_config())
+        server_env = runtime_cfg["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env == {"CAO_TERMINAL_ID": "abc12345"}
 
     def test_cleanup_resets_initialized_state(self):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")

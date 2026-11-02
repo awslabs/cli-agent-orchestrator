@@ -410,7 +410,7 @@ class GrokCliProvider(BaseProvider):
         for name, raw_server in (mcp_servers or {}).items():
             config = self._server_dict(raw_server)
             if "command" in config:
-                config = resolve_mcp_server_config(config)
+                config = resolve_mcp_server_config(config, name=name)
                 env = dict(config.get("env") or {})
                 env["CAO_TERMINAL_ID"] = self.terminal_id
                 config["env"] = env

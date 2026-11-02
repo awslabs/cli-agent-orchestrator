@@ -35,7 +35,7 @@ function FindingRow({ finding }: { finding: PluginFinding }) {
   return (
     <li className="flex items-start gap-2 text-xs py-1">
       <span
-        className={`px-1.5 py-0.5 rounded border font-mono uppercase shrink-0 ${SEVERITY_STYLE[finding.severity]}`}
+        className={`px-1.5 py-0.5 rounded-sm border font-mono uppercase shrink-0 ${SEVERITY_STYLE[finding.severity]}`}
       >
         {finding.severity}
       </span>
@@ -51,7 +51,7 @@ function FindingRow({ finding }: { finding: PluginFinding }) {
 
 function AffectedSessions({ sessions }: { sessions: PluginAffectedSession[] }) {
   return (
-    <div className="rounded border border-amber-800 bg-amber-950/40 p-3 text-xs space-y-1">
+    <div className="rounded-sm border border-amber-800 bg-amber-950/40 p-3 text-xs space-y-1">
       <p className="text-amber-300 font-medium">
         {sessions.length} live session{sessions.length === 1 ? '' : 's'} reference a skill this
         plugin provides.
@@ -211,7 +211,7 @@ export function PluginsPanel() {
           onChange={e => setSource(e.target.value)}
           placeholder="https://github.com/owner/repo  or  /path/to/plugin"
           aria-label="Plugin source"
-          className="w-full bg-gray-950 border border-gray-800 rounded px-3 py-2 text-sm text-gray-200"
+          className="w-full bg-gray-950 border border-gray-800 rounded-sm px-3 py-2 text-sm text-gray-200"
         />
         <div className="flex gap-3">
           <input
@@ -219,35 +219,35 @@ export function PluginsPanel() {
             onChange={e => setRef(e.target.value)}
             placeholder="branch or tag (git only)"
             aria-label="Git ref"
-            className="flex-1 bg-gray-950 border border-gray-800 rounded px-3 py-2 text-sm text-gray-200"
+            className="flex-1 bg-gray-950 border border-gray-800 rounded-sm px-3 py-2 text-sm text-gray-200"
           />
           <input
             value={subdir}
             onChange={e => setSubdir(e.target.value)}
             placeholder="subdirectory (optional)"
             aria-label="Subdirectory"
-            className="flex-1 bg-gray-950 border border-gray-800 rounded px-3 py-2 text-sm text-gray-200"
+            className="flex-1 bg-gray-950 border border-gray-800 rounded-sm px-3 py-2 text-sm text-gray-200"
           />
         </div>
         <div className="flex gap-2">
           <button
             onClick={handleValidate}
             disabled={busy || !source.trim()}
-            className="px-3 py-2 rounded text-sm bg-gray-800 text-gray-200 hover:bg-gray-700 disabled:opacity-50"
+            className="px-3 py-2 rounded-sm text-sm bg-gray-800 text-gray-200 hover:bg-gray-700 disabled:opacity-50"
           >
             Validate
           </button>
           <button
             onClick={handleInstall}
             disabled={busy || !source.trim()}
-            className="px-3 py-2 rounded text-sm bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50 flex items-center gap-1.5"
+            className="px-3 py-2 rounded-sm text-sm bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50 flex items-center gap-1.5"
           >
             <Plus size={14} /> Install
           </button>
         </div>
 
         {preview && (
-          <div className="rounded border border-gray-800 bg-gray-950 p-3 space-y-2">
+          <div className="rounded-sm border border-gray-800 bg-gray-950 p-3 space-y-2">
             <p className="text-sm">
               <span className="text-gray-400">{preview.name ?? preview.root}: </span>
               <span className={preview.loadable ? 'text-emerald-400' : 'text-red-400'}>
@@ -379,14 +379,14 @@ export function PluginsPanel() {
             <div className="flex justify-end gap-2">
               <button
                 onClick={() => setPending(null)}
-                className="px-3 py-2 rounded text-sm bg-gray-800 text-gray-200 hover:bg-gray-700"
+                className="px-3 py-2 rounded-sm text-sm bg-gray-800 text-gray-200 hover:bg-gray-700"
               >
                 Cancel
               </button>
               <button
                 onClick={confirmRemove}
                 disabled={busy}
-                className="px-3 py-2 rounded text-sm bg-red-600 text-white hover:bg-red-500 disabled:opacity-50"
+                className="px-3 py-2 rounded-sm text-sm bg-red-600 text-white hover:bg-red-500 disabled:opacity-50"
               >
                 Remove
               </button>

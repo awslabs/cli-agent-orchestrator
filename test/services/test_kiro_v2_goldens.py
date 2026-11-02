@@ -88,7 +88,7 @@ def test_v2_profile_rendering_matches_complete_golden(
         "description": description,
         "tools": ["*"],
         "allowedTools": expected_extra["allowedTools"],
-        "useLegacyMcpJson": False,
+        "includeMcpJson": False,
         "resources": expected_extra.get("resources", []),
         **{
             key: value

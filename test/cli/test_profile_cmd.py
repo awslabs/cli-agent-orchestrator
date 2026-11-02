@@ -389,7 +389,7 @@ class TestProfileRemoveVerb:
             patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store),
             patch("cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", store),
         ):
-            result = runner.invoke(profile, ["remove", "keep-me"], input="n\n")
+            _result = runner.invoke(profile, ["remove", "keep-me"], input="n\n")
         assert profile_file.exists()  # File should still be there
 
 
@@ -420,7 +420,6 @@ class TestInjectionRegression:
 
     def test_jinja_in_config_renders_literally(self):
         """A config value like {{7*7}} must render as-is, not evaluate."""
-        from cli_agent_orchestrator.services.agent_scaffold import render_template
 
         config = {
             "profile": "test",

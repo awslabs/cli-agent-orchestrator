@@ -28,7 +28,6 @@ Run:
 import time
 import uuid
 from test.e2e.conftest import (
-    cleanup_terminal,
     extract_output,
     get_terminal_status,
     wait_for_status,

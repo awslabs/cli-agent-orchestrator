@@ -1,0 +1,23 @@
+● TodoWrite isn't available, and I'll skip the ticket tool since it'd create real
+  external tickets — I'll just track progress as plain text instead. Current
+  status: API mapping done, helper extraction in progress, with import updates,
+  tests, and cleanup still pending.
+
+● Waiting 60 seconds · 49s
+  ⎿  $ sleep 60 (48s)
+     (ctrl+b ctrl+b (twice) to run in background)
+
+❯ queued message one: please also note the time
+
+❯ queued message two: and the date
+  ctrl+x ctrl+s to send now
+
+* Skedaddling… (1m 2s · ↓ 778 tokens)
+  ⎿  Tip: /loop runs any prompt on a recurring schedule. Great for monitoring
+     deploys, babysitting PRs, or polling status.
+
+────────────────────────────────────────────────────────────────────────────────
+❯ Press up to edit queued messages
+────────────────────────────────────────────────────────────────────────────────
+  Opus 5.5 (1M context) | Context: 4%
+  ⏵⏵ auto mode on (shift+tab to cycle)

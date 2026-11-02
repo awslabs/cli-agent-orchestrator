@@ -373,7 +373,6 @@ def test_cleanup_provider_retains_restored_grok_metadata_when_cleanup_is_deferre
 
 def test_list_providers():
     """Test list_providers returns correct mapping."""
-    from cli_agent_orchestrator.providers.codex import CodexProvider
 
     manager = ProviderManager()
     manager.create_provider(
@@ -548,4 +547,36 @@ def test_create_provider_resume_session_id_rejected_for_other_providers():
             tmux_window="w1",
             agent_profile=None,
             resume_session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+        )
+
+
+def test_create_provider_session_id_reaches_claude_code():
+    """Issue #1082: a fresh-launch session_id reaches ClaudeCodeProvider."""
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value,
+        terminal_id="t-fresh",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+    )
+
+    assert isinstance(provider, ClaudeCodeProvider)
+    assert provider._session_id == "11d55034-bb41-46ca-8686-59a9dbff16b5"
+
+
+def test_create_provider_session_id_rejected_for_other_providers():
+    """session_id is claude_code-only, same restriction as resume_session_id."""
+    manager = ProviderManager()
+    with pytest.raises(Exception, match="session_id is only supported"):
+        manager.create_provider(
+            ProviderType.CODEX.value,
+            terminal_id="t-bad",
+            tmux_session="s1",
+            tmux_window="w1",
+            agent_profile=None,
+            session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
         )

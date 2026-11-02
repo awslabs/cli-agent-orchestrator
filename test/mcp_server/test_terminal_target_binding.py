@@ -10,7 +10,6 @@ terminal the caller created, or (for ``send_message``) the caller's creator.
 import os
 from unittest.mock import MagicMock, patch
 
-import pytest
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
@@ -494,6 +493,7 @@ class TestAnswerUserPromptBinding:
         mock_requests.post.assert_called_once_with(
             f"{API_BASE_URL}/terminals/{CHILD}/input",
             params={"message": "1", "sender_id": OWN},
+            headers=None,
             timeout=_mcp_timeout(),
         )
 

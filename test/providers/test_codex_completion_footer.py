@@ -692,7 +692,11 @@ class TestFooterReleaseDetection:
         provider = CodexProvider("test1234", "test-session", "window-0")
         backend = MagicMock()
         backend.get_history.return_value = history
-        backend.get_pane_current_command.return_value = "zsh"
+        # The shell at the baseline read, codex at every exit check after the launch (#1018).
+        pane_commands = iter(["zsh"])
+        backend.get_pane_current_command.side_effect = lambda *_a, **_k: next(
+            pane_commands, "codex"
+        )
         with (
             patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
             patch("cli_agent_orchestrator.providers.codex.wait_for_shell", return_value=True),

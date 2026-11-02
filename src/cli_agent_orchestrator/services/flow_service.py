@@ -23,7 +23,7 @@ from cli_agent_orchestrator.clients.database import update_flow_enabled as db_up
 from cli_agent_orchestrator.clients.database import (
     update_flow_run_times as db_update_flow_run_times,
 )
-from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.kiro_engine import parse_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -210,7 +210,7 @@ def _is_terminal_busy(terminal_id: str) -> bool:
 
 def _delete_recycled_terminal_rows(terminal_ids: List[str]) -> None:
     """Release names only after the existing bulk deletion succeeds."""
-    if delete_terminals_by_ids(terminal_ids):
+    if delete_terminals_by_ids(terminal_ids, end_reason="session_teardown"):
         from cli_agent_orchestrator.services import ephemeral_service
 
         for terminal_id in terminal_ids:

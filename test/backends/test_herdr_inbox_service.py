@@ -441,13 +441,130 @@ class TestHerdrInboxServiceKiroSupplement:
 class TestHerdrInboxServiceReconcile:
     """Test _reconcile() prunes stale panes and cleans up DB/workspace."""
 
-    def test_reconcile_is_called_before_subscribe(self):
-        """_reconcile must be awaited before _subscribe_all_events in _socket_loop
-        so the combined subscription only covers live panes."""
-        # Structural test: confirms both are async coroutines.
+    def test_subscribe_happens_before_snapshot(self):
+        """_socket_loop must subscribe BEFORE _reconcile takes its snapshot (#755).
+
+        herdr 0.9.0 removed retained-history replay on subscribe, so any event
+        emitted between a snapshot and a later subscribe is lost permanently.
+        The settled-pane sweep must then run last, after _reconcile has
+        refreshed the pane map.
+        """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         assert inspect.iscoroutinefunction(service._reconcile)
         assert inspect.iscoroutinefunction(service._subscribe_all_events)
+
+        order = []
+
+        async def _record(name):
+            order.append(name)
+
+        async def _event_loop():
+            order.append("event_loop")
+            raise ConnectionError("stop the loop")
+
+        service.register_terminal("tid1", "pane-1")
+        with (
+            patch.object(service, "_connect", lambda: _record("connect")),
+            patch.object(service, "_reconcile", lambda: _record("reconcile")),
+            patch.object(service, "_subscribe_all_events", lambda: _record("subscribe")),
+            # create=True so a service that lost the sweep entirely fails on the
+            # ORDER assertion (missing "sweep") rather than on a patch error.
+            patch.object(service, "_deliver_settled_panes", lambda: _record("sweep"), create=True),
+            patch.object(service, "_event_loop", _event_loop),
+            patch("asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                _run_async(service._socket_loop())
+
+        assert order == ["connect", "subscribe", "reconcile", "sweep", "event_loop"]
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_settled_pane_is_delivered_without_an_event(self, mock_snap):
+        """A managed pane already idle at subscribe time is delivered (#755).
+
+        The broadcast subscription reports transitions only, so this pane emits
+        no further event and the sweep is the only thing that can deliver.
+        """
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock", delivery_callback=delivered.append
+        )
+        service.register_terminal("tid1", "pane-1")
+        service.register_terminal("tid2", "pane-2")
+        service._working_since["tid1"] = time.time()
+
+        mock_snap.return_value = {
+            "panes": [
+                {"pane_id": "pane-1", "agent_status": "idle"},
+                {"pane_id": "pane-2", "agent_status": "done"},
+            ]
+        }
+
+        _run_async(service._deliver_settled_panes())
+
+        assert sorted(delivered) == ["tid1", "tid2"]
+        # The working latch is cleared, same as the live-event path.
+        assert "tid1" not in service._working_since
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_settled_sweep_skips_unmanaged_and_working_panes(self, mock_snap):
+        """Only managed panes in idle/done are delivered."""
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock", delivery_callback=delivered.append
+        )
+        service.register_terminal("tid1", "pane-1")
+
+        mock_snap.return_value = {
+            "panes": [
+                {"pane_id": "pane-1", "agent_status": "working"},
+                {"pane_id": "pane-unmanaged", "agent_status": "idle"},
+                {"pane_id": "pane-1", "agent_status": "unknown"},
+                "not-a-dict",
+                {"agent_status": "idle"},
+            ]
+        }
+
+        _run_async(service._deliver_settled_panes())
+
+        assert delivered == []
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_settled_sweep_survives_null_panes(self, mock_snap):
+        """A snapshot with an explicit `"panes": null` must not raise.
+
+        `.get("panes", [])` only falls back to `[]` when the key is absent, not
+        when it is present with value None, so a bare `.get` here would raise
+        a TypeError that escapes the narrow except in _socket_loop and
+        permanently kills the inbox task.
+        """
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock", delivery_callback=delivered.append
+        )
+        service.register_terminal("tid1", "pane-1")
+        mock_snap.return_value = {"panes": None}
+
+        _run_async(service._deliver_settled_panes())
+
+        assert delivered == []
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_settled_sweep_survives_snapshot_failure(self, mock_snap):
+        """A failed snapshot degrades to a no-op, never an exception.
+
+        _socket_loop would otherwise treat it as a disconnect and back off.
+        """
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock", delivery_callback=delivered.append
+        )
+        service.register_terminal("tid1", "pane-1")
+        mock_snap.return_value = None
+
+        _run_async(service._deliver_settled_panes())
+
+        assert delivered == []
 
     @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
@@ -473,7 +590,7 @@ class TestHerdrInboxServiceReconcile:
         assert "pane-live" in service._pane_to_terminal
         assert "tid1" in service._terminal_to_pane
         # DB record for stale terminal deleted
-        mock_delete.assert_called_once_with("tid2")
+        mock_delete.assert_called_once_with("tid2", end_reason="pane_closed")
 
     @patch.object(HerdrInboxService, "_fetch_snapshot")
     def test_reconcile_no_op_when_all_panes_live(self, mock_snap):
@@ -531,7 +648,7 @@ class TestHerdrInboxServiceReconcile:
         _run_async(service._reconcile())
 
         # Only the ghost terminal should be deleted
-        mock_delete.assert_called_once_with("tid-ghost")
+        mock_delete.assert_called_once_with("tid-ghost", end_reason="pane_closed")
 
     @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
@@ -694,6 +811,19 @@ class TestHerdrInboxServiceReconcile:
         # Must not raise; w1:p1 is live so nothing pruned.
         _run_async(service._reconcile())
         assert service._pane_to_terminal == {"w1:p1": "tid1"}
+
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconcile_survives_null_panes(self, mock_snap, mock_list):
+        """`"panes": null` must not raise (which would escape _reconcile and
+        kill the socket loop, same hazard as a missing pane_id)."""
+        mock_list.return_value = []
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_snap.return_value = {"panes": None, "workspaces": [], "tabs": []}
+
+        # Must not raise.
+        _run_async(service._reconcile())
+        assert service._pane_to_terminal == {}
 
 
 class TestHerdrInboxSnapshot:
@@ -876,7 +1006,7 @@ class TestHerdrInboxServiceStartupDbCleanup:
 
         _run_async(service._startup_db_cleanup())
 
-        mock_delete.assert_called_once_with("tid-ghost")
+        mock_delete.assert_called_once_with("tid-ghost", end_reason="pane_closed")
 
     @patch("cli_agent_orchestrator.clients.database.list_all_terminals", return_value=[])
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
@@ -1059,8 +1189,8 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         assert service._cleanup_closed_session("cao-reused") is True
 
-        mock_delete.assert_called_once_with("old00001")
-        assert call("new00001") not in mock_delete.call_args_list
+        mock_delete.assert_called_once_with("old00001", end_reason="pane_closed")
+        assert call("new00001", end_reason="pane_closed") not in mock_delete.call_args_list
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
@@ -1126,6 +1256,22 @@ class TestHerdrInboxServiceLifecycleEvents:
         service.register_terminal("tid-dead", "pane-a")
         mock_meta.side_effect = RuntimeError("database is locked")
         mock_snapshot.return_value = {"panes": [], "workspaces": [], "tabs": []}
+        mock_retain.return_value = True
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-a"})
+
+        assert "tid-dead" not in service._terminal_to_pane
+        mock_retain.assert_called_once_with("tid-dead", on_cleanup_deferred=ANY)
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_pane_closed_db_outage_survives_null_panes(self, mock_meta, mock_snapshot, mock_retain):
+        """A snapshot with `"panes": null` during a DB outage must not raise."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-dead", "pane-a")
+        mock_meta.side_effect = RuntimeError("database is locked")
+        mock_snapshot.return_value = {"panes": None, "workspaces": [], "tabs": []}
         mock_retain.return_value = True
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-a"})
@@ -1297,7 +1443,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "tid1" not in service._terminal_to_pane
         assert "tid1" not in service._kiro_terminals
         assert "tid1" not in service._working_since
-        mock_delete.assert_called_once_with("tid1")
+        mock_delete.assert_called_once_with("tid1", end_reason="pane_closed")
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
@@ -1385,7 +1531,7 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-3"})
 
-        mock_delete.assert_called_once_with("9d00610c")
+        mock_delete.assert_called_once_with("9d00610c", end_reason="pane_closed")
         assert "pane-3" not in service._pane_to_terminal
         assert "9d00610c" not in service._terminal_to_pane
 
@@ -1429,7 +1575,7 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-retained"})
 
-        mock_teardown.assert_called_once_with("retained-grok")
+        mock_teardown.assert_called_once_with("retained-grok", end_reason="pane_closed")
         mock_database_delete.assert_not_called()
 
     @patch.object(HerdrInboxService, "_label_still_live", return_value=False)
@@ -1500,7 +1646,10 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "ws-abc" not in service._workspace_to_session
         # Each persisted terminal goes through the normal provider-aware
         # teardown rather than a bulk DB delete.
-        assert mock_delete_terminal.call_args_list == [call("tid1"), call("tid2")]
+        assert mock_delete_terminal.call_args_list == [
+            call("tid1", end_reason="pane_closed"),
+            call("tid2", end_reason="pane_closed"),
+        ]
 
     @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
     def test_workspace_closed_unknown_workspace_is_noop(self, mock_delete):
@@ -1609,7 +1758,7 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         assert "pane-x" not in service._pane_to_terminal
         assert "tid-x" not in service._terminal_to_pane
-        mock_delete.assert_called_once_with("tid-x")
+        mock_delete.assert_called_once_with("tid-x", end_reason="pane_closed")
 
     def test_event_loop_agent_status_real_shape_delivers(self):
         """A real-shape broadcast pane_updated (event key, nested data.pane) triggers delivery."""
@@ -1732,7 +1881,7 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
         _run_async(service._reconcile())
 
         # Genuinely-closed terminal is cleaned up.
-        mock_delete.assert_called_once_with("tid1")
+        mock_delete.assert_called_once_with("tid1", end_reason="pane_closed")
         assert "pane-old" not in service._pane_to_terminal
         assert "tid1" not in service._terminal_to_pane
         assert "tid1" not in service._working_since
@@ -1820,7 +1969,7 @@ class TestHerdrInboxServiceWorkspaceClosedLiveResolution:
         service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-new"})
 
         # Resolved live -> persisted terminal gets provider-aware teardown.
-        mock_delete_terminal.assert_called_once_with("tid1")
+        mock_delete_terminal.assert_called_once_with("tid1", end_reason="pane_closed")
         # Map pruned for the closed session's terminal.
         assert "p-1" not in service._pane_to_terminal
         assert "tid1" not in service._terminal_to_pane

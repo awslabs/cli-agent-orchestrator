@@ -149,7 +149,7 @@ status view and the documentation cannot drift.
 9. **`secret_detected` is the one refusal driven by a heuristic rather than a parse
    result, and that changes what the row has to promise.** Every other refusal in this table
    is decidable: a symlink either is one or is not, YAML either parses or does not.
-   `scan_for_secrets` is an ordered deny-list of six regexes, one of which is
+   `scan_for_secrets` is an ordered deny-list of twelve regexes (`aws_access_key`, `aws_secret_access_key`, `pem_private_key`, `anthropic_api_key`, `openai_api_key`, `github_fine_grained_pat`, `github_pat`, `gitlab_pat`, `slack_token`, `jwt`, `bearer_token`, `secret_assignment`; six when this was written), one of which is
    `(?i)(?:password|passwd|secret|pwd)\s*[:=]\s*\S{6,}` — so a runbook quoting
    `password: hunter2` as an example, or a design note about credential handling, matches.
    **In a knowledge vault that is ordinary content, not a mistake, and it is the concrete
@@ -183,7 +183,7 @@ status view and the documentation cannot drift.
    - **Per-pattern confidence policy** — always quarantine on the high-confidence patterns
      (`aws_access_key`, `pem_private_key`) and warn-only on the loose `password:` regex.
      The most precise answer and **the natural future refinement**, explicitly deferred
-     rather than dismissed. It requires classifying all six patterns by confidence and then
+     rather than dismissed. It requires classifying all twelve patterns by confidence and then
      maintaining that classification, which makes the classification itself a
      security-relevant review surface — a cost worth paying later, with evidence about
      which patterns actually misfire, and not worth guessing at now.

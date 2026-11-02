@@ -26,14 +26,18 @@ verifies, then everything is cleaned up.
 
 ## What the run plane returns
 
-A successful connection produces this frame sequence:
+A successful run produces this frame sequence, and the body ends after the
+last frame:
 
 ```
 RUN_STARTED        -> echo threadId/runId
 STATE_SNAPSHOT     -> current fleet state
-[live frames...]   -> STATE_DELTA, STEP_STARTED/FINISHED, TOOL_CALL_*, CUSTOM
 RUN_FINISHED       -> outcome: {type: "success"} or {type: "interrupt", ...}
 ```
+
+The run plane does not stream live fleet frames (`STATE_DELTA`,
+`STEP_STARTED/FINISHED`, `TOOL_CALL_*`, `CUSTOM`). Those are on the ambient
+plane, `GET /agui/v1/stream`.
 
 ## Stock client code (minimal — `client.mjs`)
 
@@ -49,3 +53,7 @@ agent
 The `@ag-ui/client` version is pinned in `package.json`; `run.sh` installs it on
 first run. Because the client is solely `@ag-ui/*` packages, a passing run proves
 the run plane is stock-AG-UI-protocol compliant.
+
+`package.json` also overrides `zod` to `^4.6.6`. The pinned `@ag-ui/*` packages
+ask for zod 3, and zod 3 has no fix for CVE-2023-54404. The `@ag-ui/*` code does
+not change, and the client still parses every frame with the SDK event schemas.

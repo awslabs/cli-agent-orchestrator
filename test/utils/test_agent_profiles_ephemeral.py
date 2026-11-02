@@ -13,6 +13,9 @@ DOCUMENT = f"---\nname: {NAME}\ndescription: test\nprovider: claude_code\n---\nT
 
 @pytest.fixture
 def stores(tmp_path, monkeypatch):
+    import hashlib
+
+    from cli_agent_orchestrator.clients import database
     from cli_agent_orchestrator.services import settings_service
 
     local = tmp_path / "installed"
@@ -24,6 +27,13 @@ def stores(tmp_path, monkeypatch):
     monkeypatch.setattr(settings_service, "get_agent_dirs", lambda: {})
     monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [])
     monkeypatch.setattr(settings_service, "get_disabled_agent_dirs", lambda: [])
+    monkeypatch.setattr(
+        database,
+        "get_ephemeral_agent",
+        lambda name: {
+            "profile_sha256": hashlib.sha256((live / (name + ".md")).read_bytes()).hexdigest()
+        },
+    )
     return local, live
 
 
@@ -353,3 +363,54 @@ def test_nonregular_live_profile_refuses_without_blocking(stores, shape):
     worker.join(timeout=2)
     assert completed, "live profile read blocked on FIFO"
     assert len(errors) == 1
+
+
+@pytest.mark.parametrize(
+    "row",
+    [None, {}, {"profile_sha256": None}, {"profile_sha256": ""}, {"profile_sha256": "0" * 64}],
+)
+def test_live_profile_without_matching_registry_hash_fails_closed(stores, monkeypatch, row):
+    from cli_agent_orchestrator.clients import database
+
+    (stores[1] / (NAME + ".md")).write_text(DOCUMENT)
+    monkeypatch.setattr(database, "get_ephemeral_agent", lambda _: row)
+    parse = Mock(side_effect=AssertionError("unverified bytes must not be parsed"))
+    monkeypatch.setattr(profiles, "parse_agent_profile_text", parse)
+    with pytest.raises(profiles.EphemeralProfileUnavailable):
+        profiles.load_launch_profile(NAME)
+    parse.assert_not_called()
+
+
+def test_loader_parses_verified_snapshot_without_second_read(stores, monkeypatch):
+    import hashlib
+
+    from cli_agent_orchestrator.clients import database
+
+    path = stores[1] / (NAME + ".md")
+    original = DOCUMENT.encode()
+    path.write_bytes(original)
+
+    def lookup(name):
+        assert name == NAME
+        path.write_bytes(original.replace(b"Task.", b"Unverified replacement."))
+        return {"profile_sha256": hashlib.sha256(original).hexdigest()}
+
+    monkeypatch.setattr(database, "get_ephemeral_agent", lookup)
+    assert profiles.load_launch_profile(NAME)[0].system_prompt == "Task."
+
+
+def test_namespace_matcher_imports_without_state_clients():
+    """MCP name routing must be usable without importing state clients."""
+    import subprocess
+    import sys
+
+    script = """
+import sys
+from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_store
+assert routes_to_ephemeral_store('Ramones-log_triage-3f9a')
+assert not routes_to_ephemeral_store('ordinary')
+assert not any(name.startswith(('cli_agent_orchestrator.clients.database',
+                                'cli_agent_orchestrator.clients.tmux'))
+               for name in sys.modules)
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)

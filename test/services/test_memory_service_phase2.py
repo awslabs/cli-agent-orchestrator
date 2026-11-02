@@ -4,7 +4,6 @@ Tests create a per-test SQLite DB via db_engine fixture.
 """
 
 import asyncio
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest

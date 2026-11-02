@@ -43,7 +43,7 @@ describe('ErrorBoundary', () => {
 
   afterAll(() => consoleSpy.mockRestore())
 
-  function ThrowingComponent(): JSX.Element {
+  function ThrowingComponent(): React.JSX.Element {
     throw new Error('Test error')
   }
 

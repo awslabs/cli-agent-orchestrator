@@ -22,13 +22,18 @@ from cli_agent_orchestrator.utils.forwarded_env import (
     ForwardedEnvError,
     validate_forwarded_env,
 )
+from cli_agent_orchestrator.utils.init_allowance import synchronous_create_timeout
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 JsonDict = Dict[str, Any]
 
-# (connect, read) seconds for every call to the CAO API server. The server is
-# localhost-only, so a slow connect means something is wrong rather than far
-# away; the read budget is generous because launching a session is not instant.
+# (connect, read) seconds for every call to the CAO API server that it answers
+# without waiting on provider init. The server is localhost-only, so a slow
+# connect means something is wrong rather than far away; the read budget is
+# generous so a busy server is not misreported as a dead one. The ONE call the
+# server answers only after ``provider.initialize()`` -- ``POST /sessions``
+# without ``initial_message`` -- is sized separately, from
+# ``provider_init_timeout`` (issue #710); see ``_launch_session_impl``.
 _HTTP_TIMEOUT = (5, 300)
 
 mcp = FastMCP(
@@ -97,6 +102,7 @@ def _request_json(
     params: Optional[Dict[str, Any]] = None,
     json: Optional[Any] = None,
     operation: str,
+    timeout: tuple[float, float] = _HTTP_TIMEOUT,
 ) -> tuple[Optional[Any], Optional[str]]:
     """Execute an API request and return either JSON data or an error message.
 
@@ -104,6 +110,10 @@ def _request_json(
     operation-named string to the calling agent rather than a traceback, a hang,
     or a silently empty result. That contract is what the packaged ``cao-ops``
     Agent Plugin depends on when the operator's ``cao-server`` is not running.
+
+    ``timeout`` defaults to ``_HTTP_TIMEOUT``, right for every call the server
+    answers promptly. A caller whose request the server holds through provider
+    init passes ``synchronous_create_timeout(...)`` instead (issue #710).
     """
     # Surface an actionable misconfiguration instead of letting a bare 401 leak
     # out of the API boundary (see security/auth.local_auth_misconfig_error).
@@ -124,7 +134,7 @@ def _request_json(
             # this covers the rest (a dropped packet, a wedged listener). A
             # timeout is a `requests.RequestException`, so it flows through the
             # same handler below and produces the identical structured error.
-            timeout=_HTTP_TIMEOUT,
+            timeout=timeout,
         )
     except requests.RequestException as exc:
         return None, f"{operation} failed: {exc}"
@@ -337,8 +347,22 @@ async def _launch_session_impl(
     if not session_name:
         body = {**(body or {}), "description": None}
 
+    # Two latency regimes behind one POST (issue #710). With ``initial_message``
+    # in the body cao-server defers provider init and answers at once, so the
+    # ordinary budget applies. Without it the server holds the response until
+    # ``provider.initialize()`` returns, and the budget has to come from the
+    # ``provider_init_timeout`` the server is itself waiting out -- a flat 300s
+    # read was below a successful Antigravity init (370s at stock settings).
+    create_timeout = (
+        _HTTP_TIMEOUT if initial_message is not None else synchronous_create_timeout(agent_profile)
+    )
     session_data, error = _request_json(
-        "post", "/sessions", params=params, json=body, operation="Launch session"
+        "post",
+        "/sessions",
+        params=params,
+        json=body,
+        operation="Launch session",
+        timeout=create_timeout,
     )
     if error:
         return LaunchResult(

@@ -59,6 +59,18 @@ reuse do not overwrite it. Operators can edit it in Home or Agents. See the
 [canonical description contract](api.md#terminal-descriptions) for normalization,
 omission versus `null`, editing, and idempotency.
 
+`cao agent assign`, `cao agent handoff` and `cao agent send-message` take the
+task text as a positional argument or, for anything longer than a shell argument
+comfortably holds, from `--message-file PATH` (`-` reads stdin). The file is read
+as UTF-8 and exactly one trailing newline is dropped, so a file written by an
+editor sends the same text as the quoted argument would. The two forms are
+mutually exclusive, and one is required:
+
+```bash
+cao agent handoff reviewer --message-file review-task.md --json
+git diff | cao agent send-message --message-file - --to "$SUPERVISOR_TERMINAL_ID"
+```
+
 ## Remote fleets
 
 `cao fleet` and `cao worker` manage agents that are not on this machine. Every

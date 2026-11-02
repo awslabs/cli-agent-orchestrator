@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,8 +18,24 @@ from fastmcp.server.auth import require_scopes
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token
 from simulation import Identifier, World
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse
+
+VIEWER_HTML = Path(__file__).resolve().parent / "viewer.html"
 
 LOGGER = logging.getLogger("transport")
+
+
+def allowed_hosts() -> list[str] | None:
+    """Extra Host names the controller accepts, from TRANSPORT_ALLOWED_HOSTS.
+
+    The controller accepts only the loopback names (127.0.0.1, localhost, ::1)
+    in the Host header, so that a web page cannot use DNS rebinding to read the
+    live view. A port forward that rewrites Host to its own name needs that name
+    here, for example TRANSPORT_ALLOWED_HOSTS='*.cloudfront.net'.
+    """
+    names = [name.strip() for name in os.environ.get("TRANSPORT_ALLOWED_HOSTS", "").split(",")]
+    return [name for name in names if name] or None
 
 
 def save_snapshot(path: Path, state: dict) -> None:
@@ -80,6 +97,19 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         auth=StaticTokenVerifier(tokens, required_scopes=["observe"]),
         lifespan=lifespan,
     )
+
+    # Read-only live view, served on the same 127.0.0.1 controller.
+    # It exposes only observe() - the measured poses, custody, and command
+    # history that any observe-scoped agent already sees - never a credential.
+    # Loopback-bound, so it is reachable only from this machine (in the
+    # workshop, through the Code Editor's own port forwarding).
+    @server.custom_route("/", methods=["GET"], include_in_schema=False)
+    async def viewer(_request: Request) -> HTMLResponse:
+        return HTMLResponse(VIEWER_HTML.read_text(encoding="utf-8"))
+
+    @server.custom_route("/state", methods=["GET"], include_in_schema=False)
+    async def state(_request: Request) -> JSONResponse:
+        return JSONResponse(world.observe())
 
     def zone() -> str:
         token = get_access_token()

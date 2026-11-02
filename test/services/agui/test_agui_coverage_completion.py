@@ -238,7 +238,7 @@ async def test_handoff_edit_too_long_rejected():
     )
 
     c = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
-    it = c.on_provider_waiting("t1", "claude_code", "\u2191/\u2193 to navigate")
+    it = c.on_provider_waiting("t1", "kiro_cli", "Allow this action? [y/n/t]:")
     with pytest.raises(ValueError):
         await c.resume(interrupt_id=it.id, decision=ApprovalDecision.EDIT, edited_text="x" * 4001)
 
@@ -325,7 +325,7 @@ async def test_run_plane_resume_failure_emits_run_error():
     from cli_agent_orchestrator.services.agui.handoff_approval import AgentHandoffWithApproval
 
     c = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
-    it = c.on_provider_waiting("t1", "claude_code", "\u2191/\u2193 to navigate", session_name="s")
+    it = c.on_provider_waiting("t1", "kiro_cli", "Allow this action? [y/n/t]:", session_name="s")
     # editedArgs → decision "edit" but empty text → construct.resume raises →
     # run plane emits RUN_ERROR.
     frames = await _collect(

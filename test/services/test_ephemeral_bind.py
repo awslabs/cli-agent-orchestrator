@@ -582,7 +582,7 @@ async def test_deferred_provider_cleanup_waits_for_delete(release_runtime, monke
     )
     assert database.get_ephemeral_agent(name)["state"] == "launched"
     monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda _: True)
-    assert terminal_service.delete_terminal(CHILD)
+    assert terminal_service.delete_terminal(CHILD, end_reason="deleted")
     assert_released(env, name, "terminal_deleted")
 
 
@@ -1071,5 +1071,65 @@ def test_ordinary_delete_never_opens_ephemeral_write_transaction(release_runtime
     database.create_terminal(ordinary, "cao-session", "ordinary", "claude_code")
     transaction = Mock(side_effect=AssertionError("ordinary deletion must not take write lock"))
     monkeypatch.setattr(env[0], "_transaction", transaction)
-    assert terminal_service.delete_terminal_row(ordinary, None) is True
+    assert terminal_service.delete_terminal_row(ordinary, None, end_reason="deleted") is True
     transaction.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_claim", [False, True])
+async def test_modified_profile_refused_before_allocation(runtime_store, with_claim):
+    env, name, backend, factory = runtime_store
+    token = claim(env, name)["claim_id"] if with_claim else None
+    path = env[2] / "ephemeral/live" / (name + ".md")
+    path.write_bytes(path.read_bytes() + b"\nUnverified instructions.\n")
+    with pytest.raises(env[0].EphemeralPolicyError) as exc:
+        await terminal_service.create_terminal(
+            "claude_code", name, session_name="cao-session", caller_id=CALLER, claim_id=token
+        )
+    assert exc.value.rule == "spec_unavailable"
+    assert database.get_ephemeral_agent(name)["state"] == "pending"
+    factory.assert_not_called()
+    backend.create_window.assert_not_called()
+    assert database.get_terminal_metadata(CHILD) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
+async def test_launch_omits_catalog_but_named_skill_load_remains(
+    runtime_store, monkeypatch, tmp_path, provider_name
+):
+    from cli_agent_orchestrator.mcp_server import server
+    from cli_agent_orchestrator.utils import skills
+
+    env, name, backend, factory = runtime_store
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    row_update(env, name, provider=provider_name)
+    root = tmp_path / "skills"
+    folder = root / "example"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text(
+        "---\nname: example\ndescription: Test skill\n---\nNamed skill content."
+    )
+    monkeypatch.setattr(skills, "SKILLS_DIR", root)
+    monkeypatch.setattr(skills, "_skill_search_dirs", lambda: [root])
+    assert "## Available Skills" in skills.build_skill_catalog()
+    monkeypatch.setattr(terminal_service, "build_skill_catalog", skills.build_skill_catalog)
+    await terminal_service.create_terminal(
+        provider_name, name, session_name="cao-session", caller_id=CALLER
+    )
+    assert not factory.call_args.kwargs["skill_prompt"]
+    # Exercise the MCP client and real API handler without a socket or server.
+    from cli_agent_orchestrator.api.main import app
+
+    client = TestClient(app, base_url="http://localhost")
+    monkeypatch.setattr(
+        server.requests, "get", lambda *args, **kwargs: client.get("/skills/example")
+    )
+    monkeypatch.setenv("CAO_TERMINAL_ID", CHILD)
+    monkeypatch.setattr(
+        server,
+        "_get_terminal_context_from_env",
+        lambda: {"ephemeral": True, "allowed_tools": ["@cao-mcp-server"]},
+    )
+    assert server._tool_denied_reason("load_skill") is None
+    assert await server.load_skill("example") == "Named skill content."
