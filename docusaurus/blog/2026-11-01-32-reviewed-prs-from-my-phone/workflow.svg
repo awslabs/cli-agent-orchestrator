@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="460" viewBox="0 0 1000 460" role="img" aria-labelledby="title desc">
+  <title id="title">CAO at home, approvals on the phone</title>
+  <desc id="desc">The Mac runs CAO, herdr, and the conductor agent. herdr-push streams events to a relay, which runs a Telegram bot that carries notifications and one-tap approvals to the phone.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#047857"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: 1.5px; fill: #64748b; }
+      .box-title { font-size: 16px; font-weight: 700; fill: #0f172a; }
+      .box-copy { font-size: 13px; font-weight: 450; fill: #475569; }
+      .label { font-size: 12px; font-weight: 700; fill: #1d4ed8; }
+      .label-green { font-size: 12px; font-weight: 700; fill: #047857; }
+    </style>
+  </defs>
+
+  <rect width="1000" height="460" fill="#ffffff"/>
+  <text class="eyebrow" x="40" y="36">AT HOME, THEN ON THE PHONE</text>
+
+  <!-- Home machine -->
+  <rect x="40" y="70" width="400" height="330" rx="20" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+  <text class="box-title" x="64" y="104">Home: the Mac</text>
+
+  <rect x="64" y="128" width="352" height="64" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text class="box-title" x="84" y="154">CAO + herdr</text>
+  <text class="box-copy" x="84" y="174">one conductor agent, plus its workers</text>
+
+  <rect x="64" y="208" width="352" height="64" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text class="box-title" x="84" y="234">herdr-push (plugin)</text>
+  <text class="box-copy" x="84" y="254">streams agent events, no public IP needed</text>
+
+  <rect x="64" y="288" width="352" height="64" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text class="box-title" x="84" y="314">Relay + Telegram bot</text>
+  <text class="box-copy" x="84" y="334">outbound-only connection to Telegram</text>
+
+  <path d="M240 192V208" fill="none" stroke="#94a3b8" stroke-width="2"/>
+  <path d="M240 272V288" fill="none" stroke="#94a3b8" stroke-width="2"/>
+
+  <!-- Phone -->
+  <rect x="700" y="130" width="220" height="270" rx="28" fill="#eff6ff" stroke="#2563eb" stroke-width="3"/>
+  <rect x="724" y="160" width="172" height="210" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text class="box-title" x="810" y="190" text-anchor="middle">Phone</text>
+  <text class="box-copy" x="810" y="214" text-anchor="middle">"Push PR 2a?"</text>
+  <rect x="744" y="232" width="60" height="30" rx="8" fill="#047857"/>
+  <text x="774" y="252" text-anchor="middle" font-size="13" font-weight="700" fill="#ffffff">Yes</text>
+  <rect x="816" y="232" width="60" height="30" rx="8" fill="#e2e8f0"/>
+  <text x="846" y="252" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">No</text>
+  <text class="box-copy" x="810" y="296" text-anchor="middle">one question,</text>
+  <text class="box-copy" x="810" y="314" text-anchor="middle">one tap</text>
+
+  <!-- Arrows between relay and phone -->
+  <path d="M416 320C520 320 560 220 700 220" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#arrow)"/>
+  <text class="label" x="520" y="200">notify / ask</text>
+
+  <path d="M700 290C560 290 520 360 416 360" fill="none" stroke="#047857" stroke-width="3" marker-end="url(#arrow-green)"/>
+  <text class="label-green" x="520" y="384">approve</text>
+</svg>

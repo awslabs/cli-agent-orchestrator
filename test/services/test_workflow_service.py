@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.models.workflow import (
     InputDecl,
@@ -154,7 +155,7 @@ async def test_workflow_step_forwards_explicit_engine(monkeypatch):
 
     await ws.start_run(spec, {}, "engine-run")
 
-    assert mock.await_args.kwargs["engine"] == "kas"
+    assert mock.await_args.kwargs["engine"] is KiroEngine.V3
 
 
 @pytest.mark.asyncio
