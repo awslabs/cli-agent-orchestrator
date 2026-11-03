@@ -353,13 +353,14 @@ async def run_plane_stream(
                 finished = True
                 return
 
-            if answered.outcome == "expired":
+            if answered.outcome == "expired" and entry.status != "cancelled":
                 # The interrupt was pending when checked above, but expired while
                 # its delivery was queued behind a sibling delivery on the same
                 # terminal (a status flap can expire one interrupt and open the
                 # next while the first is still being typed). Expiry won with zero
                 # keystrokes, so this answer was not used: warn and list it, the
-                # same as an answer that arrived after expiry.
+                # same as an answer that arrived after expiry. Abandoning it
+                # (status "cancelled") stays quiet, as it does in the pre-check.
                 logger.warning(
                     "run_plane: ignoring resume entry for expired interrupt %s; "
                     "an expired interrupt can no longer be answered",
