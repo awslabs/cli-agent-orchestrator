@@ -8,8 +8,10 @@ guard is the always-on half, and it does not rely on anyone remembering to
 list a new pattern:
 
 * every regex in the modules below is DISCOVERED: module-level and class-level
-  ``re.Pattern`` objects and constant-named strings that compile, plus the
-  ``*_pattern``/``*_re`` attributes a provider builds per instance;
+  ``re.Pattern`` objects and constant-named strings that compile, the same two
+  kinds one level inside a module- or class-level tuple, list or dict (the v3
+  option rows, held in tuples), plus the ``*_pattern``/``*_re`` attributes a
+  provider builds per instance;
 * a discovered pattern that is in ``REGISTRY`` is checked in the mode its
   callers use (``structural_issues``), and its backtracking steps must grow
   linearly on inputs generated from its own structure;
@@ -88,6 +90,17 @@ REGISTRY: dict[str, tuple[str, int]] = {
     "kiro_cli.KiroCliProvider()._new_tui_header_pattern": ("search", 0),
     "kiro_cli._V3_APPROVAL_TITLE": ("search", 0),
     "kiro_cli._V3_TRUST_DECLINED": ("search", 0),
+    # The v3 dialogs' option rows (note 1 of haofeif's review): held in
+    # module-level tuples, applied one line at a time with .match by
+    # _options_follow (kiro_cli.py:_options_follow).
+    "kiro_cli._V3_APPROVAL_OPTIONS[0]": ("match", 0),
+    "kiro_cli._V3_APPROVAL_OPTIONS[1]": ("match", 0),
+    "kiro_cli._V3_APPROVAL_OPTIONS[2]": ("match", 0),
+    "kiro_cli._V3_TRUST_OPTIONS[0]": ("match", 0),
+    "kiro_cli._V3_TRUST_OPTIONS[1]": ("match", 0),
+    "kiro_cli._V3_UPSELL_OPTIONS[0]": ("match", 0),
+    "kiro_cli._V3_UPSELL_OPTIONS[1]": ("match", 0),
+    "kiro_cli._V3_UPSELL_OPTIONS[2]": ("match", 0),
 }
 
 _FRAGMENT = "A fragment, never applied on its own: it is spliced into {}, which is registered."
@@ -157,9 +170,19 @@ def _discover() -> dict[str, Regex]:
     """Every regex in MODULES, by name, as it is defined (a string or a compiled pattern)."""
     found: dict[str, Regex] = {}
 
-    def take(name: str, value: object, named_like_a_regex: bool) -> None:
+    def take(
+        name: str, value: object, named_like_a_regex: bool, open_containers: bool = False
+    ) -> None:
         if isinstance(value, re.Pattern) or (named_like_a_regex and _is_regex(value)):
             found[name] = value  # type: ignore[assignment]
+        elif named_like_a_regex and open_containers and isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                if _is_regex(item):
+                    found[f"{name}[{index}]"] = item  # type: ignore[assignment]
+        elif named_like_a_regex and open_containers and isinstance(value, dict):
+            for key, item in value.items():
+                if _is_regex(item):
+                    found[f"{name}[{key!r}]"] = item  # type: ignore[assignment]
 
     for module_path, instance_spec in MODULES.items():
         module = importlib.import_module(f"cli_agent_orchestrator.{module_path}")
@@ -167,9 +190,19 @@ def _discover() -> dict[str, Regex]:
         for name, value in vars(module).items():
             if inspect.isclass(value) and value.__module__ == module.__name__:
                 for attr, attr_value in vars(value).items():
-                    take(f"{module_name}.{name}.{attr}", attr_value, bool(_CONSTANT.match(attr)))
+                    take(
+                        f"{module_name}.{name}.{attr}",
+                        attr_value,
+                        bool(_CONSTANT.match(attr)),
+                        open_containers=True,
+                    )
             else:
-                take(f"{module_name}.{name}", value, bool(_CONSTANT.match(name)))
+                take(
+                    f"{module_name}.{name}",
+                    value,
+                    bool(_CONSTANT.match(name)),
+                    open_containers=True,
+                )
         if instance_spec is None:
             continue
         class_name, args = instance_spec
@@ -251,3 +284,24 @@ def test_discovery_sees_every_kind_of_pattern():
         assert name in DISCOVERED, f"{name} not discovered"
     modules = {path.rsplit(".", 1)[-1] for path in MODULES}
     assert {name.split(".", 1)[0] for name in pinned} == modules, "pin a name for every module"
+
+
+def test_discovery_opens_module_level_tuples():
+    """The v3 dialogs' option rows sit in tuples; discovery must open them (review note 1).
+
+    Before this, ``_V3_APPROVAL_OPTIONS``, ``_V3_TRUST_OPTIONS`` and
+    ``_V3_UPSELL_OPTIONS`` were invisible to the guard: a slow pattern added
+    inside one of them would pass unnoticed.
+    """
+    names = (
+        "kiro_cli._V3_APPROVAL_OPTIONS[0]",
+        "kiro_cli._V3_APPROVAL_OPTIONS[1]",
+        "kiro_cli._V3_APPROVAL_OPTIONS[2]",
+        "kiro_cli._V3_TRUST_OPTIONS[0]",
+        "kiro_cli._V3_TRUST_OPTIONS[1]",
+        "kiro_cli._V3_UPSELL_OPTIONS[0]",
+        "kiro_cli._V3_UPSELL_OPTIONS[1]",
+        "kiro_cli._V3_UPSELL_OPTIONS[2]",
+    )
+    for name in names:
+        assert name in DISCOVERED, f"{name} not discovered"

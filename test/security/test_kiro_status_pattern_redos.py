@@ -94,6 +94,15 @@ class TestLegacyPermissionPrompt:
         assert spans == _old_permission_spans(clean)
         assert spans, "fixture holds a permission prompt; the scan must find it"
 
+    def test_second_question_inside_an_open_prompt_adds_no_span(self):
+        # A scan that resumed at `start + 1` instead of `end` would restart
+        # inside the first prompt's own text, treat its embedded "Allow this
+        # action?" as a second question, and report an extra span starting
+        # there (21, 61) even though the first prompt already consumed it.
+        text = "Allow this action? [ Allow this action? y/n/t]: done\n[y/n/t]: x"
+        assert _old_permission_spans(text) == [(0, 47)]
+        assert kiro_cli._legacy_permission_prompt_spans(text) == [(0, 47)]
+
 
 class TestTuiInitializing:
     def test_current_form_is_clean(self):
