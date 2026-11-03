@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 import pytest
 
@@ -171,6 +172,37 @@ def test_a_directory_named_like_markdown_is_404(client, root):
     _run("r9", {"report": str(root / "dir.md")})
 
     assert client.get("/workflows/runs/r9/artifacts/report").status_code == 404
+
+
+def test_a_fifo_named_like_markdown_is_404_without_blocking(client, root):
+    fifo = root / "pipe.md"
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs unavailable on this platform")
+    os.mkfifo(fifo)
+    _run("r12", {"report": str(fifo)})
+
+    # If the read blocked on open, this writer would be what released it: so the
+    # test fails instead of hanging, and the failure says why.
+    rescued = threading.Event()
+
+    def _rescue() -> None:
+        try:
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            rescued.set()
+        except OSError:  # ENXIO: no reader waiting, so nothing blocked.
+            pass
+
+    timer = threading.Timer(5.0, _rescue)
+    timer.start()
+    try:
+        response = client.get("/workflows/runs/r12/artifacts/report")
+    finally:
+        timer.cancel()
+
+    assert not rescued.is_set(), "opening the FIFO blocked until a writer appeared"
+    assert response.status_code == 404
+    listing = client.get("/workflows/runs/r12/artifacts").json()["artifacts"]
+    assert listing == [{"input": "report", "path": str(fifo), "available": False, "size": None}]
 
 
 def test_an_oversized_report_is_refused_not_truncated(client, root, monkeypatch):

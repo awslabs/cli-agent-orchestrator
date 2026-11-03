@@ -8393,7 +8393,11 @@ async def get_workflow_run_artifact_endpoint(
 
     def _read() -> Dict[str, Any]:
         try:
-            fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            # O_NONBLOCK so a FIFO named like a report opens at once instead of blocking
+            # this worker thread until a writer appears; the fstat check then refuses it.
+            # It changes nothing for a regular file.
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            fd = os.open(resolved, flags)
         except FileNotFoundError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such report file")
         except OSError:
