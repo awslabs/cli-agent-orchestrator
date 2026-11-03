@@ -232,3 +232,46 @@ class TestTheBumpPassesThePublishCheck:
         for rel, text in originals.items():
             assert (tree / rel).read_text("utf-8") == text, rel
         assert "relock main in a reviewed PR" in capsys.readouterr().err
+
+
+class _RaisingRunner:
+    """Stands in for ``subprocess.run`` when ``uv`` itself cannot run at all."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.calls: List[List[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        raise self.exc
+
+
+class TestMainRestoresOnAnyException:
+    """Review on #652, P3-2: ``main`` restored ``pyproject.toml`` and the devcontainer
+    feature only on ``LockDrift``; ``update_uv_lock`` restores only ``uv.lock``. A missing
+    or failing ``uv``, or Ctrl-C, left the tree half-bumped and a re-run did not repair it.
+    """
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            FileNotFoundError(2, "No such file or directory: 'uv'"),
+            subprocess.CalledProcessError(2, ["uv", "lock"]),
+            KeyboardInterrupt(),
+        ],
+        ids=["missing-uv", "failing-uv", "interrupt"],
+    )
+    def test_every_snapshotted_file_is_restored_on_any_exception(self, tree, monkeypatch, exc):
+        originals = {
+            rel: (tree / rel).read_text("utf-8") for rel in ("pyproject.toml", "uv.lock", FEATURE)
+        }
+        runner = _RaisingRunner(exc)
+        monkeypatch.setattr(bv, "generate_changelog", lambda version: None)
+        real = bv.update_uv_lock
+        monkeypatch.setattr(bv, "update_uv_lock", lambda old, new: real(old, new, run=runner))
+        monkeypatch.setattr(sys, "argv", ["bump_version.py", "patch"])
+        with pytest.raises(type(exc)):
+            bv.main()
+        for rel, text in originals.items():
+            assert (tree / rel).read_text("utf-8") == text, rel
+        assert runner.calls == [["uv", "lock"]], "the second uv call never runs"

@@ -174,6 +174,13 @@ def main() -> None:
             path.write_text(text)
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
+    except BaseException:
+        # A missing or failing `uv`, or Ctrl-C, raises something other than LockDrift here.
+        # update_uv_lock already restored uv.lock on any exception; restore the other two
+        # files it does not touch so a re-run starts from an unbumped tree, not a split one.
+        for path, text in originals.items():
+            path.write_text(text)
+        raise
     generate_changelog(new)
 
     print(f"Bumped {old} -> {new}")
