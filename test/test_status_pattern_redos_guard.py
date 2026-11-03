@@ -86,6 +86,8 @@ REGISTRY: dict[str, tuple[str, int]] = {
     "kiro_cli.KiroCliProvider._COMPOSER_CHROME_RE": ("search", 0),
     "kiro_cli.KiroCliProvider._COMPOSER_PROMPT_RE": ("match", 0),
     "kiro_cli.KiroCliProvider()._new_tui_header_pattern": ("search", 0),
+    "kiro_cli._V3_APPROVAL_TITLE": ("search", 0),
+    "kiro_cli._V3_TRUST_DECLINED": ("search", 0),
 }
 
 _FRAGMENT = "A fragment, never applied on its own: it is spliced into {}, which is registered."

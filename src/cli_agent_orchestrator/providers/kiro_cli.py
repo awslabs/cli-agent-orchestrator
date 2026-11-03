@@ -282,21 +282,43 @@ IDENTITY_HEADER_READ_INTERVAL_S = 0.5
 # every option, its own footer) with no idle prompt after it, so a reply that
 # quotes one cannot flip the status. The footers are the dialogs' own: v3's
 # generic list chrome ("esc to close · …") alone is never enough.
+#
+# Every pattern here is applied to one line of agent-painted text at a time,
+# and only its verdict is read, so none may cost more than linear time in the
+# line (CWE-1333):
+#
+# * the approval title and the declined-trust line start their attempt at the
+#   line start and skip to the first place the old pattern
+#   (``\S.*\brequires approval\s*$``, ``Not trusted: .*Kiro exited ...``) could
+#   start: its first non-blank, its first "Not trusted: ". Unanchored, the
+#   search restarted at every later one and re-scanned the rest of the line
+#   from each. A match from a later start on the line is also reachable from
+#   the first, so text matches exactly when it did, and the match ends where
+#   it did (it now begins at its line's start). ``\Z`` stands for the old
+#   ``$``, which ``(?m)`` would let match before any newline: ``\s*`` takes a
+#   final newline, so ``\s*$`` only ever matched at the end of the string;
+# * the trust title and the footers (here and _V3_SELECTOR_FOOTER) use ``\A``,
+#   which is what ``^`` means without re.MULTILINE, so their matches are
+#   unchanged; unlike ``^`` it stays one start position if re.MULTILINE is
+#   ever added, where ``^\s*`` would re-scan a run of blank lines from each.
+#   The option rows keep ``^``: _options_follow applies them with ``.match``.
 V3_DIALOG_BOTTOM_LINES = 30
-_V3_APPROVAL_TITLE = re.compile(r"\S.*\brequires approval\s*$")
+_V3_APPROVAL_TITLE = re.compile(r"(?m)^[^\S\n]*+\S[^\n]*\brequires approval\s*\Z")
 _V3_APPROVAL_OPTIONS = (
     re.compile(r"^\s*(?:❯\s*)?Allow once\s*$"),
     re.compile(r"^\s*(?:❯\s*)?Deny once\s*$"),
     re.compile(r"^\s*(?:❯\s*)?Create deny rule\b"),
 )
-_V3_APPROVAL_FOOTER = re.compile(r"^\s*esc to close · ↑↓ to navigate · ↵ to select\b")
-_V3_TRUST_TITLE = re.compile(r"^\s*Trust this workspace\?\s*$")
+_V3_APPROVAL_FOOTER = re.compile(r"\A\s*esc to close · ↑↓ to navigate · ↵ to select\b")
+_V3_TRUST_TITLE = re.compile(r"\A\s*Trust this workspace\?\s*$")
 _V3_TRUST_OPTIONS = (
     re.compile(r"^\s*(?:❯\s*)?Trust, continue\s*$"),
     re.compile(r"^\s*(?:❯\s*)?Don't trust, exit\s*$"),
 )
-_V3_TRUST_FOOTER = re.compile(r"^\s*esc to exit · ↑↓ to navigate · ↵ to select\s*$")
-_V3_TRUST_DECLINED = re.compile(r"Not trusted: .*Kiro exited without loading this folder")
+_V3_TRUST_FOOTER = re.compile(r"\A\s*esc to exit · ↑↓ to navigate · ↵ to select\s*$")
+_V3_TRUST_DECLINED = re.compile(
+    r"(?m)^(?:(?!Not trusted: ).)*+Not trusted: .*Kiro exited without loading this folder"
+)
 # v2's "Switch to V3" offer, which also rewrites agent files if accepted. A
 # pinned launch should never show it; if one does, nobody answers it.
 _V3_UPSELL_TITLE = re.compile(r"Switch to V3 today\.")
@@ -361,7 +383,7 @@ def kiro_v3_dialog(output: str) -> Optional[str]:
 # Any v3 selector's own footer: the approval picker's and the trust dialog's
 # (``esc to close`` / ``esc to exit``, then ``↑↓ to navigate · ↵ to select``).
 # At startup no selector is expected and CAO answers none (#1167).
-_V3_SELECTOR_FOOTER = re.compile(r"^\s*esc to (?:close|exit) · ↑↓ to navigate · ↵ to select\b")
+_V3_SELECTOR_FOOTER = re.compile(r"\A\s*esc to (?:close|exit) · ↑↓ to navigate · ↵ to select\b")
 
 
 def kiro_v3_startup_selector(output: str) -> bool:

@@ -13,7 +13,16 @@ These Kiro patterns backtracked superlinearly on agent-controlled text:
 * ``_new_tui_header_pattern`` (extraction, one row at a time) restarted at every
   occurrence of the agent name on a row. It now skips to the first one;
 * the AG-UI approval classifier kept its own copy of the permission regex (run
-  without re.DOTALL). It now calls ``kiro_cli.has_single_line_permission_prompt``.
+  without re.DOTALL). It now calls ``kiro_cli.has_single_line_permission_prompt``;
+* the v3 approval title ``\\S.*\\brequires approval\\s*$`` and declined-trust line
+  ``Not trusted: .*Kiro exited ...`` (each searched for on one line of the
+  screen) restarted at every non-blank / every "Not trusted: " on the line and
+  re-scanned the rest of it from each. They now start at the line start and
+  skip to the first such place. Text matches exactly when it did, and a match
+  ends where the old one did;
+* the v3 trust title and footers were linear where they are applied, but
+  ``^\\s*`` failed the guard's strict check (search with re.MULTILINE). ``^``
+  became ``\\A``, its meaning without re.MULTILINE.
 
 Each fix is checked three ways, none of them timed: the structure check (or,
 for the scan, a step count of the characters it reads), step growth at n, 4n
@@ -246,3 +255,179 @@ class TestSingleLinePermissionPrompt:
         from cli_agent_orchestrator.services.agui.handoff_approval import classify_reason
 
         assert classify_reason("kiro_cli", text) == expected
+
+
+# The v3 dialog patterns (#1167) as they were defined, and how kiro_v3_dialog
+# and kiro_v3_startup_selector apply each one: to one line of the screen.
+OLD_V3 = {
+    "_V3_APPROVAL_TITLE": (r"\S.*\brequires approval\s*$", "search"),
+    "_V3_TRUST_DECLINED": (r"Not trusted: .*Kiro exited without loading this folder", "search"),
+    "_V3_TRUST_TITLE": (r"^\s*Trust this workspace\?\s*$", "search"),
+    "_V3_APPROVAL_FOOTER": (r"^\s*esc to close · ↑↓ to navigate · ↵ to select\b", "match"),
+    "_V3_TRUST_FOOTER": (r"^\s*esc to exit · ↑↓ to navigate · ↵ to select\s*$", "match"),
+    "_V3_SELECTOR_FOOTER": (
+        r"^\s*esc to (?:close|exit) · ↑↓ to navigate · ↵ to select\b",
+        "match",
+    ),
+}
+SEARCHED = ("_V3_APPROVAL_TITLE", "_V3_TRUST_DECLINED")
+ANCHORED = tuple(sorted(set(OLD_V3) - set(SEARCHED)))
+
+#: What str.splitlines() splits on: no line the dialog code reads holds one.
+_LINE_BREAKS = frozenset("\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
+#: Characters around a dialog row in the differential inputs: blanks, line
+#: breaks (no line holds one, but the match must be the old one on any text),
+#: and word and non-word neighbours.
+_EDGES = [" ", " ", "\t", "\xa0", "\u3000", "\r", "\n", "\x0b", "\u2028", "x", "_", "·", ":"]
+_FOOTER_TAIL = " · ↑↓ to navigate · ↵ to select"
+
+#: Name -> fragments of its rows, whole and in pieces, for the differential inputs.
+TOKENS = {
+    "_V3_APPROVAL_TITLE": ["requires approval", "requires", " approval", "requires approvals"]
+    + ["shell"],
+    "_V3_TRUST_DECLINED": ["Not trusted: ", "Not trusted:", "Not trusted", "N", "K"]
+    + ["Kiro exited without loading this folder", "Kiro exited", " without loading this folder"],
+    "_V3_TRUST_TITLE": ["Trust this workspace?", "Trust this workspace", "?"],
+    "_V3_APPROVAL_FOOTER": ["esc to close" + _FOOTER_TAIL, "esc to close", _FOOTER_TAIL],
+    "_V3_TRUST_FOOTER": ["esc to exit" + _FOOTER_TAIL, "esc to exit", _FOOTER_TAIL],
+    "_V3_SELECTOR_FOOTER": [f"esc to {w}{_FOOTER_TAIL}" for w in ("close", "exit", "cancel")]
+    + ["esc to exit", _FOOTER_TAIL],
+}
+
+V3_FIXTURES = sorted(FIXTURES.glob("kiro_cli_tui_2_35_1_v3_*.txt"))
+
+
+def _one_line_shapes(pattern: str) -> list[tuple[str, str]]:
+    """The shapes ``input_shapes`` grows from ``pattern`` that fit on one line."""
+    return [s for s in input_shapes(pattern) if not _LINE_BREAKS & set(s[0] + s[1])]
+
+
+def _dialog_lines(text: str) -> list[str]:
+    """The lines kiro_v3_dialog and kiro_v3_startup_selector read."""
+    clean = kiro_cli.strip_terminal_escapes(text)
+    return [line.rstrip() for line in clean.splitlines() if line.strip()]
+
+
+def _random_texts(name: str, longest: int):
+    rng = random.Random(name)
+    tokens = TOKENS[name] + _EDGES
+    for _ in range(20000):
+        yield "".join(rng.choice(tokens) for _ in range(rng.randrange(0, longest)))
+
+
+class TestV3SearchedLines:
+    """The approval title and the declined-trust line, searched for on each line.
+
+    Unanchored, the search restarted at every place the pattern can start (any
+    non-blank; every "Not trusted: ") and re-scanned the rest of the line from
+    each, so one long line cost time quadratic in its length. Both now start at
+    the line start and skip to the first such place. Text matches exactly when
+    it did, and the match ends where the old one did; it begins at the start of
+    the old match's line.
+    """
+
+    @pytest.mark.parametrize("name", SEARCHED)
+    def test_old_form_grows_superlinearly_on_one_line(self, name):
+        old, mode = OLD_V3[name]
+        assert structural_issues(old, mode)
+        assert first_superlinear(pattern_probe(old, mode), _one_line_shapes(old))
+
+    @pytest.mark.parametrize("name", SEARCHED)
+    def test_current_form_is_clean_and_grows_linearly(self, name):
+        old, mode = OLD_V3[name]
+        new = getattr(kiro_cli, name)
+        assert structural_issues(new, mode) == []
+        assert structural_issues(new.pattern, "search", re.MULTILINE) == []
+        shapes = sorted(set(input_shapes(old)) | set(input_shapes(new)))
+        assert nonlinear_shapes(pattern_probe(new, mode), shapes) == []
+
+    @pytest.mark.parametrize("name", SEARCHED)
+    def test_matches_where_the_old_form_did(self, name):
+        # Line breaks included, though no line holds one: the verdict is the old
+        # one on any text, not only on the lines the dialog code reads. With them,
+        # the title's ``$`` under (?m) would also match before an inner newline.
+        old, _mode = OLD_V3[name]
+        new = getattr(kiro_cli, name)
+        matched = 0
+        for text in _random_texts(name, 14):
+            expected = re.search(old, text)
+            found = new.search(text)
+            assert bool(found) == bool(expected), repr(text)
+            if found and expected:
+                line_start = text.rfind("\n", 0, expected.start()) + 1
+                assert found.span() == (line_start, expected.end()), repr(text)
+                matched += 1
+        assert matched > 200, "the inputs must hit the pattern often"
+
+
+class TestV3AnchoredLines:
+    """The trust title and the footers: ``^`` became ``\\A``.
+
+    Applied the way kiro_cli applies them (``.match``, or ``.search`` without
+    re.MULTILINE), they were already linear: ``^`` holds at one position. Only
+    the guard's strict check (``search`` with re.MULTILINE) found them slow,
+    where ``^\\s*`` re-scans a run of blank lines from every line start.
+    Without re.MULTILINE ``^`` and ``\\A`` mean the same, so nothing else
+    changed, and with it ``\\A`` still holds at one position.
+    """
+
+    @pytest.mark.parametrize("name", ANCHORED)
+    def test_only_the_anchor_changed(self, name):
+        old, _mode = OLD_V3[name]
+        new = getattr(kiro_cli, name)
+        assert old.startswith("^") and new.pattern == "\\A" + old[1:]
+        assert not new.flags & re.MULTILINE
+
+    @pytest.mark.parametrize("name", ANCHORED)
+    def test_old_form_was_linear_where_used_and_failed_only_the_strict_check(self, name):
+        old, mode = OLD_V3[name]
+        assert structural_issues(old, mode) == []
+        assert nonlinear_shapes(pattern_probe(old, mode), _one_line_shapes(old)) == []
+        assert structural_issues(old, "search", re.MULTILINE)
+        assert first_superlinear(pattern_probe(old, "search", re.MULTILINE), input_shapes(old))
+
+    @pytest.mark.parametrize("name", ANCHORED)
+    def test_current_form_passes_the_strict_check_and_grows_linearly(self, name):
+        old, mode = OLD_V3[name]
+        new = getattr(kiro_cli, name)
+        assert structural_issues(new, mode) == []
+        assert structural_issues(new.pattern, "search", re.MULTILINE) == []
+        shapes = sorted(set(input_shapes(old)) | set(input_shapes(new)))
+        probe = pattern_probe(new.pattern, "search", re.MULTILINE)
+        assert nonlinear_shapes(probe, shapes) == []
+
+    @pytest.mark.parametrize("name", ANCHORED)
+    def test_current_form_returns_the_old_matches(self, name):
+        old, mode = OLD_V3[name]
+        new = getattr(kiro_cli, name)
+        matched = 0
+        for text in _random_texts(name, 8):
+            expected = getattr(re.compile(old), mode)(text)
+            found = getattr(new, mode)(text)
+            assert (found and found.span()) == (expected and expected.span()), repr(text)
+            matched += bool(expected)
+        assert matched > 200, "the inputs must hit the pattern often"
+
+
+class TestV3DialogVerdicts:
+    """The dialog readers give the old verdicts on every captured v3 pane."""
+
+    @pytest.mark.parametrize("fixture", V3_FIXTURES, ids=lambda path: path.stem)
+    def test_readers_give_the_old_verdicts(self, fixture, monkeypatch):
+        screen = fixture.read_text(encoding="utf-8")
+        new = (kiro_cli.kiro_v3_dialog(screen), kiro_cli.kiro_v3_startup_selector(screen))
+        for name, (old, _mode) in OLD_V3.items():
+            monkeypatch.setattr(kiro_cli, name, re.compile(old))
+        assert (kiro_cli.kiro_v3_dialog(screen), kiro_cli.kiro_v3_startup_selector(screen)) == new
+
+    @pytest.mark.parametrize("name", sorted(OLD_V3))
+    def test_each_pattern_reads_each_captured_line_as_before(self, name):
+        old, mode = OLD_V3[name]
+        new = getattr(kiro_cli, name)
+        hits = 0
+        for fixture in V3_FIXTURES:
+            for line in _dialog_lines(fixture.read_text(encoding="utf-8")):
+                verdict = bool(getattr(new, mode)(line))
+                assert verdict == bool(getattr(re.compile(old), mode)(line)), (fixture.name, line)
+                hits += verdict
+        assert hits, f"no captured v3 pane holds a {name} line"
