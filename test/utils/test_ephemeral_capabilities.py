@@ -31,10 +31,22 @@ def test_codex_is_advisory_until_the_contained_launch():
     assert row.effort_config[0] == "codexConfig"
 
 
-def test_kiro_is_refused_until_its_ephemeral_launch():
+def test_kiro_is_hard_with_every_atom_model_and_effort():
+    # #1167 Phase 2: helpers run on v3 from a per-launch universal file;
+    # effort maps to kiroConfig.effort and --effort.
     row = caps.capability_for("kiro_cli")
-    assert not row.supports_ephemeral and row.enforcement == caps.REFUSED
-    assert not row.tool_atoms and not row.honors_model and not row.honors_effort
+    assert row.supports_ephemeral and row.enforcement == caps.HARD
+    assert row.tool_atoms == frozenset(TOOL_ATOMS)
+    assert row.honors_model and row.honors_effort
+    assert row.effort_config == ("kiroConfig", "effort")
+
+
+def test_the_kiro_row_agrees_with_the_provider_class():
+    from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+
+    assert caps.capability_for("kiro_cli").honors_model is KiroCliProvider.honors_model(
+        None, None, None
+    )
 
 
 @pytest.mark.parametrize("provider", [p.value for p in ProviderType])
@@ -52,7 +64,7 @@ def test_unknown_and_non_string_providers_fail_closed(value):
 
 
 def test_ephemeral_providers_are_the_supporting_rows_in_table_order():
-    assert caps.ephemeral_providers() == ("claude_code", "codex")
+    assert caps.ephemeral_providers() == ("claude_code", "codex", "kiro_cli")
     assert set(caps.ephemeral_providers()) <= {p.value for p in ProviderType}
     for provider in caps.ephemeral_providers():
         assert caps.CAPABILITIES[provider].supports_ephemeral
@@ -101,7 +113,7 @@ def test_a_row_that_breaks_an_invariant_is_rejected(changes, message):
 
 def test_a_refused_row_cannot_carry_atoms():
     with pytest.raises(ValueError, match="refused provider runs no tool atoms"):
-        replace(caps.CAPABILITIES["kiro_cli"], tool_atoms=frozenset({"fs_read"}))
+        replace(caps._REFUSED, tool_atoms=frozenset({"fs_read"}))
 
 
 def test_the_reserved_sandboxed_class_is_a_valid_supporting_row():
