@@ -1,0 +1,17 @@
+
+kiro-cli (Kiro CLI)
+
+Popular Subcommands              Usage: kiro-cli [subcommand]
+╭────────────────────────────────────────────────────╮
+│ chat         Chat with Kiro CLI                    │
+│ agent        Manage AI agents                      │
+│ doctor       Debug installation issues             │ 
+│ settings     Customize appearance & behavior       │
+│ quit         Quit the app                          │
+╰────────────────────────────────────────────────────╯
+
+Use --agent AGENT_NAME to start chat with a specific agent
+
+To see all subcommands, use:
+ ❯ kiro-cli --help-all
+ㅤ
