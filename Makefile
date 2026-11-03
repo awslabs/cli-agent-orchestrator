@@ -47,7 +47,7 @@ agent-plugin:
 agent-plugin-keep-pin:
 	uv run python scripts/build_agent_plugin.py --keep-committed-pin
 
-# Verify every committed package match their allowlists and load with zero fatal
+# Verify every committed package matches its allowlist and loads with zero fatal
 # findings. Evaluates each package independently so one failure cannot mask
 # another. Exit 0 = in sync, 1 = drift or non-conformance.
 check-agent-plugin:

@@ -991,9 +991,9 @@ def _build_at_committed_pin() -> int:
 
 
 def run_check(*, require_current_pin: bool = False) -> int:
-    """Evaluate **both** packages independently and report both outcomes.
+    """Evaluate **every** package independently and report every outcome.
 
-    A failure in one package must not suppress reporting a failure in the other —
+    A failure in one package must not suppress reporting a failure in another —
     otherwise the contributor package can quietly rot behind a green check on the
     operator package.
 
@@ -1057,10 +1057,12 @@ def run_check(*, require_current_pin: bool = False) -> int:
             print(f"\n  {name}:", file=sys.stderr)
             for problem in problems:
                 print(f"    - {problem}", file=sys.stderr)
-        if pin_problems:
+        if pin_problems or require_current_pin or ordering:
+            # The pin is unknown, must become pyproject's, or is ahead of it: only
+            # a plain build (which pins pyproject's version) can fix any of those.
             hint = "python scripts/build_agent_plugin.py"
         else:
-            # The pin is known, so rebuilding must not move it.
+            # Plain drift at a known pin, so rebuilding must not move it.
             hint = "python scripts/build_agent_plugin.py --keep-committed-pin"
         print(f"\nRun: {hint}  (then commit the result)", file=sys.stderr)
         return 1

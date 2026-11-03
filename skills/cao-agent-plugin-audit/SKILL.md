@@ -152,27 +152,42 @@ on `$schema`, and nested closed objects such as `author`. The bundled validator
 runs the vendored JSON Schema (draft 2020-12) over the manifest and over
 `mcp.json`. When you cite any other validator, say which of the two it does.
 
-## Run the audit
+## Locate the script
 
-From the repository root, against an Agent Plugin root (a directory holding
-`plugin.json`):
+The validator ships inside this skill's own directory, at
+`scripts/validate_agent_plugin.py`. `load_skill` returns this text without that
+directory, so set `SCRIPT` to whichever one of these copies you have:
 
 ```bash
-uv run --script skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py ./agent-plugin/cao
+# Seeded by `cao init` (the skill as CAO installs it):
+SCRIPT="${CAO_HOME_DIR:-$HOME/.aws/cli-agent-orchestrator}/skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py"
+# From a CAO checkout's repository root, or an installed Agent Plugin's package root:
+SCRIPT=skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py
+```
+
+Use the seeded path when you work from any other directory, such as your own
+project. Run `test -f "$SCRIPT"` before going on: a missing script is not an
+audit result.
+
+## Run the audit
+
+Against an Agent Plugin root (a directory holding `plugin.json`):
+
+```bash
+uv run --script "$SCRIPT" ./agent-plugin/cao
 ```
 
 To include CAO's own verdict, set the gate inline on the same command:
 
 ```bash
-CAO_AGENT_PLUGINS_ENABLED=1 uv run --script \
-  skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py ./agent-plugin/cao
+CAO_AGENT_PLUGINS_ENABLED=1 uv run --script "$SCRIPT" ./agent-plugin/cao
 ```
 
 To check a directory of skills that is not a package, use `--skills-dir`. This is
 the mode gate 1 uses over this repository's `skills/`:
 
 ```bash
-uv run --script skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py --skills-dir skills/
+uv run --script "$SCRIPT" --skills-dir skills/
 ```
 
 **`skills/` in this repository is not an Agent Plugin root.** It holds
@@ -182,10 +197,6 @@ contains a `SKILL.md` as one skill and **ignores everything else**: a `plugin.js
 at the top of the directory, and any child without a `SKILL.md`, such as
 `skills/vendor/`. It prints an `ignored:` line for each. It reads no manifest, so
 the manifest checks do not run in this mode.
-
-Inside an installed Agent Plugin, the script is at
-`skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py` under the package
-root; use that path instead.
 
 ### Exit status
 
@@ -229,7 +240,8 @@ audit exit non-zero.
 
 ## Step by step
 
-1. Run the bundled validator against the package root. Record the exit status.
+1. Set `SCRIPT` (see "Locate the script"), then run the bundled validator
+   against the package root. Record the exit status.
 2. If exit is 2, fix the cause it printed and run again. Nothing else is a result.
 3. Read every FATAL first: the package does not load until they are gone.
 4. Read SKIPPED: each one is a skill or an MCP server CAO will silently drop.

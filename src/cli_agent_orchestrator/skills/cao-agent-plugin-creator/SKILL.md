@@ -184,18 +184,19 @@ SKILL=my-package/skills/first-skill
 SKILL="$SKILL" uv run --with pyyaml python - <<'PY'
 import os, pathlib, re, sys, yaml
 d = pathlib.Path(os.environ["SKILL"])
-lines = (d / "SKILL.md").read_text(encoding="utf-8").splitlines()
-# The frontmatter runs from a first line that is exactly '---' to the next such
-# line, so a '---' inside a value does not end it.
-ends = [i for i, line in enumerate(lines) if line.strip() == "---"]
-if len(ends) < 2 or ends[0] != 0:
+text = (d / "SKILL.md").read_text(encoding="utf-8").strip()
+# CAO's rule: after stripping the text, a delimiter is a line of three or more
+# dashes starting at column 0. An indented '---' inside a value does not end it.
+fm = re.compile(r"^-{3,}\s*$", re.M)
+parts = fm.split(text, 2) if fm.match(text) else []
+if len(parts) < 3:
     print("SKILL.md has no '---' ... '---' frontmatter block", file=sys.stderr); sys.exit(2)
-meta = yaml.safe_load("\n".join(lines[1:ends[1]])) or {}
+meta = yaml.safe_load(parts[1]) or {}
 missing = [k for k in ("name", "description") if not str(meta.get(k) or "").strip()]
 if missing:
     print("frontmatter is missing or blank: " + ", ".join(missing), file=sys.stderr); sys.exit(2)
 name, desc = str(meta["name"]).strip(), str(meta["description"]).strip()
-body_lines = len("\n".join(lines[ends[1] + 1:]).strip().splitlines())
+body_lines = len(parts[2].strip().splitlines())
 ok = (name == d.name and len(name) <= 64
       and re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name)
       and len(desc) <= 1024 and body_lines <= 500)

@@ -301,14 +301,27 @@ def check_mcp(root: Path, schema: Dict[str, Any], report: Report) -> None:
 # --- skills ------------------------------------------------------------------
 
 
+# CAO reads SKILL.md with python-frontmatter (``utils/skills.py``), whose YAML
+# handler splits on this pattern. A delimiter is three or more dashes starting at
+# column 0, so an indented ``---`` inside a block scalar is part of the value.
+_FM_BOUNDARY = re.compile(r"^-{3,}\s*$", re.MULTILINE)
+
+
 def _split_frontmatter(text: str) -> Tuple[str, str]:
-    lines = text.splitlines(keepends=True)
-    if not lines or lines[0].strip() != "---":
+    """Split SKILL.md the way CAO's loader does, without importing the library.
+
+    python-frontmatter strips the whole text first, requires it to open with a
+    delimiter, then splits at most twice. Porting the rule rather than declaring
+    the dependency keeps a seeded ``uv run --script`` free of a network fetch for
+    it.
+    """
+    text = text.strip()
+    if not _FM_BOUNDARY.match(text):
         raise ValueError("SKILL.md does not start with a '---' frontmatter delimiter")
-    for index in range(1, len(lines)):
-        if lines[index].strip() == "---":
-            return "".join(lines[1:index]), "".join(lines[index + 1 :])
-    raise ValueError("SKILL.md has no closing '---' frontmatter delimiter")
+    parts = _FM_BOUNDARY.split(text, 2)
+    if len(parts) < 3:
+        raise ValueError("SKILL.md has no closing '---' frontmatter delimiter")
+    return parts[1], parts[2]
 
 
 def check_skill(skill_dir: Path, report: Report) -> Optional[str]:
