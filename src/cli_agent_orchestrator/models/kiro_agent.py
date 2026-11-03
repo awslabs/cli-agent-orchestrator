@@ -12,6 +12,9 @@ class KiroAgentConfig(BaseModel):
     description: str
     tools: List[str] = Field(default_factory=lambda: ["*"])
     allowedTools: List[str] = Field(default_factory=list)
+    # Kiro v3 (#1167): set only for a v3-enabled ("universal") install and
+    # otherwise None, so ``exclude_none`` keeps a v2-only file's bytes as they were.
+    excludedTools: Optional[List[str]] = None
     # Serialized under the name Kiro CLI documents today. ``useLegacyMcpJson``
     # is the spelling Kiro CLI retired in favour of ``includeMcpJson``; it still
     # accepts the old one as an alias of the same field, so a spec that carries
@@ -40,6 +43,9 @@ class KiroAgentConfig(BaseModel):
     toolsSettings: Optional[Dict[str, Any]] = None
     hooks: Optional[Dict[str, Any]] = None
     model: Optional[str] = None
+    # Kiro v3 (#1167): ``{"rules": [...]}``, CAO's allow and deny rules for the
+    # grant. Like ``excludedTools``, only in a universal file.
+    permissions: Optional[Dict[str, Any]] = None
 
     class Config:
         # Exclude None values when serializing to JSON
