@@ -19,8 +19,10 @@ is a string.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -438,3 +440,126 @@ async def test_quiet_skips_are_not_listed() -> None:
 
     assert events[-1]["outcome"] == {"type": "success"}
     assert "result" not in events[-1]
+
+
+# ---------------------------------------------------------------------------
+# #1198 round 3 (fanhongy, haofeif): an answer whose interrupt expires while
+# its delivery is QUEUED behind a sibling delivery on the same terminal.
+# ---------------------------------------------------------------------------
+
+
+class _BlockingDelivery:
+    """Records keystrokes; the first ``send_input`` blocks until released.
+
+    Runs in the worker thread ``_deliver_and_commit`` uses (``asyncio.to_thread``),
+    so the event loop stays free while interrupt A is "being typed".
+    """
+
+    def __init__(self) -> None:
+        self.calls: List[tuple] = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def send_input(self, terminal_id: str, text: str, **kwargs: Any) -> None:
+        self.calls.append(("input", terminal_id, text))
+        if not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(timeout=10), "test never released the blocked delivery"
+
+    def send_special_key(self, terminal_id: str, key: str) -> bool:
+        self.calls.append(("key", terminal_id, key))
+        return True
+
+
+async def _until(predicate: Any, what: str, timeout: float = 5.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        assert loop.time() < deadline, f"timed out waiting for: {what}"
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_answer_that_expires_while_queued_is_listed_as_expired(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A is being typed; a status flap expires A and opens B on the same
+    terminal; the run for B queues on the per-terminal delivery lock and B
+    expires before its turn. B gets zero keystrokes (expiry-before-send), so
+    the run must list B as expired, not end a plain success."""
+    caplog.set_level(logging.WARNING, logger=_RUN_PLANE_LOGGER)
+    delivery = _BlockingDelivery()
+    construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=delivery)
+    a = _raise(construct, "t-race", _KIRO_PROMPT)
+
+    # A is being typed: its worker thread is blocked inside send_input.
+    a_task = asyncio.create_task(construct.resume(a.id, ApprovalDecision.APPROVE))
+    await _until(delivery.entered.is_set, "A's delivery to start")
+
+    # The flap: A expires and B opens on the same terminal.
+    assert construct.expire("t-race") is not None
+    b = _raise(construct, "t-race", _KIRO_PROMPT)
+    assert b.id != a.id and not b.resolved
+
+    # The run for B passes the pending check and queues behind A on the lock.
+    b_run = asyncio.create_task(
+        _events(
+            construct,
+            resume=[{"interruptId": b.id, "status": "resolved", "payload": {"approved": True}}],
+        )
+    )
+    await _until(
+        lambda: construct._delivery_locks["t-race"].refs == 2, "B to queue on the terminal lock"
+    )
+
+    # B's prompt goes away before its turn; then A's typing finishes.
+    assert construct.expire("t-race") is not None
+    delivery.release.set()
+    await asyncio.gather(a_task, return_exceptions=True)
+    events = await asyncio.wait_for(b_run, timeout=10)
+
+    assert construct.get_interrupt(b.id).outcome == "expired"
+    assert delivery.calls == [("input", "t-race", "y")]  # only A's keystroke
+    assert events[-1]["type"] == "RUN_FINISHED", events
+    assert events[-1]["outcome"] == {"type": "success"}
+    assert _skipped(events[-1]) == [{"interruptId": b.id, "reason": "expired"}]
+    assert any(b.id in w and "expired" in w for w in _warnings(caplog)), _warnings(caplog)
+
+
+class _FailingDelivery:
+    """Every delivery raises, so ``resume`` raises ``DeliveryError``."""
+
+    def send_input(self, terminal_id: str, text: str, **kwargs: Any) -> None:
+        raise RuntimeError("backend down")
+
+    def send_special_key(self, terminal_id: str, key: str) -> bool:
+        raise RuntimeError("backend down")
+
+
+@pytest.mark.asyncio
+async def test_run_error_after_a_skipped_entry_carries_no_list() -> None:
+    """An unknown id is skipped, then the next entry's delivery fails. The run
+    ends RUN_ERROR, and RUN_ERROR never carries ``result.skippedResume``."""
+    construct = AgentHandoffWithApproval(
+        emitter=RecordingUiEmitter(), answer_delivery=_FailingDelivery()
+    )
+    pending = _raise(construct, "t-fail", _KIRO_PROMPT)
+
+    frames = await _raw_frames(
+        construct,
+        resume=[
+            {"interruptId": "never-raised", "status": "resolved", "payload": {"approved": True}},
+            {"interruptId": pending.id, "status": "resolved", "payload": {"approved": True}},
+        ],
+    )
+    events = [
+        json.loads(line[len("data: ") :])
+        for frame in frames
+        for line in frame.strip().split("\n")
+        if line.startswith("data: ")
+    ]
+
+    assert events[-1]["type"] == "RUN_ERROR", events
+    assert "Delivery failed" in events[-1]["message"]
+    assert "result" not in events[-1]
+    assert "skippedResume" not in frames[-1]

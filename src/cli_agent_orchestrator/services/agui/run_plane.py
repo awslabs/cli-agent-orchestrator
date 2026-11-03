@@ -324,7 +324,7 @@ async def run_plane_stream(
 
             try:
                 decision_enum = ApprovalDecision(decision_str)
-                await approval_construct.resume(
+                answered = await approval_construct.resume(
                     interrupt_id=interrupt_id,
                     decision=decision_enum,
                     edited_text=edited_text,
@@ -352,6 +352,20 @@ async def run_plane_stream(
                 yield _emit(err)
                 finished = True
                 return
+
+            if answered.outcome == "expired":
+                # The interrupt was pending when checked above, but expired while
+                # its delivery was queued behind a sibling delivery on the same
+                # terminal (a status flap can expire one interrupt and open the
+                # next while the first is still being typed). Expiry won with zero
+                # keystrokes, so this answer was not used: warn and list it, the
+                # same as an answer that arrived after expiry.
+                logger.warning(
+                    "run_plane: ignoring resume entry for expired interrupt %s; "
+                    "an expired interrupt can no longer be answered",
+                    interrupt_id,
+                )
+                skipped_resume.append({"interruptId": interrupt_id, "reason": "expired"})
 
     # ── 3. Check for open interrupts ────────────────────────────────────
     if approval_construct is not None:
