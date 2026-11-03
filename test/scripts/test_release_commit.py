@@ -191,6 +191,26 @@ class TestWhatTheReleaseCommitMayCarry:
         assert rc.main(["--version", version, "--repo-root", str(world.clone)]) == 1
         assert world.git("rev-parse", "HEAD") == world.base
 
+    def test_the_commit_carries_exactly_the_changed_release_files(self, world):
+        """Review on #652, Note 1: ``git add -- RELEASE_FILES`` (``:86``) stages only those
+        paths, so an untracked stray file in the tree is excluded even though the pre-flight
+        stray check reads only TRACKED changes (``--untracked-files=no``) and would never
+        catch it. A ``git add -A`` here would sweep the stray file into the release commit;
+        the explicit pathspec is what actually refuses it."""
+        world.bump()
+        (world.clone / "untracked.txt").write_text("surprise\n", encoding="utf-8")
+        assert rc.main(["--version", "1.0.1", "--repo-root", str(world.clone)]) == 0
+        committed = set(
+            world.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").split()
+        )
+        assert committed == {
+            "pyproject.toml",
+            "uv.lock",
+            ".devcontainer/features/cao/devcontainer-feature.json",
+        }
+        assert "untracked.txt" not in committed
+        assert world.git("status", "--porcelain").strip() == "?? untracked.txt"
+
 
 def test_release_yml_commits_through_the_script():
     import yaml
