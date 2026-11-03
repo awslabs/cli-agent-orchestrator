@@ -417,8 +417,7 @@ def check_kiro_global_home(probe_home: Path) -> KiroGlobalHome:
     if listable and snapshot.powers_source and not snapshot.powers_marker:
         logger.warning(
             "Kiro helper refused: this server's user can list a mode-0000 directory, so "
-            "Kiro would copy %s into the helper's home",
-            _global_entry(user_home, POWERS_DIR),
+            "Kiro would copy ~/.kiro/powers into the helper's home"
         )
         raise KiroLaunchRefusal(
             "kiro_v3_global_home:powers",
@@ -429,9 +428,8 @@ def check_kiro_global_home(probe_home: Path) -> KiroGlobalHome:
         )
     if snapshot.secrets_source and not snapshot.secrets_marker:
         logger.warning(
-            "Kiro helper refused: %s exists and %s does not",
-            _global_entry(user_home, SECRETS_FILE),
-            _global_entry(user_home, SECRETS_MARKER),
+            "Kiro helper refused: ~/.kiro/secrets.json exists and "
+            "~/.kiro/.secrets-migrated does not"
         )
         raise KiroLaunchRefusal(
             "kiro_v3_global_home:secrets",

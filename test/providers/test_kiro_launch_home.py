@@ -13,6 +13,7 @@ import functools
 import hashlib
 import itertools
 import json
+import logging
 import os
 import shutil
 import signal
@@ -924,6 +925,55 @@ class TestGlobalHomeGuard:
         else:
             monkeypatch.setenv("HOME", value)
         assert refusal(k.check_kiro_global_home, probe) == "kiro_v3_global_home:unknown"
+
+
+class TestGlobalHomeGuardLogsNoPath:
+    """CodeQL #426 (py/clear-text-logging-sensitive-data, #1183): the refusal
+
+    warnings name fixed ``~/.kiro`` labels, never a path built from the fake
+    operator HOME under ``tmp_path``.
+    """
+
+    def test_the_powers_refusal_logs_a_fixed_label(
+        self, store, operator_home, monkeypatch, caplog  # noqa: F811
+    ):
+        _arrange(operator_home, "powers", "present", directory=True)
+        _arrange(operator_home, ".powers-migrated", "absent")
+        monkeypatch.setattr(k, "placeholder_is_listable", lambda path: True)
+        probe = k.ensure_probe_home()
+        with caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.providers.kiro_launch_home"
+        ):
+            assert refusal(k.check_kiro_global_home, probe) == "kiro_v3_global_home:powers"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "Kiro helper refused: this server's user can list a mode-0000 directory, so "
+            "Kiro would copy ~/.kiro/powers into the helper's home" == m
+            for m in messages
+        )
+        for m in messages:
+            assert str(operator_home.home) not in m
+            assert str(operator_home.kiro) not in m
+
+    def test_the_secrets_refusal_logs_a_fixed_label(
+        self, store, operator_home, monkeypatch, caplog  # noqa: F811
+    ):
+        _arrange(operator_home, "secrets.json", "present")
+        _arrange(operator_home, ".secrets-migrated", "absent")
+        probe = k.ensure_probe_home()
+        with caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.providers.kiro_launch_home"
+        ):
+            assert refusal(k.check_kiro_global_home, probe) == "kiro_v3_global_home:secrets"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "Kiro helper refused: ~/.kiro/secrets.json exists and "
+            "~/.kiro/.secrets-migrated does not" == m
+            for m in messages
+        )
+        for m in messages:
+            assert str(operator_home.home) not in m
+            assert str(operator_home.kiro) not in m
 
 
 class TestGlobalHomeUnchanged:
