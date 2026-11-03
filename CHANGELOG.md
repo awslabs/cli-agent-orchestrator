@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process cannot be proven gone, the home stays and the operator retries the delete; the sweep
   removes it only once the terminal row is gone. Installed Kiro launches are unchanged.
 
+- **Kiro helpers: `effort: "auto"` is decided at launch** (#1167, #1083). A Kiro helper with
+  `effort: "auto"` now asks `effort.route`, as Claude Code and Codex do, and the decided level
+  reaches kiro-cli as `--effort` for that launch only. An unusable answer runs the stored effort,
+  and the decision record names the reason. kiro-cli checks the decided level against the model, as it
+  does a stored effort, and a launch it refuses is not retried on the stored effort, so keep
+  `min_effort` and `max_effort` to levels your Kiro models accept. Installed Kiro agents are unchanged.
+
 - **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
   API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one
   universal agent file with v3 tool exclusions and deny rules. A v3 launch is refused before
@@ -278,7 +285,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Ephemeral agents accept an optional `ephemeral.min_effort` floor (#1083). An explicit effort below it refuses with `effort_below_policy`, and a stored effort or provider default below a floor raised since create refuses at claim with `policy_changed_since_create:effort_below_policy`.
 
-- Decision policy bounds take an optional effort floor (#1083, #810): an explicit effort below it is refused as `below_floor`, and a decider answer below it is capped up to it. The launch plan carries an on-mode `effort.route` answer, applied or capped. Providers declare `honors_effort`; only Claude Code (outside a native agent) and Codex do, and `effort.route` is recorded as `not_honored`, without asking, for any other provider.
+- Decision policy bounds take an optional effort floor (#1083, #810): an explicit effort below it is refused as `below_floor`, and a decider answer below it is capped up to it. The launch plan carries an on-mode `effort.route` answer, applied or capped. Providers declare `honors_effort`; only Claude Code (outside a native agent), Codex and Kiro helpers do, and `effort.route` is recorded as `not_honored`, without asking, for any other provider.
 
 - Ephemeral agents accept `model_tier: "auto"` (#1068). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `model.route` for that name only; explicit and omitted tiers never ask. Off and shadow launch on `ephemeral.default_tier`; on applies a confident answer capped into `[min_tier, max_tier]`, and falls back on any unusable answer. `auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier` (`auto_requires_bounds`) and a `claim_lease_seconds` of at least `decisions.on_timeout_ms / 1000 + 30`. The ephemeral archive records the decision record ids.
 

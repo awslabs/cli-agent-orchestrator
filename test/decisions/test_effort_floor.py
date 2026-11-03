@@ -24,6 +24,7 @@ from cli_agent_orchestrator.decisions.registry import DeciderRegistry
 from cli_agent_orchestrator.decisions.settings import PointSettings
 from cli_agent_orchestrator.decisions.targets import TargetKind
 from cli_agent_orchestrator.decisions.types import POINTS, DecisionAnswer, LaunchPlan, PointState
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 EFFORTS = POINTS["effort.route"].options
 TIERS = POINTS["model.route"].options
@@ -311,16 +312,41 @@ async def test_a_provider_that_cannot_apply_effort_is_never_asked(scripted, stat
     assert seen == [("codex", req.agent_profile, None)]
 
 
+# A reserved ephemeral name, as create gives a helper.
+KIRO_HELPER = "Ramones-log_triage-3f9a"
+
+
 @pytest.mark.asyncio
 async def test_the_default_declaration_comes_from_the_provider_class(scripted):
     engine, req, decider, store, _ = scripted
-    # Kiro's row applies a stored effort (kiroConfig.effort), but its class declares no
-    # decided-effort path, so it keeps the base class's False: effort "auto" on a Kiro
-    # helper falls back to the stored effort.
-    plan = await launch(engine, replace(req, provider="kiro_cli"))
+    # Kiro's class declares effort for a helper: it runs on v3 only, and its launch carries
+    # the plan's effort to --effort ahead of kiroConfig.effort. So a Kiro helper's effort
+    # "auto" asks effort.route, and the answer is carried like any other provider's.
+    plan = await launch(engine, replace(req, provider="kiro_cli", agent_profile=KIRO_HELPER))
+    assert [r.points for r in decider.requests] == [("effort.route",)]
+    assert decider.requests[0].facts.provider == "kiro_cli"
+    (record,) = store.list()
+    assert record["point"] == "effort.route" and record["provider"] == "kiro_cli"
+    assert record["outcome"] == "applied" and record["reason"] is None
+    assert plan.effort == record["applied_value"] == "high"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kiro_engine", [None, "v2", "v3"])
+async def test_an_installed_kiro_agent_is_still_never_asked(scripted, kiro_engine):
+    # Only a helper carries a decided effort; an installed agent's command never does.
+    engine, req, decider, store, _ = scripted
+    engine.profile_loader = lambda _: AgentProfile(
+        name="worker", description="worker", engine=kiro_engine
+    )
+    installed = replace(
+        req, provider="kiro_cli", agent_profile="worker", target_kind=TargetKind.INSTALLED
+    )
+    plan = await launch(engine, installed)
     assert decider.requests == []
     (record,) = store.list()
-    assert record["reason"] == "not_honored" and plan.effort is None
+    assert record["reason"] == "not_honored" and record["outcome"] == "fallback"
+    assert plan.effort is None
 
 
 @pytest.mark.asyncio
