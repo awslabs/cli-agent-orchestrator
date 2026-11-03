@@ -122,6 +122,18 @@ def test_a_missing_flag_refuses_v3(flag, request_extra):
     assert "Retry with engine 'v2'" in str(excinfo.value)
 
 
+def test_a_missing_flag_on_v2_names_no_engine_remedy():
+    """v2's missing-flag text is unchanged: no "retry with engine" clause (#1167 Phase 2)."""
+    chat = _without(HELP["2.35.1"][1], "--trust-all-tools")
+    with pytest.raises(KiroCapabilityError) as excinfo:
+        probe_kiro_capabilities(KiroEngine.V2, {"profile", "trust"}, runner=_runner(chat=chat))
+    assert excinfo.value.kind == "unsupported_capability"
+    assert excinfo.value.capability == "--trust-all-tools"
+    message = str(excinfo.value)
+    assert message.endswith("by Kiro wrapper help. Detected wrapper version: 2.35.1.")
+    assert "Retry" not in message
+
+
 def test_v3_missing_from_the_engine_values_refuses():
     chat = HELP["2.35.1"][1].replace("[possible values: v2, v1, v3]", "[possible values: v2, v1]")
     assert chat != HELP["2.35.1"][1]

@@ -420,7 +420,23 @@ shipped, with the archive reserved for audit.
 **As built: shipped in #866/#898/#905.** Claude uses the generated prompt and
 CAO-only MCP config without installed plugin MCP servers. Codex uses advisory
 tools with --yolo and a temporary developer-instructions file removed by provider
-cleanup; user-configured Codex MCP servers still load. Kiro is unsupported.
+cleanup; user-configured Codex MCP servers still load.
+
+Kiro (#1074 phase 5, #1167 Phase 2) runs on the v3 engine from a per-launch, CAO-owned
+`KIRO_HOME`, `$CAO_HOME_DIR/ephemeral/kiro/<terminal_id>/`. CAO creates it after bind and
+before the terminal's window exists. It seeds the directory (`settings/cli.json`, and a
+tool-less universal default agent `cao-null`), writes one agent file, `agents/<name>.json`,
+from the hash-verified live profile as the universal file for the bounded grant, and adds two
+placeholders against Kiro's legacy copies from `~/.kiro`: an empty `powers/` that no one can
+list, and a `{}` `secrets.json`. Every file is written with exclusive no-follow writes and
+owner-only modes, and both agent files pass CAO's v3 validator before the window exists. CAO
+never changes `~/.kiro`: it only stats Kiro's two copy sources and their migration markers. It
+refuses a helper whose secret store Kiro has not marked migrated, and refuses after the header
+when a placeholder changed or a marker appeared. The launch command and the pane environment
+both carry that `KIRO_HOME`. Provider cleanup stops every process whose `KIRO_HOME` is that
+directory, then removes the whole directory, Kiro's own session files included. A cleanup
+that cannot prove those processes gone keeps the directory and the terminal row for a retry,
+as Grok's private home does.
 
 Release removes only the exact regular &lt;name&gt;.md and &lt;name&gt;.spec.json
 inside the opened live directory, best-effort, and keeps registry identity and
@@ -447,6 +463,9 @@ terminal-owned claim returns to pending or collects past TTL; workflow-owned
 lapsed claims collect. Periodic launched-row cleanup waits the proposed 600-second
 bind-to-insert grace; startup can skip it before serving requests. GC rows retry
 removal of both exact regular live files even when immediate cleanup failed.
+GC rows also retry removal of their Kiro home once the terminal row is gone, and a GC
+row is not pruned while its Kiro home exists. A Kiro home without a registry row is
+left to the per-launch home sweep (#1074 phase 6).
 
 Create and sweep must be serialized or use a staging/creating protocol; file
 writes and SQLite insert are not atomic together. Do not implement unconditional
@@ -455,8 +474,14 @@ race test are E3 prerequisites. Missing live files must not collect a row with a
 live terminal. Retention and row pruning follow ADR-3's proposed guards.
 
 **Alternatives.** Optional post-kill plugins cannot own core cleanup. TTL alone
-would expire running children. Deletion at launch breaks re-init. Kiro's shared
-agent directory needs a later owned-file manifest.
+would expire running children. Deletion at launch breaks re-init. For Kiro, an
+owned-file manifest in the shared `KIRO_AGENTS_DIR` was rejected, for three reasons:
+kiro-cli rewrites and backs up files there; the operator's own Kiro and other CAO servers
+resolve names from it; and the shared home's MCP servers, steering and skills load. One
+CAO-owned Kiro home per CAO home was also rejected: Kiro names its session files itself,
+so release could not remove them by exact path, one `KIRO_HOME` value could not tell one
+child's processes from another's, and a long-lived home would keep whatever a legacy copy
+from `~/.kiro` put into it.
 
 ### ADR-5: Policy envelope and tool ceiling
 
@@ -532,7 +557,9 @@ extends E1; the tier/effort rules are proposed E2, workflow rules are planned E4
 Only settings JSON true enables creation; there is no environment override.
 Claude Code is the default supported provider with Hard native-tool enforcement.
 Codex opt-in has advisory tools and --yolo, with user MCP servers still loaded.
-Kiro remains unsupported. The operator accepts those provider limitations.
+Kiro is an operator opt-in: on the v3 engine its built-in tools are enforced by
+availability and deny rules (ADR-4), and it has no OS sandbox. The operator accepts
+those provider limitations.
 
 **Proposed E2 block rules**, validated before stored-value checks, with the same
 settings/table snapshot and #863 policy code (A5-1):
@@ -590,7 +617,8 @@ Raw HTTP is still scope-only, not server-side caller identity.
 > The recorded native-tool allowlist is bounded at create/launch. CAO generates
 > the profile without creator-supplied MCP servers, hooks or native agents and
 > skips installed plugin MCP servers. This is not a same-user privilege boundary.
-> Claude native tools are enforced; Codex tools are advisory. The CAO server grant
+> Claude native tools are enforced; Kiro's built-in tools are enforced by availability
+> and deny rules on the v3 engine; Codex tools are advisory. The CAO server grant
 > remains coarse. #912 binds MCP answer/delete to the caller's own tree;
 > workflow_cancel is denied unless child_may_delegate is enabled. The generated
 > skills list is empty, with named skill loading still available. Shared-state
@@ -1186,11 +1214,19 @@ rather than passing vacuously before integration.
   effective allowed_providers parity; rejected-record crash window and lease floor.
 - *Unblocks:* auto model tier/effort after these gates, never from #863 alone.
 
-**Deferred: Kiro.** #836 has merged, and Kiro enforcement is now "Hard (install time)" (`docs/tool-restrictions.md`).
-What still blocks ephemerals is that the enforced file is written at install time into the user-shared agents dir
-(`KIRO_AGENTS_DIR`, default `~/.kiro/agents`, `constants.py`). The slice adds an owned-file manifest for
-`KIRO_AGENTS_DIR/<name>.json` plus its context file, written through the install helpers. Release and sweep remove
-manifest paths only. Until it lands, Kiro gets `provider_unsupported`.
+**Kiro (#1074 phase 5, #1167 Phase 2).** #836 made Kiro enforcement Hard at install time, and #1167
+Phase 1 added the v3 engine. Ephemeral helpers run on v3 only, from ADR-4's per-launch home instead of
+the shared `KIRO_AGENTS_DIR`. The agent file is CAO's universal render for the bounded grant: `tools`
+and `excludedTools` limit what v3 exposes, permission rules deny every capability outside the grant,
+`includeMcpJson` is false, and the only MCP server is `cao-mcp-server`, with #1066's address and the
+terminal id. Before any task is typed, CAO refuses the launch in any of these cases:
+- the engine is v2, or the kiro-cli version is not allow-listed;
+- Kiro would copy the operator's `~/.kiro` secret store or powers into the home, or did so at startup;
+- the home or either agent file is wrong, or the workspace holds Kiro configuration or is the home folder;
+- the TUI header names another agent;
+- the `/tools` and `/mcp list` panels show anything beyond the per-launch file's grant and `cao-mcp-server`.
+
+Kiro is Hard for the v3 engine on allow-listed kiro-cli versions, pending the operator checklist.
 
 ## 4. Acceptance criteria (Given/When/Then)
 
@@ -1234,7 +1270,8 @@ manifest paths only. Until it lands, Kiro gets `provider_unsupported`.
 - **AC-1.4 Policy rejection: provider.**
   - *Given* `allowed_providers=["claude_code"]`. *When* the spec says `codex`. *Then* `provider_not_allowed`.
   - *Given* a `kiro_cli` creator and no provider in the spec. *Then*
-    `provider_unsupported: kiro_cli; set provider explicitly`.
+    `provider_unsupported: kiro_cli; set provider explicitly`. (Historical: before #1074
+    phase 5. A Kiro creator with no provider now resolves to `kiro_cli`.)
 
 **Coverage:** Secrets shipped E1; tier/effort proposed E2.
 
@@ -1303,7 +1340,7 @@ manifest paths only. Until it lands, Kiro gets `provider_unsupported`.
     - nothing is written;
     - the same spec with the tier omitted launches on the provider default.
   - *Given* the Kiro slice is not merged. *Then* a `kiro_cli` spec gets `provider_unsupported`, rather than a launch
-    from a file in the user-shared agents dir.
+    from a file in the user-shared agents dir. (Historical: the slice landed as #1074 phase 5 on v3.)
 
 **Coverage:** Shipped E1 caller denial and #912 answer/delete tree binding; #1063 adds workflow_cancel gating.
 
@@ -1517,8 +1554,8 @@ The document does not say the E side has no open items.
 
 - **[A1]/[A2] Effort:** the proposed v1 set is low/medium/high. Provider support
   and emitted keys must be tested in E2; other CLI levels do not enlarge this set.
-- **[A3] Kiro:** unsupported until its dedicated slice; effort support must be
-  rechecked there rather than assuming no CLI flag exists.
+- **[A3] Kiro:** effort maps to `--effort` through `kiroConfig.effort`, gated by the
+  capability probe (#1074 phase 5, #1167).
 - **[A4] Codex cleanup:** the temporary developer-instructions file belongs to
   provider cleanup. Codex tools remain advisory.
 - **[A5] Identity:** caller_id is supplied by clients. Same-user access is not
@@ -1604,7 +1641,7 @@ These proposals do not override as-built facts. The 2026-09-30/10-01 attribution
 in the original design have no supporting maintainer record.
 
 - **Q1 Tools:** retain the strict ephemeral child ceiling. Per-role exceptions deferred.
-- **Q2 Providers:** Claude Code by default, Codex opt-in, Kiro deferred.
+- **Q2 Providers:** Claude Code by default; Codex and Kiro opt-in.
 - **Q3 Lifecycle:** one launch per name.
 - **Q4 Vocabulary:** use #863's shipped small/medium/large tiers and low/medium/high
   effort; unsure is a separate decision answer. Supersedes simple/medium/complex

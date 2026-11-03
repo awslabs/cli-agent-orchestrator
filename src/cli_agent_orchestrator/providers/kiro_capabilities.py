@@ -110,6 +110,23 @@ class KiroCapabilityError(ValueError):
         self.version = version
 
 
+#: What a missing v3 wrapper flag's refusal suggests by default; an ephemeral
+#: helper, which runs only on v3, names its own (#1167 Phase 2).
+MISSING_FLAG_REMEDY = "Retry with engine 'v2'."
+
+
+def missing_flag_message(
+    engine: KiroEngine, flag: str, version: Optional[str], remedy: Optional[str]
+) -> str:
+    """The refusal for a wrapper flag ``engine`` needs that Kiro wrapper help did not list."""
+    detail = f" Detected wrapper version: {version}." if version else ""
+    retry = f" {remedy}" if remedy else ""
+    return (
+        f"Kiro engine '{engine.value}' requires wrapper flag {flag!r}, "
+        f"but it was not advertised by Kiro wrapper help.{detail}{retry}"
+    )
+
+
 class KiroV3LaunchError(KiroV3Refusal):
     """A Kiro v3 launch refused by one of CAO's own checks (#1167); nothing was typed.
 
@@ -376,13 +393,11 @@ def probe_kiro_capabilities(
 
     for flag in required:
         if flag not in flags:
-            detail = f" Detected wrapper version: {version}." if version else ""
-            retry = " Retry with engine 'v2'." if engine == KiroEngine.V3 else ""
+            remedy = MISSING_FLAG_REMEDY if engine == KiroEngine.V3 else None
             raise KiroCapabilityError(
                 "unsupported_capability",
                 engine,
-                f"Kiro engine '{engine.value}' requires wrapper flag {flag!r}, "
-                f"but it was not advertised by Kiro wrapper help.{detail}{retry}",
+                missing_flag_message(engine, flag, version, remedy),
                 capability=flag,
                 version=version,
             )
@@ -552,6 +567,18 @@ def requested_kiro_capabilities(
 _EFFORT_VALUE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 
+def kiro_effort_value(effort: object) -> str:
+    """An ``--effort`` value, checked: a lowercase level, never something read as a flag.
+
+    Passed through unchanged (kiro-cli checks it against the model's own
+    levels). Shared by a profile's ``kiroConfig.effort`` and a launch plan's
+    effort, so both are held to one rule.
+    """
+    if not isinstance(effort, str) or not _EFFORT_VALUE.fullmatch(effort):
+        raise ValueError("kiroConfig.effort must be a lowercase level such as low, medium or high")
+    return effort
+
+
 def kiro_effort(profile: object) -> Optional[str]:
     """The ``--effort`` value a profile's ``kiroConfig.effort`` sets, or None.
 
@@ -562,7 +589,4 @@ def kiro_effort(profile: object) -> Optional[str]:
     config = getattr(profile, "kiroConfig", None)
     if not isinstance(config, dict) or config.get("effort") is None:
         return None
-    effort = config["effort"]
-    if not isinstance(effort, str) or not _EFFORT_VALUE.fullmatch(effort):
-        raise ValueError("kiroConfig.effort must be a lowercase level such as low, medium or high")
-    return effort
+    return kiro_effort_value(config["effort"])
