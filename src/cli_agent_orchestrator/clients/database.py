@@ -5,12 +5,11 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, NamedTuple, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, TypeVar, cast
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
-    Column,
     DateTime,
     Float,
     Index,
@@ -26,6 +25,29 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.types import TypeDecorator
+
+if TYPE_CHECKING:
+    from sqlalchemy import Column as _SAColumn
+
+    _T = TypeVar("_T")
+
+    class Column(_SAColumn[_T]):
+        """Type-checking view of ``sqlalchemy.Column`` for the legacy models below.
+
+        SQLAlchemy 2.1 gave ``Column`` a typing-only ``__get__`` that returns
+        ``Never`` for class-level access, to stop ``TypedColumns`` classes being
+        used as ORM classes. These models declare ``x = Column(...)`` without
+        ``Mapped[]``, so under 2.1 every ``Model.x`` became ``Never`` and mypy
+        stopped checking the code after it. This restores 2.0's typing, where
+        ``Model.x`` is ``Column[T]``. Runtime uses the real ``Column`` (below).
+        """
+
+        def __get__(  # type: ignore[override]  # 2.1's overload returns Never
+            self, instance: Any, owner: Any
+        ) -> "_SAColumn[_T]": ...
+
+else:
+    from sqlalchemy import Column
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
 from cli_agent_orchestrator.models.flow import Flow
