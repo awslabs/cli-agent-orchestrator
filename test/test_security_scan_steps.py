@@ -51,10 +51,31 @@ AUTOLOADED_TRIVY_CONFIGS = (
 # Exactly the `with:` keys each step uses. Anything else -- `vuln-type`, `version`, a future
 # input -- can silently change what a step scans or which binary runs it, with no entry in
 # FORBIDDEN_WITH_KEYS to catch it.
+#
+# `skip-setup-trivy` (#351) is on every step: the job installs Trivy itself via
+# ./.github/actions/install-trivy (get.trivy.dev is down), so each trivy-action
+# step must skip its own built-in setup-trivy call rather than fetch a second
+# copy.
 STEP_WITH_ALLOWLIST = {
-    "report": {"scan-type", "scan-ref", "format", "output", "ignore-unfixed", "exit-code"},
-    "secret": {"scan-type", "scan-ref", "scanners", "format", "exit-code"},
-    "vuln": {"scan-type", "scan-ref", "format", "severity", "ignore-unfixed", "exit-code"},
+    "report": {
+        "scan-type",
+        "scan-ref",
+        "format",
+        "output",
+        "ignore-unfixed",
+        "exit-code",
+        "skip-setup-trivy",
+    },
+    "secret": {"scan-type", "scan-ref", "scanners", "format", "exit-code", "skip-setup-trivy"},
+    "vuln": {
+        "scan-type",
+        "scan-ref",
+        "format",
+        "severity",
+        "ignore-unfixed",
+        "exit-code",
+        "skip-setup-trivy",
+    },
 }
 
 
