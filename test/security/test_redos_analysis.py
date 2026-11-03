@@ -45,6 +45,8 @@ import pytest
         # A backtracking repeat before a lookahead that re-scans what it gives back:
         (r"x(?:ab)*(?!(?:ab)*c)\s", "match"),
         (r"[⏺●](?:\x1b\[[0-9;]*m)*(?![ \t]*+(?:\x1b\[[0-9;]*m)*+\w)\s+", "match"),
+        # A negative lookahead demands nothing, so it does not pin the first run:
+        (r"a*(?!b)a*x", "match"),
         # Unanchored, a possessive skip still restarts at every position:
         (r"(?:[^\n…]++|…(?![ \t]+\())*+…[ \t]+\(", "search"),
         # A repeat that ends the pattern but whose body is several items can
