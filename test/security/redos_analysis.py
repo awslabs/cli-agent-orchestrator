@@ -904,7 +904,7 @@ def _repeats_in(nodes: Sequence[tuple[object, object]]) -> Iterator[tuple[object
 
 
 def _nested_issues(nodes: Sequence[tuple[object, object]], ctx: _Ctx, flags: int) -> list[str]:
-    """S1/S2: nested unbounded repeats without a fence; ambiguous alternation under a repeat."""
+    """S1/S2: nested variable-width repeats without a fence; ambiguous alternation under a repeat."""
     issues: list[str] = []
     for op, av, _depth in _repeats_in(nodes):
         lo, hi, sub = av  # type: ignore[misc]
@@ -929,17 +929,16 @@ def _nested_issues(nodes: Sequence[tuple[object, object]], ctx: _Ctx, flags: int
                                 "alternation under a repeat has branches that can start "
                                 f"with the same character ({_describe(shapes[i].first & shapes[j].first)})"
                             )
-        # S1: unbounded repeats inside the body need a fence on both sides. A
-        # possessive inner repeat cannot be re-split across iterations, so it
-        # needs none. A sequence's neighbours in its parent (the token before a
-        # lookaround or a branch) fence its ends; the body's own ends meet the
-        # neighbouring iterations, so its last element fences its first and
-        # its first fences its last.
+        # S1: variable-width repeats inside the body, bounded or not, need a
+        # fence on both sides. A possessive inner repeat cannot be re-split
+        # across iterations, so it needs none, and neither can a fixed count
+        # such as x{3}. A sequence's neighbours in its parent (the token before
+        # a lookaround or a branch) fence its ends; the body's own ends meet
+        # the neighbouring iterations, so its last element fences its first
+        # and its first fences its last.
         for seq, before, after in _sequences_in(body, body[-1], body[0]):
             for index, (i_op, i_av) in enumerate(seq):
-                if i_op not in (C.MAX_REPEAT, C.MIN_REPEAT):
-                    continue
-                if not _is_unbounded(i_av[1]):  # type: ignore[index]
+                if not _variable_width(i_op, i_av):
                     continue
                 inner = _shape_seq(i_av[2], ctx, flags).chars  # type: ignore[index]
                 left = seq[index - 1] if index > 0 else before
@@ -985,13 +984,25 @@ def _sequences_in(
             yield from _sequences_in(list(av[2]), left, right)  # type: ignore[index]
 
 
+def _variable_width(op: object, av: object) -> bool:
+    """A backtracking repeat that can stop at more than one count: ``x*``, ``x{1,20}``, ``x?``."""
+    if op not in (C.MAX_REPEAT, C.MIN_REPEAT):
+        return False
+    lo, hi, _sub = av  # type: ignore[misc]
+    return _is_unbounded(hi) or hi > lo
+
+
 def _varies(body: list[Node_]) -> bool:
-    """The body holds an unbounded repeat or an alternation (at any depth)."""
+    """The body holds a variable-width repeat or an alternation (at any depth).
+
+    A bounded repeat varies as much as an unbounded one: ``(?:\\w{1,20}\\s?){1,20}:``
+    is exponential just like ``(?:\\w+\\s?){1,20}:``.
+    """
     for seq, _before, _after in _sequences_in(body):
         for op, av in seq:
             if op is C.BRANCH:
                 return True
-            if op in (C.MAX_REPEAT, C.MIN_REPEAT) and _is_unbounded(av[1]):  # type: ignore[index]
+            if _variable_width(op, av):
                 return True
     return False
 

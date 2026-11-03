@@ -37,6 +37,10 @@ import pytest
         (r"(?:[^\S\n]*){2}x", "match"),
         (r"(?:a|a){0,200}b", "match"),  # exponential: ambiguous alternation, bounded
         (r"(?:\w+\s?){1,20}:", "match"),  # exponential: nested, bounded outer repeat
+        # ...and a bounded inner repeat varies as much as an unbounded one:
+        (r"(?:\w{1,20}\s?){1,20}:", "match"),
+        (r"(?:\w{1,20}\s?)+:", "match"),
+        (r"(?:a{0,200})*b", "match"),
         (r"(?:\S+\s*)*x", "match"),  # an optional delimiter fences nothing
         # A backtracking repeat before a lookahead that re-scans what it gives back:
         (r"x(?:ab)*(?!(?:ab)*c)\s", "match"),
@@ -70,6 +74,8 @@ def test_superlinear_shapes_are_flagged(pattern, mode):
         # A one-character repeat that ends the pattern cannot fail after scanning:
         (r"─{8,}", "search"),
         (r"(?:a++|b)*c", "match"),  # a possessive inner repeat cannot be re-split
+        (r"(?:x{3})+y", "match"),  # nor can a fixed count
+        (r"(?:\d{1,3}\.){3}\d{1,3}", "match"),  # a bounded inner repeat, fenced by "."
         (r"(?:\S+\s+)*x", "match"),  # each repeat is fenced by the other's class
         (r"Press \S+(?:[^\S\n]+\S+){0,14} to", "search"),
         (r"(?:[ \t]*+\n){0,2}+x", "match"),  # nor can a possessive bounded group
@@ -105,11 +111,13 @@ def test_matcher_agrees_with_re(pattern, flags):
     [
         (r"(?:\D*\d)+", "search"),
         (r"x(?:[^\n]*\n)+", "search"),
+        (r"(?:\w{1,20}\s?){1,20}:", "match"),
+        (r"(?:a{0,200})*b", "match"),
     ],
 )
 def test_flagged_shapes_really_grow_superlinearly(pattern, mode):
     # The step count agrees with the structure check on the shapes it flags:
-    # a repeat that ends the pattern but whose body is several items.
+    # the terminal-repeat rule and bounded repeats inside a repeat.
     assert structural_issues(pattern, mode)
     assert first_superlinear(pattern_probe(pattern, mode), input_shapes(pattern))
 
