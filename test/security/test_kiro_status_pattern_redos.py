@@ -161,6 +161,51 @@ class TestNewTuiHeader:
             row = "".join(rng.choice(tokens) for _ in range(rng.randrange(0, 16)))
             assert bool(re.search(new, row)) == bool(re.search(self._old(profile), row)), repr(row)
 
+    # The skip before the header stops only at "<name> · " (name, blanks, "·",
+    # a blank). These rows put the name earlier on the row in every other way,
+    # so a weaker stop -- at any occurrence of the name, or at "<name> ·" --
+    # changes their verdict. ``{p}`` is the profile name.
+    BOUNDARY_ROWS = [
+        ("{p} · claude-sonnet-4 · ◔ 5%", True),
+        ("{p}/{p} · claude · ◔ 5%", True),  # the name as a prefix of an earlier token
+        ("kiro {p}: {p} · auto · ◔ 12%", True),  # the name repeated
+        ("{p}{p} · auto · ◔ 12%", True),  # the name twice in a row
+        ("{p} {p} · auto · ◔ 12%", True),  # the name, a blank, then the header
+        ("x{p}x {p} · auto · ◔ 12%", True),  # the name inside a word
+        ("{p}· {p} · auto · ◔ 12%", True),  # "·" with no blank before it
+        ("{p} ·{p} · auto · ◔ 12%", True),  # "·" with no blank after it
+        ("{p}\t·\xa0{p} · auto · ◔ 12%", True),  # other blanks start a header too
+        ("{p} · {p} · auto · ◔ 12%", True),  # a header start, then another
+        ("{p}  ·  auto  ·  ◔  12%", True),
+        ("{p}/{p} · claude ◔ 5%", False),  # no second "·" before "◔"
+        ("{p}· auto · ◔ 12%", False),
+        ("{p} ·auto · ◔ 12%", False),
+        ("x{p} · auto · ◔ 12%", True),  # the old form never needed a word boundary
+        ("x{p}x · auto · ◔ 12%", False),
+        ("{p}/{p}", False),
+        ("{q} · auto · ◔ 12%", False),  # a shorter name is not the profile
+    ]
+
+    @pytest.mark.parametrize("profile", PROFILES)
+    @pytest.mark.parametrize("template,expected", BOUNDARY_ROWS)
+    def test_rows_with_the_name_earlier_match_where_they_did(self, profile, template, expected):
+        new = kiro_cli.KiroCliProvider("t", "s", "w", profile)._new_tui_header_pattern
+        row = template.format(p=profile, q=profile[:3])
+        assert bool(re.search(self._old(profile), row)) is expected, "the old form's verdict"
+        assert bool(re.search(new, row)) is expected, repr(row)
+
+    @pytest.mark.parametrize("profile", PROFILES)
+    def test_rows_built_from_header_fragments_match_where_they_did(self, profile):
+        # Whole fragments, so rows with an earlier name and then a full header
+        # are common rather than rare.
+        new = kiro_cli.KiroCliProvider("t", "s", "w", profile)._new_tui_header_pattern
+        fragments = [profile, profile, profile[:3], " · ", "·", " ", "\t", "\xa0", "/", ":"]
+        fragments += ["claude-sonnet-4", "auto", " · ◔ 5%", "◔", "12%", "x"]
+        rng = random.Random(f"{profile}-fragments")
+        for _ in range(20000):
+            row = "".join(rng.choice(fragments) for _ in range(rng.randrange(0, 10)))
+            assert bool(re.search(new, row)) == bool(re.search(self._old(profile), row)), repr(row)
+
 
 class TestSingleLinePermissionPrompt:
     """The AG-UI approval classifier's reading: no re.DOTALL, so one line per prompt."""
