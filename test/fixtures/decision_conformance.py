@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -78,10 +77,19 @@ class UnsureDecider(ConfidentDecider):
 
 
 class TimeoutDecider(ConfidentDecider):
+    """Sleeps far longer than any plausible launch, so a correct engine must
+    cancel it at ``on_timeout_ms`` rather than wait for it to finish."""
+
+    def __init__(self, delay_s: float = 30) -> None:
+        super().__init__()
+        self.delay_s = delay_s
+        self.finished = False
+
     async def decide(self, request: DecisionRequest, config: Mapping[str, Any]) -> DecisionResponse:
         self.calls += 1
         self.requests.append(request)
-        await asyncio.Event().wait()
+        await asyncio.sleep(self.delay_s)
+        self.finished = True
         return None
 
 
@@ -414,7 +422,6 @@ async def _run_single_case(
             on_timeout_ms=50,
             threshold=0.70,
         )
-        start = time.perf_counter()
         observation = await adapter.delegate(
             message="sentinel-conformance-body",
             model="explicit-model" if case.name == "explicit" else None,
@@ -422,7 +429,10 @@ async def _run_single_case(
             purpose=purpose,
         )
         if case.name == "fallback_timeout":
-            assert time.perf_counter() - start < 1
+            # delegate() must have returned by cancelling the decider at
+            # on_timeout_ms, not by waiting the full 30s for it to finish.
+            # A load-independent proof: the decider is still mid-sleep.
+            assert decider.finished is False
         if case.name in missing_cases - {"profile_control", "installed_off_control"}:
             assert not observation.launched
             assert "model_tiers.claude_code.small" in observation.error
@@ -460,6 +470,14 @@ async def _run_single_case(
                 "fallback_"
             )
             assert row["applied_value"] is None
+            if case.name == "fallback_timeout":
+                # latency_ms covers only the ask (DecisionEngine._ask starts its
+                # clock before awaiting the decider and stops it right after
+                # cancellation), not the launch. A correct engine cancels at the
+                # configured on_timeout_ms=50; an engine that fell back to the
+                # 1000 ms default would still be well under the 30s sleep but
+                # over this bound.
+                assert row["latency_ms"] < 500
             if case.name == "fallback_invalid_answer":
                 assert (
                     row["answer"] is None
