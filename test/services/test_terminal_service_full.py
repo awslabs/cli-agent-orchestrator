@@ -1731,6 +1731,27 @@ class TestIdempotentReplayWaitsForInitialization:
         terminal_service._pending_sync_inits.clear()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    async def test_session_replay_through_real_create_publishes_no_creation_event(
+        self, mock_lookup, mock_get_terminal, mock_dispatch
+    ):
+        """Review on PR #773: the replay flag set by the real create_terminal
+        reaches session_service, so a replayed session is not announced twice."""
+        from cli_agent_orchestrator.services import session_service
+
+        mock_lookup.return_value = _record(terminal_id="prior-terminal")
+        mock_get_terminal.return_value = dict(_PRIOR_ROW)
+
+        result = await session_service.create_session(
+            provider="kiro_cli", agent_profile="developer", idempotency_key="k"
+        )
+
+        assert result.id == "prior-terminal"
+        mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("replay_defer_init", [False, True])
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")

@@ -1377,7 +1377,9 @@ class TestCreateTerminalInSession:
         """Review on PR #773: same contract as POST /sessions."""
         with (
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
-            patch("cli_agent_orchestrator.api.main._prepare_delegation", new=AsyncMock()) as decider,
+            patch(
+                "cli_agent_orchestrator.api.main._prepare_delegation", new=AsyncMock()
+            ) as decider,
         ):
             mock_svc.create_terminal = AsyncMock(
                 side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")

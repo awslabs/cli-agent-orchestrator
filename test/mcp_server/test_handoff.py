@@ -1121,7 +1121,9 @@ class TestHandoffCreateTimeoutRecovery:
         assert result.success is False
         assert result.terminal_id is None
         assert seen == []
-        # The bounded attempts, then exactly one non-allocating lookup.
+        # The bounded attempts (3, as the PR documents), then exactly one
+        # non-allocating lookup.
+        assert _HANDOFF_CREATE_ATTEMPTS == 3
         assert mock_create.call_count == _HANDOFF_CREATE_ATTEMPTS + 1
         flags = [c.kwargs.get("lookup_only", False) for c in mock_create.call_args_list]
         assert flags == [False] * _HANDOFF_CREATE_ATTEMPTS + [True]

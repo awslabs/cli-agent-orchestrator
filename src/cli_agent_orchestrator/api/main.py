@@ -4618,6 +4618,10 @@ async def create_terminal_in_session_as_operator(
         )
     except HTTPException:
         raise
+    except IdempotentCreateFailed as e:
+        # A keyed replay of a failed original, as on the other create routes
+        # (review on PR #773).
+        raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(e))
     except IdempotencyKeyConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (

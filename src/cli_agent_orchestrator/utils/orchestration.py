@@ -1787,7 +1787,8 @@ class _HandoffCreateUnresolved(Exception):
     """The create ended without telling the caller whether a worker exists.
 
     Raised when the bounded attempts all time out, or when an attempt that
-    follows a timeout fails for a reason other than a failed original create.
+    follows a timeout gets an HTTP error or claim refusal other than a failed
+    original create (424). Other transport errors propagate unchanged.
     In both cases an earlier attempt may have committed a worker under the same
     key, so the caller looks its identity up before reporting the failure. The
     original error is the ``__cause__``.
@@ -1831,9 +1832,10 @@ def _create_handoff_terminal(
     A replay of a create whose initialization FAILED comes back as HTTP 424
     with the cause. That is the original failure, so it is raised with that
     cause and never retried: retrying would start a second worker for a key
-    whose first one already failed. Any other error after a timeout is not
-    retried either; it raises ``_HandoffCreateUnresolved`` so the caller can
-    still look up a worker an earlier attempt may have committed.
+    whose first one already failed. Any other HTTP error or claim refusal
+    after a timeout is not retried either; it raises
+    ``_HandoffCreateUnresolved`` so the caller can still look up a worker an
+    earlier attempt may have committed.
     """
     claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
     saw_timeout = False
