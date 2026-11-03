@@ -756,6 +756,8 @@ class _Item:
     shape: _Shape
     label: str
     possessive: bool = False
+    #: repeat only: its body is one single-character item, as in ``─{8,}``.
+    single_char: bool = False
     negative: bool = False
     look_chars: frozenset[str] = field(default_factory=frozenset)
     #: lookahead only: the characters its body can start with, whether the body
@@ -843,6 +845,7 @@ def _node_paths(op: object, av: object, ctx: _Ctx, flags: int, source: str) -> l
                 f"{'possessive ' if op is C.POSSESSIVE_REPEAT else ''}repeat over "
                 f"{_describe(sh.chars)}",
                 possessive=op is C.POSSESSIVE_REPEAT,
+                single_char=_single_char_body(sub, flags),
             )
             return [[item]]
         if op is C.POSSESSIVE_REPEAT and not _single_char_body(sub, flags):
@@ -1094,10 +1097,12 @@ def _rescan_issues(paths: list[list[_Item]], multiline_start: bool) -> list[str]
                 continue
             if item.kind in ("anchor", "lookahead"):
                 continue
-            # A repeat that ends the pattern cannot fail after scanning: either
-            # it reaches its minimum and the attempt succeeds, or it stops
-            # short within that minimum. Search resumes after a success.
-            terminal = position == len(rest) - 1
+            # A repeat of one character that ends the pattern cannot fail after
+            # scanning: either it reaches its minimum and the attempt succeeds,
+            # or it stops short within that minimum. Search resumes after a
+            # success. A body of several items can scan to the end inside one
+            # iteration and still fail, from every start: (?:\D*\d)+.
+            terminal = position == len(rest) - 1 and item.single_char
             if item.kind == "repeat" and not terminal:
                 c = item.shape.chars
                 crosses = triggers is None or bool(c & triggers)

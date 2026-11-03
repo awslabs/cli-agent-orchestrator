@@ -43,6 +43,12 @@ import pytest
         (r"[⏺●](?:\x1b\[[0-9;]*m)*(?![ \t]*+(?:\x1b\[[0-9;]*m)*+\w)\s+", "match"),
         # Unanchored, a possessive skip still restarts at every position:
         (r"(?:[^\n…]++|…(?![ \t]+\())*+…[ \t]+\(", "search"),
+        # A repeat that ends the pattern but whose body is several items can
+        # scan to the end within one iteration and fail, from every start:
+        (r"(?:\D*\d)+", "search"),
+        (r"x(?:[^\n]*\n)+", "search"),
+        (r"\*(?:[^\n]*+\d)+", "search"),
+        (r"(?:\D*\d)*", "finditer"),
     ],
 )
 def test_superlinear_shapes_are_flagged(pattern, mode):
@@ -61,7 +67,8 @@ def test_superlinear_shapes_are_flagged(pattern, mode):
         (r"[*][^\n]*x", "match"),  # one attempt: no rescans in match mode
         (r"\w*ing\b.*x", "match"),  # \b after a word character pins the \w* run
         (r"[\w-]*ing(?=…).*…", "match"),  # so does a lookahead the run cannot consume
-        (r"─{8,}", "search"),  # a repeat that ends the pattern cannot fail after scanning
+        # A one-character repeat that ends the pattern cannot fail after scanning:
+        (r"─{8,}", "search"),
         (r"(?:a++|b)*c", "match"),  # a possessive inner repeat cannot be re-split
         (r"(?:\S+\s+)*x", "match"),  # each repeat is fenced by the other's class
         (r"Press \S+(?:[^\S\n]+\S+){0,14} to", "search"),
@@ -91,6 +98,20 @@ def test_matcher_agrees_with_re(pattern, flags):
         text = "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 24)))
         for mode in ("search", "finditer", "match", "fullmatch"):
             count_steps(pattern, text, mode, flags)  # raises if a span disagrees
+
+
+@pytest.mark.parametrize(
+    "pattern,mode",
+    [
+        (r"(?:\D*\d)+", "search"),
+        (r"x(?:[^\n]*\n)+", "search"),
+    ],
+)
+def test_flagged_shapes_really_grow_superlinearly(pattern, mode):
+    # The step count agrees with the structure check on the shapes it flags:
+    # a repeat that ends the pattern but whose body is several items.
+    assert structural_issues(pattern, mode)
+    assert first_superlinear(pattern_probe(pattern, mode), input_shapes(pattern))
 
 
 def test_bounded_max_is_where_a_bound_stops_counting_as_unbounded():

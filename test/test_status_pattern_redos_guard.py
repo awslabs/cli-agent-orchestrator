@@ -93,6 +93,10 @@ _UNUSED = "Defined but applied nowhere. It is superlinear: fix it before anythin
 
 #: Discovered name -> why it may fail the strict check.
 EXEMPT: dict[str, str] = {
+    "claude_code._ANSI_OPT": _FRAGMENT.format(
+        "EXTRACTION_RESPONSE_PATTERN and, through _EFFORT_FOOTER_TAIL, "
+        "EFFORT_FOOTER_LINE_PATTERN, between tokens,"
+    ),
     "claude_code._EFFORT_FOOTER_TAIL": _FRAGMENT.format(
         "EXTRACTION_RESPONSE_PATTERN and EFFORT_FOOTER_LINE_PATTERN, after the marker,"
     ),
@@ -100,6 +104,9 @@ EXEMPT: dict[str, str] = {
         "NEW_TUI_BOX_SPINNER_PATTERN and AFTER_SUMMARY_SPINNER_PATTERN, after the glyph,"
     ),
     "claude_code._REDUCED_MOTION_STATUS": _FRAGMENT.format("REDUCED_MOTION_SPINNER_PATTERN"),
+    "claude_code._REDUCED_MOTION_HOOK_GAP": _FRAGMENT.format(
+        "REDUCED_MOTION_SPINNER_PATTERN, through _REDUCED_MOTION_STATUS, after 'running',"
+    ),
     "claude_code._REDUCED_MOTION_AFTER_ELLIPSIS": _FRAGMENT.format(
         "REDUCED_MOTION_SPINNER_PATTERN, after a '…',"
     ),
