@@ -470,6 +470,14 @@ async def _run_single_case(
                 "fallback_"
             )
             assert row["applied_value"] is None
+            if case.name == "fallback_timeout":
+                # latency_ms covers only the ask (DecisionEngine._ask starts its
+                # clock before awaiting the decider and stops it right after
+                # cancellation), not the launch. A correct engine cancels at the
+                # configured on_timeout_ms=50; an engine that fell back to the
+                # 1000 ms default would still be well under the 30s sleep but
+                # over this bound.
+                assert row["latency_ms"] < 500
             if case.name == "fallback_invalid_answer":
                 assert (
                     row["answer"] is None
