@@ -1,0 +1,31 @@
+{
+  "name": "retrospector",
+  "description": "Retrospective Agent — distills workflow outcomes into durable memory lessons",
+  "tools": [
+    "@cao-mcp-server",
+    "fs_read",
+    "glob",
+    "grep",
+    "knowledge",
+    "read"
+  ],
+  "allowedTools": [
+    "@cao-mcp-server",
+    "fs_read",
+    "fs_list"
+  ],
+  "includeMcpJson": false,
+  "resources": [
+    "file://<ROOT>/agent-context/retrospector.md",
+    "skill://<ROOT>/skills/**/SKILL.md",
+    "skill://<ROOT>/skills/*/SKILL.md"
+  ],
+  "mcpServers": {
+    "cao-mcp-server": {
+      "type": "stdio",
+      "command": "/fixture/bin/cao-mcp-server",
+      "args": [],
+      "timeout": 1200000
+    }
+  }
+}

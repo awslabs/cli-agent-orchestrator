@@ -19,7 +19,6 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     KimiDialect,
     UnsupportedKimiError,
 )
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
@@ -96,8 +95,6 @@ class ProviderManager:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
                 resolved_engine = resolve_kiro_engine(persisted=engine)
-                if resolved_engine == KiroEngine.V3:
-                    raise KiroV3UnavailableError()
                 provider = KiroCliProvider(
                     terminal_id,
                     tmux_session,
@@ -161,6 +158,8 @@ class ProviderManager:
                     allowed_tools,
                     model=model,
                 )
+                if provider_variant is not None:
+                    provider.restore_runtime_variant(provider_variant)
             elif provider_type == ProviderType.OMP.value:
                 provider = OmpProvider(
                     terminal_id,
@@ -258,11 +257,6 @@ class ProviderManager:
         # Check if already exists
         provider = self._providers.get(terminal_id)
         if provider:
-            if (
-                isinstance(provider, KiroCliProvider)
-                and getattr(provider, "_engine", None) == KiroEngine.V3
-            ):
-                raise KiroV3UnavailableError()
             return provider
 
         # Try to create on-demand from database metadata
@@ -275,8 +269,6 @@ class ProviderManager:
             if metadata["provider"] == ProviderType.KIRO_CLI.value
             else None
         )
-        if persisted_engine == KiroEngine.V3:
-            raise KiroV3UnavailableError()
 
         # Kimi's two CLI families share one public provider id but disagree on
         # spinner/composer/transcript semantics.  A row created before variant
@@ -303,6 +295,12 @@ class ProviderManager:
             engine=persisted_engine,
             provider_variant=metadata.get("provider_variant"),
         )
+        if isinstance(provider, OpenCodeCliProvider) and not metadata.get("provider_variant"):
+            try:
+                provider.restore_runtime_variant(None)
+            except Exception:
+                self._providers.pop(terminal_id, None)
+                raise
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since
         # launched — mark the provider as initialized so KiroCliProvider's
