@@ -1,0 +1,50 @@
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ /tools · 37 tools
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ search:   type to filter
+
+ Name                    Source              Status                Description
+ glob                    built-in            ● allowed             Find files and directories whose paths match a glob pattern
+ grep                    built-in            ● allowed             Fast text pattern search in files using regex
+ read                    built-in            ● allowed             Tool for reading files, directories and images
+ answer_user_prompt      mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Answer an active approval or clarify prompt in another terminal.
+ assign                  mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Assigns a task to another agent without blocking.
+ assign_elastic          mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Provision one elastic worker and assign one task to it.
+ complete_assignment     mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Deliver an elastic worker's final result, then release the worker itself.
+ delete_terminal         mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Delete a terminal that is no longer needed, freeing system resources.
+ emit_ui                 mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Render a generative-UI component to the operator's AG-UI dashboard.
+ find_profiles           mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Find installed agent profiles by keyword, ranked by relevance.
+ get_handoff_result      mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Retrieve a durably persisted handoff result by job_id (issue #447).
+ handoff                 mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Hand off a task to another agent via CAO terminal and wait for completion.
+ list_outcomes           mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) List recorded workflow outcomes (retrospector read path).
+ list_siblings           mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Discover sibling terminals sharing a leading prefix of your own group.
+ load_skill              mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Retrieve the full Markdown body of an available skill from cao-server.
+ memory_forget           mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Remove a memory by key and scope.
+ memory_recall           mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Retrieve memories matching a query and optional filters.
+ memory_store            mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Store a persistent memory
+ report_outcome          mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Record the outcome of a unit of agent work (self-learning signal).
+ send_message            mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Send a message to another terminal's inbox.
+ store_lesson            mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Store a retrospective lesson in a target agent's scope (retrospector write path).
+ update_metadata         mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Update your own terminal's metadata, visible to siblings via list_siblings.
+ workflow_cancel         mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Cooperatively cancel a running workflow (issue #312, N5).
+ workflow_create         mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Create a NEW Python workflow spec (issue #583 FR-10).
+ workflow_events         mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Follow a run's live event stream, BOUNDED, and return a dict envelope (issue #505, U10).
+ workflow_get            mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Read back a workflow spec, including its source and ``content_hash`` (issue #583 FR-10).
+ workflow_list           mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) List journaled workflow runs newest-first (issue #505, U6; FR-3.5).
+ workflow_plan_approval  mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Report a run's plan identifier and whether that plan is approved (issue #583 FR-8).
+ workflow_result         mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Return the complete retained result for a run (issue #505, U6; FR-7.2).
+ workflow_resume         mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Resume a crashed or failed workflow run from its durable journal (issue #312, N6).
+ workflow_return         mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Return a structured output for the current workflow step (issue #312, N4).
+ workflow_run            mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Run a workflow to completion and return the aggregated result (issue #312, N5).
+ workflow_start          mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Submit a workflow run ASYNCHRONOUSLY and return its handle immediately (issue #505, U6).
+ workflow_status         mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Return a point-in-time status snapshot for a run (issue #505, U6).
+ workflow_update         mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Replace an EXISTING spec's source, refusing a stale update (issue #583 FR-10, FR-8).
+ workflow_validate       mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Lint Python spec source WITHOUT creating anything (issue #583 FR-10).
+ workflow_wait           mcp:cao-mcp-server  ● allowed             (MCP tool from cao-mcp-server) Follow a submitted run to a terminal state, then return its result (issue #505, U6).
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ esc to close
+
+
+
+

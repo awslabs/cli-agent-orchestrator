@@ -1,0 +1,45 @@
+{
+  "name": "developer",
+  "description": "Developer Agent in a multi-agent system",
+  "tools": [
+    "@cao-mcp-server",
+    "code",
+    "execute_bash",
+    "fs_read",
+    "fs_write",
+    "glob",
+    "goal",
+    "grep",
+    "introspect",
+    "knowledge",
+    "read",
+    "shell",
+    "subagent",
+    "todo_list",
+    "use_aws",
+    "web_fetch",
+    "web_search",
+    "write"
+  ],
+  "allowedTools": [
+    "@builtin",
+    "fs_*",
+    "execute_bash",
+    "web_fetch",
+    "@cao-mcp-server"
+  ],
+  "includeMcpJson": false,
+  "resources": [
+    "file://<ROOT>/agent-context/developer.md",
+    "skill://<ROOT>/skills/**/SKILL.md",
+    "skill://<ROOT>/skills/*/SKILL.md"
+  ],
+  "mcpServers": {
+    "cao-mcp-server": {
+      "type": "stdio",
+      "command": "/fixture/bin/cao-mcp-server",
+      "args": [],
+      "timeout": 1200000
+    }
+  }
+}
