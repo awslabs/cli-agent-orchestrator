@@ -229,11 +229,23 @@ def test_registry_and_exemptions_are_well_formed():
 
 
 def test_discovery_sees_every_kind_of_pattern():
-    """Module constants, class attributes and per-instance patterns are all found."""
-    for name in (
+    """Module constants, class attributes and per-instance patterns are all found.
+
+    Each module in MODULES is pinned by at least one name, so dropping a module
+    from the list fails here instead of silently shrinking the guard.
+    """
+    pinned = (
         "claude_code.PROCESSING_PATTERN",
         "claude_code.ClaudeCodeProvider._COMPOSER_RAIL_RE",
+        "codex.TUI_PROGRESS_PATTERN",
         "kiro_cli.KiroCliProvider()._new_tui_header_pattern",
         "kiro_cli.KiroCliProvider()._idle_prompt_pattern",
-    ):
+        # The AG-UI approval classifier: a provider pattern it applies under
+        # its own name, and one of its own.
+        "handoff_approval.KIRO_TUI_PATTERN",
+        "handoff_approval._ANSI_ESCAPE_RE",
+    )
+    for name in pinned:
         assert name in DISCOVERED, f"{name} not discovered"
+    modules = {path.rsplit(".", 1)[-1] for path in MODULES}
+    assert {name.split(".", 1)[0] for name in pinned} == modules, "pin a name for every module"
