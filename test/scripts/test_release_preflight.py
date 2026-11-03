@@ -286,6 +286,47 @@ class TestWhereAMarkerCounts:
         assert rp.derive_bump([commit(subject)]).bump == "major"
 
     @pytest.mark.parametrize(
+        "subject",
+        [
+            "i18n!: remove the legacy locale API",
+            "cross-zone-transport!: drop the v1 handshake",
+            "feat_x!: rename the experimental flag",
+        ],
+        ids=["digit-type", "hyphenated-type", "underscored-type"],
+    )
+    def test_a_bang_subject_with_a_non_letter_type_is_a_major(self, subject):
+        # Review on #652, P3-1: a type with a digit, a hyphen or an underscore (main already
+        # has `cross-zone-transport:`, #1023) must still read as breaking, not a quiet patch.
+        derivation = rp.derive_bump([commit(subject)])
+        assert derivation.bump == "major"
+        assert derivation.unclear == ()
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "i18n!: remove the legacy locale API",
+            "cross-zone-transport!: drop the v1 handshake",
+            "feat_x!: rename the experimental flag",
+        ],
+        ids=["digit-type", "hyphenated-type", "underscored-type"],
+    )
+    def test_a_scheduled_run_refuses_a_non_letter_type_bang_subject(self, subject):
+        probe = FakeProbe(history=[commit(subject, sha="5" * 40)])
+        decision = rp.decide("schedule", SHA, probe)
+        assert decision.refused and not decision.should_release
+        assert decision.bump == "major"
+        (problem,) = decision.problems
+        assert "55555555" in problem
+
+    def test_a_non_letter_type_bullet_is_unclear_not_hidden(self):
+        # The same charclass widening in UNCLEAR_MARKER: a squashed `* i18n!: ...` bullet
+        # must still hand the week to a person, not pass through as patch.
+        message = "feat: x\n\n* i18n!: remove the legacy locale API\n"
+        derivation = rp.derive_bump([commit(message)])
+        assert derivation.bump == "minor"
+        assert [line for _, line in derivation.unclear] == ["* i18n!: remove the legacy locale API"]
+
+    @pytest.mark.parametrize(
         "message",
         [
             "docs: explain footers\n\n> BREAKING CHANGE: an example in a quote\n\nMore prose.\n",

@@ -89,7 +89,7 @@ FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 # squash-merges, so bodies routinely carry PR descriptions and nested commit lists.
 # Conventional Commits puts `!` and the type in the SUBJECT and `BREAKING CHANGE:` in the
 # FOOTER, so only those two places are read. See `parse_message` for what "footer" means.
-BANG_SUBJECT = re.compile(r"^[A-Za-z]+(?:\([^)]*\))?!:")
+BANG_SUBJECT = re.compile(r"^[^\s():!]+(?:\([^)]*\))?!:")
 FEAT_SUBJECT = re.compile(r"^feat(?:\([^)]*\))?!?:", re.IGNORECASE)
 FOOTER_START = re.compile(r"^(?:BREAKING[ -]CHANGE|[A-Za-z][A-Za-z0-9-]*)(?::\s|\s#)", re.I)
 BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:", re.IGNORECASE)
@@ -98,7 +98,7 @@ FENCE = re.compile(r"^\s*(?:```|~~~)")
 # A marker anywhere else in the body. It does not change the bump, but a scheduled run cannot
 # tell a quote from a real break inside a squashed commit, so it hands the week to a person.
 UNCLEAR_MARKER = re.compile(
-    r"^\s*(?:BREAKING[ -]CHANGE\b|(?:[*-]\s+)?[A-Za-z]+(?:\([^)]*\))?!:)", re.IGNORECASE
+    r"^\s*(?:BREAKING[ -]CHANGE\b|(?:[*-]\s+)?[^\s():!]+(?:\([^)]*\))?!:)", re.IGNORECASE
 )
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
