@@ -1,0 +1,18 @@
+{
+  "name": "v3star",
+  "description": "KV3 all tools visible, shell denied by policy",
+  "prompt": "You are a KV3 probe agent for a CAO compatibility test. Answer briefly.",
+  "tools": "*",
+  "includeMcpJson": false,
+  "includePowers": false,
+  "resources": [],
+  "mcpServers": {},
+  "permissions": {
+    "rules": [
+      {
+        "capability": "shell",
+        "effect": "deny"
+      }
+    ]
+  }
+}
