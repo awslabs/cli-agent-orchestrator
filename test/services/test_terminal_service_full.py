@@ -320,6 +320,15 @@ class TestCreateTerminal:
 
         assert terminal_service.resolve_launch_model(explicit_model, profile) == expected
 
+    def test_resolve_launch_effort_reads_only_the_launch_plan(self):
+        # #1068 C, #1083 ruling: effort has no per-call override and no profile-level
+        # default read here; a provider falls back to its own profile config when None.
+        from cli_agent_orchestrator.decisions.types import LaunchPlan
+
+        assert terminal_service.resolve_launch_effort(LaunchPlan(effort="high")) == "high"
+        assert terminal_service.resolve_launch_effort(LaunchPlan()) is None
+        assert terminal_service.resolve_launch_effort(None) is None
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")

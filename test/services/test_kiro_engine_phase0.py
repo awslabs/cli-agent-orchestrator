@@ -1,4 +1,4 @@
-"""Fail-closed terminal-service coverage for Kiro Phase 0."""
+"""Fail-closed terminal-service coverage for the Kiro engine selection."""
 
 import asyncio
 import subprocess
@@ -12,11 +12,14 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroCapabilityError,
-    KiroPhase0KASError,
     probe_kiro_capabilities,
 )
+from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
 from cli_agent_orchestrator.services.agent_step import run_agent_step
-from cli_agent_orchestrator.services.terminal_service import create_terminal
+from cli_agent_orchestrator.services.terminal_service import (
+    TerminalInputBlockedError,
+    create_terminal,
+)
 
 _MODULE = "cli_agent_orchestrator.services.terminal_service"
 
@@ -82,7 +85,8 @@ async def test_capability_probe_does_not_block_event_loop():
         ticks_while_blocked = heartbeat_ticks
         release_probe.set()
 
-        with pytest.raises(KiroPhase0KASError):
+        # Version 3.0.0 is not on the v3 allow-list (#1167).
+        with pytest.raises(KiroV3Refusal, match="kiro_v3_unsupported_version"):
             await create_task
         await heartbeat_task
 
@@ -95,8 +99,8 @@ async def test_capability_probe_does_not_block_event_loop():
 
 
 @pytest.mark.asyncio
-async def test_kas_probes_then_rejects_before_backend_or_persistence_allocation():
-    """KAS Phase 0 rejection happens before every terminal lifecycle side effect."""
+async def test_kas_probes_then_refuses_an_unsupported_version_before_allocation():
+    """A v3 refusal after the probe happens before every lifecycle side effect."""
     probe = Mock(
         return_value=KiroCapabilities(version="2.13.0", flags=frozenset({"--v3", "--agent"}))
     )
@@ -115,7 +119,7 @@ async def test_kas_probes_then_rejects_before_backend_or_persistence_allocation(
         patch(f"{_MODULE}.fifo_manager") as fifo,
         patch(f"{_MODULE}.provider_manager") as providers,
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
+        with pytest.raises(KiroV3Refusal, match="kiro_v3_unsupported_version"):
             await create_terminal(
                 provider="kiro_cli",
                 agent_profile="kas-profile",
@@ -123,7 +127,7 @@ async def test_kas_probes_then_rejects_before_backend_or_persistence_allocation(
                 kiro_capability_probe=probe,
             )
 
-    probe.assert_called_once_with(KiroEngine.KAS, {"profile"})
+    probe.assert_called_once_with(KiroEngine.V3, {"profile", "trust", "trust_workspace"})
     backend.return_value.create_session.assert_not_called()
     backend.return_value.create_window.assert_not_called()
     db_create.assert_not_called()
@@ -448,11 +452,13 @@ async def test_v2_agent_engine_value_exclusion_rejects_before_allocation():
     providers.create_provider.assert_not_called()
 
 
-def test_send_input_rejects_persisted_kas_before_provider_or_pane_access():
+@pytest.mark.parametrize("stored", ["v3", "kas"])
+def test_send_input_to_an_unverified_v3_terminal_is_refused_before_pane_access(stored):
+    """v3 rows take input like v2 ones (#1167), but only once the identity is recorded."""
     metadata = {
         "id": "persisted-kas",
         "provider": "kiro_cli",
-        "engine": "kas",
+        "engine": stored,
         "tmux_session": "cao-session",
         "tmux_window": "developer-window",
     }
@@ -462,7 +468,7 @@ def test_send_input_rejects_persisted_kas_before_provider_or_pane_access():
         patch(f"{_MODULE}.provider_manager") as providers,
         patch(f"{_MODULE}.get_backend") as backend,
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
+        with pytest.raises(TerminalInputBlockedError):
             from cli_agent_orchestrator.services.terminal_service import send_input
 
             send_input("persisted-kas", "must not be delivered")
@@ -472,11 +478,12 @@ def test_send_input_rejects_persisted_kas_before_provider_or_pane_access():
 
 
 @pytest.mark.asyncio
-async def test_agent_step_reuse_rejects_persisted_kas_before_pane_write():
+@pytest.mark.parametrize("stored", ["v3", "kas"])
+async def test_agent_step_reuse_of_an_unverified_v3_terminal_is_refused_before_pane_write(stored):
     metadata = {
         "id": "persisted-kas",
         "provider": "kiro_cli",
-        "engine": "kas",
+        "engine": stored,
         "tmux_session": "cao-session",
         "tmux_window": "developer-window",
     }
@@ -486,13 +493,14 @@ async def test_agent_step_reuse_rejects_persisted_kas_before_pane_write():
         patch(f"{_MODULE}.provider_manager") as providers,
         patch(f"{_MODULE}.get_backend") as backend,
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
+        with pytest.raises(Exception) as excinfo:
             await run_agent_step(
                 provider="kiro_cli",
                 agent="developer",
                 prompt="must not be delivered",
                 reuse_terminal_id="persisted-kas",
             )
+    assert "identity" in str(excinfo.value).lower()
 
     providers.get_provider.assert_not_called()
     backend.return_value.send_keys.assert_not_called()

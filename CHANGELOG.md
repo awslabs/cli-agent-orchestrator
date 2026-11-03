@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
+  API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one
+  universal agent file with v3 tool exclusions and deny rules. A v3 launch is refused before
+  anything is allocated unless the kiro-cli version is supported, the agent file on disk is CAO's
+  own render for its grant, `KIRO_HOME` is the default, `CAO_AGENTS_DIR` (if set) is
+  `~/.kiro/agents`, and the workspace's `.kiro/` holds no configuration; after the header, CAO
+  reads `/mcp` until no server is loading, then `/tools`, before any task. **Not yet a
+  supported configuration:** v3 support is claimed only once the live operator checklist has passed.
+  A kiro-cli version still pending operator verification (2.36.0, 2.37.0) refuses unless the operator sets
+  `kiro.v3_allow_unverified_versions: true` (provisional, for running the checklist on it); such a
+  launch logs a warning and its response carries `launch_notes`.
+  Also: `cao launch` now shows the server's refusal reason instead of "Failed to connect", and the
+  memory wiki compiler's Kiro call pins `--agent-engine v2`.
+
 - **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3
   `Default` fallback** (#1167). A Kiro header with extra columns between the model and the context
   gauge, such as `<agent> · claude-haiku-5.5 · low · ◔ 2%` on the v2 engine with `--effort`, or
@@ -235,7 +249,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Ephemeral agents accept `model_tier: "auto"` (#1068). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `model.route` for that name only; explicit and omitted tiers never ask. Off and shadow launch on `ephemeral.default_tier`; on applies a confident answer capped into `[min_tier, max_tier]`, and falls back on any unusable answer. `auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier` (`auto_requires_bounds`) and a `claim_lease_seconds` of at least `decisions.on_timeout_ms / 1000 + 30`. The ephemeral archive records the decision record ids. `effort: "auto"` still refuses.
+- Ephemeral agents accept `provider: "auto"` (#1099, provisional). Create resolves it to the creator's provider, the fallback that the response, the registry row, the live profile and the archive keep. At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `provider.route` first, within the options CAO computes from the fallback's `ephemeral.provider_route` set, then ask the other `auto` fields for the provider it chose. On, a confident answer among the options runs the launch on that provider through its launch plan only: its own tier table maps the model and the plan carries the effort; nothing shared names it, and the decision record, the terminal, the archive's `bound` event and the launch record name the provider that ran. A pre-bind recheck refuses a decided provider the policy no longer allows with `policy_changed_since_create:<rule>`, including the new `provider_not_equivalent`, and collects the name; no other provider is ever tried, and a launch that fails before the bind for any other reason (the node cap, the delegation ceiling, the owner's own 400, a lapsed lease, a crash) leaves the name pending with its stored values. `claim_lease_seconds` counts one more wait. The claim response gains `provider_auto`, and for an `auto` claim the MCP helpers shape text the same way whichever CLI runs: the default `handoff` always adds the `[CAO Handoff]` banner, `assign` drops the sender suffix from an `@`-leading task, and the `handoff` success message names no provider. With today's providers nothing is routed, since no set validates.
+
+- Ephemeral settings accept `ephemeral.provider_route.equivalent` (#1099, provisional): disjoint sets of providers a decider may choose between for a `provider: "auto"` spec, empty by default. A set names two or more supported providers and never mixes an `advisory` provider with a `hard` or `sandboxed` one; any other block, including an unknown key inside it, refuses every create and claim with `policy_config_error:provider_route`. With today's providers no set validates. The create response's `enforcement` now comes from one label helper that the validation reads too.
+
+- Decision points gain `provider.route`, "Which CLI should run this task?" (#1099). It is off by default. CAO computes its options for each launch and sends them as `DecisionRequest.options`, which is null on every other point's request; `CONTRACT_VERSION` is unchanged, but a decider that sends the whole request now sends one more `"options": null` key. An answer outside the options falls back as `invalid_answer`, and a launch with one option asks nothing and records the new reason `single_option`. The fallback source `creator` names the creator's provider. Records gain three nullable columns, `options`, `fallback_enforcement` and `applied_enforcement`, written only on `provider.route` records; the upgrade adds them without a backfill. The launch plan carries a decided provider that differs from the fallback. A decider that declares every point is asked `provider.route` once it is on.
+
+- Ephemeral agents accept `effort: "auto"` (#1083). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `effort.route` for that name only; explicit and omitted efforts never ask. Off and shadow launch on `ephemeral.default_effort`; on passes a confident answer, capped into `[min_effort, max_effort]`, to the provider for that launch only, as for the decided model, and falls back on any unusable answer; the live profile keeps the stored effort. `auto` needs both `ephemeral.min_effort` and `ephemeral.max_effort` (`auto_requires_bounds`). With both fields `auto`, `model.route` and `effort.route` are asked in turn, and `claim_lease_seconds` must be at least `2 * decisions.on_timeout_ms / 1000 + 30`. The `auto_requires_decision_platform` refusal is retired.
+
+- Ephemeral agents accept an optional `ephemeral.min_effort` floor (#1083). An explicit effort below it refuses with `effort_below_policy`, and a stored effort or provider default below a floor raised since create refuses at claim with `policy_changed_since_create:effort_below_policy`.
+
+- Decision policy bounds take an optional effort floor (#1083, #810): an explicit effort below it is refused as `below_floor`, and a decider answer below it is capped up to it. The launch plan carries an on-mode `effort.route` answer, applied or capped. Providers declare `honors_effort`; only Claude Code (outside a native agent) and Codex do, and `effort.route` is recorded as `not_honored`, without asking, for any other provider.
+
+- Ephemeral agents accept `model_tier: "auto"` (#1068). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `model.route` for that name only; explicit and omitted tiers never ask. Off and shadow launch on `ephemeral.default_tier`; on applies a confident answer capped into `[min_tier, max_tier]`, and falls back on any unusable answer. `auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier` (`auto_requires_bounds`) and a `claim_lease_seconds` of at least `decisions.on_timeout_ms / 1000 + 30`. The ephemeral archive records the decision record ids.
 
 - Decision policy bounds take an optional model tier floor (#1068, #810): an explicit tier below it is refused as `below_floor`, a decider answer below it is capped up to it, and mappings are required from the floor to the ceiling. A delegation to an ephemeral target can carry the creator's description, redacted, in `profile_description`.
 
@@ -359,7 +385,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained. There is no background sweep, so keep the feature disabled outside testing.
   The live files and archive can be deleted by exact path while no ephemeral
   terminal exists. Reserved names also refuse remote placement with
-  `remote_placement_not_allowed`. `effort: "auto"` still requires the decision platform.
+  `remote_placement_not_allowed`.
 - Advanced CodeQL analysis for same-repository and fork pull requests, with
   Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
   weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`

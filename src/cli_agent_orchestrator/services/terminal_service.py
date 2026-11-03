@@ -93,7 +93,11 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
+from cli_agent_orchestrator.models.kiro_engine import (
+    KiroEngine,
+    canonical_kiro_engine,
+    resolve_kiro_engine,
+)
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     ProviderExitedInputBlockedError,
@@ -117,7 +121,8 @@ from cli_agent_orchestrator.providers.base import (
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroCapabilityError,
-    KiroPhase0KASError,
+    KiroV3LaunchError,
+    kiro_effort,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
@@ -131,10 +136,15 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.install_service import (
+    installed_kiro_agent_is_universal,
     installed_kiro_tools,
     installed_opencode_permission,
     kiro_install_predates_native_enforcement,
     require_kiro_agent_resolves,
+)
+from cli_agent_orchestrator.services.kiro_v3_launch import (
+    require_kiro_v3_admissible,
+    require_kiro_v3_launchable,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
     memory_context_for_terminal,
@@ -417,15 +427,40 @@ def _finalize_launch_best_effort(terminal_id: str, *, end_reason: str) -> None:
         logger.warning("Launch record finalize failed for %s", terminal_id, exc_info=True)
 
 
+def resolve_launch_provider(launch_plan: "LaunchPlan | None", provider: str) -> str:
+    """Resolve the CLI this launch runs on (#1099).
+
+    Only the engine sets ``launch_plan.provider``, for a claimed ephemeral launch that a
+    ``provider.route`` answer routed. The request's provider stays the claim's identity: the
+    idempotency fingerprint, the ephemeral launch checks and the bind compare it unchanged.
+    """
+    return launch_plan.provider if launch_plan and launch_plan.provider else provider
+
+
 def resolve_launch_model(
     model: Optional[str], profile: Optional[AgentProfile], launch_plan: "LaunchPlan | None" = None
 ) -> Optional[str]:
     """Resolve the model CAO passes to a provider for this launch."""
+    if launch_plan is not None and launch_plan.provider is not None:
+        # #1099: a routed launch's profile names the fallback provider's model id, so only
+        # the plan can name the model the decided provider runs.
+        return model or launch_plan.model
     return (
         model
         or (launch_plan.model if launch_plan else None)
         or (profile.model if profile else None)
     )
+
+
+def resolve_launch_effort(launch_plan: "LaunchPlan | None" = None) -> Optional[str]:
+    """Resolve the effort CAO passes to a provider for this launch (#1068 C, #1083).
+
+    Unlike the model, effort is never a per-call override or a profile-level default read
+    here: a provider falls back to its own profile config (``claudeConfig.effort``,
+    ``codexConfig.model_reasoning_effort``) when this is ``None``. A decided effort reaches
+    the provider only through the plan, never through a rewritten live profile.
+    """
+    return launch_plan.effort if launch_plan else None
 
 
 # Track terminals that have already received memory injection (first message only).
@@ -1215,11 +1250,13 @@ def _request_fingerprint(
       cannot yield materially different terminals. Same-shaped question as
       ``allowed_tools``, opposite verified answer -- which is why the resolver
       has to be read rather than the pattern matched.
-    - ``engine`` normalises through ``KiroEngine.value`` because the parameter
-      accepts the enum OR a plain string -- ``api/main.py`` forwards a query
-      string while ``parse_kiro_engine`` returns the member, and the same
-      logical request arriving by those two routes must produce ONE digest or
-      a legitimate retry 409s.
+    - ``engine`` normalises through ``canonical_kiro_engine`` because the
+      parameter accepts the enum OR a plain string -- ``api/main.py`` forwards
+      a query string while ``parse_kiro_engine`` returns the member, and the
+      same logical request arriving by those two routes must produce ONE digest
+      or a legitimate retry 409s. The ``kas`` alias canonicalises to ``v3`` for
+      the same reason: a retry spelled ``kas`` and one spelled ``v3`` are one
+      request (#1167).
 
     sha256 hexdigest rather than the joined text: the column stays a bounded
     64 chars regardless of path length, and filesystem paths and profile names
@@ -1242,6 +1279,8 @@ def _request_fingerprint(
     # decide whether that request is acceptable; the engine is validated below,
     # on the path that owns that decision. An invalid engine simply hashes as
     # itself and mismatches, which is all this function needs to be correct.
+    # `canonical_kiro_engine` is the pure half: it maps the `kas` alias to `v3`
+    # and leaves every other string as it is, so it validates nothing.
     # `KiroEngine` is a `str` Enum so joining a member happens to work, but
     # `.value` is the documented contract (`step_fingerprint`: "a KiroEngine
     # member's repr is not stable across versions") and an explicit branch
@@ -1253,7 +1292,7 @@ def _request_fingerprint(
     elif isinstance(engine, KiroEngine):
         engine_value = engine.value
     else:
-        engine_value = str(engine)
+        engine_value = canonical_kiro_engine(str(engine)) or ""
 
     # `None` and `{}` share one encoding, and that is VERIFIED rather than
     # assumed -- the opposite answer to `allowed_tools` above. Every use of
@@ -1919,7 +1958,7 @@ async def _create_terminal_unguarded(
     worktree_repo_root: Optional[str] = None
     try:
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
-        # resource. A KAS request must probe then fail closed with no window,
+        # resource. A v3 request must probe then fail closed with no window,
         # database row, FIFO, Herdr registration, or provider process.
         source = agent_profiles.ProfileSource.INSTALLED
         try:
@@ -1937,14 +1976,29 @@ async def _create_terminal_unguarded(
         # accepting arbitrary attributes as configuration.
         if profile is not None and not isinstance(profile, AgentProfile):
             profile = None
+        if (
+            launch_plan is not None
+            and launch_plan.provider is not None
+            and (source is not agent_profiles.ProfileSource.EPHEMERAL or claim_id is None)
+        ):
+            # #1099: only the engine routes, and only a claimed ephemeral launch. Anything
+            # else is a bug, refused here before any resource is allocated.
+            raise RuntimeError("a launch plan routed a launch that is not a claimed ephemeral")
+        # The request's provider stays the claim's identity: the fingerprint and the ephemeral
+        # launch checks above used it, and the bind below compares it. Everything else that
+        # depends on which CLI runs uses the launch provider (#1099).
+        requested_provider = provider
+        provider = resolve_launch_provider(launch_plan, provider)
         decision_not_honored = False
         launch_model = resolve_launch_model(model, profile, launch_plan)
+        launch_effort = resolve_launch_effort(launch_plan)
         model_honored = ProviderManager.provider_class(provider).honors_model(
             agent_profile=agent_profile,
             profile=profile,
             requested_model=launch_model,
         )
 
+        kiro_v3_admission = None
         if provider == ProviderType.KIRO_CLI.value:
             resolved_engine = resolve_kiro_engine(
                 explicit=engine,
@@ -1964,30 +2018,52 @@ async def _create_terminal_unguarded(
             # Mirror the launch-time precedence (`model or profile.model`, see
             # _get_profile_model): probing the profile snapshot alone would let an
             # explicit override launch --model on a wrapper never probed for it.
+            # A v3 launch also passes kiroConfig.effort as --effort (#1167), so
+            # the probe asks for that flag too; v2's request is unchanged.
+            launch_effort = None
+            if resolved_engine == KiroEngine.V3:
+                try:
+                    launch_effort = kiro_effort(profile)
+                except ValueError as exc:
+                    # A coded refusal, so every create route answers 400 (the
+                    # in-session and run-step routes map a bare ValueError to 404).
+                    raise KiroV3LaunchError(
+                        "kiro_v3_bad_effort",
+                        f"{exc}. Fix the profile's kiroConfig.effort, or retry with engine 'v2'.",
+                    ) from None
             requested = requested_kiro_capabilities(
                 resolved_engine,
                 model=launch_model,
                 yolo=True,
+                effort=launch_effort,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
             try:
-                await asyncio.to_thread(probe, resolved_engine, requested)
+                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
             except KiroCapabilityError:
-                if model or launch_plan is None or launch_plan.model is None:
+                # A routed launch is refused, never relaunched on the profile's model, which
+                # is the fallback provider's (#1099).
+                if (
+                    model
+                    or launch_plan is None
+                    or launch_plan.model is None
+                    or launch_plan.provider is not None
+                ):
                     raise
                 launch_model = resolve_launch_model(model, profile)
                 requested = requested_kiro_capabilities(
-                    resolved_engine, model=launch_model, yolo=True
+                    resolved_engine, model=launch_model, yolo=True, effort=launch_effort
                 )
-                await asyncio.to_thread(probe, resolved_engine, requested)
+                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
                 decision_not_honored = True
                 model_honored = ProviderManager.provider_class(provider).honors_model(
                     agent_profile=agent_profile, profile=profile, requested_model=launch_model
                 )
-            if resolved_engine == KiroEngine.KAS:
-                raise KiroPhase0KASError(
-                    bool(profile and (profile.allowedTools or profile.toolsSettings))
-                )
+            if resolved_engine == KiroEngine.V3:
+                # #1167: the probed version must be allow-listed and verified
+                # (or pending, with the operator's opt-in), and the policy
+                # restricted.
+                kiro_v3_admission = require_kiro_v3_admissible(capabilities, allowed_tools)
         else:
             if engine is not None:
                 raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
@@ -2131,7 +2207,10 @@ async def _create_terminal_unguarded(
             and allowed_tools is not None
             and "*" not in allowed_tools
         ):
-            from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
+            from cli_agent_orchestrator.utils.tool_mapping import (
+                kiro_agent_tools,
+                kiro_universal_tools,
+            )
 
             installed = installed_kiro_tools(agent_profile)
             if installed is None:
@@ -2152,7 +2231,14 @@ async def _create_terminal_unguarded(
                     child_profile=agent_profile,
                 )
             else:
-                permitted = set(kiro_agent_tools(allowed_tools))
+                # A v3-enabled install's universal file lists v3 tool ids next
+                # to the v2 names, so it is compared with the universal map, or
+                # those ids would read as wider than the row (#1167).
+                permitted = set(
+                    kiro_universal_tools(allowed_tools)
+                    if installed_kiro_agent_is_universal(agent_profile)
+                    else kiro_agent_tools(allowed_tools)
+                )
                 wider = [tool for tool in installed if tool not in permitted]
                 if wider:
                     raise InstalledPolicyExceedsAllowlistError(
@@ -2242,10 +2328,11 @@ async def _create_terminal_unguarded(
                 agent_profile,
                 terminal_id,
                 caller_id,
-                provider,
+                requested_provider,
                 claim_id,
                 allowed_tools,
                 idempotency_key,
+                launched_provider=provider,
             )
             ephemeral_state.bound_terminal_id = terminal_id
 
@@ -2296,6 +2383,23 @@ async def _create_terminal_unguarded(
             check_env = (
                 env_vars if new_session else {**get_session_env(session_name), **(env_vars or {})}
             )
+            if kiro_v3_admission is not None:
+                # #1167: from the same cwd and env, a v3 launch needs the default
+                # Kiro home, an installed agent file that passes the validator
+                # for this launch's grant, and a workspace whose .kiro/ v3 would
+                # not load as configuration. First, so a missing file refuses
+                # with the v3 install remedy rather than the v2 resolver's.
+                from cli_agent_orchestrator.services import install_service
+
+                await asyncio.to_thread(
+                    require_kiro_v3_launchable,
+                    agent_profile,
+                    resolved_working_directory,
+                    check_env,
+                    list(allowed_tools or []),
+                    kiro_v3_admission.schema,
+                    Path(install_service.KIRO_AGENTS_DIR),
+                )
             await asyncio.to_thread(
                 require_kiro_agent_resolves, agent_profile, resolved_working_directory, check_env
             )
@@ -2671,6 +2775,7 @@ async def _create_terminal_unguarded(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=launch_model,
+            effort=launch_effort,
             engine=resolved_engine,
             resume_session_id=resume_session_id,
             session_id=fresh_claude_session_id,
@@ -2767,6 +2872,9 @@ async def _create_terminal_unguarded(
             session_incarnation_id=session_incarnation_id,
             status=initial_status,
             last_active=datetime.now(timezone.utc),
+            launch_notes=(
+                kiro_v3_admission.launch_notes if kiro_v3_admission is not None else None
+            ),
         )
 
         logger.info(
@@ -3132,7 +3240,7 @@ def terminal_input_refusal(
     verified before it failed (a restart during its initial delivery) accepts
     the re-send.
 
-    A row from before the column (``identity_verified`` None) is grandfathered
+    A v2 row from before the column (``identity_verified`` None) is grandfathered
     unless it carries a durable failure, in the DB or the fallback sidecar.
     Provisional (#1074): main never verified a Kiro pane, so refusing these
     would break every Kiro worker running across an upgrade.
@@ -3155,7 +3263,10 @@ def terminal_input_refusal(
         return None
     failure = get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
     if failure is None:
-        if verified is None:
+        # Grandfathering is for v2 rows older than the column. No v3 row can
+        # predate it (v3 never launched before #1167), so an unset value on a
+        # v3 row is not trust.
+        if verified is None and canonical_kiro_engine(metadata.get("engine")) != "v3":
             return None
         if _is_identity_check_in_flight(terminal_id):
             return TerminalInputBlockedError(
@@ -3736,11 +3847,13 @@ def _runtime_untrusted_from_row(metadata: dict[str, Any]) -> bool:
     not verify which agent the pane is running. A row from before the column
     (``identity_verified`` None) keeps its window, as live legacy rows are
     grandfathered; once it carries a failure, input to it is still refused.
+    A v3 row is never grandfathered: none can predate the column (#1167).
     Provisional (#1074).
     """
-    return (
-        metadata.get("provider") == ProviderType.KIRO_CLI.value
-        and metadata.get("identity_verified") is False
+    verified = metadata.get("identity_verified")
+    return metadata.get("provider") == ProviderType.KIRO_CLI.value and (
+        verified is False
+        or (verified is None and canonical_kiro_engine(metadata.get("engine")) == "v3")
     )
 
 
@@ -5376,12 +5489,6 @@ def dispatch_input(
         refusal = terminal_input_refusal(terminal_id, metadata)
         if refusal is not None:
             raise refusal
-
-        if (
-            metadata.get("provider") == ProviderType.KIRO_CLI.value
-            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
-        ):
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = _orchestration_value(orchestration_type)

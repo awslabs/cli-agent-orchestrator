@@ -845,56 +845,52 @@ jobs:
         run: |
           uv export --locked --format requirements-txt > requirements.txt
 
-      # SR-4 (interview Q1): `exit-code: 1` makes this job FAIL on a CRITICAL/HIGH finding.
-      # Before this, the step had no exit-code, so it uploaded SARIF and continued — meaning
-      # "Security Scan passed" attested that a scan COMPLETED, not that it was clean. The
-      # rest of the repo already treats scanners as gates: secret-scan.yml passes
-      # `--exit-code 1` to gitleaks at both :68 and :82. This closes the inconsistency
-      # rather than introducing a new policy. (#321)
-      #
-      # SARIF is still produced and uploaded (see the next step's `if: always()`), so the
-      # Security tab keeps its history even on a failing run.
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.69.3
+      # REPORT (never fails on findings): every severity, both default scanners, so the Security
+      # tab keeps MEDIUM/LOW history (#568 DR-5). Runs BEFORE both gates, so a red gate still
+      # leaves a SARIF for the `if: always()` upload below.
+      - name: Trivy report (SARIF, all severities)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'sarif'
           output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          exit-code: '0'
+
+      # SECRET GATE: FAIL on a committed secret of ANY severity (Security Scan's policy since
+      # #321, kept on purpose). Trivy's `severity:` filter applies to every scanner in a run, so
+      # the CRITICAL/HIGH/UNKNOWN gate below would let a MEDIUM/LOW secret (e.g. a JWT) through.
+      # No `severity:` input here = no TRIVY_SEVERITY = every severity gates. gitleaks
+      # (secret-scan.yml) scans PR ranges only, not pushes to main.
+      - name: Trivy secret gate (all severities)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'secret'
+          format: 'table'
           exit-code: '1'
 
-      # FR-8: the SARIF step above writes findings to a FILE, so a failing scan
-      # logs an exit code and names nothing — diagnosing #568 took an out-of-band
-      # `gh api .../code-scanning/alerts` call to learn what had failed. This step
-      # re-runs the same scan in table format so the finding appears in the log.
-      #
-      # `if: failure()` — runs only when the gate above fails, so a green run pays
-      # nothing. `exit-code: '0'` — this step must not be the one that fails the
-      # job; the gate above already did, and a second failure would obscure which
-      # step is authoritative.
-      #
-      # No `severity:` input, matching the effective gate: trivy-action's
-      # entrypoint.sh unsets TRIVY_SEVERITY whenever format is sarif, so the step
-      # above scans at ALL severities. Passing CRITICAL,HIGH here would print a
-      # narrower set than the one that failed the build — and could print NOTHING
-      # while the job is red.
-      - name: Show Trivy findings in the log
-        if: failure()
+      # VULNERABILITY GATE (SR-4, #321): FAIL on a fixable CRITICAL, HIGH or UNKNOWN finding.
+      # UNKNOWN = advisory not yet scored: it gates until scored, then follows its real severity.
+      # Fixable MEDIUM/LOW are report-only (#568 OQ-1). Table format honours `severity:`
+      # (trivy-action only discards it for SARIF) and prints what failed (FR-8).
+      - name: Trivy gate (CRITICAL/HIGH/UNKNOWN)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'table'
+          severity: 'CRITICAL,HIGH,UNKNOWN'
           ignore-unfixed: true
-          exit-code: '0'
+          exit-code: '1'
 
       - name: Upload Trivy scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
-        # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL finding
-        # would fail the scan step and SKIP the upload, hiding the very finding that failed
-        # the build from the Security tab.
+        # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL/HIGH
+        # finding would fail the gate step and SKIP the upload, hiding the very finding that
+        # failed the build from the Security tab.
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
