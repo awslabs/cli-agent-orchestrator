@@ -1,0 +1,37 @@
+{
+  "name": "workflow_scout",
+  "description": "Read-only locator for existing CAO workflow specs",
+  "tools": [
+    "@cao-mcp-server",
+    "execute_bash",
+    "fs_read",
+    "goal",
+    "introspect",
+    "knowledge",
+    "read",
+    "shell",
+    "subagent",
+    "todo_list",
+    "use_aws"
+  ],
+  "allowedTools": [
+    "@builtin",
+    "fs_read",
+    "execute_bash",
+    "@cao-mcp-server"
+  ],
+  "includeMcpJson": false,
+  "resources": [
+    "file://<ROOT>/agent-context/workflow_scout.md",
+    "skill://<ROOT>/skills/**/SKILL.md",
+    "skill://<ROOT>/skills/*/SKILL.md"
+  ],
+  "mcpServers": {
+    "cao-mcp-server": {
+      "type": "stdio",
+      "command": "/fixture/bin/cao-mcp-server",
+      "args": [],
+      "timeout": 1200000
+    }
+  }
+}

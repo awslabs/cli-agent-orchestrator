@@ -166,33 +166,32 @@ async def test_a_keyed_replay_of_a_routed_launch_reattaches(runtime_store):
     assert factory.call_count == 1 and backend.create_window.call_count == 1
 
 
-# Kiro's probe-failure fallback reruns the profile's model; a routed launch refuses instead.
+# A plan routed to Kiro is refused before any Kiro step (#1167): Kiro is not routable yet.
 
 
 @pytest.mark.asyncio
-async def test_a_routed_launch_whose_planned_model_the_kiro_probe_refuses_is_refused(
-    runtime_store,
+async def test_a_launch_plan_routed_to_kiro_refuses_before_any_kiro_step(
+    runtime_store, monkeypatch
 ):
-    from cli_agent_orchestrator.models.kiro_engine import KiroEngine
-    from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilityError
-
     env, name, backend, factory = runtime_store
-    calls = []
-
-    def probe(engine, requested):
-        calls.append(set(requested))
-        if len(calls) == 1:
-            raise KiroCapabilityError("unsupported", KiroEngine.V2, "synthetic probe refusal")
-
+    stage_a = Mock(side_effect=AssertionError("stage A ran for a plan routed to Kiro"))
+    probe = Mock(side_effect=AssertionError("the Kiro probe ran for a plan routed to Kiro"))
+    monkeypatch.setattr(terminal_service, "_helper_stage_a", stage_a)
     claimed = claim(env, name)["claim_id"]
     plan = LaunchPlan(model="kiro-planned", provider="kiro_cli")
-    with pytest.raises(KiroCapabilityError):
+    with pytest.raises(RuntimeError) as err:
         await launch(env, name, plan, claimed=claimed, kiro_capability_probe=probe)
-    assert len(calls) == 1
+    assert str(err.value) == (
+        "a launch plan routed a launch to kiro_cli, which provider.route cannot route to yet"
+    )
+    stage_a.assert_not_called()
+    probe.assert_not_called()
     factory.assert_not_called()
     backend.create_window.assert_not_called()
+    assert database.get_terminal_metadata(CHILD) is None
     row = database.get_ephemeral_agent(name)
     assert row["state"] == "pending" and row["provider"] == "claude_code"
+    assert bound_events(name) == []
 
 
 # run_agent_step classifies the output with the provider that ran.

@@ -966,3 +966,185 @@ def test_sweep_interval_keeps_the_default_for_errors_the_loader_does_not_wrap():
     settings_service.SETTINGS_FILE.write_text("[" * 100_000 + "]" * 100_000)
     expected = EPHEMERAL_DEFAULTS["sweep_interval_seconds"]
     assert ephemeral_service.sweep_interval_seconds() == expected
+
+
+# --- Kiro helpers' per-launch homes (#1167 Phase 2) -----------------------------
+
+
+@pytest.fixture
+def kiro_store(store, monkeypatch, tmp_path):
+    from cli_agent_orchestrator.providers import kiro_launch_home
+
+    store.config["allowed_providers"] = ["claude_code", "kiro_cli"]
+    owners = SimpleNamespace(stoppable=True, calls=[])
+
+    def stop(home):
+        owners.calls.append(home)
+        return owners.stoppable
+
+    monkeypatch.setattr(kiro_launch_home, "stop_kiro_home_processes", stop)
+    # A fake operator HOME: the release compares its ~/.kiro markers.
+    operator = tmp_path / "operator-home"
+    (operator / ".kiro").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(operator))
+    store.kiro = kiro_launch_home
+    store.owners = owners
+    store.operator = operator
+    yield store
+    kiro_launch_home.discard_launch_home(CHILD)
+    for directory, dirnames, _ in os.walk(store.home):
+        for name in dirnames:
+            path = Path(directory) / name
+            if not path.is_symlink() and (os.lstat(path).st_mode & 0o777) == 0:
+                path.chmod(0o700)
+
+
+def kiro_launch(s, with_row=True, prepared=True, recorded_home=None):
+    """Bind a kiro_cli name and prepare its home as stage B does; no kiro-cli runs."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    spec = {**SPEC, "provider": "kiro_cli"}
+    name = s.service.create_ephemeral_agent(spec, CALLER)["name"]
+    token = claim(s, name)
+    s.service.bind_ephemeral_agent(name, CHILD, CALLER, "kiro_cli", token, None)
+    if prepared:
+        profile = AgentProfile(name=name, description="d", system_prompt="brief")
+        grant = s.kiro.kiro_helper_grant(["fs_read"])
+        payload = s.kiro.render_helper_agent(name, profile, grant, CHILD)
+        snapshot = s.kiro.snapshot_kiro_global_home(
+            s.kiro.server_home(), placeholder_listable=False
+        )
+        home = s.kiro.create_launch_home(CHILD, name, payload, snapshot)
+        s.kiro.seal_launch_home(home)
+        s.service.record_kiro_event(
+            CHILD,
+            "kiro_home_prepared",
+            home=recorded_home or str(home.home),
+            hashes=home.hashes(),
+            global_home=snapshot.record(),
+        )
+        # As after a restart: only the archive remembers the home.
+        s.kiro.discard_launch_home(CHILD)
+    if with_row:
+        database.create_terminal(CHILD, "cao-session", "child", "kiro_cli")
+    return name
+
+
+def kiro_events(name):
+    return [
+        e
+        for e in json.loads(archive(name).read_bytes())["events"]
+        if e["event"].startswith("kiro_")
+    ]
+
+
+def test_the_sweep_removes_a_kiro_home_whose_terminal_row_is_gone(kiro_store):
+    s = kiro_store
+    name = kiro_launch(s)
+    home = s.kiro.kiro_home_path(CHILD)
+    database.delete_terminal(CHILD, end_reason="deleted")
+    s.service.release(CHILD, "terminal_gone")
+    result = sweep(s)
+    assert result.get("kiro_homes") == 1
+    assert not os.path.lexists(home) and s.owners.calls == [home]
+    removed = kiro_events(name)[-1]
+    assert removed["event"] == "kiro_home_removed"
+    assert removed["agent_modified"] is False and removed["settings_modified"] is False
+    assert removed["secrets_store_changed"] is False and removed["global_home_changed"] is False
+
+
+def test_an_archive_record_proves_only_this_homes_path(kiro_store, tmp_path):
+    """A record for the same terminal id under another CAO home is no proof for this one."""
+    s = kiro_store
+    other = tmp_path / "other-cao" / "ephemeral" / "kiro" / CHILD
+    kiro_launch(s, with_row=False, recorded_home=str(other))
+    home = s.kiro.kiro_home_path(CHILD)
+    assert str(home) != str(other) and s.service.kiro_home_record(CHILD) is None
+    assert s.service.remove_kiro_home(CHILD) is True  # not CAO's: nothing to retry
+    assert home.is_dir() and s.owners.calls == []
+
+
+def test_the_release_record_says_what_kiro_changed(kiro_store):
+    s = kiro_store
+    name = kiro_launch(s, with_row=False)
+    home = s.kiro.kiro_home_path(CHILD)
+    (home / "secrets.json").write_text('{"copied": true}')
+    (s.operator / ".kiro" / ".secrets-migrated").write_text("x")
+    s.service.release(CHILD, "launch_failed")
+    assert sweep(s).get("kiro_homes") == 1
+    removed = kiro_events(name)[-1]
+    assert removed["secrets_store_changed"] is True and removed["global_home_changed"] is True
+
+
+def test_the_sweep_leaves_a_home_whose_terminal_row_survives(kiro_store):
+    s = kiro_store
+    kiro_launch(s)
+    s.service.release(CHILD, "launch_failed")
+    assert "kiro_homes" not in sweep(s)
+    assert s.kiro.kiro_home_path(CHILD).is_dir() and s.owners.calls == []
+
+
+def test_the_sweep_retries_a_kiro_home_while_an_owner_may_remain(kiro_store):
+    s = kiro_store
+    kiro_launch(s, with_row=False)
+    s.service.release(CHILD, "launch_failed")
+    s.owners.stoppable = False
+    assert "kiro_homes" not in sweep(s)
+    assert s.kiro.kiro_home_path(CHILD).is_dir()
+    s.owners.stoppable = True
+    assert sweep(s).get("kiro_homes") == 1
+
+
+def test_the_sweep_never_removes_a_kiro_entry_cao_did_not_prepare(kiro_store):
+    s = kiro_store
+    kiro_launch(s, with_row=False, prepared=False)
+    s.service.release(CHILD, "launch_failed")
+    planted = s.kiro.kiro_home_path(CHILD)
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.mkdir()
+    (planted / "keep").write_text("x")
+    assert "kiro_homes" not in sweep(s)
+    assert (planted / "keep").read_text() == "x" and s.owners.calls == []
+
+
+@pytest.mark.parametrize("prepared", [True, False])
+def test_retention_keeps_a_gc_row_while_its_kiro_home_exists(kiro_store, prepared):
+    s = kiro_store
+    name = kiro_launch(s, with_row=False, prepared=prepared)
+    s.service.release(CHILD, "launch_failed")
+    home = s.kiro.kiro_home_path(CHILD)
+    if not prepared:
+        home.parent.mkdir(parents=True, exist_ok=True)
+        home.symlink_to(s.home)  # an entry of any type keeps the row
+    s.owners.stoppable = False
+    s.clock.at(days=15)
+    age(archive(name), s.clock.now - RETENTION - timedelta(days=1))
+    sweep(s)
+    assert row(name) is not None and archive(name).is_file()
+    # Once the home is gone, retention prunes the row as for any other name.
+    if prepared:
+        s.owners.stoppable = True
+        sweep(s)
+    else:
+        home.unlink()
+    assert not os.path.lexists(home)
+    age(archive(name), s.clock.now - RETENTION - timedelta(days=1))
+    assert sweep(s).get("pruned") == 1 and row(name) is None
+
+
+def test_an_unreadable_archive_keeps_a_kiro_home_for_a_retry(kiro_store):
+    """Fail-closed: an archive that cannot be read is not 'no record'."""
+    s = kiro_store
+    name = kiro_launch(s, with_row=False)
+    s.service.release(CHILD, "launch_failed")
+    archive(name).write_text("{not json")
+    assert "kiro_homes" not in sweep(s)
+    assert s.kiro.kiro_home_path(CHILD).is_dir() and s.owners.calls == []
+    assert row(name) is not None
+    # Not "no record": the read raises, so even a caller holding row proof (a
+    # provider rebuilt after a restart) retains instead of removing without hashes.
+    with pytest.raises(ValueError):
+        s.service.kiro_home_record(CHILD)
+    with pytest.raises(ValueError):
+        s.service.remove_kiro_home(CHILD, row_proof=True)
+    assert s.kiro.kiro_home_path(CHILD).is_dir() and s.owners.calls == []

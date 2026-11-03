@@ -79,6 +79,11 @@ _HERDR_ALLOWED_FLAGS = frozenset(
 )
 
 
+def herdr_arg_is_safe(value: str) -> bool:
+    """True when ``value`` passes the herdr argument sanitizer (``_SAFE_ARG_RE``)."""
+    return _SAFE_ARG_RE.fullmatch(value) is not None
+
+
 def _sanitize_herdr_args(args: List[str]) -> List[str]:
     """Validate herdr CLI arguments and return a shallow copy.
 
@@ -354,6 +359,18 @@ class HerdrBackend(TerminalBackend):
 
         logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
         return window_name
+
+    def restore_session_env(self, session_name: str, key: str, launch_value: str) -> None:
+        """Nothing to restore: herdr's ``--env`` reaches only the pane it launches.
+
+        Measured on herdr 0.9.3 (#1074, provisional): a workspace created with
+        ``--env KEY=…`` gives ``KEY`` to its root pane only. Later tabs, with or
+        without an ``--env`` of their own, and a split of that root pane start
+        without it. herdr keeps no workspace environment, so a later tab gets
+        exactly what it would have had without ``launch_value``: its own
+        ``--env`` (``_build_env_args``) over the herdr server's environment.
+        """
+        logger.debug(f"restore_session_env({key}) is a no-op for herdr (session={session_name})")
 
     def session_exists(self, session_name: str) -> bool:
         """Check if a workspace with the given label exists."""
