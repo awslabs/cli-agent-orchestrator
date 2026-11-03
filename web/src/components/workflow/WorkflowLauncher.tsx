@@ -45,6 +45,32 @@ export function rowsFromDeclaredInputs(inputs: unknown): InputRow[] {
   return rows.length ? rows : EMPTY_ROWS
 }
 
+const INT_RE = /^\s*[+-]?\d+\s*$/
+
+// A row's value as the server expects it, by the declared type: the same rules as
+// the CLI's `_coerce` (cli/commands/workflow.py). An `int` or `bool` input sent as
+// a string is a 400, so those go out as JSON numbers and booleans. Undeclared rows
+// get the CLI's guess (true/false -> bool, a bare integer -> int); declared
+// string and path rows stay strings. An empty `int` is left out, so its default
+// applies (or the server reports it missing).
+export function coerceInput(row: InputRow): { value?: unknown; error?: string } {
+  const low = row.value.trim().toLowerCase()
+  const int = INT_RE.test(row.value) ? Number.parseInt(row.value, 10) : NaN
+  switch (row.type) {
+    case 'bool':
+      return { value: low === 'true' }
+    case 'int':
+      if (!low) return {}
+      return Number.isSafeInteger(int) ? { value: int } : { error: 'Must be a whole number' }
+    case 'string':
+    case 'path':
+      return { value: row.value }
+    default:
+      if (low === 'true' || low === 'false') return { value: low === 'true' }
+      return Number.isSafeInteger(int) ? { value: int } : { value: row.value }
+  }
+}
+
 export const LAUNCHER_DRAFT_KEY = 'cao.workflowLauncher'
 
 interface PendingApproval {
@@ -196,12 +222,15 @@ export function WorkflowLauncher() {
 
   // Only send rows with a non-empty key; the server validates against the
   // workflow's declared inputs and returns a 400 the store surfaces as a snackbar.
+  // A value that can't take its declared type blocks the run with an inline error.
+  const coerced = inputs.map(coerceInput)
+  const invalid = coerced.some((c, i) => c.error && inputs[i].key.trim())
   const buildPayload = () => {
     const payload: Record<string, unknown> = {}
-    for (const { key, value } of inputs) {
+    inputs.forEach(({ key }, i) => {
       const k = key.trim()
-      if (k) payload[k] = value
-    }
+      if (k && 'value' in coerced[i]) payload[k] = coerced[i].value
+    })
     return payload
   }
 
@@ -213,7 +242,7 @@ export function WorkflowLauncher() {
   }
 
   const submit = async () => {
-    if (!selected || submitting) return
+    if (!selected || submitting || invalid) return
     setSubmitting(true)
     try {
       await run()
@@ -223,7 +252,7 @@ export function WorkflowLauncher() {
   }
 
   const approveAndRun = async () => {
-    if (!pendingApproval || submitting) return
+    if (!pendingApproval || submitting || invalid) return
     setSubmitting(true)
     try {
       await api.approveWorkflowPlan(pendingApproval.planId)
@@ -276,29 +305,48 @@ export function WorkflowLauncher() {
                 <span className="text-xs text-gray-400">Inputs</span>
                 <div className="mt-1 space-y-1.5">
                   {inputs.map((row, i) => (
-                    <div key={i} className="flex items-center gap-1.5">
-                      <input
-                        aria-label={`Input ${i + 1} name`}
-                        value={row.key}
-                        onChange={e => setRow(i, { key: e.target.value })}
-                        placeholder="name"
-                        className="w-28 rounded-lg border border-gray-700 bg-gray-900 px-2 py-1 text-sm text-gray-200 font-mono"
-                      />
-                      <input
-                        aria-label={`Input ${i + 1} value`}
-                        value={row.value}
-                        onChange={e => setRow(i, { value: e.target.value })}
-                        placeholder={row.required ? `value (required${row.type ? `, ${row.type}` : ''})` : row.type ? `value (${row.type})` : 'value'}
-                        className="flex-1 rounded-lg border border-gray-700 bg-gray-900 px-2 py-1 text-sm text-gray-200"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => removeRow(i)}
-                        aria-label={`Remove input ${i + 1}`}
-                        className="p-1 text-gray-500 hover:text-red-400"
-                      >
-                        <X size={14} aria-hidden="true" />
-                      </button>
+                    <div key={i}>
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          aria-label={`Input ${i + 1} name`}
+                          value={row.key}
+                          onChange={e => setRow(i, { key: e.target.value })}
+                          placeholder="name"
+                          className="w-28 rounded-lg border border-gray-700 bg-gray-900 px-2 py-1 text-sm text-gray-200 font-mono"
+                        />
+                        {row.type === 'bool' ? (
+                          <label className="flex flex-1 items-center gap-2 px-2 py-1 text-sm text-gray-300">
+                            <input
+                              type="checkbox"
+                              aria-label={`Input ${i + 1} value`}
+                              checked={row.value.trim().toLowerCase() === 'true'}
+                              onChange={e => setRow(i, { value: e.target.checked ? 'true' : 'false' })}
+                            />
+                            <span className="text-xs text-gray-500">{row.required ? 'bool, required' : 'bool'}</span>
+                          </label>
+                        ) : (
+                          <input
+                            aria-label={`Input ${i + 1} value`}
+                            aria-invalid={!!coerced[i].error}
+                            inputMode={row.type === 'int' ? 'numeric' : undefined}
+                            value={row.value}
+                            onChange={e => setRow(i, { value: e.target.value })}
+                            placeholder={row.required ? `value (required${row.type ? `, ${row.type}` : ''})` : row.type ? `value (${row.type})` : 'value'}
+                            className={`flex-1 rounded-lg border bg-gray-900 px-2 py-1 text-sm text-gray-200 ${coerced[i].error ? 'border-red-700' : 'border-gray-700'}`}
+                          />
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => removeRow(i)}
+                          aria-label={`Remove input ${i + 1}`}
+                          className="p-1 text-gray-500 hover:text-red-400"
+                        >
+                          <X size={14} aria-hidden="true" />
+                        </button>
+                      </div>
+                      {coerced[i].error && (
+                        <p className="mt-0.5 text-xs text-red-400" role="alert">{row.key}: {coerced[i].error}</p>
+                      )}
                     </div>
                   ))}
                   <button
@@ -325,7 +373,7 @@ export function WorkflowLauncher() {
                 <button
                   type="button"
                   onClick={submit}
-                  disabled={!selected || submitting}
+                  disabled={!selected || submitting || invalid}
                   className="inline-flex items-center gap-2 rounded-lg bg-emerald-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {submitting ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
@@ -394,7 +442,7 @@ export function WorkflowLauncher() {
                     <button
                       type="button"
                       onClick={approveAndRun}
-                      disabled={submitting}
+                      disabled={submitting || invalid}
                       className="inline-flex items-center gap-2 rounded-lg bg-amber-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       {submitting ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <ShieldCheck size={14} aria-hidden="true" />}

@@ -9,7 +9,7 @@ import { PlanApprovalForm } from '../components/workflow/PlanApprovalForm'
 import { RunResultPanel, findReportPaths } from '../components/workflow/RunResultPanel'
 import { RunArtifacts } from '../components/workflow/RunArtifacts'
 import {
-  WorkflowLauncher, LAUNCHER_DRAFT_KEY, loadLauncherDraft, rowsFromDeclaredInputs,
+  WorkflowLauncher, LAUNCHER_DRAFT_KEY, loadLauncherDraft, rowsFromDeclaredInputs, coerceInput,
 } from '../components/workflow/WorkflowLauncher'
 
 function ok(data: unknown) {
@@ -154,6 +154,57 @@ describe('WorkflowLauncher', () => {
     resolveSpec({ name: 'review_flow', inputs: { topic: { type: 'string' } } })
     await new Promise(r => setTimeout(r, 0))
     expect((screen.getByLabelText('Input 1 name') as HTMLInputElement).value).toBe('mine')
+  })
+
+  it('coerces values by the declared type, like the CLI', () => {
+    expect(coerceInput({ key: 'n', value: ' 3 ', type: 'int' })).toEqual({ value: 3 })
+    expect(coerceInput({ key: 'n', value: '-2', type: 'int' })).toEqual({ value: -2 })
+    expect(coerceInput({ key: 'n', value: '2.5', type: 'int' }).error).toBeTruthy()
+    expect(coerceInput({ key: 'n', value: 'two', type: 'int' }).error).toBeTruthy()
+    expect(coerceInput({ key: 'n', value: '', type: 'int' })).toEqual({})
+    expect(coerceInput({ key: 'b', value: 'True', type: 'bool' })).toEqual({ value: true })
+    expect(coerceInput({ key: 'b', value: '', type: 'bool' })).toEqual({ value: false })
+    expect(coerceInput({ key: 's', value: '42', type: 'string' })).toEqual({ value: '42' })
+    expect(coerceInput({ key: 'p', value: 'true', type: 'path' })).toEqual({ value: 'true' })
+    // Undeclared rows: the CLI's `_coerce` guess.
+    expect(coerceInput({ key: 'x', value: '7' })).toEqual({ value: 7 })
+    expect(coerceInput({ key: 'x', value: 'false' })).toEqual({ value: false })
+    expect(coerceInput({ key: 'x', value: 'hello' })).toEqual({ value: 'hello' })
+  })
+
+  it('sends declared int and bool inputs as a number and a boolean', async () => {
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue([DEF])
+    vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue({ name: 'review_flow', inputs: {
+      topic: { type: 'string', required: true },
+      concurrency: { type: 'int', required: false, default: 2 },
+      strict: { type: 'bool', required: false, default: false },
+    } })
+    const submit = vi.spyOn(api, 'submitWorkflowRun').mockResolvedValue({ run_id: 'r1', state: 'running' })
+    vi.spyOn(api, 'listWorkflowRuns').mockResolvedValue([])
+    render(<WorkflowLauncher />)
+    fireEvent.click(screen.getByRole('button', { name: /Run a workflow/ }))
+    await waitFor(() => expect((screen.getByLabelText('Input 3 name') as HTMLInputElement).value).toBe('strict'))
+    fireEvent.change(screen.getByLabelText('Input 1 value'), { target: { value: 'auth' } })
+    fireEvent.change(screen.getByLabelText('Input 2 value'), { target: { value: '4' } })
+    fireEvent.click(screen.getByLabelText('Input 3 value'))
+    fireEvent.click(screen.getByRole('button', { name: /Run workflow/ }))
+    await waitFor(() => expect(submit).toHaveBeenCalled())
+    expect(submit.mock.calls[0][0].inputs).toEqual({ topic: 'auth', concurrency: 4, strict: true })
+  })
+
+  it('blocks the run with an inline error when an int input is not a whole number', async () => {
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue([DEF])
+    vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue({ name: 'review_flow', inputs: { concurrency: { type: 'int', default: 2 } } })
+    const submit = vi.spyOn(api, 'submitWorkflowRun')
+    render(<WorkflowLauncher />)
+    fireEvent.click(screen.getByRole('button', { name: /Run a workflow/ }))
+    await waitFor(() => expect((screen.getByLabelText('Input 1 value') as HTMLInputElement).value).toBe('2'))
+    fireEvent.change(screen.getByLabelText('Input 1 value'), { target: { value: 'lots' } })
+    expect(screen.getByRole('alert').textContent).toContain('concurrency: Must be a whole number')
+    const runButton = screen.getByRole('button', { name: /Run workflow/ }) as HTMLButtonElement
+    expect(runButton.disabled).toBe(true)
+    fireEvent.click(runButton)
+    expect(submit).not.toHaveBeenCalled()
   })
 
   const inputs = [{ key: 'topic', value: 't' }, { key: 'report', value: '/tmp/report.md' }]
