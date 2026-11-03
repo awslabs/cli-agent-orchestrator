@@ -380,6 +380,26 @@ class TestNoJobCanDispatchAWorkflow:
         }
 
 
+class TestReleaseCheckoutPinsTheEventSha:
+    """Review on #652, Note 1: the `release` job's checkout has no `ref:`, so it checks out
+    the same commit (`github.sha`) `preflight` already validated CI for. `release` is a
+    SEPARATE job that can start minutes after `preflight`, and an explicit `ref: main` would
+    re-resolve main's CURRENT tip at that later checkout time, releasing a commit `preflight`
+    never checked. Passes all other tests silently; only this one pins it."""
+
+    def test_the_release_checkout_has_no_ref_override(self):
+        steps = RELEASE["jobs"]["release"]["steps"]
+        (checkout,) = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
+        assert "ref" not in (
+            checkout.get("with") or {}
+        ), "an explicit ref re-resolves at checkout time, after preflight already ran"
+
+    def test_the_preflight_checkout_also_has_no_ref_override(self):
+        steps = RELEASE["jobs"]["preflight"]["steps"]
+        (checkout,) = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
+        assert "ref" not in (checkout.get("with") or {})
+
+
 class TestBothEventsStopAtTheGitHubRelease:
     @pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
     def test_a_release_runs_preflight_and_release_only(self, event):
