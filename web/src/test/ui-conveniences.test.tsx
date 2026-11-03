@@ -96,7 +96,16 @@ describe('HealthCard', () => {
     render(<HealthCard />)
     expect(await screen.findByText('herdr')).toBeTruthy()
     expect(screen.getByText('v2.5.4')).toBeTruthy()
-    expect(screen.getByText('claude: unavailable')).toBeTruthy()
+    expect(screen.getByText('claude: not installed')).toBeTruthy()
+  })
+
+  it('shows a binary that is not on PATH as neutral, and a failed probe in red', async () => {
+    vi.spyOn(api, 'getHealth').mockResolvedValue({ status: 'ok', terminal_backend: 'tmux', components: { herdr: 'unavailable', db: 'error' } })
+    render(<HealthCard />)
+    const missing = await screen.findByText('herdr: not installed')
+    expect(missing.className).toContain('text-gray-400')
+    expect(missing.className).not.toContain('red')
+    expect(screen.getByText('db: error').className).toContain('text-red-300')
   })
 })
 

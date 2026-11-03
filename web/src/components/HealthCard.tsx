@@ -6,6 +6,15 @@ import { useEffect, useState } from 'react'
 import { Server } from 'lucide-react'
 import { api, HealthInfo } from '../api'
 
+// The server probes each binary with `which`; `unavailable` only means it isn't
+// on PATH (herdr on a tmux host, a provider CLI nobody installed), which is not a
+// fault. Shown neutral, so red stays for components that actually failed.
+function componentChip(state: unknown): { className: string; label: string } {
+  if (state === 'ok') return { className: 'bg-emerald-900/40 text-emerald-300', label: 'ok' }
+  if (state === 'unavailable') return { className: 'bg-gray-800 text-gray-400', label: 'not installed' }
+  return { className: 'bg-red-900/40 text-red-300', label: String(state) }
+}
+
 export function HealthCard() {
   const [health, setHealth] = useState<HealthInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -36,14 +45,14 @@ export function HealthCard() {
             </p>
           )}
           <div className="flex flex-wrap gap-1.5">
-            {Object.entries(health.components && typeof health.components === 'object' ? health.components : {}).map(([name, state]) => (
-              <span
-                key={name}
-                className={`rounded px-1.5 py-0.5 font-mono ${state === 'ok' ? 'bg-emerald-900/40 text-emerald-300' : 'bg-red-900/40 text-red-300'}`}
-              >
-                {name}: {state}
-              </span>
-            ))}
+            {Object.entries(health.components && typeof health.components === 'object' ? health.components : {}).map(([name, state]) => {
+              const chip = componentChip(state)
+              return (
+                <span key={name} className={`rounded px-1.5 py-0.5 font-mono ${chip.className}`}>
+                  {name}: {chip.label}
+                </span>
+              )
+            })}
           </div>
         </div>
       )}
