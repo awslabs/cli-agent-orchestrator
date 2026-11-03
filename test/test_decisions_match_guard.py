@@ -12,6 +12,10 @@ attribute chains through an imported package alias (``decisions.catalog``). It i
 one hop deep: a value computed at run time, or a module reached through another module's
 attributes, is outside what any AST check can see.
 
+``EXEMPT`` names the modules that use the bare word ``match`` for something else, and exactly
+how many times each does. A new ``match`` literal in one of them still fails, and so does an
+entry that no longer matches its module.
+
 AC20. No module under ``src/`` names a decider ``jev`` or ``jevk5``: core never branches on
 which decider answered (D9). The design scopes this to ``src/``; ``test/`` legitimately builds
 fakes under those names to prove that neutrality.
@@ -20,6 +24,7 @@ fakes under those names to prove that neutrality.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from importlib.util import resolve_name
 from pathlib import Path
 
@@ -45,6 +50,16 @@ IMPORTERS = {
     MATCHER: READERS | {"cli_agent_orchestrator/decisions/engine.py"},
 }
 KEY_WORDS = ("match", "match_catalog")
+# Modules that name the bare key "match" for something other than decisions.match, with the
+# exact number of such literals and why. Only the bare key is allowed: "match_catalog",
+# "decisions.match" and the .match_catalog field still fail in these modules too.
+KIRO_RULE_KEY = "Kiro v3 permission-rule key `match`, not `decisions.match`"
+EXEMPT = {
+    "cli_agent_orchestrator/providers/kiro_v3_schema.py": (1, KIRO_RULE_KEY),
+    "cli_agent_orchestrator/services/kiro_v3_validate.py": (3, KIRO_RULE_KEY),
+    "cli_agent_orchestrator/utils/tool_mapping.py": (2, KIRO_RULE_KEY),
+}
+BARE_KEY = "names 'match'"
 DECIDER_NAMES = ("jev", "jevk5")
 
 
@@ -159,9 +174,32 @@ def _scan_src() -> dict[str, list[str]]:
     return total
 
 
+def _bare_key_counts(reads: list[str]) -> Counter[str]:
+    """How many bare ``match`` literals each module names, from the ``reads`` findings."""
+    return Counter(
+        finding.split(":", 1)[0] for finding in reads if finding.endswith(": " + BARE_KEY)
+    )
+
+
+def _unexempted(reads: list[str]) -> list[str]:
+    """The findings left once each EXEMPT module's allowed bare ``match`` literals are removed.
+
+    Only up to the allowed count is removed, so an extra literal in an exempt module stays.
+    """
+    allowance = {relative: count for relative, (count, _) in EXEMPT.items()}
+    left = []
+    for finding in reads:
+        relative = finding.split(":", 1)[0]
+        if finding.endswith(": " + BARE_KEY) and allowance.get(relative, 0) > 0:
+            allowance[relative] -= 1
+            continue
+        left.append(finding)
+    return left
+
+
 def test_AC19_only_the_matcher_validator_cli_and_hash_read_decisions_match():
     findings = _scan_src()
-    assert findings["reads"] == [], findings["reads"]
+    assert _unexempted(findings["reads"]) == [], _unexempted(findings["reads"])
     assert findings["imports"] == [], findings["imports"]
     # Not vacuous: the readers do read it, and the scan sees them.
     for relative in READERS:
@@ -171,6 +209,31 @@ def test_AC19_only_the_matcher_validator_cli_and_hash_read_decisions_match():
         scan((SRC / relative).read_text(encoding="utf-8"), "elsewhere/x.py")["reads"]
         for relative in READERS
     )
+
+
+def test_AC19_each_exemption_is_exact_and_covers_only_the_bare_key():
+    counts = _bare_key_counts(_scan_src()["reads"])
+    for relative, (count, reason) in EXEMPT.items():
+        assert (SRC / relative).is_file(), relative
+        assert reason.strip(), relative
+        assert relative not in READERS, relative
+        # Exact: one more literal is a new reader, one fewer is a stale entry.
+        assert counts[relative] == count, (relative, counts[relative], count)
+    # The exemption removes only the allowed bare keys from an exempt module.
+    relative = "cli_agent_orchestrator/utils/tool_mapping.py"
+    extra = scan(
+        "A = {'match': 1}\nB = 'match'\nC = 'match'\nD = 'match_catalog'\n"
+        "E = 'decisions.match'\ndef f(s):\n    return s.match_catalog\n",
+        relative,
+    )["reads"]
+    assert len(extra) == 6, extra
+    # Three bare keys against an allowance of two leave one; the other words are never exempt.
+    left = sorted(finding.split(": ", 1)[1] for finding in _unexempted(extra))
+    assert left == sorted(
+        [BARE_KEY, "names 'match_catalog'", "names 'decisions.match'", "reads .match_catalog"]
+    ), left
+    # And never from a module that isn't listed.
+    assert _unexempted(scan("A = 'match'\n", OUTSIDE)["reads"]) == [f"{OUTSIDE}:1: names 'match'"]
 
 
 def test_AC20_no_src_module_names_jev_or_jevk5():
