@@ -133,8 +133,10 @@ def kiro_agent_dirs(
     ``~/.kiro``), which kiro-cli reads; plus ``installed_dir``, the directory
     ``cao install`` writes. kiro-cli reads that one only when it is one of the
     others: a ``CAO_AGENTS_DIR`` elsewhere passes this check, and the launch is
-    then refused at the header check instead. Duplicates are dropped and order
-    is kept.
+    then refused at the header check instead. A v3 launch is refused before
+    this check (``kiro_v3_agents_dir_unsupported``), because an older file of
+    the same name in ``~/.kiro/agents`` would pass the header check. Duplicates
+    are dropped and order is kept.
 
     Provisional (#1074): the workspace is the launch cwd only, not its parents,
     and a workspace agent counts for installed launches; refusing a workspace

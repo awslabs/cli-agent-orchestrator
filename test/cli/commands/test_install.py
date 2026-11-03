@@ -68,6 +68,7 @@ class TestInstallCommand:
             "developer",
             "kiro_cli",
             {"API_TOKEN": "secret-token"},
+            engine=None,
         )
 
     def test_install_without_provider_flag_passes_none_and_echoes_resolved_provider(
@@ -96,7 +97,7 @@ class TestInstallCommand:
 
         assert result.exit_code == 0
         assert "copilot_cli agent: /tmp/copilot/developer.agent.md" in result.output
-        mock_install.assert_called_once_with("developer", None, None)
+        mock_install.assert_called_once_with("developer", None, None, engine=None)
 
     def test_install_help_documents_provider_precedence(self, runner: CliRunner) -> None:
         """--provider help text should document flag > frontmatter > default."""
@@ -168,7 +169,7 @@ class TestInstallCommand:
         assert "Agent 'local' installed successfully" in result.output
         # Service sees the validated stem and the text, never the full user path.
         mock_install.assert_called_once_with(
-            "local", "kiro_cli", None, profile_content=source_profile.read_text()
+            "local", "kiro_cli", None, profile_content=source_profile.read_text(), engine=None
         )
         # The CLI does not write the store; that is the service's job, after the guard.
         assert not (local_store / "local.md").exists()
@@ -286,4 +287,4 @@ def test_install_omp_provider_is_accepted_by_cli():
         result = runner.invoke(install, ["developer", "--provider", "omp"])
 
     assert result.exit_code == 0
-    mock_install.assert_called_once_with("developer", "omp", None)
+    mock_install.assert_called_once_with("developer", "omp", None, engine=None)
