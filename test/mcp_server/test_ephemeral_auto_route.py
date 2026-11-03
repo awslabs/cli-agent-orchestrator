@@ -1129,7 +1129,7 @@ def drop_provider_support(rt, monkeypatch, rule):
         # validate_block reads the same table: the operator has already removed the provider.
         tiers = {**TIERS, "codex": {t: "codex-" + t for t in ("small", "medium", "large")}}
         operator_edit(rt, {"allowed_providers": ["codex"], "model_tiers": tiers})
-        monkeypatch.setitem(caps.CAPABILITIES, "claude_code", caps.capability_for("kiro_cli"))
+        monkeypatch.setitem(caps.CAPABILITIES, "claude_code", caps._REFUSED)
     else:
         narrowed = replace(row, tool_atoms=row.tool_atoms - {"fs_read"})
         monkeypatch.setitem(caps.CAPABILITIES, "claude_code", narrowed)

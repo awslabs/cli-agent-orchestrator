@@ -14,7 +14,6 @@ import pytest
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3UnavailableError
 from cli_agent_orchestrator.services.agent_step import (
     StepExecutionError,
     run_agent_step,
@@ -263,7 +262,7 @@ class TestHappyPath:
         m_create.assert_not_awaited()
         m_send.assert_called_once_with("reuse99", "x")
 
-    def test_reuse_conflicting_kas_uses_phase0_guard_before_send(self):
+    def test_reuse_with_kas_against_a_v2_terminal_is_a_mismatch_before_send(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with (
             create as m_create,
@@ -277,7 +276,7 @@ class TestHappyPath:
                 f"{_MODULE}.terminal_service.get_terminal_metadata",
                 return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
             ),
-            pytest.raises(KiroV3UnavailableError, match="not available yet"),
+            pytest.raises(ValueError, match="requested 'v3', persisted 'v2'"),
         ):
             asyncio.run(
                 run_agent_step(

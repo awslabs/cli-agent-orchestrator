@@ -112,20 +112,39 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
+from cli_agent_orchestrator.providers import kiro_launch_home
 from cli_agent_orchestrator.providers.base import (
     BaseProvider,
     OutputExtractionError,
     OutputExtractionRejected,
 )
 from cli_agent_orchestrator.providers.kiro_capabilities import (
+    MISSING_FLAG_REMEDY,
     KiroCapabilities,
     KiroCapabilityError,
-    KiroV3UnavailableError,
+    KiroV3LaunchError,
+    kiro_effort,
+    kiro_effort_value,
+    missing_flag_message,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
-from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_cli import KiroAttestation, KiroCliProvider
 from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+from cli_agent_orchestrator.providers.kiro_launch_home import (
+    KiroGlobalHome,
+    KiroLaunch,
+    KiroLaunchHome,
+    KiroLaunchRefusal,
+    ResolvedKiroCli,
+)
+from cli_agent_orchestrator.providers.kiro_v3_schema import (
+    KiroV3EngineSchema,
+    KiroV3Refusal,
+    KiroV3UnsupportedVersionError,
+    KiroV3UnverifiedVersionError,
+)
+from cli_agent_orchestrator.providers.kiro_workspace import check_kiro_helper_workspace
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
 from cli_agent_orchestrator.services import ephemeral_service, worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
@@ -134,10 +153,15 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.install_service import (
+    installed_kiro_agent_is_universal,
     installed_kiro_tools,
     installed_opencode_permission,
     kiro_install_predates_native_enforcement,
     require_kiro_agent_resolves,
+)
+from cli_agent_orchestrator.services.kiro_v3_launch import (
+    require_kiro_v3_admissible,
+    require_kiro_v3_launchable,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
     memory_context_for_terminal,
@@ -165,6 +189,7 @@ from cli_agent_orchestrator.utils.enforcement import (
     enforcement_for,
     native_providers,
 )
+from cli_agent_orchestrator.utils.ephemeral_capabilities import capability_for
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -1336,6 +1361,257 @@ class _EphemeralLaunchState:
     """What the create body bound, for the caller's compensation."""
 
     bound_terminal_id: Optional[str] = None
+    # A prepared per-launch Kiro home no provider owns yet (#1167 Phase 2).
+    kiro_home: Optional[KiroLaunchHome] = None
+
+
+def _ephemeral_kiro_refusal(
+    agent_profile: str, caller_id: Optional[str], error: KiroV3Refusal
+) -> "ephemeral_service.EphemeralPolicyError":
+    """A pre-window Kiro helper refusal as the ephemeral policy error the API reports.
+
+    Its rule is the refusal's own code (#1167 Phase 2); the detail carries no
+    server path. Logged and counted in the name's archive like every refusal.
+    """
+    if isinstance(error, KiroLaunchRefusal):
+        detail = error.detail
+    else:
+        text = str(error)
+        detail = text.split(": ", 1)[1] if text.startswith(f"{error.code}: ") else text
+    policy = ephemeral_service.EphemeralPolicyError(error.code, detail)
+    ephemeral_service.report_launch_refusal(agent_profile, caller_id, policy)
+    return policy
+
+
+#: A helper runs only on v3 (``kiro_ephemeral_engine:v2``), so its version and
+#: wrapper refusals name these in place of "retry with engine 'v2'" (#1167 Phase 2).
+_HELPER_SUPPORTED_CLI = "Use a supported kiro-cli version: a Kiro helper runs only on engine 'v3'."
+_HELPER_VERIFIED_CLI = (
+    "Use a verified kiro-cli version, or have the operator opt in with "
+    "kiro.v3_allow_unverified_versions: a Kiro helper runs only on engine 'v3'."
+)
+
+
+def _helper_v3_refusal(error: KiroV3Refusal) -> KiroV3Refusal:
+    """A version refusal with the helper's remedy and the same code; any other as it is."""
+    if isinstance(error, KiroV3UnverifiedVersionError):
+        return KiroV3UnverifiedVersionError(error.version, remedy=_HELPER_VERIFIED_CLI)
+    if isinstance(error, KiroV3UnsupportedVersionError):
+        return KiroV3UnsupportedVersionError(error.version, remedy=_HELPER_SUPPORTED_CLI)
+    return error
+
+
+def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
+    """The probe's version or missing-flag refusal with the helper's remedy, same kind.
+
+    It stays a capability error (a 400 with a plain-string detail); any other
+    probe failure, which suggests no engine, is returned as it is.
+    """
+    if error.kind == KiroV3UnsupportedVersionError.code:
+        message = str(KiroV3UnsupportedVersionError(error.version, remedy=_HELPER_SUPPORTED_CLI))
+    elif (
+        error.kind == "unsupported_capability"
+        and error.capability
+        and str(error)
+        == missing_flag_message(error.engine, error.capability, error.version, MISSING_FLAG_REMEDY)
+    ):
+        message = missing_flag_message(
+            error.engine, error.capability, error.version, _HELPER_SUPPORTED_CLI
+        )
+    else:
+        return error
+    return KiroCapabilityError(
+        error.kind, error.engine, message, capability=error.capability, version=error.version
+    )
+
+
+def _helper_probe(probe: Callable[..., KiroCapabilities]) -> Callable[..., KiroCapabilities]:
+    """``probe``, whose refusals carry the helper's remedy."""
+
+    def run(*args: Any, **kwargs: Any) -> KiroCapabilities:
+        try:
+            return probe(*args, **kwargs)
+        except KiroCapabilityError as exc:
+            raise _helper_capability_error(exc) from exc
+
+    return run
+
+
+def _helper_engine(
+    agent_profile: str, caller_id: Optional[str], engine: Any, profile: Optional[AgentProfile]
+) -> KiroEngine:
+    """An ephemeral Kiro helper runs on v3 (#1167 Phase 2).
+
+    No engine, ``v3`` and ``kas`` resolve to v3; ``v2`` refuses before bind with
+    ``kiro_ephemeral_engine:v2``. An explicit engine and the profile's must
+    still agree, as for every Kiro launch. Provisional (#1167).
+    """
+    profile_engine = getattr(profile, "engine", None)
+    if engine is None and profile_engine is None:
+        return KiroEngine.V3
+    resolved = resolve_kiro_engine(explicit=engine, profile=profile_engine)
+    if resolved != KiroEngine.V3:
+        raise _ephemeral_kiro_refusal(
+            agent_profile,
+            caller_id,
+            KiroLaunchRefusal(
+                "kiro_ephemeral_engine:v2",
+                "an ephemeral Kiro helper runs on the v3 engine only; omit the engine, or "
+                "pass v3",
+            ),
+        )
+    return resolved
+
+
+def _helper_stage_a(
+    agent_profile: str, caller_id: Optional[str], env_vars: Optional[dict[str, str]]
+) -> Tuple[ResolvedKiroCli, Path, KiroGlobalHome]:
+    """Stage A of a Kiro helper launch, before the probe and before bind (#1167 Phase 2).
+
+    First the legacy-copy guard: the probe home and its placeholders, then
+    what Kiro would copy from ``~/.kiro`` (stat only). Then the kiro-cli to run,
+    and the forwarded-home and herdr-path refusals. A refusal returns the
+    claim. Blocking I/O: callers to_thread it.
+    """
+    from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend, herdr_arg_is_safe
+
+    try:
+        probe_home = kiro_launch_home.ensure_probe_home()
+        global_home = kiro_launch_home.check_kiro_global_home(probe_home)
+        kiro_cli = kiro_launch_home.resolve_kiro_cli()
+        if env_vars and kiro_launch_home.KIRO_HOME_ENV in env_vars:
+            raise KiroLaunchRefusal(
+                "kiro_home_invalid:forwarded",
+                "an ephemeral Kiro helper runs from its own CAO-owned KIRO_HOME; "
+                "do not forward one in env_vars",
+            )
+        sample = kiro_launch_home.kiro_home_path("0" * 8)
+        if isinstance(get_backend(), HerdrBackend) and not herdr_arg_is_safe(
+            f"{kiro_launch_home.KIRO_HOME_ENV}={sample}"
+        ):
+            raise KiroLaunchRefusal(
+                "kiro_home_invalid:unsafe_path",
+                "the CAO home path has characters herdr cannot pass to a pane",
+            )
+    except KiroLaunchRefusal as exc:
+        raise _ephemeral_kiro_refusal(agent_profile, caller_id, exc) from None
+    return kiro_cli, probe_home, global_home
+
+
+def _check_helper_workspace(
+    agent_profile: str, caller_id: Optional[str], cwd: str, user_home: str
+) -> None:
+    """Phase 1's workspace check for a helper, plus ``HOME``'s own rule; refuses before bind."""
+    try:
+        check_kiro_helper_workspace(cwd, user_home)
+    except KiroV3Refusal as exc:
+        raise _ephemeral_kiro_refusal(agent_profile, caller_id, exc) from None
+
+
+def _remove_unowned_kiro_home(prepared: KiroLaunchHome) -> None:
+    """Remove a prepared Kiro home no provider owns; the sweep retries a failure."""
+    try:
+        if not ephemeral_service.remove_kiro_home(prepared.terminal_id):
+            logger.warning("Kiro home for terminal %s retained for a retry", prepared.terminal_id)
+    except Exception:  # noqa: BLE001 - cleanup must not replace the launch's own error
+        logger.exception("Removing the Kiro home for terminal %s failed", prepared.terminal_id)
+
+
+def _prepare_kiro_launch(
+    agent_profile: str,
+    caller_id: Optional[str],
+    profile: AgentProfile,
+    allowed_tools: List[str],
+    terminal_id: str,
+    working_directory: str,
+    kiro_cli: ResolvedKiroCli,
+    global_home: KiroGlobalHome,
+    model: Optional[str],
+    effort: Optional[str],
+    version: Optional[str],
+    schema: KiroV3EngineSchema,
+) -> KiroLaunch:
+    """Stage B of a Kiro helper launch, after bind and before the window (#1167 Phase 2).
+
+    Renders the helper's universal agent file from the profile Step 0 verified,
+    creates and seeds the home with its sentinel and placeholders, checks both
+    agent files from disk with CAO's v3 validator for this grant and the
+    probed schema, runs the workspace check again on the final cwd (a worktree
+    included), and seals the home. Any refusal removes the home again.
+    Blocking I/O: callers to_thread it.
+    """
+    prepared: Optional[KiroLaunchHome] = None
+    try:
+        grant = kiro_launch_home.kiro_helper_grant(allowed_tools)
+        payload = kiro_launch_home.render_helper_agent(agent_profile, profile, grant, terminal_id)
+        prepared = kiro_launch_home.create_launch_home(
+            terminal_id, agent_profile, payload, global_home
+        )
+        kiro_launch_home.verify_launch_home(prepared, sealed=False)
+        kiro_launch_home.check_helper_files(prepared, grant, schema)
+        check_kiro_helper_workspace(working_directory, global_home.user_home)
+        kiro_launch_home.seal_launch_home(prepared)
+        ephemeral_service.record_kiro_event(
+            terminal_id,
+            "kiro_home_prepared",
+            home=str(prepared.home),
+            hashes=prepared.hashes(),
+            placeholder=prepared.powers.record(),
+            global_home=global_home.record(),
+            kiro_cli=kiro_cli.path,
+            kiro_cli_target=kiro_cli.target,
+            kiro_version=version,
+            schema=schema.engine,
+        )
+    except KiroV3Refusal as exc:
+        if prepared is not None:
+            _remove_unowned_kiro_home(prepared)
+        raise _ephemeral_kiro_refusal(agent_profile, caller_id, exc) from None
+    except BaseException:
+        if prepared is not None:
+            _remove_unowned_kiro_home(prepared)
+        raise
+    return KiroLaunch(
+        home=prepared,
+        kiro_cli=kiro_cli,
+        grant=tuple(grant),
+        working_directory=working_directory,
+        model=model,
+        effort=effort,
+        version=version,
+        schema=schema.engine,
+    )
+
+
+def _add_kiro_home_to_window_env(env: Dict[str, str], kiro_launch: Optional[KiroLaunch]) -> None:
+    """Put the per-launch home in the window's own env, never in ``env_vars``.
+
+    Kiro's shell integration runs ``kiro-cli init`` and ``pre-cmd`` in the pane
+    with the pane's ``KIRO_HOME``; ``env_vars`` would persist into the session
+    and reach every later window in it. The command assigns it as well, so an
+    rc file's export cannot change it. On a new session the window's env is
+    also the backend's session env, so ``_keep_kiro_home_out_of_session``
+    replaces it there once the session exists.
+    """
+    if kiro_launch is not None:
+        env[kiro_launch_home.KIRO_HOME_ENV] = str(kiro_launch.home.home)
+
+
+def _keep_kiro_home_out_of_session(session_name: str, kiro_launch: Optional[KiroLaunch]) -> None:
+    """Give a session this launch just created back its own KIRO_HOME (#1167 Phase 2).
+
+    tmux's ``new-session -e`` makes the first window's env the session's own, so
+    every later window in the session would start with this helper's
+    ``KIRO_HOME``, and the release would stop those windows' processes as owners
+    of the home. The session gets back the ``KIRO_HOME`` it would have had
+    without the launch (the server's own, if CAO forwards one), and the first
+    pane keeps its value. Called inside the create's rollback guard: when the
+    backend cannot put it back, the session is torn down and the launch fails.
+    """
+    if kiro_launch is not None:
+        get_backend().restore_session_env(
+            session_name, kiro_launch_home.KIRO_HOME_ENV, str(kiro_launch.home.home)
+        )
 
 
 async def create_terminal(
@@ -1654,6 +1930,10 @@ async def create_terminal(
                 ephemeral_service.end_claim(agent_profile, claim_id)
         elif isinstance(exc, asyncio.CancelledError):
             ephemeral_service.release(state.bound_terminal_id, "launch_failed")
+            if state.kiro_home is not None:
+                # Prepared after bind, before any provider took it over (#1167
+                # Phase 2); the sweep retries if this cannot finish.
+                _remove_unowned_kiro_home(state.kiro_home)
         raise
 
 
@@ -1861,6 +2141,17 @@ async def _create_terminal_unguarded(
             # #1099: only the engine routes, and only a claimed ephemeral launch. Anything
             # else is a bug, refused here before any resource is allocated.
             raise RuntimeError("a launch plan routed a launch that is not a claimed ephemeral")
+        if (
+            launch_plan is not None
+            and launch_plan.provider is not None
+            and not capability_for(launch_plan.provider).routable
+        ):
+            # A routed Kiro helper would drop its planned effort and escape the sweep's
+            # home retry, so it is refused before any resource or Kiro step (#1167).
+            raise RuntimeError(
+                f"a launch plan routed a launch to {launch_plan.provider}, "
+                "which provider.route cannot route to yet"
+            )
         # The request's provider stays the claim's identity: the fingerprint and the ephemeral
         # launch checks above used it, and the bind below compares it. Everything else that
         # depends on which CLI runs uses the launch provider (#1099).
@@ -1875,11 +2166,20 @@ async def _create_terminal_unguarded(
             requested_model=launch_model,
         )
 
+        kiro_v3_admission = None
+        # An ephemeral Kiro helper (#1167 Phase 2): stage A's kiro-cli and the
+        # ~/.kiro snapshot, then the launch stage B prepares after bind.
+        kiro_helper: Optional[Tuple[ResolvedKiroCli, KiroGlobalHome]] = None
+        kiro_launch: Optional[KiroLaunch] = None
+        helper = source is agent_profiles.ProfileSource.EPHEMERAL
         if provider == ProviderType.KIRO_CLI.value:
-            resolved_engine = resolve_kiro_engine(
-                explicit=engine,
-                profile=getattr(profile, "engine", None),
-            )
+            if helper:
+                resolved_engine = _helper_engine(agent_profile, caller_id, engine, profile)
+            else:
+                resolved_engine = resolve_kiro_engine(
+                    explicit=engine,
+                    profile=getattr(profile, "engine", None),
+                )
             if allowed_tools is None and profile is not None:
                 from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
                 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
@@ -1894,14 +2194,52 @@ async def _create_terminal_unguarded(
             # Mirror the launch-time precedence (`model or profile.model`, see
             # _get_profile_model): probing the profile snapshot alone would let an
             # explicit override launch --model on a wrapper never probed for it.
+            # A v3 launch also passes an effort as --effort (#1167), so the probe
+            # asks for that flag too; v2's request is unchanged.
+            # #1083: the plan's effort first, as for every provider (resolve_launch_effort),
+            # then the profile's kiroConfig.effort; v2 takes no effort.
+            planned_effort = launch_effort
+            launch_effort = None
+            if resolved_engine == KiroEngine.V3:
+                try:
+                    launch_effort = (
+                        kiro_effort_value(planned_effort)
+                        if planned_effort is not None
+                        else kiro_effort(profile)
+                    )
+                except ValueError as exc:
+                    # A coded refusal, so every create route answers 400 (the
+                    # in-session and run-step routes map a bare ValueError to 404).
+                    raise KiroV3LaunchError(
+                        "kiro_v3_bad_effort",
+                        f"{exc}. Fix the profile's kiroConfig.effort, or retry with engine 'v2'.",
+                    ) from None
             requested = requested_kiro_capabilities(
                 resolved_engine,
                 model=launch_model,
                 yolo=True,
+                effort=launch_effort,
             )
-            probe = kiro_capability_probe or probe_kiro_capabilities
+            probe: Callable[..., KiroCapabilities] = (
+                kiro_capability_probe or probe_kiro_capabilities
+            )
+            if helper:
+                # Stage A (#1167 Phase 2), before the probe: nothing Kiro would
+                # copy from ~/.kiro, an absolute kiro-cli, no forwarded KIRO_HOME;
+                # then the probe runs that same binary under the probe home.
+                resolved_cli, kiro_probe_home, global_home = await asyncio.to_thread(
+                    _helper_stage_a, agent_profile, caller_id, env_vars
+                )
+                kiro_helper = (resolved_cli, global_home)
+                probe = _helper_probe(
+                    functools.partial(
+                        probe,
+                        executable=resolved_cli.path,
+                        env=kiro_launch_home.kiro_env(kiro_probe_home),
+                    )
+                )
             try:
-                await asyncio.to_thread(probe, resolved_engine, requested)
+                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
             except KiroCapabilityError:
                 # A routed launch is refused, never relaunched on the profile's model, which
                 # is the fallback provider's (#1099).
@@ -1914,15 +2252,35 @@ async def _create_terminal_unguarded(
                     raise
                 launch_model = resolve_launch_model(model, profile)
                 requested = requested_kiro_capabilities(
-                    resolved_engine, model=launch_model, yolo=True
+                    resolved_engine, model=launch_model, yolo=True, effort=launch_effort
                 )
-                await asyncio.to_thread(probe, resolved_engine, requested)
+                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
                 decision_not_honored = True
                 model_honored = ProviderManager.provider_class(provider).honors_model(
                     agent_profile=agent_profile, profile=profile, requested_model=launch_model
                 )
             if resolved_engine == KiroEngine.V3:
-                raise KiroV3UnavailableError()
+                # #1167: the probed version must be allow-listed and verified
+                # (or pending, with the operator's opt-in), and the policy
+                # restricted.
+                try:
+                    kiro_v3_admission = require_kiro_v3_admissible(capabilities, allowed_tools)
+                except KiroV3Refusal as exc:
+                    if not helper:
+                        raise
+                    raise _ephemeral_kiro_refusal(
+                        agent_profile, caller_id, _helper_v3_refusal(exc)
+                    ) from None
+            if kiro_helper is not None and not use_worktree:
+                # A5: the request's cwd, before bind. With a worktree the cwd does
+                # not exist yet; stage B checks the final cwd either way.
+                await asyncio.to_thread(
+                    _check_helper_workspace,
+                    agent_profile,
+                    caller_id,
+                    _resolve_working_directory(working_directory),
+                    kiro_helper[1].user_home,
+                )
         else:
             if engine is not None:
                 raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
@@ -2059,14 +2417,22 @@ async def _create_terminal_unguarded(
         # unrestricted delegator (ceiling ``*``) and operator launches keep the
         # launch-time warning instead: nothing the creator may not delegate can
         # leak there, and the launch prompt already says what runs.
+        #
+        # A Kiro helper has no installed file: its policy is the per-launch
+        # file, checked against this launch's grant in stage B, bounded or not
+        # (#1167 Phase 2).
         if (
             provider == ProviderType.KIRO_CLI.value
+            and not helper
             and parent_ceiling is not None
             and "*" not in parent_ceiling
             and allowed_tools is not None
             and "*" not in allowed_tools
         ):
-            from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
+            from cli_agent_orchestrator.utils.tool_mapping import (
+                kiro_agent_tools,
+                kiro_universal_tools,
+            )
 
             installed = installed_kiro_tools(agent_profile)
             if installed is None:
@@ -2087,7 +2453,14 @@ async def _create_terminal_unguarded(
                     child_profile=agent_profile,
                 )
             else:
-                permitted = set(kiro_agent_tools(allowed_tools))
+                # A v3-enabled install's universal file lists v3 tool ids next
+                # to the v2 names, so it is compared with the universal map, or
+                # those ids would read as wider than the row (#1167).
+                permitted = set(
+                    kiro_universal_tools(allowed_tools)
+                    if installed_kiro_agent_is_universal(agent_profile)
+                    else kiro_agent_tools(allowed_tools)
+                )
                 wider = [tool for tool in installed if tool not in permitted]
                 if wider:
                     raise InstalledPolicyExceedsAllowlistError(
@@ -2220,13 +2593,53 @@ async def _create_terminal_unguarded(
         # row exists, from the launch cwd (workspace agents live under it). The
         # provider re-checks the pane header before any task is typed.
         # Provisional (#1074): installed launches refuse rather than warn.
-        if provider == ProviderType.KIRO_CLI.value:
+        #
+        # A Kiro helper replaces this check (#1167 Phase 2): it has no installed
+        # file, and Kiro reads its agents from the per-launch home. Stage B
+        # prepares that home instead, after bind and before the window.
+        if provider == ProviderType.KIRO_CLI.value and kiro_helper is not None:
+            assert profile is not None and allowed_tools is not None
+            assert kiro_v3_admission is not None
+            kiro_launch = await asyncio.to_thread(
+                _prepare_kiro_launch,
+                agent_profile,
+                caller_id,
+                profile,
+                allowed_tools,
+                terminal_id,
+                resolved_working_directory,
+                kiro_helper[0],
+                kiro_helper[1],
+                launch_model,
+                launch_effort,
+                capabilities.version,
+                kiro_v3_admission.schema,
+            )
+            ephemeral_state.kiro_home = kiro_launch.home
+        elif provider == ProviderType.KIRO_CLI.value:
             # A window joining an existing session launches with the session env
             # under the per-launch env (Step 3c), so a forwarded KIRO_HOME there
             # counts here too. Off the loop: a miss parses every agent file.
             check_env = (
                 env_vars if new_session else {**get_session_env(session_name), **(env_vars or {})}
             )
+            if kiro_v3_admission is not None:
+                # #1167: from the same cwd and env, a v3 launch needs the default
+                # Kiro home, an installed agent file that passes the validator
+                # for this launch's grant, and a workspace whose .kiro/ v3 would
+                # not load as configuration. First, so a missing file refuses
+                # with the v3 install remedy rather than the v2 resolver's.
+                from cli_agent_orchestrator.services import install_service
+
+                await asyncio.to_thread(
+                    require_kiro_v3_launchable,
+                    agent_profile,
+                    resolved_working_directory,
+                    check_env,
+                    list(allowed_tools or []),
+                    kiro_v3_admission.schema,
+                    Path(install_service.KIRO_AGENTS_DIR),
+                )
             await asyncio.to_thread(
                 require_kiro_agent_resolves, agent_profile, resolved_working_directory, check_env
             )
@@ -2266,6 +2679,7 @@ async def _create_terminal_unguarded(
             )
         elif (
             provider == ProviderType.KIRO_CLI.value
+            and kiro_launch is None
             and agent_profile
             and kiro_install_predates_native_enforcement(agent_profile, allowed_tools)
         ):
@@ -2372,6 +2786,7 @@ async def _create_terminal_unguarded(
 
                     # Create new tmux session with initial window
                     effective_env = dict(env_vars or {})
+                    _add_kiro_home_to_window_env(effective_env, kiro_launch)
                     get_backend().create_session(
                         session_name,
                         window_name,
@@ -2400,6 +2815,7 @@ async def _create_terminal_unguarded(
                     # CAO_WORKFLOW_RUN_ID must reach the window even when it
                     # joins an existing session (issue #408).
                     effective_env = {**get_session_env(session_name), **(env_vars or {})}
+                    _add_kiro_home_to_window_env(effective_env, kiro_launch)
                     created_window_name = get_backend().create_window(
                         session_name,
                         window_name,
@@ -2437,6 +2853,7 @@ async def _create_terminal_unguarded(
                 # caller's `except`.
                 try:
                     if created_session:
+                        _keep_kiro_home_out_of_session(session_name, kiro_launch)
                         # Drop rows a previous incarnation of this session name
                         # left behind. Inside the lock, so it can never race the
                         # row write of a concurrent create for the same name.
@@ -2593,6 +3010,10 @@ async def _create_terminal_unguarded(
             if provider == ProviderType.CLAUDE_CODE.value and not resume_session_id
             else None
         )
+        # Only a Kiro helper passes its launch, so every other call is unchanged.
+        provider_launch_options: dict[str, Any] = (
+            {"kiro_launch": kiro_launch} if kiro_launch is not None else {}
+        )
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,
@@ -2606,7 +3027,10 @@ async def _create_terminal_unguarded(
             engine=resolved_engine,
             resume_session_id=resume_session_id,
             session_id=fresh_claude_session_id,
+            **provider_launch_options,
         )
+        # The provider owns the helper's home now: its cleanup removes it.
+        ephemeral_state.kiro_home = None
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
@@ -2653,6 +3077,7 @@ async def _create_terminal_unguarded(
                     # written for it: the row reads False until this succeeds,
                     # and a failure here fails the create (#1074).
                     await _record_kiro_identity_verified(terminal_id, provider_instance)
+                    await _audit_kiro_attestation(terminal_id, provider_instance)
             finally:
                 # Init has ended in this process, verified or not: any later
                 # refusal of an unverified row is permanent.
@@ -2699,6 +3124,9 @@ async def _create_terminal_unguarded(
             session_incarnation_id=session_incarnation_id,
             status=initial_status,
             last_active=datetime.now(timezone.utc),
+            launch_notes=(
+                kiro_v3_admission.launch_notes if kiro_v3_admission is not None else None
+            ),
         )
 
         logger.info(
@@ -3054,7 +3482,7 @@ def terminal_input_refusal(
     verified before it failed (a restart during its initial delivery) accepts
     the re-send.
 
-    A row from before the column (``identity_verified`` None) is grandfathered
+    A v2 row from before the column (``identity_verified`` None) is grandfathered
     unless it carries a durable failure, in the DB or the fallback sidecar.
     Provisional (#1074): main never verified a Kiro pane, so refusing these
     would break every Kiro worker running across an upgrade.
@@ -3077,7 +3505,10 @@ def terminal_input_refusal(
         return None
     failure = get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
     if failure is None:
-        if verified is None:
+        # Grandfathering is for v2 rows older than the column. No v3 row can
+        # predate it (v3 never launched before #1167), so an unset value on a
+        # v3 row is not trust.
+        if verified is None and canonical_kiro_engine(metadata.get("engine")) != "v3":
             return None
         if _is_identity_check_in_flight(terminal_id):
             return TerminalInputBlockedError(
@@ -3384,6 +3815,36 @@ class KiroIdentityNotRecordedError(RuntimeError):
     """
 
 
+async def _audit_kiro_attestation(terminal_id: str, provider_instance: Any) -> None:
+    """Record what a Kiro helper's /tools and /mcp list panels showed (#1167 Phase 2).
+
+    The header's model is audited, not refused, when it differs from the
+    ``--model`` CAO launched.
+    """
+    attestation = getattr(provider_instance, "attestation", None)
+    launch = getattr(provider_instance, "_launch", None)
+    if not isinstance(attestation, KiroAttestation) or not isinstance(launch, KiroLaunch):
+        return
+    if launch.model is not None and attestation.model != launch.model:
+        logger.warning(
+            "Kiro terminal %s shows model %r in its header; CAO launched --model %r",
+            terminal_id,
+            attestation.model,
+            launch.model,
+        )
+    await asyncio.to_thread(
+        ephemeral_service.record_kiro_event,
+        terminal_id,
+        "kiro_attested",
+        tags=list(attestation.tags),
+        mcp_tools=dict(attestation.mcp_tools),
+        model=attestation.model,
+        launched_model=launch.model,
+        kiro_version=launch.version,
+        schema=launch.schema,
+    )
+
+
 async def _record_kiro_identity_verified(terminal_id: str, provider_instance: Any) -> None:
     """Write ``identity_verified`` True once the provider's header check passed (#1074).
 
@@ -3629,11 +4090,13 @@ def _persist_deferred_init_failure(
     message: str,
     untrusted_runtime: bool,
     exception_type: str | None = None,
+    rule: str | None = None,
 ) -> dict[str, Any] | None:
     """Persist one server-owned deferred-init failure outside consumer metadata.
 
     ``untrusted_runtime`` records the reclaim decision (#1074) for clients; the
     input gate reads the terminal's ``identity_verified``, never this field.
+    ``rule`` is a Kiro refusal's machine string when the failure was one.
     """
 
     failure: dict[str, Any] = {
@@ -3644,10 +4107,25 @@ def _persist_deferred_init_failure(
     }
     if exception_type:
         failure["exception_type"] = str(exception_type)
+    if rule:
+        failure["rule"] = str(rule)
     if not update_terminal_deferred_init_failure(terminal_id, failure):
         return None
     _delete_deferred_failure_fallback(terminal_id)
     return failure
+
+
+def _kiro_refusal_rule(exc: BaseException) -> str | None:
+    """The machine string of a Kiro refusal, for the persisted failure (provisional, #1167).
+
+    Phase 1's and the helper's refusals carry ``code``; the identity check's
+    carries ``kind``.
+    """
+    if isinstance(exc, KiroV3Refusal):
+        return exc.code
+    if isinstance(exc, KiroAgentIdentityError):
+        return exc.kind
+    return None
 
 
 def _runtime_untrusted_from_row(metadata: dict[str, Any]) -> bool:
@@ -3658,11 +4136,13 @@ def _runtime_untrusted_from_row(metadata: dict[str, Any]) -> bool:
     not verify which agent the pane is running. A row from before the column
     (``identity_verified`` None) keeps its window, as live legacy rows are
     grandfathered; once it carries a failure, input to it is still refused.
+    A v3 row is never grandfathered: none can predate the column (#1167).
     Provisional (#1074).
     """
-    return (
-        metadata.get("provider") == ProviderType.KIRO_CLI.value
-        and metadata.get("identity_verified") is False
+    verified = metadata.get("identity_verified")
+    return metadata.get("provider") == ProviderType.KIRO_CLI.value and (
+        verified is False
+        or (verified is None and canonical_kiro_engine(metadata.get("engine")) == "v3")
     )
 
 
@@ -3741,6 +4221,7 @@ async def _surface_deferred_init_failure(
     exception_type: str | None = None,
     delete_on_failure: bool | None = None,
     provider_hint: str | None = None,
+    rule: str | None = None,
 ) -> bool:
     """Persist/notify one init failure and apply lifecycle ownership.
 
@@ -3778,6 +4259,8 @@ async def _surface_deferred_init_failure(
     }
     if exception_type:
         failure_payload["exception_type"] = str(exception_type)
+    if rule:
+        failure_payload["rule"] = str(rule)
     for attempt in range(1, _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS + 1):
         try:
             failure = await asyncio.to_thread(
@@ -3786,6 +4269,7 @@ async def _surface_deferred_init_failure(
                 kind=kind,
                 message=message,
                 exception_type=exception_type,
+                rule=rule,
                 untrusted_runtime=untrusted,
             )
             persisted = failure is not None
@@ -4455,6 +4939,7 @@ def _schedule_deferred_init(
                 # the initial dispatch_input: until this succeeds the row reads
                 # False and no input reaches the pane (#1074).
                 await _record_kiro_identity_verified(terminal_id, provider_instance)
+                await _audit_kiro_attestation(terminal_id, provider_instance)
             shell_command = provider_instance.shell_baseline
             if isinstance(shell_command, str) and shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
@@ -4753,6 +5238,7 @@ def _schedule_deferred_init(
                 registry=registry,
                 delete_on_failure=delete_on_failure,
                 provider_hint=provider_hint,
+                rule=_kiro_refusal_rule(e),
             )
         finally:
             # The single release point for every path, and on the happy path the
@@ -5298,12 +5784,6 @@ def dispatch_input(
         refusal = terminal_input_refusal(terminal_id, metadata)
         if refusal is not None:
             raise refusal
-
-        if (
-            metadata.get("provider") == ProviderType.KIRO_CLI.value
-            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.V3
-        ):
-            raise KiroV3UnavailableError()
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = _orchestration_value(orchestration_type)

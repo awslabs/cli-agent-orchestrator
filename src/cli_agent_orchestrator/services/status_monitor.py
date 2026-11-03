@@ -496,8 +496,9 @@ class StatusMonitor:
         ONE critical section (the stale-PROCESSING capture path revalidating its
         generation) can do so without a check-then-apply gap for
         notify_input_sent to slip through. Returns True when the status changed;
-        the caller must then publish the change on the bus AFTER releasing the
-        lock (see _apply_detection for why).
+        the caller must then queue the change with _queue_status_transition
+        while it still holds the lock, and publish it on the bus AFTER
+        releasing the lock (see _apply_detection for why).
         """
         last = self._last_status.get(terminal_id)
 
@@ -1287,6 +1288,7 @@ class StatusMonitor:
                     return TerminalStatus.UNKNOWN
 
         revoked_ready = False
+        revoke_write: Optional[Future] = None
         with self._lock:
             cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             if cached in (
@@ -1299,6 +1301,7 @@ class StatusMonitor:
                     self._processing_generation[terminal_id] = self._capture_generation.get(
                         terminal_id, 0
                     )
+                    revoke_write = _queue_status_transition(terminal_id, TerminalStatus.PROCESSING)
             # When cached status is PROCESSING, the debounced detection may be
             # stuck: TUI providers (kiro-cli) can send escape sequences
             # continuously after becoming idle, preventing the 200ms quiescence
@@ -1314,6 +1317,7 @@ class StatusMonitor:
             bus.publish(
                 f"terminal.{terminal_id}.status", {"status": TerminalStatus.PROCESSING.value}
             )
+            _wait_for_status_write_off_loop(revoke_write)
 
         if cached == TerminalStatus.PROCESSING and buffer:
             fresh, generation = self._redetect(terminal_id, buffer)
@@ -1369,6 +1373,7 @@ class StatusMonitor:
                         # section — a check-then-apply gap would let notify_input_sent
                         # slip between them, and the stale verdict would consume the arm
                         # it just set, latch-blocking the new turn's genuine PROCESSING.
+                        status_write: Optional[Future] = None
                         with self._lock:
                             current_last_status = self._last_status.get(terminal_id)
                             generation_current = (
@@ -1402,6 +1407,10 @@ class StatusMonitor:
                                     changed = self._apply_detection_locked(
                                         terminal_id, fresh_capture
                                     )
+                                    if changed:
+                                        status_write = _queue_status_transition(
+                                            terminal_id, fresh_capture
+                                        )
                             else:
                                 self._confirmed_stale_capture_commit.pop(terminal_id, None)
                         if apply_ok:
@@ -1414,6 +1423,7 @@ class StatusMonitor:
                                     f"Terminal {terminal_id} status changed: "
                                     f"{fresh_capture.value}"
                                 )
+                                _wait_for_status_write_off_loop(status_write)
                             return fresh_capture
                         logger.debug(
                             f"get_status [{terminal_id}]: fresh capture-pane result "

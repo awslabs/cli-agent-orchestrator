@@ -101,6 +101,9 @@
     "claudeConfig": {
       "type": "object"
     },
+    "kiroConfig": {
+      "type": "object"
+    },
     "hermesProfile": {
       "type": "string",
       "minLength": 1

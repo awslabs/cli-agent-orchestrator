@@ -333,7 +333,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 
 **Soft enforcement** = a system prompt tells the agent not to use certain tools. The agent may still attempt them. Use hard-enforcement providers for security-critical work.
 
-**Ephemeral agents** have their own provider table, because not every provider runs them. A create response's `enforcement` field reports `hard` on Claude Code and `advisory` on Codex, and Kiro ephemerals are refused. See [Ephemeral agents](ephemeral-agents.md#create-surface-and-stored-files).
+**Ephemeral agents** have their own provider table, because not every provider runs them. A create response's `enforcement` field reports `hard` on Claude Code and Kiro CLI and `advisory` on Codex. A Kiro CLI ephemeral helper is Hard (v3, per-launch file): a CAO-written universal agent file under a per-launch `KIRO_HOME`, whose `tools` and `excludedTools` limit what v3 exposes and whose rules deny every capability outside the grant, with the TUI header and the `/tools` and `/mcp list` panels checked before the task; `--trust-all-tools` only removes prompts. See [Ephemeral agents](ephemeral-agents.md#kiro-helpers).
 
 ### What "hard" looks like per provider
 
@@ -358,6 +358,31 @@ applied. An unrestricted policy writes `tools: ["*"]`; a profile that sets its
 own `tools` list keeps it. Enforcement is therefore install-time: change the
 profile, re-run `cao install`. Profiles installed before CAO wrote `tools`
 still carry `["*"]`; `cao launch` warns when it finds one.
+
+**Kiro CLI, v3 engine (preview, pending the operator checklist)** — `cao install
+… --engine v3` writes one universal file: the v2 fields above, plus
+`excludedTools` and `permissions.rules`. v3 selects tools by id and by tag, and
+its `read` tag also brings `code`, which can write files. So for v3:
+
+| CAO atom | Added to `tools` (v3 ids) | v3 tools the agent gets | Denied when not granted |
+|---|---|---|---|
+| `fs_read` | `read_file`, `list_directory` | the same | `fs_read`, `diagnostics`, `context`, `skill` (when `fs_list` is not granted either) |
+| `fs_list` | `file_search`, `grep_search` | the same | as `fs_read` |
+| `fs_write` | `fs_append`, `str_replace`, `delete_file` | those, `fs_write` and `code` | `fs_write` |
+| `execute_bash` | `invoke_sub_agent` | that, `execute_bash` and the per-agent `subagent/…` tools | `shell`, `subagent` |
+| `web_fetch` | `remote_web_search` | that and `web_fetch` | `web_fetch`, `web_search` |
+| `@server`, `@server/tool` | unchanged | that server's (or tool's) MCP tools | every other MCP tool |
+
+`tools` never holds the `read` tag; `excludedTools` removes everything the
+remaining entries could reach beyond the grant (`code` unless `fs_write` is
+granted, and always `knowledge`). The file configures only the MCP servers the
+grant names. A server named only by single tools (`@cao-mcp-server/send_message`)
+is configured too, and its rule allows just those tools. Every capability
+outside the grant gets an unconditional deny, and `power` and `workflow` are
+always denied. CAO checks the file on disk at every v3 launch and refuses one
+that differs, so enforcement on v3 is install-time plus a launch-time check,
+and the pane's own `/tools` and `/mcp` panels are read before the first task.
+See [Kiro v3 (preview)](kiro-cli.md#kiro-v3-preview).
 
 **Copilot CLI** — Adds `--deny-tool` flags that override `--allow-all`:
 ```bash
