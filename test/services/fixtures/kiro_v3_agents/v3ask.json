@@ -1,0 +1,13 @@
+{
+  "name": "v3ask",
+  "description": "KV3 shell visible, no rule (default ask)",
+  "prompt": "You are a KV3 probe agent for a CAO compatibility test. Answer briefly.",
+  "tools": [
+    "read_file",
+    "execute_bash"
+  ],
+  "includeMcpJson": false,
+  "includePowers": false,
+  "resources": [],
+  "mcpServers": {}
+}
