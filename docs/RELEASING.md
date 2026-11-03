@@ -7,8 +7,10 @@ the production publish.
 
 A release starts one of two ways: **every Monday at 09:17 UTC on its own**, when
 something has merged since the last release, or **by hand**. Either way it stops at a
-tagged GitHub Release. Publishing to PyPI always takes **two maintainers**: one starts
-**Publish to PyPI** from the tag, and a different one approves the PyPI upload.
+tagged GitHub Release. Publishing to PyPI normally takes **two maintainers**: one starts
+**Publish to PyPI** from the tag, and a different one approves the PyPI upload — though the
+`pypi` environment's `can_admins_bypass` setting lets a repo admin approve their own run and
+publish alone.
 
 ## Pipeline overview
 
