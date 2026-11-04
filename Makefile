@@ -6,7 +6,7 @@
 
 .PHONY: refresh-ext-apps-skills check-ext-apps-skills \
         refresh-agent-plugins-schemas check-agent-plugins-schemas \
-        agent-plugin check-agent-plugin
+        agent-plugin agent-plugin-keep-pin check-agent-plugin
 
 # Re-vendor the ext-apps builder skills from the pinned tag and rewrite NOTICE.
 # To move to a newer upstream release, bump PINNED_REF/PINNED_SHA in
@@ -33,15 +33,22 @@ check-agent-plugins-schemas:
 	uv run python scripts/vendor_agent_plugins_schemas.py --check
 
 # --- CAO's own Agent Plugins packages ---------------------------------------
-# Two packages, `cao` (operator) and `cao-contributor`, generated from the
-# canonical skills/ tree and committed. See docs/agent-plugins.md.
+# CAO's own packages (`cao`, `cao-contributor`, `cao-agent-plugin-lifecycle`),
+# generated from the canonical skills/ tree and committed. See docs/agent-plugins.md.
 
-# Regenerate both packages from their allowlists and CAO's package version.
+# Regenerate every package from its allowlist at CAO's package version. This
+# moves the pin; the release workflow's regenerate-agent-plugin job runs it.
 agent-plugin:
 	uv run python scripts/build_agent_plugin.py
 
-# Verify both committed packages match their allowlists and load with zero fatal
-# findings. Evaluates each package independently so one failure cannot mask the
-# other. Exit 0 = in sync, 1 = drift or non-conformance.
+# Regenerate every package at the version the committed packages already pin.
+# Use this after editing a packaged skill: it never moves the pin and never
+# contacts PyPI, and it refuses when the committed packages disagree (#1152).
+agent-plugin-keep-pin:
+	uv run python scripts/build_agent_plugin.py --keep-committed-pin
+
+# Verify every committed package matches its allowlist and loads with zero fatal
+# findings. Evaluates each package independently so one failure cannot mask
+# another. Exit 0 = in sync, 1 = drift or non-conformance.
 check-agent-plugin:
 	uv run python scripts/build_agent_plugin.py --check

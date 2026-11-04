@@ -415,7 +415,8 @@ def test_the_enumeration_still_sees_the_known_create_sites():
         "cli/commands/launch.py::launch",
         "mcp_server/app_tools.py::_route_command",
         "utils/orchestration.py::_create_terminal",
-        "utils/orchestration.py::_handoff_impl",
+        "utils/orchestration.py::_create_handoff_terminal",
+        "utils/orchestration.py::_lookup_committed_handoff_terminal",
         "utils/orchestration.py::_assign_impl",
         "ops_mcp_server/server.py::_launch_session_impl",
     ):
@@ -430,7 +431,9 @@ def test_the_enumeration_classifies_the_known_create_sites():
 
     ``launch`` and ``_launch_session_impl`` have both regimes behind one POST
     and therefore MUST derive; ``_create_terminal`` is the delegating helper;
-    ``_handoff_impl`` derives per call and ``_assign_impl`` defers per call.
+    ``_create_handoff_terminal`` and ``_lookup_committed_handoff_terminal``
+    derive per call (handoff's create, PR #773) and ``_assign_impl`` defers
+    per call.
     """
 
     posts = _create_post_functions()
@@ -442,7 +445,8 @@ def test_the_enumeration_classifies_the_known_create_sites():
     assert posts["utils/orchestration.py::_create_terminal"].delegating
 
     callers = _delegating_calls()
-    assert callers["utils/orchestration.py::_handoff_impl"] == ["derived"]
+    assert callers["utils/orchestration.py::_create_handoff_terminal"] == ["derived"]
+    assert callers["utils/orchestration.py::_lookup_committed_handoff_terminal"] == ["derived"]
     assert callers["utils/orchestration.py::_assign_impl"] == ["deferred"]
 
 
