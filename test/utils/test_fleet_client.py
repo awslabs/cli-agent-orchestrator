@@ -328,8 +328,17 @@ class TestProxiedRoutes:
         with patch(
             "cli_agent_orchestrator.utils.fleet.requests.request",
             return_value=_response(payload={"id": "t1", "status": "completed"}),
-        ):
+        ) as mock_request:
             assert client.terminal_status("w1", "t1") == "completed"
+            assert mock_request.call_args.kwargs["timeout"] == (5.0, 5.0)
+
+    def test_terminal_status_allows_custom_read_timeout(self, client):
+        with patch(
+            "cli_agent_orchestrator.utils.fleet.requests.request",
+            return_value=_response(payload={"id": "t1", "status": "idle"}),
+        ) as mock_request:
+            assert client.terminal_status("w1", "t1", read_timeout=2.5) == "idle"
+            assert mock_request.call_args.kwargs["timeout"] == (5.0, 2.5)
 
 
 class TestSoleTerminal:

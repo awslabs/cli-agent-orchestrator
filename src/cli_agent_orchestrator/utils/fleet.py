@@ -44,6 +44,9 @@ from cli_agent_orchestrator.constants import (
 # slow connect means it is not there; a slow read means a worker is thinking.
 _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 60.0
+# Polling a worker's terminal status should fail fast so stalled reads don't
+# overrun the caller's timeout budget (matches local poll_until_done timeout).
+_STATUS_READ_TIMEOUT = 5.0
 
 
 class BrokerRequestError(click.ClickException):
@@ -148,8 +151,16 @@ class FleetClient:
 
     # -- the worker's own cao-server, proxied --------------------------------
 
-    def node_get(self, worker_id: str, path: str, params: Optional[dict[str, Any]] = None) -> Any:
-        return self._request("GET", self._node_path(worker_id, path), params=params).json()
+    def node_get(
+        self,
+        worker_id: str,
+        path: str,
+        params: Optional[dict[str, Any]] = None,
+        timeout: Optional[tuple[float, Optional[float]]] = None,
+    ) -> Any:
+        return self._request(
+            "GET", self._node_path(worker_id, path), params=params, timeout=timeout
+        ).json()
 
     def node_post(self, worker_id: str, path: str, params: Optional[dict[str, Any]] = None) -> Any:
         response = self._request("POST", self._node_path(worker_id, path), params=params)
@@ -176,11 +187,29 @@ class FleetClient:
             self.node_get(worker_id, f"sessions/{quote(session_name, safe='')}/terminals"),
         )
 
-    def terminal(self, worker_id: str, terminal_id: str) -> dict[str, Any]:
-        return cast(dict[str, Any], self.node_get(worker_id, f"terminals/{terminal_id}"))
+    def terminal(
+        self,
+        worker_id: str,
+        terminal_id: str,
+        timeout: Optional[tuple[float, Optional[float]]] = None,
+    ) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            self.node_get(worker_id, f"terminals/{terminal_id}", timeout=timeout),
+        )
 
-    def terminal_status(self, worker_id: str, terminal_id: str) -> Optional[str]:
-        return self.terminal(worker_id, terminal_id).get("status")
+    def terminal_status(
+        self,
+        worker_id: str,
+        terminal_id: str,
+        *,
+        read_timeout: float = _STATUS_READ_TIMEOUT,
+    ) -> Optional[str]:
+        return self.terminal(
+            worker_id,
+            terminal_id,
+            timeout=(_CONNECT_TIMEOUT, read_timeout),
+        ).get("status")
 
     def terminal_output(self, worker_id: str, terminal_id: str) -> Optional[str]:
         payload = self.node_get(worker_id, f"terminals/{terminal_id}/output", {"mode": "last"})
@@ -218,6 +247,7 @@ class FleetClient:
         path: str,
         params: Optional[dict[str, Any]] = None,
         raise_for_status: bool = True,
+        timeout: Optional[tuple[float, Optional[float]]] = None,
     ) -> requests.Response:
         try:
             response = requests.request(
@@ -225,7 +255,7 @@ class FleetClient:
                 f"{self.url}{path}",
                 params=params,
                 headers=self._headers,
-                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+                timeout=timeout if timeout is not None else (_CONNECT_TIMEOUT, _READ_TIMEOUT),
             )
         except requests.RequestException as exc:
             raise BrokerRequestError(
