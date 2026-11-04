@@ -54,7 +54,7 @@ removed from PR #436.)
 `showcase.sh` also runs standalone against any reachable CAO
 (`CAO_AGUI_BASE=… CAO_TOKEN=… ./showcase.sh`) — it exits non-zero unless all
 six components are accepted, the off-list component is refused, **and** the
-six `GENERATIVE_UI` frames actually arrive on the live SSE stream, so it
+six `CUSTOM` `cao.generative_ui` frames actually arrive on the live SSE stream, so it
 doubles as a smoke test for a deployment.
 
 ## How agents do this for real

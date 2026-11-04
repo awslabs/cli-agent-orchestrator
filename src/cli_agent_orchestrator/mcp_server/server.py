@@ -1023,9 +1023,10 @@ async def emit_ui(
 
     Lets an agent author a small, declarative UI intent (an approval card, a
     choice prompt, a diff summary, a progress/metric readout, …) that appears
-    live in any AG-UI client watching this fleet. The intent is validated
-    server-side against a frozen allow-list — arbitrary HTML/markup is never
-    accepted — so this is safe to call from any agent.
+    live on the fleet's AG-UI stream as a ``CUSTOM`` event named
+    ``cao.generative_ui``; a dashboard that handles that name renders it. The
+    intent is validated server-side against a frozen allow-list — arbitrary
+    HTML/markup is never accepted — so this is safe to call from any agent.
 
     Args:
         component: One of the allow-listed component names.
