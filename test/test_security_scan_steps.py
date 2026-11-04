@@ -30,6 +30,7 @@ SECURITY_SCAN_SH = REPO_ROOT / "scripts" / "security-scan.sh"
 
 TRIVY_ACTION_PREFIX = "aquasecurity/trivy-action@"
 UPLOAD_SARIF_PREFIX = "github/codeql-action/upload-sarif@"
+INSTALL_TRIVY_USES = "./.github/actions/install-trivy"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 FORBIDDEN_WITH_KEYS = {
@@ -52,7 +53,7 @@ AUTOLOADED_TRIVY_CONFIGS = (
 # input -- can silently change what a step scans or which binary runs it, with no entry in
 # FORBIDDEN_WITH_KEYS to catch it.
 #
-# `skip-setup-trivy` (#351) is on every step: the job installs Trivy itself via
+# `skip-setup-trivy` (aquasecurity/setup-trivy#42) is on every step: the job installs Trivy itself via
 # ./.github/actions/install-trivy (get.trivy.dev is down), so each trivy-action
 # step must skip its own built-in setup-trivy call rather than fetch a second
 # copy.
@@ -131,6 +132,21 @@ def check_security_job(doc: dict) -> list[str]:
     trivy_indices = [i for i, s in enumerate(steps) if _is_trivy_step(s)]
     if len(trivy_indices) != 3:
         errors.append(f"expected exactly 3 trivy-action steps, found {len(trivy_indices)}")
+
+    install_indices = [i for i, s in enumerate(steps) if s.get("uses") == INSTALL_TRIVY_USES]
+    if len(install_indices) != 1:
+        errors.append(
+            f"expected exactly one {INSTALL_TRIVY_USES!r} step, found {len(install_indices)}"
+        )
+    elif trivy_indices and install_indices[0] > min(trivy_indices):
+        errors.append(
+            f"{INSTALL_TRIVY_USES!r} step (index {install_indices[0]}) must come before the "
+            f"first trivy-action step (index {min(trivy_indices)})"
+        )
+
+    for i in trivy_indices:
+        if (steps[i].get("with") or {}).get("skip-setup-trivy") is not True:
+            errors.append(f"step {i}: skip-setup-trivy is not true")
 
     shas = {
         steps[i]["uses"].split("@", 1)[1] for i in trivy_indices if "@" in steps[i].get("uses", "")
@@ -422,6 +438,27 @@ def _mutate_vuln_gate_gets_version_pin(doc: dict) -> None:
     steps[_trivy_role_index(doc, "vuln")]["with"]["version"] = "v0.40.0"
 
 
+def _mutate_vuln_gate_loses_skip_setup_trivy(doc: dict) -> None:
+    """The vulnerability gate falls back to trivy-action's own setup-trivy."""
+    steps = _security_steps(doc)
+    del steps[_trivy_role_index(doc, "vuln")]["with"]["skip-setup-trivy"]
+
+
+def _mutate_report_skip_setup_trivy_becomes_false(doc: dict) -> None:
+    """The report step re-enables trivy-action's own (unpinned) setup-trivy."""
+    steps = _security_steps(doc)
+    steps[_trivy_role_index(doc, "report")]["with"]["skip-setup-trivy"] = False
+
+
+def _mutate_install_trivy_step_deleted(doc: dict) -> None:
+    """The job's own Install Trivy step is gone, so the trivy-action steps would run with
+    skip-setup-trivy: true but nothing installed Trivy first."""
+    steps = _security_steps(doc)
+    install_indices = [i for i, s in enumerate(steps) if s.get("uses") == INSTALL_TRIVY_USES]
+    for i in reversed(install_indices):
+        del steps[i]
+
+
 MUTATIONS = {
     "gate_gets_if_failure": _mutate_gate_gets_if_failure,
     "upload_loses_always": _mutate_upload_loses_always,
@@ -438,6 +475,9 @@ MUTATIONS = {
     "workflow_env_trivy_ignorefile": _mutate_workflow_env_trivy_ignorefile,
     "vuln_gate_gets_vuln_type": _mutate_vuln_gate_gets_vuln_type,
     "vuln_gate_gets_version_pin": _mutate_vuln_gate_gets_version_pin,
+    "vuln_gate_loses_skip_setup_trivy": _mutate_vuln_gate_loses_skip_setup_trivy,
+    "report_skip_setup_trivy_becomes_false": _mutate_report_skip_setup_trivy_becomes_false,
+    "install_trivy_step_deleted": _mutate_install_trivy_step_deleted,
 }
 
 

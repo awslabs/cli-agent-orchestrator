@@ -1172,15 +1172,17 @@ def _dependency_section_paths() -> set[str]:
 
 
 def _pinned_trivy_version(action_text: str) -> str | None:
-    """The ``inputs.version`` default of ``install-trivy/action.yml``, without its ``v``.
+    """The ``TRIVY_VERSION`` env value of ``install-trivy/action.yml``'s one step, without its ``v``.
 
-    #351: install-trivy/action.yml is the one place CI pins the Trivy version;
-    every setup-trivy/trivy-action call site defers to its default rather than
-    pinning its own copy.
+    aquasecurity/setup-trivy#42: install-trivy/action.yml is the one place CI pins
+    the Trivy version; every setup-trivy/trivy-action call site defers to it rather
+    than pinning its own copy.
     """
     action = yaml.safe_load(action_text) or {}
-    default = ((action.get("inputs") or {}).get("version") or {}).get("default")
-    match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", str(default or ""))
+    steps = ((action.get("runs") or {}).get("steps")) or [{}]
+    env = steps[0].get("env") or {}
+    version = env.get("TRIVY_VERSION")
+    match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", str(version or ""))
     return match.group(1) if match else None
 
 
@@ -1225,19 +1227,22 @@ class TestDependencySectionMatchesTheRepo:
 
     def test_security_md_names_the_trivy_version_ci_pins(self):
         pinned = _pinned_trivy_version(INSTALL_TRIVY_ACTION.read_text(encoding="utf-8"))
-        assert pinned, "install-trivy/action.yml no longer pins a Trivy version default"
+        assert pinned, "install-trivy/action.yml no longer sets TRIVY_VERSION in its step env"
         security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
         assert f"Trivy {pinned}" in security, (
             f"the skill sends readers to SECURITY.md for the Trivy version, but SECURITY.md "
             f"does not name the pinned {pinned}"
         )
 
-    def test_the_trivy_version_is_read_from_the_inputs_default(self):
-        """A missing or malformed ``inputs.version.default`` must not silently pass."""
-        action = 'inputs:\n  version:\n    default: "0.70.0"\n'
+    def test_the_trivy_version_is_read_from_the_step_env(self):
+        """A missing or malformed ``runs.steps[0].env.TRIVY_VERSION`` must not silently pass."""
+        action = 'runs:\n  steps:\n    - env:\n        TRIVY_VERSION: "0.70.0"\n'
         assert _pinned_trivy_version(action) == "0.70.0"
-        assert _pinned_trivy_version("inputs: {}\n") is None
-        assert _pinned_trivy_version('inputs:\n  version:\n    default: "latest"\n') is None
+        assert _pinned_trivy_version("runs:\n  steps:\n    - {}\n") is None
+        assert (
+            _pinned_trivy_version('runs:\n  steps:\n    - env:\n        TRIVY_VERSION: "latest"\n')
+            is None
+        )
 
 
 # --- Absolute self-links, which CI's link checker does not see ----------------

@@ -367,9 +367,7 @@ def test_real_inventory_regression_has_a_required_scanner_in_ci():
     job = ci["jobs"]["test"]
     assert "3.12" in job["strategy"]["matrix"]["python-version"]
     setup = next(
-        step
-        for step in job["steps"]
-        if step.get("uses", "") == "./.github/actions/install-trivy"
+        step for step in job["steps"] if step.get("uses", "") == "./.github/actions/install-trivy"
     )
     action = yaml.safe_load(
         (ROOT / ".github" / "actions" / "dependency-security" / "action.yml").read_text()
