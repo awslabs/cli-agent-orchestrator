@@ -673,7 +673,7 @@ def test_duplicate_federated_rows_are_discovered_and_deduped(tmp_path: Path, eng
         if record.identity is not None and record.identity.scope == "federated"
     ), "federated topics must be discovered by the scan"
 
-    report = service.apply()
+    _report = service.apply()
     remaining = _rows(engine)
     assert len(remaining) == 1
     assert remaining[0].scope == "federated"

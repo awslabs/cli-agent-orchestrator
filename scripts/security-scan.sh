@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Local mirror of the `security` and `codeql` CI jobs so contributors can catch
+# Local mirror of the `dependency-security`, `security`, and `codeql` CI jobs.
+# Contributors can catch
 # SSRF/path-injection/SCA/secret findings before pushing. Exits non-zero on any
 # scanner failure so it's safe to wire into pre-push hooks or Makefile targets.
 #
 # Usage:
-#   scripts/security-scan.sh                 # run every available scanner
+#   scripts/security-scan.sh                 # full dependency gate, then available other scanners
 #   scripts/security-scan.sh trivy           # just Trivy
+#   scripts/security-scan.sh dependencies    # full locked dependency gate
 #   scripts/security-scan.sh codeql          # just CodeQL (python)
 #   scripts/security-scan.sh gitleaks        # just gitleaks (secret scan, #457)
 #
@@ -21,21 +23,20 @@ cd "$ROOT_DIR"
 target="${1:-all}"
 exit_code=0
 
-# This scan passes NO severity filter, deliberately (#568). The CI `security`
-# job does pass `severity: 'CRITICAL,HIGH'`, but trivy-action's entrypoint.sh
-# runs `unset TRIVY_SEVERITY` whenever `format` is sarif and
-# `limit-severities-for-sarif` is not true — and CI uses `format: 'sarif'`.
-# So that input is DISCARDED and the gate fails on a finding of ANY severity
-# ("Building SARIF report with all severities" in the job log). A local check
-# narrowed to CRITICAL,HIGH passes while CI goes red, which is exactly how
-# #568 was missed. It likewise passes no scanner filter: CI supplies no such
-# input either, so Trivy runs its default scanner set — the job log shows both
-# [vuln] and [secret] scanning enabled. Narrowing either axis here would make
-# this wrapper weaker than the gate it claims to mirror; don't reintroduce it.
+# Mirrors the CI `security` job's two gates (#568 OQ-1 / DR-5,
+# docs/issues/568-js-yaml-omap-dos/design.md; see SECURITY.md, "Running
+# security scans locally"):
+#   1. secrets at EVERY severity: `--scanners secret`, no --severity. Trivy's
+#      --severity filter applies to every scanner in a run, so folding secrets
+#      into run 2 would stop gating MEDIUM/LOW secrets;
+#   2. fixable CRITICAL, HIGH and UNKNOWN (not yet scored) vulnerabilities, in
+#      table format, which honours --severity (only CI's SARIF report step has
+#      it unset by trivy-action, and that step never gates).
+# Fixable MEDIUM/LOW vulnerabilities are report-only in CI. Don't add
+# --severity to run 1, and don't remove run 1: either makes this wrapper
+# weaker than CI.
 run_trivy() {
-    echo "==> Trivy filesystem scan (ALL severities; unfixed ignored, matching CI)"
-    echo "    Note: the CI gate fails on ANY severity — trivy-action unsets"
-    echo "    TRIVY_SEVERITY under format: sarif, so its CRITICAL,HIGH input is ignored."
+    echo "==> Trivy filesystem scan (secrets: all severities; vulns: fixable CRITICAL,HIGH,UNKNOWN; matching the CI gates)"
     if ! command -v trivy >/dev/null 2>&1; then
         echo "  SKIP: trivy not on PATH (brew install aquasecurity/trivy/trivy)"
         return 0
@@ -47,6 +48,11 @@ run_trivy() {
     # --frozen the export reads the lockfile and never rewrites it (#568).
     uv export --frozen --format requirements-txt > requirements.txt
     trivy fs \
+        --scanners secret \
+        --exit-code 1 \
+        . || exit_code=1
+    trivy fs \
+        --severity CRITICAL,HIGH,UNKNOWN \
         --ignore-unfixed \
         --exit-code 1 \
         . || exit_code=1
@@ -129,11 +135,13 @@ run_gitleaks() {
 }
 
 case "$target" in
+    dependencies) python3 scripts/dependency_security.py || exit_code=1 ;;
     trivy)    run_trivy ;;
     codeql)   run_codeql ;;
     gitleaks) run_gitleaks ;;
-    all)      run_trivy; run_codeql; run_gitleaks ;;
-    *)        echo "Unknown target: $target (use trivy|codeql|gitleaks|all)"; exit 2 ;;
+    all)      python3 scripts/dependency_security.py || exit_code=1
+              run_trivy; run_codeql; run_gitleaks ;;
+    *)        echo "Unknown target: $target (use dependencies|trivy|codeql|gitleaks|all)"; exit 2 ;;
 esac
 
 exit "$exit_code"

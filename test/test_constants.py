@@ -793,6 +793,45 @@ class TestEventBusConstants:
         assert mod.EVENT_BUS_MAX_QUEUE_SIZE == 16384
 
 
+class TestTmuxHistoryLimitConstant:
+    """``TMUX_HISTORY_LIMIT`` is the scrollback floor CAO raises a shared tmux
+    server to (#728). An operator on a memory-constrained box needs a way to
+    lower or disable it, so it reads ``CAO_TMUX_HISTORY_LIMIT``."""
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_TMUX_HISTORY_LIMIT", None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def test_default_matches_the_recommended_tmux_conf(self):
+        mod = self._reload_constants({})
+
+        assert mod.TMUX_HISTORY_LIMIT == 50000
+
+    def test_env_override_is_honoured(self):
+        mod = self._reload_constants({"CAO_TMUX_HISTORY_LIMIT": "8000"})
+
+        assert mod.TMUX_HISTORY_LIMIT == 8000
+
+    def test_zero_is_a_valid_value_meaning_never_raise(self):
+        mod = self._reload_constants({"CAO_TMUX_HISTORY_LIMIT": "0"})
+
+        assert mod.TMUX_HISTORY_LIMIT == 0
+
+    def test_non_numeric_falls_back_to_the_default(self):
+        mod = self._reload_constants({"CAO_TMUX_HISTORY_LIMIT": "lots"})
+
+        assert mod.TMUX_HISTORY_LIMIT == 50000
+
+
 class TestOpenCodeConstants:
     """Tests for OpenCode provider path constants."""
 

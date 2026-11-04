@@ -7,8 +7,395 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro ephemeral helpers on v3** (#1167 Phase 2, #1074 phase 5; preview, pending the operator
+  checklist). `kiro_cli` can now be listed in `ephemeral.allowed_providers` (an operator opt-in; the
+  default stays `claude_code`), and a create reports `enforcement: "hard"`. A Kiro helper is not yet
+  a `provider.route` target: a set naming `kiro_cli` refuses with
+  `policy_config_error:provider_route`. Helpers run on the v3
+  engine only (`engine=v2` refuses), each from its own CAO-owned `KIRO_HOME` under
+  `$CAO_HOME_DIR/ephemeral/kiro/<terminal_id>/`, created after the bind and before the window. The
+  agent file is the same universal file `cao install --engine v3` writes, for the helper's tools plus
+  `@cao-mcp-server`, with a tool-less universal `cao-null` default; both pass CAO's v3 validator and
+  are sealed read-only. CAO never changes `~/.kiro`: it only checks whether Kiro's two legacy-copy
+  sources and their markers exist. An unlistable empty `powers/` placeholder stops Kiro's powers copy,
+  and a helper is refused when Kiro would copy an unmigrated secret store. After the header, a changed
+  placeholder or a new marker refuses before any task, and so does a workspace check that now also
+  refuses the home folder itself. `/tools` and `/mcp list` are held to the helper's own file. The
+  command assigns `KIRO_HOME` and runs one absolute kiro-cli, the one the probe ran. Release stops
+  every process whose `KIRO_HOME` is the home, records what changed, and removes the home. When a
+  process cannot be proven gone, the home stays and the operator retries the delete; the sweep
+  removes it only once the terminal row is gone. Installed Kiro launches are unchanged.
+
+- **Kiro helpers: `effort: "auto"` is decided at launch** (#1167, #1083). A Kiro helper with
+  `effort: "auto"` now asks `effort.route`, as Claude Code and Codex do, and the decided level
+  reaches kiro-cli as `--effort` for that launch only. An unusable answer runs the stored effort,
+  and the decision record names the reason. kiro-cli checks the decided level against the model, as it
+  does a stored effort, and a launch it refuses is not retried on the stored effort, so keep
+  `min_effort` and `max_effort` to levels your Kiro models accept. Installed Kiro agents are unchanged.
+
+- **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
+  API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one
+  universal agent file with v3 tool exclusions and deny rules. A v3 launch is refused before
+  anything is allocated unless the kiro-cli version is supported, the agent file on disk is CAO's
+  own render for its grant, `KIRO_HOME` is the default, `CAO_AGENTS_DIR` (if set) is
+  `~/.kiro/agents`, and the workspace's `.kiro/` holds no configuration; after the header, CAO
+  reads `/mcp` until no server is loading, then `/tools`, before any task. **Not yet a
+  supported configuration:** v3 support is claimed only once the live operator checklist has passed.
+  A kiro-cli version still pending operator verification (2.36.0, 2.37.0) refuses unless the operator sets
+  `kiro.v3_allow_unverified_versions: true` (provisional, for running the checklist on it); such a
+  launch logs a warning and its response carries `launch_notes`.
+  Also: `cao launch` now shows the server's refusal reason instead of "Failed to connect", and the
+  memory wiki compiler's Kiro call pins `--agent-engine v2`.
+
+- **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3
+  `Default` fallback** (#1167). A Kiro header with extra columns between the model and the context
+  gauge, such as `<agent> · claude-haiku-5.5 · low · ◔ 2%` on the v2 engine with `--effort`, or
+  `<agent> · <model> · thinking · low · ◔ 1%` on v3 with a pinned thinking model, used to read as no
+  header, so the launch was refused as `header_not_found`. Up to three short extra columns are now
+  read. The v3 engine's fallback agent, `Default` (`default` in its notice), has read, write, shell
+  and web tools; a header naming it, or an explicit request for it, is refused like `kiro_default`.
+  A launch is also refused, before any task is typed, when the screen shows kiro-cli's notice that
+  it did not load the requested agent (`agent "<name>" not found, using "kiro_default"` on v2,
+  `… using "default"` and its variants on v3), even under a header that names that agent; a notice
+  naming another agent leaves the header to decide. Elided and wrapped names still refuse. See
+  `docs/kiro-cli.md`, troubleshooting item 7.
+- **Kiro launches refuse an agent that kiro-cli would not run** (#1074). kiro-cli does not fail on
+  an unknown `--agent`. It prints `agent "<name>" not found, using "kiro_default"` and starts its
+  built-in default agent, which has every built-in tool, so launching a profile that was not
+  installed for Kiro, or whose agent file did not load, ran unrestricted. If a Kiro launch is now
+  refused, the remedy is `cao install <name> --provider kiro_cli`, then retry. Every `kiro_cli`
+  launch refuses an agent that none of the agent directories CAO searches defines, before any
+  terminal exists (`400`; the directories searched go to the server log, not the response). It also
+  refuses a pane whose TUI header rows do not all name the requested agent, before any task is
+  typed; an elided or wrapped header name, or a pane left in plan mode, never counts as the agent. A
+  Kiro terminal now takes typed input (`/input`, `/key`, `/exit`, `cao session send`, inbox delivery,
+  MCP `answer_user_prompt` and AG-UI) only once CAO has recorded that its header check passed. While
+  it is still starting, input is refused and queued inbox messages wait; `/terminals/run-step` on
+  such a reused terminal answers `409` `identity_pending`, retryable. A Kiro launch whose startup
+  ended without that record -- a refused identity, a timeout before the header was read, a server
+  restart mid-start -- has its window closed, even a deferred launch with no caller whose failure
+  record is kept (if the close cannot be confirmed, input to it stays refused). A Kiro terminal
+  verified before a server restart still accepts a re-sent task, and other providers are unchanged.
+  Kiro terminals launched before this change are not re-verified and keep their windows: they keep
+  accepting input unless they carry a startup failure. A correctly installed profile launches
+  exactly as before. **Behaviour change:** Kiro launches of a profile not installed for `kiro_cli`,
+  or of a Kiro built-in agent, are now refused; `cao launch --memory` on Kiro reports the
+  `memory_manager` sidecar as `refused` unless it is installed for Kiro; and with `CAO_AGENTS_DIR`
+  set in the server's environment outside `~/.kiro/agents` and `$KIRO_HOME/agents`, a launch now
+  fails at the header check, after kiro-cli has started (`cao-server --agents-dir` instead fails
+  early, as `agent_not_found`). **Not closed by this change:** the `/ws` web terminal drops the
+  attached pane's own keystrokes the same way, and refuses attaching to a pane whose runtime was
+  already reclaimed, but `/ws` is a full tmux (or herdr) client of the whole session, so its prefix
+  keys, mouse and command prompt can still reach another pane in that session, including an
+  unverified one. That gap predates this change and is tracked as a follow-up. See
+  `docs/kiro-cli.md`, troubleshooting item 7.
+- **Hierarchical robot factory example** (`examples/robotics/hierarchical-factory/`): a
+  simulation-only factory floor in MuJoCo, run by four CAO agents in two layers. A supervisor assigns
+  three team managers with `assign`; each manager runs its own team of Open Duck Mini robots (a serial
+  queue of 3, two parallel assembly lines, and a 4-robot formation that spins, turns, and runs to the
+  dock) through scoped MCP tools and reports with `send_message`; the supervisor balances the line when
+  a team blocks. Per-team credentials; managers hold only `@cao-mcp-server/send_message`, so CAO
+  refuses them `assign` and `handoff`. A loopback-only controller with a read-only live view, operator
+  stop, recorded frames and a GIF, a pinned and hash-checked download of the Open Duck Mini model, and
+  a `Robotics factory example` CI workflow. No CAO core change.
+
+- **Breaking: CAO now requires Python 3.11 or later** (CVE-2026-114605). dnspython, which CAO pulls in
+  through fastmcp, pydantic and email-validator, fixes CVE-2026-114605 (HIGH) only in 2.9.0, and 2.9.0
+  requires Python 3.11. Python 3.10 reached end-of-life on 2026-10-01. `requires-python` is now `>=3.11`,
+  release wheels build on `cp311`, and CI no longer tests 3.10. On Python 3.10, keep using the current
+  release or upgrade the interpreter. The docusaurus lock also moves `qs` to 6.17.0 (CVE-2026-110816), and
+  its override floor is now `^6.16.1`.
+
+- **`POST /agui/v1/run` refuses a `resume[]` it cannot process** (#1107 follow-up). When the server
+  started with the AG-UI surface off and it was turned on later, no approval bridge exists, so the run
+  skipped every `resume[]` entry and still reported `RUN_FINISHED` `success`. The route now answers
+  HTTP 404 "Approval bridge not initialized", as `POST /agui/v1/interrupts/{id}/resume` does. A run
+  without `resume[]` is unchanged. The documented request bodies now include the required `messages`
+  and the AG-UI 1.0 resume entry shape, and the docs no longer say the run plane streams live frames.
+
+- **`POST /agui/v1/run` now ends its response after `RUN_FINISHED`** (#1106, ag-ui-protocol/ag-ui#2216). A
+  run with nothing pending, or one whose `resume[]` resolved the last pending interrupt, used to stay
+  open forever. The route handed the run plane the whole-fleet SSE bus, which never ends, and nothing
+  in that loop could finish the run. A stock AG-UI client completes a run only when the body ends, so
+  `runAgent()` never resolved. The route no longer passes the fleet bus. Every run now ends with
+  `RUN_STARTED`, `STATE_SNAPSHOT`, then `RUN_FINISHED` (`interrupt` while approvals are pending,
+  otherwise `success`) or `RUN_ERROR`. After `resume[]`, `success` means the decision was delivered,
+  not that the agent finished; a later prompt surfaces as an interrupt on the next run. Live fleet
+  activity stays on `GET /agui/v1/stream`. `RunAgentInput.messages` is still not read.
+
+- **Claude Code 2.1.310 tool-permission prompts are detected as `WAITING_USER_ANSWER`** (#1106; related:
+  #405). Bash "Do you want to proceed?" and Write "Do you want to create <file>?" dialogs now render
+  the footer `Esc to cancel · Tab to amend`, which no existing pattern matched, so the terminal stayed
+  `processing`: no AG-UI interrupt was raised and inbox delivery could type into the dialog. The new
+  pattern arm is anchored to the same-line `·` chrome, so completed prose that mentions the phrases does
+  not match. Fixtures are real `tmux capture-pane` frames from 2.1.310 under `--permission-mode default`.
+
+- **A plan approval now names the working directory it was granted for, not just its path** (#827,
+  #1000). A path is not an identity. Move a non-Git working directory away, put a different directory
+  at the same path, and every value the plan identifier recorded was byte-identical, so the
+  replacement ran under the first directory's approval. A non-Git root now contributes its device and
+  inode (`st_dev`, `st_ino`) to the `plan_id` and to the per-run launch guard: the next run of a root
+  that was moved or renamed away and replaced, or whose path now carries a different mount, is refused
+  until re-approved, and a root swapped that way while a run is in flight stops that run's next agent
+  step with `plan_inputs_changed`. This does NOT catch a directory deleted and created again at the
+  same path: ext4 and XFS reuse the inode number just freed, so the recreated directory can get the
+  same pair back and keeps the approval, the same as a rewrite of its contents does — recorded under
+  "What an approval does not cover" in `docs/workflows.md`, with a stronger identity tracked in #1050.
+  A Git root's `plan_id` is deliberately unchanged, because its
+  identity is the commit plus the worktree digest, so two checkouts in the same state still share one
+  approval. Where the filesystem supplies no usable inode (some network mounts, container overlays,
+  Windows volumes with no file index), CAO falls back to the previous path-only identity rather than
+  refusing the run, and records the fallback instead of skipping it: the manifest carries
+  `repo_baseline.root_identity.bound: false` with a closed reason, the server logs that reason with no
+  path, and the unbound marker is part of the `plan_id`, so the weaker binding is visible in the
+  identifier an operator approves.
+
+- **A Git working directory replaced under a live run is now caught too, with no change to any Git
+  `plan_id`** (#827, #1051). A Git root's identity is its commit plus worktree digest, which settles
+  the case across runs — a different checkout at the same path is a different plan. It does not settle
+  it *within* a run: nothing recomputes the `plan_id` once a run is admitted, so `git worktree remove`
+  followed by `git worktree add <same path> <other branch>` during a long step, or a re-clone at the
+  path, left the script running in the old directory while every later terminal started by path inside
+  the replacement checkout, under the original approval, with nothing refusing it. The per-run launch
+  guard now records the device and inode for either kind of root, from the same single `stat` the
+  identifier used. That pair never reaches `plan_id`, so **Git identifiers do not move and existing
+  Git approvals stay valid.** A run admitted before this change carries no pair for a Git root and
+  keeps launching its remaining steps unchecked.
+
+- **A resume verifies the working directory before it re-drives anything** (#827, #1051). The root
+  comparison lived at agent launch, so a resumed run reached it only when it started a *new* agent
+  step: the script code before that step ran in the replacement directory, and a resume whose
+  remaining agent steps were all replays ran to completion there. Resume admission now does the same
+  comparison, after the approval gate and **before** the generation bump and before any recovery
+  decision is written, so a refused resume changes nothing and leaves a still-live process for that
+  run alone. `POST /workflows/runs/{run_id}/resume` answers `409` with
+  `{"kind": "plan_inputs_changed"}`, the same shape the agent-step route already returns; it
+  previously had no arm for this refusal. A resume whose directory never moved is unaffected, and so
+  is a run admitted before the root binding existed.
+
+- **A removed working directory gets its own refusal instead of being called a replacement** (#1051).
+  A bound root that is deleted, or whose `stat` fails with `EACCES`/`ESTALE`, could not be shown to be
+  the approved directory, so the guard refused — correctly — but under the "the directory at that path
+  has been replaced; start a new run" text. Starting a new run in a path that does not exist then
+  fails with `422`. The two states now say different things, and the refusal for a missing root tells
+  the operator to restore it.
+
+- **Breaking / migration:** every plan whose working directory is outside Git gets a new identifier
+  and is refused once, until re-approved under it (#827). The `plan-v2` scheme is not bumped: the
+  field set is unchanged and the root identity is new content inside the existing repository-baseline
+  field. Plans in a Git working directory keep their existing identifiers. A run already admitted and
+  left resumable keeps launching its steps, because a `launch-guard-v2` record written before the
+  binding carries no root identity and is checked without it rather than refused.
+- **Decision points say when a decider keeps failing, and records carry their target kind**
+  (#1067). The server logs one warning when a decider starts failing at a point (`timeout`,
+  `error`, `invalid_answer`, `no_answer` or `decider_unavailable`), at most once a minute for
+  each decider, point and reason, and one line when it answers again. These lines name only
+  the decider, point and reason. The server also logs its resolved threshold, timeouts, point
+  states and deciders at startup and when they change. `cao decisions status` adds
+  `decider_status`: each decider's last outcome, reason and time, and its counts by reason over
+  the last 24 hours, read from the database read-only. `decision_records` gains a nullable
+  `target_kind` column (`installed`, `ephemeral` or `workflow`); existing rows stay null.
+
+- **Ephemeral agents: startup and periodic sweeps, a live-name cap and retention** (#1079).
+  cao-server now collects expired and abandoned ephemeral names. It sweeps once at startup,
+  before serving requests, then every `ephemeral.sweep_interval_seconds` (default 300).
+  A sweep collects pending names past their TTL or whose creator terminal is gone, lapsed
+  claims past their TTL, and launched names with no terminal row. For those, periodic sweeps
+  wait `ephemeral.launch_grace_seconds` (default 600) after the bind; the startup sweep
+  doesn't wait. Claims inside their lease and launched names whose terminal exists are never
+  touched. Failed file deletions are retried. Live files left by a crashed create are deleted
+  under a lock shared with creation, once older than the launch grace. The live-name cap is
+  opt-in: `ephemeral.max_live_per_session` defaults to 0 (no cap), so existing users see no
+  behaviour change. Set it, for example to 32, to cap pending, claimed and launched names per
+  session; a create over the cap is refused with `max_live_exceeded` before anything is
+  written. A create that can't take the store lock is refused with `store_busy` (503), or
+  with `store_lock_unavailable` (503) when the lock is unavailable — for example, no `flock`
+  support, or the lock file can't be created, as on a read-only home. After
+  `ephemeral.retention_days` (default 14), a collected name's archive and then its registry
+  row are deleted, but only once its terminal and live files are gone. Earlier releases kept
+  them forever. All four defaults are provisional, and the feature stays off by default.
+
+- **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
+  paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
+  terminal still read IDLE, so the sender waited forever and the next message was pasted on top
+  of the first. The inbox now waits for a post-dispatch started status and, when it does not come,
+  sends a bare Enter if the provider can read its composer (`codex`, `claude_code`, `kiro_cli`),
+  re-sends in full only when the composer is known to be empty and the provider has a direct
+  probe, and otherwise logs the drop. A dropped delivery holds that one terminal's inbox for up
+  to 24s; other terminals, the sweeps and the inbox POST are not held. New env var
+  `CAO_INBOX_SUBMIT_CONFIRMATION` (default `true`) turns the confirmation off.
+
+- **The MCP server sent no bearer on 14 of its calls to the local API** (#990). Ten
+  `requests` calls in `mcp_server/server.py` reached scope-guarded routes with no
+  `Authorization` header, so on an auth-enabled server each one got `401`. Two were
+  fail-closed authorization lookups whose 401 surfaced as a refusal: `list_siblings` and
+  `update_metadata` refused a profile that holds the `discovery` grant, and
+  `answer_user_prompt` refused everyone. All fourteen sites now use the existing bearer
+  helpers; a call-site census test keeps the rule enforced. No change when auth is off.
+
+- **Breaking / migration:** workflow approval enforcement now defaults ON for script-tier runs
+  (#583 Bolt 3) (#699). The first run of each script plan is refused until
+  an operator runs `cao workflow approve <plan_id>`; operators choosing the previous behaviour set
+  `workflow.require_approval: false` in `settings.json`. Script runs journaled before this upgrade
+  cannot launch further agent steps while approval enforcement is on; start a new run. With
+  approval enforcement off, those runs continue. Plan identifiers used the `plan-v1:` scheme; see the
+  `plan-v2` entry below.
+
+- **Breaking / migration:** a fresh script run now executes a private copy of the approved source.
+  Modules beside the spec are not importable and `__file__` names the copy; this matches resume.
+- **Breaking / migration:** reserved ephemeral names are refused as fresh script-run agent steps
+  while approval is enforced: they have no installed definition for the launch guard to digest. The
+  ephemeral namespace is also outside the `plan-v2` profile-set digest by design: those profiles are
+  created by the run after admission and are bound on their own path.
+- **Breaking / migration:** non-Git roots now bind the directory's canonical path into `plan_id`.
+  Moving or renaming such a directory requires a new approval; Git-repository plan identifiers are
+  unchanged.
+- **Breaking / migration:** plan approval binds the script source, its resolved inputs, the working
+  directory's state (the Git commit and worktree, or the canonical path of a non-Git directory) and,
+  since `plan-v2`, the installed agent profile set. It does not bind memory content (#828), the
+  managed `.env` values a profile references, installed skills, agent-plugin MCP servers for the
+  providers that receive them at launch (`with_plugin_mcp`; for Kiro and OpenCode `cao install`
+  writes them into files that are bound, so an agent-plugin change moves `plan_id` there), the Kiro
+  `resources` files and global `mcp.json`, or a same-name profile shadowed in a lower-priority
+  directory: a later run of an approved plan uses their current content.
+- **Breaking / migration:** script-run plan identifiers move from `plan-v1:` to `plan-v2:` and now
+  bind the installed agent profile set — every installed profile's source text plus the files
+  `cao install` wrote for it (the Kiro agent JSON, the Copilot and OpenCode agent files, the shared
+  OpenCode `opencode.json`, the installed context copy) — because a step's system prompt and tool
+  policy come from those files, not from the script (#827, first acceptance criterion). Every stored
+  `plan-v1` approval stops matching: the first new run of each plan is refused with its `plan-v2`
+  identifier until an operator approves it again. A run frozen and approved before the upgrade still
+  resumes on its stored `plan-v1` identifier, and its launch guard record (which has no scheme
+  marker) keeps checking each agent launch under the rule it was admitted with, the profile text
+  alone; new runs record `launch-guard-v2`.
+  Editing or installing any profile, and a CAO upgrade that changes a bundled profile, moves every
+  `plan_id`. An entry the launch path cannot serve (a symlink leaving the store, a `..` name) is
+  digested by name only; a profile store CAO cannot read refuses the run as `profiles_unreadable`.
+  Binding the project root by device and inode (#827, second criterion) is not part of this change.
+
 ### Added
 
+- Ephemeral agents accept `provider: "auto"` (#1099, provisional). Create resolves it to the creator's provider, the fallback that the response, the registry row, the live profile and the archive keep. At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `provider.route` first, within the options CAO computes from the fallback's `ephemeral.provider_route` set, then ask the other `auto` fields for the provider it chose. On, a confident answer among the options runs the launch on that provider through its launch plan only: its own tier table maps the model and the plan carries the effort; nothing shared names it, and the decision record, the terminal, the archive's `bound` event and the launch record name the provider that ran. A pre-bind recheck refuses a decided provider the policy no longer allows with `policy_changed_since_create:<rule>`, including the new `provider_not_equivalent`, and collects the name; no other provider is ever tried, and a launch that fails before the bind for any other reason (the node cap, the delegation ceiling, the owner's own 400, a lapsed lease, a crash) leaves the name pending with its stored values. `claim_lease_seconds` counts one more wait. The claim response gains `provider_auto`, and for an `auto` claim the MCP helpers shape text the same way whichever CLI runs: the default `handoff` always adds the `[CAO Handoff]` banner, `assign` drops the sender suffix from an `@`-leading task, and the `handoff` success message names no provider. With today's providers nothing is routed, since no set validates.
+
+- Ephemeral settings accept `ephemeral.provider_route.equivalent` (#1099, provisional): disjoint sets of providers a decider may choose between for a `provider: "auto"` spec, empty by default. A set names two or more supported providers that `provider.route` can route to (not `kiro_cli` yet) and never mixes an `advisory` provider with a `hard` or `sandboxed` one; any other block, including an unknown key inside it, refuses every create and claim with `policy_config_error:provider_route`. With today's providers no set validates. The create response's `enforcement` now comes from one label helper that the validation reads too.
+
+- Decision points gain `provider.route`, "Which CLI should run this task?" (#1099). It is off by default. CAO computes its options for each launch and sends them as `DecisionRequest.options`, which is null on every other point's request; `CONTRACT_VERSION` is unchanged, but a decider that sends the whole request now sends one more `"options": null` key. An answer outside the options falls back as `invalid_answer`, and a launch with one option asks nothing and records the new reason `single_option`. The fallback source `creator` names the creator's provider. Records gain three nullable columns, `options`, `fallback_enforcement` and `applied_enforcement`, written only on `provider.route` records; the upgrade adds them without a backfill. The launch plan carries a decided provider that differs from the fallback. A decider that declares every point is asked `provider.route` once it is on.
+
+- Ephemeral agents accept `effort: "auto"` (#1083). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `effort.route` for that name only; explicit and omitted efforts never ask. Off and shadow launch on `ephemeral.default_effort`; on passes a confident answer, capped into `[min_effort, max_effort]`, to the provider for that launch only, as for the decided model, and falls back on any unusable answer; the live profile keeps the stored effort. `auto` needs both `ephemeral.min_effort` and `ephemeral.max_effort` (`auto_requires_bounds`). With both fields `auto`, `model.route` and `effort.route` are asked in turn, and `claim_lease_seconds` must be at least `2 * decisions.on_timeout_ms / 1000 + 30`. The `auto_requires_decision_platform` refusal is retired.
+
+- Ephemeral agents accept an optional `ephemeral.min_effort` floor (#1083). An explicit effort below it refuses with `effort_below_policy`, and a stored effort or provider default below a floor raised since create refuses at claim with `policy_changed_since_create:effort_below_policy`.
+
+- Decision policy bounds take an optional effort floor (#1083, #810): an explicit effort below it is refused as `below_floor`, and a decider answer below it is capped up to it. The launch plan carries an on-mode `effort.route` answer, applied or capped. Providers declare `honors_effort`; only Claude Code (outside a native agent), Codex and Kiro helpers do, and `effort.route` is recorded as `not_honored`, without asking, for any other provider.
+
+- Ephemeral agents accept `model_tier: "auto"` (#1068). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `model.route` for that name only; explicit and omitted tiers never ask. Off and shadow launch on `ephemeral.default_tier`; on applies a confident answer capped into `[min_tier, max_tier]`, and falls back on any unusable answer. `auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier` (`auto_requires_bounds`) and a `claim_lease_seconds` of at least `decisions.on_timeout_ms / 1000 + 30`. The ephemeral archive records the decision record ids.
+
+- Decision policy bounds take an optional model tier floor (#1068, #810): an explicit tier below it is refused as `below_floor`, a decider answer below it is capped up to it, and mappings are required from the floor to the ceiling. A delegation to an ephemeral target can carry the creator's description, redacted, in `profile_description`.
+
+- Ephemeral agents (#801) accept an optional `ephemeral.min_tier` floor. An explicit tier below it refuses with `tier_below_policy`, and a stored tier or provider default below a floor raised since create refuses at claim with `policy_changed_since_create:tier_below_policy`. Unknown `ephemeral.*` keys now log one warning per server process naming the keys, never their values.
+
+- Ephemeral agents (#1074): one provider-capability table now drives the `allowed_providers` rule, the create and claim provider checks, the effort mapping and the MCP tool's provider list. A create response carries `enforcement` (`hard` on Claude Code, `advisory` on Codex), and a provider that cannot run a requested tool atom refuses with `tool_unsupported_on_provider:<atom>`, which no current provider does. Accepted providers, refusals and stored files are unchanged. The label values and the new rule are provisional.
+
+- Ephemeral agents (#801) accept an explicit `effort` and apply `ephemeral.default_effort` and `ephemeral.max_effort` (Claude Code `--effort`, Codex `model_reasoning_effort`).
+
+- Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim.
+
+- `POST /sessions` and `POST /sessions/{session_name}/terminals` accept
+  `lookup_only=true` with an `idempotency_key`: the request returns the terminal
+  that key already committed, without waiting for it to initialize and without
+  creating anything (404 when nothing is committed, 400 without a key) (#773).
+- `examples/decision-model-host`: hosts the open-weight JevK5-4B decision model behind
+  a loopback-only `/v1/systemone` API. Locally, it uses llama.cpp, with Metal or the CPU.
+  On AWS, a CDK stack creates a single GPU instance with no IAM resources. Its services
+  bind to loopback and are reached by SSH tunnel, and it stops itself when idle. The CDK
+  tests pin those properties (#952)
+- Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
+  `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
+  are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update
+  with a stale `--expected-hash` is rejected at commit time. Lint warnings are shown on the default CLI
+  output. Every `cao workflow` HTTP verb and every workflow MCP tool forward
+  `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
+  run-step transport does not yet receive that credential; subprocess credential delivery
+  remains a separate security-boundary decision.
+- Launch records (#1082): CAO writes one content-free record per terminal launch to a new
+  `launch_records` table (labels, timings, ids and the reported outcome, never prompts or output)
+  and keeps it after teardown, with the reason the launch ended. `launch_status_events` records
+  status changes for a provisional busy-time figure. `report_outcome` takes an optional
+  `terminal_id` and returns `launch_linked`, and `POST /outcomes` takes `launch_terminal_id`: only a
+  self-report or the launch's direct creator may link, and the route answers `403`, writing
+  nothing, when records exist for that id and none is bound to the reporter. **Behaviour change:**
+  a fresh Claude Code launch now always gets a CAO-generated `--session-id` (never together with
+  `--resume`), so a Claude Code CLI too old to know the flag fails every fresh launch.
+
+### Changed
+
+- `examples/aidlc-portfolio`: `question answer` now requires a packet-bound, single-use
+  `--approval-id` instead of `--answered-by`; removed `learning approve` / `learning reconcile`
+  and `memory refresh` / `inspect` / `clean` in favor of `learning propose` / `list` /
+  `promote` / `reject`, with promotion recorded against a CAO memory entry. `dispatch check`
+  no longer returns memory baseline revisions, and learning proposals now record promotion
+  metadata instead of `baseRevision`. CAO resolves project memory per terminal, so runners
+  cannot recall the supervisor's scope: the new `dispatch message` renders the runner
+  assignment with the promoted learnings that apply to it, from the supervisor's own
+  `memory_recall`, and `learning promote` now requires the `--memory-key` that `memory_store`
+  returned (#936).
+
+- Opt-in non-accessing inspection for CLI memory list/show and HTTP GET
+  memory views. Agent recall still reinforces access counts; repeated
+  operator views cannot make lessons promotion-eligible. Part of #861.
+
+- Opt-in `memory.lifecycle.enabled` excludes active supersedes targets from
+  injection and adds transient recall labels/demotion. Defaults and canonical
+  Markdown remain unchanged; score/relevance demotion is always on. Ordering
+  and labels share one supersedes snapshot, including related targets. Part of #861.
+
+- Batch lifecycle eligibility seam for native, vault, related and curator
+  injection paths, with lazy checks before caps and per-source fail-open
+  diagnostics. The registry contains only the built-in supersedes source,
+  disabled by default; ordinary explicit recall remains unfiltered.
+  Part of #861. Refs #867.
+
+- On-demand `cao memory list --query Q --explain` compares default/relevance
+  ranks without recording access or exposing memory content, tags or paths.
+  Both pools share one supersedes snapshot for consistent ranks and labels;
+  source failures are visible and errors omit paths and keys. `lexical_degenerate`
+  reports all-zero lexical batches without changing ranking.
+  Table/JSON output is bounded; `memory.explain_enabled` defaults to true and
+  supports `CAO_MEMORY_EXPLAIN_ENABLED`. Part of #861.
+
+- Opt-in memory recall `sort_by="relevance"` over the widened candidate pool,
+  with all-term tiers and bounded age influence for native project rows.
+  Missing, empty and whitespace-only queries follow the exact recency path,
+  including source selection and access effects; defaults are unchanged. Part of #861.
+
+- `assign` and `handoff` now launch ephemeral agents (#801) from their creator terminal: Claude Code by default, Codex when an operator allows it.
+- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
+- Persistent agent descriptions with creation-time CLI/MCP labels and editable
+  descriptions in Web UI Home and Agents (#942).
+- `cao agent assign`, `handoff` and `send-message` accept `--message-file PATH` (`-` for
+  stdin) in place of the positional MESSAGE, the file/stdin input #616 asked for: read as UTF-8,
+  one trailing newline dropped, mutually exclusive with MESSAGE, and refused when empty.
+
+- The publish workflow now refuses, in seconds, a release tag whose version
+  `pyproject.toml`, `uv.lock` and the devcontainer feature do not carry, and a
+  version the target index already serves: both TestPyPI and PyPI on a release,
+  only the chosen one on a manual dispatch (`scripts/assert_release_version.py`).
+  v2.5.1, v2.5.2 and v2.5.4 each spent ~80 minutes building wheels before TestPyPI
+  answered `400 File already exists`, because the tag sat on a commit that had not
+  been bumped. The failure text names the remedy for the situation it found.
+- Security regression tests derived from the review harnesses Augusto Santos
+  (@gutosantos82) wrote while assessing CAO's CI security gates: a route-by-scope
+  authorization matrix with auth enabled (every HTTP route x no/read/write/admin
+  token, handlers stubbed, admin-only and read-tier routes pinned as literals), a
+  browser-boundary matrix for the Host (#124), WebSocket Origin (#533), CSRF
+  (#605), malformed-Origin (#656) and scheme-aware same-origin (#658) guards, and
+  filesystem invariants for the per-terminal FIFO path (#823) and atomic-file
+  modes under a concurrent writer (#821). `test/security/`. (#938)
+- Simulation-only cross-zone robot transport example (#845): existing CAO CLI
+  supervisor, zone-operation, and checker agents share a persistent MuJoCo
+  kinematic world through scoped MCP tools. Includes measured custody handoffs,
+  operator stopping, refusal/interruption cases, alternative robot setup, and
+  isolated optional dependencies; no additional reasoning framework or hardware path.
+  The generated launch command carries an explicit, nonblank operator request.
 - Security groundwork for ephemeral agents (#801): installed profiles whose
   names match the reserved pattern can no longer be launched or listed;
   installed-profile APIs and CLI lookups refuse those names, and cao-server
@@ -17,7 +404,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unless the operator sets `ephemeral.child_may_delegate` to `true` in
   `settings.json`. Workflow `run`/`resume`/`start` now refuse when
   `CAO_TERMINAL_ID` is set but the calling terminal cannot be resolved.
-  Ephemeral agent creation is not yet available.
+- Ephemeral profile creation (#801): `create_ephemeral_agent` and
+  `POST /ephemeral-agents` are available behind `ephemeral.enabled`, off by
+  default. Creation stores a pending row, two live files and an archive.
+  Live files remain until collection or release; registry rows and archives are
+  retained. There is no background sweep, so keep the feature disabled outside testing.
+  The live files and archive can be deleted by exact path while no ephemeral
+  terminal exists. Reserved names also refuse remote placement with
+  `remote_placement_not_allowed`.
 - Advanced CodeQL analysis for same-repository and fork pull requests, with
   Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
   weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
@@ -33,6 +427,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cao session status`, and the ops MCP `get_terminal_status` and
   `get_session_info` return both fields; `list_siblings` and the delegation
   tool results are unchanged (#810)
+- launch-decision platform: `model.route` (`small`/`medium`/
+  `large`) and `effort.route` (`low`/`medium`/`high`), each `off`, `shadow` or
+  `on`, all off by default. Deciders register under the `cao.deciders`
+  entry-point group; the built-in `fixed_table` looks a tier up by profile,
+  then role. The top-level `model_tiers` setting maps each provider's tiers to
+  model IDs. Shadow and on write content-free rows to a new `decision_records`
+  table (a keyed message hash, never the task text), kept 90 days. Operators
+  control it through `cao decisions`, `cao-server --decision`, the
+  `CAO_DECISION_*` variables and the ops MCP decision tools; the agent-facing
+  MCP server has none. Assign, handoff, elastic assign and CLI handoff that
+  omit a model ask `model.route`; an explicit model always wins. In on mode
+  their result notes the model that ran, carried in the optional
+  `X-CAO-Decision` response header, and agent tool definitions are unchanged.
+  With every point off, launches are unchanged. See `docs/decisions.md` (#810)
+- `cao decisions off` turns every decision point off, including a running
+  server's environment and startup-flag overrides, and waits up to the shadow
+  timeout plus five seconds for in-flight external decider requests to finish;
+  if they don't, it exits non-zero and the halt stays. An installed external
+  decider must send only while holding `decisions.egress.egress_permit`, which
+  refuses during the halt. `cao decisions enable|disable|show <name>` run the
+  decider package's own consent, revoke and status commands, and `cao
+  decisions status` shows the halt and each installed decider's version and
+  kind without importing it. Ops MCP gains `decisions_off` and cannot grant
+  consent. Core still bundles only `fixed_table` and makes no external call.
+  See `docs/decisions.md` (#810)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
   `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
@@ -77,6 +496,235 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `memory_store` and `memory_forget` MCP tools now honor the caller's local memory switch
+  when a remote memory owner is configured (#1087). `memory_recall` checked the switch before
+  branching to the owner, but the write and delete tools did not, so a caller with memory off
+  was refused a read yet could still write or delete on the owner, which applied only its own
+  switch. Both tools now return `disabled: true`, as `memory_recall` does, without calling the
+  owner.
+- Ephemeral profiles explicitly omit the inherited skill catalog while keeping named skill
+  loading available. Every live-profile load verifies the parsed bytes against the registry
+  hash and fails closed on missing or modified data, including claim-less launches and provider
+  reloads. `workflow_cancel` now requires `ephemeral.child_may_delegate` for ephemeral callers;
+  the guide also reflects terminal-target binding for MCP messaging, answers and deletion (#801).
+
+- Antigravity CLI workers no longer report under another worker's terminal id.
+  Every `agy` process starts every server in the shared
+  `~/.gemini/config/mcp_config.json`, and each worker's entry pinned its
+  `CAO_TERMINAL_ID`. So a reviewer assigned while its developer was alive also
+  ran the developer's `cao-mcp-server`, and its `send_message` could reach the
+  supervisor labelled with the developer's id. Entries now carry no identity:
+  `cao-mcp-server` takes `CAO_TERMINAL_ID` from the `agy` process environment,
+  workers with the same server config share one entry (owners listed under
+  `caoTerminalIds`), and leftover per-terminal entries are removed at the next
+  launch (#940).
+- Script-run frozen memory now uses the memory gateway, so a configured remote memory owner
+  supplies the same context as live terminals instead of freezing stale local memory. A journal
+  read failure for a known script run now withholds memory with a warning instead of falling back
+  to live, unfrozen memory; non-script runs keep their existing fallback. A memory resolution error
+  now gives the step no memory with a warning, as on the live path, instead of failing it. This
+  includes a local read error and a remote owner that is unreachable, errors, or has memory
+  disabled (#828).
+- Context injection with a configured remote memory owner now honours the operator's local
+  memory switch. The switch was only checked on the local curated path and on the
+  frozen-replay path (#828); with a remote owner configured and the switch off, a live
+  terminal's first message, and the Claude Code/Codex/Kiro CLI provider-config-file memory
+  plugins, still called out to the owner and injected its block. The check now sits in
+  `memory_gateway.memory_context_for_terminal`, the single choke point all five callers
+  (the first-message path, the frozen-replay path, and the three provider plugins) go
+  through, so the owner is no longer called at all for context injection when the switch is
+  off; it is unreachable, not merely unused (#1071).
+- Every client call that creates a session or terminal synchronously (`cao launch` without
+  `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
+  `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
+  and the profile's override of it, through one shared derivation, instead of from
+  `mcp_request_timeout` or a per-site literal (30s, 150s, 300s). A successful but slow
+  provider init was being reported to the caller as a transport failure while cao-server went
+  on building the worker, so a retry collided with a session that already existed. Only the
+  read half of the request timeout widens; an unreachable server still reports in 5s. A guard
+  test enumerates every create call site and fails on one that neither defers init nor derives
+  its budget. `GET /health` now reports the server's `provider_init_timeout` so an operator can
+  check that a client on another host sees the same value (#710).
+- `cao agent handoff` no longer loses the worker when provider startup
+  outlasts the client's create timeout. The create is retried under one
+  idempotency key with the full timeout each time (sized per profile by #710),
+  and cao-server holds a replay until the original initialization finishes, so
+  input is sent only to a ready worker. If startup outlasts every attempt, the
+  handoff fails but reports the worker's terminal ID and sends it no input; if
+  the original startup failed, that cause is reported and no second worker is
+  started. A keyed replay of a create whose initialization failed answers 424
+  with the cause, and a keyed replay no longer publishes `post_create_session`
+  again (#773).
+- Inbox delivery no longer types a queued message into an open user-answer dialog (#896). With
+  `CAO_EAGER_INBOX_DELIVERY=true`, a message for a Claude Code terminal sitting in
+  WAITING_USER_ANSWER was pasted into the AskUserQuestion dialog, marked DELIVERED, and the
+  trailing Enter answered the question. Eager delivery now holds the message while a provider
+  that declares `blocks_orchestrated_input_while_waiting_user_answer` shows a dialog, and
+  `dispatch_input`'s dialog guard covers every `OrchestrationType` (including `send_message`),
+  not a hand-written subset. A refusal caused by an open dialog keeps the message PENDING for
+  the next IDLE/COMPLETED event or reconcile sweep instead of marking it FAILED. The guard also
+  covers the swallowed-Enter recovery from #78: a bare Enter submits what is already in the
+  composer without going through `dispatch_input`, so it checks the same predicate itself rather
+  than relying on a dialog happening to hide the composer box.
+- Web UI: the three create calls in the browser client (start a session, add a terminal to a
+  session, run a flow on demand) now size their budget from the server's `provider_init_timeout`
+  as well, instead of the fixed 90s they carried. 90s is below a successful Antigravity init at
+  stock settings, which the same change sizes at 430s, so the browser gave up and showed a
+  failure while cao-server went on building the worker. The budget comes from one exported
+  `createBudgetMs()` helper, which reads `provider_init_timeout` from `GET /health` once per page
+  load and applies the same arithmetic as the Python helper, so both clients derive the same
+  number. An unreachable server, or one old enough not to report the field, falls back to the
+  previous 90s. Deadlines on reads, cancels and the profile authoring round-trips are not
+  init-bound and are unchanged. A guard test enumerates the create call sites, fails on a fixed
+  timeout literal or a create that bypasses the helper, and fails if a new create call is added
+  without being registered; it also reads the Python constants so the two derivations cannot
+  drift apart. The UI still sizes from the server's global value only, because `GET /health` does
+  not report a profile-level override (#710, #1002).
+- Workflow scripts over 131,072 characters (128 KiB) now fail `validate`, `create`, `update`,
+  `run` and `submit` with a `syntax` finding that names the size and the limit, instead of being
+  parsed. On CPython 3.10 `ast.parse` segfaults the interpreter on deeply nested source and no
+  exception can catch it, so the linter and the `INPUTS` extractor each refuse oversize source
+  before parsing. A script between 128 KiB and the 256 KiB spec budget that ran before this
+  release must be split (#969).
+- Vault scan now re-reads a note whose size, mtime or ctime changed across the read window up to
+  three times with a short backoff, as ADR-006 specifies, instead of skipping it on the first
+  torn read. A note saved by Obsidian during a reconcile is indexed from the clean re-read; a
+  note still changing after the bound is recorded as `unstable_skipped` with the attempt count in
+  the finding detail and its prior row is left intact (#644).
+- Vault configuration validation no longer queries the database. `VaultConfig` validators are
+  pure, so a `memory.vault` document with a project mapping validates on a fresh `CAO_HOME_DIR`
+  that has never run `init_db()`, and `cao config list` shows it without a database. Project
+  aliases are still canonicalised, and alias-equivalent mappings still refused, on the loading
+  path (`get_vault_config`) that owns a database; a guard test keeps every vault validator free
+  of `clients.database` (#644).
+- `cao-server` now refuses to start when another `cao-server` already owns the
+  same `CAO_HOME_DIR`, whatever port either uses. The server takes an exclusive
+  `flock` on `server.lock` in the data directory before the database, recovery
+  sweeps, terminal registry, status monitor or port bind, holds it for the
+  process lifetime, and the second instance exits non-zero naming the owning
+  PID, port and start time. Previously the port was the only guard, and a
+  second server on another port silently marked the first server's in-flight
+  launches as interrupted, double-delivered inbox messages on the herdr
+  backend, and could tear down the first server's tmux panes. Two servers on
+  one data directory are unsupported; use a separate `CAO_HOME_DIR` and
+  `--port` per server (#406, #709).
+- Concurrent blocking script starts with the same run id now return a conflict
+  for the loser without changing the winning run's journal or live record.
+- Script runs under approval enforcement now stop before spawning if their run row
+  cannot be recorded. A known script run with a missing row supplies no memory
+  and logs a warning, whether enforcement is on or off. Its launch guard also
+  refuses fresh agent launches while approval is enforced.
+- Kiro CLI agent specs installed by CAO now carry `includeMcpJson`, the name Kiro CLI documents, instead of the retired `useLegacyMcpJson` alias, which Kiro rejected as a duplicate field whenever another writer added the canonical key (#1026). The profile field keeps its `useLegacyMcpJson` spelling and is now actually forwarded into the spec; previously it was accepted and ignored.
+- `cao session send` no longer prints the previous turn's answer, and no longer
+  waits out its timeout on a turn that finished (#735). `POST /terminals/{id}/input`
+  now returns the `dispatch_boundary` of the turn it started, and
+  `GET /terminals/{id}` reports `status_generation` (the output generation the
+  status was earned at) and `output_generation` (the current counter). The CLI
+  refuses a status earned at or before the boundary; once output has landed
+  without the status being re-earned it gives the stamp 8 s to move, then warns
+  on stderr and finishes on the frame as before. A cao-server restart during the
+  wait is detected and warned about instead of waiting out the timeout. Both
+  fields are additive: `success` is unchanged, and an older server gets the
+  previous behaviour.
+- **Security:** a task's text could be executed by the worker's login shell. If `codex`
+  exited during startup (for example on a network timeout while reading the account),
+  its `› Error: ...` line read as an idle composer, the exit-to-shell check was switched
+  off until initialization had completed, and the assigned task was pasted into bash,
+  which ran every line of it including backtick and `$(...)` substitutions. Codex
+  startup now reads the pane's foreground process on every readiness poll and once more
+  before declaring ready, a ready verdict from a pane that is back at the shell is ERROR
+  whether or not initialization has finished, and the shared delivery path re-checks the
+  status and the pane's foreground process immediately before typing, for every provider
+  that records a shell baseline. `assign` and `handoff` now tear down a worker whose
+  provider is in ERROR or has exited to the shell by delivery time and report
+  `provider_exited` (or `provider_exited_after_dispatch` when a resubmit was refused after
+  the task had been typed once); previously the dead worker was kept and reported as
+  waiting on a prompt (#1018).
+- Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
+  workflow inputs and earlier step outputs stay filled in when structured output
+  is missing or invalid (#966).
+- `claude_code` workers running with Claude Code's `prefersReducedMotion` setting
+  are no longer reported as completed while they work. That setting draws the
+  spinner with a static `●`, which both status paths read as a finished response,
+  so `handoff` and workflow steps tore the worker down about 2s after sending the
+  task. A `●` line whose ellipsis is followed by the spinner's status in
+  parentheses (a running hook, the elapsed time, the token count or `thinking`)
+  is now treated as a live spinner, whatever the message before it (#908). A
+  finished response that reports its own timing — `● Done. The fix is in place…
+  (3m 12s)` with the end-of-turn summary under it — is the same text, so both
+  detectors now look for a spinner only on the newest conversation row above the
+  input box, instead of holding the worker at processing until the step timed
+  out (#974). Blank rows, box chrome, the rows a wrapped chrome line continues
+  onto, and the status area Claude Code draws under the spinner — the task
+  list's indented checkbox rows and queued messages — are not conversation: one
+  shared walker skips them on the way up, so a `⎿ Tip:` line that wrapped in a
+  narrow pane, a task list or a queued message under the spinner cannot hide it
+  and report a working agent as completed either. The same scope stops a
+  response bullet in the bottom rows from reading as a spinner.
+
+- `store_lesson` no longer decides the learning gate, authorizes itself, or opens
+  SQLite inside the agent's process. It writes through a new `POST /lessons`
+  route, finishing the boundary move #734 started for `report_outcome` and
+  `list_outcomes`: an unreadable `settings.json` now surfaces as a plain error
+  (503) instead of `disabled: true`, which `skills/cao-learning` tells agents to
+  skip silently — so a filesystem fault used to swallow the lesson with no trace.
+  A missing route or unreachable server is likewise an explicit failure, never
+  `disabled`: only a 404 carrying `cao.learning_disabled` reads as the gate. The
+  caller's profile and its `store_lesson` capability are now resolved on the
+  server from the terminal record and profile frontmatter, so the check no longer
+  depends on the agent process being able to read the profile store (#744).
+- Kiro profile installation now preserves profile-defined `resources` alongside
+  CAO's default context and skill resources. Reinstall existing profiles to
+  include their configured resources in the generated Kiro agent configuration
+  (#904).
+- Copilot CLI readiness detection recognizes the downloaded-update notice prepended
+  to the hint bar, avoiding initialization timeouts after a background update.
+  Busy, waiting, error, and unrecognized rows still prevent readiness (#870).
+- Script workflows that exit while a process they started still holds their
+  stdout/stderr now settle on the script's own exit. On Python 3.11+ such a run
+  used to wait out the whole wall-clock bound and be recorded as a timeout with
+  its output dropped, and on 3.10 it did not settle until that process exited.
+  The pipes now get the reap grace to drain, and a warning names the case (#894).
+  Timeout and cancel likewise settle once the script itself is gone, instead of
+  waiting for that process, and a timed-out run closes the pipes too.
+- `cao launch` with an initial message no longer gives up on the first failed
+  poll of the delivery state (#882). A failed poll that is not a 4xx (a
+  connection error, a read timeout, a 5xx, or a reply that is not JSON) is
+  retried until the init allowance runs out, so `--async` no longer exits
+  non-zero for a task the server goes on to deliver. A 4xx still fails at once,
+  and a timeout after failed polls says the message may already have been
+  delivered.
+- `cao session send`, the headless `cao launch` run, `cao worker send` and
+  `cao worker attach` no longer lose the agent's reply when one status poll
+  fails while they wait (#1016). The same rule as #882 applies: a connection
+  error, a read timeout, a 5xx or a reply that is not JSON is retried until the
+  send timeout, a 4xx fails at once, and a timeout after failed polls names the
+  last error. Broker errors from `FleetClient` now keep their HTTP status, so a
+  worker's 404 still fails at once.
+- Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
+  and weekly, including development dependencies and unfixed advisories. Block
+  every HIGH/CRITICAL finding and scan error, and publish complete inventory and
+  finding summaries. Replace the affected `braces` package in docs, web UI,
+  and MCP Apps with the provenance-verified published guarded fork
+  `@dieub/braces-depth-guard@3.0.3-pn.3`, retaining a small shared patch for
+  acyclic AST parent-link bounds. Verify dev-only inventory with real Trivy,
+  fail non-vacuously on missing consumers, and preserve three-project failure
+  aggregation. No advisory exemptions or fabricated versions are used.
+- Preserve canonical dependency identity for the guarded fork in GitHub's
+  dependency graph: private one-statement local adapters retain existing
+  `braces` imports while the real package remains directly visible.
+  Reject and revert the npm version-2 workaround, which produced an unparsed
+  alias rather than a correctly identified dependency.
+- Vendor the verified guarded-fork tarball so cold installs in all three
+  toolchains survive registry removal without changing package identity,
+  version, license, or integrity. Document the fork's upstream-advisory blind
+  spot and concrete weekly/pre-release maintainer tracking checkpoints.
+- Consolidate the dependency fixes from #888-#890: update `source-map-js`
+  throughout docs, web, and MCP Apps, plus docs `compression` and `proxy-addr`.
+  Clear the remaining Joi, selector-parser, and Tinypool scan findings with
+  upstream fixed releases and explicit overrides where older consumer ranges
+  exclude them. Add source-map, selector, worker-pool, and all-copy lockfile
+  regressions without changing scanner exclusions or severity policy.
 - `copilot_cli` launches no longer time out after 60 seconds on Copilot CLI
   1.0.91 (#870). Copilot repaints only changed cells in its full-screen view,
   so the raw output stream never shows a settled idle prompt; the provider now
@@ -127,6 +775,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `http-cache-semantics` to 4.3.0. Document the patch and disputed cache advisory,
   and run dependency regression checks as part of the existing site build
   without suppressing alerts or changing scan policy.
+
+- claude_code: a streaming answer no longer reads as a finished turn. The
+  newest Claude Code TUI draws no spinner while response text streams, so a
+  settled mid-answer frame read COMPLETED (a `⏺` still on screen) or IDLE (every
+  marker scrolled off), and `run_step` / `handoff` tore the worker down
+  mid-answer. After a dispatch, both the raw-stream and rendered-screen
+  detectors now require the end-of-turn summary (`✻ Worked for Ns`) as the
+  newest line above the input box before reporting a ready status, with a 15 s
+  fallback to the previous verdict for an end state that paints no summary.
+  While a terminal is PROCESSING, the status monitor's per-poll re-derivation
+  now reads Claude Code from its composited screen (the provider opts in with
+  `status_recheck_uses_screen`, #907) instead of the raw rolling window, whose
+  repaint fragments and size cap left no input box to anchor on. That re-check
+  reuses its verdict while the output is unchanged, so the 15 s fallback lands
+  at the next stale-pane re-check (#558) after the grace period (#865).
+
 - Address five baseline CodeQL alerts without suppressions: remove filesystem
   probes from plugin source-kind inference, confine Kiro policy-file inspection
   to its canonical agent directory, replace the flagged Kimi footer and swarm
@@ -191,6 +855,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override configured, the guard and the probe also consult the default
   directory, so ownership records written there by earlier releases stay in
   force (#493).
+
+- **In-band provider refusals are now workflow step failures.** A provider
+  that exits cleanly after printing an error is classified as `provider_error`
+  instead of returning the refusal as a successful answer; `/terminals/run-step`
+  maps it to 502, and the structured kind survives journal settlement and status
+  rendering. (#638)
 
 - **Workflow script run-step refusals now retain their typed reason in run
   records.** When a structured HTTP error includes a string `detail.kind`,
@@ -521,6 +1191,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Ephemeral settings (#801): `ephemeral.max_tier`, `default_tier`, `max_effort`, `default_effort` and the `model_tiers` table are now validated, not ignored with a warning. A ceiling without a default, an invalid value, or a table missing a required mapping refuses every ephemeral create and claim with `policy_config_error:<key>`. Explicit `model_tier` and `effort` no longer refuse with `tier_not_supported`/`effort_not_supported`, and the 'not applied yet' notes and create warning are removed.
+
+- A plain (non-Git) directory is now an approvable plan, keyed by its canonical path.
+
+- Script runs execute in, and fingerprint, one project root (#699): the run request's optional
+  `working_directory`, defaulting to cao-server's working directory. The CLI sends its current
+  directory (or `--working-directory`) and the MCP tools send the calling terminal's directory, so
+  script runs started from those clients now run in the caller's directory instead of cao-server's.
+  Agent steps that name neither a working directory nor a caller default to the run's root. A project
+  root outside Git is now an approvable plan instead of `plan_identity_unavailable`. Approvals granted
+  for a plan fingerprinted against a different directory must be granted again.
+
+- While approval is enforced, a script run refuses to launch further agent steps (HTTP 409,
+  `kind: plan_inputs_changed`) when an agent profile or the memory-enabled setting changes after
+  the admission snapshot. That snapshot is captured before the approval check (#699).
+
+- `cao workflow get` / `update` / `delete` validate and percent-encode workflow names;
+  `cao workflow validate --json` returns the `{ok: false, ...}` envelope on failure; `cao workflow
+  delete` gains `--json` (#699).
+
+- SECURITY.md now states the supported release line as 2.x (it said 1.x while
+  2.5.x was on PyPI), guarded by `test/test_security_policy.py` against the
+  version in `pyproject.toml`, and documents how maintainers handle a report:
+  triage in the advisory draft, fix in its private fork unless the finding is
+  already public, no draft advisory identifiers in public commits or PRs, CVE
+  through Amazon's CNA rather than GitHub's request button, release before
+  publishing with an affected/fixed statement, reporter credit, and a
+  regression test for the class.
+- Dependabot now watches every tracked lockfile, not only the Actions pins:
+  `uv.lock` (root and the two example projects), the seven npm lockfiles, the
+  TUI `Cargo.lock`, and the two `bun.lock` files, with a seven-day release
+  cooldown and weekly minor/patch groups per ecosystem. The guarded `braces`
+  fork is excluded so Dependabot cannot propose a registry replacement for it.
+
+- The MCP server now requires fastmcp 3.2.0 or newer (was 2.14.0), the
+  version CI tests. fastmcp 2.x does not export `ToolResult` from
+  `fastmcp.tools`, so `cao-mcp-server` would not start on it. Upgrading
+  CAO upgrades fastmcp (#801).
+
 - record the originating install handle in each shared context copy's frontmatter
   (`x-cao-source-stem`), so a reinstall can tell its own prior copy apart from a
   different profile that resolves to the same OpenCode agent id. The key is
@@ -542,6 +1251,191 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently, so `limit=500` keeps working rather than becoming a 422.
 
 ### Security
+
+- **Vault `secret_gate: "warn"` no longer forwards raw secret matches to a model** (#644 AC10).
+  Under `warn` a secret-bearing note is still indexed and recallable, but every match is replaced by
+  `[REDACTED:<pattern_name>]` at the single vault read chokepoint, so automatic injection, explicit
+  recall, related-key expansion and BM25 ranking all see the marker, never the bytes. Raw bytes pass
+  only when the note's frontmatter carries a per-finding acceptance bound to the pattern name and the
+  SHA-256 of the matched span (`cao.secret_ok: [{pattern, sha256}]`); a boolean or pattern-only entry
+  quarantines the note. `cao memory vault scan --fingerprints` prints the values an acceptance needs;
+  `cao memory vault status` reports honoured acceptances (`secret_acceptances`, `secret_accepted`) and
+  inert ones (`secret_acceptance_unmatched`). Fingerprints come from one acceptance-free pass, so
+  they never change with what is accepted; a credential two patterns match, such as
+  `NAME_TOKEN=value`, prints two fingerprints and needs both accepted before the value is served
+  raw. The config-load warning for `warn` with `inject: true` is retired because the pairing no
+  longer carries exposure. Redaction runs over the body exactly as the scan read it, leading
+  `# Heading` included, and the heading is dropped only afterwards for display; because
+  `bearer_token` and `secret_assignment` match across a line break, a heading ending in a key word
+  with the value beneath it is one match, and where the marker replaces that line break the rest of
+  the value's line goes with the heading, so recall can show less of the note than it holds.
+  `reject` is unchanged.
+  **Migration:** operators who relied on `warn` passing raw bytes to agents must add a per-finding
+  acceptance to each note for each span they want served raw; until then those spans are redacted.
+
+- **Child allowlists are bounded by the creator's delegation ceiling.** A
+  terminal's `allowedTools` limited what it could call, not what it could
+  create: a restricted agent could `assign` or `handoff` to a profile holding
+  tools it lacked (for example a read-only reviewer launching a developer with
+  `execute_bash`), and the in-session create endpoint stored whatever
+  `allowed_tools` string the client sent. `create_terminal` now refuses a child
+  whose resolved tools exceed the creator's **delegation ceiling**, recorded on
+  the new `terminals.delegate_tools` column at creation (migration runs at
+  server start), read from the creator's stored row, and never re-derived from
+  a profile, so an intermediate `role: supervisor` profile cannot widen a
+  restricted tree. One comparator (`utils/delegation.py`) serves installed
+  profiles and the ephemeral path, which already enforced the rule.
+  - **Where it is enforced.** Every creation path: `assign`/`handoff` (the MCP
+    layer prechecks and the server re-checks), `POST /sessions/{name}/terminals`
+    with a client `allowed_tools` string (403), `/terminals/run-step`, workflow
+    steps on both tiers (YAML steps and the run-step calls a `.py` script
+    dispatches), which inherit the ceiling of the terminal that started or
+    resumed the run (the MCP workflow tools and `cao workflow` from inside a
+    terminal send `caller_id`), the `memory_manager` sidecar (bounded by its
+    primary's recorded ceiling) and remote placement (`caller_ceiling`). A
+    refused step settles FAILED with the refusal text instead of escaping the
+    engine.
+  - **Declaring a ceiling.** Profiles declare it with `delegateTools`; the
+    built-in `supervisor` role defaults to `*` and every other role to its own
+    list, so the documented supervisor → developer pattern and every shipped
+    example keep working. `cao launch` prints the ceiling as `Delegates:`;
+    `Terminal` responses carry `delegate_tools`; `/health` advertises
+    `features: ["delegation_ceiling"]`.
+  - **Install-time providers.** A delegated Kiro CLI or OpenCode CLI launch
+    whose installed agent file grants more than the bounded allowlist is
+    refused with the reinstall remedy, because those providers run the
+    installed file, not the request. A bounded Kiro or OpenCode launch whose
+    agent file is missing, unreadable or unparseable is refused the same way
+    (fail closed) rather than skipping the comparison; operator launches keep
+    the launch-time warning.
+  - **Vocabulary.** MCP references are compared with the resolver's selector
+    semantics (`@plugin-*` covers `@plugin-search`, `@server` covers
+    `@server/tool`; a pattern-shaped child entry is covered only by an identical
+    or bare-`*` grant). The issue #141 behaviour (a child `allowedTools: ["*"]`
+    is not collapsed to the parent's list) is kept within the parent's ceiling.
+  - **Durability.** The starting terminal is journaled on the run row
+    (`workflow_run.caller_id`, migration at server start) so a resumed run
+    re-binds to the original caller, and a script-tier run-step whose run has
+    no live record after a restart is refused. The idempotency fingerprint
+    hashes `caller_ceiling` and `delegating_terminal_id` when supplied, so two
+    keyed creates that differ only in the bounding terminal collide (409)
+    instead of resolving to the first one's terminal.
+  - **Operator form of the in-session create.** `POST
+    /sessions/{name}/terminals:operator` adds a terminal to an existing session
+    as the operator (the Web UI's Add Agent button uses it): a distinct sub-path
+    that records the profile's declared ceiling like `POST /sessions` and
+    answers 400 when the request also names a caller (`caller_id`,
+    `caller_ceiling`, `delegating_terminal_id` or a callback environment).
+  - **Memory sidecar visibility.** Under a primary whose ceiling does not cover
+    the sidecar's `@cao-mcp-server, fs_read, fs_list` (for example
+    `workflow_scout`), `POST /sessions?memory_manager=true` reports
+    `memory_manager: {"state": "refused", "detail"}` on the response and
+    `cao launch --memory` prints the refusal as a warning; before, the launch
+    reported success and the sidecar silently never existed.
+  - **Guards against the class recurring.** `test/test_launch_path_invariant.py`
+    enumerates every terminal-launch path from the source and fails on one whose
+    launch call or HTTP payload does not carry a ceiling key and is not a
+    classified operator path; `test/services/test_delegation_forwarding_invariant.py`
+    checks on every run that the ceiling arguments reach `create_terminal` and
+    cause the refusal; `test/api/test_web_client_contract.py` posts the shipped
+    Web UI's request shapes (read from `web/src/api.ts`) at the real routes, so a
+    route tightening that breaks a first-party UI action fails CI.
+  - **Breaking changes.**
+    1. A user-authored restricted role or profile that launches wider children
+       is now refused with a message naming the parent, the child, the exceeding
+       tools and the remedy (add `delegateTools` to the parent profile and
+       relaunch it).
+    2. Terminals created before the upgrade have no recorded ceiling and are
+       bounded by their own recorded `allowedTools` until relaunched; a
+       pre-upgrade row with neither column recorded cannot delegate until
+       relaunched (the profile on disk is never consulted for an existing
+       terminal).
+    3. `assign`/`handoff` with `target_host` send the caller's ceiling as
+       `caller_ceiling` and refuse to place work on a node whose `/health` lacks
+       the feature, and the receiving node refuses a remote-shaped create
+       (callback env present) that omits the ceiling, so mixed-version fleets
+       must upgrade the worker nodes first.
+    4. Workflow steps started from inside a CAO terminal inherit that terminal's
+       ceiling rather than running unbounded.
+    5. `POST /sessions/{name}/terminals` requires `caller_id`; operators use
+       `POST /sessions` for a new session or `POST
+       /sessions/{name}/terminals:operator` for an existing one. Web UI builds
+       older than this release cannot add an agent to a session against a server
+       with this change (upgrade both together).
+  - **Residual.** `caller_id` and `caller_ceiling` remain client assertions
+    under the shared bearer, and "bounded" means bounded at the level the
+    provider enforces (soft-enforcement providers such as Codex and Antigravity
+    CLI restrict by prompt only). Binding caller identity to an authenticated
+    terminal is tracked in #965.
+- A profile's `tools:` allowlist is now enforced for every CAO MCP tool, not
+  just the delegation tools (`assign`, `handoff`, `assign_elastic`,
+  `create_ephemeral_agent`, `workflow_run`/`resume`/`start`) that #769/#811
+  already checked. Provider-native tool restrictions can't name an MCP tool
+  (`get_disallowed_tools` skips every `@`-prefixed entry), so a bound terminal
+  whose allowlist omitted `@cao-mcp-server` could still reach `memory_store`,
+  `memory_forget`, `delete_terminal`, `workflow_cancel`, and the rest of the
+  surface. One `on_call_tool` middleware now gates every `cao-mcp-server` tool
+  on the caller's allowlist, deferring to the same policy function #769 added,
+  so a tool registered later is covered by default. The callback protocol
+  (`send_message`, `complete_assignment`, `workflow_return`,
+  `answer_user_prompt`) and the independently-granted `discovery` tools
+  (`list_siblings`, `update_metadata`) are carved out, matching documented
+  behavior. Denied calls now surface as an MCP `ToolError` rather than a
+  `{"success": false, "error": ...}` result for the previously-gated seven.
+  `cao-ops-mcp-server` is unaffected — it is a separate, operator-granted
+  control plane. (#671)
+- New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
+  and push to `main`, failing on Medium-or-higher findings. Accepted findings
+  are listed with reasons in `.github/zizmor.yml` (checkout credential
+  persistence, the workflow-level `security-events: write` in `ci.yml`, and
+  the npm cache in the release build), each a tracked follow-up rather than a
+  silenced result.
+
+- `settings.json` is now written atomically at mode 0600 through the shared
+  locked atomic writer by both of its writers (the settings service and
+  `cao config set`), so a symlink planted at that path is replaced rather than
+  followed, the file is private like `.env` and the database, and the two
+  writers serialize on one lock. Under `logs/terminal/`, the per-terminal
+  `.log` is created 0600 and opened with `O_NOFOLLOW`, so a symlinked log path
+  is refused instead of appended through, and every write re-applies 0600 to
+  the open descriptor so a log left at 0644 by a terminal running across the
+  upgrade is tightened on its next write. The `.scrollback` and
+  `.snapshot.json` sidecars written at teardown are published 0600 through
+  the new lock-free `unlocked_atomic_write` (unique temp file plus
+  `os.replace`, a planted symlink is replaced); they deliberately skip the
+  cross-process lock because each terminal gets fresh sidecar names and the
+  locked writer keeps one lock file per target for good, which would have
+  grown `locks/` by two files per teardown with nothing to reap them.
+  Existing 0644 `settings.json` and `.log` files are tightened on the next
+  write; sidecars are rewritten whole at 0600.
+- `delete_terminal`, `answer_user_prompt` and `send_message` (explicit
+  `receiver_id`) now refuse a target outside the caller's assign/handoff tree:
+  a terminal may act on itself, on terminals it created (locally or on a
+  `target_host` node), and (for `send_message`) on the terminal that created
+  it. The documented peer flow of issue #432 is kept: when the caller's
+  profile grants `discovery`, `send_message` also accepts a sibling that
+  `list_siblings` returns for the caller, checked by exact membership at send
+  time. `GET /terminals/{id}` gains `callback_terminal_id`, the cross-node
+  creator read from the `CAO_CALLBACK_TERMINAL_ID` the supervisor injected,
+  which is how a remote node recognises the supervisor deleting its worker
+  (`caller_id` is `null` on such rows); a remote node that does not report
+  the field, or has restarted since the worker was created, refuses the
+  delete. Operators and external MCP clients without `CAO_TERMINAL_ID` are
+  unchanged. The `cao` CLI commands that reach these paths are bound the same
+  way when run from a shell inside a CAO pane: `cao agent cancel <id>` (both
+  the interrupt and `--delete`). Supersedes #607 (shpalac), whose
+  own-terminal-only rule would have blocked in-terminal supervisors.
+
+- Require `shell-quote ^1.11.0` in the documentation toolchain to fix
+  CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
+  No runtime agent dependency or security-gate policy changes.
+
+- Workflow execution and resumption through MCP now enforce the calling
+  terminal's existing `@cao-mcp-server` or `*` grant, including installed
+  profiles. Restricted callers can no longer bypass direct-delegation checks
+  through `workflow_run`, `workflow_resume`, or `workflow_start`. Operator
+  calls remain unchanged, and ephemeral delegation still requires its separate
+  opt-in (#892).
 
 - **Kiro CLI, the default provider, now applies the CAO tool policy.** `cao
   install --provider kiro_cli` writes the resolved `allowedTools` into the agent

@@ -1,0 +1,11 @@
+{
+  "app": "npx tsx bin/app.ts",
+  "context": {
+    "region": "",
+    "vpcId": "",
+    "operatorCidr": "",
+    "model": "jevk5-4b",
+    "instanceType": "g4dn.xlarge",
+    "publicKeyFile": "../keys/decision-host.pub"
+  }
+}

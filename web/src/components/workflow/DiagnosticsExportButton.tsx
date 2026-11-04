@@ -49,7 +49,7 @@ export function DiagnosticsExportButton({ runId }: DiagnosticsExportButtonProps)
       onClick={handleExport}
       disabled={loading}
       aria-label="Export diagnostics bundle"
-      className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium text-gray-200 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:opacity-60"
+      className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium text-gray-200 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors focus:outline-hidden focus:ring-2 focus:ring-emerald-500 disabled:opacity-60"
     >
       {loading ? (
         <Loader2 size={14} className="animate-spin" aria-hidden="true" />

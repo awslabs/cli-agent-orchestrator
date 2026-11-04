@@ -65,7 +65,6 @@ bounded by a hard timeout so a regression fails loudly and NEVER hangs the suite
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 import threading
 from pathlib import Path

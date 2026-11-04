@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.288
+▝▜██████▀  Sonnet 5.5
+ ▝▝   ▝▝   /home/user/project
+
+
+❯ Reply with the word PONG.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✻ Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED) · Retrying in 14s · attempt 6/10
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Model: Sonnet 5.5 | Thinking: medium | Context: [░░░░░░░░░░░░░░░░] 0/1.0M (0%) | Session: <1m
+  ⎇ no git | cwd: /home/user/project
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

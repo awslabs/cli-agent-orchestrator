@@ -17,6 +17,7 @@ from cli_agent_orchestrator.services.vault.config import (
     FolderMapping,
     VaultConfig,
     VaultSpec,
+    mapping_identity,
 )
 
 logger = logging.getLogger(__name__)
@@ -293,6 +294,32 @@ def _canonical_scope_id(scope: str, scope_id: Optional[str]) -> Optional[str]:
         return get_project_id_by_alias(scope_id, fail_closed=True) or scope_id
     except ProjectAliasLookupUnavailableError as exc:
         raise VaultConfigUnavailableError(f"vault configuration unavailable: {exc}") from exc
+
+
+def canonicalize_vault_config(config: VaultConfig) -> VaultConfig:
+    """Return ``config`` with every project mapping bound to its canonical project id.
+
+    ``VaultConfig`` validation is pure and never consults the database, so the
+    persisted alias table is applied here, on the loading path that owns one.
+    Two mappings that collapse onto a single ``(scope, scope_id)`` identity are
+    refused with ``ValueError``; an unreadable alias table fails closed with
+    ``ProjectAliasLookupUnavailableError`` so an outage is never mistaken for an
+    unrecognised alias.
+    """
+    vaults: list[VaultSpec] = []
+    for vault in config.vaults:
+        mappings: list[FolderMapping] = []
+        for mapping in vault.mappings:
+            if mapping.scope != "project" or mapping.scope_id is None:
+                mappings.append(mapping)
+                continue
+            canonical = get_project_id_by_alias(mapping.scope_id, fail_closed=True)
+            mappings.append(mapping.model_copy(update={"scope_id": canonical or mapping.scope_id}))
+        identities = [mapping_identity(mapping) for mapping in mappings]
+        if len(identities) != len(set(identities)):
+            raise ValueError("mappings must not resolve to the same (scope, scope_id)")
+        vaults.append(vault.model_copy(update={"mappings": mappings}))
+    return config.model_copy(update={"vaults": vaults})
 
 
 def _scope_ids_match(scope: str, left: Optional[str], right: Optional[str]) -> bool:

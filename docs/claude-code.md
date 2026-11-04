@@ -115,7 +115,7 @@ You review code for quality and correctness.
 
 ## Eager Inbox Delivery
 
-Claude Code's Ink TUI buffers pasted input even while the agent is processing. CAO exploits this to deliver queued inbox messages during PROCESSING and WAITING_USER_ANSWER states, eliminating inter-turn latency. Enable with `CAO_EAGER_INBOX_DELIVERY=true`.
+Claude Code's Ink TUI buffers pasted input even while the agent is processing. CAO exploits this to deliver queued inbox messages during PROCESSING, eliminating inter-turn latency. Enable with `CAO_EAGER_INBOX_DELIVERY=true`. WAITING_USER_ANSWER is excluded: Claude Code's Ink Select widget would consume the paste as the dialog's answer (issue #896), so the message is held until the dialog closes.
 
 See [Inbox Delivery](inbox-delivery.md) for the full architecture, two-flag gate, and how to enable this for other providers.
 

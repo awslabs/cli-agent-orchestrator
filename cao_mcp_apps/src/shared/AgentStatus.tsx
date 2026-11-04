@@ -22,7 +22,7 @@ export function AgentStatus({
   terminal,
   onOpen,
   isSupervisor = false,
-}: AgentStatusProps): JSX.Element {
+}: AgentStatusProps): React.JSX.Element {
   const status = (terminal.status ?? "unknown").toLowerCase();
   const statusClass = KNOWN_STATUSES.has(status) ? status : "unknown";
   // Label/role/pulse are derived from the generated status SSOT; the color is

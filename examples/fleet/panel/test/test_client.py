@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 from app import client
@@ -16,19 +18,30 @@ async def test_list_sessions_parses():
     assert out == [{"id": "cao-abc"}]
 
 
-async def test_launch_sends_expected_params():
+@pytest.mark.parametrize("generated_name", [False, True])
+async def test_launch_sends_expected_params(generated_name):
     seen = {}
     def handler(req):
         seen["path"] = req.url.path
         seen["params"] = dict(req.url.params)
+        seen["body"] = json.loads(req.content) if req.content else {}
         return httpx.Response(201, json={"id": "term-1", "session_name": "sess-1"})
     async with _mock(handler) as c:
-        out = await client.launch(c, "http://x", "developer", "claude_code", "sess-1", "/tmp")
+        out = await client.launch(
+            c,
+            "http://x",
+            "developer",
+            "claude_code",
+            "sess-1",
+            "/tmp",
+            generated_name=generated_name,
+        )
     assert seen["path"] == "/sessions"
     assert seen["params"]["agent_profile"] == "developer"
     assert seen["params"]["provider"] == "claude_code"
     assert seen["params"]["session_name"] == "sess-1"
     assert seen["params"]["working_directory"] == "/tmp"
+    assert seen["body"] == ({"description": None} if generated_name else {})
     assert out["id"] == "term-1"
 
 

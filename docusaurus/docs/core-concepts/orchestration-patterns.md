@@ -74,7 +74,7 @@ Supervisor reads result from inbox
 ### Behavior
 
 1. Creates a new terminal, sends the task with callback instructions, returns the terminal ID immediately.
-2. The supervisor's terminal ID is automatically appended to the task message (disable with `CAO_ENABLE_SENDER_ID_INJECTION=false`) and recorded as the `caller_id` on the worker terminal.
+2. The supervisor's terminal ID is automatically appended to the task message (disable with `CAO_ENABLE_SENDER_ID_INJECTION=false`) and recorded as the `caller_id` on the worker terminal. One exception: a task for a **kiro-cli** worker that starts with `@` (a prompt invocation such as `@agent-sop:code-analysis query="..."`) is delivered unmodified, because kiro reads any trailing text as parameter values. Such a worker receives no callback instruction from CAO, so the SOP or its arguments must tell it to report back with `send_message` (omitting `receiver_id` still routes to the assigning terminal). Workers on every other provider read a leading `@path` as a file mention and keep the suffix.
 3. When done, the worker sends results back via `send_message` -- omitting `receiver_id` routes the reply to the assigning terminal automatically.
 4. Messages queue in the supervisor's inbox if it is busy.
 

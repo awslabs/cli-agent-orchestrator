@@ -22,7 +22,7 @@ export function AgentView({
   app,
   terminalId,
   initialSnapshot,
-}: AgentViewProps): JSX.Element {
+}: AgentViewProps): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<AgentDetailSnapshot | null>(
     initialSnapshot ?? null,
   );

@@ -1,6 +1,6 @@
 # Headless / CI Example
 
-This example shows how to drive a single CAO agent from a CI runner — non-interactively, with a hard timeout, and with an exit code CI can act on. It uses the same `--headless --async --yolo` flag set documented under [launching a session](../../skills/cao-session-management/SKILL.md#launching-a-session), wrapped in a polling loop. With an initial message, `cao launch --async` sends that message and returns immediately while the agent continues in the background.
+This example shows how to drive a single CAO agent from a CI runner — non-interactively, with a hard timeout, and with an exit code CI can act on. It launches with `--headless --async --yolo`, wrapped in a polling loop; `--yolo` removes every tool restriction, so read [`--auto-approve` vs `--yolo`](../../docs/tool-restrictions.md#--auto-approve-vs---yolo) before reusing it. With an initial message, `cao launch --async` sends that message and returns immediately while the agent continues in the background.
 
 ## What this demonstrates
 
@@ -78,5 +78,5 @@ CAO_CI_TIMEOUT=60 ./examples/headless-ci/run.sh "Quick task"
 
 ## See also
 
-- [Session-management skill](../../skills/cao-session-management/SKILL.md#launching-a-session) — headless launch flag reference.
+- [`--auto-approve` vs `--yolo`](../../docs/tool-restrictions.md#--auto-approve-vs---yolo) — what each launch flag skips and what it removes.
 - [`test/e2e/test_headless_ci.py`](../../test/e2e/test_headless_ci.py) — e2e test that invokes this script.

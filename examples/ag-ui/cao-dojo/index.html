@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<!--
+  ABOUTME: Zero-dependency CAO Dojo: live AG-UI fleet view plus an approval card you can answer.
+  ABOUTME: Streams GET /agui/v1/stream and drives POST /agui/v1/run (resume[]) using DOM APIs only.
+
+  Built from examples/ag-ui/ag-ui-eventsource-viewer/index.html, adding the
+  answerable approval card described in #1109. No npm, no framework, no
+  build step. It:
+    - opens an EventSource on GET /agui/v1/stream?since=… (the live stream) and
+      renders fleet state and the six allow-listed GENERATIVE_UI components;
+    - renders approval_card with Approve and Reject buttons;
+    - posts POST /agui/v1/run (the run plane: fetch-based SSE) to collect open
+      interrupts, and resumes one with
+      resume: [{interruptId, status: "resolved", payload}], where payload is
+      {approved: true} or {approved: false};
+    - shows how each run ended: RUN_FINISHED (with its outcome) or RUN_ERROR.
+
+  Security note: everything on the AG-UI wire is a named component + JSON props.
+  Props are rendered with textContent / createElement only — never innerHTML or
+  eval. The approval_card prompt body is withheld server-side (metadata only).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CAO Dojo</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a21; --panel-2: #1e222b; --border: #2a2f3a;
+    --text: #e6e9ef; --muted: #9aa4b2; --accent: #6ea8fe; --ok: #4ec9a5;
+    --warn: #e6b450; --err: #f07178; --chip: #232833;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  label { color: var(--muted); font-size: 12px; }
+  input[type="text"], input[type="password"], textarea {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font: inherit;
+  }
+  header input[type="text"] { min-width: 260px; }
+  textarea { width: 100%; min-height: 56px; resize: vertical; }
+  button {
+    background: var(--accent); color: #0b0e14; border: 0; border-radius: 6px;
+    padding: 6px 12px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button.secondary { background: var(--chip); color: var(--text); border: 1px solid var(--border); }
+  button.approve { background: var(--ok); }
+  button.reject { background: var(--err); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #status {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+    padding: 4px 10px; border-radius: 999px; background: var(--chip); color: var(--muted);
+  }
+  #status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  #status.connected .dot { background: var(--ok); }
+  #status.connecting .dot { background: var(--warn); }
+  #status.error .dot { background: var(--err); }
+  main { display: grid; grid-template-columns: 1.1fr 1fr; gap: 16px; padding: 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+  section > h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 12px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+  .fleet-session { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 10px; background: var(--panel-2); }
+  .fleet-session .sname { font-weight: 600; }
+  .terminals { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .terminal-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13px; padding: 6px 8px; background: var(--chip); border-radius: 6px; }
+  .chip { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--chip); border: 1px solid var(--border); color: var(--muted); }
+  .status-idle { color: var(--ok); } .status-processing { color: var(--warn); }
+  .status-completed { color: var(--accent); } .status-error { color: var(--err); }
+  .empty { color: var(--muted); font-style: italic; }
+  #components, #runs { display: flex; flex-direction: column; gap: 10px; }
+  .gcard { border: 1px solid var(--border); border-radius: 8px; padding: 12px; background: var(--panel-2); }
+  .gcard .ghead { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .gcard .gtype { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .gcard .gtitle { font-weight: 600; }
+  .gcard[data-state="pending"] { border-color: var(--warn); }
+  .gcard[data-state="approved"] { border-color: var(--ok); }
+  .gcard[data-state="rejected"] { border-color: var(--err); }
+  .gcard[data-state="settled"] { opacity: 0.6; }
+  .fields { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; font-size: 13px; }
+  .fields dt { color: var(--muted); }
+  .fields dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .choices { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .bar { height: 8px; background: var(--chip); border-radius: 999px; overflow: hidden; margin-top: 6px; }
+  .bar > span { display: block; height: 100%; background: var(--accent); }
+  .bar.indeterminate > span { width: 40% !important; animation: slide 1.2s infinite ease-in-out; }
+  @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+  .metric-value { font-size: 22px; font-weight: 700; }
+  .difffile { display: flex; justify-content: space-between; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .add { color: var(--ok); } .del { color: var(--err); }
+  .placeholder { border: 1px dashed var(--err); border-radius: 8px; padding: 12px; background: rgba(240,113,120,0.06); }
+  .placeholder .gtype { color: var(--err); }
+  .run { border-left: 3px solid var(--muted); padding: 6px 10px; background: var(--panel-2); border-radius: 4px; font-size: 13px; }
+  .run[data-terminal="RUN_FINISHED"] { border-left-color: var(--ok); }
+  .run[data-terminal="RUN_ERROR"], .run[data-terminal="HTTP_ERROR"], .run[data-terminal="NO_END"] { border-left-color: var(--err); }
+  .run .rt { font-weight: 600; }
+  .run .rd { color: var(--muted); word-break: break-word; }
+  #log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-height: 260px; overflow-y: auto; display: flex; flex-direction: column-reverse; gap: 2px; }
+  .logline { display: flex; gap: 8px; padding: 2px 0; border-bottom: 1px solid var(--border); }
+  .logline .lt { color: var(--muted); flex: 0 0 84px; }
+  .logline .ls { color: var(--muted); flex: 0 0 52px; }
+  .logline .le { flex: 0 0 168px; color: var(--accent); }
+  .logline .ld { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CAO Dojo</h1>
+  <label for="endpoint">cao-server</label>
+  <input id="endpoint" type="text" value="http://localhost:9889" spellcheck="false" />
+  <label for="token">Access token</label>
+  <input id="token" type="password" placeholder="optional (auth-enabled servers)"
+         autocomplete="off" spellcheck="false" />
+  <button id="connect">Connect</button>
+  <button id="disconnect" class="secondary" disabled>Disconnect</button>
+  <span id="status"><span class="dot"></span><span id="statusText">disconnected</span></span>
+</header>
+
+<main>
+  <section>
+    <h2>Run</h2>
+    <label for="prompt">Message</label>
+    <textarea id="prompt" spellcheck="false">Is anything waiting for my approval?</textarea>
+    <div class="row">
+      <button id="send">Send run</button>
+      <span class="hint">POST /agui/v1/run. CAO answers with any open approvals; it does not deliver this text to an agent.</span>
+    </div>
+    <h2 style="margin-top:16px">Run results</h2>
+    <div id="runs"><p class="empty">No runs yet.</p></div>
+  </section>
+
+  <section>
+    <h2>Approvals and generative UI</h2>
+    <div id="components"><p class="empty">No components yet.</p></div>
+  </section>
+
+  <section>
+    <h2>Fleet (STATE_SNAPSHOT + STATE_DELTA)</h2>
+    <div id="fleet"><p class="empty">Not connected.</p></div>
+  </section>
+
+  <section>
+    <h2>Event log</h2>
+    <div id="log" aria-live="polite"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+(function () {
+  // Client-side mirror of the server's frozen generative-UI allow-list
+  // (services/agui/base.py GENERATIVE_UI_COMPONENTS). Off-list names render as
+  // an inert placeholder.
+  var ALLOWED_COMPONENTS = Object.freeze({
+    approval_card: true, choice_prompt: true, diff_summary: true,
+    progress: true, metric: true, agent_card: true,
+  });
+  var STREAM_EVENTS = [
+    "STATE_SNAPSHOT", "STATE_DELTA", "GENERATIVE_UI",
+    "RUN_STARTED", "RUN_FINISHED", "STEP_STARTED", "STEP_FINISHED",
+    "TOOL_CALL_START", "TOOL_CALL_END", "TEXT_MESSAGE_CONTENT", "RUN_ERROR",
+  ];
+  // How far back the stream replays on connect, so a card raised before the
+  // page opened still shows. The server's ring buffer bounds what comes back.
+  var REPLAY_WINDOW_MS = 10 * 60 * 1000;
+  // A run ends after its resume step and the snapshot (the run plane has no
+  // follow deadline since #1107, and resume delivery has no hard timeout); this
+  // is only a backstop so the page can never sit in a run forever.
+  var RUN_TIMEOUT_MS = 150 * 1000;
+
+  var els = {
+    endpoint: document.getElementById("endpoint"),
+    token: document.getElementById("token"),
+    connect: document.getElementById("connect"),
+    disconnect: document.getElementById("disconnect"),
+    status: document.getElementById("status"),
+    statusText: document.getElementById("statusText"),
+    prompt: document.getElementById("prompt"),
+    send: document.getElementById("send"),
+    runs: document.getElementById("runs"),
+    components: document.getElementById("components"),
+    fleet: document.getElementById("fleet"),
+    log: document.getElementById("log"),
+  };
+
+  var es = null;
+  var fleetState = null;
+  var seenIds = new Set();
+  // The previous frame's EventSource lastEventId. A frame sent without an `id:`
+  // line keeps the previous value, so only a changed value is the frame's own id.
+  var prevStreamId = "";
+  var cards = new Map();          // interrupt_id -> card element
+  // interrupt_id -> final state, kept across reconnects: the stream's replay
+  // window resends an answered card's frame, which must not reopen it.
+  var resolved = new Map();
+  var runInFlight = false;
+  var threadId = "cao-dojo-" + randomId();
+
+  function randomId() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return Date.now().toString(36) + Math.random().toString(36).slice(2);
+  }
+  function baseUrl() { return (els.endpoint.value || "").trim().replace(/\/+$/, ""); }
+  function token() { return (els.token.value || "").trim(); }
+
+  // Tiny inline RFC-6902 JSON-Patch applier (add / replace / remove only).
+  function jsonPointerParse(path) {
+    if (path === "") return [];
+    if (path[0] !== "/") throw new Error("invalid JSON pointer: " + path);
+    return path.substring(1).split("/").map(function (tok) {
+      return tok.replace(/~1/g, "/").replace(/~0/g, "~");
+    });
+  }
+  // Atomic (CP-3): the ops apply to a copy, which replaces the state only if
+  // every op applies. Any op that cannot apply throws and the state is kept.
+  function applyPatch(doc, ops) {
+    if (!Array.isArray(ops)) throw new Error("delta is not an array");
+    var draft = JSON.parse(JSON.stringify(doc));
+    ops.forEach(function (op, n) {
+      var where = "op " + n + ": ";
+      if (!op || typeof op !== "object") throw new Error(where + "not an object");
+      if (op.op !== "add" && op.op !== "replace" && op.op !== "remove") {
+        throw new Error(where + "unsupported op " + op.op);
+      }
+      var tokens = jsonPointerParse(op.path || "");
+      if (tokens.length === 0) {
+        if (op.op === "remove" || !op.value || typeof op.value !== "object") {
+          throw new Error(where + "cannot " + op.op + " the whole document");
+        }
+        draft = JSON.parse(JSON.stringify(op.value));
+        return;
+      }
+      var parent = draft;
+      for (var i = 0; i < tokens.length - 1; i++) {
+        var key = tokens[i];
+        if (parent == null || typeof parent !== "object") throw new Error(where + "no parent at " + op.path);
+        if (!(key in parent)) {
+          if (op.op !== "add") throw new Error(where + "missing " + op.path);
+          parent[key] = {};
+        }
+        parent = parent[key];
+      }
+      var last = tokens[tokens.length - 1];
+      if (parent == null || typeof parent !== "object") throw new Error(where + "no parent at " + op.path);
+      if (Array.isArray(parent)) {
+        var idx = last === "-" && op.op === "add" ? parent.length : Number(last);
+        var max = op.op === "add" ? parent.length : parent.length - 1;
+        if (!/^(0|[1-9][0-9]*|-)$/.test(last) || !(idx >= 0 && idx <= max)) {
+          throw new Error(where + "bad array index at " + op.path);
+        }
+        if (op.op === "remove") parent.splice(idx, 1);
+        else parent.splice(idx, op.op === "add" ? 0 : 1, op.value);
+      } else {
+        if (op.op !== "add" && !Object.prototype.hasOwnProperty.call(parent, last)) {
+          throw new Error(where + "missing " + op.path);
+        }
+        if (op.op === "remove") delete parent[last];
+        else parent[last] = op.value;
+      }
+    });
+    return draft;
+  }
+
+  // DOM helpers: text and attributes only, never innerHTML.
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  function dropEmpty(node) {
+    var empty = node.querySelector(".empty");
+    if (empty) node.removeChild(empty);
+  }
+  function text(v) { return v == null || v === "" ? "—" : String(v); }
+
+  // Fleet
+  function statusClass(s) {
+    s = (s || "").toLowerCase();
+    if (s.indexOf("idle") >= 0) return "status-idle";
+    if (s.indexOf("process") >= 0) return "status-processing";
+    if (s.indexOf("complet") >= 0) return "status-completed";
+    if (s.indexOf("error") >= 0) return "status-error";
+    return "";
+  }
+  function renderFleet() {
+    clear(els.fleet);
+    if (!fleetState || !Array.isArray(fleetState.sessions) || fleetState.sessions.length === 0) {
+      els.fleet.appendChild(el("p", "empty", "No sessions in current snapshot."));
+      return;
+    }
+    var terminals = Array.isArray(fleetState.terminals) ? fleetState.terminals : [];
+    fleetState.sessions.forEach(function (s) {
+      var box = el("div", "fleet-session");
+      var head = el("div");
+      head.appendChild(el("span", "sname", s.name || s.id || "(unnamed)"));
+      head.appendChild(document.createTextNode("  "));
+      head.appendChild(el("span", "chip " + statusClass(s.status), s.status || "unknown"));
+      box.appendChild(head);
+      var mine = terminals.filter(function (t) { return (t.session_name || "") === (s.name || s.id); });
+      var twrap = el("div", "terminals");
+      if (mine.length === 0) {
+        twrap.appendChild(el("span", "empty", "no terminals"));
+      } else {
+        mine.forEach(function (t) {
+          var row = el("div", "terminal-row");
+          row.appendChild(el("span", "", t.agent_profile || t.provider || t.id));
+          if (t.provider) row.appendChild(el("span", "chip", t.provider));
+          row.appendChild(el("span", "chip " + statusClass(t.status), t.status || "unknown"));
+          row.appendChild(el("span", "chip", (t.id || "").slice(0, 8)));
+          twrap.appendChild(row);
+        });
+      }
+      box.appendChild(twrap);
+      els.fleet.appendChild(box);
+    });
+  }
+
+  // approval_card: props are interrupt_id, reason, message (always "": the
+  // prompt body is withheld), options, provider, terminal_id. All text only.
+  var STATE_LABEL = {
+    pending: "awaiting your decision",
+    sending: "sending…",
+    approved: "approved",
+    rejected: "rejected",
+    settled: "no longer pending",
+  };
+  function setCardState(card, state, note) {
+    card.setAttribute("data-state", state);
+    var id = card.getAttribute("data-interrupt-id");
+    if (state === "pending" || state === "sending") resolved.delete(id);
+    else resolved.set(id, state);
+    card._state.textContent = STATE_LABEL[state] + (note ? " — " + note : "");
+    var live = state === "pending";
+    card._approve.disabled = !live || runInFlight;
+    card._reject.disabled = !live || runInFlight;
+  }
+  function renderApprovalCard(props) {
+    var card = el("div", "gcard");
+    card.setAttribute("data-testid", "approval-card");
+    card.setAttribute("data-interrupt-id", String(props.interrupt_id));
+    var head = el("div", "ghead");
+    head.appendChild(el("span", "gtype", "approval_card"));
+    head.appendChild(el("span", "gtitle", "Approval requested"));
+    card.appendChild(head);
+    var dl = el("dl", "fields");
+    [["reason", props.reason, "approval-reason"],
+     ["provider", props.provider, "approval-provider"],
+     ["terminal_id", props.terminal_id, "approval-terminal"],
+     ["options", Array.isArray(props.options) ? props.options.join(", ") : props.options, null],
+     ["interrupt_id", props.interrupt_id, null]].forEach(function (f) {
+      dl.appendChild(el("dt", "", f[0]));
+      var dd = el("dd", "", text(f[1]));
+      if (f[2]) dd.setAttribute("data-testid", f[2]);
+      dl.appendChild(dd);
+    });
+    card.appendChild(dl);
+    var row = el("div", "row");
+    var approve = el("button", "approve", "Approve");
+    approve.setAttribute("data-testid", "approval-approve");
+    var reject = el("button", "reject", "Reject");
+    reject.setAttribute("data-testid", "approval-reject");
+    var state = el("span", "hint");
+    row.appendChild(approve);
+    row.appendChild(reject);
+    row.appendChild(state);
+    card.appendChild(row);
+    card._approve = approve;
+    card._reject = reject;
+    card._state = state;
+    approve.addEventListener("click", function () { decide(card, true); });
+    reject.addEventListener("click", function () { decide(card, false); });
+    setCardState(card, "pending");
+    return card;
+  }
+  function addApprovalCard(props) {
+    if (!props || props.interrupt_id == null) return null;
+    var id = String(props.interrupt_id);
+    if (cards.has(id)) return cards.get(id);
+    var answered = resolved.get(id);
+    var card = renderApprovalCard(props);
+    if (answered) setCardState(card, answered, "replayed");
+    cards.set(id, card);
+    dropEmpty(els.components);
+    els.components.insertBefore(card, els.components.firstChild);
+    return card;
+  }
+  function refreshCardButtons() {
+    cards.forEach(function (card) {
+      var state = card.getAttribute("data-state");
+      if (state === "pending") setCardState(card, "pending");
+    });
+  }
+
+  // The other five allow-listed components, as in the viewer.
+  function renderComponent(component, props) {
+    var card = el("div", "gcard");
+    var head = el("div", "ghead");
+    head.appendChild(el("span", "gtype", component));
+    card.appendChild(head);
+    if (component === "choice_prompt") {
+      head.appendChild(el("span", "gtitle", props.question || "Choose"));
+      var cwrap = el("div", "choices");
+      (Array.isArray(props.choices) ? props.choices : []).forEach(function (c) {
+        var label = (c && typeof c === "object") ? (c.label != null ? c.label : c.value) : c;
+        cwrap.appendChild(el("span", "chip", label));
+      });
+      card.appendChild(cwrap);
+    } else if (component === "diff_summary") {
+      head.appendChild(el("span", "gtitle", props.title || "Changes"));
+      (Array.isArray(props.files) ? props.files : []).forEach(function (f) {
+        f = f || {};
+        var row = el("div", "difffile");
+        row.appendChild(el("span", "", f.path || "(file)"));
+        var n = el("span");
+        n.appendChild(el("span", "add", "+" + (f.additions || 0)));
+        n.appendChild(document.createTextNode(" "));
+        n.appendChild(el("span", "del", "-" + (f.deletions || 0)));
+        row.appendChild(n);
+        card.appendChild(row);
+      });
+    } else if (component === "progress") {
+      head.appendChild(el("span", "gtitle", props.label || "Progress"));
+      var hasValue = typeof props.value === "number" && isFinite(props.value);
+      var bar = el("div", "bar" + (hasValue ? "" : " indeterminate"));
+      var fill = el("span");
+      if (hasValue) fill.style.width = Math.max(0, Math.min(1, props.value)) * 100 + "%";
+      bar.appendChild(fill);
+      card.appendChild(bar);
+      if (hasValue) card.appendChild(el("div", "gtype", Math.round(props.value * 100) + "%"));
+    } else if (component === "metric") {
+      head.appendChild(el("span", "gtitle", props.label || "Metric"));
+      card.appendChild(el("div", "metric-value", (props.value != null ? props.value : "—") + (props.unit ? " " + props.unit : "")));
+    } else if (component === "agent_card") {
+      head.appendChild(el("span", "gtitle", props.name || "agent"));
+      if (props.provider) card.appendChild(el("span", "chip", props.provider));
+      if (props.status) card.appendChild(el("span", "chip " + statusClass(props.status), props.status));
+    }
+    return card;
+  }
+  function renderInertPlaceholder(component) {
+    var card = el("div", "placeholder");
+    var head = el("div", "ghead");
+    head.appendChild(el("span", "gtype", "refused component"));
+    card.appendChild(head);
+    card.appendChild(el("div", "", "Component \"" + String(component) +
+      "\" is not on the allow-list. Rendered as an inert placeholder — not executed."));
+    return card;
+  }
+  function addComponent(component, props) {
+    props = (props && typeof props === "object") ? props : {};
+    if (!Object.prototype.hasOwnProperty.call(ALLOWED_COMPONENTS, component)) {
+      dropEmpty(els.components);
+      els.components.insertBefore(renderInertPlaceholder(component), els.components.firstChild);
+    } else if (component === "approval_card") {
+      addApprovalCard(props);
+    } else {
+      dropEmpty(els.components);
+      els.components.insertBefore(renderComponent(component, props), els.components.firstChild);
+    }
+    // Prune the oldest cards past 40, but never one still waiting on a
+    // decision: that would leave an open interrupt with no control.
+    var kids = els.components.children;
+    for (var i = kids.length - 1; i >= 0 && kids.length > 40; i--) {
+      var state = kids[i].getAttribute("data-state");
+      if (state === "pending" || state === "sending") continue;
+      var gone = kids[i];
+      els.components.removeChild(gone);
+      if (gone.getAttribute("data-interrupt-id")) cards.delete(gone.getAttribute("data-interrupt-id"));
+    }
+  }
+
+  // Event log
+  function logEvent(source, type, data) {
+    var line = el("div", "logline");
+    line.appendChild(el("span", "lt", new Date().toLocaleTimeString()));
+    line.appendChild(el("span", "ls", source));
+    line.appendChild(el("span", "le", type));
+    var desc = "";
+    try {
+      if (type === "GENERATIVE_UI") desc = data.component;
+      else if (type === "STATE_SNAPSHOT") desc = "snapshot: " + ((data.snapshot && data.snapshot.sessions || []).length) + " session(s)";
+      else if (type === "STATE_DELTA") desc = (data.delta || []).length + " patch op(s)";
+      else if (type === "RUN_FINISHED") desc = "outcome: " + ((data.outcome && data.outcome.type) || "—");
+      else desc = data.message || data.runId || data.session_name || data.step_name || "";
+    } catch (e) { desc = ""; }
+    line.appendChild(el("span", "ld", desc));
+    els.log.insertBefore(line, els.log.firstChild);
+    while (els.log.children.length > 300) els.log.removeChild(els.log.lastChild);
+  }
+
+  // The live stream: EventSource on GET /agui/v1/stream (named events).
+  function handleStream(type, ev) {
+    var data;
+    try { data = JSON.parse(ev.data); } catch (e) { data = {}; }
+    // Dedupe record frames on their id (the SSE `id:` line or the payload's
+    // event_id), which absorbs the reconnect replay overlap. Never
+    // STATE_SNAPSHOT / STATE_DELTA: cao-server sends these per connection with
+    // no `id:` line and never replays them, so they cannot be duplicates.
+    // EventSource keeps lastEventId across events and reconnects, so deduping
+    // them on it would drop every snapshot after a reconnect and every delta
+    // that follows a record.
+    // Frames from the server's session-end close (TOOL_CALL_END) have no `id:`
+    // line either; reading lastEventId for them would drop them as duplicates.
+    var stateFrame = type === "STATE_SNAPSHOT" || type === "STATE_DELTA";
+    var sseId = ev.lastEventId || "";
+    var ownId = sseId && sseId !== prevStreamId ? sseId : "";
+    prevStreamId = sseId;
+    var id = stateFrame ? null : data.event_id || ownId;
+    if (id) {
+      if (seenIds.has(id)) return;
+      seenIds.add(id);
+    }
+    logEvent("stream", type, data);
+    if (type === "STATE_SNAPSHOT") {
+      fleetState = data.snapshot && typeof data.snapshot === "object" ? data.snapshot : {};
+      renderFleet();
+    } else if (type === "STATE_DELTA") {
+      if (!fleetState) return;
+      try {
+        fleetState = applyPatch(fleetState, data.delta);
+        renderFleet();
+      } catch (e) {
+        logEvent("page", "PATCH_REJECTED", { message: e.message + "; fleet state unchanged" });
+      }
+    } else if (type === "GENERATIVE_UI") {
+      addComponent(data.component, data.props);
+    }
+  }
+  function buildStreamUrl(base, tok) {
+    var url = new URL(base + "/agui/v1/stream");
+    url.searchParams.set("since", new Date(Date.now() - REPLAY_WINDOW_MS).toISOString());
+    if (tok) url.searchParams.set("access_token", tok);
+    return url.toString();
+  }
+  function setStatus(state, msg) {
+    els.status.className = state;
+    els.statusText.textContent = msg;
+  }
+  // A new connection starts clean, so another server's fleet and cards never
+  // mix with this one's. Answered interrupt ids are kept (see `resolved`).
+  function resetView() {
+    fleetState = null;
+    seenIds = new Set();
+    prevStreamId = "";
+    cards = new Map();
+    clear(els.fleet);
+    els.fleet.appendChild(el("p", "empty", "Waiting for the first snapshot."));
+    clear(els.components);
+    els.components.appendChild(el("p", "empty", "No components yet."));
+  }
+  function connect() {
+    disconnect();
+    resetView();
+    var base = baseUrl();
+    if (!base) { setStatus("error", "enter a cao-server URL"); return; }
+    var url;
+    try {
+      url = buildStreamUrl(base, token());
+      es = new EventSource(url);
+    } catch (e) {
+      setStatus("error", "bad URL: " + e.message);
+      return;
+    }
+    setStatus("connecting", "connecting…");
+    els.connect.disabled = true;
+    els.disconnect.disabled = false;
+    var frames = 0;
+    var opened = false;
+    es.onopen = function () {
+      opened = true;
+      setStatus("connected", "connected → " + base + "/agui/v1/stream");
+    };
+    es.onerror = function () {
+      if (!es) return;
+      // EventSource retries on its own while readyState is CONNECTING (0).
+      if (opened && es.readyState === 0) {
+        setStatus("connecting", "reconnecting… (" + frames + " frame(s) so far)");
+        return;
+      }
+      setStatus("error", frames === 0
+        ? "no CAO server reachable at " + base + " (is CAO_AGUI_ENABLED set, and this page's origin in CAO_CORS_ORIGINS?)"
+        : "disconnected after " + frames + " frame(s); retrying…");
+    };
+    STREAM_EVENTS.forEach(function (type) {
+      es.addEventListener(type, function (ev) { frames++; handleStream(type, ev); });
+    });
+  }
+  function disconnect() {
+    if (es) { es.close(); es = null; }
+    els.connect.disabled = false;
+    els.disconnect.disabled = true;
+    setStatus("disconnected", "disconnected");
+  }
+
+  // The run plane: fetch-based SSE over POST /agui/v1/run (data:-only frames).
+  function addRunResult(terminal, outcome, detail) {
+    dropEmpty(els.runs);
+    var row = el("div", "run");
+    row.setAttribute("data-testid", "run-result");
+    row.setAttribute("data-terminal", terminal);
+    if (outcome) row.setAttribute("data-outcome", outcome);
+    row.appendChild(el("div", "rt", terminal + (outcome ? " · outcome: " + outcome : "")));
+    if (detail) row.appendChild(el("div", "rd", detail));
+    els.runs.insertBefore(row, els.runs.firstChild);
+    while (els.runs.children.length > 30) els.runs.removeChild(els.runs.lastChild);
+  }
+  // run_plane.py camelCases interrupt metadata (terminalId, sessionName) to
+  // match the stock ag-ui client, so terminalId here is correct.
+  function interruptToProps(intr) {
+    var meta = (intr && intr.metadata) || {};
+    return {
+      interrupt_id: intr.id,
+      reason: intr.reason,
+      message: intr.message,
+      options: meta.options,
+      provider: meta.provider,
+      terminal_id: meta.terminalId,
+    };
+  }
+  // Ids of the cards that are pending or sending right now.
+  function openCardIds() {
+    var ids = [];
+    cards.forEach(function (card, id) {
+      var state = card.getAttribute("data-state");
+      if (state === "pending" || state === "sending") ids.push(id);
+    });
+    return ids;
+  }
+  // Bring the cards in line with what the server says is still open. The server
+  // reads its pending list once per run, so only cards that were already open
+  // when the run started can be judged by it: a card that arrived during the
+  // run is newer than that list and stays pending.
+  function reconcile(openIds, openAtStart) {
+    openAtStart.forEach(function (id) {
+      var card = cards.get(id);
+      if (!card) return;
+      var state = card.getAttribute("data-state");
+      if ((state === "pending" || state === "sending") && openIds.indexOf(id) < 0) setCardState(card, "settled");
+    });
+  }
+  function onRunFinished(data, decided, openAtStart) {
+    var outcome = data.outcome && data.outcome.type;
+    if (decided) setCardState(decided.card, decided.approved ? "approved" : "rejected", "RUN_FINISHED");
+    if (outcome === "interrupt") {
+      var open = (data.outcome.interrupts || []).map(function (intr) {
+        var card = addApprovalCard(interruptToProps(intr));
+        if (card && card.getAttribute("data-state") !== "pending") setCardState(card, "pending");
+        return String(intr.id);
+      });
+      reconcile(open, openAtStart);
+      addRunResult("RUN_FINISHED", outcome, open.length + " approval(s) waiting");
+    } else {
+      reconcile([], openAtStart);
+      addRunResult("RUN_FINISHED", outcome || "—", decided
+        ? (decided.approved ? "approval delivered to the agent" : "rejection delivered to the agent")
+        : "nothing is waiting for approval");
+    }
+  }
+  function runAgentInput(extra) {
+    var prompt = (els.prompt.value || "").trim();
+    var body = {
+      threadId: threadId,
+      runId: randomId(),
+      state: {},
+      messages: prompt ? [{ id: randomId(), role: "user", content: prompt }] : [],
+      tools: [],
+      context: [],
+      forwardedProps: {},
+    };
+    if (extra) Object.keys(extra).forEach(function (k) { body[k] = extra[k]; });
+    return body;
+  }
+  function setRunInFlight(v) {
+    runInFlight = v;
+    els.send.disabled = v;
+    refreshCardButtons();
+  }
+  async function run(body, decided) {
+    var base = baseUrl();
+    if (!base) {
+      addRunResult("HTTP_ERROR", null, "enter a cao-server URL");
+      if (decided) setCardState(decided.card, "pending", "not sent: enter a cao-server URL");
+      return;
+    }
+    setRunInFlight(true);
+    var openAtStart = openCardIds();
+    var ended = null;
+    var abort = new AbortController();
+    var timer = setTimeout(function () { abort.abort(); }, RUN_TIMEOUT_MS);
+    try {
+      var headers = { "Content-Type": "application/json", "Accept": "text/event-stream" };
+      if (token()) headers.Authorization = "Bearer " + token();
+      var res = await fetch(base + "/agui/v1/run", {
+        method: "POST", headers: headers, body: JSON.stringify(body), signal: abort.signal,
+      });
+      if (!res.ok) {
+        var detail = "";
+        try { detail = (await res.json()).detail || ""; } catch (e) { detail = ""; }
+        ended = "HTTP_ERROR";
+        addRunResult("HTTP_ERROR", null, "HTTP " + res.status + (detail ? ": " + detail : ""));
+        if (decided) setCardState(decided.card, "pending", "not sent (HTTP " + res.status + ")");
+        return;
+      }
+      var reader = res.body.getReader();
+      var decoder = new TextDecoder();
+      var buf = "";
+      for (;;) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buf += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, "\n");
+        var cut;
+        while ((cut = buf.indexOf("\n\n")) >= 0) {
+          var block = buf.slice(0, cut);
+          buf = buf.slice(cut + 2);
+          var dataLines = block.split("\n").filter(function (l) { return l.indexOf("data:") === 0; })
+            .map(function (l) { return l.slice(5).replace(/^ /, ""); });
+          if (!dataLines.length) continue;  // ":keep-alive" comments
+          var data;
+          try { data = JSON.parse(dataLines.join("\n")); } catch (e) { continue; }
+          var type = data.type || "message";
+          logEvent("run", type, data);
+          if (type === "STATE_SNAPSHOT") {
+            fleetState = data.snapshot && typeof data.snapshot === "object" ? data.snapshot : {};
+            renderFleet();
+          } else if (type === "RUN_FINISHED") {
+            ended = type;
+            onRunFinished(data, decided, openAtStart);
+          } else if (type === "RUN_ERROR") {
+            ended = type;
+            addRunResult("RUN_ERROR", null, data.message || "");
+            if (decided) setCardState(decided.card, "pending", "RUN_ERROR: " + (data.message || ""));
+          }
+        }
+      }
+      if (!ended) {
+        ended = "NO_END";
+        addRunResult("NO_END", null, "the stream closed without RUN_FINISHED or RUN_ERROR");
+        if (decided) setCardState(decided.card, "pending", "run ended without a result");
+      }
+    } catch (e) {
+      if (!ended) {
+        ended = "HTTP_ERROR";
+        addRunResult("HTTP_ERROR", null, abort.signal.aborted
+          ? "no RUN_FINISHED within " + RUN_TIMEOUT_MS / 1000 + " s"
+          : "request failed: " + e.message + " (is this page's origin in CAO_CORS_ORIGINS?)");
+        if (decided) setCardState(decided.card, "pending", "not sent");
+      }
+    } finally {
+      clearTimeout(timer);
+      setRunInFlight(false);
+    }
+  }
+  function resume(interruptId, payload, decided) {
+    // ag-ui's ResumeEntry requires status; without it the run stream breaks
+    // before RUN_STARTED instead of answering RUN_ERROR.
+    var entry = { interruptId: String(interruptId), status: "resolved", payload: payload };
+    return run(runAgentInput({ resume: [entry] }), decided);
+  }
+  function decide(card, approved) {
+    if (runInFlight || card.getAttribute("data-state") !== "pending") return;
+    setCardState(card, "sending");
+    card._approve.disabled = true;
+    card._reject.disabled = true;
+    resume(card.getAttribute("data-interrupt-id"), { approved: approved }, { card: card, approved: approved });
+  }
+
+  els.connect.addEventListener("click", connect);
+  els.disconnect.addEventListener("click", disconnect);
+  els.send.addEventListener("click", function () { if (!runInFlight) run(runAgentInput()); });
+
+  // Test seam (as the viewer's window.__caoBuildStreamUrl): lets the local e2e
+  // send a resume for an interrupt id the page has no card for.
+  window.__caoDojo = { resume: function (id, payload) { return resume(id, payload, null); } };
+
+  try {
+    // Seed the endpoint from the URL only for a loopback server: a crafted link
+    // must not point the page, and a token typed into it, at another host.
+    var seeded = new URL(window.location.href).searchParams.get("endpoint");
+    if (seeded && ["127.0.0.1", "localhost", "[::1]"].indexOf(new URL(seeded).hostname) >= 0) {
+      els.endpoint.value = seeded;
+    }
+  } catch (e) { /* not a parseable URL in some test hosts */ }
+})();
+</script>
+</body>
+</html>

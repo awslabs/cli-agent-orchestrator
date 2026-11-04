@@ -23,8 +23,6 @@ from test.fixtures.jwt_factory import (
     JWTFactory,
 )
 
-import pytest
-
 
 def _decode_jwt_payload(token: str) -> dict:
     """Base64url-decode the JWT payload without verifying the signature."""

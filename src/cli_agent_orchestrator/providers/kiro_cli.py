@@ -19,24 +19,62 @@ The provider detects the following terminal states:
 
 import asyncio
 import logging
+import os
 import re
 import shlex
 import time
-from typing import Optional
+from dataclasses import dataclass
+from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.kiro_attest import (
+    KiroAttestationError,
+    check_mcp_panel,
+    check_tools_panel,
+    palette_shows_only,
+    parse_mcp_panel,
+    parse_tools_panel,
+)
 from cli_agent_orchestrator.providers.kiro_capabilities import (
-    KiroPhase0KASError,
+    KiroV3LaunchError,
     build_kiro_command,
+    kiro_effort,
+)
+from cli_agent_orchestrator.providers.kiro_identity import (
+    PLAN_MODE_AGENT,
+    KiroAgentIdentityError,
+    fallback_notice,
+    header_agents,
+    header_model,
+    identity_readable,
+    in_plan_mode,
+    require_header_identity,
+)
+from cli_agent_orchestrator.providers.kiro_launch_home import (
+    CAO_MCP_SERVER,
+    KiroLaunch,
+    check_global_home_unchanged,
+    kiro_home_path,
+    launch_agent_grant,
+    valid_terminal_id,
+    verify_launch_home,
+)
+from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
+from cli_agent_orchestrator.providers.kiro_workspace import (
+    check_kiro_helper_workspace,
+    check_kiro_workspace,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.delegation import tools_exceeding
+from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_store
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+from cli_agent_orchestrator.utils.tool_mapping import kiro_v3_granted_mcp_servers
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +98,10 @@ ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 # Additional escape sequences that may appear in terminal output
 ESCAPE_SEQUENCE_PATTERN = r"\[[?0-9;]*[a-zA-Z]"
 
-# Control characters to strip from final output
-CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
+# Control characters to strip from final output. Tab and newline stay: they
+# are the layout of the reply, and without them a multi-line reply (a report
+# template from a handoff, for example) came back as one line.
+CONTROL_CHAR_PATTERN = r"[\x00-\x08\x0b-\x1f\x7f-\x9f]"
 
 # Legacy-UI IDLE prompt pattern for log files (with ANSI codes)
 IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*m"
@@ -106,12 +146,22 @@ TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*(?:[A-Za-z]+\s+)?[\d.]+"
 # reply is not reliably separated from the echoed prompt by a blank line, so
 # extraction uses the credits anchors and the bullet line as the reply start.
 TUI_225_CREDITS_PATTERN = r"▸\s*Credits:\s*turn\s+[\d.]+"
-# The assistant's final reply bullet is truecolor blue; tool rows use green.
-# Keep the raw color marker for extraction, then fall back to a column-zero
-# bullet for uncolored captures (manual fixtures and older terminal records).
-TUI_225_ASSISTANT_BULLET_PATTERN = r"\x1b\[38;2;95;135;215m•"
+# A colored capture: bullet rows that carry a truecolor SGR.
 TUI_225_COLORED_BULLET_PATTERN = r"\x1b\[38;2;\d+;\d+;\d+m•"
+# A row at column 0 that starts with a bullet: a reply, a tool row, or a
+# reasoning row. An echoed prompt is indented, so its bullets do not match.
 TUI_225_REPLY_PATTERN = r"^•\s+\S"
+# Tool rows ("• Shell ...", "• assign") and reasoning rows ("• Thought for
+# 2s...") have child rows that start with "╰" (arguments, output, the thought).
+# The lines of a reply are plain indented text. The colors of the rows are not
+# a boundary: 2.25 drew the reply blue, and 2.29 draws it orange.
+TUI_225_CHILD_ROW_PATTERN = r"^\s+╰"
+# A reasoning row with its thought collapsed has no child row.
+TUI_225_THOUGHT_ROW_PATTERN = r"^•\s+Thought for \d"
+
+# Reading the pane command costs about 0.1 s of tmux calls; the exit check reads
+# it at most this often (see KiroCliProvider._exited_to_shell).
+EXIT_CHECK_INTERVAL_S = 2.0
 
 # TUI processing indicator: ghost text shown while agent is working.
 # kiro-cli 2.11+ replaced "Kiro is working" with "Thinking..." (with an
@@ -133,11 +183,73 @@ TUI_PROCESSING_PATTERN = r"Kiro is working|Thinking\.\.\."
 #
 # kiro-cli 2.8.x also shows "Initializing · type to queue a message" during
 # boot (different from the "Initializing..." with three dots).
+#
+# ``(?<!\d)`` lets the server count start only where a run of digits starts.
+# Without it the search restarted inside every digit run and re-scanned the
+# rest of the run each time, so a long run of digits anywhere in the buffer
+# cost time quadratic in its length (CWE-1333). The matches are unchanged:
+# whenever a match exists inside a run, one exists from the run's first digit,
+# and the leftmost one wins.
 TUI_INITIALIZING_PATTERN = (
     r"Initializing\.\.\."
-    r"|\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"
+    r"|(?<!\d)\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"
     r"|Initializing\s*·\s*type to queue a message"
 )
+
+# Legacy permission prompt: "Allow this action? ... [y/n/t]:". The text between
+# the question and the bracketed choice varies by version ("Use 't' to trust
+# (always allow) this tool for the session."), so detection looks for the
+# question and then, in order, "[", "y", "/", "n", "/", "t" and "]:" anywhere
+# after it, across lines -- the subsequence the old regex
+# ``Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:`` (re.DOTALL) spelled
+# out with six lazy gaps. Run over the whole buffer on every status poll, that
+# regex tried every ordered combination of those characters whenever the
+# question was present without a closing "]:" after it: polynomial of degree
+# ~6 in the text that followed (CWE-1333). See _legacy_permission_prompt_spans.
+_PERMISSION_PROMPT_QUESTION = "Allow this action?"
+_PERMISSION_PROMPT_STEPS = ("[", "y", "/", "n", "/", "t")
+_PERMISSION_PROMPT_CLOSE = "]:"
+
+
+def _legacy_permission_prompt_spans(text: str) -> List[tuple[int, int]]:
+    """``(start, end)`` of every legacy permission prompt in ``text``, in order.
+
+    Returns the spans ``re.finditer`` returned for the old six-gap regex (see
+    ``_PERMISSION_PROMPT_QUESTION``), in one forward pass. Taking the EARLIEST
+    occurrence of each step finds exactly the regex's match, because an earlier
+    choice never leaves less text for the steps after it. When the steps fail
+    after one question they fail after every later question too (each later
+    search sees a suffix of the same text), so the scan can stop there instead
+    of retrying from each later question as the regex engine did.
+    """
+    spans: List[tuple[int, int]] = []
+    pos = 0
+    while True:
+        start = text.find(_PERMISSION_PROMPT_QUESTION, pos)
+        if start == -1:
+            return spans
+        cursor = start + len(_PERMISSION_PROMPT_QUESTION)
+        for step in _PERMISSION_PROMPT_STEPS:
+            cursor = text.find(step, cursor)
+            if cursor == -1:
+                return spans
+            cursor += len(step)
+        close = text.find(_PERMISSION_PROMPT_CLOSE, cursor)
+        if close == -1:
+            return spans
+        end = close + len(_PERMISSION_PROMPT_CLOSE)
+        spans.append((start, end))
+        pos = end
+
+
+def has_single_line_permission_prompt(text: str) -> bool:
+    """True when one line of ``text`` holds a whole legacy permission prompt.
+
+    The reading without re.DOTALL: the question and every step up to "]:" on
+    the same line, which is how the AG-UI approval classifier has always
+    matched it. Linear, like _legacy_permission_prompt_spans, per line.
+    """
+    return any(_legacy_permission_prompt_spans(line) for line in text.split("\n"))
 
 
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
@@ -170,6 +282,161 @@ TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
 # Bottom pane lines scanned for the consent dialog (mirrors codex's window).
 STARTUP_PROMPT_BOTTOM_LINES = 15
 
+# Reads of the screen for the TUI header after the prompt is ready (see
+# KiroCliProvider._verify_agent_identity). A screen with no header row, only a
+# partial (elided or wrapped) name, or Kiro's plan mode is read again; a screen
+# whose header rows name any other agent is refused on the first read.
+# Provisional (#1074): about 2 s, after which a screen without a header (a
+# kiro-cli TUI change, say) is refused rather than trusted.
+IDENTITY_HEADER_READS = 5
+IDENTITY_HEADER_READ_INTERVAL_S = 0.5
+
+# =============================================================================
+# Kiro v3 dialogs (#1167). Used for v3 terminals only; v2 parsing is unchanged.
+# =============================================================================
+
+# Each dialog is matched as a whole block in the bottom of the screen (title,
+# every option, its own footer) with no idle prompt after it, so a reply that
+# quotes one cannot flip the status. The footers are the dialogs' own: v3's
+# generic list chrome ("esc to close · …") alone is never enough.
+#
+# Every pattern here is applied to one line of agent-painted text at a time,
+# and only its verdict is read, so none may cost more than linear time in the
+# line (CWE-1333):
+#
+# * the approval title and the declined-trust line start their attempt at the
+#   line start and skip to the first place the old pattern
+#   (``\S.*\brequires approval\s*$``, ``Not trusted: .*Kiro exited ...``) could
+#   start: its first non-blank, its first "Not trusted: ". Unanchored, the
+#   search restarted at every later one and re-scanned the rest of the line
+#   from each. A match from a later start on the line is also reachable from
+#   the first, so text matches exactly when it did, and the match ends where
+#   it did (it now begins at its line's start). ``\Z`` stands for the old
+#   ``$``, which ``(?m)`` would let match before any newline: ``\s*`` takes a
+#   final newline, so ``\s*$`` only ever matched at the end of the string;
+# * the trust title and the footers (here and _V3_SELECTOR_FOOTER) use ``\A``,
+#   which is what ``^`` means without re.MULTILINE, so their matches are
+#   unchanged; unlike ``^`` it stays one start position if re.MULTILINE is
+#   ever added, where ``^\s*`` would re-scan a run of blank lines from each.
+#   The option rows keep ``^``: _options_follow applies them with ``.match``.
+V3_DIALOG_BOTTOM_LINES = 30
+_V3_APPROVAL_TITLE = re.compile(r"(?m)^[^\S\n]*+\S[^\n]*\brequires approval\s*\Z")
+_V3_APPROVAL_OPTIONS = (
+    re.compile(r"^\s*(?:❯\s*)?Allow once\s*$"),
+    re.compile(r"^\s*(?:❯\s*)?Deny once\s*$"),
+    re.compile(r"^\s*(?:❯\s*)?Create deny rule\b"),
+)
+_V3_APPROVAL_FOOTER = re.compile(r"\A\s*esc to close · ↑↓ to navigate · ↵ to select\b")
+_V3_TRUST_TITLE = re.compile(r"\A\s*Trust this workspace\?\s*$")
+_V3_TRUST_OPTIONS = (
+    re.compile(r"^\s*(?:❯\s*)?Trust, continue\s*$"),
+    re.compile(r"^\s*(?:❯\s*)?Don't trust, exit\s*$"),
+)
+_V3_TRUST_FOOTER = re.compile(r"\A\s*esc to exit · ↑↓ to navigate · ↵ to select\s*$")
+_V3_TRUST_DECLINED = re.compile(
+    r"(?m)^(?:(?!Not trusted: ).)*+Not trusted: .*Kiro exited without loading this folder"
+)
+# v2's "Switch to V3" offer, which also rewrites agent files if accepted. A
+# pinned launch should never show it; if one does, nobody answers it.
+_V3_UPSELL_TITLE = re.compile(r"Switch to V3 today\.")
+_V3_UPSELL_OPTIONS = (
+    re.compile(r"^\s*(?:❯\s*)?Switch to V3 and upgrade my configs\s*$"),
+    re.compile(r"^\s*(?:❯\s*)?Remind me later\s*$"),
+    re.compile(r"^\s*(?:❯\s*)?Don't ask again\s*$"),
+)
+
+
+def _options_follow(lines: List[str], start: int, options: tuple, window: int = 8) -> Optional[int]:
+    """Index of the last option row when every option follows ``start`` in order."""
+    index = start
+    for option in options:
+        for candidate in range(index + 1, min(len(lines), index + 1 + window)):
+            if option.match(lines[candidate]):
+                index = candidate
+                break
+        else:
+            return None
+    return index
+
+
+def kiro_v3_dialog(output: str) -> Optional[str]:
+    """Which v3 dialog the bottom of ``output`` shows, if any.
+
+    ``approval`` (the per-call approval picker), ``trust`` (the workspace-trust
+    dialog), ``trust_declined`` (Kiro exited from it), ``upsell`` (v2's Switch
+    to V3 offer), or ``None``. A dialog with an idle prompt below it is history,
+    not a dialog.
+    """
+    lines = [line.rstrip() for line in strip_terminal_escapes(output).splitlines() if line.strip()]
+    lines = lines[-V3_DIALOG_BOTTOM_LINES:]
+
+    def after_has_idle(index: int) -> bool:
+        return any(re.search(NEW_TUI_IDLE_PATTERN, line) for line in lines[index + 1 :])
+
+    for title, options, footer, name in (
+        (_V3_APPROVAL_TITLE, _V3_APPROVAL_OPTIONS, _V3_APPROVAL_FOOTER, "approval"),
+        (_V3_TRUST_TITLE, _V3_TRUST_OPTIONS, _V3_TRUST_FOOTER, "trust"),
+    ):
+        titles = [i for i, line in enumerate(lines) if title.search(line)]
+        if not titles:
+            continue
+        last_option = _options_follow(lines, titles[-1], options)
+        if last_option is None:
+            continue
+        footers = [i for i in range(last_option + 1, len(lines)) if footer.match(lines[i])]
+        if not footers or after_has_idle(footers[0]):
+            continue
+        if name == "trust" and any(_V3_TRUST_DECLINED.search(l) for l in lines[footers[0] :]):
+            return "trust_declined"
+        return name
+    upsell = [i for i, line in enumerate(lines) if _V3_UPSELL_TITLE.search(line)]
+    if upsell:
+        last_option = _options_follow(lines, upsell[-1], _V3_UPSELL_OPTIONS)
+        if last_option is not None and not after_has_idle(last_option):
+            return "upsell"
+    return None
+
+
+# Any v3 selector's own footer: the approval picker's and the trust dialog's
+# (``esc to close`` / ``esc to exit``, then ``↑↓ to navigate · ↵ to select``).
+# At startup no selector is expected and CAO answers none (#1167).
+_V3_SELECTOR_FOOTER = re.compile(r"\A\s*esc to (?:close|exit) · ↑↓ to navigate · ↵ to select\b")
+
+
+def kiro_v3_startup_selector(output: str) -> bool:
+    """Whether the bottom of ``output`` is a v3 selector with no idle prompt below it.
+
+    Covers dialogs CAO has no pattern for (the uncaptured v3 trust-all consent
+    is the expected one): the startup wait refuses on it instead of waiting out
+    the init timeout. Used at startup only; status parsing does not read it.
+    """
+    lines = [line.rstrip() for line in strip_terminal_escapes(output).splitlines() if line.strip()]
+    lines = lines[-V3_DIALOG_BOTTOM_LINES:]
+    footers = [i for i, line in enumerate(lines) if _V3_SELECTOR_FOOTER.match(line)]
+    if not footers:
+        return False
+    return not any(re.search(NEW_TUI_IDLE_PATTERN, line) for line in lines[footers[-1] + 1 :])
+
+
+# Reads of the pane during the v3 attestation (#1167): for the typed palette
+# and each panel, then for MCP servers still loading. Provisional, about 3 s
+# and 20 s.
+V3_ATTEST_READS = 6
+V3_ATTEST_READ_INTERVAL_S = 0.5
+V3_MCP_LOADING_READS = 40
+
+
+@dataclass(frozen=True)
+class KiroAttestation:
+    """What a v3 pane's ``/tools`` and ``/mcp list`` showed once they passed (#1167)."""
+
+    tags: tuple[str, ...]
+    #: The tool count of each MCP server ``/mcp list`` showed running.
+    mcp_tools: tuple[tuple[str, int], ...]
+    #: The header's model column, audited and never enforced.
+    model: Optional[str]
+
+
 # =============================================================================
 # Error Detection
 # =============================================================================
@@ -190,7 +457,6 @@ class KiroCliProvider(BaseProvider):
         window_name: Name of the tmux window for this terminal
         _agent_profile: Name of the Kiro agent profile to use
         _idle_prompt_pattern: Regex pattern for detecting IDLE state
-        _permission_prompt_pattern: Regex pattern for detecting permission prompts
     """
 
     @classmethod
@@ -202,6 +468,21 @@ class KiroCliProvider(BaseProvider):
     ) -> bool:
         return True
 
+    @classmethod
+    def honors_effort(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+    ) -> bool:
+        """Only an ephemeral helper applies a decided effort (#1083, #1167 Phase 2).
+
+        A helper runs on the v3 engine only, and its launch object carries the launch
+        plan's effort, else the stored ``kiroConfig.effort``, to ``--effort``. An installed
+        agent is unchanged: v2 passes no effort, and v3 reads ``kiroConfig.effort`` from
+        the agent's own profile, so a decided effort would never reach it.
+        """
+        return agent_profile is not None and routes_to_ephemeral_store(agent_profile)
+
     def __init__(
         self,
         terminal_id: str,
@@ -211,6 +492,7 @@ class KiroCliProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         engine: Optional[KiroEngine] = None,
         model: Optional[str] = None,
+        launch: Optional[KiroLaunch] = None,
     ):
         """Initialize Kiro CLI provider with terminal context.
 
@@ -224,13 +506,29 @@ class KiroCliProvider(BaseProvider):
             model: Explicit per-call override for profile.model (see
                 _get_profile_model), e.g. a handoff/assign caller pinning a
                 specific model for one worker without a dedicated profile.
+            launch: An ephemeral helper's per-launch home and kiro-cli, prepared
+                by terminal creation before the window existed (#1167 Phase 2).
+                None for an installed agent. A helper runs on v3 only.
         """
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._input_received = False
+        # The cached result of the exit check (see _exited_to_shell).
+        self._exit_checked_at: Optional[float] = None
+        self._exited = False
         self._agent_profile = agent_profile
         self._engine = resolve_kiro_engine(persisted=engine)
         self._model = model
+        # The evidence that this runtime's TUI header named the agent (#1074).
+        # Only _verify_agent_identity sets it, and only once the check passed;
+        # terminal_service records it on the row before any task is typed.
+        # initialize() returning is not evidence on its own.
+        self.identity_verified = False
+        self._launch = launch
+        if launch is not None and self._engine != KiroEngine.V3:
+            raise ValueError("an ephemeral Kiro helper runs on the v3 engine only")
+        # What the v3 attestation read, once it passed; audited for a helper.
+        self.attestation: Optional[KiroAttestation] = None
 
         # Build dynamic prompt pattern based on agent profile
         # This pattern matches various Kiro prompt formats after ANSI stripping:
@@ -242,10 +540,21 @@ class KiroCliProvider(BaseProvider):
         self._idle_prompt_pattern = (
             rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?(?:\u03bb\s*)?!?>\s*"
         )
-        self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
+        # The legacy "Allow this action? ... [y/n/t]:" prompt is found by
+        # _legacy_permission_prompt_spans (a linear scan, not a regex).
 
-        # New TUI header pattern: "agent_name · model · ◔ N%"
-        self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
+        # New TUI header pattern: "agent_name · model · ◔ N%", applied to one
+        # row at a time. The attempt starts at the row start and skips to the
+        # FIRST "agent_name ·" on it: unanchored, the search restarted at every
+        # occurrence of the name and re-scanned the rest of the row from each,
+        # and ``\s+.*`` could split the blanks after "·" every way (CWE-1333).
+        # A later header on the row is reachable from the first, so a row
+        # matches exactly when it did; ``\s++`` is equivalent because ``.*``
+        # takes back any blanks it gave up.
+        agent = re.escape(self._agent_profile)
+        self._new_tui_header_pattern = (
+            rf"(?m)^(?:(?!{agent}\s+·\s)[^\n])*+{agent}\s+·\s++.*·\s+◔\s*\d+%"
+        )
 
     @property
     def paste_enter_count(self) -> int:
@@ -261,6 +570,23 @@ class KiroCliProvider(BaseProvider):
         """Kiro 2.11's TUI needs a longer delay after bracketed paste before
         the Enter key registers as submit rather than being swallowed."""
         return 1.0
+
+    def _exited_to_shell(self) -> bool:
+        """Return True when the pane is back at the shell that ran before kiro-cli.
+
+        Read at most every EXIT_CHECK_INTERVAL_S: the lookup costs about 0.1 s
+        of tmux calls (more inside a PTY proxy), and get_status() reaches it on
+        every read of a busy frame. A stale "still running" only keeps the
+        terminal PROCESSING for up to that long after kiro-cli exits.
+        """
+        now = time.monotonic()
+        if self._exit_checked_at is None or now - self._exit_checked_at >= EXIT_CHECK_INTERVAL_S:
+            current_cmd = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
+            self._exited = current_cmd == self.shell_baseline
+            self._exit_checked_at = now
+        return self._exited
 
     def mark_input_received(self) -> None:
         """Track that input was sent, enabling separator-free completion detection."""
@@ -290,6 +616,9 @@ class KiroCliProvider(BaseProvider):
         """
         if self._model:
             return self._model
+        if self._launch is not None:
+            # A helper's name is reserved: load_agent_profile cannot read it.
+            return self._launch.model
         try:
             profile = load_agent_profile(self._agent_profile)
         except (FileNotFoundError, RuntimeError) as exc:
@@ -301,6 +630,21 @@ class KiroCliProvider(BaseProvider):
             return None
         return profile.model or None
 
+    def _get_profile_effort(self) -> Optional[str]:
+        """``kiroConfig.effort`` for a v3 launch's ``--effort`` (#1167), or None.
+
+        Best-effort like ``_get_profile_model``: a profile that cannot be read
+        sets no effort. Creation already probed the flag from the same profile.
+        A helper's effort comes from its launch object.
+        """
+        if self._launch is not None:
+            return self._launch.effort
+        try:
+            return kiro_effort(load_agent_profile(self._agent_profile))
+        except Exception as exc:  # noqa: BLE001 - a missing profile sets no effort
+            logger.debug("Profile '%s' sets no Kiro effort: %s", self._agent_profile, exc)
+            return None
+
     async def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
 
@@ -308,20 +652,19 @@ class KiroCliProvider(BaseProvider):
         1. Waits for the shell to be ready in the tmux window
         2. Sends the kiro-cli chat command with the configured agent profile
         3. Waits for the agent to reach IDLE state (ready for input)
+        4. Checks that the TUI header names the configured agent profile
 
         Returns:
             True if initialization was successful
 
         Raises:
             TimeoutError: If shell or Kiro CLI initialization times out
+            KiroAgentIdentityError: If kiro-cli started a different agent (for
+                example its ``kiro_default`` fallback) or no header was read
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        if self._engine == KiroEngine.KAS:
-            # This defensive guard makes direct provider use fail closed too.
-            # Normal terminal creation has already probed and rejected KAS before
-            # a backend window or provider is allocated.
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
+        v3 = self._engine == KiroEngine.V3
 
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
@@ -347,6 +690,11 @@ class KiroCliProvider(BaseProvider):
         # tools, so the agent could not assign/handoff/report_outcome at all.
         model = self._get_profile_model()
 
+        if self._launch is not None:
+            # Stage C (#1167 Phase 2): the sealed home must still be exactly what
+            # creation prepared before kiro-cli reads it.
+            await asyncio.to_thread(verify_launch_home, self._launch.home, sealed=True)
+
         # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
         # blocks MCP tool calls that spawn subagents (e.g. cao-mcp-server's
         # assign/handoff). Current CAO policy always bypasses Kiro's
@@ -360,6 +708,8 @@ class KiroCliProvider(BaseProvider):
             self._agent_profile,
             model=model,
             yolo=True,
+            effort=self._get_profile_effort() if v3 else None,
+            **self._launch_command_options(),
         )
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
@@ -381,14 +731,99 @@ class KiroCliProvider(BaseProvider):
         # engine with no MCP tools — turning a loud timeout into an agent that
         # looks healthy and cannot orchestrate. Failing here is the honest
         # outcome.
-        if not await self._wait_ready_accepting_trust_dialog():
+        ready = (
+            await self._wait_ready_refusing_v3_dialogs()
+            if v3
+            else await self._wait_ready_accepting_trust_dialog()
+        )
+        if not ready:
             raise TimeoutError(
                 "Kiro CLI initialization timed out waiting for the agent prompt "
                 f"(engine={self._engine.value}, profile={self._agent_profile!r})"
             )
 
+        # Step 4: the prompt being ready does not mean the requested agent is
+        # running. Nothing is typed into the pane until the header names it.
+        await self._verify_agent_identity()
+
+        if v3:
+            # Step 5 (#1167): the header names the agent, not its tools. Hold
+            # the identity back until the workspace is re-checked and the pane's
+            # own /tools and /mcp panels match the installed grant.
+            self.identity_verified = False
+            if self._launch is not None:
+                await self._recheck_helper_after_header(self._launch)
+            else:
+                await self._recheck_v3_workspace()
+            self.attestation = await self._attest_v3_tools_and_mcp()
+            self.identity_verified = True
+
         self._initialized = True
         return True
+
+    async def _verify_agent_identity(self) -> None:
+        """Raise unless every TUI header row names this provider's agent (#1074).
+
+        kiro-cli answers an ``--agent`` it cannot load by starting its built-in
+        ``kiro_default`` agent, which has every built-in tool, and reaches the
+        same ready prompt. Called after the prompt is ready and before
+        ``initialize`` returns, so on a refusal no task has been typed, and the
+        pane receives no keys from here. The creation path then closes the
+        window: a synchronous create rolls back, and a deferred create reclaims
+        the runtime even when an external owner keeps the failure row.
+        Provisional (#1074): no ``/exit`` is typed into the wrong agent either.
+
+        Reads the rendered screen, not the scrollback, so the requested name in
+        the echoed launch command is never what is matched (see
+        ``kiro_identity.header_agents``). A screen without a header row is read
+        again a few times, because the header can trail the prompt by a frame,
+        and so is one whose header name is only partial or that shows plan mode;
+        if that persists it is refused (``header_not_found``, or for plan mode
+        ``identity_mismatch``). kiro-cli's fallback notice for this agent on any
+        read refuses the launch too (#1167), whatever the header names.
+
+        Raises:
+            KiroAgentIdentityError: ``identity_mismatch`` or ``header_not_found``.
+        """
+        backend = get_backend()
+        observed: List[str] = []
+        plan_mode = False
+        fallback: Optional[str] = None
+        for attempt in range(IDENTITY_HEADER_READS):
+            if attempt:
+                await asyncio.sleep(IDENTITY_HEADER_READ_INTERVAL_S)
+            try:
+                screen = await asyncio.to_thread(
+                    backend.get_history,
+                    self.session_name,
+                    self.window_name,
+                    strip_escapes=True,
+                    visible_only=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - an unread screen is not identity
+                logger.debug("kiro_cli: screen read for the identity check failed: %s", exc)
+                continue
+            observed = header_agents(screen) if isinstance(screen, str) else []
+            if fallback is None and isinstance(screen, str):
+                fallback = fallback_notice(screen, self._agent_profile)
+            plan_mode = (
+                bool(observed)
+                and self._agent_profile != PLAN_MODE_AGENT
+                and isinstance(screen, str)
+                and in_plan_mode(screen)
+            )
+            if identity_readable(observed) and not plan_mode:
+                break
+        try:
+            require_header_identity(
+                self._agent_profile, observed, plan_mode=plan_mode, fallback=fallback
+            )
+        except KiroAgentIdentityError as exc:
+            logger.error(
+                "kiro_cli: terminal %s refused before any input: %s", self.terminal_id, exc
+            )
+            raise
+        self.identity_verified = True
 
     async def _wait_ready_accepting_trust_dialog(self) -> bool:
         """Wait for the agent prompt, auto-answering the trust-all-tools dialog.
@@ -489,6 +924,258 @@ class KiroCliProvider(BaseProvider):
             timeout=remaining,
         )
 
+    async def _wait_ready_refusing_v3_dialogs(self) -> bool:
+        """Wait for a v3 prompt; refuse, sending no key, on any startup dialog (#1167).
+
+        ``--trust-workspace`` should skip the workspace-trust dialog; if it is on
+        screen anyway CAO never answers it, because "Trust, continue" would save
+        the folder as trusted in the user's Kiro home and "Don't trust, exit"
+        ends the session. No v3 trust-all consent text has been captured, so no
+        other startup dialog is answered either.
+        """
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        init_timeout = float(get_server_settings()["provider_init_timeout"])
+        # Every poll also reads the pane, so a dialog the status cannot express
+        # (an unrecognised selector reads PROCESSING, a declined trust dialog
+        # ERROR) refuses at once instead of waiting out the timeout.
+        ready = await wait_until_status(
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
+            timeout=init_timeout,
+            on_poll=self._refuse_v3_startup_screen,
+        )
+        if not ready:
+            return False
+        current = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
+        if current != TerminalStatus.WAITING_USER_ANSWER:
+            return True
+        await self._refuse_v3_startup_screen()
+        raise KiroV3LaunchError(
+            "kiro_v3_startup_dialog",
+            "kiro-cli is waiting for an answer at startup on a screen CAO does not "
+            "recognize for v3; it was not answered and no task was sent.",
+        )
+
+    async def _refuse_v3_startup_screen(self) -> None:
+        """Refuse, sending no key, if the pane shows any v3 dialog at startup (#1167).
+
+        ``kiro_v3_trust_dialog`` for the workspace-trust dialog (``--trust-workspace``
+        was not honoured), also once declined (Kiro exited); ``kiro_v3_startup_dialog``
+        for any other dialog or selector. The creation path then closes the window.
+        """
+        screen = await self._read_screen()
+        dialog = kiro_v3_dialog(screen)
+        if dialog == "trust":
+            raise KiroV3LaunchError(
+                "kiro_v3_trust_dialog",
+                "kiro-cli showed the workspace-trust dialog although CAO passed "
+                "--trust-workspace, so the flag was not honoured. CAO does not answer "
+                "it; no task was sent.",
+            )
+        if dialog == "trust_declined":
+            raise KiroV3LaunchError(
+                "kiro_v3_trust_dialog",
+                "kiro-cli showed the workspace-trust dialog although CAO passed "
+                "--trust-workspace, and it was declined, so Kiro exited. CAO never "
+                "answers that dialog; no task was sent.",
+            )
+        if dialog is not None or kiro_v3_startup_selector(screen):
+            raise KiroV3LaunchError(
+                "kiro_v3_startup_dialog",
+                "kiro-cli showed a startup dialog CAO does not answer on v3; it was not "
+                "answered and no task was sent.",
+            )
+
+    async def _read_screen(self) -> str:
+        screen = await asyncio.to_thread(
+            get_backend().get_history,
+            self.session_name,
+            self.window_name,
+            strip_escapes=True,
+            visible_only=True,
+        )
+        return screen if isinstance(screen, str) else ""
+
+    async def _recheck_v3_workspace(self) -> None:
+        """Run the workspace check again from the pane's own cwd, after the header (#1167)."""
+        cwd = await asyncio.to_thread(
+            get_backend().get_pane_working_directory, self.session_name, self.window_name
+        )
+        if not cwd:
+            raise KiroV3LaunchError(
+                "kiro_v3_bad_cwd", "the pane's working directory could not be read for the re-check"
+            )
+        await asyncio.to_thread(check_kiro_workspace, cwd)
+
+    def _launch_command_options(self) -> dict[str, str]:
+        """The absolute kiro-cli and the per-launch KIRO_HOME, for a helper only."""
+        if self._launch is None:
+            return {}
+        return {
+            "executable": self._launch.kiro_cli.path,
+            "kiro_home": str(self._launch.home.home),
+        }
+
+    async def _recheck_helper_after_header(self, launch: KiroLaunch) -> None:
+        """Stage D2 for a helper (#1167 Phase 2); raises before any task is typed.
+
+        The workspace check runs again from the pane's own cwd, ``HOME``'s rule
+        included; then the check after Kiro's legacy copies, which have run by
+        now (a changed placeholder or a new ``~/.kiro`` marker refuses
+        ``kiro_v3_global_home:changed``); then the home must still be exactly
+        what creation sealed.
+        """
+        try:
+            cwd = await asyncio.to_thread(
+                get_backend().get_pane_working_directory, self.session_name, self.window_name
+            )
+            if not cwd:
+                raise KiroV3LaunchError(
+                    "kiro_v3_bad_cwd",
+                    "the pane's working directory could not be read for the re-check",
+                )
+            user_home = launch.home.global_home.user_home
+            await asyncio.to_thread(check_kiro_helper_workspace, cwd, user_home)
+            await asyncio.to_thread(check_global_home_unchanged, launch.home)
+            await asyncio.to_thread(verify_launch_home, launch.home, sealed=True)
+        except KiroV3Refusal as exc:
+            logger.error(
+                "kiro_cli: terminal %s refused before any input: %s", self.terminal_id, exc
+            )
+            raise
+
+    async def _open_v3_panel(self, command: str) -> str:
+        """Type a slash command, confirm its palette, press Enter, and return the screen.
+
+        Typed key by key, never as a paste, and never followed by Tab: on
+        2.35.1 Tab after ``/tools`` selects ``trust-all``. Enter is pressed only
+        once the palette shows the plain completion for ``command``.
+        """
+        backend = get_backend()
+        for key in command:
+            backend.send_special_key(self.session_name, self.window_name, key)
+        for attempt in range(V3_ATTEST_READS):
+            if attempt:
+                await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+            if palette_shows_only(await self._read_screen(), command):
+                break
+        else:
+            backend.send_special_key(self.session_name, self.window_name, "Escape")
+            code = "kiro_v3_tools_mismatch" if command == "/tools" else "kiro_v3_mcp_not_ready"
+            raise KiroAttestationError(
+                code, f"the {command} palette did not appear; nothing was selected"
+            )
+        backend.send_special_key(self.session_name, self.window_name, "Enter")
+        return await self._read_screen()
+
+    async def _attestation_grant(self) -> tuple[list[str], list[str], list[str]]:
+        """The grant and servers the panels are held to, and the launch's own allowlist.
+
+        An installed agent's come from its installed universal file. A
+        helper's come from its per-launch file, read again and hash-checked,
+        never from the installed store; its launch allowlist is the grant CAO
+        rendered, and its only server is cao-mcp-server (#1167 Phase 2).
+        """
+        if self._launch is not None:
+            grant, servers = await asyncio.to_thread(launch_agent_grant, self._launch.home)
+            if servers != [CAO_MCP_SERVER]:
+                raise KiroAttestationError(
+                    "kiro_v3_mcp_not_ready", f"the helper's file configures {servers}"
+                )
+            return grant, servers, list(self._launch.grant)
+        from cli_agent_orchestrator.services.install_service import installed_kiro_v3_grant
+
+        launch = self._allowed_tools
+        if launch is None or "*" in launch:
+            raise KiroAttestationError(
+                "kiro_v3_tools_mismatch", "a v3 launch needs a restricted allowlist"
+            )
+        installed = installed_kiro_v3_grant(self._agent_profile)
+        if installed is None:
+            raise KiroAttestationError(
+                "kiro_v3_tools_mismatch", "the installed agent file is not a v3 universal file"
+            )
+        return installed[0], installed[1], list(launch)
+
+    async def _attest_v3_tools_and_mcp(self) -> KiroAttestation:
+        """Refuse unless ``/mcp list`` and ``/tools`` match the agent file's grant (#1167).
+
+        Runs after the header check and before the identity is recorded, so on
+        a refusal no task has been typed; the creation path then reclaims the
+        window. Slash commands cost no credits.
+
+        The file is read again here, after Kiro loaded it. Its grant must still
+        fit this launch's and name every server it configures, so a file
+        rewritten after the pre-allocation check can widen neither what the
+        panels are compared with nor which servers they may show. Returns what
+        the panels showed, for a helper's audit.
+
+        ``/mcp`` is read first, again until no server is still loading, and
+        only then ``/tools``: a loading server has no rows on ``/tools`` yet, so
+        a per-tool grant read before then would be checked against nothing.
+        """
+        grant, servers, launch = await self._attestation_grant()
+        exceeding = tools_exceeding(grant, launch)
+        if exceeding:
+            raise KiroAttestationError(
+                "kiro_v3_tools_mismatch",
+                f"the installed grant now exceeds this launch's: {exceeding}",
+            )
+        ungranted = sorted(set(servers) - set(kiro_v3_granted_mcp_servers(grant, servers)))
+        if ungranted:
+            raise KiroAttestationError(
+                "kiro_v3_mcp_not_ready",
+                f"the installed file configures ungranted servers {ungranted}",
+            )
+        backend = get_backend()
+        model = header_model(await self._read_screen(), self._agent_profile)
+
+        screen = await self._open_v3_panel("/mcp")
+        rows = {}
+        try:
+            for attempt in range(V3_MCP_LOADING_READS):
+                try:
+                    rows = parse_mcp_panel(screen)
+                    if not check_mcp_panel(rows, servers):
+                        break
+                except KiroAttestationError:
+                    if attempt == V3_MCP_LOADING_READS - 1:
+                        raise
+                    if attempt >= V3_ATTEST_READS and "/mcp list" not in screen:
+                        raise
+                await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+                screen = await self._read_screen()
+            else:
+                raise KiroAttestationError("kiro_v3_mcp_not_ready", "MCP servers still loading")
+        finally:
+            backend.send_special_key(self.session_name, self.window_name, "Escape")
+
+        screen = await self._open_v3_panel("/tools")
+        for attempt in range(V3_ATTEST_READS):
+            try:
+                panel = parse_tools_panel(screen)
+                break
+            except KiroAttestationError:
+                if attempt == V3_ATTEST_READS - 1:
+                    backend.send_special_key(self.session_name, self.window_name, "Escape")
+                    raise
+            await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+            screen = await self._read_screen()
+        backend.send_special_key(self.session_name, self.window_name, "Escape")
+        check_tools_panel(panel, grant)
+        if not await wait_until_status(
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=float(get_server_settings()["provider_init_timeout"]),
+        ):
+            raise KiroAttestationError("kiro_v3_mcp_not_ready", "the prompt did not return")
+        return KiroAttestation(
+            tags=tuple(sorted(panel.tags)),
+            mcp_tools=tuple(sorted((name, row.tools) for name, row in rows.items())),
+            model=model,
+        )
+
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.
 
@@ -523,6 +1210,17 @@ class KiroCliProvider(BaseProvider):
         # \r in-place redraws staying on the same logical line (see
         # ANSI_CODE_PATTERN). Do not switch this to strip_terminal_escapes.
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+
+        # Check 0 (v3 only, #1167): the approval picker, the workspace-trust
+        # dialog and v2's upsell wait for an answer, whatever startup or busy
+        # text is still in the buffer; never PROCESSING. A declined trust
+        # dialog means Kiro exited.
+        if self._engine == KiroEngine.V3:
+            dialog = kiro_v3_dialog(clean_output)
+            if dialog == "trust_declined":
+                return TerminalStatus.ERROR
+            if dialog is not None:
+                return TerminalStatus.WAITING_USER_ANSWER
 
         # Check 0a: Detect idle prompts early — required for the position-aware
         # processing checks below.
@@ -608,12 +1306,8 @@ class KiroCliProvider(BaseProvider):
         # immediately after launch, which lets pre-init pastes get absorbed
         # by Kiro's boot screen and silently dropped.
         if not has_idle_prompt and not has_new_tui_idle:
-            if self._initialized and self.shell_baseline:
-                current_cmd = get_backend().get_pane_current_command(
-                    self.session_name, self.window_name
-                )
-                if current_cmd == self.shell_baseline:
-                    return TerminalStatus.IDLE
+            if self._initialized and self.shell_baseline and self._exited_to_shell():
+                return TerminalStatus.IDLE
             return TerminalStatus.PROCESSING
 
         # Check 2: Look for known error messages in the output
@@ -624,13 +1318,13 @@ class KiroCliProvider(BaseProvider):
         # Active prompt: 0-1 lines with idle prompt (CLI renders prompt on next line)
         # Stale prompt: 2+ lines with idle prompt (user answered, agent continued)
         # Line-based counting handles \r redraws (same line, no \n) correctly
-        perm_matches = list(re.finditer(self._permission_prompt_pattern, clean_output, re.DOTALL))
-        tui_perm_matches = list(re.finditer(TUI_PERMISSION_PATTERN, clean_output))
-        all_perm_matches = perm_matches + tui_perm_matches
+        perm_spans = _legacy_permission_prompt_spans(clean_output)
+        tui_perm_spans = [m.span() for m in re.finditer(TUI_PERMISSION_PATTERN, clean_output)]
+        all_perm_spans = perm_spans + tui_perm_spans
         # Sort by position so we use the last permission prompt regardless of type
-        all_perm_matches.sort(key=lambda m: m.start())
-        if all_perm_matches:
-            after_last_perm = clean_output[all_perm_matches[-1].end() :]
+        all_perm_spans.sort(key=lambda span: span[0])
+        if all_perm_spans:
+            after_last_perm = clean_output[all_perm_spans[-1][1] :]
             lines_after = after_last_perm.split("\n")
             idle_lines = sum(
                 1
@@ -731,6 +1425,59 @@ class KiroCliProvider(BaseProvider):
         # Default: Agent is IDLE, waiting for user input
         return TerminalStatus.IDLE
 
+    # The TUI's live prompt row: "› " then the first row of the text, or the
+    # placeholder / status text the TUI shows there when nothing is typed.
+    _COMPOSER_PROMPT_RE = re.compile(r"^\s*›(?:\s(.*)|\s*)$")
+    # Text the TUI itself paints in the prompt row; none of it is user input.
+    _COMPOSER_CHROME_RE = re.compile(
+        rf"{NEW_TUI_IDLE_PATTERN}|{TUI_PROCESSING_PATTERN}|{TUI_INITIALIZING_PATTERN}"
+        r"|type to queue a message|Type to steer"
+    )
+
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return the text sitting unsubmitted in the TUI's › prompt, if it is on screen.
+
+        Issue #78 (PR #1004 review, P2-1): the inbox recovery can only send the
+        bare Enter that submits a paste whose Enter was swallowed when the
+        provider can read its own composer; without this method kiro_cli had
+        no recovery at all and the next inbox message was pasted on top of the
+        first ({MSG1}{MSG2}).
+
+        The TUI pins its prompt to the bottom of the viewport below the last
+        "────" separator and a header row (agent · model · ◔ N% · auth). The
+        header text varies with the agent and the auth state, so the reader
+        anchors on the last separator and the first "›" row after it; the
+        composer is that row minus the glyph plus the indented continuation
+        rows a wrapped or multi-line paste occupies (real captures:
+        fixtures/COMPOSER_FIXTURES.md). Earlier "›" rows are transcript echoes
+        above the separator and are never included. Returns "" when the row
+        holds only the TUI's own text (the "ask a question" placeholder, "Kiro
+        is working", "Initializing") and None for frames without the TUI
+        prompt row (legacy "[agent]>" UI, boot screens).
+        """
+        rows = rendered_pane.splitlines()
+        separators = [
+            index for index, row in enumerate(rows) if re.match(TUI_SEPARATOR_PATTERN, row.strip())
+        ]
+        if not separators:
+            return None
+        prompt_index = next(
+            (
+                index
+                for index in range(separators[-1] + 1, len(rows))
+                if self._COMPOSER_PROMPT_RE.match(rows[index])
+            ),
+            None,
+        )
+        if prompt_index is None:
+            return None
+        match = self._COMPOSER_PROMPT_RE.match(rows[prompt_index])
+        first = ((match.group(1) if match else None) or "").strip()
+        if self._COMPOSER_CHROME_RE.search(first):
+            return ""
+        continuation = [row.strip() for row in rows[prompt_index + 1 :] if row.strip()]
+        return "\n".join([first] + continuation).strip()
+
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract agent's final response message using green arrow indicator."""
         # Strip ANSI codes for pattern matching
@@ -808,19 +1555,11 @@ class KiroCliProvider(BaseProvider):
         paragraph inside the response box.  2.25 moved the assistant text to a
         bullet-prefixed line and can render a one-word reply immediately below
         the echoed prompt, so paragraph splitting cannot distinguish the two.
-        When the capture retains ANSI colors, the blue assistant bullet is the
-        exact boundary; green tool rows are never candidates. Uncolored live
-        captures fall back to the final column-zero bullet block.
+        The reply is the last bullet row of the turn that is not a tool or
+        reasoning row (see TUI_225_CHILD_ROW_PATTERN), up to the next bullet
+        row or the Credits line. ``raw_output`` is not used; the parameter is
+        kept for callers.
         """
-        if raw_output is not None:
-            raw_reply = self._extract_tui_225_raw_reply(raw_output)
-            if raw_reply is not None:
-                return raw_reply
-            if re.search(TUI_225_COLORED_BULLET_PATTERN, raw_output):
-                # The capture has colored bullet rows, so a missing blue assistant
-                # bullet means this turn ended in tool chrome, not assistant text.
-                return None
-
         prev_credits_idx = -1
         for i in range(credits_idx - 1, -1, -1):
             if re.search(TUI_CREDITS_PATTERN, lines[i]):
@@ -829,51 +1568,41 @@ class KiroCliProvider(BaseProvider):
 
         reply_start = None
         for i in range(credits_idx - 1, prev_credits_idx, -1):
-            if re.search(TUI_225_REPLY_PATTERN, lines[i]):
+            if re.search(TUI_225_REPLY_PATTERN, lines[i]) and not self._is_tui_225_chrome_row(
+                lines, i, credits_idx
+            ):
                 reply_start = i
-                while reply_start - 1 > prev_credits_idx and re.search(
-                    TUI_225_REPLY_PATTERN, lines[reply_start - 1]
-                ):
-                    reply_start -= 1
                 break
 
         if reply_start is None:
             return None
 
-        response_lines = lines[reply_start:credits_idx]
+        # Rows after the reply are tool or reasoning rows (the reply is the
+        # last bullet that is not one), so the reply ends at the next bullet.
+        reply_end = next(
+            (
+                i
+                for i in range(reply_start + 1, credits_idx)
+                if re.search(TUI_225_REPLY_PATTERN, lines[i])
+            ),
+            credits_idx,
+        )
+        response_lines = lines[reply_start:reply_end]
         response_lines[0] = re.sub(r"^•\s+", "", response_lines[0], count=1)
         final_answer = "\n".join(response_lines).strip()
         final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
 
-    def _extract_tui_225_raw_reply(self, raw_output: str) -> str | None:
-        """Return the last blue assistant bullet block in the final 2.25 turn."""
-        credits: list[tuple[int, int]] = []
-        offset = 0
-        for line in raw_output.splitlines(keepends=True):
-            if re.search(TUI_225_CREDITS_PATTERN, strip_terminal_escapes(line)):
-                credits.append((offset, offset + len(line.rstrip("\r\n"))))
-            offset += len(line)
-        if not credits:
-            return None
-
-        turn_start = credits[-2][1] if len(credits) > 1 else 0
-        turn_end = credits[-1][0]
-        assistant_bullets = [
-            match
-            for match in re.finditer(TUI_225_ASSISTANT_BULLET_PATTERN, raw_output)
-            if turn_start <= match.start() < turn_end
-        ]
-        if not assistant_bullets:
-            return None
-
-        response = raw_output[assistant_bullets[-1].start() : turn_end]
-        response = strip_terminal_escapes(response)
-        response = re.sub(r"^\s*•\s+", "", response, count=1)
-        response = re.sub(ESCAPE_SEQUENCE_PATTERN, "", response)
-        response = re.sub(CONTROL_CHAR_PATTERN, "", response)
-        return response.strip()
+    @staticmethod
+    def _is_tui_225_chrome_row(lines: list[str], index: int, end: int) -> bool:
+        """Return True when the bullet row at ``index`` is a tool or reasoning row."""
+        if re.search(TUI_225_THOUGHT_ROW_PATTERN, lines[index]):
+            return True
+        for line in lines[index + 1 : end]:
+            if line.strip():
+                return bool(re.search(TUI_225_CHILD_ROW_PATTERN, line))
+        return False
 
     def _extract_tui_message(self, clean_output: str, raw_output: str | None = None) -> str:
         """Extract agent response from pure TUI output (no green arrows).
@@ -1050,6 +1779,29 @@ class KiroCliProvider(BaseProvider):
         """Get the command to exit Kiro CLI."""
         return "/exit"
 
-    def cleanup(self) -> None:
-        """Clean up Kiro CLI provider."""
+    def cleanup(self) -> Optional[bool]:
+        """Clean up Kiro CLI provider; a helper also removes its per-launch home.
+
+        The window is already killed. Every process whose ``KIRO_HOME`` is the
+        helper's home is stopped, then the home is removed, Kiro's session files
+        included (#1167 Phase 2). ``False`` keeps the provider and the row for a
+        retry when an owner cannot be proven gone.
+        """
         self._initialized = False
+        from cli_agent_orchestrator.services import ephemeral_service
+
+        if self._launch is not None:
+            return ephemeral_service.remove_kiro_home(self.terminal_id, row_proof=True)
+        # A helper's provider rebuilt from its row after a restart has no launch
+        # object, but its home keeps its deterministic path; removal still needs
+        # proof (the archive, or the ephemeral row). Installed Kiro terminals
+        # have no home, so for them this is one lstat and nothing else.
+        if not valid_terminal_id(self.terminal_id) or not os.path.lexists(
+            kiro_home_path(self.terminal_id)
+        ):
+            return None
+        from cli_agent_orchestrator.clients.database import is_ephemeral_terminal
+
+        return ephemeral_service.remove_kiro_home(
+            self.terminal_id, row_proof=is_ephemeral_terminal(self.terminal_id)
+        )

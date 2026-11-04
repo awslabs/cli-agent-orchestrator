@@ -236,6 +236,52 @@ class TestInstallAgent:
         assert kiro_config["name"] == "developer"
         assert kiro_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
 
+    @pytest.mark.parametrize(
+        ("frontmatter_line", "expected"),
+        [
+            pytest.param("", False, id="unset-means-false-as-before"),
+            pytest.param("useLegacyMcpJson: true\n", True, id="profile-true-reaches-the-spec"),
+            pytest.param("useLegacyMcpJson: false\n", False, id="profile-false-reaches-the-spec"),
+        ],
+    )
+    def test_install_writes_kiro_mcp_json_flag_under_its_current_name(
+        self,
+        install_paths: dict[str, Path],
+        tmp_path: Path,
+        frontmatter_line: str,
+        expected: bool,
+    ) -> None:
+        """The installed spec carries ``includeMcpJson`` only, with the profile's value (#1026).
+
+        Kiro CLI retired ``useLegacyMcpJson`` and rejects a spec that carries both
+        spellings, so the retired one must never be written. The profile keeps the
+        historical spelling; before this test its value never reached the spec at
+        all, so the ``true`` case is the one that would have failed either way.
+        """
+        built_in_dir = tmp_path / "builtin-agent-store"
+        built_in_dir.mkdir()
+        (built_in_dir / "mcp-json-agent.md").write_text(
+            "---\n"
+            "name: mcp-json-agent\n"
+            "description: Test agent\n"
+            "role: developer\n"
+            f"{frontmatter_line}"
+            "---\n"
+            "Body.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            return_value=built_in_dir,
+        ):
+            result = install_agent("mcp-json-agent", "kiro_cli")
+
+        assert result.success is True, result.message
+        kiro_config = json.loads((install_paths["kiro_dir"] / "mcp-json-agent.json").read_text())
+        assert kiro_config["includeMcpJson"] is expected
+        assert "useLegacyMcpJson" not in kiro_config
+
     def test_install_kiro_resolves_bundled_mcp_command_persisted(
         self, install_paths: dict[str, Path]
     ) -> None:
@@ -273,9 +319,10 @@ class TestInstallAgent:
         # persisted=True prefers the stable PATH launcher.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
 
-    def test_install_rejects_kas_profile_before_writing_kiro_config(
+    def test_install_writes_the_universal_file_for_a_kas_profile(
         self, install_paths: dict[str, Path]
     ) -> None:
+        """``engine: kas`` reads as v3, whose install writes one universal file (#1167)."""
         profile_path = install_paths["local_store_dir"] / "kas-agent.md"
         profile_path.write_text(
             "---\n"
@@ -290,9 +337,10 @@ class TestInstallAgent:
 
         result = install_agent("kas-agent", "kiro_cli")
 
-        assert result.success is False
-        assert "Cedar" in result.message
-        assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
+        assert result.success is True, result.message
+        written = json.loads((install_paths["kiro_dir"] / "kas-agent.json").read_text())
+        assert written["allowedTools"] == ["fs_read"]
+        assert {"excludedTools", "permissions"} <= set(written)
 
     def test_install_resolves_env_vars_before_parsing_and_persists_them_after_the_guard(
         self, install_paths: dict[str, Path]

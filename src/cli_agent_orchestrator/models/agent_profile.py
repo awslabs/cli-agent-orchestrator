@@ -40,7 +40,13 @@ class AgentProfile(BaseModel):
     provider: Optional[str] = None  # Provider override (e.g. "claude_code", "kiro_cli")
     system_prompt: Optional[str] = None  # The markdown content
     role: Optional[str] = None  # "supervisor", "developer", "reviewer", "workflow_scout"
-    engine: Optional[KiroEngine] = None  # Kiro v2/KAS selection; omitted resolves to v2.
+    # CAO-native. The most this agent may grant to children it creates through
+    # assign/handoff/workflow steps (its delegation ceiling). None = the role
+    # default: ``*`` for ``supervisor``, the agent's own allowedTools otherwise.
+    # Consumed by CAO's create-terminal policy only; never passed to provider JSON.
+    delegateTools: Optional[List[str]] = None
+    # Kiro v2/v3 selection ("kas" is an alias of v3); omitted resolves to v2.
+    engine: Optional[KiroEngine] = None
 
     # CAO-native. Per-agent skill-catalog scope: when set, only skills whose name
     # matches one of these patterns (exact name or fnmatch glob, e.g. "ads-*") are
@@ -79,7 +85,11 @@ class AgentProfile(BaseModel):
     permissionMode: Optional[PermissionMode] = None
     native_agent: Optional[str] = None  # Claude Code native agent name (thin-wrapper mode)
 
-    # Codex-only. Names a [profiles.<name>] block in ~/.codex/config.toml.
+    # Codex-only. Names a $CODEX_HOME/<name>.config.toml file (by default
+    # ~/.codex/<name>.config.toml), which codex layers on top of the base user
+    # config. NOT a [profiles.<name>] table inside config.toml -- that was the
+    # older layout and codex now refuses to start at all when --profile is
+    # combined with it (#967).
     # Used as --profile <name> when yolo mode is not active; unrestricted
     # allowed tools still force --yolo. min_length=1 prevents an explicit
     # empty string from silently degrading to --yolo, since this is a
@@ -116,6 +126,12 @@ class AgentProfile(BaseModel):
     # Claude analog of codexConfig for the codex provider; the top-level
     # `model` field still maps to `--model`.
     claudeConfig: Optional[Dict[str, Any]] = None
+
+    # Kiro CLI-only. Per-agent Kiro launch knobs: {"effort": "<level>"} ->
+    # `--effort <level>`, requested from the wrapper's help before launch.
+    # Defined exactly as #1074 defines it, so either change lands unchanged;
+    # the top-level `model` field still maps to `--model`.
+    kiroConfig: Optional[Dict[str, Any]] = None
 
     # Grok-only. Explicitly permits Grok's own subagents, workflows, and /goal
     # engine in this CAO terminal. Omission remains ``None`` so existing profile

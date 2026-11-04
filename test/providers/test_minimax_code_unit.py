@@ -469,3 +469,33 @@ def test_the_profile_load_is_wrapped_in_plugin_delivery(tmp_path: Path, monkeypa
     assert calls, "minimax built its command without passing the profile through plugin delivery"
     assert all(key == ProviderType.MINIMAX_CODE.value for _, key in calls), calls
     assert all(key == "mcode" for _, key in calls), "the enum value is 'mcode', not 'minimax_code'"
+
+
+def test_serialize_server_bundled_entry_gains_this_cao_address(monkeypatch):
+    """P3-2: MiniMax is resolver-routed (``_serialize_server`` calls
+    ``resolve_mcp_server_config``) but was only covered through the resolver's
+    own unit tests, not at the provider level."""
+    monkeypatch.setenv("CAO_API_PORT", "9899")
+    monkeypatch.delenv("CAO_API_HOST", raising=False)
+    monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+    serialized = MiniMaxCodeProvider._serialize_server(
+        "cao-mcp-server", {"command": "cao-mcp-server", "args": []}
+    )
+    assert serialized["env"]["CAO_API_PORT"] == "9899"
+
+
+def test_serialize_server_default_cao_is_unchanged(monkeypatch):
+    for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    serialized = MiniMaxCodeProvider._serialize_server(
+        "cao-mcp-server", {"command": "cao-mcp-server", "args": []}
+    )
+    assert not any(key.startswith("CAO_") for key in serialized["env"])
+
+
+def test_serialize_server_list_command_still_raises_provider_error():
+    """P2-1: a list ``command`` (a plausible slip, since OpenCode's own format
+    uses a list) must still reach the existing ``must define a command or
+    URL`` guard, not a bare ``TypeError`` from the resolver's basename check."""
+    with pytest.raises(ProviderError, match="must define a command or URL"):
+        MiniMaxCodeProvider._serialize_server("srv", {"command": ["uvx", "x"]})

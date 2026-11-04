@@ -1,0 +1,50 @@
+                                            ⢀⣴⣶⣶⣦⡀⠀⠀⠀⠀⢀⣴⣶⣦⣄⡀   ⢀⣴⣶⣶⣦⡀   ⢀⣴⣶⣶⣶⣶⣶⣶⣶⣶⣶⣦⣄⡀       ⢀⣠⣴⣶⣶⣶⣶⣶⣦⣄⡀
+                                           ⢰⣿⠋⠁⠈⠙⣿⡆⠀⢀⣾⡿⠁  ⠈⢻⡆ ⢰⣿⠋⠁⠈⠙⣿⡆ ⢰⣿⠋⠁        ⠈⠙⠻⣦     ⣴⡿⠟⠋⠁   ⠈⠙⠻⢿⣦
+                                           ⢸⣿⠀⠀⠀⠀⣿⣇⣴⡿⠋⠀⠀  ⢀⣼⠇ ⢸⣿⠀⠀⠀⠀⣿⡇ ⢸⣿⠀⠀⠀⢠⣤⣤⣤⣤⣄    ⣿⡆   ⣼⡟⠀⠀⠀ ⣀⣀⣀    ⢻⣧
+                                           ⢸⣿⠀⠀⠀⠀⣿⡿⠋⠀⠀  ⢀⣾⡿⠁  ⢸⣿⠀⠀⠀⠀⣿⡇ ⢸⣿⠀⠀⠀⢸⣿⠉⠉⠉⣿⡇   ⣿⡇  ⣼⡟⠀⠀ ⣰⡿⠟⠛⠻⢿⣆⠀⠀ ⢻⣧
+                                           ⢸⣿⠀⠀⠀⠀⠙⠁⠀⠀ ⢀⣼⡟⠁    ⢸⣿⠀⠀⠀⠀⣿⡇ ⢸⣿⠀⠀⠀⢸⣿⣶⣶⡶⠋⠀   ⣿⠇ ⢰⣿⠀⠀⠀⢰⣿⠀⠀⠀  ⣿⡆⠀⠀ ⣿⡆
+                                           ⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀ ⠹⣷⡀     ⢸⣿⠀⠀⠀⠀⣿⡇⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀   ⣠⣼⠟  ⢸⣿⠀⠀ ⢸⣿⠀⠀⠀⠀ ⣿⡇⠀⠀ ⣿⡇
+                                           ⢸⣿⠀⠀⠀⠀⠀⣠⡀⠀⠀ ⠹⣷⡄    ⢸⣿⠀⠀⠀⠀⣿⡇⠀⢸⣿⠀⠀⠀⠀⣤⣄  ⠀⠀⠹⣿⡅   ⠸⣿⠀⠀ ⠸⣿⠀⠀⠀⠀ ⣿⠇⠀  ⣿⠇
+                                           ⢸⣿⠀⠀⠀⠀⣾⡟⣷⡀⠀⠀ ⠘⣿⣆   ⢸⣿⠀⠀⠀⠀⣿⡇ ⢸⣿⠀⠀⠀⠀⣿⡟⣷⡀⠀⠀ ⠘⣿⣆   ⢻⣧⠀⠀ ⠹⣷⣦⣤⣤⣾⠏⠀⠀⠀⣼⡟
+                                           ⢸⣿⠀⠀⠀⠀⣿⡇⠹⣷⡀  ⠀⠈⢻⡇  ⢸⣿⠀⠀⠀⠀⣿⡇ ⢸⣿⠀⠀⠀⠀⣿⡇⠹⣷⡀  ⠀⠈⢻⡇   ⢻⣧⠀⠀⠀ ⠉⠉⠉    ⣼⡟
+                                           ⠸⣿⣄⡀⢀⣠⣿⠇⠀⠙⣷⡀  ⢀⣼⠇  ⠸⣿⣄⡀⢀⣠⣿⠇ ⠸⣿⣄⡀⢀⣠⣿⠇⠀⠙⣷⡀  ⢀⣼⠇    ⠻⣷⣦⣄⡀   ⢀⣠⣴⣾⠟
+                                            ⠈⠻⠿⠿⠟⠁⠀⠀⠀⠈⠻⠿⠿⠟⠁    ⠈⠻⠿⠿⠟⠁   ⠈⠻⠿⠿⠟⠁⠀⠀⠀⠈⠻⠿⠿⠟⠁     ⠀⠀⠈⠙⠻⠿⠿⠿⠿⠟⠋⠁
+
+                                      An early release of Kiro CLI V3 is now available! Try it out: kiro-cli --v3
+                                                             https://kiro.dev/docs/cli/v3/
+
+                            Tip: Press Ctrl+R to reverse-search prompt history; press again for older matches, Esc accepts.
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ✧ What's new: Cloud sessions, specs, expanded hooks, improved trust model, workflows and memory.
+
+ ctrl+o to expand
+• 1 MCP failure — see /mcp
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+kiro_default · auto · ◔ 14% · Midway: 19h 42m                                                                                                        ~
+
+› MSG2: write tests for module B covering the retry policy, the backoff schedule, the jitter bounds, the max-attempts ceiling, the circuit breaker
+  reset, and the metrics emitted on every attempt so the dashboard can show failures per minute
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

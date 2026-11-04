@@ -315,3 +315,59 @@ class TestScanJsonForSecrets:
         from cli_agent_orchestrator.services.secret_gate import scan_json_for_secrets
 
         assert scan_json_for_secrets({"n": 1, "b": True, "x": None, "l": [], "d": {}}) is None
+
+
+class TestAsciiFastPath:
+    """The invisible-character pre-check is skipped for ASCII text (P3, #1034).
+
+    Soundness rests on one fact: no code point in the invisible class is ASCII.
+    The first test pins that fact so a future addition to the class that broke
+    the shortcut would fail here rather than silently let a hidden credential
+    through on an "ASCII" string that is not.
+    """
+
+    def test_every_invisible_code_point_is_above_ascii(self):
+        import re
+
+        from cli_agent_orchestrator.services.secret_gate import _invisible_character_class
+
+        code_points = [
+            int(hex_value, 16)
+            for hex_value in re.findall(r"\\U([0-9a-fA-F]{8})", _invisible_character_class())
+        ]
+        assert code_points, "the class must enumerate its code points"
+        assert min(code_points) == 0x00AD
+        assert all(not chr(cp).isascii() for cp in code_points)
+
+    def test_has_invisible_answers_ascii_without_the_class_search(self, monkeypatch):
+        from cli_agent_orchestrator.services import secret_gate
+
+        calls = []
+        real = secret_gate._INVISIBLE
+
+        class _Spy:
+            def search(self, text):
+                calls.append(text)
+                return real.search(text)
+
+        monkeypatch.setattr(secret_gate, "_INVISIBLE", _Spy())
+        assert secret_gate._has_invisible("password: hunter2sixteen") is False
+        assert calls == []
+        assert secret_gate._has_invisible("AK\u200bIAIOSFODNN7EXAMPLE") is True
+        assert len(calls) == 1
+
+    def test_redaction_is_unchanged_on_ascii_and_still_joins_split_tokens(self):
+        from cli_agent_orchestrator.services.secret_gate import (
+            redact_secrets,
+            redact_secrets_with_acceptances,
+        )
+
+        ascii_body = "creds: AKIAIOSFODNN7EXAMPLE in config"
+        assert redact_secrets(ascii_body) == (
+            "creds: [REDACTED:aws_access_key] in config",
+            ["aws_access_key"],
+        )
+        assert redact_secrets_with_acceptances(ascii_body, ())[0] == redact_secrets(ascii_body)[0]
+        split = "creds: AK\u200bIAIOSFODNN7EXAMPLE in config"
+        assert redact_secrets(split)[0] == "creds: [REDACTED:aws_access_key] in config"
+        assert redact_secrets_with_acceptances(split, ())[0] == redact_secrets(split)[0]

@@ -1,8 +1,5 @@
 """Tests for agent_scaffold service."""
 
-import json
-from pathlib import Path
-
 import pytest
 
 from cli_agent_orchestrator.services.agent_scaffold import (

@@ -5,6 +5,10 @@ the supplied content against a fixed, ordered list of named regexes and
 returns the NAME of the first matching pattern (or ``None`` if clean).
 ``redact_secrets`` replaces every match of every pattern with a
 ``[REDACTED:<name>]`` marker for the export ``--redact`` path (#345, D5).
+``redact_secrets_with_acceptances`` is the same cascade with a per-finding
+allowlist: a match whose ``(pattern name, sha256 of the matched span)`` pair
+is accepted passes raw, every other match is redacted (#644 AC10, the vault
+``secret_gate: "warn"`` chokepoint in ``services/vault/reader.py``).
 
 ``scan_for_secrets`` is used ONLY to reject credentials on
 ``scope="federated"`` writes — the machine-wide shared tier. This is a
@@ -12,9 +16,11 @@ heuristic deny-list, not entropy scoring; it errs toward catching common
 credential shapes.
 """
 
+import hashlib
 import re
 import unicodedata
-from typing import Any, Dict, List, Optional, Pattern, Tuple
+from dataclasses import dataclass
+from typing import Any, Collection, Dict, List, Optional, Pattern, Tuple
 
 # Ordered (name, compiled_regex) pairs. First match wins, so ordering is
 # stable and reproducible across calls. No entropy scoring. Vendor-specific
@@ -162,7 +168,21 @@ def _invisible_character_class() -> str:
 _INVISIBLE = re.compile(f"[{_invisible_character_class()}]")
 
 
+def _has_invisible(content: str) -> bool:
+    """Whether ``content`` holds any character of the invisible class.
+
+    The class search is a character class with one entry per code point and
+    costs about 1.5 ms per 7.5 KB, which every vault load used to pay. Every
+    code point in the class is above U+007F (the lowest is the soft hyphen,
+    U+00AD; a test pins this), so ASCII text is answered by ``str.isascii``,
+    a flag check, and the search runs only on text that could contain one.
+    """
+    return not content.isascii() and _INVISIBLE.search(content) is not None
+
+
 def _strip_invisible(content: str) -> str:
+    if content.isascii():
+        return content
     return _INVISIBLE.sub("", content)
 
 
@@ -319,7 +339,7 @@ def redact_secrets(content: str) -> Tuple[str, List[str]]:
     """
     if not content:
         return content, []
-    if _INVISIBLE.search(content):
+    if _has_invisible(content):
         # An invisible character may be hiding a credential from the patterns;
         # remove the ones inside any such credential so the loop below sees,
         # and redacts, the whole token. Invisible characters elsewhere stay.
@@ -330,6 +350,258 @@ def redact_secrets(content: str) -> Tuple[str, List[str]]:
         if count:
             fired.append(name)
     return content, fired
+
+
+def pattern_names() -> Tuple[str, ...]:
+    """The ordered names of every credential pattern the gate knows.
+
+    This is the public view of the pattern table: the vault acceptance
+    validator refuses an acceptance naming a pattern that is not here, and the
+    parametrised redaction tests iterate it so a pattern added to the table is
+    covered without anyone remembering to add a test case.
+    """
+    return tuple(name for name, _pattern in _SECRET_PATTERNS)
+
+
+def span_sha256(span: str) -> str:
+    """Fingerprint of one matched span: lowercase hex SHA-256 of its UTF-8 bytes.
+
+    This is the value an operator writes into a vault note's
+    ``cao.secret_ok[].sha256`` to accept one specific finding. It is bound to
+    the exact bytes the pattern matched, so editing the credential, or a new
+    credential of the same shape appearing in the note, invalidates it.
+
+    Line endings inside the span are normalised to LF first. ``bearer_token``
+    and ``secret_assignment`` allow a line break between the key and the
+    value, the vault scan hashes the LF-normalised note while the reader hashes
+    the file as written, and a CRLF note would otherwise print a fingerprint
+    the reader could never match.
+    """
+    return hashlib.sha256(normalize_line_endings(span).encode("utf-8")).hexdigest()
+
+
+def normalize_line_endings(text: str) -> str:
+    """CRLF and lone CR to LF, leaving every other code point alone.
+
+    This is the one definition of the gate's line-ending rule. ``span_sha256``
+    applies it to a matched span and the vault's ``secret_scan_text`` applies it
+    to the body it hands the cascade, so the bytes a fingerprint is taken from
+    and the bytes a later caller checks against it agree. Unicode line
+    separators (U+2028/9) and the vertical tab, form feed and NEL are NOT line
+    endings here: the patterns match across them, so rewriting them would
+    change what the gate sees.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+@dataclass(frozen=True)
+class SecretMatch:
+    """One pattern match met during a redaction cascade, content-free.
+
+    ``sha256`` is the fingerprint :func:`span_sha256` gives the span as the
+    cascade saw it, which is what ``cao memory vault scan --fingerprints``
+    prints. ``accepted`` is True when the caller's allowlist named this exact
+    ``(pattern, sha256)`` pair. ``passed`` is True when the span actually
+    reached the output as the operator fingerprinted it: the pair is accepted
+    and so is every enclosing match. ``enclosed_by`` names the nearest match
+    that contains this one (``None`` at top level); ``blocked_by`` names the
+    match that kept an accepted span out of the output, so a report can tell
+    the operator which second fingerprint to accept.
+    """
+
+    pattern: str
+    sha256: str
+    accepted: bool
+    passed: bool = False
+    enclosed_by: Optional[str] = None
+    blocked_by: Optional[str] = None
+
+
+class _Span:
+    """One match of the cascade, with the tagged text it replaced.
+
+    ``tags`` runs parallel to ``text``: an ``int`` is an offset into the
+    content the cascade started from, a ``_Span`` is the child whose marker
+    character sits there. Because every earlier match is already a marker when
+    a later pattern runs, the children found here are exactly the direct
+    children, so the spans of one cascade form a tree.
+    """
+
+    __slots__ = ("pattern", "sha256", "text", "tags", "marker", "parent", "accepted", "passed")
+
+    def __init__(self, pattern: str, text: str, tags: List[Any]) -> None:
+        self.pattern = pattern
+        self.sha256 = span_sha256(text)
+        self.text = text
+        self.tags = tags
+        self.marker = f"[REDACTED:{pattern}]"
+        self.parent: Optional["_Span"] = None
+        self.accepted = False
+        self.passed = False
+        for tag in tags:
+            if isinstance(tag, _Span) and tag.parent is None:
+                tag.parent = self
+
+
+class SecretFingerprints:
+    """The matches of one redaction cascade, computed once with no allowlist.
+
+    The cascade runs the patterns in order over progressively redacted text,
+    so a later pattern can match a span that contains an earlier match's
+    marker: ``GITHUB_TOKEN=ghp_...`` is ``github_pat`` on the value and then
+    ``bearer_token`` on ``TOKEN=[REDACTED:github_pat]``. The fingerprints are
+    taken from this one acceptance-free run, so the values an operator is
+    shown are the values the chokepoint checks whatever they go on to accept.
+    :meth:`render` then applies an allowlist to the recorded tree without
+    re-matching anything. A span is served as fingerprinted only when its own
+    pair and the pair of every match enclosing it are accepted; accepting the
+    inner ``github_pat`` alone leaves the outer ``bearer_token`` redacted, and
+    the report says so.
+    """
+
+    __slots__ = ("_content", "_text", "_tags", "_spans")
+
+    def __init__(self, content: str) -> None:
+        self._content = content
+        text = content
+        tags: List[Any] = list(range(len(content)))
+        spans: List[_Span] = []
+        for name, pattern in _SECRET_PATTERNS:
+            parts: List[str] = []
+            new_tags: List[Any] = []
+            last = 0
+            for match in pattern.finditer(text):
+                start, end = match.span()
+                if end <= start:
+                    continue
+                parts.append(text[last:start])
+                new_tags.extend(tags[last:start])
+                span = _Span(name, match.group(0), tags[start:end])
+                spans.append(span)
+                parts.append(span.marker)
+                new_tags.extend([span] * len(span.marker))
+                last = end
+            if last:
+                parts.append(text[last:])
+                new_tags.extend(tags[last:])
+                text = "".join(parts)
+                tags = new_tags
+        self._text = text
+        self._tags = tags
+        self._spans = spans
+
+    def __bool__(self) -> bool:
+        return bool(self._spans)
+
+    @property
+    def fingerprints(self) -> Tuple[Tuple[str, str], ...]:
+        """``(pattern, sha256)`` of every match, in cascade order."""
+        return tuple((span.pattern, span.sha256) for span in self._spans)
+
+    def render(self, accepted: Collection[Tuple[str, str]]) -> Tuple[str, Tuple[SecretMatch, ...]]:
+        """Apply an allowlist to the recorded cascade.
+
+        Returns the text and one :class:`SecretMatch` per match in cascade
+        order. With an empty allowlist the text is exactly what
+        :func:`redact_secrets` produces.
+        """
+        allow = {(str(name), str(digest)) for name, digest in accepted}
+        for span in self._spans:
+            span.accepted = (span.pattern, span.sha256) in allow
+            span.passed = False
+        if not allow:
+            text = self._text
+        else:
+            text = self._render(self._text, self._tags)
+        return text, tuple(self._match(span) for span in self._spans)
+
+    def _render(self, text: str, tags: List[Any]) -> str:
+        out: List[str] = []
+        i = 0
+        n = len(tags)
+        while i < n:
+            tag = tags[i]
+            if not isinstance(tag, _Span):
+                out.append(text[i])
+                i += 1
+                continue
+            j = i
+            while j < n and tags[j] is tag:
+                j += 1
+            run = text[i:j]
+            if len(run) != len(tag.marker) or not tag.accepted:
+                # Not accepted: the marker stands and every match inside it
+                # is absorbed. A partial marker run (a later pattern matched
+                # into the middle of a marker) is kept as the literal marker
+                # text; that span can never pass, since the operator was
+                # shown a fingerprint of marker text, not of its bytes.
+                out.append(run)
+            else:
+                tag.passed = True
+                out.append(self._render(tag.text, tag.tags))
+            i = j
+        return "".join(out)
+
+    @staticmethod
+    def _match(span: _Span) -> SecretMatch:
+        blocked_by: Optional[str] = None
+        if span.accepted and not span.passed:
+            ancestor = span.parent
+            while ancestor is not None and ancestor.accepted:
+                ancestor = ancestor.parent
+            blocked_by = (ancestor or span.parent or span).pattern
+        return SecretMatch(
+            span.pattern,
+            span.sha256,
+            span.accepted,
+            span.passed,
+            span.parent.pattern if span.parent is not None else None,
+            blocked_by,
+        )
+
+
+def fingerprint_secrets(content: str) -> SecretFingerprints:
+    """Run the redaction cascade once and keep its matches for :meth:`render`.
+
+    Invisible characters inside a credential are removed first, exactly as
+    :func:`redact_secrets` does, so the fingerprints are of the joined token.
+    The vault reader uses this two-step form so that a note's acceptances are
+    parsed only when the body has a match to apply them to.
+    """
+    if content and _has_invisible(content):
+        content = _strip_invisible_inside_matches(content)
+    return SecretFingerprints(content)
+
+
+def redact_secrets_with_acceptances(
+    content: str, accepted: Collection[Tuple[str, str]]
+) -> Tuple[str, Tuple[SecretMatch, ...]]:
+    """:func:`redact_secrets` with a per-finding allowlist.
+
+    ``accepted`` holds ``(pattern_name, sha256)`` pairs as printed by
+    ``cao memory vault scan --fingerprints``, which are the pairs of
+    :attr:`SecretFingerprints.fingerprints`. A match whose pair is present,
+    and whose enclosing matches are all accepted too, is kept as
+    fingerprinted and reported ``passed=True``; every other match is replaced
+    by ``[REDACTED:<name>]`` exactly as :func:`redact_secrets` does. With an
+    empty allowlist the text is identical to ``redact_secrets(content)[0]``;
+    a test asserts this over the pattern table and over nested shapes.
+
+    The allowlist is deliberately pair-shaped. A pattern-only or boolean
+    acceptance would silently pass every future credential of that shape in
+    the note, so neither exists here: a caller that wants to accept a finding
+    must know the bytes it is accepting.
+
+    Fingerprints are independent of the allowlist: they come from one
+    acceptance-free cascade (:func:`fingerprint_secrets`), and the allowlist is
+    applied to that recorded result rather than by re-running patterns over
+    partly unredacted text. That is what keeps the shown and the checked
+    fingerprints equal for a credential that two patterns match, such as
+    ``NAME_TOKEN=value``.
+    """
+    if not content:
+        return content, ()
+    return fingerprint_secrets(content).render(accepted)
 
 
 def redact_json_leaves(node: Any) -> Any:

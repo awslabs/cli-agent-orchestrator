@@ -36,7 +36,7 @@ export function EventStreamView({
   initialEvents,
   backplaneBaseUrl = "http://127.0.0.1:9889",
   eventSourceFactory,
-}: EventStreamViewProps): JSX.Element {
+}: EventStreamViewProps): React.JSX.Element {
   const [events, setEvents] = useState<CaoEvent[]>(initialEvents ?? []);
   const seen = useRef<Set<string>>(
     new Set((initialEvents ?? []).map((e) => e.id)),

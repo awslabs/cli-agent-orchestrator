@@ -45,19 +45,41 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
-PLAN_SCHEME_PREFIX = "plan-v1:"
+PLAN_SCHEME_PREFIX = "plan-v2:"
 """The scheme marker carried by every value ``compute`` emits.
+
+``plan-v2:`` SINCE ISSUE #827, which added a tenth component (``profile_set``). The bump is the
+versioning in this docstring doing its stated job — "the version is kept so a later change to the field
+set has a way to announce itself" — and it means every FRESH computation of a ``plan_id`` after the
+upgrade produces a ``plan-v2:`` value that no stored ``plan-v1`` approval row can match, because no
+``plan-v1`` digest can be produced again. A ``plan-v1`` approval attested to a plan whose agent profile
+set was never examined, so a fresh run matching it would be asserting a review that did not happen —
+hence a fresh run always re-checks. This module does NOT by itself reach a run that was already frozen
+and approved before the upgrade and left resumable: ``approval_gate.ensure_plan_approved`` queries the
+stored ``plan_id`` verbatim and resume reuses a run's frozen ``plan_id`` rather than recomputing it, so
+such a resume still proceeds on its original ``plan-v1`` approval today. Operators re-approve once per
+plan on its next fresh run; see ``docs/workflows.md``.
 
 NAMED RATHER THAN INLINED because ``compute`` writes it and ``scheme_of`` reads it: two literals is the
 drift that would let one side stop recognising the other's output.
 
-``plan-v1:`` RATHER THAN ``v1:``, deliberately. A stored ``plan_id`` and a stored ``call_fingerprint``
-are both "short prefix + 64 lowercase hex", and ``step_fingerprint``'s stated reason for putting
-provenance IN the value was that a row read by any future consumer is self-describing without a schema
-lookup — which only pays off if the two namespaces cannot be confused. ``v1:`` is the single worst
-available choice: it is exactly what a LEGACY step fingerprint would have been called had the narrow
-three-field scheme carried a prefix, making it the one string most likely to be misread. The version is
-kept so a later change to the field set has a way to announce itself.
+``plan-v<n>:`` RATHER THAN ``v<n>:``, deliberately. A stored ``plan_id`` and a stored
+``call_fingerprint`` are both "short prefix + 64 lowercase hex", and ``step_fingerprint``'s stated
+reason for putting provenance IN the value was that a row read by any future consumer is
+self-describing without a schema lookup — which only pays off if the two namespaces cannot be confused.
+``v2:`` is the single worst available choice here: it is exactly what ``step_fingerprint``'s CURRENT
+scheme is called, making it the one string most likely to be misread.
+"""
+
+LEGACY_PLAN_SCHEME_PREFIX = "plan-v1:"
+"""The pre-#827 nine-field scheme, recognised by :func:`scheme_of` and emitted by nothing.
+
+KEPT RATHER THAN DELETED so a stored ``plan-v1`` value classifies as a KNOWN SUPERSEDED SCHEME instead
+of falling into ``unknown``. The remedy differs and that is the whole reason this function has three
+answers rather than two: ``plan-v1`` means "re-approve, the rules changed under you", which an operator
+can act on unaided, while ``unknown`` means "nobody can say what computed this", which needs a human
+ruling. Collapsing the first into the second would make a routine, expected migration look like
+corruption on every pre-#827 row.
 """
 
 _NOT_SUPPLIED = "\x01not-supplied"
@@ -95,7 +117,7 @@ _NUMBER_PRECISION = 6
 
 @dataclass(frozen=True)
 class PlanFields:
-    """FR-8's nine execution-affecting run-level fields.
+    """FR-8's nine execution-affecting run-level fields, plus ``profile_set`` (issue #827).
 
     THE FIELD ORDER IS PART OF THE HASH CONTRACT (BR-2A3-1). It is FR-8's own stated order, adopted
     rather than invented because it is the order the requirement is written in and therefore the order a
@@ -118,6 +140,24 @@ class PlanFields:
     permissions: Any
     limits: Any
     retry_policy: Any
+    profile_set: Optional[str] = None
+    """Digest of the FULL installed agent profile set (issue #827). APPENDED, never interleaved.
+
+    The nine fields above stay in FR-8's own order so a reader can still check them against the
+    requirement in the order it is written; a tenth field inserted among them would have silently
+    changed every value while leaving the prefix intact, which is the one failure mode this scheme's
+    versioning has no answer for.
+
+    WHY THE SET IS IN PLAN IDENTITY AT ALL. ``profile`` above is a profile NAME. A step's actual
+    behaviour and tool policy come from the profile's CONTENT, resolved from a file outside the script
+    at launch time. Nothing else in these ten components covers that file, so before #827 an approved
+    plan would run unchanged after an agent profile was rewritten.
+
+    DEFAULTED TO ``None`` only so the dataclass stays constructible by positional callers written
+    against the nine-field shape; a ``None`` here hashes as :data:`_NOT_SUPPLIED`, which is a DIFFERENT
+    identity from any real digest, so forgetting to pass it cannot silently reproduce a value computed
+    with it. ``manifest_freeze`` always passes it, and fails the freeze closed if it cannot be computed.
+    """
 
 
 def _text(value: Optional[str]) -> str:
@@ -189,9 +229,9 @@ def _frame(component: str) -> bytes:
 
 
 def compute(fields: PlanFields) -> str:
-    """Hash the nine components into ``"plan-v1:<64 lowercase hex>"``.
+    """Hash the ten components into ``"plan-v2:<64 lowercase hex>"``.
 
-    NINE COMPONENTS IN A FIXED ORDER, AND THE TUPLE IS NEVER SHORTENED (BR-2A3-1/BR-2A3-2). A ``None``
+    TEN COMPONENTS IN A FIXED ORDER, AND THE TUPLE IS NEVER SHORTENED (BR-2A3-1/BR-2A3-2). A ``None``
     scalar becomes :data:`_NOT_SUPPLIED` rather than being dropped, so two plans differing only in WHICH
     field is absent cannot collide.
 
@@ -213,15 +253,16 @@ def compute(fields: PlanFields) -> str:
         _structure(fields.permissions),
         _structure(fields.limits),
         _structure(fields.retry_policy),
+        _text(fields.profile_set),
     )
     framed = b"".join(_frame(component) for component in components)
     return PLAN_SCHEME_PREFIX + hashlib.sha256(framed).hexdigest()
 
 
-def scheme_of(stored: Optional[str]) -> Literal["plan-v1", "unknown", "absent"]:
+def scheme_of(stored: Optional[str]) -> Literal["plan-v2", "plan-v1", "unknown", "absent"]:
     """Report what a stored value says about its own provenance. TOTAL — never raises.
 
-    THREE ANSWERS, NOT TWO, and the middle one is why the prefix exists. Equality alone conflates "the
+    FOUR ANSWERS SINCE #827, and the middle two are why the prefix exists. Equality alone conflates "the
     plan changed" with "this value was computed under different rules and cannot be verified":
     comparing a ``plan-v1:`` value against an unknown-scheme value ALWAYS fails, so a bare comparison
     would report a changed plan for something nobody can assess. Those two situations need different
@@ -229,15 +270,25 @@ def scheme_of(stored: Optional[str]) -> Literal["plan-v1", "unknown", "absent"]:
     conflating them pushes an operator toward approving something no one understood. ADR-583-5 records
     the same distinction for legacy step fingerprints: unverifiable, not divergent.
 
-    ``unknown`` is UNREACHABLE IN BOLT 2 — there are no legacy ``plan_id`` rows. It is defined anyway so
-    that a future field-set change is not left discovering that its only available operation is an
-    equality test guaranteed to fail.
+    ``plan-v1`` IS NOW REACHABLE — #827's field-set change is exactly the event Bolt 2 defined this
+    answer for ahead of time ("defined anyway so that a future field-set change is not left discovering
+    that its only available operation is an equality test guaranteed to fail"). Any run row frozen
+    before #827 carries one. ``unknown`` stays reserved for a value matching neither prefix.
 
-    This function reports provenance and decides nothing. What an ``unknown`` value MEANS for a run is
-    ``approval-gate``'s call.
+    This function reports provenance and decides nothing. What a ``plan-v1`` or ``unknown`` value MEANS
+    for a run is ``approval-gate``'s call, and it needs no new branch for a FRESH ``plan_id`` lookup —
+    ``compute`` never emits ``plan-v1:``, so a freshly computed identifier simply has no ``plan-v1`` row
+    to match and the existing ABSENT path refuses it with the right remedy already in the message
+    ("Approve this plan identifier and run again"). That is NOT the whole story for RESUME: resume
+    extracts and re-checks a run's already-frozen ``plan_id`` verbatim rather than recomputing it, so a
+    run frozen and approved under ``plan-v1`` before the upgrade and left resumable still has a matching
+    approval row and resumes on it. ``scheme_of`` lets a caller DETECT that case; today nothing in
+    ``approval-gate`` acts on the detection to refuse it (see ``docs/workflows.md``'s migration note).
     """
     if not stored:
         return "absent"
     if stored.startswith(PLAN_SCHEME_PREFIX):
+        return "plan-v2"
+    if stored.startswith(LEGACY_PLAN_SCHEME_PREFIX):
         return "plan-v1"
     return "unknown"

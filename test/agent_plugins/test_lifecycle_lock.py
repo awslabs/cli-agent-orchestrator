@@ -112,7 +112,6 @@ class TestTheLifecycleLockIsSeparateFromTheStoreLock:
         """A wedged holder must not hang the caller indefinitely."""
         acquired = threading.Event()
         release = threading.Event()
-        result = {}
 
         def holder():
             with store.lifecycle_lock(timeout=5.0):

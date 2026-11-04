@@ -10,7 +10,7 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
-pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+pytestmark = pytest.mark.usefixtures("isolated_memory_db", "kiro_agent_store_not_under_test")
 
 
 class TestCreateTerminalCleanup:
@@ -80,7 +80,7 @@ class TestCreateTerminalCleanup:
         mock_pm.cleanup_provider.assert_called_once_with("tid1")
         mock_tmux.kill_session.assert_called_once()
         assert lifecycle == ["kill", "cleanup"]
-        mock_db_delete.assert_called_once_with("tid1")
+        mock_db_delete.assert_called_once_with("tid1", end_reason="launch_failed")
 
     @pytest.mark.asyncio
     @patch(
@@ -150,7 +150,7 @@ class TestCreateTerminalCleanup:
             )
 
         mock_pm.cleanup_provider.assert_called_once()
-        mock_db_delete.assert_called_once_with("tid1")
+        mock_db_delete.assert_called_once_with("tid1", end_reason="launch_failed")
         mock_tmux.kill_session.assert_not_called()
         mock_tmux.kill_window.assert_called_once_with("cao-existing", "w1")
 
@@ -327,7 +327,7 @@ class TestCreateTerminalCleanup:
             )
 
         # DB rollback runs even though cleanup_provider raised first.
-        mock_db_delete.assert_called_once_with("tid1")
+        mock_db_delete.assert_called_once_with("tid1", end_reason="launch_failed")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
@@ -367,10 +367,11 @@ class TestCreateTerminalCleanup:
         mock_provider = MagicMock()
         # initialize is awaited on the success path; AsyncMock returns cleanly
         mock_provider.initialize = AsyncMock(return_value=True)
+        mock_provider.identity_verified = True  # a healthy Kiro launch (#1074)
         mock_pm.create_provider.return_value = mock_provider
         mock_log_dir.__truediv__ = MagicMock(return_value=MagicMock())
 
-        result = await create_terminal(
+        _result = await create_terminal(
             provider="kiro_cli",
             agent_profile="dev",
             session_name="myses",
@@ -508,7 +509,7 @@ class TestDeleteTerminal:
 
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
 
-        result = delete_terminal("tid1")
+        result = delete_terminal("tid1", end_reason="deleted")
 
         assert result is True
         mock_tmux.stop_pipe_pane.assert_called_once_with("ses", "win")
@@ -528,7 +529,7 @@ class TestDeleteTerminal:
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
         mock_tmux.stop_pipe_pane.side_effect = Exception("pipe error")
 
-        result = delete_terminal("tid1")
+        result = delete_terminal("tid1", end_reason="deleted")
 
         assert result is True
         mock_tmux.kill_window.assert_called_once()
@@ -546,7 +547,7 @@ class TestDeleteTerminal:
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
         mock_tmux.kill_window.side_effect = Exception("kill error")
 
-        result = delete_terminal("tid1")
+        result = delete_terminal("tid1", end_reason="deleted")
 
         assert result is True
         mock_pm.cleanup_provider.assert_called_once()
@@ -563,4 +564,52 @@ class TestDeleteTerminal:
         mock_db_del.side_effect = Exception("DB error")
 
         with pytest.raises(Exception, match="DB error"):
-            delete_terminal("tid1")
+            delete_terminal("tid1", end_reason="deleted")
+
+
+class TestGetOutputContext:
+    """Issue #638 review (fanhongy P3): the raw capture fed to the provider-error
+    classifier. Its ``None`` return is the "do not classify" contract, so every
+    branch must be pinned: a capture failure must never turn a real answer into a
+    step failure."""
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_no_metadata_returns_none(self, mock_meta):
+        from cli_agent_orchestrator.services.terminal_service import get_output_context
+
+        mock_meta.return_value = None
+
+        assert get_output_context("tid1") is None
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_rolling_buffer_is_returned(self, mock_meta, mock_monitor):
+        from cli_agent_orchestrator.services.terminal_service import get_output_context
+
+        mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
+        mock_monitor.get_buffer.return_value = "⏺ API Error: 400 nope\n❯"
+
+        assert get_output_context("tid1") == "⏺ API Error: 400 nope\n❯"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_empty_buffer_falls_back_to_backend_history(
+        self, mock_meta, mock_monitor, mock_backend
+    ):
+        from cli_agent_orchestrator.services.terminal_service import get_output_context
+
+        mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
+        mock_monitor.get_buffer.return_value = ""
+        mock_backend.return_value.get_history.return_value = "raw scrollback"
+
+        assert get_output_context("tid1") == "raw scrollback"
+        mock_backend.return_value.get_history.assert_called_once_with("ses", "win")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_exception_is_swallowed_and_returns_none(self, mock_meta):
+        from cli_agent_orchestrator.services.terminal_service import get_output_context
+
+        mock_meta.side_effect = RuntimeError("db down")
+
+        assert get_output_context("tid1") is None

@@ -32,7 +32,11 @@ def _collect(path: Path, *args: str) -> str:
     return result.stdout
 
 
-def test_contributor_and_ci_suites_keep_their_intentional_difference(tmp_path: Path) -> None:
+def test_contributor_and_ci_suites_select_the_same_tests(tmp_path: Path) -> None:
+    """The default marker filter in pyproject.toml matches the `-m "not e2e"` CI passes
+    explicitly, so a contributor's plain `pytest` runs the same set CI runs (#1005). Before
+    this alignment, integration-marked tests ran only in CI, where no author was looking.
+    Only e2e stays excluded on both; e2e needs the live providers under test/e2e/."""
     regression = tmp_path / "test_selection.py"
     regression.write_text(
         "import pytest\n\n"
@@ -52,7 +56,7 @@ def test_contributor_and_ci_suites_keep_their_intentional_difference(tmp_path: P
     integration = _collect(regression, "-m", "integration")
 
     assert "test_unit" in contributor
-    assert "test_integration" not in contributor
+    assert "test_integration" in contributor
     assert "test_e2e_outside_e2e_directory" not in contributor
     assert "test_unit" in ci
     assert "test_integration" in ci

@@ -1,6 +1,7 @@
 ---
 name: cao-supervisor-protocols
-description: Supervisor-side orchestration patterns for assign, handoff, and idle inbox delivery in CAO
+description: Coordinate, delegate, and split work across CAO worker agents as a supervisor — choose between assign (async fire-and-forget) vs handoff (sync wait-for-result), fan out tasks to parallel specialists, manage idle-based inbox delivery, or debug why worker callbacks aren't arriving. Covers dispatch patterns, result collection, and multi-agent orchestration planning. Not for worker-side task execution, creating skills, managing plugins, or session lifecycle (cao launch/shutdown).
+compatibility: Requires cao-server running at localhost:9889 and cao-mcp-server configured on the agent.
 ---
 
 # CAO Supervisor Protocols
@@ -19,6 +20,27 @@ From `cao-mcp-server`, supervisors orchestrate work with:
 - `answer_user_prompt(terminal_id, answer)` for answering a Hermes worker that reports `waiting_user_answer`
 
 Your own terminal ID is available in the `CAO_TERMINAL_ID` environment variable. CAO appends it to assigned task messages and records it on worker terminals automatically, so you rarely need to handle it yourself.
+
+## Do It Directly or Delegate
+
+Delegating has a fixed cost: routing the message, starting a worker, and the worker's own verification. Choose by the shape of the task:
+
+- Do a small, fully specified change yourself when you can run its checks. Example: a one-line dependency floor plus a relock.
+- Delegate when parallel work saves wall-clock time, when the task needs a specialist profile, or when an independent review is worth the wait.
+
+Your agent profile's rules take priority over this heuristic: `code_supervisor`, for instance, always delegates coding and never writes code itself.
+
+Measured on [#1119](https://github.com/awslabs/cli-agent-orchestrator/pull/1119): the same dependency-floor change took 1m 18s done directly and about 2m 57s routed through a conductor to a developer seat. Both produced byte-identical lockfiles. The delegated result had the better code comment, which is the value an independent pass adds.
+
+## Gotchas
+
+| Mistake | Fix |
+|---------|-----|
+| Keeping the terminal busy after `assign` — polling in a loop, or running `sleep`/`echo` to wait. | Inbox messages are delivered when your terminal goes **idle**. Dispatch everything first, then end the turn. |
+| Answering a Hermes worker that reports `waiting_user_answer` with `assign`, `handoff` or `send_message`. | Use `answer_user_prompt(terminal_id, answer)` with the exact selection to submit, such as `1` or `o`. |
+| Doing a small coding task yourself because the do-or-delegate heuristic allows it, on a profile that forbids it. | Your agent profile's rules win. `code_supervisor`, for instance, always delegates coding. |
+| Treating a `send_message` callback as proof the work landed, when the worker wrote files. | Ask workers for the deliverable up front, and for **absolute paths** in the callback message. |
+| Assuming you must hand-write callback instructions into every assigned message. | CAO appends your terminal ID and records you as the worker's caller automatically. An explicit callback ID is optional emphasis; it is required only when `CAO_ENABLE_SENDER_ID_INJECTION=false`. |
 
 ## Choosing Between Assign and Handoff
 

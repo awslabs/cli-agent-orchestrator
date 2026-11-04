@@ -8,7 +8,10 @@ given a set of allowed CAO tools.
 
 import fnmatch
 import logging
-from typing import Dict, Iterable, List, Set
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3EngineSchema
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +292,81 @@ def granted_mcp_servers(
     return sorted(granted)
 
 
+def split_mcp_reference(entry: str) -> Optional[Tuple[str, Optional[str]]]:
+    """``@server`` -> ``("server", None)``; ``@server/tool`` -> ``("server", "tool")``.
+
+    ``None`` for anything that is not an MCP server reference: a bare tool name,
+    an empty ``@``, or a vocabulary selector such as ``@builtin`` (which names a
+    provider's own built-in set and grants nothing by itself). Both halves may be
+    globs, read with the same case-sensitive ``fnmatchcase`` rule
+    :func:`granted_mcp_servers` applies to server names.
+    """
+    if not isinstance(entry, str) or not entry.startswith("@"):
+        return None
+    body = entry[1:]
+    if not body:
+        return None
+    server, sep, tool = body.partition("/")
+    if not server or server in _MCP_REF_VOCABULARY:
+        return None
+    return server, (tool if sep else None)
+
+
+def mcp_reference_covers(grant: str, requested: str) -> bool:
+    """Whether MCP reference ``grant`` authorizes MCP reference ``requested``.
+
+    The ONE rule for comparing two references, shared by the provider resolvers
+    (through :func:`granted_mcp_servers`, which matches concrete names the same
+    way) and by the delegation-ceiling comparator (``utils/delegation.py``), so
+    what ``@plugin-*`` grants at launch is exactly what it covers when a parent
+    delegates it. A grant covers a request when the request's server matches the
+    grant's server pattern (exact or ``fnmatchcase``) and either the grant names
+    the whole server (no ``/tool`` part) or its tool pattern matches the request's
+    tool. A whole-server request is never covered by a per-tool grant. Patterns
+    on the requested side match only a grant pattern that matches them
+    literally-as-a-name (so ``@*`` covers ``@plugin-*``; ``@plugin-*`` does not
+    cover ``@*``). ``@builtin`` is not a reference on either side.
+    """
+    granted = split_mcp_reference(grant)
+    wanted = split_mcp_reference(requested)
+    if granted is None or wanted is None:
+        return False
+    g_server, g_tool = granted
+    w_server, w_tool = wanted
+    if not _part_covers(g_server, w_server):
+        return False
+    if g_tool is None:
+        return True
+    if w_tool is None:
+        return False
+    return _part_covers(g_tool, w_tool)
+
+
+_GLOB_META = frozenset("*?[")
+
+
+def _part_covers(grant_part: str, requested_part: str) -> bool:
+    """One reference component (server or tool) of a grant covering a request.
+
+    A CONCRETE requested name is covered when it equals the grant or matches the
+    grant pattern (``fnmatchcase``). A PATTERN-SHAPED request (any of ``*``,
+    ``?``, ``[``) is a language, not a name, and ``fnmatchcase`` would match it
+    as literal text: ``@plugin-?`` would cover ``@plugin-*`` because the
+    one-character ``*`` fits ``?``, and the child would then store a ceiling
+    wider than its parent's. Pattern inclusion is only decided in the two cases
+    that are certain: the grant is the bare ``*`` (every language is a subset)
+    or the grant is byte-identical text. Anything else is refused; the operator
+    can widen the grant explicitly.
+    """
+    if requested_part == grant_part:
+        return True
+    if grant_part == "*":
+        return True
+    if _GLOB_META & set(requested_part):
+        return False
+    return fnmatch.fnmatchcase(requested_part, grant_part)
+
+
 #: Kiro built-ins that ``@builtin`` grants on the ``tools`` axis: the ones that
 #: can neither run commands, write files nor reach the network. On Kiro a bare
 #: ``@builtin`` in ``tools`` means EVERY built-in, shell included, so it must
@@ -319,6 +397,217 @@ def kiro_agent_tools(allowed: List[str]) -> List[str]:
         else:
             tools.update(mapping.get(cao_tool, ()))
     return sorted(tools)
+
+
+# ---------------------------------------------------------------------------
+# Kiro v3 (#1167 Phase 1). Everything below is provisional.
+#
+# A v3-enabled install writes ONE "universal" agent file that both engines
+# load: v2's fields plus ``excludedTools`` and ``permissions``. v3 selects tools
+# by id and by tag, and its ``read`` tag also brings ``code``, a tool tagged read
+# AND write that the policy layer classes as ``fs_read``, so a ``deny fs_write``
+# may not stop it. So:
+#
+# * ``tools`` holds today's v2 names minus ``read``, plus the v3 ids each
+#   granted atom maps to, and never a v3 tag or meta selector beyond the
+#   ``write``/``shell``/``subagent`` names v2 already uses for their atoms;
+# * ``excludedTools`` removes everything those entries could select on a pinned
+#   engine, read worst case, beyond the grant's exact ids (``code`` unless
+#   ``fs_write``; always ``knowledge``);
+# * the rules allow the grant and deny, unconditionally, every capability
+#   outside it; MCP's complement is the one rule with ``exclude``.
+# ---------------------------------------------------------------------------
+
+#: The v3 tool ids each CAO atom grants: "the exact set". ``subagent/*`` stands
+#: for the per-agent dispatch tools the ``subagent`` tag selects.
+KIRO_V3_EXACT_TOOLS: Dict[str, frozenset[str]] = {
+    "fs_read": frozenset({"read_file", "list_directory"}),
+    "fs_list": frozenset({"file_search", "grep_search"}),
+    "fs_write": frozenset({"fs_write", "fs_append", "str_replace", "delete_file", "code"}),
+    "execute_bash": frozenset({"execute_bash", "invoke_sub_agent", "subagent/*"}),
+    "web_fetch": frozenset({"web_fetch", "remote_web_search"}),
+    "@builtin": frozenset({"introspect"}),
+}
+#: Excluded whatever the grant: ``knowledge`` reads and indexes files (CLI-only,
+#: experimental) and no CAO atom maps to it on v3.
+KIRO_V3_ALWAYS_EXCLUDED = frozenset({"knowledge"})
+#: Never in a universal ``tools`` list: v3 tags wider than any CAO atom, and the
+#: meta selectors.
+KIRO_V3_FORBIDDEN_SELECTORS = frozenset(
+    {
+        "*",
+        "read",
+        "web",
+        "spec",
+        "context",
+        "@builtin",
+        "@mcp",
+        "@powers",
+        "@subagent",
+        "@subagent-explicit",
+        "@mcp-disclosure",
+    }
+)
+_READ_CAPABILITIES = ("context", "diagnostics", "fs_read", "skill")
+#: Capability groups that follow one CAO atom (or, for reads, any read atom).
+_KIRO_V3_CAPABILITIES_BY_ATOM: Dict[str, Tuple[str, ...]] = {
+    "fs_write": ("fs_write",),
+    "execute_bash": ("shell", "subagent"),
+    "web_fetch": ("web_fetch", "web_search"),
+}
+#: Denied whatever the grant: CAO turns on no powers and no workflows.
+_KIRO_V3_ALWAYS_DENIED = ("power", "workflow")
+
+
+def _kiro_v3_atoms(allowed: Iterable[str]) -> Set[str]:
+    """The CAO atoms an allowlist grants, ``fs_*`` expanded; MCP refs excluded."""
+    atoms: Set[str] = set()
+    for entry in allowed:
+        if entry == "fs_*":
+            atoms.update(("fs_read", "fs_list", "fs_write"))
+        elif entry in KIRO_V3_EXACT_TOOLS:
+            atoms.add(entry)
+    return atoms
+
+
+def kiro_v3_exact_tools(allowed: List[str]) -> frozenset[str]:
+    """The v3 built-in tool ids a grant maps to: its "exact set"."""
+    exact: Set[str] = set()
+    for atom in _kiro_v3_atoms(allowed):
+        exact.update(KIRO_V3_EXACT_TOOLS[atom])
+    return frozenset(exact)
+
+
+def kiro_universal_tools(allowed: List[str]) -> List[str]:
+    """The universal file's ``tools``: v2 names minus ``read``, plus the grant's v3 ids.
+
+    ``["*"]`` is refused for v3, not rendered. Sorted, so two installs of
+    the same profile write the same bytes.
+    """
+    if "*" in allowed:
+        raise ValueError("an unrestricted ('*') policy cannot be rendered for Kiro v3")
+    tools = set(kiro_agent_tools(allowed)) - {"read"}
+    tools.update(tool for tool in kiro_v3_exact_tools(allowed) if "/" not in tool)
+    return sorted(tools)
+
+
+def kiro_v3_excluded_tools(
+    allowed: List[str], schemas: Iterable["KiroV3EngineSchema"]
+) -> List[str]:
+    """Everything the universal ``tools`` could select on any pinned engine, beyond the grant."""
+    exact = kiro_v3_exact_tools(allowed)
+    reachable: Set[str] = set()
+    for schema in schemas:
+        for entry in kiro_universal_tools(allowed):
+            reachable.update(schema.select(entry))
+    return sorted((reachable - exact) | KIRO_V3_ALWAYS_EXCLUDED)
+
+
+def kiro_v3_effective_tools(
+    tools: Iterable[str], excluded: Iterable[str], schema: "KiroV3EngineSchema"
+) -> frozenset[str]:
+    """The built-in ids v3 would expose: select(``tools``) − ``excludedTools`` + always-added.
+
+    The engine's own order (``BM`` in the bundle): select, then remove each
+    excluded entry, then add the always-added set. An ``excludedTools`` entry is
+    read as removing only the id it names (the narrowest reading).
+    """
+    selected: Set[str] = set()
+    for entry in tools:
+        selected.update(schema.select(entry))
+    return frozenset((selected - set(excluded)) | schema.always_added)
+
+
+def kiro_v3_mcp_patterns(allowed: List[str], server_names: Iterable[str]) -> List[str]:
+    """The ``mcp`` rule patterns a grant allows: ``server/*`` or ``server/tool``.
+
+    A glob in the server part is expanded over the concrete ``server_names``
+    (as ``granted_mcp_servers`` does), never written into the rule, so the rule
+    cannot pre-authorize a server that later answers to the pattern.
+    """
+    names = [name for name in server_names if isinstance(name, str)]
+    patterns: Set[str] = set()
+    for entry in allowed:
+        reference = split_mcp_reference(entry)
+        if reference is None:
+            continue
+        server, tool = reference
+        if any(char in _GLOB_META for char in server):
+            servers = granted_mcp_servers([f"@{server}"], names)
+        else:
+            servers = [server]
+        for name in servers:
+            patterns.add(f"{name}/{tool if tool is not None else '*'}")
+    return sorted(patterns)
+
+
+def kiro_v3_granted_mcp_servers(
+    allowed_tools: Iterable[str] | None, server_names: Iterable[str] | None
+) -> List[str]:
+    """The concrete MCP servers a v3 universal file configures for a grant.
+
+    :func:`granted_mcp_servers`, plus every server a per-tool ref
+    (``@server/tool``) names. The v3 file sets ``includeMcpJson: false``, so a
+    server it leaves out has no tools at all, and a grant of
+    ``@cao-mcp-server/send_message`` would lose ``send_message`` on v3 while v2
+    keeps it. The file's rules still allow only the named tools
+    (:func:`kiro_v3_mcp_patterns`) and deny every other one. A ref with an empty
+    tool part names no tool and configures nothing.
+
+    v3 only: OpenCode and Grok keep :func:`granted_mcp_servers`, which grants a
+    server only by a whole-server ref.
+    """
+    names = [name for name in (server_names or ()) if isinstance(name, str)]
+    allowed = [entry for entry in (allowed_tools or ()) if isinstance(entry, str)]
+    granted = set(granted_mcp_servers(allowed, names))
+    for entry in allowed:
+        reference = split_mcp_reference(entry)
+        if reference is None or not reference[1]:
+            continue
+        granted.update(granted_mcp_servers([f"@{reference[0]}"], names))
+    return sorted(granted)
+
+
+def kiro_v3_rules(allowed: List[str], server_names: Iterable[str]) -> List[Dict[str, Any]]:
+    """The universal file's ``permissions.rules`` for a grant.
+
+    Only ``allow`` and ``deny``; no meta capability, no ``sandbox_network``.
+    Allows first, then denies, each sorted by capability and then pattern.
+    """
+    if "*" in allowed:
+        raise ValueError("an unrestricted ('*') policy cannot be rendered for Kiro v3")
+    atoms = _kiro_v3_atoms(allowed)
+    allowed_caps: Set[str] = set()
+    denied_caps: Set[str] = set(_KIRO_V3_ALWAYS_DENIED)
+    if atoms & {"fs_read", "fs_list"}:
+        allowed_caps.update(_READ_CAPABILITIES)
+    else:
+        denied_caps.update(_READ_CAPABILITIES)
+    for atom, capabilities in _KIRO_V3_CAPABILITIES_BY_ATOM.items():
+        (allowed_caps if atom in atoms else denied_caps).update(capabilities)
+
+    allows: List[Tuple[str, str, Dict[str, Any]]] = [
+        (capability, "", {"capability": capability, "effect": "allow"})
+        for capability in allowed_caps
+    ]
+    denies: List[Tuple[str, str, Dict[str, Any]]] = [
+        (capability, "", {"capability": capability, "effect": "deny"}) for capability in denied_caps
+    ]
+    patterns = kiro_v3_mcp_patterns(allowed, server_names)
+    for pattern in patterns:
+        allows.append(
+            ("mcp", pattern, {"capability": "mcp", "match": [pattern], "effect": "allow"})
+        )
+    if patterns:
+        # An unconditional mcp deny would beat the allows (deny overrides), so
+        # the one conditional rule denies everything except the grant.
+        complement = {"capability": "mcp", "match": ["*"], "exclude": patterns, "effect": "deny"}
+        denies.append(("mcp", "*", complement))
+    else:
+        denies.append(("mcp", "", {"capability": "mcp", "effect": "deny"}))
+    return [rule for _, _, rule in sorted(allows, key=lambda r: r[:2])] + [
+        rule for _, _, rule in sorted(denies, key=lambda r: r[:2])
+    ]
 
 
 def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:

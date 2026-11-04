@@ -207,7 +207,7 @@ class OmpProvider(BaseProvider):
                 config = copy.deepcopy(raw_config)
             else:
                 config = raw_config.model_dump(exclude_none=True)
-            config = resolve_mcp_server_config(config, persisted=False)
+            config = resolve_mcp_server_config(config, persisted=False, name=name)
             if "command" in config:
                 env = dict(config.get("env") or {})
                 if "CAO_TERMINAL_ID" not in env:

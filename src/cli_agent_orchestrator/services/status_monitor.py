@@ -8,6 +8,8 @@ import asyncio
 import logging
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
@@ -29,6 +31,81 @@ if TYPE_CHECKING:
     from cli_agent_orchestrator.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
+
+
+# The one thread that writes tmux status transitions (issue #1082). Detection
+# runs on the event loop (the quiescence handlers) as well as on worker
+# threads, and a SQLite commit can wait up to the driver's 5 s lock timeout,
+# so the write never runs on the loop. One thread fed in transition order also
+# keeps each terminal's rows in that order: compute_busy_seconds reads them
+# by id. Created on first use.
+_status_event_writer: Optional[ThreadPoolExecutor] = None
+_status_event_writer_lock = threading.Lock()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _status_event_executor() -> ThreadPoolExecutor:
+    global _status_event_writer
+    with _status_event_writer_lock:
+        if _status_event_writer is None:
+            _status_event_writer = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="cao-launch-status"
+            )
+        return _status_event_writer
+
+
+def _write_status_transition(terminal_id: str, status: str, observed_at: datetime) -> None:
+    try:
+        from cli_agent_orchestrator.clients import database
+
+        database.record_launch_status_event(terminal_id, status, observed_at)
+    except Exception:
+        logger.debug("Launch status event recording failed for %s", terminal_id, exc_info=True)
+
+
+def _queue_status_transition(terminal_id: str, status: "TerminalStatus") -> Optional[Future]:
+    """Hand one tmux status transition to the writer thread (issue #1082).
+
+    Call it in the critical section that decided the change: ``observed_at``
+    is then the transition time, and the queue order is the transition order.
+    herdr terminals never reach this: their transitions come from herdr's own
+    ``agent_status`` events (``HerdrInboxService``), not from polling
+    ``get_status()``. Side-effect only: never raises, so a recording failure
+    can never affect the status any caller observes.
+    """
+    try:
+        return _status_event_executor().submit(
+            _write_status_transition, terminal_id, status.value, _utcnow()
+        )
+    except Exception:
+        logger.debug("Launch status event recording failed for %s", terminal_id, exc_info=True)
+        return None
+
+
+def _wait_for_status_write_off_loop(write: Optional[Future]) -> None:
+    """Let a worker-thread caller return only once its row is written, as when
+    it wrote inline. On the event loop, never wait.
+
+    The wait is deliberate: it keeps parity with the old inline write, so a
+    caller that reads the row back right after the transition finds it. It
+    runs outside the monitor lock, and only on a real transition, but under
+    SQLite lock contention it can add up to the driver's 5 s timeout to that
+    worker thread's call.
+    """
+    if write is None:
+        return
+    try:
+        asyncio.get_running_loop()
+        return
+    except RuntimeError:
+        pass
+    try:
+        write.result()
+    except Exception:
+        logger.debug("Launch status event recording failed", exc_info=True)
 
 
 # Statuses that represent a stable "ready" state — the agent has finished
@@ -119,6 +196,8 @@ class StatusMonitor:
         # notify_input_sent() into the next turn, so the status value alone is
         # not enough to authorize stale-pane self-heal for that new turn.
         self._processing_generation: Dict[str, int] = {}
+        # Waiting evidence cannot authorize recovery in a later input generation.
+        self._waiting_generation: Dict[str, int] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
         # is honored and stickiness reset. Set by notify_input_sent() whenever
         # external input is sent to the terminal (paste-bombed by send_input
@@ -129,12 +208,21 @@ class StatusMonitor:
         # Per-terminal monotonic timestamp of the last mid-burst PROCESSING probe
         # (PYTE_MIDBURST_PROBE_S rate limit); absent until the first probe.
         self._midburst_probe_at: Dict[str, float] = {}
+        # Per-terminal capture generation at the last notify_input_sent, i.e. where
+        # the current turn begins. Every chunk of the turn advances the capture
+        # generation past it, so "PROCESSING was observed in THIS turn" is
+        # ``_processing_generation > _dispatch_generation``; a stamp at or below
+        # it predates the turn's own output (#814). Absent means never dispatched
+        # (fresh terminal, or state lost on restart) and any stamp counts.
+        self._dispatch_generation: Dict[str, int] = {}
         # Per-terminal monotonic timestamp of the last stale-PROCESSING capture-pane
         # attempt — the STALE_PROCESSING_CAPTURE_INTERVAL_S rate limit. Absence is None,
         # deliberately NOT 0.0: time.monotonic()'s reference point is arbitrary, so a 0.0
         # sentinel is indistinguishable from a genuine reading and could rate-limit the
         # very first check before it ever runs.
         self._last_stale_capture_check: Dict[str, Optional[float]] = {}
+        # Inbox reconciliation alone polls too slowly to confirm within the TTL.
+        self._stale_capture_handle: Dict[str, asyncio.TimerHandle] = {}
         # Per-terminal monotonic timestamp of the last time _process_chunk actually
         # appended a chunk (i.e. the buffer changed) — the STALE_PROCESSING_BUFFER_QUIET_S
         # quiet gate reads this. Same None-vs-0.0 sentinel rule as above.
@@ -211,6 +299,10 @@ class StatusMonitor:
         # keeps status flap-free.
         self._screens: Dict[str, Tuple["pyte.Screen", "pyte.Stream"]] = {}
         self._bursting: Dict[str, bool] = {}
+        # The last screen re-check of a poller, per terminal: (output generation,
+        # verdict). A poll on the same output reuses the verdict instead of
+        # rendering the screen again under the lock (see _redetect).
+        self._recheck_cache: Dict[str, Tuple[int, TerminalStatus]] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
         # The event loop that owns the quiescence timers. Captured when the
@@ -302,20 +394,23 @@ class StatusMonitor:
             # before this chunk no longer describes it and must not be confirmable
             # by a later read.
             self._buffer_changed_at[terminal_id] = time.monotonic()
-            self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            capture_generation = self._capture_generation.get(terminal_id, 0) + 1
+            self._capture_generation[terminal_id] = capture_generation
             self._output_generation[terminal_id] = self._output_generation.get(terminal_id, 0) + 1
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
+            capture_handle = self._stale_capture_handle.pop(terminal_id, None)
             if use_screen:
                 self._feed_screen_locked(terminal_id, chunk)
 
+        self._cancel_quiesce_handle(capture_handle)
         if not use_screen:
             # Debounced raw detection: same rising-edge + quiescence pattern as
             # the pyte path.  Detects immediately on the first chunk after quiet
             # (catches PROCESSING transition), then waits for output to settle
             # before re-detecting (catches IDLE/COMPLETED without running costly
             # regex on every single chunk during bursts).
-            self._schedule_raw_detection(terminal_id, buffer)
+            self._schedule_raw_detection(terminal_id, buffer, capture_generation)
             return
 
         self._schedule_screen_detection(terminal_id, provider)
@@ -326,9 +421,17 @@ class StatusMonitor:
         detected: TerminalStatus,
         *,
         processing_evidence: bool = True,
-    ) -> None:
+        output_generation: Optional[int] = None,
+        capture_generation: Optional[int] = None,
+        expected_status: Optional[TerminalStatus] = None,
+        check_status: bool = False,
+    ) -> bool:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
+
+        ``output_generation`` is the output generation that the verdict was
+        read from. When newer output has landed since, the verdict is stale and
+        is not applied; the return value is False. Otherwise it is True.
 
         Stickiness: once a ready status is latched, refuse downgrades unless
         notify_input_sent() armed a revert. Two kinds of downgrade are blocked:
@@ -340,6 +443,18 @@ class StatusMonitor:
         paste into a busy agent).
         """
         with self._lock:
+            if (
+                output_generation is not None
+                and self._output_generation.get(terminal_id, 0) != output_generation
+            ):
+                return False
+            if (
+                capture_generation is not None
+                and self._capture_generation.get(terminal_id, 0) != capture_generation
+            ):
+                return False
+            if check_status and self._last_status.get(terminal_id) != expected_status:
+                return False
             # Refresh even if PROCESSING is already cached: after a new input
             # generation, seeing real PROCESSING again is what makes a later
             # quiet-buffer capture eligible for recovery.
@@ -347,7 +462,10 @@ class StatusMonitor:
                 self._processing_generation[terminal_id] = self._capture_generation.get(
                     terminal_id, 0
                 )
+            if detected == TerminalStatus.WAITING_USER_ANSWER:
+                self._waiting_generation[terminal_id] = self._capture_generation.get(terminal_id, 0)
             changed = self._apply_detection_locked(terminal_id, detected)
+            status_write = _queue_status_transition(terminal_id, detected) if changed else None
             if (
                 not changed
                 and detected == TerminalStatus.PROCESSING
@@ -366,6 +484,10 @@ class StatusMonitor:
             # re-enter StatusMonitor while the latch state is mid-update.
             bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
+            # Off the loop, wait for the row on purpose (see the helper);
+            # queued above, so the write order is already fixed.
+            _wait_for_status_write_off_loop(status_write)
+        return True
 
     def _apply_detection_locked(self, terminal_id: str, detected: TerminalStatus) -> bool:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
@@ -374,8 +496,9 @@ class StatusMonitor:
         ONE critical section (the stale-PROCESSING capture path revalidating its
         generation) can do so without a check-then-apply gap for
         notify_input_sent to slip through. Returns True when the status changed;
-        the caller must then publish the change on the bus AFTER releasing the
-        lock (see _apply_detection for why).
+        the caller must then queue the change with _queue_status_transition
+        while it still holds the lock, and publish it on the bus AFTER
+        releasing the lock (see _apply_detection for why).
         """
         last = self._last_status.get(terminal_id)
 
@@ -618,13 +741,25 @@ class StatusMonitor:
         restricted to providers that opt in with
         ``supports_midburst_processing_probe`` and promise a side-effect-free
         predicate; everyone else keeps edge-only detection.
+
+        The "already PROCESSING, nothing to add" skip is keyed on PROCESSING
+        being OBSERVED in this turn (``_processing_observed_this_turn_locked``),
+        not on the status field reading PROCESSING. ``assume_processing_on_dispatch``
+        publishes PROCESSING from the paste onward with ``processing_evidence=False``
+        — an optimistic latch, not an observation — so keying on the field alone
+        silently disabled the probe for exactly the turn it covers (#814). The
+        turn, not the chunk, is the unit: a key of "stamped at the current capture
+        generation" is true only inside the chunk that stamped it and never on the
+        next, so it silently removed the skip instead and the probe ran every
+        PYTE_MIDBURST_PROBE_S for the whole busy turn.
         """
         if provider is None or not getattr(provider, "supports_midburst_processing_probe", False):
             return
 
         now = time.monotonic()
         with self._lock:
-            if self._last_status.get(terminal_id) == TerminalStatus.PROCESSING:
+            generation = self._capture_generation.get(terminal_id, 0)
+            if self._processing_observed_this_turn_locked(terminal_id):
                 return
             last_probe = self._midburst_probe_at.get(terminal_id)
             if last_probe is not None and now - last_probe < PYTE_MIDBURST_PROBE_S:
@@ -643,7 +778,29 @@ class StatusMonitor:
             logger.exception("Error probing mid-burst status for %s", terminal_id)
             return
         if busy:
-            self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+            self._apply_detection(
+                terminal_id, TerminalStatus.PROCESSING, capture_generation=generation
+            )
+
+    def _processing_observed_this_turn_locked(self, terminal_id: str) -> bool:
+        """True when the cached PROCESSING was earned by THIS turn's output.
+
+        Caller MUST hold ``self._lock``. The latch field carries two meanings —
+        observed, and asserted optimistically by ``notify_input_sent`` — and only
+        the ``_processing_generation`` stamp tells them apart (#814). A stamp is
+        this turn's when it is newer than the generation recorded at dispatch:
+        every chunk of the turn advances the capture generation past that mark,
+        while a stamp at or below it came from a frame rendered before any of
+        this turn's output. Every reader that wants to stop looking because the
+        terminal is "already busy" goes through here; the field alone is not
+        evidence.
+        """
+        if self._last_status.get(terminal_id) != TerminalStatus.PROCESSING:
+            return False
+        observed_at = self._processing_generation.get(terminal_id)
+        if observed_at is None:
+            return False
+        return observed_at > self._dispatch_generation.get(terminal_id, 0)
 
     def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
         """Quiescence timer fired: output stopped, so the screen has settled.
@@ -665,7 +822,9 @@ class StatusMonitor:
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
-    def _schedule_raw_detection(self, terminal_id: str, buffer: str) -> None:
+    def _schedule_raw_detection(
+        self, terminal_id: str, buffer: str, capture_generation: int
+    ) -> None:
         """Edge-debounce detection on the raw rolling buffer.
 
         Detects on every chunk while the terminal is in a ready/armed state
@@ -686,7 +845,11 @@ class StatusMonitor:
         if loop is None:
             # No loop ever captured (unit tests / offline replay): detect
             # inline and skip the debounce timer.
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            self._apply_detection(
+                terminal_id,
+                self._detect_status(terminal_id, buffer),
+                capture_generation=capture_generation,
+            )
             return
 
         with self._lock:
@@ -694,14 +857,26 @@ class StatusMonitor:
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
             last_status = self._last_status.get(terminal_id)
+            # The dispatch latch reads PROCESSING before any evidence (#814): a
+            # field-keyed debounce would stop looking at exactly the chunks that
+            # carry the turn's real PROCESSING marker.
+            latched_unobserved = (
+                last_status == TerminalStatus.PROCESSING
+                and not self._processing_observed_this_turn_locked(terminal_id)
+            )
         self._cancel_quiesce_handle(handle)
 
         # While terminal is ready/armed, detect on every chunk so the
         # IDLE→PROCESSING transition is never missed (prevents stale-IDLE
         # delivery by InboxService). Once PROCESSING is observed, debounce.
-        if not was_bursting or last_status in _STICKY_READY_STATUSES or last_status is None:
+        if (
+            not was_bursting
+            or last_status in _STICKY_READY_STATUSES
+            or last_status is None
+            or latched_unobserved
+        ):
             detected = self._detect_status(terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, capture_generation=capture_generation)
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
 
@@ -751,14 +926,25 @@ class StatusMonitor:
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
             buffer = self._buffers.get(terminal_id, "")
+            capture_generation = self._capture_generation.get(terminal_id, 0)
+            status = self._last_status.get(terminal_id)
+
+        def apply(detected: TerminalStatus) -> None:
+            self._apply_detection(
+                terminal_id,
+                detected,
+                capture_generation=capture_generation,
+                expected_status=status,
+                check_status=True,
+            )
 
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            apply(detected)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            apply(self._detect_status(terminal_id, buffer))
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
@@ -879,6 +1065,13 @@ class StatusMonitor:
         if get_backend().supports_event_inbox():
             return StatusObservation(status, None)
         with self._lock:
+            if terminal_id not in self._last_status:
+                # No detection has ever been applied/stamped for this terminal --
+                # there is no turn stamp to pair, so trust whatever get_status()
+                # just computed (e.g. a persisted or natively-derived verdict)
+                # instead of defaulting to UNKNOWN for a status that is actually
+                # known.
+                return StatusObservation(status, self._status_generation.get(terminal_id, 0))
             applied = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             return StatusObservation(applied, self._status_generation.get(terminal_id, 0))
 
@@ -902,6 +1095,13 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            capture_handle = self._stale_capture_handle.pop(terminal_id, None)
+            # The previous turn's mid-burst probe throttle must not carry over: it
+            # would otherwise swallow the new turn's first probe opportunity (#814).
+            self._midburst_probe_at.pop(terminal_id, None)
+            # Where this turn begins; a PROCESSING stamp has to get past it to count
+            # as this turn's observation (see _processing_observed_this_turn_locked).
+            self._dispatch_generation[terminal_id] = self._capture_generation[terminal_id]
             # ``_idle_from_completed`` is deliberately NOT cleared here. The marker
             # says the current IDLE is a previous COMPLETED with its box scrolled
             # off, and arming does not change what is on screen. Clearing it on
@@ -912,6 +1112,7 @@ class StatusMonitor:
             # confirmed a task that never ran. Any stamped transition still
             # clears it, and a post-init IDLE never carries it, so a fresh
             # worker's first IDLE -> COMPLETED is still earned.
+        self._cancel_quiesce_handle(capture_handle)
         if assume_processing:
             # Optimistic dispatch latch only; this is not provider evidence and
             # must not authorize stale-pane recovery for the new generation.
@@ -945,6 +1146,41 @@ class StatusMonitor:
             if provider is not None:
                 provider.notify_status_buffer_reset(epoch)
 
+    def _redetect(self, terminal_id: str, buffer: str) -> Tuple[TerminalStatus, Optional[int]]:
+        """Detect status again for a poller, from the input that the provider reads.
+
+        A provider that sets ``status_recheck_uses_screen`` reads the
+        composited screen here too, not the raw buffer (see that flag). The
+        render holds the lock that the output consumer needs, so a poll on
+        output that has not changed reuses the last verdict.
+
+        Returns the verdict and, for the screen, the output generation that it
+        was read from, so that the caller applies it only while that output is
+        current. A chunk that lands during the read makes the sample stale:
+        UNKNOWN, which keeps the cached status. (The raw re-check keeps its
+        older behavior: a TUI that keeps sending escape sequences while idle,
+        such as kiro-cli, never stops advancing the generation.)
+        """
+        provider = provider_manager.get_provider(terminal_id)
+        if not (
+            CAO_PYTE_STATUS
+            and provider is not None
+            and getattr(provider, "supports_screen_detection", False)
+            and getattr(provider, "status_recheck_uses_screen", False) is True
+        ):
+            return self._detect_status(terminal_id, buffer), None
+        with self._lock:
+            generation = self._output_generation.get(terminal_id, 0)
+            cached = self._recheck_cache.get(terminal_id)
+        if cached is not None and cached[0] == generation:
+            return cached[1], generation
+        verdict = self._detect_screen(terminal_id, provider)
+        with self._lock:
+            if self._output_generation.get(terminal_id, 0) != generation:
+                return TerminalStatus.UNKNOWN, generation
+            self._recheck_cache[terminal_id] = (generation, verdict)
+        return verdict, generation
+
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""
         provider = provider_manager.get_provider(terminal_id)
@@ -964,10 +1200,13 @@ class StatusMonitor:
             self._buffer_epochs.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._processing_generation.pop(terminal_id, None)
+            self._waiting_generation.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
+            self._dispatch_generation.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._recheck_cache.pop(terminal_id, None)
             self._last_stale_capture_check.pop(terminal_id, None)
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
@@ -977,7 +1216,9 @@ class StatusMonitor:
             self._status_generation.pop(terminal_id, None)
             self._idle_from_completed.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
+            capture_handle = self._stale_capture_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
+        self._cancel_quiesce_handle(capture_handle)
 
     def reset_buffer(self, terminal_id: str) -> None:
         """Clear the rolling buffer + last-known status WITHOUT forgetting the
@@ -992,12 +1233,15 @@ class StatusMonitor:
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
             self._processing_generation.pop(terminal_id, None)
+            self._waiting_generation.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
+            self._dispatch_generation.pop(terminal_id, None)
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._recheck_cache.pop(terminal_id, None)
             self._last_stale_capture_check.pop(terminal_id, None)
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
@@ -1007,7 +1251,9 @@ class StatusMonitor:
             self._status_generation.pop(terminal_id, None)
             self._idle_from_completed.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
+            capture_handle = self._stale_capture_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
+        self._cancel_quiesce_handle(capture_handle)
 
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Get current terminal status — the single source of truth for both backends.
@@ -1042,6 +1288,7 @@ class StatusMonitor:
                     return TerminalStatus.UNKNOWN
 
         revoked_ready = False
+        revoke_write: Optional[Future] = None
         with self._lock:
             cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             if cached in (
@@ -1054,6 +1301,7 @@ class StatusMonitor:
                     self._processing_generation[terminal_id] = self._capture_generation.get(
                         terminal_id, 0
                     )
+                    revoke_write = _queue_status_transition(terminal_id, TerminalStatus.PROCESSING)
             # When cached status is PROCESSING, the debounced detection may be
             # stuck: TUI providers (kiro-cli) can send escape sequences
             # continuously after becoming idle, preventing the 200ms quiescence
@@ -1069,18 +1317,23 @@ class StatusMonitor:
             bus.publish(
                 f"terminal.{terminal_id}.status", {"status": TerminalStatus.PROCESSING.value}
             )
+            _wait_for_status_write_off_loop(revoke_write)
 
         if cached == TerminalStatus.PROCESSING and buffer:
-            fresh = self._detect_status(terminal_id, buffer)
+            fresh, generation = self._redetect(terminal_id, buffer)
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
                 f"fresh={fresh.value}, buffer_len={len(buffer)}"
             )
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
-                self._apply_detection(terminal_id, fresh)
-                return fresh
+                if self._apply_detection(terminal_id, fresh, output_generation=generation):
+                    return fresh
+                # Newer output landed after the read: the verdict is stale.
+                with self._lock:
+                    return self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
 
-        if cached == TerminalStatus.PROCESSING:
+        if cached in (TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER):
+            # Waiting recovery requires a provider opt-in and a confirmed pane capture.
             # The cheap re-check above re-derives from the SAME rolling buffer the FIFO
             # pipeline feeds — once the process stops emitting output, that buffer stops
             # changing too, so the re-check can return PROCESSING/UNKNOWN forever while
@@ -1102,8 +1355,8 @@ class StatusMonitor:
                 fresh_capture = self._fresh_capture_pane_status(terminal_id, generation)
                 if fresh_capture is not None:
                     logger.debug(
-                        f"get_status [{terminal_id}]: cached=PROCESSING stale-buffer re-check "
-                        f"still PROCESSING/UNKNOWN, fresh capture-pane={fresh_capture.value}"
+                        f"get_status [{terminal_id}]: cached={cached.value} stale-buffer re-check, "
+                        f"fresh capture-pane={fresh_capture.value}"
                     )
                     if (
                         fresh_capture != TerminalStatus.PROCESSING
@@ -1120,15 +1373,13 @@ class StatusMonitor:
                         # section — a check-then-apply gap would let notify_input_sent
                         # slip between them, and the stale verdict would consume the arm
                         # it just set, latch-blocking the new turn's genuine PROCESSING.
+                        status_write: Optional[Future] = None
                         with self._lock:
                             current_last_status = self._last_status.get(terminal_id)
                             generation_current = (
                                 self._capture_generation.get(terminal_id, 0) == generation
                             )
-                            apply_ok = (
-                                generation_current
-                                and current_last_status == TerminalStatus.PROCESSING
-                            )
+                            apply_ok = generation_current and current_last_status == cached
                             if apply_ok:
                                 commit_payload = self._confirmed_stale_capture_commit.pop(
                                     terminal_id, None
@@ -1156,6 +1407,10 @@ class StatusMonitor:
                                     changed = self._apply_detection_locked(
                                         terminal_id, fresh_capture
                                     )
+                                    if changed:
+                                        status_write = _queue_status_transition(
+                                            terminal_id, fresh_capture
+                                        )
                             else:
                                 self._confirmed_stale_capture_commit.pop(terminal_id, None)
                         if apply_ok:
@@ -1168,6 +1423,7 @@ class StatusMonitor:
                                     f"Terminal {terminal_id} status changed: "
                                     f"{fresh_capture.value}"
                                 )
+                                _wait_for_status_write_off_loop(status_write)
                             return fresh_capture
                         logger.debug(
                             f"get_status [{terminal_id}]: fresh capture-pane result "
@@ -1184,7 +1440,9 @@ class StatusMonitor:
     def _fresh_capture_pane_status(
         self, terminal_id: str, generation: int
     ) -> Optional[TerminalStatus]:
-        """Re-detect a stuck-PROCESSING terminal from a fresh pane capture (#558).
+        """Re-detect a stuck terminal from a confirmed fresh pane capture (#558).
+
+        Waiting recovery also requires an opt-in and current-generation evidence.
 
         ``generation`` is the turn/output generation the caller pinned BEFORE
         deciding to capture. The pane read below runs unlocked, so
@@ -1240,9 +1498,8 @@ class StatusMonitor:
 
         Returns ``None`` when skipped (rate-limited, no provider, unroutable detector,
         unconfirmed candidate, or any read/detection failure) — the caller treats that
-        identically to "still PROCESSING", never as a signal to change status. Only ever
-        called when cached status is already PROCESSING, so every failure path degrades
-        to today's behavior, never past it.
+        identically to retaining the cached status. It is called for PROCESSING
+        or explicitly opted-in waiting recovery; every failure path stays blocked.
         """
         now = time.monotonic()
         with self._lock:
@@ -1281,10 +1538,22 @@ class StatusMonitor:
         # Without this, a new turn whose paste was dropped can inherit turn 1's
         # PROCESSING latch and then "heal" from turn 1's still-rendered
         # completion pane.
-        if stale_capture:
-            with self._lock:
-                if self._processing_generation.get(terminal_id) != generation:
+        with self._lock:
+            recovering_waiting = (
+                self._last_status.get(terminal_id) == TerminalStatus.WAITING_USER_ANSWER
+            )
+            if recovering_waiting:
+                if (
+                    not stale_capture
+                    or getattr(provider, "supports_stale_waiting_capture", False) is not True
+                    or (
+                        self._waiting_generation.get(terminal_id) != generation
+                        and self._processing_generation.get(terminal_id) != generation
+                    )
+                ):
                     return None
+            elif stale_capture and self._processing_generation.get(terminal_id) != generation:
+                return None
 
         try:
             from cli_agent_orchestrator.backends.registry import get_backend
@@ -1306,6 +1575,11 @@ class StatusMonitor:
             )
             return None
         if not fresh_output:
+            # A blank redraw breaks consecutive confirmation.
+            with self._lock:
+                if self._capture_generation.get(terminal_id, 0) == generation:
+                    self._pending_stale_capture.pop(terminal_id, None)
+                    self._confirmed_stale_capture_commit.pop(terminal_id, None)
             return None
 
         try:
@@ -1383,8 +1657,71 @@ class StatusMonitor:
                 f"_fresh_capture_pane_status [{terminal_id}]: candidate {detected.value} "
                 "recorded, awaiting a second confirming read before honoring it"
             )
+            if detected in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                self._schedule_stale_capture_confirmation(terminal_id, generation)
             return None
         return detected
+
+    def _schedule_stale_capture_confirmation(self, terminal_id: str, generation: int) -> None:
+        """Schedule a confirming read through the normal status gates."""
+        loop = self._loop or self._running_loop()
+        if loop is None:
+            return
+
+        def arm() -> None:
+            with self._lock:
+                pending = self._pending_stale_capture.get(terminal_id)
+                if (
+                    self._capture_generation.get(terminal_id, 0) != generation
+                    or pending is None
+                    or pending[2] != generation
+                    or pending[0] not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+                    or self._last_status.get(terminal_id)
+                    not in (TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER)
+                    or terminal_id in self._stale_capture_handle
+                ):
+                    return
+                self._loop = loop
+                handle: asyncio.TimerHandle
+                handle = loop.call_later(
+                    STALE_PROCESSING_CAPTURE_INTERVAL_S,
+                    lambda: self._on_stale_capture_confirmation(terminal_id, generation, handle),
+                )
+                self._stale_capture_handle[terminal_id] = handle
+
+        try:
+            loop.call_soon_threadsafe(arm)
+        except RuntimeError:
+            pass  # The server loop is shutting down.
+
+    def _on_stale_capture_confirmation(
+        self, terminal_id: str, generation: int, handle: asyncio.TimerHandle
+    ) -> None:
+        with self._lock:
+            if self._stale_capture_handle.get(terminal_id) is not handle:
+                return
+            self._stale_capture_handle.pop(terminal_id, None)
+
+        async def confirm() -> None:
+            # A queued callback can outlive cancellation.
+            with self._lock:
+                pending = self._pending_stale_capture.get(terminal_id)
+                if (
+                    self._capture_generation.get(terminal_id, 0) != generation
+                    or pending is None
+                    or pending[2] != generation
+                ):
+                    return
+            try:
+                await asyncio.to_thread(self.get_status, terminal_id)
+                # A concurrent poll may have consumed this capture's rate-limit slot.
+                self._schedule_stale_capture_confirmation(terminal_id, generation)
+            except Exception:
+                logger.exception("Stale capture confirmation failed for %s", terminal_id)
+
+        loop = self._loop or self._running_loop()
+        if loop is not None:
+            self._spawn_tracked(loop, confirm())
 
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""

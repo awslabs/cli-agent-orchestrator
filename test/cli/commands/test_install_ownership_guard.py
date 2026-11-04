@@ -14,6 +14,7 @@ import logging
 import os
 from pathlib import Path
 from test.cli.commands.install_helpers import _install, _install_for, _ok, _refused, _write_profile
+from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
@@ -681,6 +682,24 @@ class TestProviderArtifactPathMirrorsTheInstaller:
     def test_providers_without_a_per_agent_file_probe_nothing(self) -> None:
         assert install_service._provider_artifact_path("claude_code", "x") is None
 
+    @pytest.mark.parametrize("provider", ["opencode_cli", "kiro_cli", "copilot_cli", "claude_code"])
+    def test_plan_identity_sees_every_file_the_install_reports(
+        self, runner: CliRunner, workspace: Dict[str, Any], provider: str
+    ) -> None:
+        """``installed_artifact_paths`` is the list plan identity hashes for a profile (#827, PR #1000
+        P2-2). Every file a real install REPORTS — the per-agent file and the context copy — must be in
+        it, or an install sink exists whose edits leave ``plan_id`` unchanged."""
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="mirror_me", body="You are an agent.")
+        result = install_service.install_agent("alpha", provider)
+        assert result.success, result.message
+        identity_paths = set(install_service.installed_artifact_paths("mirror_me").values())
+        reported = {Path(result.context_file)}
+        if result.agent_file is not None:
+            reported.add(Path(result.agent_file))
+        missing = {p for p in reported if p not in identity_paths}
+        assert not missing, f"installed but outside plan identity: {missing}"
+
 
 class TestEntryOccupying:
     def test_missing_path_is_free(self, tmp_path: Path) -> None:
@@ -1229,3 +1248,127 @@ class TestPluginRefreshFollowsTheConfiguredContextDirectory:
         _ok(_install_for(runner, "alpha", "kiro_cli"))
 
         assert install_service.refresh_installed_agents_for_plugin_mcp() == ["shared"]
+
+
+def _write_mcp_profile(path: Path, *, name: str) -> None:
+    """A profile with one MCP server, so an OpenCode install writes ``opencode.json`` too."""
+    path.write_text(
+        f"---\nname: {name}\ndescription: Test agent\nmcpServers:\n  tools-srv:\n"
+        "    command: approved-tool\n---\nYou are an agent.\n",
+        encoding="utf-8",
+    )
+
+
+class TestPlanIdentityCoversEveryFileTheInstallWrites:
+    """PR #1000 round 2, P2-1: the installer's sinks and plan identity are one list, checked against
+    what an install WRITES rather than what ``InstallResult`` reports.
+
+    The round-1 guard compared ``installed_artifact_paths`` with ``agent_file`` and ``context_file``
+    only, so a sink the result does not name -- OpenCode's shared ``opencode.json``, which carries each
+    MCP server's ``command`` and the agent's ``tools`` grant -- stayed outside ``plan_id`` and the
+    launch guard without any test noticing.
+    """
+
+    #: Files an install writes that are NOT launch inputs, with the reason each is outside identity.
+    #: A new entry here needs the same one-sentence case; anything written and not listed fails.
+    def _not_launch_inputs(self, workspace: Dict[str, Any], stem: str) -> Dict[Path, str]:
+        from cli_agent_orchestrator.utils import opencode_config
+
+        return {
+            workspace["local_store"]
+            / f"{stem}.md": "the CAO profile itself; bound as ProfileEntry.source, not as an artifact",
+            opencode_config._grant_record_path(): (
+                "CAO's record of which opencode.json grants it owns; OpenCode never reads it, it "
+                "only decides what a later install withdraws"
+            ),
+        }
+
+    @staticmethod
+    def _snapshot(root: Path) -> Dict[Path, bytes]:
+        return {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    @pytest.mark.parametrize("provider", ["opencode_cli", "kiro_cli", "copilot_cli", "claude_code"])
+    def test_every_file_the_install_writes_is_in_plan_identity_or_declared_not_a_launch_input(
+        self, runner: CliRunner, workspace: Dict[str, Any], provider: str, tmp_path: Path
+    ) -> None:
+        """THE CLASS: a filesystem diff around a real ``install_agent`` with an MCP server. Every file
+        created or changed must be in ``installed_artifact_paths`` for the profile, or be declared above
+        with its reason. Keyed on the diff, so a sink the installer gains later fails here the day it
+        is added."""
+        store = workspace["local_store"]
+        _write_mcp_profile(store / "alpha.md", name="mirror_me")
+        before = self._snapshot(tmp_path)
+        result = install_service.install_agent("alpha", provider)
+        assert result.success, result.message
+        after = self._snapshot(tmp_path)
+        written = {p for p, data in after.items() if before.get(p) != data}
+        assert (
+            written
+        ), "the install wrote nothing under the pinned roots; the diff is not observing it"
+
+        identity = set(install_service.installed_artifact_paths("mirror_me").values())
+        declared = self._not_launch_inputs(workspace, "alpha")
+        assert Path(result.context_file) in written & identity  # the diff and the list meet
+        unaccounted = {p for p in written if p not in identity and p not in declared}
+        assert not unaccounted, (
+            "install_agent wrote these files and plan identity does not hash them; a provider that "
+            f"reads one at launch executes an edit to it under a stale approval: {sorted(unaccounted)}"
+        )
+
+    def test_opencode_json_is_written_and_in_plan_identity(
+        self, runner: CliRunner, workspace: Dict[str, Any]
+    ) -> None:
+        """The instance: the file this round found outside identity is in the list by its label."""
+        store = workspace["local_store"]
+        _write_mcp_profile(store / "alpha.md", name="mirror_me")
+        assert install_service.install_agent("alpha", "opencode_cli").success
+        assert workspace["config_file"].is_file()
+        assert (
+            install_service.installed_artifact_paths("mirror_me")["opencode_cli:config"]
+            == workspace["config_file"]
+        )
+
+    def test_an_edit_to_the_mcp_command_or_the_tool_grant_in_opencode_json_moves_plan_identity_and_the_guard(
+        self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Haofei's probe on ``e34445b7``: real install, then edit ``mcp.tools-srv.command`` and
+        ``agent.<id>.tools``. Before the fix both the profile-set digest and the launch guard record
+        were unchanged, so the edited server command ran under the approved ``plan_id``."""
+        import json
+
+        from cli_agent_orchestrator.services import launch_guard
+        from cli_agent_orchestrator.utils import agent_profiles
+
+        monkeypatch.setattr(
+            launch_guard.settings_service, "is_workflow_approval_required", lambda: True
+        )
+        monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+        store = workspace["local_store"]
+        _write_mcp_profile(store / "alpha.md", name="reviewer")
+        assert install_service.install_agent("alpha", "opencode_cli").success
+        config_file: Path = workspace["config_file"]
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+        assert config["mcp"]["tools-srv"]["command"] == ["approved-tool"]
+        assert config["agent"]["reviewer"]["tools"] == {"tools-srv*": True}
+
+        digest_before = agent_profiles.profile_set_digest()
+        guard = launch_guard.capture()
+        row = SimpleNamespace(tier="script", spec_snapshot=json.dumps({"launch_guard": guard}))
+        monkeypatch.setattr(
+            launch_guard.settings_service,
+            "resolve_workflow_approval_posture",
+            lambda: launch_guard.settings_service.WorkflowApprovalPosture(
+                True, launch_guard.settings_service.GATE_SOURCE_FILE
+            ),
+        )
+        monkeypatch.setattr(launch_guard.workflow_journal, "get_run", lambda run_id: row)
+        launch_guard.check("run-1", "reviewer")  # unchanged: passes
+
+        config["mcp"]["tools-srv"]["command"] = ["evil-tool"]
+        config["agent"]["reviewer"]["tools"] = {"*": True}
+        config_file.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+        assert agent_profiles.profile_set_digest() != digest_before
+        assert launch_guard.capture()["profiles"]["reviewer"] != guard["profiles"]["reviewer"]
+        with pytest.raises(launch_guard.PlanInputsChangedError, match="profile.*changed"):
+            launch_guard.check("run-1", "reviewer")

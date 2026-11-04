@@ -54,6 +54,8 @@ def test_every_non_secret_finding_has_its_adr_severity():
         FindingCode.HARDLINK_REFUSED: "warn",
         FindingCode.PATH_ESCAPES_ROOT: "warn",
         FindingCode.NOTE_NOT_UTF8: "error",
+        FindingCode.SECRET_ACCEPTED: "info",
+        FindingCode.SECRET_ACCEPTANCE_UNMATCHED: "warn",
         FindingCode.UNSTABLE_SKIPPED: "warn",
         FindingCode.LINK_LIMIT_EXCEEDED: "warn",
         FindingCode.LINK_TARGET_INVALID: "warn",
@@ -88,7 +90,11 @@ def test_scan_findings_delegate_severity_to_the_closed_vocabulary():
 
 
 def test_every_finding_code_has_a_live_emit_site():
-    source_root = Path("src/cli_agent_orchestrator/services/vault")
+    from cli_agent_orchestrator.services import vault
+
+    # The imported package, not a cwd-relative path: service tests run from an
+    # empty directory (test/services/conftest.py).
+    source_root = Path(vault.__file__).parent
     implementation = "\n".join(
         path.read_text(encoding="utf-8")
         for path in source_root.glob("*.py")

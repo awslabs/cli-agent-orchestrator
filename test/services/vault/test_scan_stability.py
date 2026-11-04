@@ -13,7 +13,8 @@ from cli_agent_orchestrator.services.vault.scan import (
 )
 
 
-def test_same_size_mutation_between_read_stats_is_skipped(tmp_path, monkeypatch):
+def test_same_size_mutation_during_the_first_read_is_recovered_by_a_reread(tmp_path, monkeypatch):
+    """ADR-006: a torn first read window is retried; the clean second window is indexed."""
     root = tmp_path / "vault"
     root.mkdir()
     (root / "CAO").mkdir()
@@ -43,14 +44,21 @@ def test_same_size_mutation_between_read_stats_is_skipped(tmp_path, monkeypatch)
             st_dev=before_stat.st_dev,
             st_ino=before_stat.st_ino,
             st_size=before_stat.st_size,
+            st_mode=before_stat.st_mode,
             st_mtime_ns=before_stat.st_mtime_ns,
             st_ctime_ns=before_stat.st_ctime_ns + 1,
         )
 
     monkeypatch.setattr(scan.os, "fstat", mutate)
+    monkeypatch.setattr(scan.time, "sleep", lambda _seconds: None)
     report = scan_vault(_vault(root))
 
-    assert report.notes[0].findings[0].code == FindingCode.UNSTABLE_SKIPPED
+    assert calls == 4, "one torn window plus one clean re-read"
+    assert report.notes[0].status == "indexed"
+    assert report.notes[0].text == "after!"
+    assert not any(
+        finding.code == FindingCode.UNSTABLE_SKIPPED for finding in report.notes[0].findings
+    )
 
 
 def test_discovery_inode_mismatch_is_refused_on_the_open_descriptor(tmp_path):

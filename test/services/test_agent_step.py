@@ -14,7 +14,6 @@ import pytest
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services.agent_step import (
     StepExecutionError,
     run_agent_step,
@@ -165,7 +164,11 @@ class TestHappyPath:
             wait,
             status,
         ):
-            result = asyncio.run(run_agent_step("kiro_cli", "developer", "do the task"))
+            result = asyncio.run(
+                run_agent_step(
+                    "kiro_cli", "developer", "do the task", description="Review implementation"
+                )
+            )
 
         assert isinstance(result, AgentStepResult)
         assert result.terminal_id == "abc12345"
@@ -173,11 +176,12 @@ class TestHappyPath:
         assert result.status == TerminalStatus.COMPLETED
         # Canonical sequence: created, prompt sent, output extracted in LAST mode.
         m_create.assert_awaited_once()
+        assert m_create.call_args.kwargs["description"] == "Review implementation"
         m_send.assert_called_once_with("abc12345", "do the task")
         m_out.assert_called_once_with("abc12345", OutputMode.LAST)
         # Created-here + teardown default -> graceful exit THEN delete.
         m_exit.assert_called_once_with("abc12345")
-        m_delete.assert_called_once_with("abc12345", registry=None)
+        m_delete.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
 
     def test_teardown_false_skips_delete(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
@@ -205,16 +209,24 @@ class TestHappyPath:
             exit_cli as m_exit,
             wait,
             status,
+            patch(f"{_MODULE}.terminal_service.update_description") as update_description,
             patch(
                 f"{_MODULE}.terminal_service.get_terminal_metadata",
                 return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
             ),
         ):
             result = asyncio.run(
-                run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99")
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    reuse_terminal_id="reuse99",
+                    description="Do not overwrite",
+                )
             )
         assert result.terminal_id == "reuse99"
         m_create.assert_not_awaited()
+        update_description.assert_not_called()
         m_delete.assert_not_called()
         # A reused terminal is owned by the caller — no graceful exit either.
         m_exit.assert_not_called()
@@ -250,7 +262,7 @@ class TestHappyPath:
         m_create.assert_not_awaited()
         m_send.assert_called_once_with("reuse99", "x")
 
-    def test_reuse_conflicting_kas_uses_phase0_guard_before_send(self):
+    def test_reuse_with_kas_against_a_v2_terminal_is_a_mismatch_before_send(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with (
             create as m_create,
@@ -264,7 +276,7 @@ class TestHappyPath:
                 f"{_MODULE}.terminal_service.get_terminal_metadata",
                 return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
             ),
-            pytest.raises(KiroPhase0KASError, match="Phase 0"),
+            pytest.raises(ValueError, match="requested 'v3', persisted 'v2'"),
         ):
             asyncio.run(
                 run_agent_step(
@@ -426,7 +438,7 @@ class TestHappyPath:
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with create, send, delete as m_delete, get_output, exit_cli, wait, status:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", registry=sentinel))
-        m_delete.assert_called_once_with("abc12345", registry=sentinel)
+        m_delete.assert_called_once_with("abc12345", registry=sentinel, end_reason="deleted")
 
     def test_explicit_wd_wins_over_caller_inheritance(self):
         """An explicit working_directory takes precedence even when caller_id
@@ -694,7 +706,7 @@ class TestTeardownIsBestEffort:
             result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert result.status == TerminalStatus.COMPLETED
         # Exit failed but delete still ran.
-        m_delete.assert_called_once_with("abc12345", registry=None)
+        m_delete.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
 
     def test_on_step_terminal_ready_callback_failure_does_not_fail_step(self):
         """F9(b): a raising ``on_step_terminal_ready`` callback (BR-31 sweep
@@ -1047,7 +1059,7 @@ class TestInterruptibleCancel:
         m_out.assert_not_called()
         # A terminal this call created is reclaimed exactly like the success path.
         m_exit.assert_called_once_with("abc12345")
-        m_delete.assert_called_once_with("abc12345", registry=None)
+        m_delete.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
 
     def test_reused_terminal_not_torn_down_on_cancel(self):
         """A cancelled step must NOT delete a terminal it did not create — the
@@ -1109,7 +1121,7 @@ class TestOutputExtractionTeardown:
         m_out.assert_called_once_with("abc12345", OutputMode.LAST)
         # A terminal this call created is reclaimed exactly like the success path.
         m_exit.assert_called_once_with("abc12345")
-        m_delete.assert_called_once_with("abc12345", registry=None)
+        m_delete.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
 
     def test_extraction_failure_does_not_tear_down_reused_terminal(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
@@ -1136,3 +1148,381 @@ class TestOutputExtractionTeardown:
         m_out.assert_called_once_with("reuse99", OutputMode.LAST)
         m_delete.assert_not_called()
         m_exit.assert_not_called()
+
+
+@pytest.mark.parametrize("rejected", [False, True])
+def test_extraction_error_prefix_preserves_type_cause_and_owned_teardown(rejected):
+    from cli_agent_orchestrator.providers.base import (
+        OutputExtractionError,
+        OutputExtractionRejected,
+    )
+
+    error_type = OutputExtractionRejected if rejected else OutputExtractionError
+    original = error_type("no publishable response")
+    create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+        final_status=TerminalStatus.COMPLETED,
+    )
+    with (
+        create,
+        send,
+        delete as deleted,
+        exit_cli as exited,
+        wait,
+        status,
+        patch(f"{_MODULE}.terminal_service.get_output", side_effect=original),
+    ):
+        with pytest.raises(error_type) as raised:
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+    assert type(raised.value) is error_type
+    assert str(raised.value) == "terminal abc12345: no publishable response"
+    assert raised.value.__cause__ is original
+    exited.assert_called_once_with("abc12345")
+    deleted.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
+
+
+class TestInBandProviderError:
+    """Issue #638: the RUNTIME — not the workflow author — classifies an in-band
+    provider error. A provider that cannot load a model answers the transport
+    perfectly: the terminal reaches COMPLETED and the *error text* sits exactly
+    where the model's answer belongs, so the substrate must distinguish them.
+    """
+
+    # The exact shape from the issue report (a model id the provider rejects).
+    ERROR = (
+        "API Error (openai.gpt-5.6-terra): 400 Invocation of model ID "
+        "openai.gpt-5.6-terra isn't supported."
+    )
+
+    @staticmethod
+    def _context(provider, output, *, provider_owned=False):
+        """Return a minimal rendered capture in the adapter's real shape.
+
+        Codex renders an answer on the ``•`` assistant marker and provider chrome
+        unmarked.  Claude Code renders BOTH answers and its own API errors on the
+        ``⏺``/``●`` response bullet (anthropics/claude-code#91345 / #92316), so
+        ``provider_owned`` does not change its rendering — the ``API Error:`` text is
+        the provider-native signal, and the marker must not veto it.
+        """
+        if provider == "claude_code":
+            return f"⏺ {output}\n❯"
+        prefix = "" if provider_owned else "• "
+        return f"› user\n{prefix}{output}\n›"
+
+    @staticmethod
+    def _context_patch(provider, output, *, provider_owned=False):
+        return patch(
+            f"{_MODULE}.terminal_service.get_output_context",
+            return_value=TestInBandProviderError._context(
+                provider, output, provider_owned=provider_owned
+            ),
+            create=True,
+        )
+
+    @pytest.mark.parametrize(
+        ("provider", "output"),
+        (
+            ("codex", "429"),
+            ("codex", "Rate limiting protects APIs from burst traffic."),
+            ("codex", "Unknown model types use the fallback serializer."),
+            ("codex", "Rate limit exceeded is a common HTTP 429 explanation."),
+            ("codex", "Unknown model 'placeholder' is a useful teaching example."),
+            ("codex", "API Error: none found - all 42 endpoints return 2xx."),
+            ("codex", "rate_limit = 100"),
+            ("codex", "Model weights not found."),
+            ("claude_code", "Rate limit exceeded."),
+            ("claude_code", "Authentication failed."),
+            ("claude_code", "Authentication failed is an expected unit-test outcome."),
+            ("claude_code", "Unknown model 'gpt-4o-mini'"),
+        ),
+    )
+    def test_ordinary_short_answers_complete(self, provider, output):
+        """Common words and status-shaped values are answers without provider-owned chrome."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=output
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            self._context_patch(provider, output),
+        ):
+            result = asyncio.run(run_agent_step(provider, "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == output
+
+    @pytest.mark.parametrize("provider", ("codex", "claude_code"))
+    def test_long_answer_is_not_classified_below_the_cap(self, provider):
+        """A long answer that begins with error vocabulary remains a legitimate answer."""
+        output = "429: rate limit exceeded\n\n" + ("context " * 80)
+        assert len(output) > 512
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=output
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            self._context_patch(provider, output),
+        ):
+            result = asyncio.run(run_agent_step(provider, "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == output
+
+    @pytest.mark.parametrize(
+        ("provider", "output"),
+        (
+            ("codex", "API Error: 404 is the response for an unknown route."),
+            ("codex", "Unknown model: a model type absent from the serializer registry."),
+        ),
+    )
+    def test_provider_shaped_assistant_text_completes(self, provider, output):
+        """Provider-shaped words are an answer only when the adapter renders them as
+        assistant output.  Codex renders an answer on ``•``, so this text is a reply;
+        Claude Code marks its API errors on the SAME bullet, so the Claude case is a
+        refusal instead (covered by ``test_real_cli_error_chrome_fails_the_step``)."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=output
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            self._context_patch(provider, output),
+        ):
+            result = asyncio.run(run_agent_step(provider, "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == output
+
+    @pytest.mark.parametrize(
+        ("provider", "output"),
+        (
+            (
+                "claude_code",
+                "API Error: 400 invalid params, messages.4.content.1.tool_use.input: "
+                "Input should be a valid dictionary (2013)",
+            ),
+            ("codex", '■ unexpected status 400 Bad Request: {"code":20015}'),
+            (
+                "codex",
+                '⚠️ stream error: unexpected status 400 Bad Request: {"code":20015}; '
+                "retrying 1/5 in 196ms…",
+            ),
+        ),
+    )
+    def test_real_cli_error_chrome_fails_the_step(self, provider, output):
+        """The reviewed regression, at the ``run_agent_step`` seam: Claude Code marks
+        the API error on its ``⏺``/``●`` response bullet and Codex uses its own
+        ``■`` / ``⚠️ stream error`` chrome, so both must FAIL the step rather than
+        return the refusal as the answer."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=output
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            self._context_patch(provider, output, provider_owned=True),
+        ):
+            with pytest.raises(StepExecutionError) as excinfo:
+                asyncio.run(run_agent_step(provider, "dev", "x"))
+
+        assert excinfo.value.kind == "provider_error"
+
+    def test_a_stale_provider_error_does_not_taint_a_later_assistant_answer(self):
+        """Multi-turn stability: ownership is resolved against the latest matching turn."""
+        refusal = "API Error: 404 is the response for an unknown route."
+        raw = f"› first\n{refusal}\n› retry\n• {refusal}\n›"
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=refusal
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_output_context",
+                return_value=raw,
+                create=True,
+            ),
+        ):
+            result = asyncio.run(run_agent_step("codex", "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == refusal
+
+    def test_missing_raw_context_degrades_to_completed(self):
+        """Best-effort capture failures must not turn a would-match answer into a failure."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=self.ERROR
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_output_context",
+                return_value=None,
+                create=True,
+            ),
+        ):
+            result = asyncio.run(run_agent_step("codex", "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == self.ERROR
+
+    def test_provider_error_raises_and_tears_the_terminal_down(self):
+        """The step FAILS, the raw text stays retrievable on the exception, and the
+        terminal this call created is reclaimed.
+
+        The CLI here is HEALTHY and idle (it settled cleanly after printing the
+        refusal) and the text already travels on the exception (#638 criterion 2), so
+        — unlike the crash/timeout paths — no live pane is kept for inspection.
+        Leaving it alive leaks one idle terminal per retried YAML attempt (fanhongy
+        P2-2): the drive loop creates a fresh terminal every attempt and only the last
+        one stays referenced."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=self.ERROR
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            self._context_patch("codex", self.ERROR, provider_owned=True),
+        ):
+            with pytest.raises(StepExecutionError) as excinfo:
+                asyncio.run(run_agent_step("codex", "dev", "x"))
+
+        assert excinfo.value.kind == "provider_error"
+        assert self.ERROR in str(excinfo.value)  # criterion 2: text retrievable
+        assert excinfo.value.terminal_id == "abc12345"  # still reported
+        m_exit.assert_called_once_with("abc12345")
+        m_delete.assert_called_once_with("abc12345", registry=None, end_reason="deleted")
+
+    def test_provider_error_on_a_reused_terminal_is_not_torn_down(self):
+        """Teardown stays scoped to a terminal THIS call created: a reused terminal
+        belongs to the caller, so a provider refusal must not reclaim it."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=self.ERROR
+        )
+        metadata = {"id": "reuse99", "provider": "codex", "engine": None}
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            self._context_patch("codex", self.ERROR, provider_owned=True),
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+        ):
+            with pytest.raises(StepExecutionError) as excinfo:
+                asyncio.run(run_agent_step("codex", "dev", "x", reuse_terminal_id="reuse99"))
+
+        assert excinfo.value.kind == "provider_error"
+        assert excinfo.value.terminal_id == "reuse99"
+        m_delete.assert_not_called()
+        m_exit.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "answer",
+        (
+            "429 Too Many Requests",
+            "Unknown model: `Invoice` isn't registered in admin.py, so I added it.",
+            "Rate limit exceeded, retry after 60 seconds.",
+        ),
+    )
+    def test_short_bulleted_claude_answers_are_not_refusals(self, answer):
+        """fanhongy P2-1 regression: Claude Code renders answers on the ``⏺``/``●``
+        response bullet, so a short answer that merely uses that bullet must complete
+        — only the narrow ``API Error: <4xx/5xx>`` chrome is provider-native for
+        Claude (see the classifier tests)."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=answer
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            self._context_patch("claude_code", answer),
+        ):
+            result = asyncio.run(run_agent_step("claude_code", "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == answer
+
+    def test_raw_context_is_not_fetched_for_a_non_candidate_answer(self):
+        """P3: the raw-context fetch is deferred until a signature actually matches, so
+        an ordinary answer never pays for the metadata read / capture-pane."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output="The answer is 42."
+        )
+        context = MagicMock(side_effect=AssertionError("get_output_context must not be called"))
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}.terminal_service.get_output_context", context, create=True),
+        ):
+            result = asyncio.run(run_agent_step("codex", "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        context.assert_not_called()
+
+    def test_long_answer_quoting_a_provider_error_and_normal_answers_complete(self):
+        """Regression (criterion 4): quoting an error is not an error, and the
+        ordinary success path is untouched."""
+        quoted = "The provider replied:\n\nAPI Error (openai.gpt-5.6-terra): 400 " + (
+            "context " * 40
+        )
+        for output in (quoted, "The answer is 42."):
+            create, send, delete, get_output, exit_cli, get_wd, wait, status = (
+                _patch_terminal_layer(output=output)
+            )
+            with create, send, delete, get_output, exit_cli, wait, status:
+                result = asyncio.run(run_agent_step("codex", "dev", "x"))
+
+            assert result.status == TerminalStatus.COMPLETED
+            assert result.last_message == output

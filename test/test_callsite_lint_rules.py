@@ -1,0 +1,655 @@
+"""Call-site lint rules built on ``test/_support/callsite_lint.py`` (#1005).
+
+Each rule closes one half of a defect class the repo has already paid for:
+
+* **Rule 1 (enum subsets, #896)** -- ``dispatch_input``'s dialog guard asked
+  "is this machine-originated?" by testing membership in a hand-written
+  ``{ASSIGN, HANDOFF}`` subset of ``OrchestrationType``. ``SEND_MESSAGE``
+  walked past it and got typed into an open AskUserQuestion dialog. Nothing in
+  the tree linked the literal to the enum, and ``mypy`` sees no exhaustiveness
+  obligation on ``in {...}``.
+* **Rule 2 (timeout literals, #710 / #787)** -- a bare number next to
+  ``timeout=`` records the author's guess, not the bound it has to respect.
+  #787 is the shape: ``mcp_server`` helpers kept a hard-coded ``30`` after the
+  setting that was meant to govern them landed, so raising the setting changed
+  nothing and left no trace in the logs.
+* **Rule 3 (staleness gate, #735)** -- a poll that accepts whatever frame is on
+  screen can report "done" for a turn that had not started. The fix is a
+  generation/sequence floor at every call site.
+* **Rule 4 (admission snapshot, #827 / PR #1000 P3-3)** -- ``launch_guard.capture``
+  records the launch inputs a run is admitted under. Called without the
+  snapshots the freeze already read, it re-derives them AFTER the approval gate,
+  so an input edited in that window is recorded as the approved state. Every
+  production call must pass every snapshot keyword the freeze exposes
+  (``profile_set=frozen.profile_set``,
+  ``root_identity=frozen.root_identity``) -- the list is derived from
+  ``FrozenManifest``'s own fields, so a new seam added to the freeze fails here
+  until every admission path threads it.
+
+All four rules are **ratchets**. A new unexplained call site fails; so does a
+site beyond its row's reviewed occurrence count (a key collision does not
+grant unlimited headroom); so does an allowlist row that no longer matches
+anything, so the tables can only shrink. The failure message names
+``file:line`` and what to do.
+
+Cost: one ``ast.parse`` of every module under ``src/`` (269 files), cached
+across the rules by ``callsite_lint.parse_sources``. Measured at well under a
+second on this tree; see the PR description for the number.
+"""
+
+from __future__ import annotations
+
+from test._support import callsite_lint as cl
+
+import pytest
+
+# ===========================================================================
+# Rule 1: an Enum-subset membership literal must be deliberate
+# ===========================================================================
+#
+# Keys are ``(module, enum name, sorted member names)`` -- deliberately free of
+# line numbers so a reviewed row survives reformatting, and so one row covers
+# the repetitions of a single idiom inside one module. A site may instead carry
+# an inline ``# subset-ok: <reason>`` comment, which is the better choice for a
+# one-off; the table is for idioms that repeat.
+#
+# The two sites #1005 named as seeds (``services/agui_stream.py`` ~161 and
+# ``services/event_primitives.py`` ~69-70) are deliberately absent: neither is
+# an Enum subset. Both compare *strings* read out of an untyped event detail
+# dict, so no Enum-keyed rule can see them. That stringly-typed sibling class
+# needs its own rule and is called out in the PR description instead of being
+# papered over with a row here.
+
+ENUM_SUBSET_ALLOWLIST = {
+    # ---- terminal lifecycle: "the agent is not busy" ----
+    # TerminalStatus has six members; {COMPLETED, IDLE} is the standard
+    # "settled, safe to act" pair. ERROR/UNKNOWN/PROCESSING/WAITING_USER_ANSWER
+    # are all deliberately excluded: acting on them is the bug.
+    (
+        "cli_agent_orchestrator/cli/commands/session.py",
+        "TerminalStatus",
+        "COMPLETED, IDLE",
+    ): "settled-status pair; a session is reported done only when not busy",
+    (
+        "cli_agent_orchestrator/providers/codex.py",
+        "TerminalStatus",
+        "COMPLETED, IDLE",
+    ): "launch readiness gate: the CLI has reached a prompt",
+    (
+        "cli_agent_orchestrator/providers/copilot_cli.py",
+        "TerminalStatus",
+        "COMPLETED, IDLE",
+    ): "launch readiness gate: the CLI has reached a prompt",
+    (
+        "cli_agent_orchestrator/providers/grok_cli.py",
+        "TerminalStatus",
+        "COMPLETED, IDLE",
+    ): "launch readiness gate: the CLI has reached a prompt",
+    (
+        "cli_agent_orchestrator/providers/kimi_cli.py",
+        "TerminalStatus",
+        "COMPLETED, IDLE",
+    ): "launch readiness gate: the CLI has reached a prompt",
+    (
+        "cli_agent_orchestrator/providers/minimax_code.py",
+        "TerminalStatus",
+        "COMPLETED, IDLE",
+    ): "launch readiness gate: the CLI has reached a prompt",
+    (
+        "cli_agent_orchestrator/services/inbox_service.py",
+        "TerminalStatus",
+        "COMPLETED, IDLE",
+    ): (2, "delivery is allowed only into a settled terminal"),
+    (
+        "cli_agent_orchestrator/services/memory_service.py",
+        "TerminalStatus",
+        "COMPLETED, IDLE",
+    ): "settled-status pair; memory capture waits for a quiet terminal",
+    (
+        "cli_agent_orchestrator/services/status_monitor.py",
+        "TerminalStatus",
+        "COMPLETED, IDLE",
+    ): (4, "settled-status pair; the monitor's idle/completed transitions"),
+    # ---- terminal lifecycle: "the agent is busy" ----
+    # The complement pair. #896 lives here: WAITING_USER_ANSWER must never be
+    # treated as merely slow, so it is named alongside PROCESSING on purpose.
+    (
+        "cli_agent_orchestrator/services/inbox_service.py",
+        "TerminalStatus",
+        "PROCESSING, WAITING_USER_ANSWER",
+    ): "busy pair (#896): a dialog is not a delivery window",
+    (
+        "cli_agent_orchestrator/services/status_monitor.py",
+        "TerminalStatus",
+        "PROCESSING, WAITING_USER_ANSWER",
+    ): (2, "busy pair (#896): a dialog is not a delivery window"),
+    (
+        "cli_agent_orchestrator/utils/terminal.py",
+        "TerminalStatus",
+        "PROCESSING, WAITING_USER_ANSWER",
+    ): "busy pair (#896): keep polling rather than declaring done",
+    (
+        "cli_agent_orchestrator/services/status_monitor.py",
+        "TerminalStatus",
+        "PROCESSING, UNKNOWN",
+    ): "not-yet-settled pair: UNKNOWN is treated as still-starting, not as done",
+    # ---- input refusals the inbox keeps pending ----
+    # TerminalInputBlockedReason has four members. The two named are the refusals
+    # a later delivery can clear; PROVIDER_ERROR and INIT_FAILED are permanent, and
+    # a member added later is failed too until someone decides it is transient.
+    (
+        "cli_agent_orchestrator/services/inbox_service.py",
+        "TerminalInputBlockedReason",
+        "IDENTITY_PENDING, WAITING_USER_ANSWER",
+    ): "transient refusals (#896, #1074): a dialog closes, an identity check completes",
+    # ---- workflow / run state ----
+    # RunState has four members (RUNNING, COMPLETED, FAILED, CANCELLED). Each
+    # subset below is the complement of RUNNING in some combination, which is
+    # exactly the "terminal state" question these sites ask.
+    (
+        "cli_agent_orchestrator/api/main.py",
+        "RunState",
+        "CANCELLED, COMPLETED, FAILED",
+    ): (2, "every terminal RunState (the complement of RUNNING)"),
+    (
+        "cli_agent_orchestrator/api/main.py",
+        "RunState",
+        "CANCELLED, FAILED",
+    ): "unsuccessful terminal states; COMPLETED is handled separately",
+    (
+        "cli_agent_orchestrator/services/script_runner.py",
+        "RunState",
+        "CANCELLED, COMPLETED, FAILED",
+    ): "every terminal RunState (the complement of RUNNING)",
+    (
+        "cli_agent_orchestrator/services/workflow_service.py",
+        "RunState",
+        "CANCELLED, COMPLETED, FAILED",
+    ): "every terminal RunState (the complement of RUNNING)",
+    (
+        "cli_agent_orchestrator/services/workflow_service.py",
+        "RunState",
+        "CANCELLED, COMPLETED",
+    ): "states that stop further step dispatch without being a failure",
+    (
+        "cli_agent_orchestrator/services/workflow_service.py",
+        "RunState",
+        "CANCELLED, FAILED",
+    ): (2, "unsuccessful terminal states; COMPLETED is handled separately"),
+    (
+        "cli_agent_orchestrator/services/workflow_service.py",
+        "StepState",
+        "COMPLETED, COMPLETED_UNVALIDATED",
+    ): (3, "both 'the step ran' states; validation status is a separate axis"),
+    # ---- memory scope ----
+    # MemoryScope has five members. Both subsets are real partitions of it.
+    (
+        "cli_agent_orchestrator/api/main.py",
+        "MemoryScope",
+        "AGENT, SESSION",
+    ): (2, "the two scopes that require an owning id in the request"),
+    (
+        "cli_agent_orchestrator/services/memory_service.py",
+        "MemoryScope",
+        "AGENT, SESSION",
+    ): (7, "the two scopes that require an owning id"),
+    (
+        "cli_agent_orchestrator/services/memory_service.py",
+        "MemoryScope",
+        "GLOBAL, PROJECT, SESSION",
+    ): "the complement of {AGENT, FEDERATED}: scopes with no agent owner",
+    # ---- provider parsing ----
+    (
+        "cli_agent_orchestrator/providers/kimi_cli.py",
+        "KimiDialect",
+        "CODE, LEGACY",
+    ): "the two recognised dialects; UNKNOWN is the fallthrough by design",
+    (
+        "cli_agent_orchestrator/providers/kimi_transcript.py",
+        "KimiLineKind",
+        "FINAL_BULLET, USER_INPUT",
+    ): "the two line kinds that bound an answer region",
+    (
+        "cli_agent_orchestrator/providers/kimi_transcript.py",
+        "KimiLineKind",
+        "LIVE_SWARM_PROGRESS, SWARM_PROGRESS",
+    ): (4, "both swarm-progress spellings; neither is transcript content"),
+    # ---- misc ----
+    (
+        "cli_agent_orchestrator/backends/base.py",
+        "TerminalCleanupOutcome",
+        "ABSENT, DELETED",
+    ): "the two outcomes that mean the terminal is gone",
+    # #896's own site (services/terminal_service.py, OrchestrationType) has no
+    # row: the guard now derives its set from the enum
+    # (``_ORCHESTRATED_INPUT_VALUES``), so there is no literal left to explain.
+    # A return to a hand-written subset is an unexplained site and fails here.
+}
+
+ENUM_SUBSET_REMEDY = (
+    "A membership test over part of an Enum stops covering the surface the day "
+    "a member is added (#896). Either derive the test from the property you "
+    "actually mean (a predicate on the member, an exhaustive match, or the "
+    "complement spelled as `not in {...}` over the rest), or -- if the subset "
+    "is genuinely deliberate -- put an inline `# subset-ok: <reason>` comment "
+    "on the line, or add a row to ENUM_SUBSET_ALLOWLIST in this file with a "
+    "reason that says why the excluded members are excluded."
+)
+
+
+def test_enum_subset_literals_are_deliberate() -> None:
+    """Every partial-Enum membership literal under ``src/`` is explained (#896)."""
+    sources = cl.parse_sources()
+    sites = cl.enum_subset_sites(sources)
+    marked = cl.marked_sites(sites, "subset-ok", sources)
+    unmarked = [site for site in sites if (site.key, site.line) not in marked]
+
+    cl.check_against_allowlist(
+        rule="enum-subset",
+        sites=sites,
+        allowlist=ENUM_SUBSET_ALLOWLIST,
+        marked=marked,
+        remedy=ENUM_SUBSET_REMEDY,
+    )
+    # Belt and braces: check_against_allowlist already covers this, but asserting
+    # it directly keeps the intent readable when the helper changes.
+    assert not [s for s in unmarked if s.key not in ENUM_SUBSET_ALLOWLIST]
+
+
+# ===========================================================================
+# Rule 2: a timeout literal must derive from the bound it respects
+# ===========================================================================
+#
+# The rule flags ``timeout=<bare number>``. It does *not* flag a name, an
+# attribute, a call or an arithmetic expression -- deriving the number is the
+# behaviour being asked for, so it has to pass silently.
+#
+# Every row below carries a one-line justification. Five are flagged as
+# genuinely questionable rather than rubber-stamped; their reasons start with
+# "SUSPECT" and the PR description repeats them.
+
+BARE_TIMEOUT_ALLOWLIST = {
+    # ---- subprocess calls: a wall-clock cap on a local binary ----
+    (
+        "cli_agent_orchestrator/clients/tmux.py",
+        "run(timeout=5)",
+    ): "`ps` on the local host; 5s is a liveness cap, not a derived bound",
+    (
+        "cli_agent_orchestrator/providers/cursor_cli.py",
+        "run(timeout=3)",
+    ): "`cursor --version` probe; the comment above it states the intent",
+    (
+        "cli_agent_orchestrator/services/memory_service.py",
+        "run(timeout=2)",
+    ): "`git config --get remote.origin.url`; docstring cites laggy NFS",
+    (
+        "cli_agent_orchestrator/backends/herdr_backend.py",
+        "run(timeout=30)",
+    ): "SUSPECT: one 30s cap for every `herdr` subcommand, from snapshot to "
+    "session create. No stated derivation and no per-command differentiation.",
+    (
+        "cli_agent_orchestrator/services/herdr_inbox_service.py",
+        "run(timeout=10)",
+    ): (
+        3,
+        "SUSPECT: `herdr api` reads inside the socket loop. 10s is three "
+        "independent literals in one module with no shared constant.",
+    ),
+    (
+        "cli_agent_orchestrator/services/herdr_inbox_service.py",
+        "run(timeout=5)",
+    ): "SUSPECT: a fourth herdr literal in the same module, a different number "
+    "again. These four want one module-level constant.",
+    (
+        "cli_agent_orchestrator/services/flow_service.py",
+        "to_thread(timeout=30)",
+    ): "flow script cap; the comment above derives the off-loop hop from it",
+    # ---- HTTP calls to the CAO API from the CLI ----
+    (
+        "cli_agent_orchestrator/utils/terminal.py",
+        "get(timeout=2)",
+    ): "/health probe; short on purpose so backend selection cannot hang",
+    (
+        "cli_agent_orchestrator/utils/terminal.py",
+        "get(timeout=5)",
+    ): (
+        3,
+        "per-request cap inside a polling loop that has its own outer budget; "
+        "the comment at the first site states the relationship",
+    ),
+    (
+        "cli_agent_orchestrator/cli/commands/launch.py",
+        "get(timeout=5)",
+    ): "single status read on the launch path",
+    (
+        "cli_agent_orchestrator/services/agui/base.py",
+        "post(timeout=10)",
+    ): "SUSPECT: AG-UI emit to the local API. This is the #787 shape -- a "
+    "hard-coded HTTP timeout with a settings-driven sibling elsewhere in the "
+    "tree. Worth checking against server.mcp_request_timeout's precedent.",
+    (
+        "cli_agent_orchestrator/services/terminal_service.py",
+        "post(timeout=5)",
+    ): "elastic-broker release notify; best-effort and already in try/except",
+    # ---- provider launch readiness ----
+    # antigravity_cli's wait_for_shell(timeout=10) row was deleted when #710
+    # made that literal the module constant SHELL_WAIT_TIMEOUT_S, which
+    # utils.init_allowance reads to size the client wait.
+    (
+        "cli_agent_orchestrator/providers/mock_cli.py",
+        "wait_for_shell(timeout=10)",
+    ): "test-double provider; the number has no production consequence",
+    (
+        "cli_agent_orchestrator/providers/mock_cli.py",
+        "wait_until_status(timeout=15)",
+    ): "test-double provider; the number has no production consequence",
+    (
+        "cli_agent_orchestrator/providers/copilot_cli.py",
+        "_accept_trust_prompts(timeout=10)",
+    ): "first trust-dialog pass, longer than the retry below it",
+    (
+        "cli_agent_orchestrator/providers/copilot_cli.py",
+        "_accept_trust_prompts(timeout=5)",
+    ): "second trust-dialog pass; shorter because the dialog is already up",
+    (
+        "cli_agent_orchestrator/providers/opencode_cli.py",
+        "wait_until_status(timeout=120)",
+    ): "the comment above derives 120s from first-run npm install plus "
+    "concurrent multi-agent launches -- this is the shape the rule wants, "
+    "except the number is still a literal rather than a named constant",
+    (
+        "cli_agent_orchestrator/providers/hermes.py",
+        "wait_until_status(timeout=120)",
+    ): "SUSPECT: the same 120s as opencode_cli but with no comment and no "
+    "shared constant. If both derive from provider_init_timeout (#710 raised "
+    "that allowance), neither should be reading a literal.",
+    # ---- in-process waits ----
+    (
+        "cli_agent_orchestrator/api/main.py",
+        "wait_for(timeout=1)",
+    ): "asyncio.wait_for on a local queue; bounds a single request handler",
+    (
+        "cli_agent_orchestrator/api/main.py",
+        "wait_for(timeout=3)",
+    ): "asyncio.wait_for on a local queue; bounds a single request handler",
+    (
+        "cli_agent_orchestrator/cli/commands/agent.py",
+        "join(timeout=1)",
+    ): "thread join on shutdown; a join timeout is a give-up, not a budget",
+    (
+        "cli_agent_orchestrator/services/fifo_reader.py",
+        "join(timeout=2)",
+    ): (2, "thread join on shutdown; a join timeout is a give-up, not a budget"),
+    (
+        "cli_agent_orchestrator/decisions/shadow.py",
+        "wait(timeout=0.5)",
+    ): "grace period for cancelled shadow tasks; shadow work is discardable",
+    (
+        "cli_agent_orchestrator/services/vault/writer.py",
+        "_file_lock(timeout=10)",
+    ): "advisory file-lock acquisition for one vault write",
+}
+
+BARE_TIMEOUT_REMEDY = (
+    "A bare number next to `timeout=` records a guess. When the bound it has "
+    "to respect changes -- a setting, an outer deadline, a server-side cap -- "
+    "nothing connects the two and the literal silently stops being right "
+    "(#710, #787). Read the bound instead: a setting, an outer budget, or a "
+    "module-level named constant whose comment cites what it derives from. If "
+    "the number really is a local give-up with nothing to derive from, add a "
+    "row to BARE_TIMEOUT_ALLOWLIST in this file saying so."
+)
+
+
+def test_timeout_literals_are_derived_or_justified() -> None:
+    """Every bare ``timeout=<number>`` under ``src/`` is derived or justified (#710)."""
+    cl.check_against_allowlist(
+        rule="bare-timeout",
+        sites=cl.bare_timeout_sites(),
+        allowlist=BARE_TIMEOUT_ALLOWLIST,
+        remedy=BARE_TIMEOUT_REMEDY,
+    )
+
+
+def test_suspect_timeout_rows_are_named_not_buried() -> None:
+    """The allowlist must keep flagging the rows this review did not endorse.
+
+    Rubber-stamping is the failure mode of an allowlist. Five rows above were
+    accepted only to get the rule green and are marked ``SUSPECT``. This test
+    pins that count so removing the marker without fixing the site is a visible
+    edit, and so fixing one of them (which deletes its row) shows up here.
+    """
+    suspects = sorted(
+        k
+        for k, v in BARE_TIMEOUT_ALLOWLIST.items()
+        if cl.row_count_and_reason(v)[1].startswith("SUSPECT")
+    )
+    assert len(suspects) == 5, (
+        "The SUSPECT set changed. If you fixed a site, drop its row and this "
+        f"count. Current: {[k[0] + ' ' + k[1] for k in suspects]}"
+    )
+
+
+# ===========================================================================
+# Rule 3: the staleness gate on poll_until_done (#735)
+# ===========================================================================
+
+STALENESS_FUNC = "poll_until_done"
+STALENESS_KWARG = "min_generation"
+#: Inline opt-out for a ``poll_until_done`` call that cannot pass the floor. Same
+#: shape as rule 1's ``subset-ok``: ``# staleness-ok: <reason>`` on the call's
+#: line or the two above it (``cl.inline_marker``). This is the ONE opt-out
+#: mechanism for the staleness gate; PR #999 briefly carried its own
+#: ``turn-boundary: ungated`` marker read by a second lint, which was retired in
+#: favour of this rule so that a reviewer finds one convention.
+STALENESS_MARKER = "staleness-ok"
+
+#: Table form of the opt-out, for an idiom that repeats inside one module. Empty
+#: on purpose: every reviewed opt-out today is a one-off and carries the inline
+#: marker at the site instead (``cli/commands/launch.py`` headless wait after a
+#: server-confirmed initial delivery; ``cli/commands/worker.py`` ``send`` and
+#: ``attach``, whose broker status route carries no generation).
+STALENESS_OPT_OUT: dict = {}
+
+STALENESS_CALL_SITES = {
+    ("cli_agent_orchestrator/cli/commands/launch.py", STALENESS_FUNC): (
+        "initial-delivery wait after launch"
+    ),
+    ("cli_agent_orchestrator/cli/commands/session.py", STALENESS_FUNC): (
+        "`cao session send` wait for the agent to settle"
+    ),
+    ("cli_agent_orchestrator/cli/commands/worker.py", STALENESS_FUNC): (
+        2,
+        "worker-loop waits (two sites, `send` and the interactive loop) for "
+        "the assigned turn to finish -- reviewed as exactly two; a third "
+        "caller here needs its own review",
+    ),
+}
+
+STALENESS_REMEDY = (
+    "`poll_until_done` decides 'the agent is done' from whatever the terminal "
+    "shows now. Without a floor on which turn that frame belongs to, a frame "
+    "from before your input was sent reads as a finished turn (#735). Pass "
+    f"`{STALENESS_KWARG}=` the generation you are waiting past (the "
+    "`dispatch_boundary` that POST /terminals/{id}/input returned for the send). "
+    f"If this site genuinely cannot derive one, put `# {STALENESS_MARKER}: <reason>` "
+    "on the call or the line above it, or for a repeating idiom add a row to "
+    "STALENESS_OPT_OUT, saying why a stale frame is acceptable here."
+)
+
+
+def test_poll_until_done_call_site_census_is_complete() -> None:
+    """A new ``poll_until_done`` caller must be reviewed for staleness (#735).
+
+    Line-free keys, so one row covers both ``worker.py`` sites and neither row
+    is invalidated by reformatting -- but the row says ``2``, so a third
+    ``worker.py`` caller is still a new, unreviewed obligation rather than a
+    free pass through an existing key.
+    """
+    cl.check_against_allowlist(
+        rule="staleness-census",
+        sites=cl.call_sites(STALENESS_FUNC),
+        allowlist=STALENESS_CALL_SITES,
+        remedy=(
+            "You added a `poll_until_done` call site. Decide whether it needs a "
+            "staleness floor (#735) and then add a row to STALENESS_CALL_SITES "
+            "in this file describing what it waits for. " + STALENESS_REMEDY
+        ),
+    )
+
+
+def test_every_poll_until_done_passes_a_generation_floor() -> None:
+    """Every ``poll_until_done`` call site passes ``min_generation`` or opts out (#735).
+
+    The parameter landed with PR #999 (``POST /terminals/{id}/input`` returns the
+    turn's ``dispatch_boundary``; ``cao session send`` passes it here), so this
+    rule is ARMED: it used to skip while the contract was absent, and now fails
+    outright if the parameter ever disappears again, because the call sites
+    that pass it would then be broken rather than merely ungated. A site that
+    cannot derive a floor says why at the site with ``# staleness-ok: <reason>``
+    (or, for a repeating idiom, a row in ``STALENESS_OPT_OUT``).
+    """
+    declared = cl.declared_parameters(STALENESS_FUNC)
+    if not declared:
+        pytest.fail(f"{STALENESS_FUNC} is no longer defined under src/; update this rule.")
+    assert STALENESS_KWARG in declared, (
+        f"{STALENESS_FUNC} lost its {STALENESS_KWARG} parameter (declares "
+        f"{sorted(declared)}); the #735 staleness contract from PR #999 has regressed."
+    )
+
+    sources = cl.parse_sources()
+    sites = cl.missing_kwarg_sites(STALENESS_FUNC, STALENESS_KWARG, sources)
+    cl.check_against_allowlist(
+        rule="staleness-gate",
+        sites=sites,
+        allowlist=STALENESS_OPT_OUT,
+        marked=cl.marked_sites(sites, STALENESS_MARKER, sources),
+        remedy=STALENESS_REMEDY,
+    )
+
+
+# ===========================================================================
+# Rule 4: launch_guard.capture is built from the freeze's own profile-set read (#827, PR #1000 P3-3)
+# ===========================================================================
+
+ADMISSION_FUNC = "capture"
+
+
+def _admission_kwargs() -> tuple:
+    """The snapshot keywords every admission path must thread, DERIVED rather than listed.
+
+    A "snapshot seam" is a value the freeze reads once and the guard must record verbatim, so it is
+    exactly a name that is both a field of ``FrozenManifest`` and a parameter of
+    ``launch_guard.capture``. Intersecting the two sides is what makes this a ratchet: issue #827's
+    ``root_identity`` became required here the moment it was added to both, with no edit to this
+    file, and the next seam will do the same. Listing the names instead would leave the newest seam
+    unguarded until someone remembered this rule existed -- which is the shape of the defect the rule
+    is for.
+
+    ``manifest_json`` and ``unavailable_reason`` are fields of ``FrozenManifest`` but not parameters of
+    ``capture``: they are the gate's inputs, not the guard's, so the intersection excludes them
+    without an exception list.
+    """
+    from dataclasses import fields
+
+    from cli_agent_orchestrator.services.manifest_freeze import FrozenManifest
+
+    frozen_fields = {field.name for field in fields(FrozenManifest)}
+    return tuple(sorted(frozen_fields & cl.declared_parameters(ADMISSION_FUNC)))
+
+
+ADMISSION_KWARGS = _admission_kwargs()
+
+#: The complete census of ``launch_guard.capture`` call sites. A new start path
+#: that admits a script run has to be reviewed for the same obligation, so a
+#: new caller fails here first.
+ADMISSION_CALL_SITES = {
+    ("cli_agent_orchestrator/services/script_runner.py", ADMISSION_FUNC): (
+        "blocking script-run start (Step 0b): guard built from frozen.profile_set"
+    ),
+    ("cli_agent_orchestrator/api/main.py", ADMISSION_FUNC): (
+        "async script-run submit (Step 4b): guard built from frozen.profile_set"
+    ),
+}
+
+#: Call sites allowed to let ``capture`` read the store itself. Empty on
+#: purpose: a production admission path never has a reason to.
+ADMISSION_OPT_OUT: dict = {}
+
+ADMISSION_REMEDY = (
+    "`launch_guard.capture` records the launch state a run is admitted under. "
+    "Without the snapshots `manifest_freeze.freeze_manifest` already read, it "
+    "re-derives them AFTER the approval gate, so an input edited in that window "
+    "is recorded as the approved state (PR #1000 P3-3; issue #827 for the root "
+    "identity). Pass " + ", ".join(f"`{kwarg}=frozen.{kwarg}`" for kwarg in ADMISSION_KWARGS) + "."
+)
+
+
+def _capture_passed_as_a_value() -> list:
+    """``launch_guard.capture`` referenced anywhere except as the callee of a call.
+
+    Rules 4a and 4b see ``ast.Call`` nodes whose callee is ``capture``. The pre-fix shape was
+    ``asyncio.to_thread(launch_guard.capture)`` -- the function passed as a VALUE, so neither rule
+    sees it and both pass vacuously. This closes that door: the only legal reference is a direct call.
+    """
+    import ast
+
+    flagged = []
+    for module in cl.parse_sources():
+        callees = {id(node.func) for node in ast.walk(module.tree) if isinstance(node, ast.Call)}
+        for node in ast.walk(module.tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == ADMISSION_FUNC
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "launch_guard"
+                and id(node) not in callees
+            ):
+                flagged.append(f"{module.relpath}:{node.lineno}")
+    return flagged
+
+
+def test_launch_guard_capture_is_only_ever_called_directly() -> None:
+    assert not _capture_passed_as_a_value(), (
+        "launch_guard.capture is passed as a value here, which hides its keyword arguments from "
+        "rules 4a/4b. Call it directly (inside a lambda for asyncio.to_thread): "
+        + ", ".join(_capture_passed_as_a_value())
+    )
+
+
+def test_launch_guard_capture_call_site_census_is_complete() -> None:
+    cl.check_against_allowlist(
+        rule="admission-snapshot-census",
+        sites=cl.call_sites(ADMISSION_FUNC),
+        allowlist=ADMISSION_CALL_SITES,
+        remedy=(
+            "You added a `capture` call site. If it is `launch_guard.capture`, it admits a "
+            "script run and must pass the freeze's snapshot; add a row to ADMISSION_CALL_SITES "
+            "in this file. " + ADMISSION_REMEDY
+        ),
+    )
+
+
+def test_the_admission_snapshot_seams_are_still_declared() -> None:
+    """The derivation must not silently become empty.
+
+    ``_admission_kwargs`` intersects two sets, so deleting the contract on either side -- renaming
+    ``capture``'s parameters, or dropping the fields from ``FrozenManifest`` -- would leave an empty
+    tuple and make the rule below pass vacuously for every call site. Pinning the known seams is what
+    turns that into a deliberate edit of this file.
+    """
+    assert set(ADMISSION_KWARGS) >= {"profile_set", "root_identity"}, (
+        "launch_guard.capture and FrozenManifest no longer share the admission snapshot seams "
+        f"(derived: {ADMISSION_KWARGS}); the contract (PR #1000 P3-3, issue #827) has been removed, "
+        "so update or delete this rule deliberately"
+    )
+
+
+@pytest.mark.parametrize("kwarg", ADMISSION_KWARGS)
+def test_every_launch_guard_capture_passes_the_freeze_snapshot(kwarg: str) -> None:
+    cl.check_against_allowlist(
+        rule=f"admission-snapshot:{kwarg}",
+        sites=cl.missing_kwarg_sites(ADMISSION_FUNC, kwarg),
+        allowlist=ADMISSION_OPT_OUT,
+        remedy=ADMISSION_REMEDY,
+    )

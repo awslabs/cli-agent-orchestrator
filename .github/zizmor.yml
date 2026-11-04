@@ -1,0 +1,31 @@
+# zizmor configuration for the Actions-security gate (.github/workflows/zizmor.yml).
+#
+# The gate fails CI on any Medium-or-higher finding that is not listed here.
+# Every entry below is a deliberate acceptance with a reason, so a future reader
+# can tell a tuned baseline from a silenced finding. Remove an entry when the
+# underlying workflow is fixed; do not add one to make a red run green.
+rules:
+  # Checkouts without `persist-credentials: false`. zizmor rates this Low
+  # confidence; the jobs it flags here run with the read-only default token and
+  # upload no workspace artifacts, so the persisted token is the same one the
+  # job already holds. Re-enable (delete this block) once the checkouts are
+  # moved to persist-credentials: false in a follow-up sweep.
+  artipacked:
+    disable: true
+
+  # ci.yml declares `security-events: write` at workflow level because the four
+  # CodeQL jobs upload SARIF. Scoping it per job is a larger edit of the
+  # largest workflow; tracked as a follow-up, not silently accepted.
+  excessive-permissions:
+    ignore:
+      - ci.yml
+
+  # publish-to-pypi.yml restores the npm cache (`cache: 'npm'` on setup-node)
+  # while building release artifacts. zizmor rates this High: a poisoned cache
+  # entry could reach a published wheel. Fixing it means removing the cache
+  # from the release build (slower installs) and belongs to the release-workflow
+  # owner. Listed here so the gate can land first; this entry must go when the
+  # release workflow is reworked.
+  cache-poisoning:
+    ignore:
+      - publish-to-pypi.yml

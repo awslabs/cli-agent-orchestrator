@@ -1,5 +1,7 @@
 """Shared fixtures for API tests."""
 
+from test.fixtures.decision_runtime import default_decision_runtime  # noqa: F401
+
 import pytest
 from fastapi.testclient import TestClient
 

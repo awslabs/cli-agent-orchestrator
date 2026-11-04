@@ -4,7 +4,6 @@ from typing import Dict
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.constants import (
@@ -154,6 +153,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "working_directory": str(tmp_path),
@@ -187,6 +187,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "caller_id": "dcba8765",
@@ -221,6 +222,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "claude_code",
                     "agent_profile": "analyst",
                     "model": "fable-5",
@@ -251,7 +253,11 @@ class TestTerminalCreationWithWorkingDirectory:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
             assert response.status_code == 201
@@ -274,6 +280,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "model": "fable-5\nrm -rf /",
@@ -286,12 +293,12 @@ class TestTerminalCreationWithWorkingDirectory:
     def test_create_terminal_kas_refusal_maps_to_400_not_404(self, client):
         """A KAS refusal is a bad request, not a missing resource.
 
-        KiroPhase0KASError subclasses ValueError, and this endpoint's generic
+        Every Kiro v3 refusal subclasses ValueError, and this endpoint's generic
         ValueError arm means "session/window not found" -- so without a narrower
         arm ordered first, an engine rejection reports 404. POST /sessions
         already returns 400 for the identical failure.
         """
-        from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
+        from cli_agent_orchestrator.providers.kiro_capabilities import KiroV3LaunchError
 
         with (
             patch(
@@ -301,12 +308,13 @@ class TestTerminalCreationWithWorkingDirectory:
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
             mock_svc.create_terminal = AsyncMock(
-                side_effect=KiroPhase0KASError(profile_has_v2_policy=False)
+                side_effect=KiroV3LaunchError("kiro_v3_unrestricted", "refused")
             )
 
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "engine": "kas",
@@ -314,6 +322,355 @@ class TestTerminalCreationWithWorkingDirectory:
             )
 
         assert response.status_code == 400
+
+    @pytest.mark.parametrize(
+        "endpoint,target",
+        [
+            ("/sessions", "session_service.create_session"),
+            ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
+            ("/sessions/test-session/terminals:operator", "terminal_service.create_terminal"),
+        ],
+    )
+    def test_replay_of_a_failed_original_is_424(self, client, endpoint, target):
+        """Review on PR #773: a keyed replay of a create whose initialization
+        failed answers 424 on every create route, not a retryable 500."""
+        from cli_agent_orchestrator.services.terminal_service import IdempotentCreateFailed
+
+        failed = IdempotentCreateFailed(
+            "terminal 't1' for idempotency_key 'k' failed to initialize"
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(f"cli_agent_orchestrator.api.main.{target}", new=AsyncMock(side_effect=failed)),
+        ):
+            params = {"provider": "kiro_cli", "agent_profile": "analyst", "idempotency_key": "k"}
+            if endpoint.endswith("/terminals"):
+                params["caller_id"] = "dcba8765"  # the in-session route requires one
+            response = client.post(endpoint, params=params)
+
+        assert response.status_code == 424, response.text
+        assert "failed to initialize" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "endpoint,target",
+        [
+            ("/sessions", "session_service.create_session"),
+            ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
+            ("/sessions/test-session/terminals:operator", "terminal_service.create_terminal"),
+        ],
+    )
+    @pytest.mark.parametrize("kind", ["agent_not_found", "identity_mismatch"])
+    def test_kiro_agent_identity_refusal_is_a_bad_request(self, client, endpoint, target, kind):
+        """A Kiro launch whose agent kiro-cli would not run (#1074) is a configuration
+        refusal: 400 with the remedy, not the 404 the generic ValueError arm gives."""
+        from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
+        refusal = KiroAgentIdentityError(
+            kind, "analyst", "Kiro agent 'analyst' ... `cao install analyst --provider kiro_cli`"
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(f"cli_agent_orchestrator.api.main.{target}", new=AsyncMock(side_effect=refusal)),
+        ):
+            params = {"provider": "kiro_cli", "agent_profile": "analyst"}
+            if endpoint.endswith("/terminals"):
+                params["caller_id"] = "dcba8765"  # the in-session route requires one
+            response = client.post(endpoint, params=params)
+
+        assert response.status_code == 400, response.text
+        assert "cao install analyst" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "endpoint,target",
+        [
+            ("/sessions", "session_service.create_session"),
+            ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
+            ("/sessions/test-session/terminals:operator", "terminal_service.create_terminal"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "kind", ["unverified_version", "invalid_agent", "workspace", "attestation"]
+    )
+    def test_every_kiro_v3_refusal_is_a_bad_request(self, client, endpoint, target, kind):
+        """Each v3 refusal subclass is 400 on every create route, never the 404 the
+        in-session routes' generic ValueError arm gives (#1167)."""
+        from cli_agent_orchestrator.providers.kiro_attest import KiroAttestationError
+        from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3UnverifiedVersionError
+        from cli_agent_orchestrator.providers.kiro_workspace import KiroWorkspaceError
+        from cli_agent_orchestrator.services.kiro_v3_validate import (
+            KiroV3Finding,
+            KiroV3InvalidAgentError,
+        )
+
+        refusal = {
+            "unverified_version": lambda: KiroV3UnverifiedVersionError("2.36.0"),
+            "invalid_agent": lambda: KiroV3InvalidAgentError(
+                "analyst", [KiroV3Finding("forbidden_key", "kiroUpgrade")], "Reinstall it."
+            ),
+            "workspace": lambda: KiroWorkspaceError("hooks", "/repo/.kiro/hooks"),
+            "attestation": lambda: KiroAttestationError("kiro_v3_tools_mismatch", "shell"),
+        }[kind]()
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(f"cli_agent_orchestrator.api.main.{target}", new=AsyncMock(side_effect=refusal)),
+        ):
+            params = {"provider": "kiro_cli", "agent_profile": "analyst", "engine": "v3"}
+            if endpoint.endswith("/terminals"):
+                params["caller_id"] = "dcba8765"  # the in-session route requires one
+            response = client.post(endpoint, params=params)
+
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"].startswith(refusal.code)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/sessions",
+            "/sessions/test-session/terminals",
+            "/sessions/test-session/terminals:operator",
+            "/terminals/run-step",
+        ],
+    )
+    def test_a_bad_kiro_effort_on_v3_is_a_bad_request_through_a_real_create(self, client, endpoint):
+        """Through the real create_terminal: the effort refusal is coded, so the
+        in-session, operator and run-step routes answer 400, not the 404 their
+        generic ValueError arm gives (#1167 review)."""
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        profile = AgentProfile(
+            name="analyst",
+            description="a",
+            allowedTools=["fs_read"],
+            kiroConfig={"effort": "--agent"},
+        )
+        probe = MagicMock()
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile",
+                return_value=profile,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.probe_kiro_capabilities", probe
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.get_backend") as backend,
+        ):
+            backend.return_value.session_exists.return_value = True
+            if endpoint == "/terminals/run-step":
+                response = client.post(
+                    endpoint,
+                    json={
+                        "provider": "kiro_cli",
+                        "agent": "analyst",
+                        "prompt": "go",
+                        "engine": "v3",
+                    },
+                )
+            else:
+                params = {"provider": "kiro_cli", "agent_profile": "analyst", "engine": "v3"}
+                if endpoint.endswith("/terminals"):
+                    params["caller_id"] = "dcba8765"
+                response = client.post(endpoint, params=params)
+
+        assert response.status_code == 400, response.text
+        body = response.json()["detail"]
+        text = body if isinstance(body, str) else body["message"]
+        assert text.startswith("kiro_v3_bad_effort: "), text
+        probe.assert_not_called()
+        backend.return_value.create_session.assert_not_called()
+        backend.return_value.create_window.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/sessions",
+            "/sessions/test-session/terminals",
+            "/sessions/test-session/terminals:operator",
+            "/terminals/run-step",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("state", "agent", "starts"),
+        [
+            ("missing", "analyst", "kiro_v3_not_installed: "),
+            ("directory", "analyst", "kiro_v3_agent_unreadable: "),
+            ("symlink_loop", "analyst", "kiro_v3_agent_unreadable: "),
+            ("permission", "analyst", "kiro_v3_agent_unreadable: "),
+            ("missing", "kiro_default", "Kiro agent 'kiro_default' is refused"),
+        ],
+        ids=["missing", "directory", "symlink_loop", "permission", "kiro_default"],
+    )
+    def test_a_v3_agent_file_refusal_is_a_400_naming_no_server_path(
+        self, client, tmp_path, monkeypatch, endpoint, state, agent, starts
+    ):
+        """Through the real create_terminal, on every create route: a missing or
+        unreadable v3 agent file is a coded 400 whose body names neither the
+        agents directory nor the server's home (#1074's contract, #1167 review);
+        ``kiro_default`` keeps its own fallback refusal and no install remedy."""
+        import os
+        from pathlib import Path
+
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+        from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilities
+        from cli_agent_orchestrator.services import install_service, terminal_service
+
+        agents = tmp_path / "server-home" / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(tmp_path / "server-home"))
+        monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", agents)
+        target = agents / f"{agent}.json"
+        if state == "directory":
+            target.mkdir()
+        elif state == "symlink_loop":
+            os.symlink(target, target)
+        elif state == "permission":
+            target.write_text("{}")
+        real_read_bytes = Path.read_bytes
+
+        def read_bytes(path):
+            # A mode-000 file, patched so the test also holds when run as root.
+            if state == "permission" and path == target:
+                raise PermissionError(13, "Permission denied", str(target))
+            return real_read_bytes(path)
+
+        profile = AgentProfile(name=agent, description="a", allowedTools=["fs_read"])
+        caller = {"id": "dcba8765", "provider": "claude_code", "allowed_tools": ["*"]}
+        real_metadata = terminal_service.get_terminal_metadata
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile",
+                return_value=profile,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.probe_kiro_capabilities",
+                return_value=KiroCapabilities(version="2.35.1", flags=frozenset()),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                side_effect=lambda tid: caller if tid == "dcba8765" else real_metadata(tid),
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.get_backend") as backend,
+            patch.object(Path, "read_bytes", read_bytes),
+        ):
+            backend.return_value.session_exists.return_value = True
+            if endpoint == "/terminals/run-step":
+                response = client.post(
+                    endpoint,
+                    json={"provider": "kiro_cli", "agent": agent, "prompt": "go", "engine": "v3"},
+                )
+            else:
+                params = {"provider": "kiro_cli", "agent_profile": agent, "engine": "v3"}
+                if endpoint.endswith("/terminals"):
+                    params["caller_id"] = "dcba8765"
+                response = client.post(endpoint, params=params)
+
+        assert response.status_code == 400, response.text
+        body = response.json()["detail"]
+        text = body if isinstance(body, str) else body["message"]
+        assert text.startswith(starts), text
+        assert str(agents) not in text and os.path.realpath(agents) not in text
+        assert str(tmp_path) not in text and "server-home" not in text
+        if state == "permission":
+            assert "PermissionError" in text
+        if agent == "kiro_default":
+            assert "--engine v3" not in text
+        else:
+            assert f"cao install {agent} --provider kiro_cli --engine v3" in text
+        backend.return_value.create_session.assert_not_called()
+        backend.return_value.create_window.assert_not_called()
+
+    def test_an_agent_not_found_body_names_no_server_path(self, client, tmp_path):
+        """The real refusal's text is the 400 body: the remedy, not the directories
+        searched, which only the server log gets (#1074; shared-server mode)."""
+        from cli_agent_orchestrator.providers.kiro_identity import (
+            KiroAgentIdentityError,
+            require_kiro_agent_defined,
+        )
+
+        searched = [tmp_path / "repo" / ".kiro" / "agents", tmp_path / "home" / ".kiro" / "agents"]
+        with pytest.raises(KiroAgentIdentityError) as excinfo:
+            require_kiro_agent_defined("analyst", searched)
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.create_session",
+                new=AsyncMock(side_effect=excinfo.value),
+            ),
+        ):
+            response = client.post(
+                "/sessions", params={"provider": "kiro_cli", "agent_profile": "analyst"}
+            )
+
+        assert response.status_code == 400, response.text
+        detail = response.json()["detail"]
+        assert "cao install analyst --provider kiro_cli" in detail
+        assert str(tmp_path) not in detail
+
+    @pytest.mark.parametrize("kind", ["agent_not_found", "identity_mismatch"])
+    def test_kiro_agent_identity_refusal_is_a_bad_request_on_run_step(self, client, kind):
+        """run-step maps the refusal ahead of its generic ValueError arm too (#1074)."""
+        from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
+        refusal = KiroAgentIdentityError(
+            kind, "analyst", "Kiro agent 'analyst' ... `cao install analyst --provider kiro_cli`"
+        )
+        with patch(
+            "cli_agent_orchestrator.api.main.run_agent_step",
+            new=AsyncMock(side_effect=refusal),
+        ):
+            response = client.post(
+                "/terminals/run-step",
+                json={"provider": "kiro_cli", "agent": "analyst", "prompt": "do it"},
+            )
+
+        assert response.status_code == 400, response.text
+        assert "cao install analyst" in response.json()["detail"]
+
+    def test_input_to_a_terminal_with_a_deferred_init_failure_is_a_conflict(self, client):
+        """POST /terminals/{id}/input refuses a terminal whose deferred init failed
+        durably (#1074): 409, and no key reaches the pane."""
+        metadata = {
+            "id": "abcd1234",
+            "provider": "kiro_cli",
+            "tmux_session": "cao-s",
+            "tmux_window": "developer-w",
+            "deferred_init_failure": {
+                "phase": "deferred_init",
+                "kind": "provider_init_error",
+                "exception_type": "KiroAgentIdentityError",
+            },
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.get_backend") as backend,
+        ):
+            response = client.post("/terminals/abcd1234/input", params={"message": "SEND-CANARY"})
+
+        assert response.status_code == 409, response.text
+        assert "deferred initialization" in response.json()["detail"]
+        backend.return_value.send_keys.assert_not_called()
 
     @pytest.mark.parametrize(
         "endpoint,target",
@@ -349,7 +706,12 @@ class TestTerminalCreationWithWorkingDirectory:
             ),
         ):
             response = client.post(
-                endpoint, params={"provider": "kiro_cli", "agent_profile": "analyst"}
+                endpoint,
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
         assert response.status_code == 400, response.text
@@ -368,7 +730,11 @@ class TestTerminalCreationWithWorkingDirectory:
         ):
             response = client.post(
                 "/sessions/missing/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
         assert response.status_code == 404
@@ -387,6 +753,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "caller_id": "not-a-terminal-id!",
@@ -418,6 +785,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "working_directory": "/session/path",
@@ -451,6 +819,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "use_worktree": "true",
@@ -481,7 +850,11 @@ class TestTerminalCreationWithWorkingDirectory:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
             assert response.status_code == 201
@@ -507,6 +880,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "use_worktree": "true",
@@ -538,6 +912,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "idempotency_key": "retry-1",
@@ -562,7 +937,11 @@ class TestTerminalCreationWithWorkingDirectory:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
                 json={"initial_message": "do work"},
             )
 
@@ -610,6 +989,22 @@ class TestExitTerminalEndpoint:
             assert response.status_code == 500
             assert "Failed to exit terminal" in response.json()["detail"]
 
+    def test_exit_terminal_input_blocked_maps_to_409_not_500(self, client):
+        """A text exit command going through dispatch_input's refusal (#1074) is
+        a conflict with the terminal's state, not a server fault."""
+        from cli_agent_orchestrator.models.terminal import ProviderExitedInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.exit_terminal_cli.side_effect = ProviderExitedInputBlockedError(
+                "Terminal abcd1234 failed deferred initialization (identity_mismatch). "
+                "Refusing to deliver input."
+            )
+
+            response = client.post("/terminals/abcd1234/exit")
+
+            assert response.status_code == 409
+            assert "Refusing to deliver input" in response.json()["detail"]
+
 
 class TestDeleteTerminalEndpoint:
     """Test DELETE /terminals/{terminal_id} endpoint."""
@@ -623,7 +1018,9 @@ class TestDeleteTerminalEndpoint:
 
             assert response.status_code == 200
             assert response.json() == {"success": True}
-            mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
+            mock_svc.delete_terminal.assert_called_once_with(
+                "abcd1234", registry=ANY, end_reason="deleted"
+            )
 
     def test_delete_terminal_deferred_cleanup_is_conflict(self, client):
         """A retained Grok home is a failed delete, not HTTP 200."""
@@ -659,18 +1056,30 @@ class TestCreateInboxMessageEndpoint:
     """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
 
     def test_create_inbox_message_success(self, client):
-        """POST creates an inbox message and returns success."""
+        """POST creates an inbox message and starts immediate delivery with the
+        P2-2 contract (#78, PR #1004): deliver_pending gets the app's plugin
+        registry and the endpoint's own after_dispatch callback. That the
+        callback releases the response is proven in
+        test_inbox_messages.py::TestCreateInboxMessageResponseTiming by calling
+        the endpoint directly; through TestClient the per-request loop shutdown
+        waits for the delivery thread, so no timing is asserted here."""
         mock_msg = MagicMock()
         mock_msg.id = 1
         mock_msg.sender_id = "sender1"
         mock_msg.receiver_id = "abcd1234"
         mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+        delivery_calls = []
+
+        def deliver(receiver_id, registry=None, after_dispatch=None):
+            delivery_calls.append((receiver_id, registry, after_dispatch))
+            after_dispatch()  # the paste reached the pane
 
         with (
             patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
             mock_create.return_value = mock_msg
+            mock_inbox.deliver_pending.side_effect = deliver
 
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
@@ -687,7 +1096,15 @@ class TestCreateInboxMessageEndpoint:
                 "abcd1234",
                 "hello",
             )
-            mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
+
+        assert len(delivery_calls) == 1
+        receiver_id, registry, after_dispatch = delivery_calls[0]
+        assert receiver_id == "abcd1234"
+        assert registry is app.state.plugin_registry
+        assert callable(after_dispatch)
+        assert after_dispatch.__qualname__.endswith(
+            "create_inbox_message_endpoint.<locals>._mark_dispatched"
+        ), "deliver_pending must get the endpoint's own post-dispatch marker"
 
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""
@@ -1391,6 +1808,7 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "agent_profile": "developer",
                 },
             )
@@ -1423,6 +1841,7 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "reviewer",
                 },
@@ -1474,6 +1893,7 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "agent_profile": "developer",
                 },
             )

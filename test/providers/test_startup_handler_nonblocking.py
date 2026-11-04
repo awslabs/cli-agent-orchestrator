@@ -246,9 +246,15 @@ async def _codex_initialize_run() -> tuple[int, float]:
     def _blocking(*_args, **_kwargs):
         time.sleep(_MAX_GAP_BLOCKING_SECONDS)
 
+    # The pane's foreground process as a real pane reports it: the shell at the
+    # baseline read before launch, codex at every read after it. ``initialize()``
+    # compares the two during startup (#1018), so a fake that answers "zsh"
+    # forever describes a codex that exited, and startup correctly fails.
+    pane_reads = iter(["zsh"])
+
     def _blocking_pane_command(*_args, **_kwargs) -> str:
         time.sleep(_MAX_GAP_BLOCKING_SECONDS)
-        return "zsh"
+        return next(pane_reads, "codex")
 
     mock_backend = MagicMock()
     mock_backend.send_keys.side_effect = _blocking

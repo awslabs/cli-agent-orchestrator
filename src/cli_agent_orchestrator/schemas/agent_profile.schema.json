@@ -37,13 +37,18 @@
     },
     "engine": {
       "type": "string",
-      "enum": ["v2", "kas"],
-      "description": "Kiro engine selection."
+      "enum": ["v2", "v3", "kas"],
+      "description": "Kiro engine selection. 'kas' is an alias of 'v3' and is stored as 'v3'."
     },
     "allowedTools": {
       "type": "array",
       "items": {"type": "string"},
       "description": "CAO tool vocabulary allowlist."
+    },
+    "delegateTools": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Delegation ceiling: the most this agent may grant to workers it creates via assign, handoff or a workflow step (same vocabulary as allowedTools). Defaults to ['*'] for role supervisor and to the agent's own allowedTools otherwise. See docs/tool-restrictions.md."
     },
     "mcpServers": {
       "type": "object",
@@ -94,6 +99,9 @@
       "type": "object"
     },
     "claudeConfig": {
+      "type": "object"
+    },
+    "kiroConfig": {
       "type": "object"
     },
     "hermesProfile": {

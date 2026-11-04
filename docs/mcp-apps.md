@@ -65,6 +65,12 @@ build or a missing frontend build degrades gracefully (logged, never fatal).
 - `submit_command` — the **single mutation choke point**: classifies the command
   kind, applies a scope pre-check, and routes to a real Backplane HTTP endpoint.
 
+Tools whose `visibility` omits `"model"` (`cao_fetch_history`, `subscribe_events`,
+`submit_command`) are left out of `tools/list`, and `tools/call` rejects them as
+unknown tools for every client, including MCP App hosts. FastMCP 3 applied this
+filter itself; FastMCP 4 leaves it to the host and agent CLIs do not apply it, so
+`register_app_tools` adds a middleware that keeps it.
+
 Each rendering tool carries a `_meta.ui` annotation. The **spec-standard** tool
 fields are `resourceUri` + `visibility`; the spec-standard *resource* fields are a
 structured `csp`, `permissions`, `domain`, and `prefersBorder`, with MIME

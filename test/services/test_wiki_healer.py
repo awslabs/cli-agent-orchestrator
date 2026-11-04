@@ -28,7 +28,6 @@ from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
 from cli_agent_orchestrator.services import audit_log, wiki_healer
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.wiki_healer import (
-    MAX_HEAL_ACTIONS,
     STALE_CLAIM_PRESTRIP_PARAGRAPH_MAX_BYTES,
     HealConflictError,
     _parse_stale_identifier,

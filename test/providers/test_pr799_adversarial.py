@@ -2795,7 +2795,7 @@ class TestPR799CurrentMaintainerReview:
         assert ts._worker_is_started_direct("review-drop", provider) is False
         send = MagicMock()
         monkeypatch.setattr(ts, "dispatch_input", send)
-        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        monkeypatch.setattr(ts, "_message_in_composer", lambda *_: None)
         assert ts.redeliver_dropped_message("review-drop", "do the task", 1, provider) is False
         send.assert_called_once()
 
@@ -3137,7 +3137,7 @@ class TestPR799CurrentMaintainerReview:
         assert provider._execution_observed is False
         send = MagicMock()
         monkeypatch.setattr(ts, "dispatch_input", send)
-        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        monkeypatch.setattr(ts, "_message_in_composer", lambda *_: None)
         assert ts.redeliver_dropped_message(provider.terminal_id, "new task", 1, provider) is False
         send.assert_called_once()
 
@@ -3244,7 +3244,7 @@ class TestPR799CurrentMaintainerReview:
         assert provider._execution_observed is new_activity
         resend = MagicMock()
         monkeypatch.setattr(ts, "dispatch_input", resend)
-        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        monkeypatch.setattr(ts, "_message_in_composer", lambda *_: None)
         assert (
             ts.redeliver_dropped_message(provider.terminal_id, "New task", 1, provider)
             is new_activity
@@ -3446,7 +3446,7 @@ class TestPR799CurrentMaintainerReview:
         accepted = ts._worker_is_started_direct(provider.terminal_id, provider)
         resend = MagicMock()
         monkeypatch.setattr(ts, "dispatch_input", resend)
-        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        monkeypatch.setattr(ts, "_message_in_composer", lambda *_: None)
         result = ts.redeliver_dropped_message(provider.terminal_id, "New task", 1, provider)
         expected = delivery != "dropped"
         assert (accepted, result, resend.call_count) == (expected, expected, 0 if expected else 1)
@@ -3525,7 +3525,7 @@ class TestPR799CurrentMaintainerReview:
         monkeypatch.setattr(
             ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
         )
-        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        monkeypatch.setattr(ts, "_message_in_composer", lambda *_: None)
         resend = MagicMock()
         monkeypatch.setattr(ts, "dispatch_input", resend)
         monitor.clear_rolling_buffer(provider.terminal_id, provider)
@@ -3596,7 +3596,7 @@ class TestPR799CurrentMaintainerReview:
         assert provider.execution_evidence_ambiguous is False
         resend = MagicMock()
         monkeypatch.setattr(ts, "dispatch_input", resend)
-        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        monkeypatch.setattr(ts, "_message_in_composer", lambda *_: None)
         assert ts.redeliver_dropped_message(provider.terminal_id, "New task", 1, provider) is False
         resend.assert_called_once()
 
@@ -3641,7 +3641,7 @@ class TestPR799CurrentMaintainerReview:
         assert ts._worker_is_started_direct(provider.terminal_id, provider) is True
         resend = MagicMock()
         monkeypatch.setattr(ts, "dispatch_input", resend)
-        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        monkeypatch.setattr(ts, "_message_in_composer", lambda *_: None)
         assert ts.redeliver_dropped_message(provider.terminal_id, "New task", 1, provider) is True
         resend.assert_not_called()
         monitor.clear_rolling_buffer(provider.terminal_id, provider)

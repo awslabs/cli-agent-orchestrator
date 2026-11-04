@@ -13,7 +13,14 @@ from cli_agent_orchestrator.utils.terminal import sync_backend_from_server
 
 @click.group()
 def terminal():
-    """Manage CAO terminals."""
+    """Manage CAO terminals.
+
+    Requires a running cao-server.
+
+    \b
+    Examples:
+      cao terminal restore 1a2b3c4d
+    """
 
 
 @terminal.command("restore")
@@ -24,6 +31,8 @@ def restore(terminal_id: str):
     Creates a plain shell window in the original session at the original
     working directory and loads the saved scrollback history into the pane.
     The session must still exist.
+
+    Requires a running cao-server.
     """
     snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
     scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"

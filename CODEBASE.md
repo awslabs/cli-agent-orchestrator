@@ -31,6 +31,7 @@ to use.
 | `src/cli_agent_orchestrator/mcp_server/` | In-session orchestration MCP tools |
 | `src/cli_agent_orchestrator/ops_mcp_server/` | External operations MCP tools |
 | `src/cli_agent_orchestrator/services/` | Session, terminal, inbox, workflow, memory, event, configuration, and plugin services |
+| `src/cli_agent_orchestrator/decisions/` | Launch-decision platform: points, policy, settings, deciders, records, shadow runner, telemetry, and operator access ([docs](docs/decisions.md)) |
 | `src/cli_agent_orchestrator/backends/` | Terminal-backend abstraction and tmux/herdr implementations |
 | `src/cli_agent_orchestrator/clients/` | SQLite and tmux clients used by services and backends |
 | `src/cli_agent_orchestrator/providers/` | Provider adapters for interactive agent CLIs |
@@ -49,7 +50,7 @@ to use.
 | `src/cao_workflow/` | Standalone workflow authoring/runtime package shipped by the project |
 | `web/` | React browser UI source and build configuration |
 | `cao_mcp_apps/` | MCP App React views and build tooling |
-| `agent-plugin/` | CAO's own Agent Plugins 1.0.0 packages (`cao`, `cao-contributor`), generated and checked by `make check-agent-plugin` |
+| `agent-plugin/` | CAO's own Agent Plugins 1.0.0 packages (`cao`, `cao-contributor`, `cao-agent-plugin-lifecycle`), generated and checked by `make check-agent-plugin` |
 | `test/` | Unit, API, CLI, documentation, and integration tests |
 
 ## Request and service flow

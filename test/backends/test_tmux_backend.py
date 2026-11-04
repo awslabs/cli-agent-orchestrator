@@ -63,6 +63,15 @@ class TestTmuxBackendDelegation:
         with pytest.raises(TerminalBackendError, match="Failed to create session"):
             backend.create_session("cao-test", "window-0", "tid123")
 
+    def test_restore_session_env_delegates(self, backend, mock_client):
+        backend.restore_session_env("cao-test", "KIRO_HOME", "/h")
+        mock_client.restore_session_env.assert_called_once_with("cao-test", "KIRO_HOME", "/h")
+
+    def test_restore_session_env_wraps_error(self, backend, mock_client):
+        mock_client.restore_session_env.side_effect = ValueError("still set")
+        with pytest.raises(TerminalBackendError, match="Failed to restore KIRO_HOME"):
+            backend.restore_session_env("cao-test", "KIRO_HOME", "/h")
+
     def test_session_exists_delegates(self, backend, mock_client):
         mock_client.session_exists.return_value = True
         assert backend.session_exists("cao-test") is True
@@ -131,8 +140,13 @@ class TestTmuxBackendDelegation:
             strip_escapes=False,
             full_history=False,
             visible_only=False,
+            join_wrapped=False,
         )
         assert result == "output text"
+
+    def test_get_history_delegates_join_wrapped(self, backend, mock_client):
+        backend.get_history("cao-test", "window-0", join_wrapped=True)
+        assert mock_client.get_history.call_args.kwargs["join_wrapped"] is True
 
     def test_get_history_delegates_visible_only(self, backend, mock_client):
         mock_client.get_history.return_value = "viewport text"
@@ -144,6 +158,7 @@ class TestTmuxBackendDelegation:
             strip_escapes=False,
             full_history=False,
             visible_only=True,
+            join_wrapped=False,
         )
         assert result == "viewport text"
 
@@ -173,3 +188,85 @@ class TestTmuxBackendDefaultClient:
     def test_uses_module_singleton(self, mock_singleton):
         backend = TmuxBackend()
         assert backend._client is mock_singleton
+
+
+class TestRestoreSessionEnv:
+    """Giving a session back the value it would have had without the first window's (#1074)."""
+
+    LAUNCH = "/cao/ephemeral/kiro/0a1b2c3d"
+
+    @pytest.fixture
+    def client_on(self, monkeypatch):
+        """A TmuxClient with no libtmux server, its session a mock reading back ``readback``."""
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+
+        def make(readback):
+            session = MagicMock()
+            session.show_environment.side_effect = lambda: dict(readback)
+            client = TmuxClient.__new__(TmuxClient)
+            client._find_session = MagicMock(return_value=session)
+            return client, session
+
+        return make
+
+    def test_a_backend_that_does_not_say_how_its_env_is_scoped_refuses(self):
+        class Unscoped(TmuxBackend):
+            restore_session_env = TerminalBackend.restore_session_env
+
+        with pytest.raises(TerminalBackendError, match="cannot keep KIRO_HOME out"):
+            Unscoped(client=MagicMock()).restore_session_env("cao-test", "KIRO_HOME", self.LAUNCH)
+
+    def test_without_a_forwarded_value_the_key_is_unset_and_read_back_absent(self, client_on):
+        client, session = client_on({"CAO_TERMINAL_ID": "t1"})
+        client.restore_session_env("cao-test", "KIRO_HOME", self.LAUNCH)
+        session.unset_environment.assert_called_once_with("KIRO_HOME")
+        session.set_environment.assert_not_called()
+
+        client, _ = client_on({"KIRO_HOME": self.LAUNCH})
+        with pytest.raises(ValueError, match="other than the forwarded one"):
+            client.restore_session_env("cao-test", "KIRO_HOME", self.LAUNCH)
+
+    def test_the_servers_own_value_is_set_back_and_read_back(self, client_on, monkeypatch):
+        monkeypatch.setenv("KIRO_HOME", "/srv/kiro")
+        client, session = client_on({"KIRO_HOME": "/srv/kiro"})
+        client.restore_session_env("cao-test", "KIRO_HOME", self.LAUNCH)
+        session.set_environment.assert_called_once_with("KIRO_HOME", "/srv/kiro")
+        session.unset_environment.assert_not_called()
+
+        for readback in ({"KIRO_HOME": self.LAUNCH}, {}):
+            client, _ = client_on(readback)
+            with pytest.raises(ValueError, match="other than the forwarded one"):
+                client.restore_session_env("cao-test", "KIRO_HOME", self.LAUNCH)
+
+    @pytest.mark.parametrize("filtered", ["over the byte cap", "a blocked prefix"])
+    def test_a_value_create_session_would_not_forward_is_unset_not_restored(
+        self, client_on, monkeypatch, filtered
+    ):
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        if filtered == "over the byte cap":
+            monkeypatch.setenv("KIRO_HOME", "/" + "k" * TmuxClient._MAX_ENV_VALUE_BYTES)
+        else:
+            monkeypatch.setenv("KIRO_HOME", "/srv/kiro")
+            monkeypatch.setattr(TmuxClient, "_BLOCKED_ENV_PREFIXES", ("KIRO_",))
+        assert "KIRO_HOME" not in TmuxClient._forwarded_server_env()
+        client, session = client_on({})
+        client.restore_session_env("cao-test", "KIRO_HOME", self.LAUNCH)
+        session.unset_environment.assert_called_once_with("KIRO_HOME")
+        session.set_environment.assert_not_called()
+
+    def test_the_launch_value_is_never_restored_and_a_gone_session_refuses(
+        self, client_on, monkeypatch
+    ):
+        monkeypatch.setenv("KIRO_HOME", self.LAUNCH)
+        client, session = client_on({})
+        with pytest.raises(ValueError, match="private to the first window"):
+            client.restore_session_env("cao-test", "KIRO_HOME", self.LAUNCH)
+        session.set_environment.assert_not_called()
+
+        monkeypatch.delenv("KIRO_HOME")
+        client._find_session.return_value = None
+        with pytest.raises(ValueError, match="not found"):
+            client.restore_session_env("cao-test", "KIRO_HOME", self.LAUNCH)

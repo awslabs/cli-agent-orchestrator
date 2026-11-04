@@ -5,12 +5,11 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, NamedTuple, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, TypeVar, cast
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
-    Column,
     DateTime,
     Float,
     Index,
@@ -19,15 +18,41 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    exists,
+    func,
     literal_column,
     text,
 )
-from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.types import TypeDecorator
 
-from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
+if TYPE_CHECKING:
+    from sqlalchemy import Column as _SAColumn
+
+    _T = TypeVar("_T")
+
+    class Column(_SAColumn[_T]):
+        """Type-checking view of ``sqlalchemy.Column`` for the legacy models below.
+
+        SQLAlchemy 2.1 gave ``Column`` a typing-only ``__get__`` that returns
+        ``Never`` for class-level access, to stop ``TypedColumns`` classes being
+        used as ORM classes. These models declare ``x = Column(...)`` without
+        ``Mapped[]``, so under 2.1 every ``Model.x`` became ``Never`` and mypy
+        stopped checking the code after it. This restores 2.0's typing, where
+        ``Model.x`` is ``Column[T]``. Runtime uses the real ``Column`` (below).
+        """
+
+        def __get__(  # type: ignore[override]  # 2.1's overload returns Never
+            self, instance: Any, owner: Any
+        ) -> "_SAColumn[_T]": ...
+
+else:
+    from sqlalchemy import Column
+
+from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.kiro_engine import canonical_kiro_engine
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +101,7 @@ class SessionIncarnationModel(Base):
 
 
 class EphemeralAgentModel(Base):
-    """Read-only access to the server-owned ephemeral registry."""
+    """Server-owned ephemeral registry with guarded lifecycle transitions."""
 
     __tablename__ = "ephemeral_agents"
 
@@ -87,15 +112,15 @@ class EphemeralAgentModel(Base):
     state = Column(String, nullable=False)
     claim_id = Column(String, nullable=True)
     idempotency_key = Column(String, nullable=True)
-    claim_expires_at = Column(DateTime, nullable=True)
+    claim_expires_at = Column(UTCDateTime, nullable=True)
     launched_terminal_id = Column(String, nullable=True, index=True)
-    bound_at = Column(DateTime, nullable=True)
+    bound_at = Column(UTCDateTime, nullable=True)
     model_tier = Column(String, nullable=True)
     effort = Column(String, nullable=True)
     provider = Column(String, nullable=False)
     effective_tools = Column(Text, nullable=False)
-    created_at = Column(DateTime, nullable=False)
-    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(UTCDateTime, nullable=False)
+    expires_at = Column(UTCDateTime, nullable=False)
     gc_reason = Column(String, nullable=True)
     spec_sha256 = Column(String, nullable=False)
     profile_sha256 = Column(String, nullable=False)
@@ -155,6 +180,7 @@ class TerminalModel(Base):
     __tablename__ = "terminals"
 
     id = Column(String, primary_key=True)  # "abc123ef"
+    description = Column(Text, nullable=True)
     tmux_session = Column(String, nullable=False)  # "cao-session-name"
     tmux_window = Column(String, nullable=False)  # a window name, or a pane mark
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
@@ -163,6 +189,12 @@ class TerminalModel(Base):
     model_honored = Column(Boolean, nullable=True)  # NULL = unknown for pre-migration rows
     working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
+    # JSON-encoded delegation ceiling: the most this terminal may grant to the
+    # children it creates (utils/delegation.py). Capped by the creator's own
+    # ceiling at creation time and read from THIS ROW when it creates children,
+    # never re-derived from its profile. NULL = pre-migration row, which is
+    # bounded by its own allowed_tools until relaunched.
+    delegate_tools = Column(Text, nullable=True)
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
     engine = Column(String, nullable=True)  # resolved Kiro engine; NULL for legacy/non-Kiro rows
@@ -209,6 +241,12 @@ class TerminalModel(Base):
     # distinguish the old rows from failures that belong to the CURRENT live
     # session. NULL is reserved for rows created before this column existed.
     session_incarnation_id = Column(String, nullable=True)
+    # Whether CAO recorded that this Kiro runtime passed its identity check (#1074).
+    # False is written with every kiro_cli row and True only once the provider's
+    # header check has passed; it never goes back. NULL means a non-Kiro row, or a
+    # row that predates the column. A kiro_cli terminal takes typed input only when
+    # this is True (terminal_service.terminal_input_refusal).
+    identity_verified = Column(Boolean, nullable=True)
     last_active = Column(UTCDateTime, default=_utcnow)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
@@ -276,6 +314,446 @@ class InboxModel(Base):
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(UTCDateTime, default=_utcnow)
+
+
+class DecisionRecordModel(Base):
+    """Content-free decision records retained independently of terminals."""
+
+    __tablename__ = "decision_records"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+    contract_version = Column(Integer, default=1, nullable=False)
+    point = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    decider = Column(String, nullable=True)
+    decider_version = Column(String, nullable=True)
+    kind = Column(String, nullable=False)
+    provider = Column(String, nullable=False)
+    agent_profile = Column(String, nullable=True)
+    # installed, ephemeral or workflow; NULL on rows written before the column existed.
+    target_kind = Column(String, nullable=True)
+    fallback_value = Column(String, nullable=True)
+    fallback_source = Column(String, nullable=False)
+    answer = Column(String, nullable=True)
+    probabilities = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    candidate_value = Column(String, nullable=True)
+    candidate_model = Column(String, nullable=True)
+    applied_value = Column(String, nullable=True)
+    outcome = Column(String, nullable=False)
+    reason = Column(String, nullable=True)
+    launched_model = Column(String, nullable=True)
+    model_honored = Column(Boolean, nullable=True)
+    latency_ms = Column(Float, nullable=True)
+    decision_status = Column(String, default="done", nullable=False)
+    launch_status = Column(String, default="pending", nullable=False)
+    terminal_id = Column(String, nullable=True)
+    message_hash = Column(String, nullable=True)
+    hash_key_id = Column(String, nullable=True)
+    message_bytes = Column(Integer, nullable=True)
+    # provider.route rows only (#1099): the per-launch options as a JSON list, and the
+    # enforcement labels of the fallback and the applied provider. NULL on other rows.
+    options = Column(Text, nullable=True)
+    fallback_enforcement = Column(String, nullable=True)
+    applied_enforcement = Column(String, nullable=True)
+    __table_args__ = (
+        Index("ix_decision_records_created_at", "created_at"),
+        Index("ix_decision_records_terminal_id", "terminal_id"),
+        Index("ix_decision_records_point_created_at", "point", "created_at"),
+        {"sqlite_autoincrement": True},
+    )
+
+
+# target_kind vocabulary (issue #1082), independent of decisions/targets.py's
+# TargetKind: that module still has no "workflow" value at #1076 (merged at
+# 2192bd43); it labels a workflow step's own decision record with the bare
+# string "workflow", outside the enum. This module's "workflow" is wider --
+# any terminal launched with CAO_WORKFLOW_RUN_ID, YAML engine steps included,
+# not only a live script run's own step -- so the two vocabularies are kept
+# separate rather than merged. See _classify_launch_target_kind. Every write
+# through _record_launch_best_effort checks its result against this tuple and
+# fails closed (logs, stores no kind) rather than writing an unknown value.
+LAUNCH_TARGET_KINDS = ("installed", "ephemeral", "workflow")
+
+# Why a launch ended (issue #1082, provisional vocabulary). Each names the
+# cause, not the DB function that ran: ``launch_failed`` (create rollback or a
+# failed deferred init), ``deleted`` (an explicit delete, or handoff/workflow
+# step teardown), ``pane_closed`` (herdr reported the pane or workspace gone),
+# ``stale_cleanup`` (a sweep of rows nobody owns any more, or a record whose
+# row a teardown removed before the record was written) and
+# ``session_teardown`` (session delete or flow recycle). Every teardown
+# function that finalizes takes one as a required keyword, so a new call site
+# has to choose.
+LAUNCH_END_REASONS = (
+    "launch_failed",
+    "deleted",
+    "pane_closed",
+    "stale_cleanup",
+    "session_teardown",
+)
+
+
+class LaunchRecordModel(Base):
+    """Content-free per-launch record, kept after teardown (issue #1082).
+
+    One row per launch: never prompts, briefs, messages or output -- only
+    labels, timings, ids and outcomes. Terminal ids are 8 hex characters and
+    are not checked against past launches, so a later terminal can reuse one;
+    ``id`` is therefore a surrogate key and ``terminal_id`` is indexed, not
+    unique. A row is NEVER removed when the terminal row is deleted; teardown
+    only stamps ``ended_at``/``end_reason`` on the newest open row for that
+    terminal id via ``finalize_launch_records``.
+    """
+
+    __tablename__ = "launch_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    terminal_id = Column(String, nullable=False)
+    session_name = Column(String, nullable=False)
+    provider = Column(String, nullable=False)
+    target_name = Column(String, nullable=True)  # agent profile or ephemeral name
+    # One of LAUNCH_TARGET_KINDS, or NULL if the classifier's result failed
+    # that check and _record_launch_best_effort recorded no kind instead.
+    target_kind = Column(String, nullable=True)
+    launched_model = Column(String, nullable=True)
+    model_honored = Column(Boolean, nullable=True)
+    provider_session_id = Column(String, nullable=True)
+    # JSON-encoded tuple of decision_records ids this launch applied (LaunchPlan.record_ids).
+    record_ids = Column(Text, nullable=True)
+    caller_id = Column(String, nullable=True)
+    outcome = Column(String, nullable=True)  # "success" | "failure", via report_outcome
+    outcome_recorded_at = Column(UTCDateTime, nullable=True)
+    # source_terminal_id of the report that set ``outcome`` (last write wins),
+    # so a worker's self-report can be told apart from its creator's verdict.
+    outcome_reporter_id = Column(String, nullable=True)
+    created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    ended_at = Column(UTCDateTime, nullable=True)
+    end_reason = Column(String, nullable=True)  # one of LAUNCH_END_REASONS
+    __table_args__ = (
+        Index("ix_launch_records_terminal_id", "terminal_id"),
+        Index("ix_launch_records_created_at", "created_at"),
+        Index("ix_launch_records_ended_at", "ended_at"),
+        {"sqlite_autoincrement": True},
+    )
+
+
+class LaunchStatusEventModel(Base):
+    """Status transitions for a launch, used to compute busy time (issue #1082).
+
+    Content-free: just the status label and when it was observed. tmux
+    terminals get one row per detected change (``StatusMonitor._apply_detection``);
+    herdr terminals get one row per change in the ``agent_status`` herdr
+    reports for a managed pane (``HerdrInboxService``). Rows carry only the
+    terminal id; ``compute_busy_seconds`` attributes them to one launch by time.
+    """
+
+    __tablename__ = "launch_status_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    terminal_id = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    __table_args__ = (
+        Index("ix_launch_status_events_terminal_created", "terminal_id", "created_at"),
+        {"sqlite_autoincrement": True},
+    )
+
+
+def create_launch_record(
+    terminal_id: str,
+    session_name: str,
+    provider: str,
+    target_name: Optional[str],
+    target_kind: Optional[str],
+    launched_model: Optional[str],
+    model_honored: Optional[bool],
+    provider_session_id: Optional[str] = None,
+    record_ids: tuple[int, ...] = (),
+    caller_id: Optional[str] = None,
+) -> Optional[int]:
+    """Write the one content-free launch row for a freshly created terminal.
+
+    Returns the new row's id, or None if the write failed. Best-effort: never
+    raises. A failure here must never fail or alter the launch it describes
+    (issue #1082 acceptance criteria).
+    """
+    try:
+        with SessionLocal() as db:
+            record = LaunchRecordModel(
+                terminal_id=terminal_id,
+                session_name=session_name,
+                provider=provider,
+                target_name=target_name,
+                target_kind=target_kind,
+                launched_model=launched_model,
+                model_honored=model_honored,
+                provider_session_id=provider_session_id,
+                record_ids=_json.dumps(list(record_ids)) if record_ids else None,
+                caller_id=caller_id,
+                created_at=_utcnow(),
+            )
+            db.add(record)
+            db.flush()
+            record_id = cast(int, record.id)
+            db.commit()
+        return record_id
+    except Exception as e:
+        logger.warning(f"Launch record create failed for {terminal_id}: {e}")
+        return None
+
+
+def finalize_launch_records(terminal_ids: List[str], end_reason: str) -> None:
+    """Stamp ``ended_at``/``end_reason`` on launch records for torn-down terminals.
+
+    Per terminal id, only the newest still-open row is stamped: one teardown
+    ends one launch, so an older launch under a reused id keeps its own end.
+    Best-effort and idempotent: a terminal with no open launch record (never
+    recorded, pre-migration, or already finalized, so the first reason wins)
+    is silently skipped. Never raises -- a failure here must never fail or
+    alter teardown.
+    """
+    if not terminal_ids:
+        return
+    try:
+        with SessionLocal() as db:
+            newest_open = [
+                row[0]
+                for row in db.query(func.max(LaunchRecordModel.id))
+                .filter(
+                    LaunchRecordModel.terminal_id.in_(terminal_ids),
+                    LaunchRecordModel.ended_at.is_(None),
+                )
+                .group_by(LaunchRecordModel.terminal_id)
+                .all()
+            ]
+            if newest_open:
+                db.query(LaunchRecordModel).filter(LaunchRecordModel.id.in_(newest_open)).update(
+                    {"ended_at": _utcnow(), "end_reason": end_reason},
+                    synchronize_session=False,
+                )
+                db.commit()
+    except Exception as e:
+        logger.warning(f"Launch record finalize failed for {terminal_ids}: {e}")
+
+
+def finalize_launch_record_if_terminal_gone(record_id: int, *, end_reason: str) -> bool:
+    """Close a just-written launch record whose terminal row is already gone.
+
+    A teardown runs on a worker thread and does not wait for a create, so it
+    can delete the terminal row before the create writes the launch record
+    (issue #1082). Its finalize then has nothing to stamp, and the record
+    would stay open for good. The create calls this right after the write.
+    The UPDATE stamps the record only while it is still open AND no terminal
+    row exists for its id, so a teardown that runs after this check still
+    finds the record open and stamps its own reason (first reason wins).
+    The read first keeps the common case, a live row, free of a write lock.
+    Best-effort: never raises. Returns True if it stamped the record.
+    """
+    try:
+        with SessionLocal() as db:
+            open_and_gone = db.query(LaunchRecordModel).filter(
+                LaunchRecordModel.id == record_id,
+                LaunchRecordModel.ended_at.is_(None),
+                ~exists().where(TerminalModel.id == LaunchRecordModel.terminal_id),
+            )
+            if open_and_gone.first() is None:
+                return False
+            stamped = open_and_gone.update(
+                {"ended_at": _utcnow(), "end_reason": end_reason},
+                synchronize_session=False,
+            )
+            db.commit()
+        return stamped > 0
+    except Exception as e:
+        logger.warning(f"Launch record finalize failed for record {record_id}: {e}")
+        return False
+
+
+def record_launch_status_event(
+    terminal_id: str, status: str, observed_at: Optional[datetime] = None
+) -> None:
+    """Append one status-transition row for busy-time accounting (issue #1082).
+
+    ``observed_at`` lets a caller that writes off its event loop stamp the
+    moment it saw the transition rather than the moment the write landed.
+    Best-effort: never raises. Called from the live status paths, so a write
+    failure here must never affect the status a caller observes.
+    """
+    try:
+        with SessionLocal() as db:
+            db.add(
+                LaunchStatusEventModel(
+                    terminal_id=terminal_id,
+                    status=status,
+                    created_at=observed_at if observed_at is not None else _utcnow(),
+                )
+            )
+            db.commit()
+    except Exception as e:
+        logger.debug(f"Launch status event record failed for {terminal_id}: {e}")
+
+
+def find_bound_launch_record(
+    launch_terminal_id: str, source_terminal_id: str
+) -> tuple[Optional[int], bool]:
+    """Resolve which launch record a reported outcome may link to (issue #1082).
+
+    The stored record authorises the link, not the live terminal row, because
+    the record outlives teardown and outcomes are often reported after it. A
+    record is bound to the reporter when it is the launch itself (a
+    self-report) or when the reporter is the record's ``caller_id`` (the
+    direct creator, the same relation #912 applies to live rows). Grandparents
+    and anyone else are not bound.
+
+    A self-report binds only the newest row for the id, and only while that
+    row is still open (``ended_at IS NULL``). Under a reused terminal id, an
+    older, already-finalized incarnation is a different launch; a self-report
+    must not reopen its verdict just because the id matches (#1088 tracks the
+    reuse itself). When the newest row is already closed, a self-report is
+    not a refusal either -- the reporter IS that terminal id, so it is never
+    "unbound" in the sense a grandparent or outsider is. It answers unlinked,
+    the same as an id with no record at all. A direct creator's report still
+    binds the newest matching row regardless of open/closed, which is the
+    post-teardown case the feature exists for.
+
+    Returns ``(record_id, any_records)``: the newest bound record for that
+    terminal id, or ``None`` with ``any_records`` saying whether the reporter
+    is refused. It is True when records exist for the id and none is bound to
+    the reporter, and False when there is nothing to refuse: no record for the
+    id, or a self-report whose newest row is already closed (answered
+    unlinked, as above). A missing reporter is never bound, so a record with
+    no ``caller_id`` (a workflow step's) cannot match an anonymous report.
+    Read-only; raises on a genuine DB error so the caller decides.
+    """
+    with SessionLocal() as db:
+        rows = (
+            db.query(LaunchRecordModel.id, LaunchRecordModel.caller_id, LaunchRecordModel.ended_at)
+            .filter(LaunchRecordModel.terminal_id == launch_terminal_id)
+            .order_by(LaunchRecordModel.id.desc())
+            .all()
+        )
+    if source_terminal_id:
+        is_self_report = bool(rows) and launch_terminal_id == source_terminal_id
+        if is_self_report and rows[0][2] is None:
+            return rows[0][0], True
+        for record_id, caller_id, _ended_at in rows:
+            if caller_id == source_terminal_id:
+                return record_id, True
+        if is_self_report:
+            return None, False
+    return None, bool(rows)
+
+
+def link_launch_outcome(record_id: int, success: bool, reporter_id: str) -> bool:
+    """Join a reported outcome to one launch record by its id (issue #1082).
+
+    Last write wins: a later report from either bound reporter replaces the
+    outcome and ``outcome_reporter_id``. The caller resolves ``record_id``
+    with ``find_bound_launch_record`` first. Best-effort: never raises;
+    returns True only when a row was updated.
+    """
+    try:
+        with SessionLocal() as db:
+            updated = (
+                db.query(LaunchRecordModel)
+                .filter(LaunchRecordModel.id == record_id)
+                .update(
+                    {
+                        "outcome": "success" if success else "failure",
+                        "outcome_recorded_at": _utcnow(),
+                        "outcome_reporter_id": reporter_id,
+                    }
+                )
+            )
+            db.commit()
+            return updated > 0
+    except Exception as e:
+        logger.warning(f"Launch outcome link failed for record {record_id}: {e}")
+        return False
+
+
+def _launch_record_dict(row: LaunchRecordModel) -> Dict[str, Any]:
+    result = {
+        column.name: getattr(row, column.name) for column in LaunchRecordModel.__table__.columns
+    }
+    if result["record_ids"]:
+        result["record_ids"] = _json.loads(result["record_ids"])
+    return result
+
+
+def get_launch_record(terminal_id: str) -> Optional[Dict[str, Any]]:
+    """Read the newest launch record for a terminal id. Read-only; raises on a
+    genuine DB error."""
+    with SessionLocal() as db:
+        row = (
+            db.query(LaunchRecordModel)
+            .filter(LaunchRecordModel.terminal_id == terminal_id)
+            .order_by(LaunchRecordModel.id.desc())
+            .first()
+        )
+        return None if row is None else _launch_record_dict(row)
+
+
+def compute_busy_seconds(record_id: int) -> float:
+    """Sum durations spent in a 'processing' status transition (issue #1082).
+
+    Provisional "busy time" definition, stated explicitly because the issue
+    leaves it ambiguous: time from each transition INTO ``processing`` to the
+    next recorded transition, or -- for the launch's last event -- to its
+    ``ended_at`` (or now, if the launch is still live). This is the simplest
+    measurable definition, not a settled accounting policy.
+
+    Status events carry only a terminal id, so they are attributed to this
+    launch by time: events after the previous same-id launch's ``ended_at``
+    and up to this launch's ``ended_at``. Two launches under one id cannot
+    overlap (``terminals.id`` is a primary key), so each counts only its own
+    window. If a neighbouring launch was never finalized (its best-effort
+    finalize failed), this launch's ``created_at`` or the next launch's
+    ``created_at`` stands in for the missing boundary.
+    """
+    with SessionLocal() as db:
+        record = db.query(LaunchRecordModel).filter(LaunchRecordModel.id == record_id).first()
+        if record is None:
+            return 0.0
+        same_id = LaunchRecordModel.terminal_id == record.terminal_id
+        previous = (
+            db.query(LaunchRecordModel)
+            .filter(same_id, LaunchRecordModel.id < record.id)
+            .order_by(LaunchRecordModel.id.desc())
+            .first()
+        )
+        following = (
+            db.query(LaunchRecordModel)
+            .filter(same_id, LaunchRecordModel.id > record.id)
+            .order_by(LaunchRecordModel.id.asc())
+            .first()
+        )
+        lower = None
+        if previous is not None:
+            lower = previous.ended_at or record.created_at
+        upper = record.ended_at or (following.created_at if following is not None else None)
+        query = db.query(LaunchStatusEventModel).filter(
+            LaunchStatusEventModel.terminal_id == record.terminal_id
+        )
+        if lower is not None:
+            query = query.filter(LaunchStatusEventModel.created_at > lower)
+        if upper is not None:
+            query = query.filter(LaunchStatusEventModel.created_at <= upper)
+        events = query.order_by(LaunchStatusEventModel.id.asc()).all()
+    if not events:
+        return 0.0
+    closing = as_utc(upper) if upper is not None else _utcnow()
+    total = timedelta()
+    for i, event in enumerate(events):
+        if event.status != "processing":
+            continue
+        boundary = events[i + 1].created_at if i + 1 < len(events) else closing
+        start = as_utc(event.created_at)
+        end = as_utc(boundary)
+        if start and end and end > start:
+            total += end - start
+    return total.total_seconds()
 
 
 class MemoryMetadataModel(Base):
@@ -755,6 +1233,11 @@ def init_db() -> None:
     # Appended LAST (issue #447, ``handoff_results``). Its own new table, no shared
     # columns with anything above, so registry order is immaterial here too.
     _migrate_add_handoff_results()
+    # Appended LAST (issue #1067). One nullable column on decision_records, which
+    # create_all made above; no backfill, so registry order is immaterial here too.
+    _migrate_decision_records_target_kind()
+    # Appended LAST (issue #1099). Three nullable decision_records columns, no backfill.
+    _migrate_decision_records_provider_route()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -816,6 +1299,63 @@ def _migrate_add_handoff_results() -> None:
             conn.commit()
     except Exception as e:
         logger.warning(f"Migration check for handoff_results failed: {e}")
+
+
+def _migrate_decision_records_target_kind() -> None:
+    """Add the nullable target_kind column to decision_records if missing (issue #1067).
+
+    Idempotent: PRAGMA table_info gate, ALTER TABLE ADD COLUMN only when missing. Fresh
+    DBs already have the column from ``Base.metadata.create_all``. Existing rows keep
+    NULL: their target kind was never recorded, and deriving it now from a profile name
+    could mislabel them, so they are not backfilled.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(decision_records)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if columns and "target_kind" not in columns:
+                conn.execute("ALTER TABLE decision_records ADD COLUMN target_kind TEXT")
+                logger.info("Migration: added target_kind column to decision_records")
+    except Exception as e:
+        # Records cannot be written without the column, so this is louder than debug.
+        logger.warning(f"Migration check for decision_records target_kind failed: {e}")
+
+
+_PROVIDER_ROUTE_COLUMNS = {
+    "options": "ALTER TABLE decision_records ADD COLUMN options TEXT",
+    "fallback_enforcement": "ALTER TABLE decision_records ADD COLUMN fallback_enforcement TEXT",
+    "applied_enforcement": "ALTER TABLE decision_records ADD COLUMN applied_enforcement TEXT",
+}
+
+
+def _migrate_decision_records_provider_route() -> None:
+    """Add provider.route's three nullable decision_records columns if missing (issue #1099).
+
+    Idempotent, like ``_migrate_decision_records_target_kind``: PRAGMA table_info gate, one
+    ALTER TABLE ADD COLUMN per missing column. Fresh DBs already have them from
+    ``Base.metadata.create_all``. Existing rows keep NULL: they are not provider.route rows.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(decision_records)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if not columns:
+                return
+            for column, statement in _PROVIDER_ROUTE_COLUMNS.items():
+                if column not in columns:
+                    conn.execute(statement)
+                    logger.info(f"Migration: added {column} column to decision_records")
+    except Exception as e:
+        # Records cannot be written without the columns, so this is louder than debug.
+        logger.warning(f"Migration check for decision_records provider.route columns failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -1587,6 +2127,9 @@ def _migrate_workflow_run() -> None:
 
     Issue #753 additively appends nullable ``error`` for the redacted, bounded
     script-level failure diagnostic. Existing and non-script rows remain NULL.
+
+    PR #849 review additively appends nullable ``kind`` for the run-level terminal
+    verdict.  Existing rows keep NULL so cold reads retain the step-derived fallback.
     """
     import sqlite3
 
@@ -1623,6 +2166,15 @@ def _migrate_workflow_run() -> None:
             if "error" not in columns:
                 conn.execute("ALTER TABLE workflow_run ADD COLUMN error TEXT DEFAULT NULL")
                 logger.info("Migration: added error column to workflow_run")
+            if "kind" not in columns:
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN kind TEXT DEFAULT NULL")
+                logger.info("Migration: added kind column to workflow_run")
+            if "caller_id" not in columns:
+                # The terminal that started the run; lets a resumed or recovered
+                # run re-bind to the ORIGINAL caller's delegation ceiling. NULL
+                # for operator-started runs and every pre-existing row.
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN caller_id TEXT DEFAULT NULL")
+                logger.info("Migration: added caller_id column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 
@@ -1895,6 +2447,10 @@ def _migrate_terminals_schema() -> None:
         conn = sqlite3.connect(str(DATABASE_FILE))
         cursor = conn.execute("PRAGMA table_info(terminals)")
         columns = {row[1] for row in cursor.fetchall()}
+        if "description" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN description TEXT")
+            conn.commit()
+            logger.info("Migration: added description column to terminals table")
         if "allowed_tools" not in columns:
             conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
             conn.commit()
@@ -1965,9 +2521,59 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
             conn.commit()
             logger.info("Migration: added model_honored column to terminals table")
+        if "delegate_tools" not in columns:
+            # Nullable on purpose: rows from before the column have no recorded
+            # ceiling and read back as None, which create_terminal treats as
+            # "bounded by its own allowed_tools" (utils/delegation.ceiling_from_row).
+            conn.execute("ALTER TABLE terminals ADD COLUMN delegate_tools TEXT")
+            conn.commit()
+            logger.info("Migration: added delegate_tools column to terminals table")
+        if "identity_verified" not in columns:
+            # Nullable with no default (#1074): existing rows read back NULL, a
+            # legacy row, never False, so a Kiro pane running across the upgrade
+            # is not mistaken for one this version created and failed to verify.
+            conn.execute("ALTER TABLE terminals ADD COLUMN identity_verified BOOLEAN")
+            conn.commit()
+            logger.info("Migration: added identity_verified column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
+
+
+def terminal_id_in_use(terminal_id: str) -> bool:
+    """Whether ``terminal_id`` must not be issued to a new terminal (#1088).
+
+    ``terminals.id`` proves the id is live. The other two reads are what make a
+    DELETED id still dangerous: both tables join on this string and outlive the
+    terminal row (they are purged only by ``cleanup_service`` at
+    ``RETENTION_DAYS``), even though ``delete_terminal`` removes the row that
+    used to prove the id was taken.
+
+    - ``idempotency_keys.terminal_id``: a retry resolves its key to this id and
+      then looks the row up. If a new terminal reused it, ``get_terminal``
+      succeeds against the wrong terminal -- a fingerprint mismatch raises a
+      spurious conflict, and a coincidentally equal one hands the caller
+      somebody else's running worker.
+    - ``inbox.receiver_id``: reconciliation joins a PENDING message's receiver
+      id to ``terminals``, so a reused id types the deleted receiver's stale
+      message into the new terminal's live session.
+
+    Checking every status, not just PENDING: a delivered row still makes the
+    new terminal look like the receiver of history it never received. Once the
+    row ages out of retention, reuse is harmless and this returns False.
+    """
+    with SessionLocal() as db:
+        if db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first():
+            return True
+        if (
+            db.query(IdempotencyKeyModel.key)
+            .filter(IdempotencyKeyModel.terminal_id == terminal_id)
+            .first()
+        ):
+            return True
+        if db.query(InboxModel.id).filter(InboxModel.receiver_id == terminal_id).first():
+            return True
+        return False
 
 
 def create_terminal(
@@ -1992,8 +2598,19 @@ def create_terminal(
     model: Optional[str] = None,
     model_honored: Optional[bool] = None,
     initial_delivery: Optional[Dict[str, Any]] = None,
+    description: Optional[str] = None,
+    delegate_tools: Optional[List[str]] = None,
+    identity_verified: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
+
+    ``delegate_tools`` is the terminal's delegation ceiling as resolved and
+    capped by ``terminal_service.create_terminal``; it is persisted so children
+    of this terminal are bounded by the stored value rather than by a profile.
+
+    ``identity_verified`` is stored as given (#1074). ``terminal_service`` passes
+    False for every kiro_cli row; the default None is the value a row from before
+    the column reads, so a caller that leaves it out writes such a row.
 
     ``idempotency_key``, when given, is persisted in the SAME ``SessionLocal``
     session as the terminal row -- one ``commit()``, so SQLite's single-writer
@@ -2033,6 +2650,7 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            description=description,
             model=model,
             model_honored=model_honored,
             working_directory=working_directory,
@@ -2040,15 +2658,19 @@ def create_terminal(
             # falsiness test stores it as SQL NULL, and every reader treats
             # NULL as "nothing resolved", which is unrestricted.
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools is not None else None,
+            delegate_tools=_json.dumps(delegate_tools) if delegate_tools is not None else None,
             shell_command=shell_command,
             caller_id=caller_id,
-            engine=engine,
+            # The column's one writer stores the canonical spelling, so a
+            # ``kas`` that reaches here is stored as ``v3`` (#1167).
+            engine=canonical_kiro_engine(engine),
             provider_variant=provider_variant,
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
             deferred_init_external_owner=bool(deferred_init_external_owner),
             session_incarnation_id=session_incarnation_id,
             initial_delivery_json=_json.dumps(initial_delivery) if initial_delivery else None,
+            identity_verified=identity_verified,
         )
         db.add(terminal)
         if idempotency_key:
@@ -2072,11 +2694,13 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "description": terminal.description,
             "model": terminal.model,
             "model_honored": terminal.model_honored,
             "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
+            "delegate_tools": delegate_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine,
@@ -2093,6 +2717,7 @@ def create_terminal(
             "initial_delivery": initial_delivery if initial_delivery else None,
             "deferred_init_runtime_reclaimed": False,
             "session_incarnation_id": session_incarnation_id,
+            "identity_verified": identity_verified,
         }
 
 
@@ -2176,6 +2801,10 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
         )
         allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
+        raw_delegate_tools = getattr(terminal, "delegate_tools", None)
+        delegate_tools = (
+            _json.loads(raw_delegate_tools) if isinstance(raw_delegate_tools, str) else None
+        )
         group = _json.loads(terminal.group) if terminal.group else None
         metadata = _json.loads(terminal.metadata_json) if terminal.metadata_json else None
         raw_deferred_failure = getattr(terminal, "deferred_init_failure_json", None)
@@ -2192,11 +2821,13 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "description": terminal.description,
             "model": terminal.model,
             "model_honored": terminal.model_honored,
             "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
+            "delegate_tools": delegate_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),
@@ -2212,8 +2843,23 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
                 getattr(terminal, "deferred_init_runtime_reclaimed", False)
             ),
             "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
+            # As stored, None included (#1074): None is a non-Kiro or legacy row,
+            # which the Kiro input gate treats differently from False.
+            "identity_verified": getattr(terminal, "identity_verified", None),
             "last_active": terminal.last_active,
         }
+
+
+def update_terminal_description(terminal_id: str, description: Optional[str]) -> bool:
+    """Update only the description; clearing it still returns True for an existing row."""
+    with SessionLocal() as db:
+        count = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id == terminal_id)
+            .update({TerminalModel.description: description})
+        )
+        db.commit()
+        return bool(count)
 
 
 def update_terminal_group(terminal_id: str, group: Optional[List[str]]) -> bool:
@@ -2335,6 +2981,23 @@ def update_terminal_deferred_init_runtime_reclaimed(terminal_id: str, reclaimed:
         if not terminal:
             return False
         terminal.deferred_init_runtime_reclaimed = bool(reclaimed)
+        db.commit()
+        return True
+
+
+def mark_terminal_identity_verified(terminal_id: str) -> bool:
+    """Record that this terminal's Kiro identity check passed (#1074).
+
+    One way only: there is no call that writes False back, because a later
+    failure on a verified pane does not make it a different agent. Returns False
+    when the row is gone.
+    """
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.identity_verified = True
         db.commit()
         return True
 
@@ -2607,6 +3270,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "description": t.description,
                 "model": t.model,
                 "model_honored": t.model_honored,
                 "ephemeral": str(t.id) in ephemeral_ids,
@@ -2712,6 +3376,7 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "description": t.description,
                 "model": t.model,
                 "model_honored": t.model_honored,
                 "ephemeral": str(t.id) in ephemeral_ids,
@@ -2745,6 +3410,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "description": t.description,
                 "model": t.model,
                 "model_honored": t.model_honored,
                 "ephemeral": str(t.id) in ephemeral_ids,
@@ -2809,25 +3475,103 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
         return [row[0] for row in rows]
 
 
-def delete_terminal(terminal_id: str) -> bool:
-    """Delete terminal metadata."""
+def fail_orphaned_pending_messages(min_age_seconds: int) -> List[str]:
+    """Fail PENDING messages whose receiver terminal row is gone (#708).
+
+    The counterpart to the join in ``list_pending_receiver_ids_older_than``:
+    that join drops these rows so the sweep does not retry deliveries to
+    deleted agents, which leaves them claiming PENDING forever with no log
+    line, no state change, and nothing to tell them apart from a message that
+    is about to be delivered. They are not pending -- they are undeliverable,
+    and this says so.
+
+    ``create_inbox_message`` rejects an unknown receiver, and delivery requires
+    a row that ``list_pending_receiver_ids_older_than`` can join to, so a
+    missing receiver row makes the message undeliverable by every path
+    regardless of why the row is gone -- this does not depend on row deletion
+    being race-free. The same ``min_age_seconds`` grace window as the sweep
+    still applies.
+
+    Returns the ids of the messages that were failed, for logging.
+    """
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
+    with SessionLocal() as db:
+        orphaned = (
+            db.query(InboxModel)
+            .outerjoin(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.created_at < cutoff,
+                TerminalModel.id.is_(None),
+            )
+            .all()
+        )
+        failed_ids = []
+        for message in orphaned:
+            message.status = MessageStatus.FAILED.value
+            failed_ids.append(str(message.id))
+        if failed_ids:
+            db.commit()
+        return failed_ids
+
+
+def _finalize_launch_records_best_effort(terminal_ids: List[str], end_reason: str) -> None:
+    """Defense in depth around ``finalize_launch_records`` (issue #1082).
+
+    ``finalize_launch_records`` already swallows its own exceptions; this
+    second layer additionally protects every teardown caller below from a bad
+    ``end_reason``/``terminal_ids`` value raising before that function's own
+    try/except is even reached -- same double-wrap convention as
+    ``_bind_decision_launch`` around ``bind_launch``.
+    """
+    try:
+        finalize_launch_records(terminal_ids, end_reason)
+    except Exception as e:
+        logger.warning(f"Launch record finalize failed for {terminal_ids}: {e}")
+
+
+def delete_terminal(terminal_id: str, *, end_reason: str) -> bool:
+    """Delete terminal metadata.
+
+    Finalizes this terminal's launch record (issue #1082) with ``end_reason``
+    (one of ``LAUNCH_END_REASONS``) AFTER the delete commits, in a separate
+    transaction, so a finalize failure can never roll back or block the
+    teardown itself.
+    """
     with SessionLocal() as db:
         deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
         db.commit()
-        return deleted > 0
+    if deleted:
+        _finalize_launch_records_best_effort([terminal_id], end_reason)
+    return deleted > 0
 
 
-def delete_terminals_by_session(tmux_session: str) -> int:
-    """Delete all terminals in a session."""
+def delete_terminals_by_session(tmux_session: str, *, end_reason: str) -> int:
+    """Delete all terminals in a session.
+
+    Finalizes each deleted terminal's launch record (issue #1082); see
+    ``delete_terminal`` for why that runs after commit, in its own transaction.
+    A defensive path: nothing in ``src/`` calls it today (session teardown
+    uses ``delete_terminal_row`` and ``delete_terminals_by_ids``), but the
+    name is still exported for older integrations, so it keeps finalizing.
+    """
     with SessionLocal() as db:
+        ids = [
+            row[0]
+            for row in db.query(TerminalModel.id)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .all()
+        ]
         deleted = (
             db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
         )
         db.commit()
-        return deleted
+    if ids:
+        _finalize_launch_records_best_effort(ids, end_reason)
+    return deleted
 
 
-def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
+def delete_terminals_by_ids(terminal_ids: List[str], *, end_reason: str) -> int:
     """Delete specific terminal rows by id. Returns the number deleted.
 
     Unlike ``delete_terminals_by_session`` (which deletes EVERY row for a
@@ -2835,17 +3579,26 @@ def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
     scope its reconciliation sweep to the incarnation it started tearing down,
     so a concurrent same-name recreate — whose rows carry freshly generated ids
     — is never swept (#498).
+
+    Finalizes the launch record (issue #1082) of each id whose row THIS call
+    deleted, the same rule as ``delete_terminal``: an id whose row another
+    teardown already removed has been finalized by that teardown, and stamping
+    it again could close an older launch left open under the same id. Each id
+    is deleted on its own so its row count says who deleted it; see
+    ``delete_terminal`` for why the finalize runs after commit.
     """
     if not terminal_ids:
         return 0
     with SessionLocal() as db:
-        deleted = (
-            db.query(TerminalModel)
-            .filter(TerminalModel.id.in_(terminal_ids))
-            .delete(synchronize_session=False)
-        )
+        deleted_ids = [
+            terminal_id
+            for terminal_id in dict.fromkeys(terminal_ids)
+            if db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
+        ]
         db.commit()
-        return deleted
+    if deleted_ids:
+        _finalize_launch_records_best_effort(deleted_ids, end_reason)
+    return len(deleted_ids)
 
 
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
@@ -2876,23 +3629,52 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
         )
 
 
+def get_pending_inbox_counts(receiver_ids: List[str]) -> Dict[str, int]:
+    """Count pending messages grouped by the requested receivers."""
+    if not receiver_ids:
+        return {}
+
+    with SessionLocal() as db:
+        counts = (
+            db.query(InboxModel.receiver_id, func.count(InboxModel.id))
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.receiver_id.in_(receiver_ids),
+            )
+            .group_by(InboxModel.receiver_id)
+            .all()
+        )
+        return {receiver_id: int(count) for receiver_id, count in counts}
+
+
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
     """Get pending messages ordered by created_at ASC (oldest first)."""
     return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
 
 
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    sender_id: Optional[str] = None,
+    newest_first: bool = False,
 ) -> List[InboxMessage]:
-    """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
+    """Get inbox messages with optional status and sender filters.
+
+    Ordered by created_at ascending (oldest first) unless ``newest_first`` is set.
+    ``limit`` is applied after ordering. The defaults match historical callers,
+    including ``get_pending_messages``.
 
     Args:
         receiver_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10)
         status: Optional filter by message status (None = all statuses)
+        sender_id: Optional filter by sender id (None = all senders)
+        newest_first: When True, order by created_at descending so ``limit``
+            keeps the newest messages. Defaults to False.
 
     Returns:
-        List of inbox messages ordered by creation time (oldest first)
+        List of inbox messages ordered by creation time
     """
     with SessionLocal() as db:
         query = db.query(InboxModel).filter(InboxModel.receiver_id == receiver_id)
@@ -2900,7 +3682,13 @@ def get_inbox_messages(
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
 
-        messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
+        if sender_id is not None:
+            query = query.filter(InboxModel.sender_id == sender_id)
+
+        created_at_order = (
+            InboxModel.created_at.desc() if newest_first else InboxModel.created_at.asc()
+        )
+        messages = query.order_by(created_at_order).limit(limit).all()
 
         return [
             InboxMessage(

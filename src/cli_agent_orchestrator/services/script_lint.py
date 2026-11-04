@@ -13,6 +13,11 @@ error is a finding, not an exception (U1-BR-6).
 
 Rule catalogue — eight rules:
 - ``syntax`` (ERROR) — ``ast.parse`` failed; anchored at ``e.lineno`` or 1.
+  Also carries the pre-parse oversize verdict: a source over
+  ``SCRIPT_LINT_MAX_SOURCE_CHARS`` is refused WITHOUT being parsed, because on
+  CPython 3.10 a deeply nested source segfaults ``ast.parse`` outright rather
+  than raising anything the arms below could catch (3.11+ raise
+  ``RecursionError`` instead, which the arm below converts).
 - ``disallowed-import`` (ERROR) — static or literal-string dynamic import
   whose first dotted segment is in ``SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES``
   (scripts reach CAO over HTTP only; the ``cao_workflow`` shim is the
@@ -84,6 +89,7 @@ from typing import List, Literal, Sequence
 
 from cli_agent_orchestrator.constants import (
     SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES,
+    SCRIPT_LINT_MAX_SOURCE_CHARS,
     SCRIPT_LINT_NONDETERMINISM_MODULES,
     WORKFLOW_NAME_RE,
 )
@@ -97,10 +103,40 @@ def lint_script(source: str, display_path: str) -> ScriptValidationResult:
     """Lint a workflow script's source text. Total: never raises on input content.
 
     The only operation that can raise on input content is ``ast.parse``; it is
-    wrapped once with exactly three narrow arms (no broad except — totality by
+    wrapped once with four narrow arms (no broad except — totality by
     construction, proven by the hypothesis property test).
+
+    Totality needs ONE thing the except arms cannot provide. On CPython 3.10
+    ``ast.parse`` segfaults on deeply nested input instead of raising — the C
+    recursion is ungated, so there is no exception to narrow. The oversize
+    pre-check below is what keeps the never-raises contract true on the 3.10
+    floor: it runs BEFORE the parse and bounds AST depth by source length. See
+    ``SCRIPT_LINT_MAX_SOURCE_CHARS``.
     """
     findings: List[LintFinding] = []
+    if len(source) > SCRIPT_LINT_MAX_SOURCE_CHARS:
+        # Fail closed as a syntax ERROR rather than a new rule_id: from the
+        # caller's side this is the same verdict as unparsable input, and the
+        # ``syntax`` arm already owns "this source was never walked".
+        logger.warning(
+            "source for %s exceeds the %d-character lint cap (%d); refusing to parse",
+            display_path,
+            SCRIPT_LINT_MAX_SOURCE_CHARS,
+            len(source),
+        )
+        findings.append(
+            LintFinding(
+                rule_id="syntax",
+                severity="error",
+                line=1,
+                message=(
+                    f"source is {len(source)} characters, over the "
+                    f"{SCRIPT_LINT_MAX_SOURCE_CHARS}-character limit; split it into "
+                    "smaller scripts"
+                ),
+            )
+        )
+        return _build_result(findings)
     try:
         tree = ast.parse(source, filename=display_path)
     except SyntaxError as e:
@@ -139,6 +175,24 @@ def lint_script(source: str, display_path: str) -> ScriptValidationResult:
                 severity="error",
                 line=1,
                 message="source is too deeply nested to parse",
+            )
+        )
+        return _build_result(findings)
+    except MemoryError:
+        # Not an out-of-memory condition: CPython's PEG parser has a FIXED
+        # stack depth, and a right-recursive construct (a chain of about 6,000
+        # unary operators, ``**``, ``not``, ``if``/``else`` or ``lambda``)
+        # overflows it and the parser raises ``MemoryError`` ("Parser stack
+        # overflowed - Python source too complex to parse" on 3.12+, bare on
+        # 3.10), far under the length cap and long before the C stack is at
+        # risk. Same fail-closed shape as the three arms above.
+        logger.warning("out of memory parsing %s", display_path)
+        findings.append(
+            LintFinding(
+                rule_id="syntax",
+                severity="error",
+                line=1,
+                message="source is too complex to parse",
             )
         )
         return _build_result(findings)

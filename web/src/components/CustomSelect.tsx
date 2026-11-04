@@ -103,9 +103,9 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
         aria-label={ariaLabel}
         aria-expanded={open}
         onClick={() => setOpen(!open)}
-        className={`w-full flex items-center justify-between bg-gray-900 text-sm rounded-lg px-3 py-2.5 focus:outline-none transition-colors ${
+        className={`w-full flex items-center justify-between bg-gray-900 text-sm rounded-lg px-3 py-2.5 focus:outline-hidden transition-colors ${
           invalid
-            ? 'border-2 !border-red-500 ring-2 ring-red-500/30'
+            ? 'border-2 border-red-500! ring-2 ring-red-500/30'
             : 'border border-gray-700 focus:border-emerald-500 hover:border-gray-600'
         }`}
       >
@@ -125,7 +125,7 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
           // every consumer and is deferred to a dedicated follow-up.
           data-testid="custom-select-menu"
           style={{ position: 'fixed', left: pos.left, width: pos.width, top: pos.top, bottom: pos.bottom, maxHeight: MENU_MAX_H }}
-          className="z-[80] bg-gray-900 border border-gray-700 rounded-lg shadow-xl shadow-black/30 overflow-y-auto"
+          className="z-80 bg-gray-900 border border-gray-700 rounded-lg shadow-xl shadow-black/30 overflow-y-auto"
         >
           {groups.map((group, gi) => (
             <div key={gi}>

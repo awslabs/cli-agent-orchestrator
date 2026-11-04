@@ -52,7 +52,7 @@ export function Dashboard({
   app,
   initialSnapshot,
   onOpenAgent,
-}: DashboardProps): JSX.Element {
+}: DashboardProps): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot>(
     initialSnapshot ?? EMPTY_SNAPSHOT,
   );

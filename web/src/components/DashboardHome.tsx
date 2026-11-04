@@ -1,12 +1,15 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useStore } from '../store'
-import { api, TerminalMeta } from '../api'
+import { api, TerminalMeta, sessionDescriptionRevision } from '../api'
 import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, LogOut, Send, ChevronRight, ChevronDown, Users, Filter, ArrowDownUp } from 'lucide-react'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { AgentDescription } from './AgentDescription'
+import { FleetStatusCard } from './FleetStatusCard'
+import { FleetWorkers } from './FleetWorkers'
 import { parseServerTime } from '../time'
 
 const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
@@ -75,6 +78,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   const { sessions, terminalStatuses, setTerminalStatus, clearTerminalStatuses, showSnackbar, deleteSession } = useStore()
   const [profileCount, setProfileCount] = useState(0)
   const [sessionData, setSessionData] = useState<SessionWithTerminals[]>([])
+  const sessionDataRef = useRef(sessionData)
+  sessionDataRef.current = sessionData
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set())
   const [liveTerminal, setLiveTerminal] = useState<{ id: string; provider?: string; agentProfile?: string | null } | null>(null)
   const [pendingClose, setPendingClose] = useState<TerminalMeta | null>(null)
@@ -129,16 +134,18 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   useEffect(() => {
     const fetchAll = async () => {
       try {
+        const revision = sessionDescriptionRevision
         const sessionDetails = await Promise.all(
           sessions.map(async s => {
             try {
               const detail = await api.getSession(s.name)
               return { name: s.name, status: s.status, terminals: detail.terminals || [] }
             } catch {
-              return { name: s.name, status: s.status, terminals: [] }
+              return sessionDataRef.current.find(session => session.name === s.name) || { name: s.name, status: s.status, terminals: [] }
             }
           })
         )
+        if (revision !== sessionDescriptionRevision) { void fetchAll(); return }
         setSessionData(sessionDetails)
         // Auto-expand only newly seen sessions
         const newNames = sessionDetails.map(s => s.name).filter(n => !seenSessionsRef.current.has(n))
@@ -245,7 +252,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
     <div className="space-y-6">
       {/* Stats Row */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <div className="bg-gradient-to-br from-gray-800/80 to-gray-900/80 rounded-xl p-5 border border-gray-700/50">
+        <div className="bg-linear-to-br from-gray-800/80 to-gray-900/80 rounded-xl p-5 border border-gray-700/50">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-lg bg-emerald-900/50 flex items-center justify-center">
               <Users size={20} className="text-emerald-400" />
@@ -256,7 +263,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
             </div>
           </div>
         </div>
-        <div className="bg-gradient-to-br from-gray-800/80 to-gray-900/80 rounded-xl p-5 border border-gray-700/50">
+        <div className="bg-linear-to-br from-gray-800/80 to-gray-900/80 rounded-xl p-5 border border-gray-700/50">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-lg bg-cyan-900/50 flex items-center justify-center">
               <TermIcon size={20} className="text-cyan-400" />
@@ -270,7 +277,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
         <button
           onClick={() => onNavigate('profiles')}
           aria-label="Open Profiles tab"
-          className="bg-gradient-to-br from-gray-800/80 to-gray-900/80 rounded-xl p-5 border border-gray-700/50 text-left hover:border-blue-500/60 transition-colors cursor-pointer"
+          className="bg-linear-to-br from-gray-800/80 to-gray-900/80 rounded-xl p-5 border border-gray-700/50 text-left hover:border-blue-500/60 transition-colors cursor-pointer"
         >
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-lg bg-blue-900/50 flex items-center justify-center">
@@ -284,6 +291,11 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
         </button>
       </div>
 
+      {/* Fleet */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <FleetStatusCard />
+      </div>
+
       {/* Quick Actions */}
       <div className="flex gap-3 flex-wrap">
         <button onClick={() => onNavigate('agents')} className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium px-4 py-2.5 rounded-lg transition-colors">
@@ -295,7 +307,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
       </div>
 
       {/* Header with sort toggle */}
-      <div className="mb-1">
+      <div>
         <div className="flex items-center justify-between">
           <div>
             <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">Active Sessions</h3>
@@ -322,7 +334,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
       )}
 
       {/* Status filter */}
-      <div className="flex items-center gap-2 flex-wrap -mt-3">
+      <div className="flex items-center gap-2 flex-wrap">
         <Filter size={12} className="text-gray-500" />
         <button onClick={() => setStatusFilter(null)} className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${!statusFilter ? 'bg-gray-700 border-gray-500/50 text-gray-200' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}>Any status</button>
         {STATUS_ORDER.map(s => {
@@ -408,7 +420,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                   <div className="ml-8 mt-1.5 flex flex-col gap-1">
                     <div className="flex items-center gap-2 flex-wrap">
                       {typeSummary.map(([type, count]) => (
-                        <span key={type} className="text-[10px] bg-gray-700/60 text-gray-400 px-1.5 py-0.5 rounded">{type}{count > 1 ? ` ×${count}` : ''}</span>
+                        <span key={type} className="text-[10px] bg-gray-700/60 text-gray-400 px-1.5 py-0.5 rounded-sm">{type}{count > 1 ? ` ×${count}` : ''}</span>
                       ))}
                     </div>
                     <StatusSummary counts={statusCounts} />
@@ -434,6 +446,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                             const relCreated = fmtRel(t.created_at)
                             const relActive = fmtRel(t.last_active)
                             const showActive = relActive && relActive !== relCreated
+                            const pendingInboxCount = t.pending_inbox_count ?? 0
                             return (
                               <div key={t.id} className="bg-gray-900/50 border border-gray-700/30 rounded-lg px-3 py-2 space-y-1.5">
                                 <div className="flex items-center justify-between">
@@ -445,13 +458,39 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                     <span className="text-[10px] text-gray-600">{t.provider}</span>
                                   </div>
                                   <div className="flex items-center gap-1 shrink-0">
-                                    <button onClick={() => setInboxTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Inbox"><Mail size={12} /></button>
-                                    <button onClick={() => setOutputTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Output"><FileText size={12} /></button>
-                                    <button onClick={() => setLiveTerminal({ id: t.id, provider: t.provider, agentProfile: t.agent_profile })} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded transition-colors"><Monitor size={12} />Terminal</button>
-                                    <button onClick={() => setPendingExit(t)} disabled={exitingTerminal === t.id} className="p-1 text-gray-500 hover:text-amber-400 bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Graceful Exit"><LogOut size={12} /></button>
-                                    <button onClick={() => setPendingClose(t)} disabled={closingTerminal === t.id} className="p-1 text-gray-500 hover:text-red-400 bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Close"><Trash2 size={12} /></button>
+                                    <button
+                                      onClick={() => setInboxTerminalId(t.id)}
+                                      className="relative p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded-sm transition-colors"
+                                      title="Inbox"
+                                      aria-label={pendingInboxCount > 1 ? `Inbox: ${pendingInboxCount} pending messages` : 'Inbox'}
+                                    >
+                                      <Mail size={12} />
+                                      {pendingInboxCount > 1 && (
+                                        <span aria-hidden="true" className="pointer-events-none absolute -top-2.5 -right-1 flex h-4 min-w-4 items-center justify-center whitespace-nowrap rounded-full bg-red-600 px-1 text-[10px] font-semibold leading-none text-white">
+                                          {pendingInboxCount}
+                                        </span>
+                                      )}
+                                    </button>
+                                    <button onClick={() => setOutputTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded-sm transition-colors" title="Output"><FileText size={12} /></button>
+                                    <button onClick={() => setLiveTerminal({ id: t.id, provider: t.provider, agentProfile: t.agent_profile })} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded-sm transition-colors"><Monitor size={12} />Terminal</button>
+                                    <button onClick={() => setPendingExit(t)} disabled={exitingTerminal === t.id} className="p-1 text-gray-500 hover:text-amber-400 bg-gray-800 hover:bg-gray-700 rounded-sm transition-colors" title="Graceful Exit"><LogOut size={12} /></button>
+                                    <button onClick={() => setPendingClose(t)} disabled={closingTerminal === t.id} className="p-1 text-gray-500 hover:text-red-400 bg-gray-800 hover:bg-gray-700 rounded-sm transition-colors" title="Close"><Trash2 size={12} /></button>
                                   </div>
                                 </div>
+                                <AgentDescription id={t.id} description={t.description} onSaved={description => {
+                                  setSessionData(current => current.map(session => ({ ...session,
+                                    terminals: session.terminals.map(terminal => terminal.id === t.id ? { ...terminal, description } : terminal),
+                                  })))
+                                  useStore.setState(state => ({ activeSessionDetail: state.activeSessionDetail ? {
+                                    ...state.activeSessionDetail,
+                                    terminals: state.activeSessionDetail.terminals.map(terminal => terminal.id === t.id ? { ...terminal, description } : terminal),
+                                  } : null }))
+                                  const revision = sessionDescriptionRevision
+                                  void api.getSession(t.tmux_session).then(detail => {
+                                    if (revision !== sessionDescriptionRevision) return
+                                    setSessionData(current => current.map(session => session.name === t.tmux_session ? { ...session, terminals: detail.terminals } : session))
+                                  }).catch(() => {})
+                                }} />
                                 {/* Timestamps */}
                                 <div className="flex items-center gap-3 text-[10px] text-gray-600">
                                   {relCreated && <span title={fmtAbs(t.created_at) || ''}>{relCreated}</span>}
@@ -462,8 +501,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                   <button onClick={() => setSendInputOpen(prev => ({ ...prev, [t.id]: true }))} className="text-[10px] text-gray-600 hover:text-gray-300 transition-colors">Message agent...</button>
                                 ) : (
                                   <div className="flex items-center gap-1.5">
-                                    <input type="text" value={sendInputValues[t.id] || ''} onChange={e => setSendInputValues(prev => ({ ...prev, [t.id]: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') handleSendInput(t.id) }} placeholder="Type a message..." className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-[11px] font-mono rounded px-2 py-1 focus:border-emerald-500 focus:outline-none" autoFocus />
-                                    <button onClick={() => handleSendInput(t.id)} disabled={sendingInput === t.id || !(sendInputValues[t.id] || '').trim()} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-[10px] font-medium rounded transition-colors"><Send size={10} /></button>
+                                    <input type="text" value={sendInputValues[t.id] || ''} onChange={e => setSendInputValues(prev => ({ ...prev, [t.id]: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') handleSendInput(t.id) }} placeholder="Type a message..." className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-[11px] font-mono rounded-sm px-2 py-1 focus:border-emerald-500 focus:outline-hidden" autoFocus />
+                                    <button onClick={() => handleSendInput(t.id)} disabled={sendingInput === t.id || !(sendInputValues[t.id] || '').trim()} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-[10px] font-medium rounded-sm transition-colors"><Send size={10} /></button>
                                   </div>
                                 )}
                               </div>
@@ -479,6 +518,9 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
           })}
         </div>
       )}
+
+      {/* CAO cluster workers (read-only); collapsed, fetches only when opened. */}
+      <FleetWorkers />
 
       {/* Modals */}
       {inboxTerminalId && <InboxPanel terminalId={inboxTerminalId} onClose={() => setInboxTerminalId(null)} />}

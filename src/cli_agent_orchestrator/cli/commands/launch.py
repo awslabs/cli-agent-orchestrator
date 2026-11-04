@@ -30,6 +30,11 @@ from cli_agent_orchestrator.utils.forwarded_env import (
     ForwardedEnvError,
     validate_forwarded_env,
 )
+from cli_agent_orchestrator.utils.init_allowance import (
+    init_allowance,
+    synchronous_create_timeout,
+)
+from cli_agent_orchestrator.utils.orchestration import _extract_error_detail
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
     sync_backend_from_server,
@@ -70,19 +75,6 @@ _READINESS_WAIT_TIMEOUT = 120
 # so a retry duplicated the work (PR #566 review, haofeif).
 _HEADLESS_TASK_TIMEOUT = 300
 
-# Worst case of the server's confirm-and-resubmit loop after the send
-# (``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` x (1 + ``_DEFERRED_SUBMIT_MAX_RESUBMITS``)
-# = 32s) with headroom for the pre-dispatch work (memory injection) and polling.
-_DELIVERY_CONFIRM_ALLOWANCE = 60
-
-# Provider init is not one wait of ``provider_init_timeout`` (T). A successful
-# path legitimately spans several T-bounded phases: Claude's shell wait +
-# startup-prompt handler + readiness wait is 3T (+ settle), Kimi's is up to
-# T + 2*max(120, T), Kiro's legacy fallback 4T. The client allowance has to
-# cover the longest of those or a valid init blows the deadline while the
-# server later runs the task anyway.
-_INIT_PHASES = 4
-
 
 def _init_allowance(agent_profile: str, settings: dict) -> int:
     """Client-side allowance for server-side provider init plus delivery confirmation.
@@ -92,17 +84,12 @@ def _init_allowance(agent_profile: str, settings: dict) -> int:
     prefers it), else the server setting. A profile that cannot be loaded here
     falls back to the server default rather than failing the launch -- the
     server resolves the real profile itself; this only sizes the wait.
-    """
-    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-    base = int(settings["provider_init_timeout"])
-    try:
-        profile = load_agent_profile(agent_profile)
-    except (FileNotFoundError, RuntimeError):
-        profile = None
-    if profile is not None and profile.provider_init_timeout is not None:
-        base = int(profile.provider_init_timeout)
-    return _INIT_PHASES * base + _DELIVERY_CONFIRM_ALLOWANCE
+    Thin wrapper over ``utils.init_allowance``, which is where the phase count
+    and the delivery-confirmation headroom now live so every client-side
+    allowance for server-side init reads the same derivation (issue #710).
+    """
+    return init_allowance(agent_profile, settings)
 
 
 def _is_waiting_on_user(terminal_id: str) -> bool:
@@ -178,9 +165,9 @@ def _parse_env_pairs(pairs):
 @click.option(
     "--engine",
     "engine",
-    type=click.Choice(["v2", "kas"], case_sensitive=True),
+    type=click.Choice(["v2", "v3", "kas"], case_sensitive=True),
     default=None,
-    help="Explicit Kiro engine (default: profile engine or v2).",
+    help="Explicit Kiro engine (default: profile engine or v2; 'kas' is an alias of 'v3').",
 )
 @click.option(
     "--allowed-tools",
@@ -226,8 +213,7 @@ def _parse_env_pairs(pairs):
     help="Forward an env var to the supervisor AND every worker spawned later "
     "in the same session. Repeatable. Values travel in the request body, not "
     "the URL. Rejected: provider prefixes (CLAUDE/CODEX_/__MISE_), the loader, "
-    "shell, interpreter and AWS-config startup keys listed in docs/tmux.md, and "
-    ">=2048-byte values. See issue #248.",
+    "shell, interpreter and AWS-config startup keys, and >=2048-byte values.",
 )
 @click.option(
     "--resume-session-id",
@@ -253,7 +239,20 @@ def launch(
     env_pairs,
     resume_session_id,
 ):
-    """Launch cao session with specified agent profile."""
+    """Launch cao session with specified agent profile.
+
+    Without --headless, attaches your terminal to the new session. With
+    --headless and MESSAGE, waits for the provider to start and confirm
+    delivery, then up to 300s for the reply; --async returns once delivery
+    is confirmed.
+
+    Requires a running cao-server.
+
+    \b
+    Examples:
+      cao launch --agents developer
+      cao launch --agents developer --headless --auto-approve "Run the tests"
+    """
     try:
         display_dir = working_directory or os.path.realpath(os.getcwd())
         explicit_provider = provider is not None  # True only when --provider was passed
@@ -270,6 +269,7 @@ def launch(
 
         resolved_allowed_tools = None
         no_role_set = False
+        launch_profile = None
         if yolo:
             resolved_allowed_tools = ["*"]
         elif allowed_tools:
@@ -278,6 +278,7 @@ def launch(
             # Load profile to get role-based defaults
             try:
                 profile = load_agent_profile(agents)
+                launch_profile = profile
                 mcp_server_names = grantable_server_names(profile)
                 no_role_set = not profile.role and not profile.allowedTools
                 resolved_allowed_tools = resolve_allowed_tools(
@@ -287,6 +288,16 @@ def launch(
                 # Profile not found — use developer defaults (backward compatible)
                 no_role_set = True
                 resolved_allowed_tools = resolve_allowed_tools(None, None, None)
+        # The delegation ceiling the server will record for this terminal (what
+        # it may grant to workers it assigns/hands off to); see
+        # docs/tool-restrictions.md "Delegation ceiling".
+        from cli_agent_orchestrator.utils.delegation import resolve_delegate_tools
+
+        resolved_delegate_tools = resolve_delegate_tools(
+            getattr(launch_profile, "delegateTools", None),
+            getattr(launch_profile, "role", None),
+            resolved_allowed_tools,
+        )
 
         # Honour profile.provider whenever the user did not pass --provider
         # explicitly. This runs regardless of which permission-resolution
@@ -394,6 +405,7 @@ def launch(
                     f"\nAgent '{agents}' launching on {provider}:\n"
                     f"  Allowed:  {tool_summary}\n"
                     f"  Blocked:  {blocked_summary}\n"
+                    f"  Delegates: {format_tool_summary(resolved_delegate_tools)}\n"
                     f"  Enforcement: {describe_enforcement(provider, resolved_allowed_tools)}\n"
                     f"  Directory: {display_dir}\n"
                 )
@@ -472,7 +484,25 @@ def launch(
         # MESSAGE rides in the body for the same reason, plus URL-length. See
         # issue #248 and ``CreateSessionBody``.
         settings = get_server_settings()
-        post_kwargs: dict = {"params": params, "timeout": settings["mcp_request_timeout"]}
+        # Two different waits behind one POST, so two different budgets (issue
+        # #710). With ``initial_message`` in the body the server returns BEFORE
+        # init starts, so this is an ordinary request and stays on
+        # ``mcp_request_timeout`` -- widening it there would only slow down
+        # reporting a dead server. Without it (the non-headless path, which
+        # attaches instead of sending) ``POST /sessions`` initializes
+        # synchronously and does not answer until ``provider.initialize()``
+        # returns; 30s against a 60s-and-up init budget meant a successful
+        # launch surfaced as a ReadTimeout while cao-server went on building the
+        # session -- see the Codex login-menu case in
+        # ``providers/codex.py``. The synchronous budget is derived from the
+        # profile's own ``provider_init_timeout``, and only its READ half is
+        # widened, so connect failures still report in 5s.
+        create_timeout = (
+            settings["mcp_request_timeout"]
+            if server_delivers_message
+            else synchronous_create_timeout(agents, settings)
+        )
+        post_kwargs: dict = {"params": params, "timeout": create_timeout}
         body: dict = {}
         if forwarded_env:
             body["env_vars"] = forwarded_env
@@ -482,12 +512,47 @@ def launch(
             post_kwargs["json"] = body
 
         response = api_http.post(url, **post_kwargs)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except api_http.exceptions.HTTPError as exc:
+            # The server answered, so this is a refusal and not a connection
+            # failure: show its reason (a 400's ``detail``, e.g. an unavailable
+            # Kiro engine) instead of the generic "Failed to connect" arm below.
+            detail = _extract_error_detail(response, str(exc))
+            raise click.ClickException(
+                f"cao-server refused the launch ({response.status_code}): {detail}"
+            ) from exc
 
         terminal = response.json()
 
         click.echo(f"Session created: {terminal['session_name']}")
         click.echo(f"Terminal created: {terminal['name']}")
+
+        # --memory-manager: the sidecar is bounded by the primary's recorded
+        # delegation ceiling, and under a narrow primary the server refuses it.
+        # The refusal rides on the response (``memory_manager``) so it is said
+        # here, where the operator is, instead of only in the server log; the
+        # primary itself launched.
+        sidecar = terminal.get("memory_manager") if isinstance(terminal, dict) else None
+        if memory and isinstance(sidecar, dict) and sidecar.get("state") == "refused":
+            click.echo(
+                click.style(
+                    "  WARNING: the memory_manager sidecar was NOT launched.\n"
+                    f"  {sidecar.get('detail') or 'the server refused it'}\n"
+                    "  See docs/tool-restrictions.md (`cao launch --memory` needs a primary "
+                    "ceiling covering @cao-mcp-server, fs_read, fs_list).\n",
+                    fg="yellow",
+                )
+            )
+
+        # Launch notes (#1167, provisional): today only a Kiro v3 launch that the
+        # operator's kiro.v3_allow_unverified_versions opt-in admitted on a
+        # kiro-cli version still pending verification. Said where the operator is.
+        notes = terminal.get("launch_notes") if isinstance(terminal, dict) else None
+        if isinstance(notes, list):
+            for note in notes:
+                if isinstance(note, str) and note:
+                    click.echo(click.style(f"  WARNING: {note}", fg="yellow"))
 
         # Attach to tmux session unless headless. Wait for the provider to
         # finish initializing first — otherwise tmux attach races with the
@@ -564,7 +629,13 @@ def launch(
             # The task budget starts HERE, at confirmed delivery, so a slow but
             # successful init cannot eat into it. The terminal is no longer
             # masked, so ``poll_until_done``'s own working-then-idle gate judges
-            # completion on the task's activity only.
+            # completion on the task's activity only. No generation floor is
+            # passed: the message was dispatched by the server at creation, so
+            # there is no client-side dispatch boundary, and delivery was just
+            # confirmed on a status EARNED AFTER that dispatch
+            # (``_wait_for_post_dispatch_start``), so the latch already describes
+            # this turn and the previous frame cannot be read here (#735).
+            # staleness-ok: delivery confirmed server-side on a post-dispatch stamp
             poll_until_done(terminal["id"], timeout=_HEADLESS_TASK_TIMEOUT)
             output_resp = api_http.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",

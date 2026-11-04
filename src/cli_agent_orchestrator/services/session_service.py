@@ -24,12 +24,13 @@ lock in ``services/session_lock.py`` — see ``delete_session`` for why.
 
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_ids,
+    get_pending_inbox_counts,
     get_session_incarnation,
     get_session_incarnations,
     list_terminals_by_session,
@@ -53,10 +54,18 @@ from cli_agent_orchestrator.services.terminal_service import (
     TerminalRecordCorruptError,
     create_terminal,
     get_deferred_init_failure,
+    last_create_was_replay,
 )
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
+
 logger = logging.getLogger(__name__)
+
+
+_DESCRIPTION_UNSET = object()
 
 
 async def create_session(
@@ -73,9 +82,13 @@ async def create_session(
     model: str | None = None,
     use_worktree: bool = False,
     idempotency_key: str | None = None,
+    lookup_only: bool = False,
+    caller_ceiling: list[str] | None = None,
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    description: Any = _DESCRIPTION_UNSET,
+    launch_plan: "LaunchPlan | None" = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -116,6 +129,13 @@ async def create_session(
     else:
         resolved_provider = provider
 
+    if description is _DESCRIPTION_UNSET:
+        description = session_name or None
+
+    # Passed only when set, so the ordinary create call stays
+    # byte-identical for every existing caller (review on PR #773).
+    lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
+    launch_options: dict[str, Any] = {"launch_plan": launch_plan} if launch_plan is not None else {}
     terminal = await create_terminal(
         provider=resolved_provider,
         agent_profile=agent_profile,
@@ -132,10 +152,19 @@ async def create_session(
         model=model,
         use_worktree=use_worktree,
         idempotency_key=idempotency_key,
+        **lookup_kwargs,
         resume_session_id=resume_session_id,
         group=group,
         metadata=metadata,
+        description=description,
+        **launch_options,
+        caller_ceiling=caller_ceiling,
     )
+    if lookup_only or last_create_was_replay():
+        # A lookup, or a replay of an earlier keyed request, returned a terminal
+        # that already existed: no session was created by THIS call, so there
+        # is no creation event to publish a second time.
+        return terminal
     dispatch_plugin_event(
         registry,
         "post_create_session",
@@ -500,7 +529,9 @@ def get_session(session_name: str) -> Dict:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
         from cli_agent_orchestrator.services.terminal_service import reported_status
 
+        pending_counts = get_pending_inbox_counts([terminal["id"] for terminal in terminals])
         for terminal in terminals:
+            terminal["pending_inbox_count"] = pending_counts.get(terminal["id"], 0)
             failure = failures.get(str(terminal["id"]))
             if failure is not None:
                 terminal["deferred_init_failure"] = failure
@@ -758,7 +789,9 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                     )
                     continue
                 try:
-                    if terminal_service.delete_terminal_row(terminal_id, metadata, registry=None):
+                    if terminal_service.delete_terminal_row(
+                        terminal_id, metadata, registry=None, end_reason="session_teardown"
+                    ):
                         if metadata:
                             torn_down.append((terminal_id, metadata))
                 except Exception as e:
@@ -794,7 +827,12 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             # loop already cleared them. Deferred ids are excluded: their rows
             # are the retry handle for cleanup that has NOT happened yet.
             try:
-                delete_terminals_by_ids([i for i in incarnation_ids if i not in deferred_ids])
+                sweep_ids = [i for i in incarnation_ids if i not in deferred_ids]
+                if delete_terminals_by_ids(sweep_ids, end_reason="session_teardown"):
+                    from cli_agent_orchestrator.services import ephemeral_service
+
+                    for terminal_id in sweep_ids:
+                        ephemeral_service.release(terminal_id, "terminal_gone")
             except Exception as e:
                 logger.warning(f"Failed to sweep registry rows for {session_name}: {e}")
                 result["errors"].append(

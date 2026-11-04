@@ -51,7 +51,7 @@ name: daily-standup
 schedule: "0 9 * * 1-5"  # 9am weekdays
 agent_profile: developer
 provider: kiro_cli  # Optional, defaults to kiro_cli
-engine: v2          # Optional Kiro engine; v2 is the default, kas is rejected in Phase 0
+engine: v2          # Optional Kiro engine; v2 is the default, v3 (alias kas) is not launchable yet
 ---
 
 Review yesterday's commits and create a standup summary.
@@ -114,3 +114,20 @@ cao schedule run daily-standup
 # Remove a flow
 cao schedule remove daily-standup
 ```
+
+## Workflow scheduling example
+
+[`examples/workflows/pr-health/`](../examples/workflows/pr-health/) combines a
+parameterized Python workflow with a scheduled flow. Its weekly cron entry uses
+a deterministic guard to produce an exact 14-day cadence across month
+boundaries. Scheduled runs default to non-mutating dry-run mode.
+Its separately registered apply template authorizes comments only; the workflow
+cannot change labels, PR state, reviews, statuses, or checks.
+
+Registering that apply template is not the authorization boundary — the flow
+prompt says so explicitly. Because a run's `inputs` are part of the plan
+identifier, `mode=apply` is a different plan than `mode=dry_run`, so it needs its
+own `cao workflow approve <plan_id>` once `workflow.require_approval` is enabled.
+The example also bounds its own noise: notifications are grouped into epochs with
+a 90-day re-entry cooldown and lifetime caps, so a permanently stale PR receives a
+small constant number of comments rather than one per run forever.

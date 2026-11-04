@@ -1,6 +1,6 @@
 """Enforcement of the caller's effective allowed-tools policy for CAO's MCP tools (#671).
 
-``assign``, ``handoff`` and ``assign_elastic`` mint a new agent identity under
+Direct assignment, handoff, and workflow execution can mint a new agent identity under
 a caller-chosen profile. The provider-native restrictions built by ``utils/tool_mapping`` can
 never cover them: ``get_disallowed_tools`` skips every ``@``-prefixed entry
 because MCP server references have no native tool names.
@@ -30,6 +30,14 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import Terminal
 
 BOUND = {"CAO_TERMINAL_ID": "a1b2c3d4"}
+DELEGATION_TOOLS = (
+    "assign",
+    "handoff",
+    "assign_elastic",
+    "workflow_run",
+    "workflow_resume",
+    "workflow_start",
+)
 
 
 def _ctx(allowed_tools=None, profile_name="worker"):
@@ -59,50 +67,52 @@ def _unbound_env():
     return {k: v for k, v in os.environ.items() if k != "CAO_TERMINAL_ID"}
 
 
+@pytest.mark.parametrize("tool", DELEGATION_TOOLS)
 class TestOperatorContext:
     """An unbound caller is the supported operator path and is not restricted."""
 
-    def test_unset_terminal_id_allows(self):
+    def test_unset_terminal_id_allows(self, tool):
         with patch.dict(os.environ, _unbound_env(), clear=True):
-            assert server._tool_denied_reason("assign") is None
+            assert server._tool_denied_reason(tool) is None
 
-    def test_unset_terminal_id_does_not_even_look_up(self):
+    def test_unset_terminal_id_does_not_even_look_up(self, tool):
         with patch.dict(os.environ, _unbound_env(), clear=True):
             with patch.object(server, "_get_terminal_context_from_env") as lookup:
-                assert server._tool_denied_reason("assign") is None
+                assert server._tool_denied_reason(tool) is None
             lookup.assert_not_called()
 
 
+@pytest.mark.parametrize("tool", DELEGATION_TOOLS)
 class TestFailsClosed:
     """[P1] An unknown authorization result must never become permission."""
 
-    def test_transport_failure_denies(self):
+    def test_transport_failure_denies(self, tool):
         with patch.dict(os.environ, BOUND):
             with patch.object(
                 server,
                 "_get_terminal_context_from_env",
                 side_effect=requests.RequestException("cao-server down"),
             ):
-                reason = server._tool_denied_reason("assign")
+                reason = server._tool_denied_reason(tool)
         assert reason is not None
-        assert "assign" in reason
+        assert tool in reason
 
-    def test_unexpected_error_denies(self):
+    def test_unexpected_error_denies(self, tool):
         with patch.dict(os.environ, BOUND):
             with patch.object(
                 server, "_get_terminal_context_from_env", side_effect=RuntimeError("boom")
             ):
-                assert server._tool_denied_reason("assign") is not None
+                assert server._tool_denied_reason(tool) is not None
 
-    def test_bound_caller_that_does_not_resolve_denies(self):
+    def test_bound_caller_that_does_not_resolve_denies(self, tool):
         """A malformed CAO_TERMINAL_ID and a 404 both arrive here as None."""
         with patch.dict(os.environ, BOUND):
             with patch.object(server, "_get_terminal_context_from_env", return_value=None):
-                reason = server._tool_denied_reason("assign")
+                reason = server._tool_denied_reason(tool)
         assert reason is not None
         assert "CAO_TERMINAL_ID" in reason
 
-    def test_unreadable_profile_denies(self):
+    def test_unreadable_profile_denies(self, tool):
         with patch.dict(os.environ, BOUND):
             with (
                 patch.object(server, "_get_terminal_context_from_env", return_value=_ctx()),
@@ -111,9 +121,9 @@ class TestFailsClosed:
                     side_effect=FileNotFoundError("no such profile"),
                 ),
             ):
-                assert server._tool_denied_reason("assign") is not None
+                assert server._tool_denied_reason(tool) is not None
 
-    def test_unresolvable_policy_denies(self):
+    def test_unresolvable_policy_denies(self, tool):
         """Recorded None with no profile to fall back to cannot be resolved."""
         with patch.dict(os.environ, BOUND):
             with patch.object(
@@ -121,72 +131,71 @@ class TestFailsClosed:
                 "_get_terminal_context_from_env",
                 return_value=_ctx(profile_name=None),
             ):
-                assert server._tool_denied_reason("assign") is not None
+                assert server._tool_denied_reason(tool) is not None
 
 
+@pytest.mark.parametrize("tool", DELEGATION_TOOLS)
 class TestRecordedPolicy:
     """[P2] The recorded allowed_tools IS the effective list."""
 
-    def test_server_selector_grants(self):
+    def test_server_selector_grants(self, tool):
         with patch.dict(os.environ, BOUND):
             with patch.object(
                 server,
                 "_get_terminal_context_from_env",
                 return_value=_ctx(["fs_read", "@cao-mcp-server"]),
             ):
-                assert server._tool_denied_reason("assign") is None
+                assert server._tool_denied_reason(tool) is None
 
-    def test_wildcard_grants(self):
+    def test_wildcard_grants(self, tool):
         with patch.dict(os.environ, BOUND):
             with patch.object(server, "_get_terminal_context_from_env", return_value=_ctx(["*"])):
-                assert server._tool_denied_reason("assign") is None
+                assert server._tool_denied_reason(tool) is None
 
-    def test_narrow_list_denies(self):
+    @pytest.mark.parametrize("allowed", [[], ["fs_read"], ["@transport-sim"], ["@inventory"]])
+    def test_narrow_list_denies(self, tool, allowed):
         """A narrow --allowed-tools grant is now enforced against these tools."""
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server, "_get_terminal_context_from_env", return_value=_ctx(["fs_read"])
-            ):
-                reason = server._tool_denied_reason("assign")
+            with patch.object(server, "_get_terminal_context_from_env", return_value=_ctx(allowed)):
+                reason = server._tool_denied_reason(tool)
         assert reason is not None
         assert "@cao-mcp-server" in reason
 
-    def test_bare_tool_name_does_not_grant(self):
+    def test_bare_tool_name_does_not_grant(self, tool):
         """MCP tools are granted by server selector, never by bare name."""
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server, "_get_terminal_context_from_env", return_value=_ctx(["assign"])
-            ):
-                assert server._tool_denied_reason("assign") is not None
+            with patch.object(server, "_get_terminal_context_from_env", return_value=_ctx([tool])):
+                assert server._tool_denied_reason(tool) is not None
 
 
+@pytest.mark.parametrize("tool", DELEGATION_TOOLS)
 class TestProfileFallback:
     """Recorded None means resolve from the profile, matching create_terminal."""
 
-    def test_profile_allowed_tools_grant(self):
+    def test_profile_allowed_tools_grant(self, tool):
         with patch.dict(os.environ, BOUND):
             with (
                 patch.object(server, "_get_terminal_context_from_env", return_value=_ctx()),
                 _patch_profile(_profile(allowed_tools=["@cao-mcp-server"])),
             ):
-                assert server._tool_denied_reason("assign") is None
+                assert server._tool_denied_reason(tool) is None
 
-    def test_profile_allowed_tools_deny(self):
+    def test_profile_allowed_tools_deny(self, tool):
         with patch.dict(os.environ, BOUND):
             with (
                 patch.object(server, "_get_terminal_context_from_env", return_value=_ctx()),
                 _patch_profile(_profile(allowed_tools=["fs_read"])),
             ):
-                assert server._tool_denied_reason("assign") is not None
+                assert server._tool_denied_reason(tool) is not None
 
-    def test_role_default_grants(self):
+    def test_role_default_grants(self, tool):
         """ROLE_TOOL_DEFAULTS gives developer @cao-mcp-server, so a role-only profile passes."""
         with patch.dict(os.environ, BOUND):
             with (
                 patch.object(server, "_get_terminal_context_from_env", return_value=_ctx()),
                 _patch_profile(_profile(role="developer")),
             ):
-                assert server._tool_denied_reason("assign") is None
+                assert server._tool_denied_reason(tool) is None
 
 
 class TestToolsRefuse:
@@ -372,3 +381,39 @@ class TestThroughTheRealContextHelper:
                 reason = server._tool_denied_reason("assign")
         assert reason is not None
         assert "@cao-mcp-server" in reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", DELEGATION_TOOLS)
+    @pytest.mark.parametrize("provider", ["copilot_cli", "claude_code"])
+    @pytest.mark.parametrize("allowed_tools", [[], ["fs_read"], ["@transport-sim"], ["@inventory"]])
+    async def test_restricted_profiles_cannot_dispatch_through_any_route(
+        self, tool, provider, allowed_tools
+    ):
+        payload = self._payload(allowed_tools)
+        payload["provider"] = provider
+        with patch.dict(os.environ, BOUND):
+            with (
+                patch.object(server.mcp_utils, "get_json", return_value=payload),
+                patch.object(server.requests, "get", return_value=Mock(status_code=404)),
+                patch.object(server.requests, "post") as post,
+                patch.object(server, "_assign_impl") as assign,
+                patch.object(server, "_handoff_impl") as handoff,
+            ):
+                if tool in {"workflow_run", "workflow_resume", "workflow_start"}:
+                    result = await getattr(server, tool)("fixture")
+                    assert result["ok"] is False
+                    assert "@cao-mcp-server" in result["error"]
+                else:
+                    result = await getattr(server, tool)(agent_profile="developer", message="task")
+                    if tool == "handoff":
+                        assert result.success is False
+                        assert "@cao-mcp-server" in result.message
+                    else:
+                        assert result["success"] is False
+                        assert (
+                            "@cao-mcp-server"
+                            in result["message" if tool == "assign_elastic" else "error"]
+                        )
+        post.assert_not_called()
+        assign.assert_not_called()
+        handoff.assert_not_called()

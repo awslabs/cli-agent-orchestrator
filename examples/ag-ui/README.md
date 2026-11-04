@@ -17,7 +17,7 @@ that exposes multi-agent fleet observability to any stock AG-UI client.
 | [`ag-ui-session-timeline/`](ag-ui-session-timeline/) | L2 `MultiAgentSessionTimeline` construct — reconstructs delegation + message timeline from TOOL_CALL lifecycle | `uv run` |
 | [`ag-ui-handoff-approval/`](ag-ui-handoff-approval/) | L2 `AgentHandoffWithApproval` construct — full interrupt lifecycle (prompt → classify → interrupt → approve/deny/edit → delivery) | `uv run` |
 | [`ag-ui-cross-provider-sync/`](ag-ui-cross-provider-sync/) | L2 `CrossProviderStateSync` construct — convergence proof across kiro_cli / claude_code / codex | `uv run` |
-| [`ag-ui-stock-client-live/`](ag-ui-stock-client-live/) | AC3 verification — stock `@ag-ui/client` `HttpAgent` renders live frames from `POST /agui/v1/run` with zero CAO-specific code | Node.js |
+| [`ag-ui-stock-client-live/`](ag-ui-stock-client-live/) | AC3 verification — stock `@ag-ui/client` `HttpAgent` completes a run against `POST /agui/v1/run` with zero CAO-specific code | Node.js |
 | [`ag-ui-meta-dogfood/`](ag-ui-meta-dogfood/) | Real supervisor→developer→reviewer cross-provider fleet captured on the live AG-UI stream (metadata only, privacy boundary verified) | `uv run` + `cao-server` |
 | [`ag-ui-dashboard/`](ag-ui-dashboard/) | L1 showcase — drives all 6 `emit_ui` components live and demonstrates off-list refusal | `uv run` |
 | [`ag-ui-eventsource-viewer/`](ag-ui-eventsource-viewer/) | Browser-based SSE viewer for `GET /agui/v1/stream` — raw frame inspector | Browser |

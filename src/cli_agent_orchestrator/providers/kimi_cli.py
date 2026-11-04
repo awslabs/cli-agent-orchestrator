@@ -128,6 +128,13 @@ _NON_PUBLISHABLE_KINDS = frozenset(
 # clobber content another thread already read).
 _KIMI_CONFIG_WRITE_LOCK = threading.Lock()
 
+# Floor of the readiness wait in ``initialize`` (the startup-dialog handler and
+# ``wait_until_status`` both run to ``max(READY_TIMEOUT_FLOOR_S,
+# provider_init_timeout)``). A CLIENT prices its wait for a synchronous create
+# from this (``utils.init_allowance``, issue #710), so it is a module constant
+# here rather than a copy there that a change here would silently leave short.
+READY_TIMEOUT_FLOOR_S = 120.0
+
 
 # Custom exception for provider errors
 class ProviderError(Exception):
@@ -756,6 +763,11 @@ def _has_terminal_error(text: str, *, execution_established: bool = False) -> bo
     return _terminal_error_message(text, execution_established=execution_established) is not None
 
 
+# Shared with the provider-error classifier so a marker change cannot leave
+# terminal ownership and error classification disagreeing.
+KIMI_RESPONSE_MARKER_RE = re.compile(r"^[•●]\s")
+
+
 class KimiCliProvider(BaseProvider):
     """Provider for Kimi CLI tool integration.
 
@@ -790,7 +802,7 @@ class KimiCliProvider(BaseProvider):
     _KIMI_PROMPT_RE = re.compile(r"(?:\w{1,32}@[\w.\-]{1,64})?[✨💫][^\S\n]{1,4}\S")
     # Response/thinking markers used to bound a user message line. Matches
     # the same bullets the IDLE/PROCESSING path uses, in both dialects.
-    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^[•●]\s")
+    KIMI_RESPONSE_MARKER_RE = KIMI_RESPONSE_MARKER_RE
 
     @property
     def allow_raw_transcript_fallback(self) -> bool:
@@ -1872,7 +1884,9 @@ class KimiCliProvider(BaseProvider):
 
                         # Resolve the bundled cao-mcp-server console script to a
                         # PATH-independent invocation.
-                        mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
+                        mcp_config[server_name] = resolve_mcp_server_config(
+                            mcp_config[server_name], name=server_name
+                        )
 
                         # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                         # can identify the current terminal for handoff/assign operations.
@@ -2126,7 +2140,7 @@ class KimiCliProvider(BaseProvider):
         # capped at the (shorter) server default while wait_until_status used
         # a hardcoded 120s, so a dialog appearing after 60s but before 120s
         # was never dismissed.
-        ready_timeout = max(120.0, init_timeout)
+        ready_timeout = max(READY_TIMEOUT_FLOOR_S, init_timeout)
 
         # Wait for shell prompt to appear in the tmux window
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
@@ -3445,7 +3459,7 @@ class KimiCliProvider(BaseProvider):
                     msg_lines.append(after)
                 i += 1
                 while i < len(lines):
-                    if self._KIMI_PROMPT_RE.search(lines[i]) or self._KIMI_RESPONSE_MARKER_RE.match(
+                    if self._KIMI_PROMPT_RE.search(lines[i]) or self.KIMI_RESPONSE_MARKER_RE.match(
                         lines[i]
                     ):
                         break

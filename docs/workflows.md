@@ -25,10 +25,14 @@ For the shim-contract deep-dive (`run_step`/`emit_output`, retry/determinism, th
 
 ## Quick start
 
-Write a small script to the workflows directory, validate it, and run it.
+Write a small script as a **draft file anywhere you like**, install it with
+`cao workflow create` (which validates it before writing), and run it. You never write into
+the workflows directory yourself:
+`create` sends the draft's **text** to the server, which decides where the spec lands
+through the guarded write path described in [The lifecycle](#the-lifecycle).
 
 ```python
-# ~/.aws/cli-agent-orchestrator/workflows/hello.py
+# ./hello.py — a draft; its own path and name are yours and are not kept
 from cao_workflow import run_step, emit_output
 
 # Step 1 — a developer writes a note.
@@ -41,24 +45,62 @@ emit_output({"note": note.output, "review": review.output})
 ```
 
 ```bash
-# validate is mandatory — fix every finding before running
-cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/hello.py
+# create validates the draft, installs it under the name you give it, and prints the content_hash
+cao workflow create hello --from-file ./hello.py
 
 # run it by its stem, with a pre-announced run-id
 cao workflow run hello --run-id hello-1
+# -> refused: 403 approval_required, carrying the plan_id. This is by design — a plan
+#    identifier does not exist until a run computes it. Present the plan_id to the user
+#    and stop; approval is a human act (see Plan approval below).
+
+# the USER approves at their terminal, then you run again
+cao workflow approve plan-v1:<digest-from-the-refusal>
+cao workflow run hello --run-id hello-1
 ```
 
-The workflow is run **by its stem** (`hello`), so the filename must be a bare name with
-no path separators, and you must not create a same-stem `hello.yaml` sibling — it would
-collide on the run surface.
+The workflow is run **by its stem** (`hello`), so the name you pass to `create` must be a
+bare name with no path separators — the draft file's own name is irrelevant. A same-stem
+cross-tier collision (a `hello.yaml` beside the `hello.py` this creates) is refused by
+`create` **before anything is written**. Writing the file into the workflows directory
+yourself remains possible and is an explicitly acknowledged alternative with real costs —
+see step 1 of [The lifecycle](#the-lifecycle) before choosing it.
 
 ## The lifecycle
 
 Every workflow follows the same path. No step is optional.
 
-1. **Author** — write the `.py` file to `~/.aws/cli-agent-orchestrator/workflows/<name>.py`.
-2. **Validate (mandatory gate)** — `cao workflow validate <path>`. Findings are
-   **load-bearing**, not style nits:
+1. **Author** — write the script as a **draft anywhere you like**, then install it through
+   the guarded write path: `cao workflow create <name> --from-file <draft>` (to replace an
+   existing spec: `cao workflow update <name> --from-file <draft> --expected-hash <hash>`,
+   with the hash from `get <name>`). The draft's **text** is sent to the server and the
+   **server** decides where the spec lands. Every protection lives on that path, and every
+   check precedes any write, so a refusal leaves the filesystem byte-identical:
+   - **path containment** — the write cannot land outside the spec directory, whatever the
+     request asks for;
+   - **a source size cap** — enforced before any file is created;
+   - **validation + lint before the file exists** — CAO never writes a spec it would refuse
+     to run, so a failed `create` wrote nothing;
+   - **atomic publication** — `create` publishes a fully written temp inode with an atomic
+     link and `update` atomically replaces, so a concurrent reader never sees a partial spec;
+   - **a same-stem cross-tier pre-check** — creating `<name>.py` beside an existing
+     `<name>.yaml` is refused up front; a raw write would succeed and leave a spec that
+     every later `get`/`run` of `<name>` fails to reach with `TierCollisionError` — a file
+     unreachable the moment it lands.
+
+   `create` refuses to overwrite an existing spec (use `update`) and prints the new
+   `content_hash`, which a later `update` requires.
+
+   Writing the file into `~/.aws/cli-agent-orchestrator/workflows/` yourself is an
+   explicitly acknowledged alternative, and it gives up every layer above: no path
+   containment, no size cap, no pre-write validation or lint gate, no atomic publication
+   (a reader can see the half-written file), and no tier-collision pre-check. It remains
+   possible because the directory is yours; it is not the recommended path.
+2. **Validate (mandatory gate)** — `create` and `update` validate the draft source
+   server-side before writing. They refuse to write a spec with a blocking error. For a spec
+   already installed in the workflows directory, `cao workflow validate <path>` runs the same
+   linter; a relative `<path>` is resolved against that directory. Findings are **load-bearing**,
+   not style nits:
    - **`import cli_agent_orchestrator` is banned.** The script runs in a separate
      subprocess and must reach CAO only over HTTP through the `cao_workflow` shim.
      Importing the server package breaks that boundary and fails validation.
@@ -75,12 +117,16 @@ Every workflow follows the same path. No step is optional.
      `422`, but which the shim does not check before sending — so a typo fails that step
      mid-run rather than up front). See the authoring guide's recovery-policy section — a
      policy is a *declaration*, never a permission.
+   - **Scripts over 131,072 characters (128 KiB) fail validation** with a `syntax` error
+     before they are parsed. The limit is a crash guard for CPython 3.10's parser, not a
+     style rule; split a script that large into smaller ones. The spec byte budget
+     (256 KiB) still applies on top.
 3. **Run** — with an explicit, pre-announced `--run-id` so it can be cancelled.
    **Workflows are NEVER auto-run by an agent.** The user approves each run.
 4. **Status / cancel / resume** — `cao workflow status <run-id>`,
    `cao workflow cancel <run-id>`, `cao workflow resume <run-id>`.
 
-A validate that reports `valid` (status `pass` or `pass_reserved`) exits 0; a failing
+A validation that reports `valid` (status `pass` or `pass_reserved`) exits 0; a failing
 spec exits 1 and lists each error.
 
 ## Parameterized workflows (inputs)
@@ -93,7 +139,7 @@ A workflow declares a **module-level `INPUTS` dict** and reads the resolved valu
 runtime with `get_inputs()`:
 
 ```python
-# ~/.aws/cli-agent-orchestrator/workflows/summarize.py
+# ./summarize.py — a draft; `cao workflow create` decides where the spec lands
 from cao_workflow import run_step, emit_output, get_inputs
 
 INPUTS = {
@@ -113,10 +159,10 @@ review = run_step(
 emit_output({"summary": review.output})
 ```
 
-Run it with `--input key=value` (repeatable):
+Install the draft and run it with `--input key=value` (repeatable):
 
 ```bash
-cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/summarize.py
+cao workflow create summarize --from-file ./summarize.py
 cao workflow run summarize --run-id sum-1 \
   --input target_file=/abs/path/to/report.md \
   --input max_points=5 \
@@ -279,6 +325,17 @@ provider, the agent profile name, the prompt, and the other fields that determin
 actually runs. Change one of them at the same step key and the step diverges rather than
 replaying. That is why the determinism rules above are load-bearing.
 
+> **A resume checks that it is still the same working directory before it re-drives anything.**
+> While approval enforcement is on, a resume compares the run's working-directory root against the
+> identity recorded when the run was admitted, and refuses with `409 plan_inputs_changed` if the
+> directory at that path is no longer the one that was approved — or can no longer be read. This
+> happens at resume **admission**, before the generation bump and before any recovery decision is
+> written, so a refused resume changes nothing and leaves any still-live process for that run alone.
+> The check covers both root kinds; see
+> [Plan approval](#plan-approval-script-tier) for what the identity is and what it cannot catch.
+> A resume is otherwise unaffected: a run whose directory never moved resumes exactly as before, and
+> a run admitted before this check existed carries no recorded identity and is resumed without it.
+
 ### Halts and `--decide`
 
 A step halts when its outcome is genuinely unknown or unverifiable: it was dispatched and
@@ -357,15 +414,17 @@ audit log. Each one is logged at INFO by the server; that is the trail.
 
 ## CLI reference
 
-All fourteen verbs live under `cao workflow`.
+All sixteen verbs live under `cao workflow`.
 
 | Verb | Flags | Description |
 | --- | --- | --- |
-| `validate <file>` | `--json` | Validate a spec file without running it. Exit 0 valid, 1 invalid. |
+| `validate <file>` | `--json` | Validate an installed spec without running it. The path is resolved against the workflows directory. Exit 0 valid, 1 invalid. Use `create` or `update` to validate and install a draft. |
+| `create <name>` | `--from-file <path>` (required), `--json` | Create a **new** Python spec named `<name>` from a source file. Refuses to overwrite an existing spec — use `update`. Python only; a YAML-tier name is refused with a message naming the restriction. The source is sent as text and the **server** decides where it lands (validation, lint gate, path containment, atomic write, index update all happen server-side). Prints the new `content_hash`, which is what `update` wants next. Exit 0 created, 1 refused/errored. |
+| `update <name>` | `--from-file <path>` (required), `--expected-hash <hash>` (required), `--json` | Replace an **existing** spec's source, refusing a stale update. Refuses to create — use `create`. `--expected-hash` is required and is never computed for you: it is your assertion about what you believe you are replacing, and a hash derived from the file about to be overwritten would always match. There is no `--force`. Get the current hash from `get <name>` (the `Hash:` line). |
 | `list` | `--dir <path>`, `--json` | List indexed workflows (rebuilt from spec files on disk). Script-tier rows show `-` for step count. |
 | `get <name>` | `--json` | Show the parsed/validated spec for a name or file path. |
-| `delete <name>` | `--yes` / `-y` | Delete a workflow's spec file and index row (prompts unless `--yes`). |
-| `run <name_or_path>` | `--input k=v` (repeatable), `--run-id <id>`, `--detach`, `--wait`, `--json` | Submit a run and follow it to a terminal state. `--detach` submits and exits; `--wait` blocks inline. Exit 0 completed, 1 failed/cancelled. `--json` emits `{run_id, state}` — see the breaking-change note above. |
+| `delete <name>` | `--yes` / `-y`, `--json` | Delete a workflow's spec file and index row (prompts unless `--yes`). |
+| `run <name_or_path>` | `--input k=v` (repeatable), `--run-id <id>`, `--working-directory <path>`, `--detach`, `--wait`, `--json` | Submit a run and follow it to a terminal state. `--detach` submits and exits; `--wait` blocks inline. Exit 0 completed, 1 failed/cancelled. `--json` emits `{run_id, state}` — see the breaking-change note above. |
 | `status <run_id>` | `--json` | Point-in-time status snapshot for a run (full detail, including steps). |
 | `runs` | `--state <state>`, `--limit <n>`, `--json` | List recorded runs from the durable journal, newest first. |
 | `wait <run_id>` | `--json` | Follow an already-submitted run by polling until terminal. Same exit codes as `run`. |
@@ -378,11 +437,15 @@ All fourteen verbs live under `cao workflow`.
 
 ## MCP tool reference (from inside an agent session)
 
-Eleven workflow tools are exposed over MCP. Each returns a structured `{ok, ...}` envelope on
+Fifteen workflow tools are exposed over MCP. Each returns a structured `{ok, ...}` envelope on
 every path and never raises into the agent loop.
 
 | Tool | Description |
 | --- | --- |
+| `workflow_create` | Create a **new** Python spec from source **text** (not a path). Thin client over `POST /workflows`; refuses to overwrite an existing spec. |
+| `workflow_update` | Replace an existing spec's source, refusing a stale update. Requires `expected_hash` — the hash you believe the spec currently has. |
+| `workflow_get` | Read a spec back, including its source and `content_hash`. FR-10's "inspect" operation: what the workflow currently **is**, not what you last sent. |
+| `workflow_validate` | Lint spec source **without creating anything**. Takes text, so a draft can be checked before it exists anywhere — validate, revise, then create. |
 | `workflow_run` | Run a workflow to completion **inline** (blocking). Bounded by the MCP host's per-tool-call timeout — see the ceiling note above. |
 | `workflow_start` | Submit a run **asynchronously**; returns the run id immediately without waiting. |
 | `workflow_status` | Point-in-time status snapshot for one run. |
@@ -402,6 +465,10 @@ before assuming a verb and a tool with similar names do the same thing:
 
 | Concept | CLI verb | MCP tool |
 | --- | --- | --- |
+| Create a spec | `create --from-file <path>` | `workflow_create` (source **text**) |
+| Update a spec | `update --from-file <path> --expected-hash` | `workflow_update` (source **text**) |
+| Read a spec | `get <name>` | `workflow_get` |
+| Validate | `validate <file>` (installed spec) | `workflow_validate` (source **text**, including drafts) |
 | List workflow **specs** | `list` | *(none — MCP has no spec-listing tool)* |
 | List workflow **runs** | `runs` | `workflow_list` |
 | Submit asynchronously | `run` (the default) | `workflow_start` |
@@ -409,6 +476,13 @@ before assuming a verb and a tool with similar names do the same thing:
 | **Grant** a plan approval | `approve <plan_id>` | *(none — deliberately)* |
 | **Report** a plan's approval | *(none)* | `workflow_plan_approval` |
 
+> **The four authoring pairs line up by name but not by input.** `create` and `update` take a
+> **draft file path** on the CLI, while `validate` takes a path to a spec already in the workflows
+> directory; all three take **source text** over MCP. That is deliberate — an agent holds a draft in
+> context and has nowhere to put a file, whereas a person already has one on disk — but it means the
+> CLI flag and the tool argument are not interchangeable. In both directions the server does the
+> validating, containment-checking and writing; neither surface writes to the spec directory itself.
+>
 > **`list` and `workflow_list` are false friends.** The CLI's `list` lists **specs**; the
 > MCP `workflow_list` lists **runs**. An agent reaching for "the list tool" expecting specs
 > gets runs. The CLI equivalent of `workflow_list` is `cao workflow runs`.
@@ -425,27 +499,181 @@ before assuming a verb and a tool with similar names do the same thing:
 
 ## Plan approval (script tier)
 
-**Nothing in this section applies to YAML workflows**, and nothing in it is active by default.
+A script plan needs human approval before it can run: an operator approves it
+with `cao workflow approve <plan_id>` using the exact identifier from the `403`
+refusal, then runs it again. The first run of a new or changed script plan is
+refused by design. An agent must present the identifier to the user and stop;
+there is no agent-side tool that grants approval.
+
+**Nothing in this section applies to YAML workflows.** Script-tier approval enforcement is active by
+default.
+
+For a working directory outside any Git repository, the plan identifier records the directory's canonical path and the filesystem's own identity for that directory (its device and inode), and nothing about its contents.
 
 A script-tier run freezes an **execution manifest** at run start — the workflow's source hash, its
-resolved inputs, and the repository/worktree baseline — and derives a **plan identifier** (`plan_id`,
-of the form `plan-v1:<digest>`) from the execution-affecting fields. Change any of them and the
-`plan_id` changes, which is the mechanism by which a changed plan needs its own approval.
+resolved inputs, the repository/worktree baseline, and a digest of the installed agent profile set —
+and derives a **plan identifier** (`plan_id`, of the form `plan-v2:<digest>`) from the
+execution-affecting fields. Change any of them and the `plan_id` changes, which is the mechanism by
+which a changed plan needs its own approval. What the manifest actually persists is the resulting
+opaque `plan_id`, not the profile-set digest itself — the digest is computed, folded into `plan_id`,
+and discarded; it is never written to the manifest as its own value.
 
-### Enabling it
+> **The agent profile set is part of plan identity, and the whole set is.** A step's behaviour and tool
+> policy come from whichever agent profile it names, resolved from a file outside the script at launch
+> time, so editing a profile changes how an approved plan executes. Script-tier steps are discovered by
+> executing the Python, so at approval time there is no list of which profiles a run will name — the
+> digest therefore covers **every installed profile**, not just the ones a script happens to use. The
+> practical consequence: `cao install <anything>`, or editing any profile in your agent store or any
+> file `cao install` wrote for a profile (the Kiro agent JSON, the Copilot or OpenCode agent file, the
+> shared OpenCode `opencode.json`, the installed context copy), invalidates every existing approval and
+> the next run of each plan is refused until re-approved. The packaged built-in profiles are in the set
+> too, so a CAO upgrade that changes a bundled profile also moves every `plan_id`.
 
-Approval enforcement is **off by default**. With it off, `plan_id`s are still computed and frozen, and
-runs start regardless of whether an approval exists.
+> **A working directory outside Git is bound by its identity, not by its path.** A path is not an
+> identity: a directory moved away and replaced by a different directory at the same path keeps the
+> path. So for a non-Git root the identifier records the directory's device and inode (`st_dev`,
+> `st_ino`) alongside its canonical path, and the launch guard re-checks the pair at every agent launch
+> in the run. Move the directory away and put a different directory at the path — or mount a different
+> filesystem there — and the next run gets a new `plan_id` and is refused until re-approved; do it
+> while a run is in flight and that run's next agent step is refused with `plan_inputs_changed`, and so
+> is a **resume** of it. What this does **not** catch is a directory **deleted and created again** at
+> the same path: ext4 and XFS hand out the inode number that was just freed, so the recreated directory
+> can get the same pair back and keep the approval. See
+> [What an approval does not cover](#what-an-approval-does-not-cover).
+>
+> A **Git** root's `plan_id` is deliberately not bound this way — its identity is the commit plus the
+> worktree digest, which is content rather than location, so a different directory at the same path
+> already produces a different `plan_id` and two checkouts in the same state keep sharing one approval,
+> on one machine or two.
+>
+> **The launch guard binds a Git root too, and that is not the same thing.** The argument above settles
+> the case ACROSS runs only. Nothing recomputes `plan_id` inside a run or at a resume: a resume reuses
+> the identifier already frozen on the run, and an agent launch compares only the per-run record. So
+> `git worktree remove` followed by `git worktree add <same path> <other branch>` during a long step,
+> or a re-clone at the path, would otherwise leave the script running in the old directory (its working
+> directory keeps the old inode alive) while every later terminal is started **by path** inside the
+> replacement checkout, under the original approval. The guard therefore records the same device and
+> inode pair for either kind of root, taken from the same single `stat` the identifier used. That pair
+> never reaches `plan_id`, so **no Git identifier moves and no existing Git approval is invalidated.**
+>
+> The pair identifies a directory on this machine, so a non-Git plan's identifier is machine-local by
+> construction, and anything that renumbers the directory without changing it — a restore from backup,
+> an `rsync` into a fresh directory, a remount that assigns a different device number — costs one
+> re-approval. That is the price of the binding, and it is the direction to prefer: a spurious
+> re-approval is a prompt, while a reused approval is a directory nobody reviewed. **For a run that is
+> already in flight the cost can be the run**, not just one re-approval: some filesystems take their
+> device number at mount time (NFS is one), so a reboot or a remount between a crash and a resume makes
+> the recorded pair unmatchable. That resume is refused with `plan_inputs_changed` and the operator
+> starts a new run, which is the fail-closed direction — the guard cannot distinguish "same directory,
+> new device number" from "different directory".
+>
+> **Where the filesystem supplies no usable identity, CAO falls back and says so.** Some network
+> mounts, container overlays and Windows volumes report no inode for a directory. CAO does not refuse
+> those runs — that would make every script run on such a filesystem unapprovable — and it does not
+> skip the binding silently either. The manifest records
+> `repo_baseline.root_identity: {"bound": false, "reason": "root_identity_unsupported"}` (or
+> `root_identity_unreadable` if the directory could not be read at all), the server logs a warning
+> carrying that reason and no path, and the unbound marker is itself part of the `plan_id` — so a plan
+> whose root identity could not be bound has a different identifier from one where it was, and you can
+> see which you are approving. On such a filesystem the non-Git root falls back to path-only identity,
+> which is what every non-Git root had before this change.
+
+> **Migration: new runs move to `plan-v2`; approved `plan-v1` resumes still pass.** A `plan_id` computed after
+> upgrading always uses the new `plan-v2:` scheme, so the first NEW run of every plan is refused until
+> re-approved under its `plan-v2:` identifier — a `plan-v1` approval attested to a plan whose agent
+> profiles were never examined, so it cannot satisfy the new scheme. This does **not** reach a run that
+> was already frozen and approved before the upgrade and left resumable: resume reuses that run's
+> frozen `plan_id` verbatim rather than recomputing it, so an approved `plan-v1` resume still proceeds
+> on its original approval. Its per-run launch guard record carries no scheme marker, so each of its
+> agent launches is still checked under the rule it was admitted with (the profile text alone, without
+> the installed files); new runs record `launch-guard-v2` and are checked under the full rule.
+> Re-approve each plan once it is run fresh.
+>
+> The root-identity binding above does **not** bump the scheme — `plan-v2` names the field set, and the
+> root identity is new content in an existing field rather than a new field. It does change the
+> identifier of every plan whose working directory is outside Git, so those plans are refused once and
+> re-approved under their new `plan-v2:` identifier. Plans in a Git working directory keep their
+> existing identifiers. A run already admitted and left resumable keeps launching its steps: its
+> `launch-guard-v2` record carries no root identity, and a record written before the binding existed is
+> checked without it rather than refused.
+
+### It is on by default
+
+Approval enforcement is **on by default**.
+
+> **This is a behaviour change, not a fix.** A script-tier plan that ran yesterday under no approval
+> is refused today. If you run script-tier workflows non-interactively, approve each plan first with
+> `cao workflow approve <plan_id>`, or opt out as shown below. YAML-tier workflows are unaffected.
+
+Nothing is required to enable it. The environment variable still works and is now useful for
+re-asserting the default rather than switching it on:
 
 ```bash
-# start the CAO server with approval enforcement enabled
+# the default -- the gate is already on
+cao-server
+
+# re-assert it explicitly (for example in a script whose settings.json you do not control)
 CAO_WORKFLOW_REQUIRE_APPROVAL=1 cao-server
 
 # invoke the CLI client normally
 cao workflow run my-script
-
-# alternatively, persist workflow.require_approval = true in the server's settings.json
 ```
+
+#### Opting out
+
+Only the server's `settings.json` can turn the gate off:
+
+```json
+{
+  "workflow": {
+    "require_approval": false
+  }
+}
+```
+
+#### Recovering from malformed settings
+
+With `CAO_WORKFLOW_REQUIRE_APPROVAL` unset, unreadable, undecodable, malformed JSON, or invalid
+approval settings **fail closed**: the gate remains on. Repair `settings.json` and restart or reload
+the CAO server. A valid explicit JSON boolean `workflow.require_approval: false` is the only
+settings-file opt-out; `null`, strings, and numbers are invalid and do not disable enforcement.
+
+#### What a refusal looks like
+
+The refusal causes are deliberately distinct, because the operator's next action differs:
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `403` | The plan's `plan_id` has no approval. | `cao workflow approve <plan_id>`, then run again. |
+| `409` | `plan_inputs_changed`: while approval enforcement is on, the run's recorded agent profile or memory setting changed, the directory at its working-directory path was replaced or removed, its launch state is unreadable, approval enforcement was turned on after this run started, or approval settings could not be read. This surfaces from an agent step's `POST /terminals/run-step`, not the initial run attempt. | Start a new run for changed inputs, a replaced working directory, unreadable launch state, or newly enabled enforcement. A working directory that was **removed** rather than replaced needs restoring first — starting a new run in a path that does not exist is refused with `422`. If approval settings could not be read, repair `settings.json`, then resume. |
+| `503` | CAO could not compute a plan identifier: untracked files exceed 64 MiB or contain unsupported entries, Git is unavailable/unreadable/timed out, files changed during the snapshot, profiles are unreadable, the freeze failed, or an older run has no recorded identity. | Follow the message; retry only when it says the cause was transient. No approval will help. |
+| `503` | The approval store could not be read, so CAO cannot determine whether the plan is approved. | Restore database access, then retry. The run remains refused. |
+
+An operator may choose the settings-file [opt-out](#opting-out) as an explicit policy decision. An agent must follow the refusal message and must not disable approval enforcement.
+
+The missing-approval and missing-identity refusal bodies carry the identifier as a **field**, not only in the message
+(issue #583 Bolt 3), so a script or agent branches on it rather than parsing prose:
+
+```json
+{
+  "detail": {
+    "kind": "approval_required",
+    "plan_id": "plan-v2:9f3c…",
+    "message": "Plan 'plan-v2:9f3c…' has not been approved. …"
+  }
+}
+```
+
+`kind` is authoritative and the status mirrors it: `approval_required` → 403, and
+`plan_identity_unavailable` → 503 with `plan_id: null`, because in that case there is no identifier to
+approve. `cao workflow run` and the `workflow_run` tool both read that field and print — or return — the
+exact `approve` command.
+
+Note that a `plan_id` is computed at run start, so the **first run of a new or changed plan is
+refused by design** — that is the mechanism by which a changed plan needs its own approval.
+
+An unavailable approval store returns `503` with a string `detail` explaining the database fault.
+It does not ask you to approve the plan again; check the server log and restore database access.
 
 > **The variable configures the server, not the CLI client.** Setting
 > `CAO_WORKFLOW_REQUIRE_APPROVAL=1` only on a short-lived `cao workflow run` invocation does not
@@ -464,12 +692,14 @@ been approved yet**. The loop is:
 
 ```bash
 cao workflow run my-script          # refused; the error carries the plan_id
-cao workflow approve plan-v1:<digest>
+cao workflow approve plan-v2:<digest>
 cao workflow run my-script          # starts
 ```
 
-This friction is temporary rather than intrinsic — the authoring sequence that presents a plan and
-takes approval *before* running is a later piece of work.
+Bolt 3 ships the conversational authoring sequence around this loop: create or update the script
+(which validates it before writing), present it for review, make the plan-discovery run above, and
+surface the refused run's `plan_id` for a human to approve before retrying. The discovery run remains
+necessary because the `plan_id` does not exist before run admission computes it.
 
 ### What approval is, and is not
 
@@ -482,7 +712,9 @@ takes approval *before* running is a later piece of work.
   nothing verifies it.
 - **A same-user local control, not a privilege boundary.** CAO runs as the invoking user, so a
   determined local script can edit the settings or the approval record directly. What the gate provides
-  is that a changed plan cannot execute *unnoticed* under an approval granted for a different plan.
+  is that a changed script, changed inputs or a changed repository state cannot execute unnoticed
+  under an approval granted for a different plan. It does not bind agent profiles or memory content;
+  see [What an approval does not cover](#what-an-approval-does-not-cover).
 - **Fail-closed while enabled**: a run whose manifest is missing or unreadable is refused rather than
   admitted.
 
@@ -491,7 +723,11 @@ takes approval *before* running is a later piece of work.
 A script-tier run resolves CAO memory **once**, at its first terminal, and records the content, its source and a
 hash of the **full** resolved content into the same manifest. Every later terminal of that run — and every resume,
 however long afterwards — is given that recorded copy. **Editing CAO memory after a failure therefore does not
-change what a resumed run sees.**
+change what a resumed run sees.** After a memory resolution error, nothing is recorded, so a later terminal or a
+resume resolves it again.
+Memory content is not part of plan identity; the memory-enabled setting is recorded at the
+approval check while approval enforcement is on, and changing it stops further agent launches for
+that run while enforcement remains on.
 
 One consequence is worth stating plainly, because it differs from a non-workflow terminal:
 
@@ -503,16 +739,107 @@ One consequence is worth stating plainly, because it differs from a non-workflow
 The recorded hash covers the full resolved content, taken **before** redaction, so it identifies what was resolved
 rather than what survived the redaction rules of the day.
 
-### Two things not yet implemented
+### What an approval does not cover
 
-Stated here because their absence is easy to assume away:
+An approval binds four things: the script source, its resolved inputs, the state of the run's
+working directory when the run is admitted, and the installed agent profile set (every profile's
+source text plus the files `cao install` wrote for it, including the shared OpenCode `opencode.json`,
+which is bound whole because OpenCode reads the whole file, so an edit to your own key in it also moves
+every `plan_id`). For a Git repository the directory state is
+the commit and the worktree changes, not the path, so two checkouts in the same state share one
+approval. For a directory outside any Git repository it is the directory's canonical path plus its
+device and inode, so the path cannot be pointed at a *moved-away* directory's replacement, or at a
+different mount, under an existing approval — but still nothing about the files inside it, and not a
+directory deleted and created again at the same path (see the inode-reuse item below).
 
-1. **Stale source-hash rejection.** A `plan_id` changes when the source changes, but an update
-   presenting a stale expected source hash is **not** rejected. Do not rely on such a check running.
-2. **Six manifest fields are omitted rather than recorded** — provider, model, profile, permissions,
+Everything else is read when a step runs, so a new run of an approved plan can do something different
+from what was reviewed and still match the same `plan_id`:
+
+- **Agent profile edits within one run.** A profile edit after a run is admitted is caught at the
+  next agent launch in that run (`plan_inputs_changed`); the next NEW run gets a new `plan_id` and is
+  refused until re-approved. What a profile edit cannot change is a run that already launched its
+  steps.
+- **Memory content.** CAO memory is resolved at a run's first agent terminal and is not part of the
+  `plan_id`. Memory added or edited after approval, including through the `memory_store` tool, reaches
+  the next run's steps under the original `plan_id`. Only the memory-enabled setting is checked, and
+  only within a run. Tracked in #828.
+- **Files in a non-Git working directory.** The `plan_id` records which directory it is — its path and
+  its device and inode — not what is inside it. Files added, changed or removed there after approval
+  are used by the next run under the original `plan_id`. A directory *moved or renamed away* and
+  replaced by another at the path is caught, and so is a different filesystem mounted at the path;
+  rewriting the *contents* is not.
+- **A non-Git root deleted and created again at the same path.** The device and inode pair is the
+  filesystem's identity for the directory, and filesystems **reuse inode numbers**. On ext4 and XFS —
+  the Linux defaults — a `rm -rf <root> && mkdir <root>`, or any tool that wipes and recreates the
+  directory, often gives the new directory the inode number that was just freed, on the same device.
+  The pair is then unchanged, so the `plan_id` is unchanged and the new directory keeps the approval,
+  exactly as a rewrite of the old directory's contents does. A directory that is **moved away** rather
+  than deleted keeps its inode allocated, which is why that case is always caught. The same gap
+  applies to a **Git** root replaced within a run or across a resume: the per-run launch guard binds a
+  Git root by the same pair, so the move-away case is caught, and the delete-and-recreate case is not.
+  A stronger identity
+  — a birth time, where the platform exposes one — is tracked in #1050; `os.stat` does not supply one
+  on Linux.
+- **A non-Git root on a filesystem with no usable inode.** Where the filesystem reports no inode for
+  the directory, the root falls back to path-only identity and the manifest records
+  `root_identity.bound: false` with its reason. Such a plan is approvable, and on that filesystem a
+  directory replaced at the same path does reuse the approval, exactly as every non-Git root did before
+  the device/inode binding. The unbound marker is part of the `plan_id`, so the weaker binding is
+  visible in the identifier you approve rather than silent.
+- **Managed `.env` values a profile references.** A profile's `${VAR}` placeholders are resolved from
+  the CAO-managed `.env` file (`cao env set`) when the step launches. The placeholder text is bound; the
+  value is not, because that file is where credentials live and a digest of the substituted text would
+  carry a hash of each credential into an identifier that is logged and displayed. Changing a referenced
+  value with `cao env set` does not change the `plan_id`.
+- **MCP servers from installed agent plugins, for providers that receive them at launch.** Where
+  `cao install` materialises agent-plugin MCP servers into a file the provider reads (the Kiro agent
+  JSON, the shared OpenCode `opencode.json`), they ARE bound: an agent-plugin install or uninstall
+  rewrites those files for every installed profile, so it moves every `plan_id`. For the providers that
+  receive agent-plugin MCP servers at launch instead (`with_plugin_mcp`: Claude Code, Codex, Copilot,
+  Kimi, Cursor, Grok, OMP, Antigravity, MiniMax), nothing on disk changes for the profile, so adding or
+  removing an agent plugin does not change the `plan_id` there.
+- **Kiro launch inputs `cao install` does not write.** The files a Kiro agent's `resources` point at,
+  other than the installed context copy, and the global Kiro `mcp.json` when a profile opts in with
+  `useLegacyMcpJson` (`includeMcpJson`), are read by Kiro at launch and are not part of the `plan_id`.
+- **Installed skills.** The skill catalog under the CAO skills directory is injected into a launching
+  agent's context and is not part of the `plan_id`.
+- **A same-name profile shadowed in a lower-priority directory.** Only the profile that wins
+  resolution, plus the files `cao install` wrote for that name, is bound; a same-named file in a
+  directory that loses resolution is not.
+- **The reserved ephemeral namespace.** Ephemeral profiles are created by the run after admission and
+  are bound on their own path, so they are outside the installed-set digest by design.
+
+Each of these is a launch input the next run reads live. Binding any of them is a separate change from
+#827; the `.env` case needs a design that does not leak values, and the others need a product ruling on
+whether an operator's agent-plugin or skill change should invalidate every approval on every provider
+(today it does so only where `cao install` writes the servers to disk).
+- **Repository changes after admission.** The repository state is read once, when the run is
+  admitted. Changes made after that, including while a submitted run waits for a free slot, are not
+  detected.
+- **Agents a step delegates to** with assign or handoff. They run with their current profiles,
+  including creator-owned ephemeral agents through that separate claim/launch path. Fresh agent steps
+  in an approved script run still refuse reserved ephemeral profiles until their definitions are bound.
+
+With API authentication off, which is the default, any process running as you can change these inputs,
+and can also run `cao workflow approve`. The gate makes sure that a changed script, changed inputs,
+changed repository state, or a working directory that is no longer the same directory can't run
+unnoticed under an approval granted for something else. It doesn't detect changes to the inputs listed
+above.
+
+1. **Six manifest fields are omitted rather than recorded** — provider, model, profile, permissions,
    limits and retry policy. Script-tier steps are discovered by executing the Python, so those values
    have no run-level existence at freeze time; they are covered transitively by the source hash,
    because changing any of them means editing the script.
+   While approval enforcement is on, the profile set and the memory-enabled setting are recorded at
+   the approval check; the run refuses to launch further agent steps if either changes while
+   enforcement remains on.
+
+> **Stale source-hash rejection now runs** (issue #583 Bolt 3). This section previously listed it as a
+> second gap. `cao workflow update` and the `workflow_update` tool both require the `content_hash` you
+> last read, and the write is refused if the spec has moved on since — so an edit made from a stale read
+> is stopped rather than silently overwriting someone else's. Do not work around it by re-reading the
+> hash immediately before writing: a hash read from the file you are about to overwrite always matches,
+> which removes the check instead of satisfying it.
 
 ## See also
 
@@ -524,4 +851,10 @@ Stated here because their absence is easy to assume away:
   - [`conditional_example.py`](examples/conditional_example.py) — branching, explicit `step_id` per branch.
   - [`fanout_example.py`](examples/fanout_example.py) — concurrent fan-out via `ThreadPoolExecutor`.
   - [`loop_raw_http_example.py`](examples/loop_raw_http_example.py) — the same loop with no shim, raw `urllib` against the identity env vars.
+- [`examples/workflows/pr-health/`](../examples/workflows/pr-health/) — a
+  deterministic open-PR health scorer with comment-only notifications, an
+  epoch-bounded notification lifecycle (fixed grace periods, a 90-day re-entry
+  cooldown, and lifetime caps past which decisions are report-only), a
+  journal-visible per-PR decision record, and a biweekly scheduled-flow example.
+  Its apply mode is gated by plan approval rather than by prompt prose.
 - [`skills/cao-workflow/SKILL.md`](../skills/cao-workflow/SKILL.md) — the agent-facing skill that teaches this lifecycle.

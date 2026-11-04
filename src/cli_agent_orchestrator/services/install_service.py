@@ -22,11 +22,8 @@ from cli_agent_orchestrator.agent_plugins.mcp_delivery import (
     apply_plugin_mcp_servers,
     grantable_server_names,
     log_delivery_findings,
-    merge_plugin_mcp_servers,
     opencode_config_collision_finding,
 )
-from cli_agent_orchestrator.agent_plugins.mcp_mapping import is_pre_expanded as is_plugin_mcp_entry
-from cli_agent_orchestrator.agent_plugins.mcp_mapping import strip_marker as strip_plugin_mcp_marker
 from cli_agent_orchestrator.agent_plugins.models import Finding
 from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
 from cli_agent_orchestrator.constants import (
@@ -37,19 +34,26 @@ from cli_agent_orchestrator.constants import (
     OPENCODE_AGENTS_DIR,
     SKILLS_DIR,
 )
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
-from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers.kiro_identity import (
+    kiro_agent_dirs,
+    require_kiro_agent_defined,
+)
+from cli_agent_orchestrator.providers.kiro_v3_schema import pinned_kiro_v3_schemas
+from cli_agent_orchestrator.services.kiro_v3_validate import require_valid_for_every_pinned_schema
 from cli_agent_orchestrator.services.profile_store import write_profile
-from cli_agent_orchestrator.utils import agent_profiles
+from cli_agent_orchestrator.utils import agent_profiles, opencode_config
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
 )
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
 from cli_agent_orchestrator.utils.env import load_env_vars, set_env_var
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
     OpenCodeAgentIdCollisionError,
     disable_mcp_server,
@@ -72,6 +76,10 @@ from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 from cli_agent_orchestrator.utils.tool_mapping import (
     granted_mcp_servers,
     kiro_agent_tools,
+    kiro_universal_tools,
+    kiro_v3_excluded_tools,
+    kiro_v3_granted_mcp_servers,
+    kiro_v3_rules,
     resolve_allowed_tools,
 )
 
@@ -164,6 +172,164 @@ def _inject_kiro_mcp_timeout(
             cfg = {**cfg, "timeout": _KIRO_MCP_TOOL_TIMEOUT_MS}
         result[name] = cfg
     return result
+
+
+#: Profile fields a v3 install refuses rather than translating (#1167): v3 has
+#: no ``toolsSettings``, its ``hooks`` are a different shape and run commands,
+#: ``toolAliases`` is not in its schema, and an explicit ``tools`` list is raw
+#: Kiro names CAO cannot prove against the grant. Their v2 installs are unchanged.
+_KIRO_V3_UNTRANSLATED_FIELDS = ("hooks", "toolsSettings", "toolAliases", "tools")
+
+
+def _kiro_install_is_universal(
+    profile: AgentProfile, engine: Optional[str], profile_name: str
+) -> bool:
+    """Whether this Kiro install writes the v3-enabled universal file (#1167).
+
+    An explicit ``--engine`` and the profile's ``engine`` must agree, and either
+    one decides. With neither, the format already on disk is kept, so a
+    reinstall or a plugin refresh never turns a universal file back into a
+    v2-only one. An absent or unreadable file installs as v2, as today; a later
+    v3 launch then refuses it with the reinstall remedy.
+    """
+    if engine is not None or profile.engine is not None:
+        return resolve_kiro_engine(explicit=engine, profile=profile.engine) is KiroEngine.V3
+    return installed_kiro_agent_is_universal(profile_name)
+
+
+def _kiro_install_resources(context_file: Path, profile: AgentProfile) -> List[str]:
+    """The ``resources`` a Kiro agent file lists: context copy, skill globs, profile's own."""
+    # Kiro natively supports skill:// resources with progressive loading
+    # (metadata at startup, full content on demand).
+    #
+    # TWO globs, not one, and the second is not redundant. Kiro expands
+    # these itself, so which files it finds depends on ITS glob
+    # implementation, and `**` does not have one agreed meaning for
+    # directory symlinks: Python's own stdlib `glob.glob(recursive=True)`
+    # descends into them while `pathlib.Path.glob` does not. Agent-plugin
+    # skills are projected into SKILLS_DIR as symlinks to the plugin
+    # store, so under the stricter reading every plugin skill would be
+    # invisible to Kiro alone while reaching all six other providers.
+    #
+    # `*/SKILL.md` is immune to that ambiguity: a single-level match names
+    # the symlink as a directory entry and resolves through it, with no
+    # recursive descent to opt out of. It covers exactly the layout CAO
+    # guarantees — skills are immediate children of the store (see
+    # docs/skills.md "No nested skill directories") — so it alone is
+    # sufficient for CAO-managed skills. `**/SKILL.md` is kept because
+    # Kiro supports nested skill directories natively even though CAO's
+    # own catalog does not, and dropping it would silently narrow a
+    # capability operators may already rely on.
+    #
+    # Duplicate matches are not a concern: both patterns resolve to the
+    # same absolute paths, and Kiro deduplicates the skills it loads by
+    # path. Verified by TestKiroFilesystemGlob in
+    # test/agent_plugins/test_delivery_providers.py.
+    resources = [
+        f"file://{context_file.absolute()}",
+        f"skill://{SKILLS_DIR}/**/SKILL.md",
+        f"skill://{SKILLS_DIR}/*/SKILL.md",
+    ]
+    resources.extend(profile.resources or [])
+    return resources
+
+
+def _kiro_install_prompt(profile: AgentProfile) -> Optional[str]:
+    """The ``prompt`` a Kiro agent file carries: the profile's, stripped, or None."""
+    return profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
+
+
+def kiro_universal_agent_config(
+    *,
+    name: str,
+    description: str,
+    prompt: Optional[str],
+    allowed_tools: List[str],
+    mcp_servers: Optional[Dict[str, Any]],
+    resources: List[str],
+    model: Optional[str],
+) -> KiroAgentConfig:
+    """The universal Kiro agent file for one grant, unvalidated (#1167).
+
+    The one render core for ``cao install`` and for an ephemeral helper's
+    per-launch file, so their ``tools``, ``excludedTools`` and rules cannot
+    drift apart. Only granted MCP servers are configured, a server named only
+    by per-tool refs (``@server/tool``) included, each cao-mcp-server entry
+    with Kiro's raised tool-call timeout; the rules allow just the granted
+    tools and deny every other one. Callers validate the result before
+    writing it.
+    """
+    servers = _inject_kiro_mcp_timeout(mcp_servers) or {}
+    granted = set(kiro_v3_granted_mcp_servers(allowed_tools, servers))
+    configured = {server: config for server, config in servers.items() if server in granted}
+    return KiroAgentConfig(
+        name=name,
+        description=description,
+        tools=kiro_universal_tools(allowed_tools),
+        allowedTools=allowed_tools,
+        excludedTools=kiro_v3_excluded_tools(allowed_tools, pinned_kiro_v3_schemas()),
+        resources=resources,
+        prompt=prompt,
+        mcpServers=configured or None,
+        model=model,
+        includeMcpJson=False,
+        permissions={"rules": kiro_v3_rules(allowed_tools, sorted(configured))},
+    )
+
+
+def _render_kiro_universal_agent(
+    profile: AgentProfile,
+    allowed_tools: List[str],
+    resources: List[str],
+    prompt: Optional[str],
+    file_stem: str,
+) -> str:
+    """The universal Kiro agent JSON for ``profile``, validated before it is returned.
+
+    One file meant for both engines: the v2 fields plus ``excludedTools`` and
+    ``permissions``, rendered from the resolved grant (``utils.tool_mapping``).
+    Only granted MCP servers are configured, a server named only by per-tool
+    refs (``@server/tool``) included; the rules allow just the granted tools and
+    deny every other one. Raises ``ValueError`` (``KiroV3InvalidAgentError`` for a failed check) and
+    writes nothing.
+    """
+    # Set at all, not truthy: an explicit empty ``tools: []`` is a deny-everything
+    # on v2, and dropping it here would widen the agent on v3.
+    untranslated = [
+        field for field in _KIRO_V3_UNTRANSLATED_FIELDS if getattr(profile, field) is not None
+    ]
+    if untranslated:
+        raise ValueError(
+            f"Kiro engine 'v3' install refused: the profile sets {', '.join(untranslated)}, "
+            "which CAO does not translate for the v3 engine. Remove it, or install with "
+            "--engine v2."
+        )
+    if profile.useLegacyMcpJson:
+        raise ValueError(
+            "Kiro engine 'v3' install refused: useLegacyMcpJson: true would load the user's "
+            "and the workspace's MCP configuration. Remove it, or install with --engine v2."
+        )
+    if "*" in allowed_tools:
+        raise ValueError(
+            "Kiro engine 'v3' install refused: an unrestricted ('*') policy is not rendered "
+            "for the v3 engine. Restrict allowedTools, or install with --engine v2."
+        )
+    config = kiro_universal_agent_config(
+        name=profile.name,
+        description=profile.description,
+        prompt=prompt,
+        allowed_tools=allowed_tools,
+        mcp_servers=profile.mcpServers,
+        resources=resources,
+        model=profile.model,
+    )
+    text = config.model_dump_json(indent=2, exclude_none=True)
+    require_valid_for_every_pinned_schema(
+        text.encode("utf-8"),
+        expected_name=file_stem,
+        remedy="Nothing was written; the installed agent file is unchanged.",
+    )
+    return text
 
 
 # URL path component for allowlisted hosts. Each segment must start with an
@@ -922,6 +1088,24 @@ def _create_context_temp_file(context_file: Path) -> Tuple[int, Path]:
     ) from last_exc
 
 
+def _planned_context_file(agent_name: str) -> Path:
+    """Where :func:`_write_context_file` puts ``agent_name``'s copy, raising its path refusals.
+
+    The same computation the writer makes, without writing: a v3 Kiro install
+    (#1167) renders and validates its agent file, whose resources name this
+    path, before the first write.
+    """
+    context_dir = _context_dir()
+    if not context_dir.is_absolute():
+        raise _relative_context_dir_error(context_dir)
+    safe_name = validate_path_component(agent_name, description="profile name")
+    base = os.path.realpath(context_dir)
+    candidate = os.path.join(base, f"{safe_name}.md")
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise _escaping_context_target_error(agent_name, candidate)
+    return Path(candidate)
+
+
 def _preflight_context_file(agent_name: str, raw_content: str, source_name: str) -> str:
     """Raise every refusal :func:`_write_context_file` would raise, without writing.
 
@@ -938,15 +1122,8 @@ def _preflight_context_file(agent_name: str, raw_content: str, source_name: str)
     an I/O fault during the write itself is a failure, not a refusal, and is
     reported by the writer.
     """
+    context_file = _planned_context_file(agent_name)
     context_dir = _context_dir()
-    if not context_dir.is_absolute():
-        raise _relative_context_dir_error(context_dir)
-    safe_name = validate_path_component(agent_name, description="profile name")
-    base = os.path.realpath(context_dir)
-    candidate = os.path.join(base, f"{safe_name}.md")
-    if candidate != base and not candidate.startswith(base + os.sep):
-        raise _escaping_context_target_error(agent_name, candidate)
-    context_file = Path(candidate)
     try:
         st = os.lstat(context_file)
     except FileNotFoundError:
@@ -1142,6 +1319,47 @@ def _provider_artifact_path(provider: str, profile_name: str) -> Optional[Path]:
     if _is_opencode(provider):
         return OPENCODE_AGENTS_DIR / f"{to_opencode_agent_id(profile_name)}.md"
     return None
+
+
+def installed_artifact_paths(profile_name: str) -> Dict[str, Path]:
+    """Every per-profile file ``install_agent`` writes that a provider reads at launch, by path-free label.
+
+    One entry per provider with a per-agent sink (:func:`_provider_artifact_path`, keyed by the
+    ``ProviderType`` value) and one ``context:<n>`` entry per directory in :func:`_context_lookup_dirs`
+    (the configured directory, then the legacy default while an override is active), resolved the way
+    the ownership guard resolves a copy (:func:`_installed_context_copy_path`).
+
+    This is a PLAN-IDENTITY input list (#827, PR #1000 P2-2). A Kiro step starts as
+    ``kiro-cli chat --agent <name>``; Kiro reads ``tools``, ``allowedTools``, ``toolsSettings``,
+    ``hooks`` and ``mcpServers`` from the JSON written here and the system prompt from the context copy
+    that JSON references by ``file://``. A Copilot step reads its prompt from ``<name>.agent.md``. CAO
+    consults its own profile at launch only for ``model``. So these files decide what an approved plan
+    executes, and ``agent_profiles.read_profile_entry`` hashes each one (or its absence) into the entry.
+    Labels, not paths, so the digest does not depend on the machine.
+
+    ``opencode_cli:config`` is the SHARED ``opencode.json`` (PR #1000 round 2, P2-1). For OpenCode the
+    per-agent ``.md`` carries only the prompt and the permission map; :func:`_materialize_opencode_mcp`
+    writes the MCP servers -- each one's ``command`` -- into that file's ``mcp`` map and the agent's
+    grant into ``agent.<id>.tools``, and the provider launches with ``OPENCODE_CONFIG=<that file>`` and
+    reads the whole of it. The whole file is bound, not the agent's section: OpenCode's ``mcp`` map is
+    global (every agent sees every enabled server unless its own ``tools`` map says otherwise) and the
+    file's top-level ``instructions``, ``permission`` and ``model`` apply to every agent, so there is no
+    smaller part that decides what one agent executes. The cost is that an operator's edit to their own
+    key in that file moves every ``plan_id``, which the docs record. The path is looked up on the
+    ``opencode_config`` module at call time, as the installer's own writers do.
+
+    ``test_install_ownership_guard`` pins this list against the files a real install WRITES (a
+    filesystem diff around ``install_agent``), not only against the fields ``InstallResult`` reports.
+    """
+    paths: Dict[str, Path] = {}
+    for provider in ProviderType:
+        path = _provider_artifact_path(provider.value, profile_name)
+        if path is not None:
+            paths[provider.value] = path
+    paths[f"{ProviderType.OPENCODE_CLI.value}:config"] = opencode_config.OPENCODE_CONFIG_FILE
+    for index, directory in enumerate(_context_lookup_dirs()):
+        paths[f"context:{index}"] = _installed_context_copy_path(profile_name, directory)
+    return paths
 
 
 def _entry_occupying(path: Path) -> Optional[str]:
@@ -1616,14 +1834,10 @@ def _materialize_opencode_mcp(
         log_delivery_findings(McpDeliveryResult(findings=tuple(collisions)), agent_name=agent_name)
 
 
-def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
-    """The ``tools`` list in the Kiro agent JSON ``cao install`` wrote for ``profile_name``.
+def _installed_kiro_agent(profile_name: str) -> Optional[Dict[str, Any]]:
+    """The Kiro agent JSON ``cao install`` wrote for ``profile_name``, parsed.
 
-    ``None`` when no agent file exists or it cannot be read as JSON with a
-    list-valued ``tools``. The launch gate and the server use this to notice a
-    profile installed before CAO wrote the policy into ``tools`` (it carries
-    ``["*"]``) and say so, since on Kiro the installed file is the policy.
-
+    ``None`` when no agent file exists or it does not parse as a JSON object.
     Raises ``KiroAgentPathError`` when the file is not beneath the Kiro agent directory.
     """
     base = os.path.realpath(KIRO_AGENTS_DIR)
@@ -1636,10 +1850,115 @@ def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
         data = json.loads(Path(agent_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    tools = data.get("tools") if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
+    """The ``tools`` list in the Kiro agent JSON ``cao install`` wrote for ``profile_name``.
+
+    ``None`` when no agent file exists or it cannot be read as JSON with a
+    list-valued ``tools``. The launch gate and the server use this to notice a
+    profile installed before CAO wrote the policy into ``tools`` (it carries
+    ``["*"]``) and say so, since on Kiro the installed file is the policy.
+
+    Raises ``KiroAgentPathError`` when the file is not beneath the Kiro agent directory.
+    """
+    data = _installed_kiro_agent(profile_name)
+    tools = data.get("tools") if data is not None else None
     if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
         return None
     return tools
+
+
+def _is_cao_universal_kiro_agent(data: Dict[str, Any]) -> bool:
+    """Whether a parsed Kiro agent file is CAO's own universal render (#1167).
+
+    ``permissions`` alone is not enough: Kiro's upgrader adds it to a v2 file
+    too, and marks the file with ``kiroUpgrade``. Every file CAO renders has
+    ``excludedTools`` (at least ``knowledge``), which the upgrader does not
+    write, and never that marker.
+    """
+    return "permissions" in data and "excludedTools" in data and "kiroUpgrade" not in data
+
+
+def installed_kiro_v3_grant(profile_name: str) -> Optional[Tuple[List[str], List[str]]]:
+    """The grant and MCP server names a universal Kiro agent file records (#1167).
+
+    ``(allowedTools, sorted mcpServers names)``, or ``None`` when the file is
+    absent, unreadable or not CAO's universal file. The v3 launch attests the
+    pane against these after the file itself passed the validator.
+    """
+    data = _installed_kiro_agent(profile_name)
+    if data is None or not _is_cao_universal_kiro_agent(data):
+        return None
+    grant = data.get("allowedTools")
+    servers = data.get("mcpServers") or {}
+    if not isinstance(grant, list) or not isinstance(servers, dict):
+        return None
+    return [str(entry) for entry in grant], sorted(str(name) for name in servers)
+
+
+def installed_kiro_agent_is_universal(profile_name: str) -> bool:
+    """True when the installed Kiro agent file is CAO's v3-enabled universal file (#1167).
+
+    A file Kiro's upgrader rewrote is not: it is still v2 names plus
+    ``permissions`` (see ``_is_cao_universal_kiro_agent``), so a reinstall with
+    no engine writes v2 again and a bounded create compares it with the v2 map.
+    An absent or unreadable file is not universal.
+    """
+    data = _installed_kiro_agent(profile_name)
+    return data is not None and _is_cao_universal_kiro_agent(data)
+
+
+def require_kiro_agent_resolves(
+    profile_name: str,
+    working_directory: str,
+    env_vars: Optional[Dict[str, str]] = None,
+) -> None:
+    """Refuse a Kiro launch from ``working_directory`` whose agent kiro-cli would not load.
+
+    kiro-cli starts its built-in ``kiro_default`` agent for an ``--agent`` it
+    cannot find (#1074), so the launch path calls this before any window exists.
+    The directories searched include ``KIRO_AGENTS_DIR``, the one this module
+    installs into; see ``providers.kiro_identity`` for the rest.
+
+    Raises ``KiroAgentIdentityError`` when no directory defines the name.
+    """
+    require_kiro_agent_defined(
+        profile_name, kiro_agent_dirs(working_directory, KIRO_AGENTS_DIR, env_vars)
+    )
+
+
+def installed_opencode_permission(
+    profile_name: str, agents_dir: Optional[Path] = None
+) -> Optional[Dict[str, str]]:
+    """The ``permission:`` block in the OpenCode agent file ``cao install`` wrote.
+
+    OpenCode enforces that installed block at launch, not the allowlist a
+    create request resolved, so the server compares the two before a bounded
+    launch (``terminal_service.create_terminal``, Step 0d), mirroring
+    :func:`installed_kiro_tools`. ``agents_dir`` defaults to
+    ``OPENCODE_AGENTS_DIR``; the launch path passes the directory the provider
+    will actually point OpenCode at. ``None`` when no agent file exists, its
+    front matter does not parse, or it carries no dict-valued ``permission``.
+
+    Every way the file can fail to yield a policy maps to ``None`` so the
+    bounded-launch gate refuses with the ``cao install`` remedy; an exception
+    escaping here would surface as a 500 instead. ``frontmatter.load`` raises
+    ``yaml.YAMLError`` subclasses (parser, scanner, composer) for bad YAML,
+    which are not ``ValueError``; ``UnicodeDecodeError`` is.
+    """
+    base = Path(agents_dir) if agents_dir is not None else OPENCODE_AGENTS_DIR
+    agent_file = base / f"{to_opencode_agent_id(profile_name)}.md"
+    try:
+        permission = frontmatter.load(agent_file).metadata.get("permission")
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+    if not isinstance(permission, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in permission.items()
+    ):
+        return None
+    return dict(permission)
 
 
 def kiro_install_predates_native_enforcement(
@@ -1664,6 +1983,7 @@ def install_agent(
     preserve_recorded_provider: bool = False,
     *,
     profile_content: Optional[str] = None,
+    engine: Optional[str] = None,
 ) -> InstallResult:
     """Install an agent profile for the requested provider.
 
@@ -1829,6 +2149,25 @@ def install_agent(
         )
         log_delivery_findings(plugin_mcp, agent_name=profile.name)
 
+        # ``delivered=`` is not optional in spirit: ``apply_plugin_mcp_servers``
+        # above stripped the pre-expanded marker from every entry it merged, so
+        # the helper's entry-level check cannot see a plugin server on this path.
+        # The delivery result was computed before that strip and is the only
+        # durable answer. Dropping this argument silently reinstates the
+        # auto-grant (G0) -- test_no_auto_grant.py's install-path cases fail if
+        # it goes missing.
+        mcp_server_names = grantable_server_names(profile, delivered=plugin_mcp)
+        allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
+
+        # A v3-enabled Kiro install (#1167) is decided here; it is refused and
+        # validated after the context preflight below, still before this
+        # install writes anything.
+        if engine is not None and provider != ProviderType.KIRO_CLI.value:
+            raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
+        kiro_universal = provider == ProviderType.KIRO_CLI.value and _kiro_install_is_universal(
+            profile, engine, profile.name
+        )
+
         # Record the provider we actually installed for into the LOCAL store
         # copy, so later provider resolution on this node is deterministic.
         #
@@ -1874,6 +2213,20 @@ def install_agent(
         # does not read back, unwritable directory) are raised here, before the
         # store write, for the same reason; the stamped content is reused below.
         context_content = _preflight_context_file(profile.name, raw_content, agent_name)
+        if kiro_universal:
+            # The whole v3 render, with the real prompt and resources at the
+            # planned context path, so every refusal it can raise -- an engine
+            # field v3 does not translate, a render that fails the pinned
+            # schemas, an agent file over the size cap -- leaves the store
+            # record, the context copy and the agent file as they were. The
+            # Kiro branch below renders and validates again before its write.
+            _render_kiro_universal_agent(
+                profile,
+                allowed_tools,
+                _kiro_install_resources(_planned_context_file(profile.name), profile),
+                _kiro_install_prompt(profile),
+                flatten_path_separators(profile.name),
+            )
 
         record_provider = profile.provider != provider and not preserve_recorded_provider
         stored_text = (
@@ -1894,16 +2247,6 @@ def install_agent(
 
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
 
-        # ``delivered=`` is not optional in spirit: ``apply_plugin_mcp_servers``
-        # above stripped the pre-expanded marker from every entry it merged, so
-        # the helper's entry-level check cannot see a plugin server on this path.
-        # The delivery result was computed before that strip and is the only
-        # durable answer. Dropping this argument silently reinstates the
-        # auto-grant (G0) -- test_no_auto_grant.py's install-path cases fail if
-        # it goes missing.
-        mcp_server_names = grantable_server_names(profile, delivered=plugin_mcp)
-        allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
-
         agent_file: Optional[Path] = None
         # Defence in depth. The resolved profile name is attacker-controlled, but
         # the ownership guard and _write_context_file BELOW both reject any name
@@ -1920,74 +2263,54 @@ def install_agent(
         )
 
         if provider == ProviderType.KIRO_CLI.value:
-            if profile.engine == KiroEngine.KAS:
-                raise ValueError(
-                    "Kiro KAS profiles cannot be installed in Phase 0: CAO cannot "
-                    "render KAS profiles or translate allowedTools/toolsSettings to Cedar. "
-                    "Set engine: v2 or wait for a later migration phase."
-                )
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-            # Kiro natively supports skill:// resources with progressive loading
-            # (metadata at startup, full content on demand).
-            #
-            # TWO globs, not one, and the second is not redundant. Kiro expands
-            # these itself, so which files it finds depends on ITS glob
-            # implementation, and `**` does not have one agreed meaning for
-            # directory symlinks: Python's own stdlib `glob.glob(recursive=True)`
-            # descends into them while `pathlib.Path.glob` does not. Agent-plugin
-            # skills are projected into SKILLS_DIR as symlinks to the plugin
-            # store, so under the stricter reading every plugin skill would be
-            # invisible to Kiro alone while reaching all six other providers.
-            #
-            # `*/SKILL.md` is immune to that ambiguity: a single-level match names
-            # the symlink as a directory entry and resolves through it, with no
-            # recursive descent to opt out of. It covers exactly the layout CAO
-            # guarantees — skills are immediate children of the store (see
-            # docs/skills.md "No nested skill directories") — so it alone is
-            # sufficient for CAO-managed skills. `**/SKILL.md` is kept because
-            # Kiro supports nested skill directories natively even though CAO's
-            # own catalog does not, and dropping it would silently narrow a
-            # capability operators may already rely on.
-            #
-            # Duplicate matches are not a concern: both patterns resolve to the
-            # same absolute paths, and Kiro deduplicates the skills it loads by
-            # path. Verified by TestKiroFilesystemGlob in
-            # test/agent_plugins/test_delivery_providers.py.
-            kiro_resources = [
-                f"file://{context_file.absolute()}",
-                f"skill://{SKILLS_DIR}/**/SKILL.md",
-                f"skill://{SKILLS_DIR}/*/SKILL.md",
-            ]
-            raw_prompt = (
-                profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
-            )
-            kiro_agent_config = KiroAgentConfig(
-                name=profile.name,
-                description=profile.description,
-                # ``tools`` is what Kiro lets the agent HAVE; ``allowedTools``
-                # only names what runs without a prompt (and CAO launches
-                # --trust-all-tools). An explicit profile ``tools`` list wins;
-                # otherwise the resolved CAO policy is the availability list,
-                # so a restricted role is restricted on Kiro too, natively.
-                tools=(
-                    profile.tools if profile.tools is not None else kiro_agent_tools(allowed_tools)
-                ),
-                allowedTools=allowed_tools,
-                resources=kiro_resources,
-                prompt=raw_prompt,
-                # Raise the cao-mcp-server tool-call timeout so kiro doesn't
-                # cancel long handoff RPCs client-side (see helper docstring).
-                mcpServers=_inject_kiro_mcp_timeout(profile.mcpServers),
-                toolAliases=profile.toolAliases,
-                toolsSettings=profile.toolsSettings,
-                hooks=profile.hooks,
-                model=profile.model,
-            )
+            kiro_resources = _kiro_install_resources(context_file, profile)
+            raw_prompt = _kiro_install_prompt(profile)
             agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
-            agent_file.write_text(
-                kiro_agent_config.model_dump_json(indent=2, exclude_none=True),
-                encoding="utf-8",
-            )
+            if kiro_universal:
+                # A v3-enabled install (#1167): one universal file at the same
+                # path, validated against every pinned engine schema before an
+                # atomic write that keeps the file's mode.
+                locked_atomic_write(
+                    agent_file,
+                    _render_kiro_universal_agent(
+                        profile, allowed_tools, kiro_resources, raw_prompt, safe_filename
+                    ),
+                )
+            else:
+                kiro_agent_config = KiroAgentConfig(
+                    name=profile.name,
+                    description=profile.description,
+                    # ``tools`` is what Kiro lets the agent HAVE; ``allowedTools``
+                    # only names what runs without a prompt (and CAO launches
+                    # --trust-all-tools). An explicit profile ``tools`` list wins;
+                    # otherwise the resolved CAO policy is the availability list,
+                    # so a restricted role is restricted on Kiro too, natively.
+                    tools=(
+                        profile.tools
+                        if profile.tools is not None
+                        else kiro_agent_tools(allowed_tools)
+                    ),
+                    allowedTools=allowed_tools,
+                    resources=kiro_resources,
+                    prompt=raw_prompt,
+                    # Raise the cao-mcp-server tool-call timeout so kiro doesn't
+                    # cancel long handoff RPCs client-side (see helper docstring).
+                    mcpServers=_inject_kiro_mcp_timeout(profile.mcpServers),
+                    toolAliases=profile.toolAliases,
+                    toolsSettings=profile.toolsSettings,
+                    hooks=profile.hooks,
+                    model=profile.model,
+                    # The profile keeps its historical ``useLegacyMcpJson`` spelling;
+                    # the installed spec gets Kiro CLI's current ``includeMcpJson``.
+                    # Unset in the profile means the historical default, False, so
+                    # a profile that never mentioned it installs exactly as before.
+                    includeMcpJson=bool(profile.useLegacyMcpJson),
+                )
+                agent_file.write_text(
+                    kiro_agent_config.model_dump_json(indent=2, exclude_none=True),
+                    encoding="utf-8",
+                )
 
         elif provider == ProviderType.COPILOT_CLI.value:
             COPILOT_AGENTS_DIR.mkdir(parents=True, exist_ok=True)

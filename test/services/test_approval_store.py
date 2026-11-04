@@ -42,6 +42,53 @@ def _columns(path):
 
 
 # ---------------------------------------------------------------------------
+# Lock tolerance (issue #583 Bolt 3, ``approval-enforcement-default``; NFR-4)
+# ---------------------------------------------------------------------------
+
+
+def test_the_connection_tolerates_a_busy_database(db_path):
+    """The gate now reads this store on EVERY default-install run start, so contention matters.
+
+    NFR-4 bounds lock contention at up to 12 concurrent background drives. This store adds no
+    ``busy_timeout`` pragma and does not need one: CPython's ``sqlite3.connect`` defaults to
+    ``timeout=5.0``, which IS ``PRAGMA busy_timeout = 5000``.
+
+    THE SECOND HALF OF THIS TEST IS WHAT GIVES IT TEETH. Asserting 5000 alone passes on stock CPython
+    whether or not the code does anything, which is a test that cannot fail — the exact shape the
+    construction guardrails forbid, and the trap that a sibling unit in this issue already fell into
+    once. Forcing the library default to 0 and re-asserting is what would catch a future refactor
+    passing ``timeout=0`` and silently dropping the guarantee.
+    """
+    with approval_store._connect() as conn:
+        effective = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert effective == 5000, (
+        "the effective busy_timeout is the guarantee, whether it comes from a pragma or from the "
+        "library default"
+    )
+
+    real_connect = sqlite3.connect
+    calls = {}
+
+    def _impatient(*args, **kwargs):
+        calls["timeout"] = kwargs.get("timeout")
+        kwargs["timeout"] = 0
+        return real_connect(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sqlite3, "connect", _impatient)
+        with approval_store._connect() as conn:
+            forced = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert calls, "_connect must go through sqlite3.connect for this control to be meaningful"
+    assert forced == 0, (
+        "with the library default forced to 0 the effective timeout drops to 0, which proves the "
+        "5000 above comes from the default and NOT from a pragma this module sets. If this ever "
+        "reads 5000, the module has grown an explicit pragma and the assertion above is no longer "
+        "measuring what it claims to measure"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The two load-bearing properties
 # ---------------------------------------------------------------------------
 

@@ -8,7 +8,7 @@ CAO includes a web dashboard for managing agents, terminals, and flows from the 
 
 The pre-built Web UI is bundled inside the CAO wheel (at `src/cli_agent_orchestrator/web_ui/`), so a regular `uv tool install` ships everything you need. **You do not need Node.js or `npm install` to use the Web UI.**
 
-Node.js 18+ is only required if you want to:
+Node.js 22.22.2 or later is only required if you want to:
 
 - Run the frontend dev server for hot-reload development (Option A below), or
 - Rebuild the bundle from source.
@@ -20,14 +20,14 @@ Install Node only if one of those applies:
 brew install node
 
 # Ubuntu/Debian
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
 sudo apt-get install -y nodejs
 
 # Amazon Linux 2023 / Fedora
-sudo dnf install nodejs20
+sudo dnf install nodejs22
 
 # Verify
-node --version   # 18 or higher
+node --version   # 22.22.2 or higher
 ```
 
 ## Starting the Web UI
@@ -86,6 +86,21 @@ Then open the same URLs (localhost:5173 or localhost:9889) in your local browser
 ## Features
 
 Manage sessions, spawn agents, browse and author agent profiles (create from templates or from scratch, edit, clone, delete — with server-side validation before every write), create scheduled flows, configure agent directories, and interact with live terminals — all from the browser. Includes live status badges, an inbox for agent-to-agent messaging, output viewer, and provider auto-detection.
+
+### Edit agent descriptions
+
+In Home or Agents, use the pencil beside an agent's description to edit it.
+Choose Save or press Enter to save; choose Cancel or press Escape to discard
+the draft. Save an empty or whitespace-only value to clear the description.
+Descriptions persist across reloads. Polling updates and transient read failures
+preserve an open draft; deleting the selected session closes its detail panel
+when the next poll returns `404`.
+
+The editor normalizes line separators to spaces, removes C0/C1 controls
+(including interior tabs), and trims outer whitespace before validating the
+64 Unicode code point limit. Overlong edits show an error and keep the draft.
+See the [terminal description API contract](api.md#terminal-descriptions) for
+creation defaults, clearing, and retry behavior.
 
 ## Related
 

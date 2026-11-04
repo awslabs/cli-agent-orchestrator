@@ -1,0 +1,20 @@
+{
+  "message": "As the supervisor, reproduce this coordination scenario using CAO MCP exclusively:  1. Create exactly one agent with assign and the developer profile. Give it these instructions:    - Send the coordinator three separate messages using send_message without a receiver_id.    - First message: “ACK: agent available”.    - Wait 5 seconds, then send: “Second notice: still available”.    - Wait another 5 seconds, then send: “Third notice: no pending tasks”.    - Then end your turn. Keep your terminal open. 2. Once assign confirms the agent’s creation, end your turn with a brief response: “Agent created; waiting for notices”. 3. When you receive the first ACK, end that turn WITHOUT producing any visible text and WITHOUT calling any tools. Do not write confirmations, periods, explanations, or messages to the agent. End the turn with an empty response, leaving only the completion footer rendered by Codex. 4. Apply the same rule to any subsequent notice: end the turn without visible text or tool calls.  Do not actively wait, check the queue or status, close terminals, or modify files. Do not run osascript, alarms, or notifications.  The goal is to observe whether CAO preserves processing after the empty turn and leaves the next two notices in pending.",
+  "screen": [
+    "› As the supervisor, reproduce this coordination scenario using CAO MCP exclusively:  1. Create exactly one agent with assign and the developer profile. Give it these instructions:    - Send the coordinator three separate",
+    "  messages using send_message without a receiver_id.    - First message: “ACK: agent available”.    - Wait 5 seconds, then send: “Second notice: still available”.    - Wait another 5 seconds, then send: “Third notice: no",
+    "  pending tasks”.    - Then end your turn. Keep your terminal open. 2. Once assign confirms the agent’s creation, end your turn with a brief response: “Agent created; waiting for notices”. 3. When you receive the first ACK,",
+    "  end that turn WITHOUT producing any visible text and WITHOUT calling any tools. Do not write confirmations, periods, explanations, or messages to the agent. End the turn with an empty response, leaving only the completion",
+    "  footer rendered by Codex. 4. Apply the same rule to any subsequent notice: end the turn without visible text or tool calls.  Do not actively wait, check the queue or status, close terminals, or modify files. Do not run",
+    "  osascript, alarms, or notifications.  The goal is to observe whether CAO preserves processing after the empty turn and leaves the next two notices in pending.",
+    "",
+    "",
+    "• Agent created; waiting for notices",
+    "",
+    "  Worked for 10s • 9:16 AM",
+    "",
+    "› Ask Codex to do anything",
+    "",
+    "  gpt-6 high · /tmp/project                       ⚠ 1 warning · f2 to view"
+  ]
+}

@@ -109,12 +109,12 @@ class TestValidateFrontmatter:
         }
         assert _validate_frontmatter(meta) == []
 
-    @pytest.mark.parametrize("engine", ["v2", "kas"])
+    @pytest.mark.parametrize("engine", ["v2", "v3", "kas"])
     def test_valid_kiro_engine(self, engine):
         assert _validate_frontmatter({"name": "x", "engine": engine}) == []
 
     def test_invalid_kiro_engine(self):
-        msgs = _validate_frontmatter({"name": "x", "engine": "v3"})
+        msgs = _validate_frontmatter({"name": "x", "engine": "v4"})
         assert any("[error]" in msg and "engine" in msg for msg in msgs)
 
     def test_missing_name(self):
@@ -389,7 +389,7 @@ class TestProfileRemoveVerb:
             patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store),
             patch("cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", store),
         ):
-            result = runner.invoke(profile, ["remove", "keep-me"], input="n\n")
+            _result = runner.invoke(profile, ["remove", "keep-me"], input="n\n")
         assert profile_file.exists()  # File should still be there
 
 
@@ -420,7 +420,6 @@ class TestInjectionRegression:
 
     def test_jinja_in_config_renders_literally(self):
         """A config value like {{7*7}} must render as-is, not evaluate."""
-        from cli_agent_orchestrator.services.agent_scaffold import render_template
 
         config = {
             "profile": "test",

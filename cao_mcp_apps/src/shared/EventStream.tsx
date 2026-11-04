@@ -32,7 +32,7 @@ export interface EventStreamProps {
 export function EventStream({
   events,
   emptyLabel,
-}: EventStreamProps): JSX.Element {
+}: EventStreamProps): React.JSX.Element {
   if (events.length === 0) {
     return (
       <div

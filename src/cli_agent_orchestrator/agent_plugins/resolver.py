@@ -173,7 +173,7 @@ def _resolve_git(source: PluginSource, dest: Path) -> tuple[Path, Optional[str]]
 
     try:
         _run_git(args, what=f"clone {location}")
-    except ResolverError as exc:
+    except ResolverError:
         # `--branch` takes a branch or tag name only, so a caller pinning an exact
         # commit lands here — and that caller is not hypothetical: it is what
         # replaying an install record's own `resolved_ref` looks like.

@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<!--
+  Live view of the cross-zone transport simulation.
+  Served read-only by the controller (demo.py serve) on 127.0.0.1 only.
+  It polls /state (the controller's observe() output) and draws a top-down
+  map of the floor, highlighting which agent is acting as the run proceeds.
+  No external assets: it works offline, with no CDN and no build step.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cross-zone transport - live view</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --edge: #2b333d; --ink: #e6edf3;
+    --muted: #9aa7b2; --amber: #d29922; --green: #2ea043; --red: #da3633;
+    --accent: #388bfd;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 18px; border-bottom: 1px solid var(--edge); background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  .badges { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+  .badge {
+    font-size: 12px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--edge); color: var(--muted); white-space: nowrap;
+  }
+  .badge.on  { color: #0d1117; background: var(--green); border-color: transparent; }
+  .badge.off { color: #0d1117; background: var(--amber); border-color: transparent; }
+  .badge.stop{ color: #fff;     background: var(--red);   border-color: transparent; }
+  main { display: grid; grid-template-columns: 1fr 360px; gap: 0; height: calc(100vh - 54px); }
+  #stage { position: relative; min-width: 0; }
+  svg { width: 100%; height: 100%; display: block; }
+  aside {
+    border-left: 1px solid var(--edge); background: var(--panel);
+    overflow-y: auto; padding: 14px 14px 24px;
+  }
+  aside h2 {
+    font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--muted); margin: 18px 0 8px; font-weight: 650;
+  }
+  aside h2:first-child { margin-top: 0; }
+  .agent {
+    display: flex; gap: 10px; align-items: flex-start; padding: 9px 10px;
+    border: 1px solid var(--edge); border-radius: 8px; margin-bottom: 8px;
+    background: #0e141b; transition: border-color .15s, box-shadow .15s;
+  }
+  .agent.acting {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent), 0 0 14px -2px var(--accent);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 1px var(--accent), 0 0 10px -3px var(--accent);} 50% { box-shadow: 0 0 0 1px var(--accent), 0 0 20px 0 var(--accent);} }
+  .dot { width: 12px; height: 12px; border-radius: 3px; margin-top: 3px; flex: none; }
+  .agent .who { font-weight: 600; }
+  .agent .role { color: var(--muted); font-size: 12px; }
+  .agent .act { font-size: 12.5px; margin-top: 2px; }
+  .agent .act.live { color: var(--accent); font-weight: 600; }
+  .agent.recent { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
+  .agent .act.recent { color: var(--amber); font-weight: 600; }
+  .log { font-size: 12.5px; }
+  .log .row { display: flex; gap: 8px; padding: 4px 0; border-bottom: 1px dashed var(--edge); }
+  .log .op { font-weight: 600; }
+  .log .st { margin-left: auto; font-size: 11px; padding: 1px 7px; border-radius: 999px; }
+  .st.accepted, .st.running { color:#0d1117; background: var(--amber); }
+  .st.finished { color:#0d1117; background: var(--green); }
+  .st.rejected, .st.failed, .st.interrupted { color:#fff; background: var(--red); }
+  .muted { color: var(--muted); }
+  .conn { font-size: 12px; }
+  text { font-family: ui-sans-serif, system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cross-zone transport <span class="muted" style="font-weight:400">· live view</span></h1>
+  <div class="badges" id="badges"></div>
+</header>
+<main>
+  <div id="stage"><svg id="svg" preserveAspectRatio="xMidYMid meet"></svg></div>
+  <aside>
+    <h2>Who is acting</h2>
+    <div id="agents"></div>
+    <h2>Action log <span class="muted" id="logcount"></span></h2>
+    <div class="log" id="log"></div>
+    <h2>Connection</h2>
+    <div class="conn muted" id="conn">connecting to /state&hellip;</div>
+  </aside>
+</main>
+<script>
+const SVGNS = "http://www.w3.org/2000/svg";
+// Stable colour per zone, assigned in scene order.
+const PALETTE = ["#388bfd","#2ea043","#d29922","#a371f7","#db61a2","#26a69a","#f0883e"];
+let zoneColor = {};
+
+function el(tag, attrs = {}, parent = null) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+function assignColors(zones) {
+  const names = Object.keys(zones).sort();
+  names.forEach((z, i) => { if (!(z in zoneColor)) zoneColor[z] = PALETTE[i % PALETTE.length]; });
+}
+
+// Describe, in plain words, what a sim command means for the acting agent.
+function describe(cmd) {
+  const a = cmd.arguments || [];
+  if (cmd.operation === "move")   return `moving ${a[0]} \u2192 ${a[2]} (carrying ${a[1]})`;
+  if (cmd.operation === "offer")  return `offering custody of ${a[0]} to ${a[1]} zone`;
+  if (cmd.operation === "accept") return `accepting custody of ${a[0]} with ${a[1]}`;
+  return cmd.operation;
+}
+
+// Past-tense summary for a command that just finished (offer/accept finish instantly).
+function describePast(cmd) {
+  const a = cmd.arguments || [];
+  if (cmd.operation === "move")   return `moved ${a[0]} to ${a[2]}`;
+  if (cmd.operation === "offer")  return `offered custody of ${a[0]} to ${a[1]} zone`;
+  if (cmd.operation === "accept") return `accepted custody of ${a[0]} with ${a[1]}`;
+  return cmd.operation + " finished";
+}
+
+function render(state) {
+  // ---- badges ----
+  const badges = document.getElementById("badges");
+  badges.innerHTML = "";
+  const mk = (txt, cls) => { const b = document.createElement("span"); b.className = "badge " + (cls||""); b.textContent = txt; badges.appendChild(b); };
+  mk("run " + (state.run_id || "").slice(0, 8));
+  mk("sim " + (state.simulation_seconds ?? 0).toFixed(1) + "s");
+  if (state.stopped) mk("STOPPED", "stop");
+  else mk(state.motion_approved ? "motion approved" : "motion disabled", state.motion_approved ? "on" : "off");
+
+  const scene = state.scene || {};
+  const zones = scene.zones || {};
+  const locs = scene.locations || {};
+  assignColors(zones);
+
+  // ---- world bounds -> svg transform (flip Y so +y points up) ----
+  let xs = [], ys = [];
+  for (const z of Object.values(zones)) { xs.push(z.bounds[0], z.bounds[2]); ys.push(z.bounds[1], z.bounds[3]); }
+  const pad = 0.6;
+  const minX = Math.min(...xs) - pad, maxX = Math.max(...xs) + pad;
+  const minY = Math.min(...ys) - pad, maxY = Math.max(...ys) + pad;
+  const W = 1000, H = Math.max(360, Math.round(1000 * (maxY - minY) / (maxX - minX || 1)));
+  const sx = x => (x - minX) / (maxX - minX) * W;
+  const sy = y => H - (y - minY) / (maxY - minY) * H;
+  const sl = d => d / (maxX - minX) * W; // scalar length
+
+  const svg = document.getElementById("svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = "";
+
+  // zones
+  for (const [name, z] of Object.entries(zones)) {
+    const [x0, y0, x1, y1] = z.bounds, c = zoneColor[name];
+    el("rect", { x: sx(x0), y: sy(y1), width: sl(x1 - x0), height: Math.abs(sy(y1) - sy(y0)),
+                 fill: c, "fill-opacity": .08, stroke: c, "stroke-opacity": .5, "stroke-width": 2, rx: 6 }, svg);
+    const t = el("text", { x: sx(x0) + 8, y: sy(y1) + 20, fill: c, "font-size": 16, "font-weight": 700, "fill-opacity": .9 }, svg);
+    t.textContent = name;
+  }
+  // locations (dock/handoff drawn with a ring)
+  for (const [name, loc] of Object.entries(locs)) {
+    const cx = sx(loc.xy[0]), cy = sy(loc.xy[1]);
+    if (loc.handoff) el("circle", { cx, cy, r: 16, fill: "none", stroke: "#e6edf3", "stroke-opacity": .5, "stroke-dasharray": "4 4" }, svg);
+    el("circle", { cx, cy, r: 5, fill: "#8b98a5" }, svg);
+    const t = el("text", { x: cx + 9, y: cy + 4, fill: "#c7d0d9", "font-size": 13 }, svg);
+    t.textContent = name + (loc.handoff ? " (dock)" : "");
+  }
+  // payload(s) - outlined in the current owner's zone colour (custody is visible as colour)
+  for (const [name, p] of Object.entries(state.payloads || {})) {
+    const cx = sx(p.xy[0]), cy = sy(p.xy[1]), oc = zoneColor[p.owner] || "#e6edf3";
+    const r = 11;
+    el("rect", { x: cx - r, y: cy - r, width: 2 * r, height: 2 * r, transform: `rotate(45 ${cx} ${cy})`,
+                 fill: "#e3a008", stroke: oc, "stroke-width": 4 }, svg);
+    const t = el("text", { x: cx, y: cy - 20, fill: "#f0d58a", "font-size": 13, "text-anchor": "middle", "font-weight": 600 }, svg);
+    t.textContent = name + " \u00b7 " + p.owner;
+    if (p.offer) {
+      const b = el("text", { x: cx, y: cy + 30, fill: "#e6edf3", "font-size": 12, "text-anchor": "middle" }, svg);
+      b.textContent = `handoff pending: ${p.offer.from_zone} \u2192 ${p.offer.to_zone}`;
+    }
+  }
+  // robots - square, filled with its zone colour
+  for (const [name, r] of Object.entries(state.robots || {})) {
+    const cx = sx(r.xy[0]), cy = sy(r.xy[1]), c = zoneColor[r.zone] || "#8b98a5", s = 13;
+    el("rect", { x: cx - s, y: cy - s, width: 2 * s, height: 2 * s, rx: 3, fill: c, "fill-opacity": .9, stroke: "#0d1117", "stroke-width": 2 }, svg);
+    const t = el("text", { x: cx, y: cy + 30, fill: c, "font-size": 12, "text-anchor": "middle", "font-weight": 600 }, svg);
+    t.textContent = name;
+  }
+
+  // ---- who is acting ----
+  // offer/accept finish synchronously, so they never show as accepted/running in a
+  // snapshot. Highlight live motion (accepted/running moves), a pending custody offer
+  // read from the payload, and commands that finished within a short recency window.
+  const cmds = (state.commands || []).slice();
+  const nowMs = state.observed_at ? Date.parse(state.observed_at) : Date.now();
+  const RECENT_MS = 4000;
+  const active = cmds.filter(c => c.status === "accepted" || c.status === "running");
+  const liveCmd = active.length ? active[active.length - 1] : null;
+  const liveZone = liveCmd ? liveCmd.actor : null;
+
+  let offer = null; // pending custody handoff, taken from the payload
+  for (const [pname, p] of Object.entries(state.payloads || {})) {
+    if (p.offer) { offer = { ...p.offer, payload: pname }; break; }
+  }
+
+  const recentByZone = {}; // the latest command each actor finished within the window
+  for (const c of cmds) {
+    if (c.status !== "finished" || !c.updated_at) continue;
+    const age = nowMs - Date.parse(c.updated_at);
+    if (age < 0 || age > RECENT_MS) continue;
+    const prev = recentByZone[c.actor];
+    if (!prev || Date.parse(c.updated_at) > Date.parse(prev.updated_at)) recentByZone[c.actor] = c;
+  }
+  const anyFinishedMove = cmds.some(c => c.operation === "move" && c.status === "finished");
+
+  const roster = [{ id: "supervisor", role: "plans the job, delegates each leg" }];
+  for (const z of Object.keys(zones).sort()) roster.push({ id: z, zone: z, role: `moves only ${z}-zone robots` });
+  roster.push({ id: "checker", role: "verifies the result, read-only" });
+
+  const box = document.getElementById("agents");
+  box.innerHTML = "";
+  for (const a of roster) {
+    const z = a.zone;
+    let cls = "", act = "", mark = "";
+    if (z && !state.stopped) {
+      if (liveZone === z) { cls = "live"; mark = "\u25b6 "; act = describe(liveCmd); }
+      else if (offer && offer.from_zone === z) { cls = "live"; mark = "\u25b6 "; act = `offering custody of ${offer.payload} to ${offer.to_zone} zone`; }
+      else if (offer && offer.to_zone === z) { cls = "recent"; act = `offered custody - ready to accept from ${offer.from_zone}`; }
+      else if (recentByZone[z]) { cls = "recent"; act = "just " + describePast(recentByZone[z]); }
+      else act = "idle";
+    } else if (a.id === "supervisor") act = anyFinishedMove ? "waiting for the current leg" : "planning the legs";
+    else if (a.id === "checker") act = state.stopped ? "run stopped" : "waiting to verify";
+    else act = "idle";
+    const div = document.createElement("div");
+    div.className = "agent" + (cls === "live" ? " acting" : cls === "recent" ? " recent" : "");
+    const color = z ? (zoneColor[z] || "#8b98a5") : (a.id === "supervisor" ? "#a371f7" : "#8b98a5");
+    const who = z ? `${z} zone worker` : (a.id[0].toUpperCase() + a.id.slice(1));
+    div.innerHTML =
+      `<span class="dot" style="background:${color}"></span>` +
+      `<div><div class="who">${who}</div><div class="role">${a.role}</div>` +
+      `<div class="act${cls ? " " + cls : ""}">${mark}${act}</div></div>`;
+    box.appendChild(div);
+  }
+
+  // ---- action log (newest first) ----
+  cmds.sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
+  const log = document.getElementById("log");
+  log.innerHTML = "";
+  for (const c of cmds.slice(0, 40)) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const worker = (c.actor in zones) ? `${c.actor} worker` : c.actor;
+    row.innerHTML =
+      `<span class="op">${worker}</span>` +
+      `<span class="muted">${describe(c)}${c.reason ? " \u00b7 " + c.reason : ""}</span>` +
+      `<span class="st ${c.status}">${c.status}</span>`;
+    log.appendChild(row);
+  }
+  document.getElementById("logcount").textContent = cmds.length ? `(${cmds.length})` : "";
+}
+
+let fails = 0;
+async function poll() {
+  const conn = document.getElementById("conn");
+  try {
+    const r = await fetch("state", { cache: "no-store" });  // page-relative: keeps a proxy path prefix
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+    fails = 0;
+    conn.textContent = "live \u00b7 updated " + new Date().toLocaleTimeString();
+    conn.classList.remove("muted");
+  } catch (e) {
+    fails++;
+    conn.classList.add("muted");
+    conn.textContent = `waiting for the controller (${e.message})` + (fails > 1 ? ` \u00d7${fails}` : "");
+  }
+}
+poll();
+setInterval(poll, 350);
+</script>
+</body>
+</html>

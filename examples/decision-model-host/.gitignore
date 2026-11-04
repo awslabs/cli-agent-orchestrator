@@ -1,0 +1,9 @@
+models/
+vendor/
+logs/
+aws/keys/
+aws/cdk-outputs.json
+aws/cdk/cdk.out/
+aws/cdk/node_modules/
+user-data.rendered.sh
+__pycache__/
