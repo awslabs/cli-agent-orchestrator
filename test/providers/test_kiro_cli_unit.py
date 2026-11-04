@@ -1160,11 +1160,13 @@ class TestKiroCliProviderRegexPatterns:
         assert re.search(provider._idle_prompt_pattern, "[developer] 5% > Ready for next task")
 
     def test_permission_prompt_pattern(self):
-        """Test permission prompt pattern detection."""
-        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        """Test permission prompt detection (a linear scan since the ReDoS fix)."""
+        from cli_agent_orchestrator.providers.kiro_cli import _legacy_permission_prompt_spans
 
         permission_text = "Allow this action? [y/n/t]: [developer]>"
-        assert re.search(provider._permission_prompt_pattern, permission_text)
+        assert _legacy_permission_prompt_spans(permission_text) == [
+            (0, permission_text.index("]:") + 2)
+        ]
 
     def test_permission_prompt_no_match_stale_history(self):
         """Test that stale permission prompts are not detected as active.

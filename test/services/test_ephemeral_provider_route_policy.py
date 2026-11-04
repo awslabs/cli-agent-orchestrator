@@ -1,8 +1,9 @@
 """#1099: ephemeral.provider_route equivalence sets, their validation and their labels.
 
 Every rule here is provisional (#1099). With today's capability table no non-empty set
-validates, so the passing cases substitute capability rows, as #1074's seam tests do: Codex as
-sandboxed without web_fetch (the contained launch), and Kiro as hard or advisory.
+validates (Codex is advisory, and Kiro is hard but not routable yet), so the passing cases
+substitute capability rows, as #1074's seam tests do: Codex as sandboxed without web_fetch (the
+contained launch), and Kiro as a routable hard or advisory provider.
 """
 
 import itertools
@@ -33,9 +34,9 @@ def sandboxed_codex(monkeypatch):
 
 
 def enabled_kiro(monkeypatch, enforcement=caps.HARD):
-    """#1167 Phase 2's Kiro row, or a second advisory provider. It is never constructed here."""
+    """A routable Kiro row, or a second advisory provider: a stand-in, not the real Kiro row."""
     row = caps.EphemeralCapability(
-        enforcement, frozenset(TOOL_ATOMS), True, ("kiroConfig", "effort")
+        enforcement, frozenset(TOOL_ATOMS), True, ("kiroConfig", "effort"), routable=True
     )
     monkeypatch.setitem(caps.CAPABILITIES, "kiro_cli", row)
 
@@ -70,21 +71,37 @@ def test_AC6_claude_code_with_advisory_codex_refuses_under_the_real_table(create
     assert "claude_code=hard" in error.detail and "codex=advisory" in error.detail
 
 
-@pytest.mark.parametrize("sets", [[["claude_code", "kiro_cli"]], [["codex", "kiro_cli"]]])
+@pytest.mark.parametrize(
+    "sets",
+    [
+        [["claude_code", "kiro_cli"]],
+        [["kiro_cli", "claude_code"]],
+        [["codex", "kiro_cli"]],
+        [["claude_code", "codex", "kiro_cli"]],
+    ],
+)
 def test_AC6_any_set_naming_kiro_refuses_under_the_real_table(create_store, sets):
+    kiro = caps.capability_for("kiro_cli")
+    assert kiro.supports_ephemeral and kiro.enforcement == caps.HARD and not kiro.routable
     declare(create_store, sets)
     error = refused(create_store)
-    assert error.rule == RULE and "supported providers: claude_code, codex" in error.detail
+    assert error.rule == RULE
+    assert error.detail == (
+        "ephemeral.provider_route.equivalent set 1 names kiro_cli, "
+        "which provider.route cannot route to yet"
+    )
 
 
 def test_inert_today_every_set_of_two_or_more_refuses_under_the_real_table(create_store):
-    """The docs' claim: v1 routes nothing until a capability row changes (#1099)."""
+    """The docs' claim: v1 routes nothing until a provider's class changes or Kiro becomes
+    routable (#1099)."""
     providers = caps.ephemeral_providers()
-    assert providers == ("claude_code", "codex")
+    assert providers == ("claude_code", "codex", "kiro_cli")
+    assert [p for p in providers if caps.capability_for(p).routable] == ["claude_code", "codex"]
     candidates = [
-        list(members)
-        for size in range(2, len(providers) + 2)
-        for members in itertools.combinations(providers + ("kiro_cli",), size)
+        list(m)
+        for size in range(2, len(providers) + 1)
+        for m in itertools.combinations(providers, size)
     ]
     assert candidates
     for members in candidates:
@@ -128,7 +145,9 @@ def test_two_disjoint_sets_validate(create_store, monkeypatch):
     monkeypatch.setitem(
         caps.CAPABILITIES,
         "mock_cli",
-        caps.EphemeralCapability(caps.ADVISORY, frozenset(), True, ("mockConfig", "effort")),
+        caps.EphemeralCapability(
+            caps.ADVISORY, frozenset(), True, ("mockConfig", "effort"), routable=True
+        ),
     )
     declare(create_store, [BOTH, ["kiro_cli", "mock_cli"]])
     create_store[0].validate_block(create_store[0].read_settings())
@@ -243,10 +262,10 @@ def test_create_and_validation_read_the_one_label_helper(create_store, monkeypat
         assert create(create_store, {**SPEC, "provider": "claude_code"})["enforcement"] == "hard"
 
 
-@pytest.mark.parametrize("provider", ["claude_code", "codex"])
+@pytest.mark.parametrize("provider", ["claude_code", "codex", "kiro_cli"])
 def test_create_reports_the_label_helper_for_each_supported_provider(create_store, provider):
-    assert set(caps.ephemeral_providers()) == {"claude_code", "codex"}
-    create_store[4]["ephemeral"]["allowed_providers"] = BOTH
+    assert provider in caps.ephemeral_providers()
+    create_store[4]["ephemeral"]["allowed_providers"] = list(caps.ephemeral_providers())
     created = create(create_store, {**SPEC, "provider": provider})
     assert created["enforcement"] == caps.enforcement_label(provider)
 
@@ -291,15 +310,49 @@ def test_an_explicit_spec_gains_no_provider_note(create_store, monkeypatch):
     assert len(notes) == 2 and not any(note.startswith("provider:") for note in notes)
 
 
+def _creator_provider(env, provider):
+    with env[1]() as db:
+        db.get(database.TerminalModel, CALLER).provider = provider
+        db.commit()
+
+
 def test_an_auto_spec_from_an_unsupported_creator_says_set_provider(create_store, monkeypatch):
     routable(create_store, monkeypatch)
-    with create_store[1]() as db:
-        db.get(database.TerminalModel, CALLER).provider = "kiro_cli"
-        db.commit()
+    _creator_provider(create_store, "kimi_cli")
     with pytest.raises(create_store[0].EphemeralPolicyError) as err:
         create(create_store, AUTO)
     assert err.value.rule == "provider_unsupported"
-    assert err.value.detail == "kiro_cli; set provider explicitly"
+    assert err.value.detail == "kimi_cli; set provider explicitly"
+
+
+def test_an_auto_spec_from_a_kiro_creator_needs_kiro_allowed(create_store, monkeypatch):
+    routable(create_store, monkeypatch)
+    _creator_provider(create_store, "kiro_cli")
+    create_store[4]["ephemeral"]["allowed_providers"] = BOTH
+    with pytest.raises(create_store[0].EphemeralPolicyError) as err:
+        create(create_store, AUTO)
+    assert err.value.rule == "provider_not_allowed"
+    assert err.value.detail == "kiro_cli"
+
+
+def test_an_auto_spec_from_a_kiro_creator_falls_back_to_kiro_and_is_never_routed(
+    create_store, monkeypatch
+):
+    routable(create_store, monkeypatch, default_tier="medium")
+    create_store[4]["model_tiers"] = {
+        **BOTH_TIERS,
+        "kiro_cli": {t: f"kiro_cli-{t}" for t in ("small", "medium", "large")},
+    }
+    create_store[4]["ephemeral"]["allowed_providers"] = [*BOTH, "kiro_cli"]
+    _creator_provider(create_store, "kiro_cli")
+    result = create(create_store, AUTO)
+    assert result["provider"] == "kiro_cli" and result["enforcement"] == "hard"
+    assert result["notes"][-1] == (
+        "provider: auto (decided at launch within ephemeral.provider_route.equivalent; "
+        "fallback kiro_cli, the creator's provider)"
+    )
+    claim(create_store, result["name"])
+    assert options(create_store, result["name"]).options == ("kiro_cli",)
 
 
 def test_the_spec_rejects_an_unknown_provider_but_accepts_auto():
@@ -465,6 +518,7 @@ def test_a_member_that_cannot_apply_an_effort_is_dropped_only_when_one_launches(
         effort_config=None,
         supports_ephemeral=True,
         honors_effort=False,
+        routable=True,
     )
     monkeypatch.setitem(caps.CAPABILITIES, "codex", stub)
     name = create(create_store, AUTO)["name"]
@@ -494,7 +548,9 @@ def test_a_member_of_another_set_is_never_offered(create_store, monkeypatch):
     monkeypatch.setitem(
         caps.CAPABILITIES,
         "mock_cli",
-        caps.EphemeralCapability(caps.SANDBOXED, frozenset(TOOL_ATOMS), True, ("m", "effort")),
+        caps.EphemeralCapability(
+            caps.SANDBOXED, frozenset(TOOL_ATOMS), True, ("m", "effort"), routable=True
+        ),
     )
     providers = ["claude_code", "codex", "kiro_cli", "mock_cli"]
     create_store[4]["model_tiers"] = {
@@ -509,6 +565,33 @@ def test_a_member_of_another_set_is_never_offered(create_store, monkeypatch):
     assert options(create_store, name).options == ("claude_code", "kiro_cli")
 
 
+def test_options_never_offer_kiro_even_when_the_block_skips_validation():
+    """Defence in depth: options and the recheck refuse the real Kiro row by itself."""
+    from cli_agent_orchestrator.models.ephemeral import EphemeralSpec
+    from cli_agent_orchestrator.services import ephemeral_service as service
+
+    members = ["claude_code", "kiro_cli"]
+    settings = {
+        "allowed_providers": members,
+        "provider_route": {"equivalent": [members]},
+        "_model_tiers": {p: {"medium": p + "-m"} for p in members},
+    }
+    spec = EphemeralSpec.model_validate({"purpose": "log_triage", "brief": "b", "provider": "auto"})
+    db_row = {
+        "provider": "claude_code",
+        "effective_tools": ["fs_read"],
+        "model_tier": "medium",
+        "effort": None,
+    }
+    assert service.provider_options(db_row, spec, settings).options == ("claude_code",)
+    refusal = service._route_refusal(db_row, settings, "kiro_cli", tiers=["medium"], effort=None)
+    assert refusal is not None
+    assert (refusal.rule, refusal.detail) == (
+        "provider_not_equivalent",
+        "kiro_cli cannot be routed to yet",
+    )
+
+
 ORDER_PROBE = r"""
 import json, sys
 from dataclasses import replace
@@ -516,7 +599,9 @@ from cli_agent_orchestrator.models.ephemeral import EphemeralSpec, TOOL_ATOMS
 from cli_agent_orchestrator.services import ephemeral_service as service
 from cli_agent_orchestrator.utils import ephemeral_capabilities as caps
 
-row = caps.EphemeralCapability(caps.HARD, frozenset(TOOL_ATOMS), True, ("c", "effort"))
+row = caps.EphemeralCapability(
+    caps.HARD, frozenset(TOOL_ATOMS), True, ("c", "effort"), routable=True
+)
 caps.CAPABILITIES["codex"] = replace(caps.CAPABILITIES["codex"], enforcement=caps.SANDBOXED)
 caps.CAPABILITIES["kiro_cli"] = row
 caps.CAPABILITIES["mock_cli"] = row
@@ -666,6 +751,20 @@ def test_the_recheck_still_requires_the_stored_fallback(create_store, monkeypatc
     with pytest.raises(create_store[0].EphemeralPolicyError) as err:
         create_store[0].recheck_decided(name, token, CALLER, None, provider="codex")
     assert err.value.rule == "policy_changed_since_create:provider_not_allowed"
+
+
+def test_the_recheck_refuses_a_decided_kiro_and_collects_the_name(create_store, monkeypatch):
+    name, token = _claimed(create_store, monkeypatch, default_tier="medium")
+    create_store[4]["model_tiers"] = {
+        **BOTH_TIERS,
+        "kiro_cli": {t: f"kiro_cli-{t}" for t in ("small", "medium", "large")},
+    }
+    create_store[4]["ephemeral"]["allowed_providers"] = [*BOTH, "kiro_cli"]
+    with pytest.raises(create_store[0].EphemeralPolicyError) as err:
+        create_store[0].recheck_decided(name, token, CALLER, None, provider="kiro_cli")
+    assert err.value.rule == "policy_changed_since_create:provider_not_equivalent"
+    row = database.get_ephemeral_agent(name)
+    assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
 
 
 def test_the_recheck_bounds_a_decided_effort_for_the_decided_provider(create_store, monkeypatch):

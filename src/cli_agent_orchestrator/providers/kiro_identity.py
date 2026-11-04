@@ -270,6 +270,19 @@ def header_agents(pane: str) -> List[str]:
     return agents
 
 
+def header_model(pane: str, agent: str) -> Optional[str]:
+    """The model column of the first header row naming ``agent``, for the audit; None if none does.
+
+    Read with the identity check's own row shape, so extra effort and thinking
+    columns never shift it. Audited, never enforced (#1167 Phase 2).
+    """
+    for row in strip_terminal_escapes(pane).splitlines():
+        match = _HEADER_ROW.match(row)
+        if match and match.group("agent") == agent:
+            return match.group("model")
+    return None
+
+
 def fallback_notice(pane: str, agent: str) -> Optional[str]:
     """The agent kiro-cli says it used instead of ``agent``, from its first fallback
     notice in ``pane`` that names ``agent``; None when no notice names it.
