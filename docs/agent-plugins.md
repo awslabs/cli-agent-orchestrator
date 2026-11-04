@@ -484,18 +484,20 @@ Some entries are rejected, always with a report and never silently:
 
 ## CAO's own packages
 
-CAO ships itself as two agent plugins, so any Agent-Plugins-compatible client
-can drive a CAO session without CAO-specific integration code:
+CAO ships its own agent plugins, so any Agent-Plugins-compatible client can
+drive a CAO session, extend CAO, or author and audit an agent plugin without
+CAO-specific integration code:
 
 | Package | Install this if you are… | Skills | Also ships |
 |---|---|---|---|
 | [`cao`](../agent-plugin/cao) | **an operator** driving CAO from another client | `cao-session-management`, `cao-agent-routing`, `cao-supervisor-protocols`, `cao-worker-protocols` | the `cao-ops` MCP server |
 | [`cao-contributor`](../agent-plugin/cao-contributor) | **a contributor** extending CAO itself | `cao-provider`, `cao-plugin`, `cao-contributing` | — |
+| [`cao-agent-plugin-lifecycle`](../agent-plugin/cao-agent-plugin-lifecycle) | **an author** writing a new Agent Plugins 1.0.0 package or auditing an existing one | `cao-agent-plugin-creator`, `cao-agent-plugin-audit` | — |
 
 The skill names are the folder names you will see under
 `~/.aws/cli-agent-orchestrator/skills/` after installing, which is what makes a
 collision report readable when one of them clashes with a skill you already have.
-Both packages are generated from CAO's own `skills/` directory by
+Every package is generated from CAO's own `skills/` directory by
 `scripts/build_agent_plugin.py`, and `make check-agent-plugin` fails if the
 generated packages drift from it — so this table, the packages, and the shipped
 skills cannot disagree for long.
@@ -518,6 +520,9 @@ call. The version is pinned exactly, and the build refuses to write a pin that
 is not already published on PyPI. `cao-contributor` ships no `mcp.json` at all:
 authoring skills work through the host agent's own tools and need no CAO
 runtime, so the `uv` and `cao-server` prerequisites do not apply to it.
+`cao-agent-plugin-lifecycle` ships no `mcp.json` either: its skills need no CAO
+runtime, and the audit skill's validator is a standalone script that carries its
+own pinned copy of the schemas.
 
 The build also refuses to write a pin whose published `cao-ops-mcp-server` does
 not bound its HTTP requests, and it decides that by **inspecting the published
@@ -539,6 +544,16 @@ findings, allowlist agreement, `mcp.json` conformance — is unaffected. Strict
 equality lives behind `--check --require-current-pin`, which that job runs after
 it has pushed, so a forgotten repin is still caught, just not on everyone
 else's PR.
+
+To rebuild after editing a packaged skill without moving the pin, run
+`make agent-plugin-keep-pin` (`scripts/build_agent_plugin.py --keep-committed-pin`).
+It renders every package at the version the committed packages already pin, contacts
+no PyPI, and
+refuses, writing nothing, when the committed manifests are missing, unreadable or
+disagree, naming each package and its version. `make agent-plugin` renders at
+`pyproject.toml`'s version and so moves the pin; that is the release job's step.
+When `make check-agent-plugin` cannot tell the committed pin, it says why before
+listing the drift that follows.
 
 ```bash
 # From a clone
@@ -708,6 +723,25 @@ What each step asserts, and why it is the load-bearing one:
 
 The runnable example, the offline-vs-live assertion matrix, and the recorder are
 in [`examples/agent-plugins/agent-plugins-dogfood/`](../examples/agent-plugins/agent-plugins-dogfood/README.md).
+
+**`cao-agent-plugin-lifecycle` is not exercised by that recording**, which
+installs only `cao`. It is gated in CI by `make check-agent-plugin`, and it is
+**audited by a skill it carries**: the `cao-agent-plugin-audit` validator, run
+against the package, reported no fatal, skipped, limit or warning finding at the
+commit that added the package. That audit is not run in CI; rerun it by hand.
+
+```bash
+uv run --script skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py ./agent-plugin/cao-agent-plugin-lifecycle
+```
+
+At the commit that added the package, this exits `0` and ends with
+`summary: 0 fatal, 0 skipped, 0 limit, 0 warning, 1 advisory; exit 0`. The
+advisory is the listing of the manifest's description beside the skills that
+would load, which the audit prints whenever it reads a manifest, for a reader to
+compare. On the same
+package, `CAO_AGENT_PLUGINS_ENABLED=1 cao plugin validate
+./agent-plugin/cao-agent-plugin-lifecycle --json` reports `"loadable": true` and
+no findings, exit `0`.
 
 ## Security posture, stated plainly
 
