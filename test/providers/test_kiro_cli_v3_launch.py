@@ -4,15 +4,17 @@ No Kiro runs. The fake pane shows the captured 2.35.1 screens in the order a
 real launch would draw them, driven by the keys CAO sends. Every refusal must
 leave ``identity_verified`` False and type no task text; the only keys ever
 sent are the launch command and the two slash commands with their Enter and
-Escape.
+Escape (``/mcp`` once per open). ``SnapshotPane`` freezes an open ``/mcp``
+panel, as Kiro v3 does, and the provider runs on a fake clock.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import shlex
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional, Sequence
 from unittest.mock import patch
 
 import pytest
@@ -93,14 +95,41 @@ def _provider(agent="v3ro", allowed=GRANT[0]):
     return KiroCliProvider("t1234567", "sess", "win", agent, allowed, engine=KiroEngine.V3)
 
 
-async def _launch(pane, *, status=TerminalStatus.IDLE, grant=GRANT, provider=None):
+class FakeClock:
+    """The provider's clock: seconds since the launch, moved only by its own sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: List[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds, *_args, **_kwargs) -> None:
+        self.sleeps.append(float(seconds))
+        self.now += max(0.0, float(seconds))
+
+
+async def _launch(
+    pane,
+    *,
+    status=TerminalStatus.IDLE,
+    grant=GRANT,
+    provider=None,
+    clock=None,
+    init_timeout=60,
+):
+    """``initialize`` against ``pane``, on a fake clock and a fixed ``provider_init_timeout``."""
     provider = provider or _provider()
+    clock = clock or getattr(pane, "clock", None) or FakeClock()
     with (
         patch(f"{_KC}.get_backend", return_value=pane),
         patch(f"{_KC}.wait_for_shell", return_value=True),
         patch(f"{_KC}.wait_until_status", return_value=True),
         patch(f"{_KC}.load_agent_profile", side_effect=FileNotFoundError("no profile")),
-        patch(f"{_KC}.asyncio.sleep", return_value=None),
+        patch(f"{_KC}.get_server_settings", return_value={"provider_init_timeout": init_timeout}),
+        patch(f"{_KC}.asyncio.sleep", new=clock.sleep),
+        patch(f"{_KC}.time", new=clock),
         patch("cli_agent_orchestrator.services.status_monitor.status_monitor") as monitor,
         patch(
             "cli_agent_orchestrator.services.install_service.installed_kiro_v3_grant",
@@ -172,9 +201,13 @@ async def test_a_v3_launch_attests_tools_and_mcp_before_recording_identity(cwd):
     assert "Tab" not in pane.keys
 
 
+#: The captured ``/mcp`` panel with ``cao-mcp-server`` loading. Kiro's bundled TUI
+#: draws ``◌`` for it; no live capture of a loading row exists yet.
 _MCP_LOADING = _screen("mcp_running").replace(
-    "● running       34 tools", "⠋ loading        0 tools"
+    "● running       34 tools", "◌ loading        0 tools"
 )
+#: ... and with it failed, drawn as the captured decoys are.
+_MCP_FAILED = _screen("mcp_running").replace("● running       34 tools", "✗ failed         0 tools")
 _MCP_ROW_LINE = re.compile(r"^\s*(@\S+)\s{2,}mcp\b")
 
 
@@ -197,61 +230,352 @@ def _tools_panel_with(mcp_tools: Iterable[str] = ()) -> str:
 #: What ``/tools`` shows while ``cao-mcp-server`` is still loading: none of its tools.
 _TOOLS_WHILE_LOADING = _tools_panel_with()
 
+#: The ``/mcp`` panel an open shows, by the server's state at that open.
+_MCP_PANELS = {
+    "running": _screen("mcp_running"),
+    "loading": _MCP_LOADING,
+    "failed": _MCP_FAILED,
+    "decoys": _screen("mcp_decoys_shown"),
+}
 
-class LoadingPane(FakePane):
-    """A pane whose MCP server is still loading when the attestation starts.
 
-    The server finishes once the ``/mcp`` panel has been read more than
-    ``loading_reads`` times (CAO's re-reads stand in for the time passing).
-    Until then ``/mcp`` shows it loading and ``/tools`` shows none of its tools,
-    as one real pane would; afterwards ``/mcp`` shows it running and ``/tools``
-    shows ``loaded_tools``.
+class SnapshotPane(FakePane):
+    """A pane whose ``/mcp`` panel is a snapshot, as Kiro v3's is (#1167).
+
+    Kiro v3's TUI copies its server list once, when ``/mcp`` opens, and never
+    updates an open panel: the engine's status notices update only that list,
+    and the panel's own updater is fed by a v2-engine notice alone. So an open
+    ``/mcp`` panel shows the server's state at the Enter that opened it, however
+    often it is read and however much time passes; only closing it and opening
+    it again shows a new state. ``/tools`` is live: it shows the server's tools
+    once the server is running.
+
+    The server's state at the n-th open is ``states[n - 1]`` (the last one
+    repeats); with ``ready_at`` it is ``loading`` until the clock reaches that
+    second, then ``running``. Keys typed while a panel is open go to its search
+    box, never to the prompt; a dialog takes every key typed while it is on
+    screen. ``open_lag`` and ``close_lag`` reads still show the old frame after
+    an Enter or an Escape, as a render can trail the key.
     """
 
-    def __init__(self, cwd: str, *, loaded_tools: str, loading_reads: int = 2):
+    def __init__(
+        self,
+        cwd: str,
+        *,
+        states: Sequence[str] = ("loading", "running"),
+        ready_at: Optional[float] = None,
+        loaded_tools: str = "tools_readonly_mcp",
+        palette_fails_at: Optional[int] = None,
+        dialog_after_close: Optional[int] = None,
+        dialog: str = "approval",
+        open_lag: int = 0,
+        close_lag: int = 0,
+        max_opens: int = 200,
+    ):
         super().__init__(cwd)
+        self.clock = FakeClock()
+        self.states = list(states)
+        self.ready_at = ready_at
         self.loaded_tools = loaded_tools
-        self.loading_reads = loading_reads
-        self.mcp_reads = 0
+        self.palette_fails_at = palette_fails_at
+        self.dialog_after_close = dialog_after_close
+        self.dialog = dialog
+        self.open_lag = open_lag
+        self.close_lag = close_lag
+        self.max_opens = max_opens
+        self.open_panel: Optional[str] = None
+        self.dialog_shown = False
+        #: Frames a read shows before ``screen``: a render trailing a key.
+        self.frames: List[str] = []
+        #: The server's state each ``/mcp`` open showed, taken at its Enter.
+        self.snapshots: List[str] = []
+        self.closes = 0
+        #: Keys typed into an open panel's search box.
+        self.search = ""
+        self.keys_into_dialog: List[str] = []
         self.tools_shown: List[str] = []
 
-    @property
-    def loaded(self) -> bool:
-        return self.mcp_reads > self.loading_reads
+    def _state_at_open(self, number: int) -> str:
+        if self.ready_at is not None:
+            return "running" if self.clock.now >= self.ready_at else "loading"
+        return self.states[min(number, len(self.states)) - 1]
 
-    def send_special_key(self, session, window, key):
-        if key == "Enter" and self.buffer in ("/tools", "/mcp"):
-            self.keys.append(key)
-            if self.buffer == "/tools":
-                self.tools_shown.append("loaded" if self.loaded else "loading")
-                self.screen = _screen(self.loaded_tools if self.loaded else _TOOLS_WHILE_LOADING)
-            else:
-                self.screen = _screen("mcp_running") if self.loaded else _MCP_LOADING
+    def _server_running(self) -> bool:
+        if self.ready_at is not None:
+            return self.clock.now >= self.ready_at
+        return bool(self.snapshots) and self.snapshots[-1] == "running"
+
+    def _open(self, panel: str, screen: str) -> None:
+        self.frames = [self.screen] * self.open_lag
+        self.open_panel = panel
+        self.screen = screen
+
+    def send_special_key(self, _session, _window, key):
+        self.keys.append(key)
+        if self.dialog_shown:
+            self.keys_into_dialog.append(key)
             return
-        super().send_special_key(session, window, key)
+        if self.open_panel is not None:
+            if key != "Escape":
+                self.search += key
+                return
+            if self.open_panel == "/mcp":
+                self.closes += 1
+            self.frames = [self.screen] * self.close_lag
+            self.open_panel, self.buffer, self.search = None, "", ""
+            self.screen = _screen("idle")
+            if self.closes == self.dialog_after_close:
+                self.dialog_shown = True
+                self.screen = _screen(self.dialog)
+            return
+        if key == "Escape":
+            self.buffer = ""
+            self.screen = _screen("idle")
+        elif key == "Enter":
+            if self.buffer == "/mcp" and self.screen == _screen("typed_mcp"):
+                number = len(self.snapshots) + 1
+                assert number <= self.max_opens, f"/mcp opened {number} times: no deadline"
+                state = self._state_at_open(number)
+                self.snapshots.append(state)
+                self._open("/mcp", _MCP_PANELS[state])
+            elif self.buffer == "/tools" and self.screen == _screen(self.typed["/tools"]):
+                running = self._server_running()
+                self.tools_shown.append("loaded" if running else "loading")
+                self._open(
+                    "/tools", _screen(self.loaded_tools if running else _TOOLS_WHILE_LOADING)
+                )
+        else:
+            self.buffer += key
+            if self.buffer == "/mcp" and self.palette_fails_at == len(self.snapshots) + 1:
+                self.screen = _screen("palette_slash_menu")
+            elif self.buffer in self.typed:
+                self.screen = _screen(self.typed[self.buffer])
 
-    def get_history(self, *args, **kwargs):
-        if self.buffer == "/mcp" and "/mcp list" in self.screen:
-            self.mcp_reads += 1
-            if self.loaded:
-                self.screen = _screen("mcp_running")
+    def get_history(self, *_args, **_kwargs):
+        if self.frames:
+            return self.frames.pop(0)
         return self.screen
+
+
+def _keys(mcp_opens: int, *, tools: bool = True) -> List[str]:
+    """The keys of ``mcp_opens`` opens of ``/mcp``, each closed, then of ``/tools``."""
+    return [*"/mcp", "Enter", "Escape"] * mcp_opens + (
+        [*"/tools", "Enter", "Escape"] if tools else []
+    )
 
 
 #: A grant that names one tool of ``cao-mcp-server`` and not the whole server.
 PER_TOOL = (["fs_read", "fs_list", "@cao-mcp-server/send_message"], ["cao-mcp-server"])
 
 
+def _type(pane, keys) -> None:
+    for key in keys:
+        pane.send_special_key("sess", "win", key)
+
+
+def test_the_snapshot_pane_never_changes_an_open_mcp_panel(cwd):
+    """The double itself (the old one turned an open panel to running on a re-read)."""
+    pane = SnapshotPane(str(cwd), ready_at=2.0)
+    _type(pane, [*"/mcp", "Enter"])
+    assert "◌ loading" in pane.get_history()
+    pane.clock.now = 30.0
+    assert all("◌ loading" in pane.get_history() for _ in range(50))
+    _type(pane, ["Escape", *"/mcp", "Enter"])
+    assert "● running" in pane.get_history()
+    assert pane.snapshots == ["loading", "running"]
+    # Keys typed into an open panel never reach the prompt's palette.
+    _type(pane, [*"/mcp", "Enter"])
+    assert pane.search == "/mcpEnter"
+    assert pane.snapshots == ["loading", "running"]
+
+
 @pytest.mark.asyncio
-async def test_mcp_servers_still_loading_are_read_again_before_tools(cwd):
-    """``/mcp`` is read until no server is loading, and only then ``/tools``, so
-    the tools panel CAO checks is the one with the server's tools on it."""
-    pane = LoadingPane(str(cwd), loaded_tools="tools_readonly_mcp")
+async def test_a_server_loading_at_the_first_open_is_seen_running_on_a_reopen(cwd):
+    """``/mcp`` is opened again until no server is loading, and only then ``/tools``,
+    so the tools panel CAO checks is the one with the server's tools on it."""
+    pane = SnapshotPane(str(cwd), states=("loading", "loading", "running"))
     provider = await _launch(pane)
     assert provider.identity_verified is True
-    assert pane.mcp_reads >= 3
+    assert pane.snapshots == ["loading", "loading", "running"]
+    assert pane.keys == _keys(3)
     assert pane.tools_shown == ["loaded"]
-    assert pane.keys == [*"/mcp", "Enter", "Escape", *"/tools", "Enter", "Escape"]
+    assert pane.texts == [pane.command]
+    assert pane.search == "" and pane.open_panel is None
+    assert provider.attestation.mcp_tools == (("cao-mcp-server", 34),)
+    # 1 s before the second open, 2 s before the third; no other wait.
+    assert pane.clock.sleeps == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_regression_mcp_is_opened_again_not_read_again(cwd):
+    """The bug a live kiro-cli 3.0.0 run found: CAO opened ``/mcp`` before
+    cao-mcp-server had connected, read that frozen panel 40 times, and refused
+    every v3 helper with ``kiro_v3_mcp_not_ready: MCP servers still loading``.
+    Here the server is up 2 s after the first open; opening the panel again
+    shows it."""
+    pane = SnapshotPane(str(cwd), ready_at=2.0)
+    provider = await _launch(pane)
+    assert provider.identity_verified is True
+    # Opened at 0 s and 1 s (loading), then at 3 s (running).
+    assert pane.snapshots == ["loading", "loading", "running"]
+    assert pane.keys == _keys(3)
+    assert pane.tools_shown == ["loaded"]
+
+
+@pytest.mark.asyncio
+async def test_a_server_slower_than_the_old_20_s_wait_attests_within_provider_init_timeout(cwd):
+    pane = SnapshotPane(str(cwd), ready_at=40.0)
+    provider = await _launch(pane, init_timeout=60)
+    assert provider.identity_verified is True
+    assert pane.snapshots.count("running") == 1 and pane.snapshots[-1] == "running"
+    assert pane.clock.now == 42.0  # opens every 3 s after the first two waits
+    assert pane.keys == _keys(len(pane.snapshots))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("init_timeout", "opens"), [(10, 6), (45, 17), (60, 22)])
+async def test_a_server_that_never_finishes_loading_refuses_before_tools_is_read(
+    cwd, init_timeout, opens
+):
+    """The reopens end at ``provider_init_timeout`` in a refusal, never in a
+    ``/tools`` read: with a per-tool grant, a ``/tools`` panel read while the
+    server loads would show none of its tools and pass blind. 45 s is past the
+    old fixed wait of about 20 s; 60 s is the default, as docs/kiro-cli.md shows."""
+    pane = SnapshotPane(str(cwd), states=("loading",))
+    provider = _provider(allowed=PER_TOOL[0])
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane, grant=PER_TOOL, provider=provider, init_timeout=init_timeout)
+    assert excinfo.value.code == "kiro_v3_mcp_not_ready"
+    assert str(excinfo.value) == (
+        f"kiro_v3_mcp_not_ready: MCP servers still loading after {init_timeout} s "
+        f"({opens} opens of /mcp): ['cao-mcp-server']"
+    )
+    assert pane.clock.now == init_timeout
+    assert pane.snapshots == ["loading"] * opens
+    assert pane.keys == _keys(opens, tools=False)
+    assert pane.open_panel is None
+    assert pane.tools_shown == []
+    assert provider.identity_verified is False
+    assert pane.texts == [pane.command]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "words"),
+    [
+        ("failed", "cao-mcp-server is '✗ failed' with 0 tools"),
+        ("decoys", "extra ['kv3-user-decoy', 'kv3-ws-decoy']"),
+    ],
+)
+async def test_a_failed_server_or_new_servers_on_a_reopen_refuse_at_once(cwd, state, words):
+    pane = SnapshotPane(str(cwd), states=("loading", state, "running"))
+    provider = _provider()
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane, provider=provider)
+    assert excinfo.value.code == "kiro_v3_mcp_not_ready"
+    assert words in str(excinfo.value)
+    assert pane.snapshots == ["loading", state]  # no further open
+    assert pane.keys == _keys(2, tools=False)
+    assert pane.open_panel is None
+    assert provider.identity_verified is False
+
+
+@pytest.mark.asyncio
+async def test_a_palette_that_does_not_appear_on_a_reopen_refuses(cwd):
+    pane = SnapshotPane(str(cwd), states=("loading", "running"), palette_fails_at=2)
+    provider = _provider()
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane, provider=provider)
+    assert excinfo.value.code == "kiro_v3_mcp_not_ready"
+    assert str(excinfo.value).endswith("the /mcp palette did not appear; nothing was selected")
+    assert pane.keys == [*_keys(1, tools=False), *"/mcp", "Escape"]
+    assert pane.snapshots == ["loading"]
+    assert provider.identity_verified is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialog", ["approval", "trust_dialog", "unrecognised_selector"])
+@pytest.mark.parametrize(
+    "states", [("loading", "running"), ("running",)], ids=["between_opens", "before_tools"]
+)
+async def test_a_dialog_once_mcp_closes_refuses_and_nothing_is_typed_into_it(cwd, dialog, states):
+    screen = _unrecognised_selector() if dialog == "unrecognised_selector" else dialog
+    pane = SnapshotPane(str(cwd), states=states, dialog_after_close=1, dialog=screen)
+    provider = _provider()
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane, provider=provider)
+    assert excinfo.value.code == "kiro_v3_mcp_not_ready"
+    assert "a dialog appeared after /mcp closed" in str(excinfo.value)
+    assert pane.keys == _keys(1, tools=False)
+    assert pane.keys_into_dialog == []
+    assert pane.clock.now == 0.0  # refused at once, not at the deadline
+    assert provider.identity_verified is False
+
+
+@pytest.mark.asyncio
+async def test_frames_trailing_an_enter_or_an_escape_are_read_again(cwd):
+    from cli_agent_orchestrator.providers import kiro_cli
+
+    lag = kiro_cli.V3_ATTEST_READS - 1
+    pane = SnapshotPane(str(cwd), states=("loading", "running"), open_lag=lag, close_lag=lag)
+    provider = await _launch(pane)
+    assert provider.identity_verified is True
+    # The snapshot is the state at the Enter, whenever its frame is drawn.
+    assert pane.snapshots == ["loading", "running"]
+    assert pane.keys == _keys(2)
+
+
+@pytest.mark.asyncio
+async def test_an_mcp_panel_that_is_never_drawn_refuses_after_the_render_wait(cwd):
+    from cli_agent_orchestrator.providers import kiro_cli
+
+    pane = SnapshotPane(str(cwd), states=("loading", "running"), open_lag=kiro_cli.V3_ATTEST_READS)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane)
+    assert excinfo.value.code == "kiro_v3_mcp_not_ready"
+    assert "no complete /mcp list panel on screen" in str(excinfo.value)
+    assert pane.keys == _keys(1, tools=False)
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_that_does_not_come_back_after_mcp_closes_refuses(cwd):
+    from cli_agent_orchestrator.providers import kiro_cli
+
+    pane = SnapshotPane(str(cwd), states=("loading", "running"), close_lag=kiro_cli.V3_ATTEST_READS)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane)
+    assert str(excinfo.value) == "kiro_v3_mcp_not_ready: the prompt did not return after /mcp"
+    assert pane.keys == _keys(1, tools=False)
+
+
+@pytest.mark.asyncio
+async def test_each_mcp_open_is_logged_at_debug_with_no_other_screen_text(cwd, caplog):
+    pane = SnapshotPane(str(cwd), states=("loading", "running"))
+    with caplog.at_level(logging.DEBUG, logger=_KC):
+        await _launch(pane)
+    records = [r for r in caplog.records if r.name == _KC]
+    opens = [r for r in records if "/mcp open" in r.getMessage()]
+    assert [r.getMessage() for r in opens] == [
+        "kiro_cli: terminal t1234567 /mcp open 1 at 0.0 s: cao-mcp-server loading (0 tools)",
+        "kiro_cli: terminal t1234567 /mcp open 2 at 1.0 s: cao-mcp-server running (34 tools)",
+    ]
+    assert {r.levelno for r in opens} == {logging.DEBUG}
+    logged = "\n".join(r.getMessage() for r in records)
+    for screen_text in ("/private/tmp", "mcp.json", "To edit local configs", "type to filter"):
+        assert screen_text not in logged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tools", "why"), [("tools_default", "shell"), ("tools_none", "no tools")])
+async def test_tools_is_still_checked_after_mcp_is_opened_again(cwd, tools, why):
+    pane = SnapshotPane(str(cwd), states=("loading", "running"), loaded_tools=tools)
+    provider = _provider()
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane, provider=provider)
+    assert excinfo.value.code == "kiro_v3_tools_mismatch"
+    assert why in str(excinfo.value)
+    assert pane.keys == _keys(2)
+    assert provider.identity_verified is False
 
 
 @pytest.mark.asyncio
@@ -259,7 +583,7 @@ async def test_a_per_tool_grant_is_not_attested_on_a_tools_panel_read_while_load
     """The blind case (maintainer review on #1179): had ``/tools`` been read while
     the server was loading, it would have shown none of the server's tools and
     passed. Read after loading, it shows tools the grant does not name."""
-    pane = LoadingPane(str(cwd), loaded_tools="tools_readonly_mcp")
+    pane = SnapshotPane(str(cwd), states=("loading", "running"))
     provider = _provider(allowed=PER_TOOL[0])
     with pytest.raises(KiroAttestationError) as excinfo:
         await _launch(pane, grant=PER_TOOL, provider=provider)
@@ -270,30 +594,13 @@ async def test_a_per_tool_grant_is_not_attested_on_a_tools_panel_read_while_load
 
 
 @pytest.mark.asyncio
-async def test_a_server_that_never_finishes_loading_refuses_before_tools_is_read(cwd):
-    """The ``/mcp`` re-reads end in a refusal, never in a ``/tools`` read: with a
-    per-tool grant, a ``/tools`` panel read while the server loads would show
-    none of its tools and pass blind."""
-    from cli_agent_orchestrator.providers import kiro_cli
-
-    pane = LoadingPane(
-        str(cwd),
-        loaded_tools="tools_readonly_mcp",
-        loading_reads=kiro_cli.V3_MCP_LOADING_READS + 1,
-    )
-    provider = _provider(allowed=PER_TOOL[0])
-    with pytest.raises(KiroAttestationError) as excinfo:
-        await _launch(pane, grant=PER_TOOL, provider=provider)
-    assert excinfo.value.code == "kiro_v3_mcp_not_ready"
-    assert provider.identity_verified is False
-    assert pane.tools_shown == []
-    assert pane.keys == [*"/mcp", "Enter", "Escape"]
-
-
-@pytest.mark.asyncio
 async def test_a_per_tool_grant_whose_pane_shows_only_that_tool_attests(cwd):
     """The server a per-tool ref names is a granted server here too (#1178 review)."""
-    pane = LoadingPane(str(cwd), loaded_tools=_tools_panel_with(["@cao-mcp-server/send_message"]))
+    pane = SnapshotPane(
+        str(cwd),
+        states=("loading", "running"),
+        loaded_tools=_tools_panel_with(["@cao-mcp-server/send_message"]),
+    )
     provider = _provider(allowed=PER_TOOL[0])
     await _launch(pane, grant=PER_TOOL, provider=provider)
     assert provider.identity_verified is True
