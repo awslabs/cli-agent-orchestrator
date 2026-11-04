@@ -71,6 +71,7 @@ from cli_agent_orchestrator.providers.kiro_workspace import (
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.delegation import tools_exceeding
+from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_store
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 from cli_agent_orchestrator.utils.tool_mapping import kiro_v3_granted_mcp_servers
@@ -466,6 +467,21 @@ class KiroCliProvider(BaseProvider):
         requested_model: Optional[str],
     ) -> bool:
         return True
+
+    @classmethod
+    def honors_effort(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+    ) -> bool:
+        """Only an ephemeral helper applies a decided effort (#1083, #1167 Phase 2).
+
+        A helper runs on the v3 engine only, and its launch object carries the launch
+        plan's effort, else the stored ``kiroConfig.effort``, to ``--effort``. An installed
+        agent is unchanged: v2 passes no effort, and v3 reads ``kiroConfig.effort`` from
+        the agent's own profile, so a decided effort would never reach it.
+        """
+        return agent_profile is not None and routes_to_ephemeral_store(agent_profile)
 
     def __init__(
         self,
