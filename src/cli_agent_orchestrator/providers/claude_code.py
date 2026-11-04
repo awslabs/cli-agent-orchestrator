@@ -827,6 +827,9 @@ class ClaudeCodeProvider(BaseProvider):
         # still prevents the agent from using the blocked tools entirely.
         # Treat a present-but-empty list as deny-all (same as Grok). A falsy
         # check used to skip the flags entirely for allowed_tools=[].
+        # The list also carries Claude Code's own agent-messaging and
+        # agent-spawning built-ins (tool_mapping.ALWAYS_DISALLOWED), which every
+        # restricted grant loses, the developer default included.
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
 

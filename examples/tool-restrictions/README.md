@@ -79,7 +79,7 @@ Proceed? [Y/n]
 | | Allowed | Denied |
 |---|---|---|
 | CAO vocabulary | `@cao-mcp-server`, `fs_read`, `fs_list` | `execute_bash`, `fs_write`, `web_fetch`, `discovery` |
-| Claude Code native | `Read`, `Glob`, `Grep`, plus MCP tools (`handoff`, `assign`, `send_message`) | Bash family (`Bash`, `BashOutput`, `KillShell`, `Task`, `Agent`, `Monitor`), file writes (`Edit`, `Write`, `NotebookEdit`), network (`WebFetch`, `WebSearch`) — all via `--disallowedTools` |
+| Claude Code native | `Read`, `LSP`, `Glob`, `Grep`, plus MCP tools (`handoff`, `assign`, `send_message`) | Bash family (`Bash`, `BashOutput`, `KillShell`, `TaskStop`, `GetTask`, `PowerShell`, `Task`, `Agent`, `Monitor`), file writes (`Edit`, `Write`, `NotebookEdit`), network (`WebFetch`, `WebSearch`), and Claude Code's own messaging and agent tools ([always removed](../../docs/tool-restrictions.md#claude-code-built-ins-cao-always-removes)) — all via `--disallowedTools` |
 
 ### `tool_restrictions_developer` — full access
 
@@ -99,7 +99,7 @@ Proceed? [Y/n]
 | | Allowed | Denied |
 |---|---|---|
 | CAO vocabulary | `@builtin`, `fs_read`, `fs_write`, `fs_list`, `execute_bash`, `web_fetch`, `@cao-mcp-server` | `discovery` (not part of any built-in role — add it explicitly if this agent needs sibling discovery) |
-| Claude Code native | Everything: `Read`, `Edit`, `Write`, `Glob`, `Grep`, `Bash`, `WebFetch`, `WebSearch`, plus MCP tools | Nothing — no `--disallowedTools` flags at all |
+| Claude Code native | Every mapped tool: `Read`, `Edit`, `Write`, `Glob`, `Grep`, `Bash`, `WebFetch`, `WebSearch`, plus MCP tools | Only Claude Code's own messaging and agent tools (`SendMessage`, `Workflow`, `CronCreate` and the rest of the [always-removed list](../../docs/tool-restrictions.md#claude-code-built-ins-cao-always-removes)) |
 
 ### `tool_restrictions_reviewer` — read-only
 
@@ -119,7 +119,7 @@ Proceed? [Y/n]
 | | Allowed | Denied |
 |---|---|---|
 | CAO vocabulary | `@builtin`, `fs_read`, `fs_list`, `@cao-mcp-server` | `execute_bash`, `fs_write`, `web_fetch`, `discovery` |
-| Claude Code native | `Read`, `Glob`, `Grep`, plus MCP tools | Bash family (`Bash`, `BashOutput`, `KillShell`, `Task`, `Agent`, `Monitor`), file writes (`Edit`, `Write`, `NotebookEdit`), network (`WebFetch`, `WebSearch`) — all via `--disallowedTools` |
+| Claude Code native | `Read`, `LSP`, `Glob`, `Grep`, plus MCP tools | Bash family (`Bash`, `BashOutput`, `KillShell`, `TaskStop`, `GetTask`, `PowerShell`, `Task`, `Agent`, `Monitor`), file writes (`Edit`, `Write`, `NotebookEdit`), network (`WebFetch`, `WebSearch`), and Claude Code's own messaging and agent tools ([always removed](../../docs/tool-restrictions.md#claude-code-built-ins-cao-always-removes)) — all via `--disallowedTools` |
 
 **Nuance:** `supervisor` and `reviewer` deny the exact same native Claude
 Code tools — both lack `execute_bash`/`fs_write`/`web_fetch`. The only CAO-
@@ -153,7 +153,7 @@ Proceed? [Y/n]
 | | Allowed | Denied |
 |---|---|---|
 | CAO vocabulary | `fs_read`, `fs_list`, `execute_bash` | `fs_write`, `web_fetch`, `@cao-mcp-server`, `discovery` |
-| Claude Code native | `Read`, `Glob`, `Grep`, `Bash` family (`Bash`, `BashOutput`, `KillShell`, `Task`, `Agent`, `Monitor`) | File writes (`Edit`, `Write`, `NotebookEdit`), network (`WebFetch`, `WebSearch`) — and no MCP tools at all, since this profile never configures the `cao-mcp-server` server |
+| Claude Code native | `Read`, `LSP`, `Glob`, `Grep`, `Bash` family (`Bash`, `BashOutput`, `KillShell`, `TaskStop`, `GetTask`, `PowerShell`, `Task`, `Agent`, `Monitor`) | File writes (`Edit`, `Write`, `NotebookEdit`), network (`WebFetch`, `WebSearch`), Claude Code's own messaging and agent tools ([always removed](../../docs/tool-restrictions.md#claude-code-built-ins-cao-always-removes)) — and no MCP tools at all, since this profile never configures the `cao-mcp-server` server |
 
 Note this does **not** show the "no role or allowedTools set" reminder
 that [Default Behavior](../../docs/tool-restrictions.md#default-behavior)
