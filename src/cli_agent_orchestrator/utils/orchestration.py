@@ -642,6 +642,46 @@ def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
         return False
 
 
+def _load_child_profile(child_profile_name: str) -> Any:
+    """Load a child's agent profile, asking cao-server when this process can't read it.
+
+    This runs in the caller's process -- for ``assign``/``handoff`` that is
+    cao-mcp-server, a child of the supervisor's CLI. A sandboxing CLI can hide the
+    agent store from it: kiro-cli with ``"sandbox": true`` gives its MCP children a
+    synthetic ``~/.aws``, so every read failed with ``Permission denied`` and every
+    ``assign`` failed. cao-server reads the same store unsandboxed, so on an OS-level
+    read error fetch the parsed profile from it instead. The intersection below then
+    runs on the same profile it would have read locally. FileNotFoundError and parse
+    errors still propagate unchanged.
+    """
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+    try:
+        return load_agent_profile(child_profile_name)
+    except RuntimeError as exc:
+        # load_agent_profile wraps the underlying error without `from`, so the
+        # OSError is on __context__.
+        if not isinstance(exc.__context__, OSError):
+            raise
+        try:
+            response = requests.get(
+                f"{API_BASE_URL}/agents/profiles/{child_profile_name}",
+                headers=_auth_headers() or None,
+                timeout=_mcp_timeout(),
+            )
+            response.raise_for_status()
+            return AgentProfile.model_validate(response.json())
+        except Exception as fallback_exc:
+            logger.warning(
+                "Profile '%s' unreadable locally (%s) and cao-server fallback failed: %s",
+                child_profile_name,
+                exc.__context__,
+                fallback_exc,
+            )
+            raise exc
+
+
 def _resolve_child_allowed_tools(
     parent_allowed_tools: Optional[list],
     child_profile_name: str,
@@ -667,11 +707,10 @@ def _resolve_child_allowed_tools(
         unrestricted child under an unrestricted parent.
     """
     from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
-    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
     from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
     try:
-        child_profile = load_agent_profile(child_profile_name)
+        child_profile = _load_child_profile(child_profile_name)
         mcp_server_names = grantable_server_names(child_profile)
         child_allowed = resolve_allowed_tools(
             child_profile.allowedTools, child_profile.role, mcp_server_names

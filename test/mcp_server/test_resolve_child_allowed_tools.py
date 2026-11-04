@@ -218,3 +218,64 @@ class TestDoubleNullParent:
         mock_load.return_value = _profile(None, role="developer")
         mock_resolve.return_value = ["*"]
         assert _resolve_child_allowed_tools(None, "developer") is None
+
+
+def _unreadable(name="correctness_reviewer"):
+    """The RuntimeError load_agent_profile raises when the store read hits an OSError."""
+    try:
+        try:
+            raise PermissionError(13, "Permission denied", f"agent-store/{name}.md")
+        except PermissionError as e:
+            raise RuntimeError(f"Failed to load agent profile '{name}': {e}")
+    except RuntimeError as wrapped:
+        return wrapped
+
+
+class TestUnreadableProfileFallsBackToServer:
+    """A sandboxed cao-mcp-server can't read the agent store; cao-server can."""
+
+    @patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=5.0)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_permission_denied_uses_server_profile(self, mock_load, mock_get, _timeout):
+        mock_load.side_effect = _unreadable()
+        mock_get.return_value = MagicMock(
+            json=lambda: {
+                "name": "correctness_reviewer",
+                "description": "d",
+                "role": "reviewer",
+                "allowedTools": ["fs_read", "@cao-mcp-server"],
+            }
+        )
+
+        result = _resolve_child_allowed_tools(
+            parent_allowed_tools=["@cao-mcp-server", "fs_read"],
+            child_profile_name="correctness_reviewer",
+        )
+
+        assert mock_get.call_args.args[0].endswith("/agents/profiles/correctness_reviewer")
+        # Same answer the local read would give: the child's own profile tools.
+        assert result == "fs_read,@cao-mcp-server"
+
+    @patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=5.0)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_server_fallback_failure_raises_original_error(self, mock_load, mock_get, _timeout):
+        original = _unreadable()
+        mock_load.side_effect = original
+        mock_get.side_effect = ConnectionError("cao-server down")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            _resolve_child_allowed_tools(["fs_read"], "correctness_reviewer")
+
+        assert excinfo.value is original
+
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_non_os_error_does_not_fall_back(self, mock_load, mock_get):
+        mock_load.side_effect = RuntimeError("Failed to load agent profile 'x': bad yaml")
+
+        with pytest.raises(RuntimeError):
+            _resolve_child_allowed_tools(["fs_read"], "x")
+
+        mock_get.assert_not_called()
