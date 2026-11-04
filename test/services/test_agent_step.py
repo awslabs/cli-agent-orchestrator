@@ -681,6 +681,39 @@ class TestTeardownOutcome:
         assert result.torn_down is False
 
 
+class TestTimeoutAndErrorKeepWorker:
+    """Issue #1203: a worker that timed out or errored is left alive, and its output
+    is not persisted. Pins existing behavior that the handoff messages now describe."""
+
+    @pytest.mark.parametrize(
+        "final_status,kind",
+        [(TerminalStatus.PROCESSING, "timeout"), (TerminalStatus.ERROR, "error")],
+    )
+    def test_worker_is_not_torn_down_and_nothing_is_persisted(self, final_status, kind):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=final_status,
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(f"{_MODULE}.upsert_handoff_result") as m_upsert,
+        ):
+            with pytest.raises(StepExecutionError) as exc_info:
+                asyncio.run(
+                    run_agent_step("kiro_cli", "dev", "x", timeout=0, job_id="cafe1234" * 4)
+                )
+        assert exc_info.value.kind == kind
+        assert exc_info.value.terminal_id == "abc12345"
+        m_delete.assert_not_called()
+        m_exit.assert_not_called()
+        m_upsert.assert_not_called()
+
+
 class TestDurablePersistenceBeforeTeardown:
     """Issue #447 / PR #453 review finding 2: the durable result must be
     written BEFORE teardown, not after run_agent_step returns — a crash
