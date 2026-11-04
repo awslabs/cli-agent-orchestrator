@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro ephemeral helpers on v3** (#1167 Phase 2, #1074 phase 5; preview, pending the operator
+  checklist). `kiro_cli` can now be listed in `ephemeral.allowed_providers` (an operator opt-in; the
+  default stays `claude_code`), and a create reports `enforcement: "hard"`. A Kiro helper is not yet
+  a `provider.route` target: a set naming `kiro_cli` refuses with
+  `policy_config_error:provider_route`. Helpers run on the v3
+  engine only (`engine=v2` refuses), each from its own CAO-owned `KIRO_HOME` under
+  `$CAO_HOME_DIR/ephemeral/kiro/<terminal_id>/`, created after the bind and before the window. The
+  agent file is the same universal file `cao install --engine v3` writes, for the helper's tools plus
+  `@cao-mcp-server`, with a tool-less universal `cao-null` default; both pass CAO's v3 validator and
+  are sealed read-only. CAO never changes `~/.kiro`: it only checks whether Kiro's two legacy-copy
+  sources and their markers exist. An unlistable empty `powers/` placeholder stops Kiro's powers copy,
+  and a helper is refused when Kiro would copy an unmigrated secret store. After the header, a changed
+  placeholder or a new marker refuses before any task, and so does a workspace check that now also
+  refuses the home folder itself. `/tools` and `/mcp list` are held to the helper's own file. The
+  command assigns `KIRO_HOME` and runs one absolute kiro-cli, the one the probe ran. Release stops
+  every process whose `KIRO_HOME` is the home, records what changed, and removes the home. When a
+  process cannot be proven gone, the home stays and the operator retries the delete; the sweep
+  removes it only once the terminal row is gone. Installed Kiro launches are unchanged.
+
+- **Kiro helpers: `effort: "auto"` is decided at launch** (#1167, #1083). A Kiro helper with
+  `effort: "auto"` now asks `effort.route`, as Claude Code and Codex do, and the decided level
+  reaches kiro-cli as `--effort` for that launch only. An unusable answer runs the stored effort,
+  and the decision record names the reason. kiro-cli checks the decided level against the model, as it
+  does a stored effort, and a launch it refuses is not retried on the stored effort, so keep
+  `min_effort` and `max_effort` to levels your Kiro models accept. Installed Kiro agents are unchanged.
+
 - **Ephemeral helpers can be matched to your models from task features** (#1199, off by default,
   provisional). A decider can size a helper but can't tell which of your models suits the task.
   With the new `task.features` switch on, CAO asks a decider that declares them four fixed yes/no
@@ -268,7 +294,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Ephemeral agents accept `provider: "auto"` (#1099, provisional). Create resolves it to the creator's provider, the fallback that the response, the registry row, the live profile and the archive keep. At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `provider.route` first, within the options CAO computes from the fallback's `ephemeral.provider_route` set, then ask the other `auto` fields for the provider it chose. On, a confident answer among the options runs the launch on that provider through its launch plan only: its own tier table maps the model and the plan carries the effort; nothing shared names it, and the decision record, the terminal, the archive's `bound` event and the launch record name the provider that ran. A pre-bind recheck refuses a decided provider the policy no longer allows with `policy_changed_since_create:<rule>`, including the new `provider_not_equivalent`, and collects the name; no other provider is ever tried, and a launch that fails before the bind for any other reason (the node cap, the delegation ceiling, the owner's own 400, a lapsed lease, a crash) leaves the name pending with its stored values. `claim_lease_seconds` counts one more wait. The claim response gains `provider_auto`, and for an `auto` claim the MCP helpers shape text the same way whichever CLI runs: the default `handoff` always adds the `[CAO Handoff]` banner, `assign` drops the sender suffix from an `@`-leading task, and the `handoff` success message names no provider. With today's providers nothing is routed, since no set validates.
 
-- Ephemeral settings accept `ephemeral.provider_route.equivalent` (#1099, provisional): disjoint sets of providers a decider may choose between for a `provider: "auto"` spec, empty by default. A set names two or more supported providers and never mixes an `advisory` provider with a `hard` or `sandboxed` one; any other block, including an unknown key inside it, refuses every create and claim with `policy_config_error:provider_route`. With today's providers no set validates. The create response's `enforcement` now comes from one label helper that the validation reads too.
+- Ephemeral settings accept `ephemeral.provider_route.equivalent` (#1099, provisional): disjoint sets of providers a decider may choose between for a `provider: "auto"` spec, empty by default. A set names two or more supported providers that `provider.route` can route to (not `kiro_cli` yet) and never mixes an `advisory` provider with a `hard` or `sandboxed` one; any other block, including an unknown key inside it, refuses every create and claim with `policy_config_error:provider_route`. With today's providers no set validates. The create response's `enforcement` now comes from one label helper that the validation reads too.
 
 - Decision points gain `provider.route`, "Which CLI should run this task?" (#1099). It is off by default. CAO computes its options for each launch and sends them as `DecisionRequest.options`, which is null on every other point's request; `CONTRACT_VERSION` is unchanged, but a decider that sends the whole request now sends one more `"options": null` key. An answer outside the options falls back as `invalid_answer`, and a launch with one option asks nothing and records the new reason `single_option`. The fallback source `creator` names the creator's provider. Records gain three nullable columns, `options`, `fallback_enforcement` and `applied_enforcement`, written only on `provider.route` records; the upgrade adds them without a backfill. The launch plan carries a decided provider that differs from the fallback. A decider that declares every point is asked `provider.route` once it is on.
 
@@ -276,7 +302,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Ephemeral agents accept an optional `ephemeral.min_effort` floor (#1083). An explicit effort below it refuses with `effort_below_policy`, and a stored effort or provider default below a floor raised since create refuses at claim with `policy_changed_since_create:effort_below_policy`.
 
-- Decision policy bounds take an optional effort floor (#1083, #810): an explicit effort below it is refused as `below_floor`, and a decider answer below it is capped up to it. The launch plan carries an on-mode `effort.route` answer, applied or capped. Providers declare `honors_effort`; only Claude Code (outside a native agent) and Codex do, and `effort.route` is recorded as `not_honored`, without asking, for any other provider.
+- Decision policy bounds take an optional effort floor (#1083, #810): an explicit effort below it is refused as `below_floor`, and a decider answer below it is capped up to it. The launch plan carries an on-mode `effort.route` answer, applied or capped. Providers declare `honors_effort`; only Claude Code (outside a native agent), Codex and Kiro helpers do, and `effort.route` is recorded as `not_honored`, without asking, for any other provider.
 
 - Ephemeral agents accept `model_tier: "auto"` (#1068). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `model.route` for that name only; explicit and omitted tiers never ask. Off and shadow launch on `ephemeral.default_tier`; on applies a confident answer capped into `[min_tier, max_tier]`, and falls back on any unusable answer. `auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier` (`auto_requires_bounds`) and a `claim_lease_seconds` of at least `decisions.on_timeout_ms / 1000 + 30`. The ephemeral archive records the decision record ids.
 
