@@ -14,8 +14,11 @@ if ! curl -sf http://localhost:9889/health > /dev/null 2>&1; then
     exit 0
 fi
 
-# Check AG-UI surface is enabled
-STREAM_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:9889/agui/v1/stream)
+# Check AG-UI surface is enabled. The stream never ends, so bound the request:
+# curl exits 28 on the timeout but still reports the status it received. No -f,
+# so a 404 is reported as a code instead of failing the script under set -e.
+STREAM_STATUS=$(curl -s --max-time 2 -o /dev/null -w "%{http_code}" \
+    http://localhost:9889/agui/v1/stream || true)
 if [ "$STREAM_STATUS" = "404" ]; then
     echo "WARN: AG-UI surface disabled (CAO_AGUI_ENABLED not set)"
     echo "  Fix: export CAO_AGUI_ENABLED=true and restart cao-server"
@@ -23,11 +26,12 @@ if [ "$STREAM_STATUS" = "404" ]; then
 fi
 
 # Test emit_ui with a valid component
-RESULT=$(curl -sf -X POST http://localhost:9889/agui/v1/emit_ui \
+RESULT=$(curl -s -X POST http://localhost:9889/agui/v1/emit_ui \
     -H 'Content-Type: application/json' \
-    -d '{"component":"metric","props":{"label":"validation","value":1,"unit":"ok"}}')
+    -d '{"component":"metric","props":{"label":"validation","value":1,"unit":"ok"}}' || true)
 
-if echo "$RESULT" | grep -q '"ok"'; then
+# Require ok:true; a bare '"ok"' match would also pass on {"ok": false}.
+if echo "$RESULT" | grep -Eq '"ok": *true'; then
     echo "PASS: emit_ui works (metric component)"
 else
     echo "FAIL: emit_ui returned unexpected result: $RESULT"
