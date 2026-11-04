@@ -1,0 +1,95 @@
+{
+  "skill_name": "cao-agent-plugin-creator",
+  "trigger_evals": [
+    {
+      "query": "I want to create a new Agent Plugin from scratch that ships two of my skills. What goes in plugin.json?",
+      "should_trigger": true
+    },
+    {
+      "query": "Scaffold a plugin.json manifest for a package called team-tools.",
+      "should_trigger": true
+    },
+    {
+      "query": "Which keys are required in an Agent Plugins 1.0.0 manifest, and which are optional?",
+      "should_trigger": true
+    },
+    {
+      "query": "Package these three skills as a portable Agent Plugin with a skills/ directory.",
+      "should_trigger": true
+    },
+    {
+      "query": "Why is my plugin.json rejected? I added an author.twitter field to the manifest.",
+      "should_trigger": true
+    },
+    {
+      "query": "Add an mcp.json with one stdio server to my new Agent Plugin package.",
+      "should_trigger": true
+    },
+    {
+      "query": "Is my Agent Plugin name my--tools valid against the manifest name pattern?",
+      "should_trigger": true
+    },
+    {
+      "query": "Write a CAO event plugin that posts to a webhook whenever cao-server creates a session.",
+      "should_trigger": false
+    },
+    {
+      "query": "Which lifecycle events can a CAO event plugin subscribe to, and how is it discovered?",
+      "should_trigger": false
+    },
+    {
+      "query": "Migrate my existing client-specific agent plugin to the portable Agent Plugins v1 structure without losing its hooks.",
+      "should_trigger": false
+    },
+    {
+      "query": "Audit the agent-plugin/cao package and report every skill whose description is over 1024 characters.",
+      "should_trigger": false
+    },
+    {
+      "query": "Add a new provider adapter so CAO can drive another CLI coding tool.",
+      "should_trigger": false
+    },
+    {
+      "query": "Launch a supervisor session and shut it down when it finishes.",
+      "should_trigger": false
+    }
+  ],
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Create a minimal Agent Plugin called notes-kit that ships one skill, summarize-notes. Show me the files and how to check it.",
+      "expected_output": "A package layout with plugin.json at the root and skills/summarize-notes/SKILL.md, a manifest containing only $schema and name, and a validation command with CAO_AGENT_PLUGINS_ENABLED set inline.",
+      "assertions": [
+        "plugin.json declares $schema as https://agent-plugins.org/schemas/1.0.0/plugin.schema.json and name as notes-kit",
+        "States that $schema and name are the only required manifest keys",
+        "Places the skill as an immediate child of skills/, with the folder name equal to the frontmatter name",
+        "Does not say README.md, CHANGELOG.md or LICENSE is required by the schema",
+        "The validation command sets CAO_AGENT_PLUGINS_ENABLED inline",
+        "Does not instruct running any script at a path that does not exist in this repository"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I ran cao plugin validate --json on my package and got exit 1 with nothing on stdout. Is my package broken?",
+      "expected_output": "An explanation that exit 1 with no JSON is not a conformance result and says nothing about the package, that the cause cannot be inferred from the missing JSON alone, and that the stderr text says what happened; if it is the release-gate refusal, re-run with CAO_AGENT_PLUGINS_ENABLED set inline.",
+      "assertions": [
+        "Does not conclude the package is broken from exit 1 with no JSON",
+        "Does not infer the cause from the missing JSON alone, and points the reader at the stderr text",
+        "Names an unset CAO_AGENT_PLUGINS_ENABLED as one possible cause, identified by its stderr refusal text",
+        "States that the value is stripped and lowercased and compared against 1, true and yes",
+        "States that an unset gate emits no JSON and no conformance result",
+        "Gives the discriminator as whether stdout parses as JSON, not the exit status"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "My manifest has a top-level hooks key and CAO still says loadable. Is that fine?",
+      "expected_output": "An explanation that the vendored schema is closed, that CAO tolerates an unrecognized top-level key as a WARNING and ignores it, and that client-specific data belongs under extensions.",
+      "assertions": [
+        "States that the schema sets additionalProperties to false",
+        "States that CAO reports the unrecognized top-level key as a WARNING and still loads the package",
+        "Advises moving client-specific data under extensions with a namespace the author controls"
+      ]
+    }
+  ]
+}
