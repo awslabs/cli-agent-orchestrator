@@ -19,9 +19,12 @@ IDLE is a valid completion signal alongside COMPLETED), NOT a second
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.agent_step import run_agent_step
 from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.utils import orchestration
 from cli_agent_orchestrator.utils.orchestration import HandoffContext
 
 _STEP = "cli_agent_orchestrator.services.agent_step"
@@ -208,3 +211,164 @@ class TestEngineHandoffEquivalence:
         # worker is identical across paths. Identical kinds alone could not catch
         # a divergent prompt/timeout — this does.
         assert engine.send_prompts() == handoff.send_prompts() == ["do the task"]
+
+
+# --- Issue #1203: the handoff result states whether the worker was torn down. ---
+
+
+def _run_step_response(status_code, body):
+    response = MagicMock()
+    response.status_code = status_code
+    response.json.return_value = body
+    return response
+
+
+_TEARDOWN_PAYLOAD = {"agent": "dev", "prompt": "x", "job_id": "j1"}
+
+
+class TestHandoffTeardownReporting:
+    """A success says whether the worker was torn down. A timeout or worker error
+    names the terminal and job, says it was not torn down, and tells the caller
+    nothing about deleting it or whether it still runs."""
+
+    @pytest.mark.parametrize("body", [{"torn_down": True}, {"torn_down": False}, {}])
+    def test_success_states_torn_down_only_when_the_server_said_so(self, body):
+        response = _run_step_response(200, {"terminal_id": "t1", "last_message": "ok", **body})
+        with (
+            patch.object(orchestration, "_get_cleanup_nudge", return_value=""),
+            patch.object(orchestration.requests, "post", return_value=response),
+        ):
+            res = asyncio.run(
+                orchestration._run_step_and_build_result(
+                    _TEARDOWN_PAYLOAD, "dev", "kiro_cli", 600, 0.0
+                )
+            )
+        assert res.success is True
+        if body.get("torn_down") is True:
+            assert "Worker terminal t1 was torn down." in res.message
+        else:
+            # Explicit False and a missing field (older server) both read as not torn down.
+            assert "Worker terminal t1 was not torn down." in res.message
+            assert "was torn down" not in res.message
+
+    def test_timeout_names_terminal_and_job_and_says_not_torn_down(self):
+        detail = {"message": "step did not complete", "kind": "timeout", "terminal_id": "t1"}
+        with patch.object(
+            orchestration.requests, "post", return_value=_run_step_response(504, {"detail": detail})
+        ):
+            res = asyncio.run(
+                orchestration._run_step_and_build_result(
+                    _TEARDOWN_PAYLOAD, "dev", "kiro_cli", 600, 0.0
+                )
+            )
+        assert res.success is False
+        assert res.terminal_id == "t1"
+        assert res.job_id == "j1"
+        assert res.pending is None
+        assert res.message == (
+            "Handoff timed out after 600 seconds (job j1). Worker terminal t1 was not torn down."
+        )
+
+    def test_worker_error_names_terminal_and_job_and_says_not_torn_down(self):
+        detail = {
+            "message": "terminal t1 reached ERROR status",
+            "kind": "error",
+            "terminal_id": "t1",
+        }
+        with patch.object(
+            orchestration.requests, "post", return_value=_run_step_response(502, {"detail": detail})
+        ):
+            res = asyncio.run(
+                orchestration._run_step_and_build_result(
+                    _TEARDOWN_PAYLOAD, "dev", "kiro_cli", 600, 0.0
+                )
+            )
+        assert res.success is False
+        assert res.terminal_id == "t1"
+        assert res.job_id == "j1"
+        assert res.pending is None
+        assert res.message == (
+            "Handoff failed: worker errored (terminal t1 reached ERROR status) (job j1). "
+            "Worker terminal t1 was not torn down."
+        )
+
+    @pytest.mark.parametrize(
+        "status_code,kind",
+        [(504, "timeout"), (502, "error")],
+    )
+    def test_failure_message_gives_no_delete_instruction_and_no_liveness_claim(
+        self, status_code, kind
+    ):
+        detail = {"message": "boom", "kind": kind, "terminal_id": "t1"}
+        with patch.object(
+            orchestration.requests,
+            "post",
+            return_value=_run_step_response(status_code, {"detail": detail}),
+        ):
+            res = asyncio.run(
+                orchestration._run_step_and_build_result(
+                    _TEARDOWN_PAYLOAD, "dev", "kiro_cli", 600, 0.0
+                )
+            )
+        assert "delete_terminal" not in res.message
+        assert "still running" not in res.message
+        assert "is running" not in res.message
+
+    @pytest.mark.parametrize("torn_down", [True, False])
+    def test_cleanup_nudge_is_shown_only_when_the_worker_was_not_torn_down(self, torn_down):
+        response = _run_step_response(
+            200, {"terminal_id": "t1", "last_message": "ok", "torn_down": torn_down}
+        )
+        with (
+            patch.object(orchestration, "_get_cleanup_nudge", return_value=" NOTE: nudge"),
+            patch.object(orchestration.requests, "post", return_value=response),
+        ):
+            res = asyncio.run(
+                orchestration._run_step_and_build_result(
+                    _TEARDOWN_PAYLOAD, "dev", "kiro_cli", 600, 0.0
+                )
+            )
+        assert ("NOTE: nudge" in res.message) is (not torn_down)
+
+
+class TestHandoffEarlyPathReportsRealDelete:
+    """The early-terminal-id path deletes the worker itself after success, so its
+    message must reflect that delete, not the server's "not torn down"."""
+
+    def _run(self, delete_result):
+        with (
+            patch.object(orchestration, "_get_cleanup_nudge", return_value=" NOTE: nudge"),
+            patch.object(orchestration, "_resolve_handoff_provider") as mock_provider,
+            patch.object(orchestration, "_create_terminal") as mock_create,
+            patch.object(orchestration, "synchronous_create_timeout", return_value=(5.0, 430.0)),
+            patch.object(
+                orchestration, "_delete_terminal_impl", return_value=delete_result
+            ) as mock_delete,
+            patch.object(orchestration.requests, "post") as mock_post,
+        ):
+            mock_provider.return_value = HandoffContext(
+                provider="kiro_cli", session_name=None, caller_id=None, allowed_tools=None
+            )
+            mock_create.return_value = ("dev-t1", "kiro_cli")
+            mock_post.return_value = _run_step_response(
+                200, {"terminal_id": "dev-t1", "last_message": "ok"}
+            )
+            res = asyncio.run(
+                orchestration._handoff_impl("developer", "Do task", on_terminal_id=lambda _: None)
+            )
+        mock_delete.assert_called_once()
+        return res
+
+    def test_successful_delete_reports_torn_down_and_no_nudge(self):
+        res = self._run({"success": True, "message": "deleted"})
+        assert res.success is True
+        assert "Worker terminal dev-t1 was torn down." in res.message
+        assert "not torn down" not in res.message
+        assert "NOTE: nudge" not in res.message
+
+    def test_failed_delete_reports_not_torn_down_and_keeps_nudge(self):
+        res = self._run({"success": False, "message": "boom"})
+        assert res.success is True
+        assert "Worker terminal dev-t1 was not torn down." in res.message
+        assert "was torn down" not in res.message
+        assert "NOTE: nudge" in res.message
