@@ -32,7 +32,7 @@ HELP = {
         (FIXTURES / f"kiro_cli_{version.replace('.', '_')}_root_help.txt").read_text(),
         (FIXTURES / f"kiro_cli_{version.replace('.', '_')}_chat_help.txt").read_text(),
     )
-    for version in ("2.35.1", "2.36.0", "2.37.0")
+    for version in ("2.35.1", "2.36.0", "2.37.0", "3.0.0")
 }
 V3_REQUEST = {"profile", "trust", "trust_workspace"}
 
@@ -55,7 +55,7 @@ def _runner(version="2.35.1", *, chat=None, root=None, version_text=None):
     return run
 
 
-@pytest.mark.parametrize("version", ["2.35.1", "2.36.0", "2.37.0"])
+@pytest.mark.parametrize("version", ["2.35.1", "2.36.0", "2.37.0", "3.0.0"])
 def test_supported_releases_pass_the_v3_probe(version):
     caps = probe_kiro_capabilities(
         KiroEngine.V3, V3_REQUEST | {"model", "effort"}, runner=_runner(version)
@@ -68,7 +68,8 @@ def test_supported_releases_pass_the_v3_probe(version):
 
 
 @pytest.mark.parametrize(
-    "version_text", ["kiro-cli 2.38.0\n", "kiro-cli 2.35.0\n", "kiro-cli 3.0.0\n"]
+    "version_text",
+    ["kiro-cli 2.38.0\n", "kiro-cli 2.35.0\n", "kiro-cli 3.0.1\n", "kiro-cli 2.37.1\n"],
 )
 def test_an_unknown_version_refuses_v3(version_text):
     with pytest.raises(KiroCapabilityError) as excinfo:
@@ -276,15 +277,20 @@ async def test_create_refuses_an_unsupported_version_before_allocation():
 
 
 @pytest.mark.asyncio
-async def test_a_pending_version_refuses_v3_before_allocation():
-    """2.36.0 is allow-listed but pending operator verification (#1167): not admitted."""
+@pytest.mark.parametrize("version", ["2.36.0", "3.0.0"])
+async def test_a_pending_version_refuses_v3_before_allocation(version):
+    """A version allow-listed but pending operator verification (#1167) is not admitted.
+
+    3.0.0 runs through the real probe on its own captured help, so that help passes
+    the probe and the refusal comes from the pending entry, not a missing flag.
+    """
     from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3UnverifiedVersionError
     from cli_agent_orchestrator.services import terminal_service
 
     _TS = "cli_agent_orchestrator.services.terminal_service"
 
     def probe(engine, requested):
-        return probe_kiro_capabilities(engine, requested, runner=_runner("2.36.0"))
+        return probe_kiro_capabilities(engine, requested, runner=_runner(version))
 
     with (
         patch(
@@ -294,7 +300,9 @@ async def test_a_pending_version_refuses_v3_before_allocation():
         patch(f"{_TS}.get_backend") as backend,
         patch(f"{_TS}.db_create_terminal") as db_create,
     ):
-        with pytest.raises(KiroV3UnverifiedVersionError, match="pending operator verification"):
+        with pytest.raises(
+            KiroV3UnverifiedVersionError, match="pending operator verification"
+        ) as excinfo:
             await terminal_service.create_terminal(
                 provider="kiro_cli",
                 agent_profile="r",
@@ -302,5 +310,6 @@ async def test_a_pending_version_refuses_v3_before_allocation():
                 engine="kas",
                 kiro_capability_probe=probe,
             )
+    assert excinfo.value.version == version
     backend.return_value.create_window.assert_not_called()
     db_create.assert_not_called()

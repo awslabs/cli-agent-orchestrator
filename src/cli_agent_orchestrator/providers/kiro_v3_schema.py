@@ -248,6 +248,27 @@ SUPPORTED_KIRO_CLI_VERSIONS: Mapping[str, KiroCliVersionEntry] = MappingProxyTyp
                 "so it cannot widen the render, tags or rules; pending operator verification"
             ),
         ),
+        # PENDING OPERATOR VERIFICATION. Derived statically, never run, as for
+        # 2.37.0. This release ships the same engine, @kiro/agent 0.66.70: the
+        # whole package, acp-server.js included, is byte-identical to 2.35.1's.
+        # Unlike 2.36.0 and 2.37.0, the engine tree is not identical file for
+        # file: of its 694 files, only the bundled copies of two helper
+        # libraries changed (semver 7.8.6, tslib 2.9.1), and acp-server.js loads
+        # neither directly. `chat --help` and the root --help are identical to
+        # 2.37.0's, and Kiro's legacy copies read the same in its TUI and its
+        # binary. It reuses KAS_0_66_70 unchanged, so it cannot widen anything:
+        # the render, the tags and the rules are 2.35.1's. It only lets the v3
+        # probe accept 3.0.0; a launch on it needs the operator opt-in (#1167).
+        "3.0.0": KiroCliVersionEntry(
+            cli_version="3.0.0",
+            schema=KAS_0_66_70,
+            pending_operator_verification=True,
+            basis=(
+                "static: engine package identical to 2.35.1's (only two bundled helper "
+                "libraries changed); reuses KAS_0_66_70 unchanged, so it cannot widen the "
+                "render, tags or rules; pending operator verification"
+            ),
+        ),
     }
 )
 

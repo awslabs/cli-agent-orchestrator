@@ -122,9 +122,15 @@ The launch command is:
 | 2.35.1 | `@kiro/agent` 0.66.70 | measured |
 | 2.36.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 | 2.37.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
+| 3.0.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 
 Any other version refuses v3; v2 is not affected. A new kiro-cli release needs a
 CAO update before v3 runs on it.
+
+Every pending version runs the same v3 engine as 2.35.1, so CAO checks it with the
+same rules. Each was added by reading its installed engine and help screens, without
+running a chat. What a pending version still lacks is a live run of the operator
+checklist.
 
 ### Pending versions (operator only)
 
