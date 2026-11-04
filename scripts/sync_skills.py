@@ -56,6 +56,8 @@ SHIPPED_SKILLS: List[str] = [
     "cao-plugin",
     "cao-provider",
     "cao-contributing",
+    "cao-agent-plugin-creator",
+    "cao-agent-plugin-audit",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
