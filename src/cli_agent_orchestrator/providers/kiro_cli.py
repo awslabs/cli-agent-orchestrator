@@ -183,11 +183,73 @@ TUI_PROCESSING_PATTERN = r"Kiro is working|Thinking\.\.\."
 #
 # kiro-cli 2.8.x also shows "Initializing · type to queue a message" during
 # boot (different from the "Initializing..." with three dots).
+#
+# ``(?<!\d)`` lets the server count start only where a run of digits starts.
+# Without it the search restarted inside every digit run and re-scanned the
+# rest of the run each time, so a long run of digits anywhere in the buffer
+# cost time quadratic in its length (CWE-1333). The matches are unchanged:
+# whenever a match exists inside a run, one exists from the run's first digit,
+# and the leftmost one wins.
 TUI_INITIALIZING_PATTERN = (
     r"Initializing\.\.\."
-    r"|\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"
+    r"|(?<!\d)\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"
     r"|Initializing\s*·\s*type to queue a message"
 )
+
+# Legacy permission prompt: "Allow this action? ... [y/n/t]:". The text between
+# the question and the bracketed choice varies by version ("Use 't' to trust
+# (always allow) this tool for the session."), so detection looks for the
+# question and then, in order, "[", "y", "/", "n", "/", "t" and "]:" anywhere
+# after it, across lines -- the subsequence the old regex
+# ``Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:`` (re.DOTALL) spelled
+# out with six lazy gaps. Run over the whole buffer on every status poll, that
+# regex tried every ordered combination of those characters whenever the
+# question was present without a closing "]:" after it: polynomial of degree
+# ~6 in the text that followed (CWE-1333). See _legacy_permission_prompt_spans.
+_PERMISSION_PROMPT_QUESTION = "Allow this action?"
+_PERMISSION_PROMPT_STEPS = ("[", "y", "/", "n", "/", "t")
+_PERMISSION_PROMPT_CLOSE = "]:"
+
+
+def _legacy_permission_prompt_spans(text: str) -> List[tuple[int, int]]:
+    """``(start, end)`` of every legacy permission prompt in ``text``, in order.
+
+    Returns the spans ``re.finditer`` returned for the old six-gap regex (see
+    ``_PERMISSION_PROMPT_QUESTION``), in one forward pass. Taking the EARLIEST
+    occurrence of each step finds exactly the regex's match, because an earlier
+    choice never leaves less text for the steps after it. When the steps fail
+    after one question they fail after every later question too (each later
+    search sees a suffix of the same text), so the scan can stop there instead
+    of retrying from each later question as the regex engine did.
+    """
+    spans: List[tuple[int, int]] = []
+    pos = 0
+    while True:
+        start = text.find(_PERMISSION_PROMPT_QUESTION, pos)
+        if start == -1:
+            return spans
+        cursor = start + len(_PERMISSION_PROMPT_QUESTION)
+        for step in _PERMISSION_PROMPT_STEPS:
+            cursor = text.find(step, cursor)
+            if cursor == -1:
+                return spans
+            cursor += len(step)
+        close = text.find(_PERMISSION_PROMPT_CLOSE, cursor)
+        if close == -1:
+            return spans
+        end = close + len(_PERMISSION_PROMPT_CLOSE)
+        spans.append((start, end))
+        pos = end
+
+
+def has_single_line_permission_prompt(text: str) -> bool:
+    """True when one line of ``text`` holds a whole legacy permission prompt.
+
+    The reading without re.DOTALL: the question and every step up to "]:" on
+    the same line, which is how the AG-UI approval classifier has always
+    matched it. Linear, like _legacy_permission_prompt_spans, per line.
+    """
+    return any(_legacy_permission_prompt_spans(line) for line in text.split("\n"))
 
 
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
@@ -237,21 +299,43 @@ IDENTITY_HEADER_READ_INTERVAL_S = 0.5
 # every option, its own footer) with no idle prompt after it, so a reply that
 # quotes one cannot flip the status. The footers are the dialogs' own: v3's
 # generic list chrome ("esc to close · …") alone is never enough.
+#
+# Every pattern here is applied to one line of agent-painted text at a time,
+# and only its verdict is read, so none may cost more than linear time in the
+# line (CWE-1333):
+#
+# * the approval title and the declined-trust line start their attempt at the
+#   line start and skip to the first place the old pattern
+#   (``\S.*\brequires approval\s*$``, ``Not trusted: .*Kiro exited ...``) could
+#   start: its first non-blank, its first "Not trusted: ". Unanchored, the
+#   search restarted at every later one and re-scanned the rest of the line
+#   from each. A match from a later start on the line is also reachable from
+#   the first, so text matches exactly when it did, and the match ends where
+#   it did (it now begins at its line's start). ``\Z`` stands for the old
+#   ``$``, which ``(?m)`` would let match before any newline: ``\s*`` takes a
+#   final newline, so ``\s*$`` only ever matched at the end of the string;
+# * the trust title and the footers (here and _V3_SELECTOR_FOOTER) use ``\A``,
+#   which is what ``^`` means without re.MULTILINE, so their matches are
+#   unchanged; unlike ``^`` it stays one start position if re.MULTILINE is
+#   ever added, where ``^\s*`` would re-scan a run of blank lines from each.
+#   The option rows keep ``^``: _options_follow applies them with ``.match``.
 V3_DIALOG_BOTTOM_LINES = 30
-_V3_APPROVAL_TITLE = re.compile(r"\S.*\brequires approval\s*$")
+_V3_APPROVAL_TITLE = re.compile(r"(?m)^[^\S\n]*+\S[^\n]*\brequires approval\s*\Z")
 _V3_APPROVAL_OPTIONS = (
     re.compile(r"^\s*(?:❯\s*)?Allow once\s*$"),
     re.compile(r"^\s*(?:❯\s*)?Deny once\s*$"),
     re.compile(r"^\s*(?:❯\s*)?Create deny rule\b"),
 )
-_V3_APPROVAL_FOOTER = re.compile(r"^\s*esc to close · ↑↓ to navigate · ↵ to select\b")
-_V3_TRUST_TITLE = re.compile(r"^\s*Trust this workspace\?\s*$")
+_V3_APPROVAL_FOOTER = re.compile(r"\A\s*esc to close · ↑↓ to navigate · ↵ to select\b")
+_V3_TRUST_TITLE = re.compile(r"\A\s*Trust this workspace\?\s*$")
 _V3_TRUST_OPTIONS = (
     re.compile(r"^\s*(?:❯\s*)?Trust, continue\s*$"),
     re.compile(r"^\s*(?:❯\s*)?Don't trust, exit\s*$"),
 )
-_V3_TRUST_FOOTER = re.compile(r"^\s*esc to exit · ↑↓ to navigate · ↵ to select\s*$")
-_V3_TRUST_DECLINED = re.compile(r"Not trusted: .*Kiro exited without loading this folder")
+_V3_TRUST_FOOTER = re.compile(r"\A\s*esc to exit · ↑↓ to navigate · ↵ to select\s*$")
+_V3_TRUST_DECLINED = re.compile(
+    r"(?m)^(?:(?!Not trusted: ).)*+Not trusted: .*Kiro exited without loading this folder"
+)
 # v2's "Switch to V3" offer, which also rewrites agent files if accepted. A
 # pinned launch should never show it; if one does, nobody answers it.
 _V3_UPSELL_TITLE = re.compile(r"Switch to V3 today\.")
@@ -316,7 +400,7 @@ def kiro_v3_dialog(output: str) -> Optional[str]:
 # Any v3 selector's own footer: the approval picker's and the trust dialog's
 # (``esc to close`` / ``esc to exit``, then ``↑↓ to navigate · ↵ to select``).
 # At startup no selector is expected and CAO answers none (#1167).
-_V3_SELECTOR_FOOTER = re.compile(r"^\s*esc to (?:close|exit) · ↑↓ to navigate · ↵ to select\b")
+_V3_SELECTOR_FOOTER = re.compile(r"\A\s*esc to (?:close|exit) · ↑↓ to navigate · ↵ to select\b")
 
 
 def kiro_v3_startup_selector(output: str) -> bool:
@@ -373,7 +457,6 @@ class KiroCliProvider(BaseProvider):
         window_name: Name of the tmux window for this terminal
         _agent_profile: Name of the Kiro agent profile to use
         _idle_prompt_pattern: Regex pattern for detecting IDLE state
-        _permission_prompt_pattern: Regex pattern for detecting permission prompts
     """
 
     @classmethod
@@ -457,10 +540,21 @@ class KiroCliProvider(BaseProvider):
         self._idle_prompt_pattern = (
             rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?(?:\u03bb\s*)?!?>\s*"
         )
-        self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
+        # The legacy "Allow this action? ... [y/n/t]:" prompt is found by
+        # _legacy_permission_prompt_spans (a linear scan, not a regex).
 
-        # New TUI header pattern: "agent_name · model · ◔ N%"
-        self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
+        # New TUI header pattern: "agent_name · model · ◔ N%", applied to one
+        # row at a time. The attempt starts at the row start and skips to the
+        # FIRST "agent_name ·" on it: unanchored, the search restarted at every
+        # occurrence of the name and re-scanned the rest of the row from each,
+        # and ``\s+.*`` could split the blanks after "·" every way (CWE-1333).
+        # A later header on the row is reachable from the first, so a row
+        # matches exactly when it did; ``\s++`` is equivalent because ``.*``
+        # takes back any blanks it gave up.
+        agent = re.escape(self._agent_profile)
+        self._new_tui_header_pattern = (
+            rf"(?m)^(?:(?!{agent}\s+·\s)[^\n])*+{agent}\s+·\s++.*·\s+◔\s*\d+%"
+        )
 
     @property
     def paste_enter_count(self) -> int:
@@ -1224,13 +1318,13 @@ class KiroCliProvider(BaseProvider):
         # Active prompt: 0-1 lines with idle prompt (CLI renders prompt on next line)
         # Stale prompt: 2+ lines with idle prompt (user answered, agent continued)
         # Line-based counting handles \r redraws (same line, no \n) correctly
-        perm_matches = list(re.finditer(self._permission_prompt_pattern, clean_output, re.DOTALL))
-        tui_perm_matches = list(re.finditer(TUI_PERMISSION_PATTERN, clean_output))
-        all_perm_matches = perm_matches + tui_perm_matches
+        perm_spans = _legacy_permission_prompt_spans(clean_output)
+        tui_perm_spans = [m.span() for m in re.finditer(TUI_PERMISSION_PATTERN, clean_output)]
+        all_perm_spans = perm_spans + tui_perm_spans
         # Sort by position so we use the last permission prompt regardless of type
-        all_perm_matches.sort(key=lambda m: m.start())
-        if all_perm_matches:
-            after_last_perm = clean_output[all_perm_matches[-1].end() :]
+        all_perm_spans.sort(key=lambda span: span[0])
+        if all_perm_spans:
+            after_last_perm = clean_output[all_perm_spans[-1][1] :]
             lines_after = after_last_perm.split("\n")
             idle_lines = sum(
                 1
