@@ -655,25 +655,192 @@ async def test_a_planned_effort_alone_is_probed_and_reaches_the_launch(kiro):
     assert kiro.factory.call_args.kwargs["kiro_launch"].effort == "high"
 
 
-@pytest.mark.asyncio
-async def test_an_auto_effort_helper_runs_its_stored_effort(kiro):
-    """effort.route is never asked for a Kiro helper yet: effort "auto" falls back to the
-    stored effort, and the launch plan the recheck builds carries it to --effort."""
-    from cli_agent_orchestrator.decisions.types import LaunchPlan
+# --- effort "auto": effort.route decides a helper's effort ------------------------
+
+
+class EffortDecider:
+    """Answers effort.route from a script; ``failure`` makes each ask fail that way."""
+
+    name = "kiro_effort_test"
+    version = "1"
+    points = frozenset({"effort.route"})
+
+    def __init__(self):
+        self.answer, self.confidence, self.failure = "high", 0.91, None
+        self.requests: list = []
+
+    async def decide(self, request, config):
+        from cli_agent_orchestrator.decisions.types import DecisionAnswer
+
+        self.requests.append(request)
+        if self.failure == "error":
+            raise ValueError("synthetic decider failure")
+        if self.failure == "timeout":
+            await asyncio.sleep(1)
+        return {
+            point: DecisionAnswer(self.answer, {self.answer: self.confidence})
+            for point in request.points
+        }
+
+
+@pytest.fixture
+def decided(kiro, tmp_path, monkeypatch):
+    """A Kiro helper declaring effort "auto", and the server's own decision path for it:
+    decision_inputs, the engine with each provider's own honors_effort, the pre-bind
+    recheck (``main._prepare_delegation``), then the launch with the plan it returns."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from cli_agent_orchestrator.api import main
+    from cli_agent_orchestrator.decisions.engine import DecisionEngine, DelegationRequest
+    from cli_agent_orchestrator.decisions.registry import DeciderRegistry
+    from cli_agent_orchestrator.decisions.settings import DecisionSettings, PointSettings
+    from cli_agent_orchestrator.decisions.shadow import ShadowRunner
+    from cli_agent_orchestrator.decisions.store import DecisionStore
+    from cli_agent_orchestrator.decisions.types import PointState
 
     kiro.env[4]["ephemeral"].update(min_effort="low", default_effort="medium", max_effort="high")
     spec = {**SPEC, "purpose": "auto_effort_triage", "provider": "kiro_cli", "effort": "auto"}
     created = create(kiro.env, spec)
-    assert created["effort"] == "medium"
-    assert created["notes"][-1] == (
+    kiro.name = created["name"]
+    db = create_engine(
+        "sqlite:///" + str(tmp_path / "decisions.db"),
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    database.DecisionRecordModel.__table__.create(db)
+    store = DecisionStore(
+        sessionmaker(bind=db), tmp_path / "decision-hash.key", emit=lambda _: None
+    )
+    decider = EffortDecider()
+    timeout = {"ms": 1000}
+    engine = DecisionEngine(
+        DeciderRegistry({decider.name: lambda: decider}),
+        store,
+        ShadowRunner(store),
+        settings_loader=lambda: DecisionSettings(
+            points={"effort.route": PointSettings(PointState.ON, decider.name)},
+            on_timeout_ms=timeout["ms"],
+        ),
+    )
+    monkeypatch.setattr(main.app.state, "decision_engine", engine, raising=False)
+
+    async def run(**kwargs):
+        claimed = claim(kiro.env, kiro.name)["claim_id"]
+        request = DelegationRequest("handoff", "kiro_cli", kiro.name, None, "inspect")
+        plan = await main._prepare_delegation(request, claimed, CALLER)
+        await launch(kiro, claim_id=claimed, launch_plan=plan, **kwargs)
+        return plan
+
+    yield SimpleEnv(created=created, decider=decider, store=store, timeout=timeout, run=run)
+    db.dispose()
+
+
+def effort_record(decided):
+    (record,) = decided.store.list()
+    assert record["point"] == "effort.route" and record["provider"] == "kiro_cli"
+    assert record["target_kind"] == "ephemeral" and record["fallback_value"] == "medium"
+    return record
+
+
+def launched_argv(kiro):
+    """The helper's v3 command, built by its provider from the launch object it got."""
+    from cli_agent_orchestrator.providers.kiro_capabilities import build_kiro_command
+    from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+
+    launch_object = kiro.factory.call_args.kwargs["kiro_launch"]
+    provider = KiroCliProvider(
+        CHILD, "cao-session", "child", kiro.name, engine=KiroEngine.V3, launch=launch_object
+    )
+    return build_kiro_command(
+        KiroEngine.V3,
+        kiro.name,
+        model=provider._get_profile_model(),
+        yolo=True,
+        effort=provider._get_profile_effort(),
+        **provider._launch_command_options(),
+    )
+
+
+def launched_effort(kiro):
+    argv = launched_argv(kiro)
+    assert argv.count("--effort") == 1
+    return argv[argv.index("--effort") + 1]
+
+
+@pytest.mark.asyncio
+async def test_an_auto_effort_helper_runs_the_effort_effort_route_decides(kiro, decided):
+    """A Kiro helper's effort "auto" asks effort.route at launch, and the decided level
+    reaches kiro-cli as --effort through the launch plan, ahead of the stored effort."""
+    assert decided.created["effort"] == "medium"
+    assert decided.created["notes"][-1] == (
         "effort: auto (decided at launch; fallback effort medium, ephemeral.default_effort)"
     )
-    kiro.name = created["name"]
-    claimed = claim(kiro.env, kiro.name)["claim_id"]
-    decided = kiro.service.recheck_decided(kiro.name, claimed, CALLER, None, None, None)
-    assert decided.effort == "medium"
-    await launch(kiro, claim_id=claimed, launch_plan=LaunchPlan(effort=decided.effort))
+    plan = await decided.run()
+    assert [request.points for request in decided.decider.requests] == [("effort.route",)]
+    assert decided.decider.requests[0].facts.provider == "kiro_cli"
+    assert plan.effort == "high"
+    assert "effort" in kiro.probe.call_args.args[1]
+    assert kiro.factory.call_args.kwargs["kiro_launch"].effort == "high"
+    assert launched_effort(kiro) == "high"
+    record = effort_record(decided)
+    assert record["outcome"] == "applied" and record["reason"] is None
+    assert record["answer"] == record["applied_value"] == "high"
+    assert record["launch_status"] == "launched" and record["agent_profile"] == kiro.name
+    # The decided effort applies to this launch only: the row keeps the stored effort.
+    assert database.get_ephemeral_agent(kiro.name)["effort"] == "medium"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer,confidence,failure,reason",
+    [
+        ("unsure", 0.91, None, "unsure"),
+        ("high", 0.2, None, "low_confidence"),
+        ("high", 0.91, "timeout", "timeout"),
+        ("high", 0.91, "error", "error"),
+    ],
+)
+async def test_a_failed_effort_decision_runs_the_stored_effort_and_says_why(
+    kiro, decided, answer, confidence, failure, reason
+):
+    decided.decider.answer, decided.decider.confidence = answer, confidence
+    decided.decider.failure = failure
+    decided.timeout["ms"] = 50
+    plan = await decided.run()
+    assert len(decided.decider.requests) == 1
+    assert plan.effort == "medium"
     assert kiro.factory.call_args.kwargs["kiro_launch"].effort == "medium"
+    assert launched_effort(kiro) == "medium"
+    record = effort_record(decided)
+    assert record["outcome"] == "fallback" and record["reason"] == reason
+    assert record["applied_value"] is None and record["launch_status"] == "launched"
+
+
+@pytest.mark.asyncio
+async def test_a_decided_level_kiro_cli_rejects_fails_the_launch_without_a_retry(kiro, decided):
+    """kiro-cli checks the level against the model. If it rejects the decided level, the
+    start fails like any other: the launch is not retried on the stored effort."""
+    kiro.provider.initialize.side_effect = TimeoutError("Kiro CLI initialization timed out")
+    with pytest.raises(TimeoutError):
+        await decided.run()
+    assert kiro.factory.call_count == 1
+    assert kiro.factory.call_args.kwargs["kiro_launch"].effort == "high"
+    row = database.get_ephemeral_agent(kiro.name)
+    assert row["state"] == "gc" and row["gc_reason"] == "launch_failed"
+    assert not os.path.lexists(home())
+    record = effort_record(decided)
+    assert record["outcome"] == "applied" and record["launch_status"] == "launch_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["v2", KiroEngine.V2])
+async def test_v2_still_refuses_a_helper_with_a_decided_effort_before_bind(kiro, decided, engine):
+    with pytest.raises(kiro.service.EphemeralPolicyError) as err:
+        await decided.run(engine=engine)
+    assert err.value.rule == "kiro_ephemeral_engine:v2"
+    assert_refused_before_the_probe(kiro)
+    # Bound as every create that raises is, so no record of the decision stays open.
+    assert effort_record(decided)["launch_status"] == "launch_failed"
 
 
 @pytest.mark.asyncio

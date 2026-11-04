@@ -221,10 +221,10 @@ upgrade adds the column and does not backfill it. A policy model
 fallback records the tier as `fallback_value`; the mapped model appears in
 `launched_model` only when bound. An on-mode effort answer, applied or capped, is
 carried in the launch plan; only an ephemeral `effort: "auto"` launch applies it, through
-its live profile. Like every record of a launch, an effort record also gets the launch's
+that plan. Like every record of a launch, an effort record also gets the launch's
 `launched_model` and `model_honored` at bind. A provider that
 declares no effort support records `effort.route` as `not_honored` without asking; only
-Claude Code (outside a native agent) and Codex declare it. A launch is recorded as launched when the
+Claude Code (outside a native agent), Codex and Kiro helpers declare it. A launch is recorded as launched when the
 provider has been built and its start has completed or been scheduled. A
 deferred startup failure updates the record to `launch_failed` without emitting
 a second decision span. A cancelled deferred start also moves a previously
