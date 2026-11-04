@@ -215,17 +215,16 @@ With both fields `auto`, the server asks `model.route` and then `effort.route`, 
 request with the same request id and facts, so an on-mode launch can wait up to twice
 `decisions.on_timeout_ms`. Neither request sees the other's answer, and one point's failure
 doesn't affect the other. A provider that can't apply an effort is never asked: the record
-says `not_honored`. Claude Code (outside a native agent) and Codex apply it. A Kiro helper
-doesn't yet: with `effort: "auto"` its record says `not_honored` and it runs the stored effort,
-as `kiroConfig.effort` and `--effort`.
+says `not_honored`. Claude Code (outside a native agent), Codex and Kiro helpers apply it.
 
 The decided effort applies to that launch only, through its launch plan, the same way as the
-decided model: CAO passes it to the provider at launch, as Claude Code's `--effort` or Codex's
-`-c model_reasoning_effort`, in place of the stored effort. Nothing writes it to disk. The live
-profile, the registry row and the archive keep the stored effort, so a launch that fails before
-the bind, a lapsed claim or a server restart leaves nothing behind: a later launch without a
-claim identifier runs the stored effort, and a later claimed launch decides again. The decision
-record names the applied effort, and the answer applies even when that record can't be written.
+decided model: CAO passes it to the provider at launch, as Claude Code's `--effort`, Codex's
+`-c model_reasoning_effort` or a Kiro helper's `--effort`, in place of the stored effort.
+Nothing writes it to disk. The live profile, the registry row and the archive keep the stored
+effort, so a launch that fails before the bind, a lapsed claim or a server restart leaves
+nothing behind: a later launch without a claim identifier runs the stored effort, and a later
+claimed launch decides again. The decision record names the applied effort, and the answer
+applies even when that record can't be written.
 
 The pre-bind recheck runs for every claimed `auto` launch, even when the engine returned no
 launch plan. A stored or decided effort now outside `[min_effort, max_effort]` gives
@@ -464,9 +463,12 @@ v3 (see [Kiro v3](kiro-cli.md#kiro-v3-preview)). Each launch gets its own CAO-ow
   itself, or under a home folder that is a git repository, where Kiro would load your own
   `~/.kiro` as workspace configuration.
 - The model tier becomes `--model`. Effort is written as `kiroConfig.effort` and becomes
-  `--effort`; the probe refuses a wrapper that does not declare `--effort`. A Kiro helper is
-  never a `provider.route` target yet, and `effort: "auto"` runs the stored effort (see
-  [Effort `auto`](#effort-auto)).
+  `--effort`; the probe refuses a wrapper that does not declare `--effort`. With
+  `effort: "auto"`, `effort.route` decides the level at launch, and the decided level becomes
+  `--effort` in place of the stored one (see [Effort `auto`](#effort-auto)). kiro-cli checks
+  the level against the model, as it does a stored effort, so keep `min_effort` and
+  `max_effort` to levels your Kiro models accept: a launch kiro-cli refuses is not retried on
+  the stored effort. A Kiro helper is never a `provider.route` target yet.
 
 Before any task is typed, CAO checks that the header names the agent, that the home and
 your `~/.kiro` markers are unchanged, and that `/tools` and `/mcp list` show only what

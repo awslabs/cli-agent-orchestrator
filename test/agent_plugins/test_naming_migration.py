@@ -108,6 +108,10 @@ _UNSCOPED_DOCS = [
     # PR #1000 (#827): "What an approval does not cover" names agent-plugin MCP
     # delivery as a launch input outside plan_id. CAO's own noun, qualified.
     "workflows.md",
+    # PR #652: the weekly release does not count the bot's
+    # `chore(agent-plugin): repin packages to vX.Y.Z` commit, and the doc quotes that
+    # subject so an operator can recognise it. CAO's own noun, inside a code span.
+    "RELEASING.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare

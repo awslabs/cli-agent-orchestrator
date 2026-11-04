@@ -37,10 +37,15 @@ from cli_agent_orchestrator.providers.claude_code import (
 from cli_agent_orchestrator.providers.codex import TRUST_PROMPT_PATTERN as CODEX_TRUST_PATTERN
 from cli_agent_orchestrator.providers.codex import WAITING_PROMPT_PATTERN as CODEX_WAITING_PATTERN
 from cli_agent_orchestrator.providers.kiro_cli import TUI_PERMISSION_PATTERN as KIRO_TUI_PATTERN
+from cli_agent_orchestrator.providers.kiro_cli import (
+    has_single_line_permission_prompt as kiro_has_legacy_permission_prompt,
+)
 
-# Legacy kiro permission pattern (instantiated on the provider instance normally,
-# but we duplicate the static regex here for the classifier).
-KIRO_LEGACY_PERMISSION_PATTERN = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
+# The legacy Kiro permission prompt ("Allow this action? ... [y/n/t]:") is found
+# with the provider's own linear scan. This classifier used to keep a copy of
+# the provider's six-gap regex, which backtracked polynomially (CWE-1333). The
+# copy ran without re.DOTALL, so the whole prompt had to sit on one line; the
+# scan is applied the same way.
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +112,7 @@ def _classify_local(provider: str, raw_prompt: str) -> str:
         if re.search(KIRO_TUI_PATTERN, raw_prompt):
             return "permission_request"
         # Legacy permission pattern
-        if re.search(KIRO_LEGACY_PERMISSION_PATTERN, raw_prompt):
+        if kiro_has_legacy_permission_prompt(raw_prompt):
             return "permission_request"
         # Trust-related wording (generic, checked last)
         if re.search(r"trust", raw_prompt, re.IGNORECASE):

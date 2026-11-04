@@ -1,0 +1,65 @@
+name: Install Trivy
+description: >
+  Installs the Trivy binary straight from its GitHub release tarball, verified
+  against a pinned SHA-256. get.trivy.dev (used by aquasecurity/setup-trivy's
+  contrib/install.sh) has been returning NXDOMAIN since 2026-11-03 ~21:45Z;
+  see aquasecurity/setup-trivy#42. TRIVY_VERSION and TRIVY_SHA256 below are
+  the one place every CI job pins the Trivy version. A version bump must
+  change three things together: (1) TRIVY_VERSION and (2) TRIVY_SHA256 below
+  -- get the new SHA-256 from that release's own
+  trivy_<version>_checksums.txt, cross-checked against the GitHub API's
+  asset `digest` field (gh api repos/aquasecurity/trivy/releases/tags/v<version>)
+  -- and (3) the "Run the same full dependency gate as CI with Trivy
+  <version>" line in SECURITY.md, plus the two versioned
+  https://github.com/aquasecurity/trivy/blob/v<version>/... coverage links
+  in SECURITY.md's "Full dependency gate" section.
+
+runs:
+  using: composite
+  steps:
+    - name: Download, verify and install Trivy
+      shell: bash
+      env:
+        TRIVY_VERSION: "0.70.0"
+        # SHA-256 of trivy_0.70.0_Linux-64bit.tar.gz, pinned in the repo rather
+        # than fetched at run time. Source: the release's own
+        # trivy_0.70.0_checksums.txt, cross-checked on 2026-11-04 against the
+        # GitHub API's asset `digest` field
+        # (gh api repos/aquasecurity/trivy/releases/tags/v0.70.0) -- both
+        # agreed. A version bump must replace TRIVY_VERSION above AND this
+        # value together; see the bump checklist in the description above.
+        TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
+      run: |
+        set -euo pipefail
+
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)
+            ASSET="Linux-64bit"
+            ;;
+          *)
+            echo "::error::install-trivy: no pinned SHA-256 for runner ${RUNNER_OS}-${RUNNER_ARCH}. Add one for its release asset before using this action there."
+            exit 1
+            ;;
+        esac
+
+        TARBALL="trivy_${TRIVY_VERSION}_${ASSET}.tar.gz"
+        URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${TARBALL}"
+        WORKDIR="${RUNNER_TEMP}/install-trivy"
+        mkdir -p "${WORKDIR}"
+        cd "${WORKDIR}"
+
+        echo "Downloading ${URL}"
+        curl --fail --location --proto '=https' --tlsv1.2 --retry 3 -o "${TARBALL}" "${URL}"
+
+        ACTUAL_SHA256="$(sha256sum "${TARBALL}" | awk '{print $1}')"
+        if [ "${ACTUAL_SHA256}" != "${TRIVY_SHA256}" ]; then
+          echo "::error::install-trivy: SHA-256 mismatch for ${TARBALL} (expected ${TRIVY_SHA256}, got ${ACTUAL_SHA256}). Refusing to install."
+          exit 1
+        fi
+
+        tar -xzf "${TARBALL}" trivy
+        chmod +x trivy
+        sudo install -m 0755 trivy /usr/local/bin/trivy
+
+        cd "${RUNNER_TEMP}"
+        rm -rf "${WORKDIR}"

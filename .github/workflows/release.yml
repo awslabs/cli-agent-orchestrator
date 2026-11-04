@@ -11,12 +11,81 @@ on:
           - patch
           - minor
           - major
+  schedule:
+    # Weekly release, Monday 09:17 UTC (UTC only; cron does not follow DST).
+    # The bump is derived from Conventional Commits: feat -> minor, else patch.
+    # Scheduled runs fail closed if CI for the exact release SHA is missing or
+    # incomplete, if the prior release did not reach both GitHub Releases and
+    # PyPI, or if the commits call for a MAJOR: a major is never cut
+    # unattended, so the run goes red and a maintainer dispatches bump=major.
+    # A run stops at a tagged GitHub Release: a maintainer then dispatches
+    # Publish to PyPI and a second maintainer approves the upload. Until that
+    # publish, and after any post-tag failure, the next schedule refuses; it
+    # never skips over an unfinished version.
+    - cron: '17 9 * * 1'
 
 permissions:
   contents: read
 
+env:
+  # As in every workflow that runs uv: nothing may silently rewrite uv.lock. The bump is
+  # the one step MEANT to change it, so scripts/bump_version.py lifts the flag for its
+  # single `uv lock`, refuses any change beyond the project's own version line, and
+  # re-checks the result with `uv lock --locked`.
+  UV_LOCKED: "1"
+
+# Never cancel an in-flight release; queue manual and scheduled releases.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  preflight:
+    if: github.repository == 'awslabs/cli-agent-orchestrator'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      bump: ${{ steps.policy.outputs.bump }}
+      count: ${{ steps.policy.outputs.count }}
+      last_tag: ${{ steps.policy.outputs.last_tag }}
+      should_release: ${{ steps.policy.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      # The whole policy lives in scripts/release_preflight.py, where
+      # test/scripts/test_release_preflight.py can exercise every decision. It only
+      # reads: git history, the GitHub Release and CI state (gh), and PyPI. Inputs come
+      # from the environment, never `${{ }}` inside `run:`.
+      #
+      # Both events are gated: a manual dispatch must also be on main with ci.yml green
+      # at the exact SHA (main has no required status checks of its own). On a schedule
+      # the script derives the bump; on a dispatch it validates the one chosen.
+      - name: Evaluate release policy
+        id: policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_BUMP: ${{ inputs.bump }}
+        run: >-
+          python scripts/release_preflight.py
+          --event "$GITHUB_EVENT_NAME"
+          --ref "$GITHUB_REF"
+          --sha "$GITHUB_SHA"
+          --repo "$GITHUB_REPOSITORY"
+          --requested-bump "$REQUESTED_BUMP"
+
   release:
+    needs: preflight
+    if: >-
+      github.repository == 'awslabs/cli-agent-orchestrator' &&
+      needs.preflight.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -27,7 +96,7 @@ jobs:
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: git-cliff
 
@@ -36,26 +105,68 @@ jobs:
         with:
           python-version: '3.12'
 
+      # The same uv CI uses, so the lock it re-writes is the one CI already accepts.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      # Bumps pyproject.toml, uv.lock and the devcontainer feature together, then the
+      # changelog. publish-to-pypi.yml refuses a tag unless all three agree; release.yml
+      # used to skip uv.lock, which is why 2.5.3 and 2.5.4 were bumped by hand (#899, #946).
       - name: Bump version and generate changelog
         id: bump
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Validated by the preflight for both events: one of patch, minor, major.
+          BUMP: ${{ needs.preflight.outputs.bump }}
         run: |
-          python scripts/bump_version.py ${{ inputs.bump }}
+          python scripts/bump_version.py "$BUMP"
           VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Commit and tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml CHANGELOG.md .devcontainer/features/cao/devcontainer-feature.json
-          git commit -m "chore: release v${{ steps.bump.outputs.version }}"
-          git tag "v${{ steps.bump.outputs.version }}"
-          git push && git push --tags
+      # The check publish-to-pypi.yml's verify-release-version runs on the tag, run here
+      # BEFORE anything is committed, tagged or pushed: a tree that job would refuse must
+      # never become a tag and a GitHub Release. It also refuses a version either index
+      # already serves.
+      - name: Refuse a version the publish workflow would refuse
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: >-
+          python scripts/assert_release_version.py --tag "v$VERSION"
+          --index https://test.pypi.org --index https://pypi.org
+
+      # One atomic push of the release commit to main AND its tag (review on #652, N2):
+      # `git push && git push --tags` could land the bump untagged, and the next schedule
+      # would then bump past the version that never got its tag. The script also refuses
+      # a commit carrying anything but the version files.
+      - name: Commit, tag and push atomically
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: python scripts/release_commit.py --version "$VERSION"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: v${{ steps.bump.outputs.version }}
           generate_release_notes: true
+
+      # Both events stop here, at a tagged GitHub Release. A Release created with GITHUB_TOKEN
+      # does not emit `on: release`, and nothing in this workflow starts publish-to-pypi.yml:
+      # a maintainer dispatches it, and is then that run's actor, so the `pypi` environment's
+      # prevent_self_review makes a SECOND maintainer approve the PyPI upload. That is what
+      # the environment enforces on any publish a person starts, and the user chose to keep
+      # it for the schedule too (2026-11-02, review of #652 P2-2). Until then, the next schedule
+      # refuses at its previous-release check. test_publish_chain.py asserts no job here can
+      # dispatch a workflow.
+      - name: Say how this release reaches PyPI
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          {
+            echo "## v$VERSION is tagged and has a GitHub Release"
+            echo
+            echo "To publish it: Actions -> Publish to PyPI -> Run workflow, use workflow from"
+            echo "tag \`v$VERSION\`, environment \`release\` (TestPyPI, smoke test, then the"
+            echo "maintainer-approved PyPI upload). Another maintainer approves the PyPI step."
+            echo
+            echo "Until it is on PyPI, the next scheduled release refuses."
+          } >> "$GITHUB_STEP_SUMMARY"

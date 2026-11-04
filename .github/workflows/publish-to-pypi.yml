@@ -5,13 +5,21 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
+      # `testpypi` and `pypi` publish to that one index (the manual paths below).
+      # `release` runs the SAME chain a `release` event runs, from a v* tag:
+      # verify -> build -> TestPyPI -> smoke test -> maintainer-approved PyPI. It exists
+      # because a GitHub Release created by release.yml under GITHUB_TOKEN never emits
+      # `on: release`. A maintainer dispatches it on the tag release.yml pushed (release.yml
+      # itself never dispatches anything), so prevent_self_review on the `pypi` environment
+      # makes a second maintainer approve the upload.
       environment:
-        description: 'Target environment (manual dispatch only)'
+        description: 'testpypi or pypi alone, or release: the full chain from a v* tag'
         required: true
         type: choice
         options:
           - testpypi
           - pypi
+          - release
 
 permissions:
   contents: read
@@ -36,9 +44,10 @@ jobs:
   # TestPyPI upload with `400 File already exists`. In every case the tag had been placed on
   # a commit whose pyproject.toml still carried the PREVIOUS version, so the matrix built
   # artifacts that were already published and twine named the artifact, not the tag.
-  # `release.yml` (bump, commit, tag) cannot push to `main` under the branch rulesets, so
-  # releases are cut by hand as a `chore: release vX.Y.Z` PR plus a GitHub Release; this job
-  # is what catches the second step happening without the first.
+  # `release.yml` never bumped uv.lock, so no tag it cut could pass this check, and releases
+  # were cut by hand as a `chore: release vX.Y.Z` PR plus a GitHub Release; this job is what
+  # catches the second step happening without the first. (release.yml now bumps uv.lock and
+  # runs this same check before it tags, #652.)
   #
   # `GITHUB_REF_NAME` is read from the ENVIRONMENT, not interpolated with `${{ }}` into the
   # script, so the ref can never be executed as shell (zizmor template-injection). On a
@@ -62,21 +71,32 @@ jobs:
       # indexes diverge in both directions (2.1.0 and 2.2.0 exist only on TestPyPI, 2.4.1 only
       # on PyPI), so the question is asked of BOTH: a version on either one is a guaranteed
       # `400 File already exists` ~80 minutes from now. (Review on PR #947.)
+      #
+      # A `release` dispatch runs the release-event chain, so it gets the release-event check,
+      # and it must be dispatched from a TAG. The `pypi` environment's deployment policy admits
+      # the `main` branch and `v*` tags (read 2026-11-02), and a branch can be NAMED like a
+      # version, so this GITHUB_REF_TYPE check is the workflow's own guard, not the policy's.
       - name: Refuse a release tag whose version the tree does not carry, or that an index already has
-        if: github.event_name == 'release'
-        run: >-
-          python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME"
-          --index https://test.pypi.org --index https://pypi.org
+        if: github.event_name == 'release' || inputs.environment == 'release'
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::error::the release chain runs from a v* tag, not the $GITHUB_REF_TYPE $GITHUB_REF_NAME"
+            exit 1
+          fi
+          python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME" \
+            --index https://test.pypi.org --index https://pypi.org
 
       # A manual dispatch uploads to exactly one index, chosen by `inputs.environment`, so
       # only THAT index is asked: a testpypi dispatch must not be refused on pypi.org state,
       # and a pypi dispatch must not be passed on test.pypi.org state. The index is selected
       # in `env:` and read from the environment; nothing from the event reaches `run:`.
       #
-      # The `pypi` environment is restricted to `v*` tags, so the PyPI escape hatch always
-      # runs on a tag ref; when it does, the tag gets the same comparison a release does.
+      # The `pypi` environment's deployment policy admits the `main` branch and `v*` tags
+      # (read 2026-11-02), so the PyPI escape hatch can run on either. From a tag, the tag
+      # gets the same comparison a release does; from `main`, only the tree and the target
+      # index are checked.
       - name: Manual dispatch; check the tree agrees with itself and the target index lacks the version
-        if: github.event_name != 'release'
+        if: github.event_name != 'release' && inputs.environment != 'release'
         env:
           TARGET_INDEX: ${{ inputs.environment == 'testpypi' && 'https://test.pypi.org' || 'https://pypi.org' }}
         run: |
@@ -316,7 +336,10 @@ jobs:
 
   publish-testpypi:
     name: Publish to TestPyPI
-    if: github.event_name == 'release' || github.event.inputs.environment == 'testpypi'
+    if: >-
+      github.event_name == 'release' ||
+      github.event.inputs.environment == 'testpypi' ||
+      github.event.inputs.environment == 'release'
     needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -356,9 +379,10 @@ jobs:
 
   smoke-test:
     name: Smoke test from TestPyPI (${{ matrix.label }})
-    # Only runs on Release-triggered publishes. Manual workflow_dispatch
-    # skips the smoke-test because we have no tagged version to pin against.
-    if: github.event_name == 'release'
+    # Runs on the release chain: a `release` event, or a `release` dispatch from a v* tag
+    # (verify-release-version refuses any other ref). The testpypi and pypi dispatches skip
+    # it because they are not guaranteed a tagged version to pin against.
+    if: github.event_name == 'release' || github.event.inputs.environment == 'release'
     needs: publish-testpypi
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -447,6 +471,7 @@ jobs:
       needs.build-sdist.result == 'success' &&
       (
         (github.event_name == 'release' && needs.smoke-test.result == 'success') ||
+        (github.event.inputs.environment == 'release' && needs.smoke-test.result == 'success') ||
         (github.event.inputs.environment == 'pypi' && needs.smoke-test.result == 'skipped')
       )
     runs-on: ubuntu-latest
