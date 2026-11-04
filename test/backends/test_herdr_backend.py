@@ -86,6 +86,12 @@ class TestHerdrBackendCommands:
     """Verify correct herdr CLI command construction for each method."""
 
     @patch("subprocess.run")
+    def test_restore_session_env_runs_no_herdr_command(self, mock_run, backend):
+        """``--env`` is pane-scoped on herdr (#1074): there is no workspace env to edit."""
+        backend.restore_session_env("cao-test", "KIRO_HOME", "/h")
+        mock_run.assert_not_called()
+
+    @patch("subprocess.run")
     def test_session_exists_true(self, mock_run, backend):
         """session_exists returns True when workspace label matches."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]

@@ -38,7 +38,7 @@ def narrow(monkeypatch, provider, atoms):
 
 
 def refuse(monkeypatch, provider):
-    monkeypatch.setitem(caps.CAPABILITIES, provider, caps.capability_for("kiro_cli"))
+    monkeypatch.setitem(caps.CAPABILITIES, provider, caps._REFUSED)
 
 
 def refusal(env, spec):
@@ -47,12 +47,13 @@ def refusal(env, spec):
     return err.value
 
 
-# Rule 8 before this change, as the reference for unchanged behaviour.
+# Rule 8's accepted set: the table's supporting rows, kiro_cli included since
+# its v3 helper launch landed (#1167 Phase 2).
 def _old_rule_8(providers):
     return (
         isinstance(providers, list)
         and bool(providers)
-        and all(p in ("claude_code", "codex") for p in providers)
+        and all(p in ("claude_code", "codex", "kiro_cli") for p in providers)
     )
 
 
@@ -116,17 +117,35 @@ def test_provider_unsupported_lists_the_table_providers(create_store, monkeypatc
     refuse(monkeypatch, "codex")
     error = refusal(env, {**SPEC, "provider": "codex"})
     assert error.rule == "provider_unsupported" and error.status_code == 400
-    assert error.detail == "codex; supported providers: claude_code"
+    assert error.detail == "codex; supported providers: claude_code, kiro_cli"
 
 
-@pytest.mark.parametrize("provider", ["claude_code", "codex"])
+@pytest.mark.parametrize("provider", ["claude_code", "codex", "kiro_cli"])
 def test_create_reports_each_providers_enforcement_label(create_store, provider):
     env = create_store
-    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex", "kiro_cli"]
     result = create(env, {**SPEC, "provider": provider})
     assert result["provider"] == provider
     assert result["enforcement"] == caps.capability_for(provider).enforcement
-    assert result["enforcement"] == {"claude_code": caps.HARD, "codex": caps.ADVISORY}[provider]
+    assert (
+        result["enforcement"]
+        == {"claude_code": caps.HARD, "codex": caps.ADVISORY, "kiro_cli": caps.HARD}[provider]
+    )
+
+
+def test_kiro_is_an_operator_opt_in(create_store):
+    """#1167 Phase 2: rule 8 accepts kiro_cli, and only a list that names it admits it."""
+    env = create_store
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "kiro_cli"]
+    env[0].validate_block(env[0].read_settings())
+    assert create(env, {**SPEC, "provider": "kiro_cli"})["enforcement"] == caps.HARD
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code"]
+    error = refusal(env, {**SPEC, "purpose": "kiro_refused", "provider": "kiro_cli"})
+    assert error.rule == "provider_not_allowed"
+    # A Kiro creator with no provider in the spec resolves to kiro_cli.
+    grant_creator(env, ["@cao-mcp-server", "fs_read"], provider="kiro_cli")
+    env[4]["ephemeral"]["allowed_providers"] = ["kiro_cli"]
+    assert create(env, {**SPEC, "purpose": "kiro_default"})["provider"] == "kiro_cli"
 
 
 def test_the_label_follows_the_resolved_provider_not_the_spec_field(create_store):
@@ -297,4 +316,4 @@ def test_mcp_schema_advertises_the_table_providers():
 
     advertised = server.Tool.from_function(server.create_ephemeral_agent).parameters
     choices = advertised["properties"]["provider"]["anyOf"][0]["enum"]
-    assert choices == list(caps.ephemeral_providers())
+    assert choices == [*caps.ephemeral_providers(), "auto"]

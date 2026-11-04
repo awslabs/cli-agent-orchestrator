@@ -114,8 +114,12 @@ EPHEMERAL_DEFAULTS = {
     "min_tier": None,
     "max_tier": None,
     "default_tier": None,
+    "min_effort": None,
     "max_effort": None,
     "default_effort": None,
+    # #1099 (provisional): disjoint sets of providers a decider may route between; none by
+    # default, so nothing is asked until the operator declares one.
+    "provider_route": {"equivalent": []},
     # Lifecycle cleanup (#1079); every default here awaits maintainer confirmation.
     "max_live_per_session": 0,  # No cap; operators opt in.
     "launch_grace_seconds": 600,
@@ -145,6 +149,20 @@ def child_may_delegate() -> bool:
     """Operator-only ephemeral.child_may_delegate; no environment overrides."""
     block = _load_or_raise().get("ephemeral", {})
     return isinstance(block, dict) and block.get("child_may_delegate") is True
+
+
+def kiro_v3_allow_unverified_versions() -> bool:
+    """Operator-only ``kiro.v3_allow_unverified_versions`` (default false).
+
+    Provisional (#1167). When JSON ``true``, a Kiro v3 launch may run on a
+    kiro-cli version whose allow-list entry is still pending operator
+    verification, so that the operator can run the live checklist on it.
+    Nothing else is widened: a version absent from the allow-list still
+    refuses, and every other v3 check still applies. No environment override;
+    an unreadable settings file reads as off.
+    """
+    block = _load().get("kiro", {})
+    return isinstance(block, dict) and block.get("v3_allow_unverified_versions") is True
 
 
 def _load() -> Dict[str, Any]:

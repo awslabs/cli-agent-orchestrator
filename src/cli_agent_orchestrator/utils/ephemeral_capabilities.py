@@ -6,9 +6,8 @@ validates ``ephemeral.allowed_providers``, by the MCP tool schema, and later by
 provider can run and the enforcement label a create reports cannot drift apart.
 
 This is the ephemeral counterpart of ``utils/enforcement.py``, which describes
-installed launches. The two differ on purpose: Kiro enforces installed agents
-natively but runs no ephemeral, and the contained Codex launch planned in #1074
-gets a sandbox class that installed Codex launches do not.
+installed launches. The two differ on purpose: the contained Codex launch
+planned in #1074 gets a sandbox class that installed Codex launches do not.
 
 The class names and the ``tool_unsupported_on_provider:<atom>`` rule built from
 ``unsupported_atoms`` are provisional public strings (#1074 open questions 4 and
@@ -42,6 +41,9 @@ class EphemeralCapability:
     # The live-profile section and key that carry effort, e.g. Claude Code's
     # claudeConfig.effort; None when the provider has no effort mapping.
     effort_config: Optional[tuple[str, str]]
+    # Whether an ephemeral.provider_route set may name this provider, so a decider can
+    # route a provider "auto" launch to it (#1099). Off unless a row says so.
+    routable: bool = False
 
     def __post_init__(self) -> None:
         if self.enforcement not in ENFORCEMENT_CLASSES:
@@ -69,23 +71,40 @@ _REFUSED = EphemeralCapability(REFUSED, frozenset(), False, None)
 CAPABILITIES: dict[str, EphemeralCapability] = {
     # --disallowedTools; the MCP config holds only cao-mcp-server.
     "claude_code": EphemeralCapability(
-        HARD, frozenset(TOOL_ATOMS), True, ("claudeConfig", "effort")
+        HARD, frozenset(TOOL_ATOMS), True, ("claudeConfig", "effort"), routable=True
     ),
     # An operator opt-in that runs --yolo with network on, so every atom runs,
     # advisorily. The contained launch moves it to SANDBOXED without web_fetch.
     "codex": EphemeralCapability(
-        ADVISORY, frozenset(TOOL_ATOMS), True, ("codexConfig", "model_reasoning_effort")
+        ADVISORY,
+        frozenset(TOOL_ATOMS),
+        True,
+        ("codexConfig", "model_reasoning_effort"),
+        routable=True,
     ),
-    # Refused until the per-launch Kiro agent lands (#1074). An ephemeral
-    # profile's model would not reach --model either: Kiro reads it with
-    # load_agent_profile, which cannot read reserved names.
-    "kiro_cli": _REFUSED,
+    # Hard on the v3 engine, from a per-launch universal agent file (#1167
+    # Phase 2): v3 exposes only what the file selects minus what it excludes,
+    # and denies every capability outside the grant; /tools and /mcp list are
+    # checked before each task. The model reaches --model through the launch
+    # object, and effort goes in kiroConfig.effort and becomes --effort. Not
+    # routable yet: a provider.route set may not name it until routing to a
+    # Kiro helper carries the planned effort and the sweep finds a routed home.
+    "kiro_cli": EphemeralCapability(HARD, frozenset(TOOL_ATOMS), True, ("kiroConfig", "effort")),
 }
 
 
 def capability_for(provider: object) -> EphemeralCapability:
     """The provider's row; an unknown provider or a non-string is refused."""
     return CAPABILITIES.get(provider, _REFUSED) if isinstance(provider, str) else _REFUSED
+
+
+def enforcement_label(provider: object) -> str:
+    """The class a create reports, provider.route validates and its records carry (#1099).
+
+    One helper, so a label that comes to depend on settings or an engine version changes here
+    and nowhere else.
+    """
+    return capability_for(provider).enforcement
 
 
 def ephemeral_providers() -> tuple[str, ...]:

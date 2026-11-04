@@ -79,8 +79,9 @@ portable and make profile listings useful.
   is accepted on input only); unset means `false`.
 - `model` (string): provider model selection.
 - `engine` (string): Kiro CLI engine selection, either `v2` (the default) or
-  `kas`. Valid only for the `kiro_cli` provider; an explicit `--engine` at
-  launch must agree with this value. See [Kiro CLI](kiro-cli.md).
+  `v3` (`kas` is accepted as an alias and read as `v3`). Valid only for the
+  `kiro_cli` provider; an explicit `--engine` at launch must agree with this
+  value. See [Kiro CLI](kiro-cli.md).
 - `permissionMode` (string): Claude Code permission mode.
 - `native_agent` (string): Claude Code native-agent name.
 - `codexProfile` (string): named Codex configuration profile.
@@ -89,6 +90,9 @@ portable and make profile listings useful.
   "<low|medium|high|xhigh>"}` maps to `--effort <level>` and
   `{"fallback_model": "<model>"}` to `--fallback-model <model>`. The Claude
   analog of `codexConfig`; the top-level `model` field still maps to `--model`.
+- `kiroConfig` (object): Kiro CLI launch knobs; `{"effort": "<level>"}` is the
+  `--effort <level>` a Kiro v3 launch passes, probed from the wrapper's help
+  first. An ephemeral Kiro helper carries its effort here.
 - `hermesProfile` (string): Hermes profile wrapper command.
 - `grokNativeWorkflows` (boolean): explicit Grok Build-native worker/workflow
   opt-in; defaults to `false`.

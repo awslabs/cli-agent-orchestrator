@@ -133,8 +133,10 @@ def kiro_agent_dirs(
     ``~/.kiro``), which kiro-cli reads; plus ``installed_dir``, the directory
     ``cao install`` writes. kiro-cli reads that one only when it is one of the
     others: a ``CAO_AGENTS_DIR`` elsewhere passes this check, and the launch is
-    then refused at the header check instead. Duplicates are dropped and order
-    is kept.
+    then refused at the header check instead. A v3 launch is refused before
+    this check (``kiro_v3_agents_dir_unsupported``), because an older file of
+    the same name in ``~/.kiro/agents`` would pass the header check. Duplicates
+    are dropped and order is kept.
 
     Provisional (#1074): the workspace is the launch cwd only, not its parents,
     and a workspace agent counts for installed launches; refusing a workspace
@@ -266,6 +268,19 @@ def header_agents(pane: str) -> List[str]:
                 agents.append(agent)
         previous = row
     return agents
+
+
+def header_model(pane: str, agent: str) -> Optional[str]:
+    """The model column of the first header row naming ``agent``, for the audit; None if none does.
+
+    Read with the identity check's own row shape, so extra effort and thinking
+    columns never shift it. Audited, never enforced (#1167 Phase 2).
+    """
+    for row in strip_terminal_escapes(pane).splitlines():
+        match = _HEADER_ROW.match(row)
+        if match and match.group("agent") == agent:
+            return match.group("model")
+    return None
 
 
 def fallback_notice(pane: str, agent: str) -> Optional[str]:

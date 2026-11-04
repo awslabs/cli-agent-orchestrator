@@ -195,9 +195,9 @@ def test_policy_rejections_leave_nothing(create_store, patch, rule, caplog):
 @pytest.mark.parametrize(
     "key,values,rule",
     [
-        # #1068 MF4: a tier auto now needs both bounds; effort auto still refuses.
+        # #1068 MF4 and #1083 (provisional): auto in either field needs that field's bounds.
         ("model_tier", ["auto"], "auto_requires_bounds"),
-        ("effort", ["auto"], "auto_requires_decision_platform"),
+        ("effort", ["auto"], "auto_requires_bounds"),
     ],
 )
 def test_auto_refuses_in_either_field(create_store, key, values, rule):
@@ -208,7 +208,7 @@ def test_auto_refuses_in_either_field(create_store, key, values, rule):
         assert err.value.rule == rule
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, {**SPEC, "model_tier": "small", "effort": "auto"})
-    assert err.value.rule == "auto_requires_decision_platform"
+    assert err.value.rule == "auto_requires_bounds"
 
 
 @pytest.mark.parametrize("value", [None, 0, 2, "1", True])
@@ -402,7 +402,7 @@ def test_session_is_one_safe_segment(create_store, session):
     [
         ("allowed_providers", []),
         ("allowed_providers", None),
-        ("allowed_providers", ["kiro_cli"]),
+        ("allowed_providers", ["kimi_cli"]),
         ("max_brief_bytes", 0),
         ("pending_ttl_seconds", True),
         ("claim_lease_seconds", "60"),
@@ -425,12 +425,12 @@ def test_invalid_config_precedes_creator(create_store, key, value):
             ["*"],
             {"model_tier": "small", "effort": "auto"},
             {},
-            "kiro_cli",
+            "kimi_cli",
             False,
-            "auto_requires_decision_platform",
+            "auto_requires_bounds",
         ),
-        (["*"], {"effort": "low"}, {}, "kiro_cli", False, "provider_unsupported"),
-        (["*"], {}, {"allowed_providers": ["codex"]}, "kiro_cli", False, "provider_unsupported"),
+        (["*"], {"effort": "low"}, {}, "kimi_cli", False, "provider_unsupported"),
+        (["*"], {}, {"allowed_providers": ["codex"]}, "kimi_cli", False, "provider_unsupported"),
         (
             ["@cao-mcp-server"],
             {"tools": ["execute_bash"], "brief": "AKIAIOSFODNN7EXAMPLE"},
@@ -685,7 +685,7 @@ def test_non_primary_integrity_failure_is_unexpected(create_store, monkeypatch):
         ("spec_version", True),
         ("spec_version", "1"),
         ("description", "x" * 281),
-        ("provider", "kiro_cli"),
+        ("provider", "kimi_cli"),
         ("purpose", "valid_name\n"),
         ("tools", ["@cao-mcp-server"]),
     ],
@@ -695,9 +695,9 @@ def test_additional_shape_refusals(create_store, field, value):
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, {**SPEC, field: value})
     assert err.value.rule == (
-        "provider_unsupported" if field == "provider" and value == "kiro_cli" else "invalid_spec"
+        "provider_unsupported" if field == "provider" and value == "kimi_cli" else "invalid_spec"
     )
-    assert err.value.status_code == (400 if field == "provider" and value == "kiro_cli" else 422)
+    assert err.value.status_code == (400 if field == "provider" and value == "kimi_cli" else 422)
     assert not (create_store[2] / "ephemeral").exists()
 
 
@@ -761,7 +761,8 @@ def test_note_build_failure_precedes_all_writes(create_store, monkeypatch):
 
 @pytest.mark.parametrize("declared", [True, False])
 @pytest.mark.parametrize(
-    "provider", [p.value for p in ProviderType if p.value not in {"claude_code", "codex"}]
+    "provider",
+    [p.value for p in ProviderType if p.value not in {"claude_code", "codex", "kiro_cli"}],
 )
 def test_known_non_v1_provider_is_policy_refusal(create_store, declared, provider):
     service, factory, home, _, config = create_store
@@ -774,7 +775,9 @@ def test_known_non_v1_provider_is_policy_refusal(create_store, declared, provide
         create(create_store, spec)
     assert err.value.rule == "provider_unsupported" and err.value.status_code == 400
     expected = provider + (
-        "; supported providers: claude_code, codex" if declared else "; set provider explicitly"
+        "; supported providers: claude_code, codex, kiro_cli"
+        if declared
+        else "; set provider explicitly"
     )
     assert err.value.detail == expected
     assert not (home / "ephemeral").exists()
@@ -782,7 +785,7 @@ def test_known_non_v1_provider_is_policy_refusal(create_store, declared, provide
 
 def test_declared_non_v1_provider_obeys_fixed_check_order(create_store):
     service, factory, _, _, config = create_store
-    spec = {**SPEC, "provider": "kiro_cli", "model_tier": "small"}
+    spec = {**SPEC, "provider": "kimi_cli", "model_tier": "small"}
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, spec)
     assert err.value.rule == "provider_unsupported"

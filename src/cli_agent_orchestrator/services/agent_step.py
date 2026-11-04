@@ -28,12 +28,15 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from cli_agent_orchestrator.clients.database import upsert_handoff_result
-from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
+from cli_agent_orchestrator.models.kiro_engine import (
+    KiroEngine,
+    canonical_kiro_engine,
+    parse_kiro_engine,
+)
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services import frozen_run_memory, launch_guard, terminal_service
 from cli_agent_orchestrator.services.provider_error_classifier import (
     classify_provider_error,
@@ -106,10 +109,6 @@ async def _validate_reused_terminal(
 
     explicit_engine = parse_kiro_engine(requested_engine)
     assert explicit_engine is not None
-    if explicit_engine == KiroEngine.KAS:
-        # KAS remains unavailable regardless of which engine the terminal
-        # persisted; use the same structured Phase 0 guard as terminal creation.
-        raise KiroPhase0KASError(profile_has_v2_policy=False)
 
     persisted_engine = parse_kiro_engine(metadata.get("engine"))
     if persisted_engine is None:
@@ -600,6 +599,7 @@ async def run_agent_step(
     """
     created_here = reuse_terminal_id is None
     terminal_id = reuse_terminal_id
+    launched_provider = provider
 
     if created_here:
         await asyncio.to_thread(
@@ -656,7 +656,9 @@ async def run_agent_step(
             model=model,
             # ``StepCallFields.engine`` is the enum's ``value`` by contract — the CALLER
             # normalises, so ``step_fingerprint`` can stay a stdlib-only leaf module.
-            engine=engine.value if isinstance(engine, KiroEngine) else engine,
+            # ``canonical_kiro_engine`` maps a member to its value and ``kas`` to
+            # ``v3`` without validating, so both spellings share one key (#1167).
+            engine=canonical_kiro_engine(engine),
             allowed_tools=None if allowed_tools is None else tuple(allowed_tools),
             effective_working_directory=working_directory,
             use_worktree=use_worktree,
@@ -721,6 +723,12 @@ async def run_agent_step(
             caller_ceiling=caller_ceiling,
         )
         terminal_id = terminal.id
+        # #1099: a routed ephemeral launch runs another CLI than the request names; its
+        # output is classified with the provider that actually ran. Terminal stores the
+        # enum's value (use_enum_values).
+        ran = getattr(terminal.provider, "value", terminal.provider)
+        if isinstance(ran, str):
+            launched_provider = ran
 
         # BR-31: make the terminal this call just made visible to U4's orphan
         # sweep, and (issue #583, BR-3) write its durable ``running`` row, BEFORE
@@ -854,11 +862,11 @@ async def run_agent_step(
     # when the rolling buffer is empty) is deferred until a row actually matches.
     # Only a candidate match pays for the capture, and only then is it re-read to
     # confirm the line is provider chrome rather than a marker-owned answer.
-    provider_error = classify_provider_error(provider, last_message)
+    provider_error = classify_provider_error(launched_provider, last_message)
     if provider_error is not None:
         script_output = await asyncio.to_thread(terminal_service.get_output_context, terminal_id)
         provider_error = classify_provider_error(
-            provider, last_message, script_output=script_output
+            launched_provider, last_message, script_output=script_output
         )
     if provider_error is not None:
         # Unlike the crash/timeout paths above, the CLI here is HEALTHY and idle: it
@@ -872,7 +880,8 @@ async def run_agent_step(
         if teardown and created_here:
             await _best_effort_teardown(terminal_id, registry)
         raise StepExecutionError(
-            f"provider error ({provider_error.slug}) from {provider}: {provider_error.detail}",
+            f"provider error ({provider_error.slug}) from {launched_provider}: "
+            f"{provider_error.detail}",
             kind=provider_error.kind,
             terminal_id=terminal_id,
         )

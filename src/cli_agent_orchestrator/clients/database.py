@@ -5,12 +5,11 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, NamedTuple, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, TypeVar, cast
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
-    Column,
     DateTime,
     Float,
     Index,
@@ -27,9 +26,33 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.types import TypeDecorator
 
+if TYPE_CHECKING:
+    from sqlalchemy import Column as _SAColumn
+
+    _T = TypeVar("_T")
+
+    class Column(_SAColumn[_T]):
+        """Type-checking view of ``sqlalchemy.Column`` for the legacy models below.
+
+        SQLAlchemy 2.1 gave ``Column`` a typing-only ``__get__`` that returns
+        ``Never`` for class-level access, to stop ``TypedColumns`` classes being
+        used as ORM classes. These models declare ``x = Column(...)`` without
+        ``Mapped[]``, so under 2.1 every ``Model.x`` became ``Never`` and mypy
+        stopped checking the code after it. This restores 2.0's typing, where
+        ``Model.x`` is ``Column[T]``. Runtime uses the real ``Column`` (below).
+        """
+
+        def __get__(  # type: ignore[override]  # 2.1's overload returns Never
+            self, instance: Any, owner: Any
+        ) -> "_SAColumn[_T]": ...
+
+else:
+    from sqlalchemy import Column
+
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.kiro_engine import canonical_kiro_engine
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +352,11 @@ class DecisionRecordModel(Base):
     message_hash = Column(String, nullable=True)
     hash_key_id = Column(String, nullable=True)
     message_bytes = Column(Integer, nullable=True)
+    # provider.route rows only (#1099): the per-launch options as a JSON list, and the
+    # enforcement labels of the fallback and the applied provider. NULL on other rows.
+    options = Column(Text, nullable=True)
+    fallback_enforcement = Column(String, nullable=True)
+    applied_enforcement = Column(String, nullable=True)
     __table_args__ = (
         Index("ix_decision_records_created_at", "created_at"),
         Index("ix_decision_records_terminal_id", "terminal_id"),
@@ -1208,6 +1236,8 @@ def init_db() -> None:
     # Appended LAST (issue #1067). One nullable column on decision_records, which
     # create_all made above; no backfill, so registry order is immaterial here too.
     _migrate_decision_records_target_kind()
+    # Appended LAST (issue #1099). Three nullable decision_records columns, no backfill.
+    _migrate_decision_records_provider_route()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1293,6 +1323,39 @@ def _migrate_decision_records_target_kind() -> None:
     except Exception as e:
         # Records cannot be written without the column, so this is louder than debug.
         logger.warning(f"Migration check for decision_records target_kind failed: {e}")
+
+
+_PROVIDER_ROUTE_COLUMNS = {
+    "options": "ALTER TABLE decision_records ADD COLUMN options TEXT",
+    "fallback_enforcement": "ALTER TABLE decision_records ADD COLUMN fallback_enforcement TEXT",
+    "applied_enforcement": "ALTER TABLE decision_records ADD COLUMN applied_enforcement TEXT",
+}
+
+
+def _migrate_decision_records_provider_route() -> None:
+    """Add provider.route's three nullable decision_records columns if missing (issue #1099).
+
+    Idempotent, like ``_migrate_decision_records_target_kind``: PRAGMA table_info gate, one
+    ALTER TABLE ADD COLUMN per missing column. Fresh DBs already have them from
+    ``Base.metadata.create_all``. Existing rows keep NULL: they are not provider.route rows.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(decision_records)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if not columns:
+                return
+            for column, statement in _PROVIDER_ROUTE_COLUMNS.items():
+                if column not in columns:
+                    conn.execute(statement)
+                    logger.info(f"Migration: added {column} column to decision_records")
+    except Exception as e:
+        # Records cannot be written without the columns, so this is louder than debug.
+        logger.warning(f"Migration check for decision_records provider.route columns failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -2598,7 +2661,9 @@ def create_terminal(
             delegate_tools=_json.dumps(delegate_tools) if delegate_tools is not None else None,
             shell_command=shell_command,
             caller_id=caller_id,
-            engine=engine,
+            # The column's one writer stores the canonical spelling, so a
+            # ``kas`` that reaches here is stored as ``v3`` (#1167).
+            engine=canonical_kiro_engine(engine),
             provider_variant=provider_variant,
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,

@@ -1,0 +1,20 @@
+{
+  "name": "v3typo",
+  "description": "KV3 typo capability in a deny rule",
+  "prompt": "You are a KV3 probe agent for a CAO compatibility test. Answer briefly.",
+  "tools": [
+    "read_file",
+    "execute_bash"
+  ],
+  "includeMcpJson": false,
+  "resources": [],
+  "mcpServers": {},
+  "permissions": {
+    "rules": [
+      {
+        "capability": "shel",
+        "effect": "deny"
+      }
+    ]
+  }
+}
