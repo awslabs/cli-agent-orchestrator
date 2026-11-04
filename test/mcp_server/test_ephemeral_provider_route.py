@@ -80,6 +80,7 @@ def codex_row(kind):
             effort_config=None,
             supports_ephemeral=True,
             honors_effort=False,
+            routable=True,
         )
     return replace(
         caps.CAPABILITIES["codex"],

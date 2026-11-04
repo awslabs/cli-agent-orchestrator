@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -19,6 +19,15 @@ from cli_agent_orchestrator.providers.opencode_cli import (
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def mock_cli_probe():
+    """Legacy provider tests must not depend on a locally installed binary."""
+    with patch(
+        "cli_agent_orchestrator.providers.opencode_cli.detect_opencode_major", return_value=1
+    ):
+        yield
 
 
 def load_fixture(name: str) -> str:
@@ -470,11 +479,17 @@ class TestExtractLastMessage:
 
 
 class TestInitialize:
+    @pytest.fixture(autouse=True)
+    def startup_pane(self):
+        with patch.object(OpenCodeCliProvider, "_check_startup", new=AsyncMock()):
+            yield
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_success_returns_true(self, mock_tmux, mock_shell, mock_wait):
+        mock_tmux.return_value.get_history.return_value = ""
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider()
@@ -485,6 +500,7 @@ class TestInitialize:
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_uses_120s_timeout(self, mock_tmux, mock_shell, mock_wait):
+        mock_tmux.return_value.get_history.return_value = ""
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider()
@@ -497,6 +513,7 @@ class TestInitialize:
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_sends_agent_flag(self, mock_tmux, mock_shell, mock_wait):
+        mock_tmux.return_value.get_history.return_value = ""
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(agent_profile="developer")
@@ -509,6 +526,7 @@ class TestInitialize:
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_includes_model_when_set(self, mock_tmux, mock_shell, mock_wait):
+        mock_tmux.return_value.get_history.return_value = ""
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(model="anthropic/claude-sonnet-4-6")
@@ -521,6 +539,7 @@ class TestInitialize:
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_no_model_flag_when_unset(self, mock_tmux, mock_shell, mock_wait):
+        mock_tmux.return_value.get_history.return_value = ""
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(model=None)
@@ -542,6 +561,7 @@ class TestInitialize:
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_raises_on_opencode_timeout(self, mock_tmux, mock_shell, mock_wait):
+        mock_tmux.return_value.get_history.return_value = ""
         mock_shell.return_value = True
         mock_wait.return_value = False
         provider = make_provider()
@@ -553,6 +573,7 @@ class TestInitialize:
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_sets_env_vars_in_command(self, mock_tmux, mock_shell, mock_wait):
+        mock_tmux.return_value.get_history.return_value = ""
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider()

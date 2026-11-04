@@ -469,7 +469,7 @@ def test_B_C2_effort_order_and_ceiling(create_store):
     )
     assert "effort=high" in err.detail and "ephemeral.max_effort=medium" in err.detail
     assert_no_create(
-        create_store, {**SPEC, "provider": "kiro_cli", "effort": "low"}, "provider_unsupported"
+        create_store, {**SPEC, "provider": "kimi_cli", "effort": "low"}, "provider_unsupported"
     )
 
 

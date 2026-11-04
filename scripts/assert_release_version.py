@@ -6,11 +6,14 @@ compiled.
 
 WHY THIS EXISTS: THREE OF THE LAST FOUR RELEASES FAILED THE SAME WAY
 --------------------------------------------------------------------
-``release.yml`` (bump, commit, tag, release) has not been able to push to ``main`` since
-the branch rulesets landed, so releases are cut by hand: a ``chore: release vX.Y.Z`` PR
-that bumps ``pyproject.toml``, ``uv.lock`` and the devcontainer feature, then a GitHub
-Release whose tag points at that merge commit. When the second step happens without the
-first, the tag says one thing and the tree says another:
+Releases v2.5.1 to v2.5.4 were cut by hand: a ``chore: release vX.Y.Z`` PR that bumps
+``pyproject.toml``, ``uv.lock`` and the devcontainer feature, then a GitHub Release whose tag
+points at that merge commit. (Not for lack of push rights: both rulesets on ``main``
+(``protect-main`` and ``branch protection``) list deploy keys as an ``always`` bypass actor,
+and the release deploy key ``release.yml`` pushes with is write-enabled, read 2026-11-02. What
+``release.yml`` lacked was a ``uv.lock`` bump, so no tag it cut could pass this check; #652
+adds it.) When the second step happens without the first, the tag says one thing and the
+tree says another:
 
     tag       pyproject.toml   result
     v2.5.1    2.5.0            TestPyPI: 400 File already exists  (2026-09-11)

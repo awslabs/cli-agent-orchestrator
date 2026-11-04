@@ -6,15 +6,19 @@ the provider's own command builder.
 """
 
 import shlex
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
+from cli_agent_orchestrator.providers.kiro_capabilities import build_kiro_command
+from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_launch_home import KiroLaunch
 from cli_agent_orchestrator.providers.manager import ProviderManager
 
 DECLARED = {ProviderType.CLAUDE_CODE.value, ProviderType.CODEX.value}
@@ -84,10 +88,41 @@ def test_codex_honors_effort_and_its_command_carries_it():
     assert CodexProvider.honors_effort("worker", profile) is True
 
 
+def test_kiro_applies_a_stored_effort_but_is_never_asked_for_one_yet():
+    """Kiro's capability row writes a stored effort to kiroConfig.effort, which
+    becomes --effort, but its class declares no decided-effort path, so
+    effort.route is never asked for a Kiro helper (it records not_honored)."""
+    from cli_agent_orchestrator.utils.ephemeral_capabilities import capability_for
+
+    assert capability_for("kiro_cli").effort_config == ("kiroConfig", "effort")
+    assert KiroCliProvider.honors_effort("worker", _profile(kiroConfig={"effort": "high"})) is False
+    assert KiroCliProvider.honors_effort(None, None) is False
+
+
 def test_a_launch_without_a_profile_file_is_judged_like_honors_model():
     # As with honors_model, no profile means no native agent to drop claudeConfig.
     assert ClaudeCodeProvider.honors_effort(None, None) is True
     assert ClaudeCodeProvider.honors_model(None, None, None) is True
+
+
+def _kiro_helper_args(profile: AgentProfile, effort=None) -> list[str]:
+    """A Kiro helper's v3 argv: its effort is the launch object's, never the profile's."""
+    launch = KiroLaunch(
+        home=Mock(),
+        kiro_cli=Mock(),
+        grant=("@cao-mcp-server",),
+        working_directory="/w",
+        effort=effort,
+    )
+    with patch(
+        "cli_agent_orchestrator.providers.kiro_cli.load_agent_profile", return_value=profile
+    ):
+        provider = KiroCliProvider(
+            "tid", "sess", "win", "worker", engine=KiroEngine.V3, launch=launch
+        )
+        return build_kiro_command(
+            KiroEngine.V3, "worker", yolo=True, effort=provider._get_profile_effort()
+        )
 
 
 # A structural guard (#201a §2.2, §5.2): a capability row can't declare effort_config
@@ -96,6 +131,7 @@ def test_a_launch_without_a_profile_file_is_judged_like_honors_model():
 _ARGS_BY_PROVIDER = {
     ProviderType.CLAUDE_CODE.value: _claude_args,
     ProviderType.CODEX.value: _codex_args,
+    ProviderType.KIRO_CLI.value: _kiro_helper_args,
 }
 
 

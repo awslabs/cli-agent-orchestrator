@@ -263,18 +263,23 @@ class KiroV3Refusal(ValueError):
     code = "kiro_v3_refused"
 
 
+#: What a version refusal suggests by default. An ephemeral helper runs only on
+#: v3, so its refusals pass their own remedy instead (#1167 Phase 2).
+UNSUPPORTED_VERSION_REMEDY = "Retry with engine 'v2', or use a supported kiro-cli version."
+UNVERIFIED_VERSION_REMEDY = "Retry with engine 'v2'."
+
+
 class KiroV3UnsupportedVersionError(KiroV3Refusal):
     """The probed kiro-cli version has no pinned v3 engine schema."""
 
     code = "kiro_v3_unsupported_version"
 
-    def __init__(self, version: Optional[str]) -> None:
+    def __init__(self, version: Optional[str], *, remedy: str = UNSUPPORTED_VERSION_REMEDY) -> None:
         detected = f"kiro-cli {version}" if version else "an unreadable kiro-cli version"
         supported = ", ".join(sorted(SUPPORTED_KIRO_CLI_VERSIONS))
         super().__init__(
             f"{self.code}: Kiro engine 'v3' is not supported on {detected}. CAO supports "
-            f"v3 only on kiro-cli {supported}, each with a pinned engine schema. "
-            "Retry with engine 'v2', or use a supported kiro-cli version."
+            f"v3 only on kiro-cli {supported}, each with a pinned engine schema. {remedy}"
         )
         self.version = version
 
@@ -292,11 +297,10 @@ class KiroV3UnverifiedVersionError(KiroV3Refusal):
 
     code = "kiro_v3_unverified_version"
 
-    def __init__(self, version: str) -> None:
+    def __init__(self, version: str, *, remedy: str = UNVERIFIED_VERSION_REMEDY) -> None:
         super().__init__(
             f"{self.code}: kiro-cli {version}'s v3 engine schema was derived statically and "
-            "is pending operator verification, so CAO does not launch v3 on it. "
-            "Retry with engine 'v2'."
+            f"is pending operator verification, so CAO does not launch v3 on it. {remedy}"
         )
         self.version = version
 

@@ -107,6 +107,28 @@ class TerminalBackend(ABC):
         """
         ...
 
+    def restore_session_env(self, session_name: str, key: str, launch_value: str) -> None:
+        """Give the session back the ``key`` it would have had without ``launch_value``.
+
+        ``create_session``'s ``extra_env`` reaches the session's first window, but
+        a backend may also keep it as session state that every later window
+        inherits (tmux's ``new-session -e`` does). Right after the session
+        exists, a value private to the first window (``launch_value``) is
+        replaced there by the one the session would have had without it, or
+        removed when it would have had none. The first window's own processes
+        keep ``launch_value``; later windows never see it.
+
+        Fails closed by default: a backend must say how its environment is scoped
+        before a caller can rely on this.
+
+        Raises:
+            TerminalBackendError: If the session's value cannot be put back, or
+                would be ``launch_value``
+        """
+        raise TerminalBackendError(
+            f"{type(self).__name__} cannot keep {key} out of session '{session_name}'"
+        )
+
     @abstractmethod
     def session_exists(self, session_name: str) -> bool:
         """Check if a session exists.
