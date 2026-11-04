@@ -372,3 +372,29 @@ class TestHandoffEarlyPathReportsRealDelete:
         assert "Worker terminal dev-t1 was not torn down." in res.message
         assert "was torn down" not in res.message
         assert "NOTE: nudge" in res.message
+
+
+def _handoff_docstrings():
+    """Both ``handoff`` definitions (one per ENABLE_WORKING_DIRECTORY branch)."""
+    import ast
+    from pathlib import Path
+
+    from cli_agent_orchestrator.mcp_server import server
+
+    tree = ast.parse(Path(server.__file__).read_text())
+    return [
+        ast.get_docstring(node) or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "handoff"
+    ]
+
+
+def test_handoff_docstrings_do_not_instruct_cleanup():
+    """Issue #1203: the docstring describes the teardown outcome the result reports,
+    and does not tell the supervisor to clean up the worker itself."""
+    docs = _handoff_docstrings()
+    assert len(docs) == 2  # one per variant
+    for doc in docs:
+        assert "Clean up the terminal with /exit" not in doc
+        assert "delete_terminal" not in doc
+        assert "was torn down" in doc
