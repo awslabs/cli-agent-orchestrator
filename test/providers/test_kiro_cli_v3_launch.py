@@ -254,8 +254,12 @@ class SnapshotPane(FakePane):
     repeats); with ``ready_at`` it is ``loading`` until the clock reaches that
     second, then ``running``. Keys typed while a panel is open go to its search
     box, never to the prompt; a dialog takes every key typed while it is on
-    screen. ``open_lag`` and ``close_lag`` reads still show the old frame after
-    an Enter or an Escape, as a render can trail the key.
+    screen. ``palette_lag``, ``open_lag`` and ``close_lag`` reads still show the
+    old frame after the last key of a slash command, an Enter or an Escape, as a
+    render can trail the key; ``close_frame`` replaces the old frame after an
+    Escape (a blank redraw, or a screen that is neither the panel nor the prompt).
+    The provider waits ``V3_ATTEST_READ_INTERVAL_S`` between reads, so on the
+    fake clock each lagging read costs time, as it would live.
     """
 
     def __init__(
@@ -268,8 +272,10 @@ class SnapshotPane(FakePane):
         palette_fails_at: Optional[int] = None,
         dialog_after_close: Optional[int] = None,
         dialog: str = "approval",
+        palette_lag: int = 0,
         open_lag: int = 0,
         close_lag: int = 0,
+        close_frame: Optional[str] = None,
         max_opens: int = 200,
     ):
         super().__init__(cwd)
@@ -280,8 +286,10 @@ class SnapshotPane(FakePane):
         self.palette_fails_at = palette_fails_at
         self.dialog_after_close = dialog_after_close
         self.dialog = dialog
+        self.palette_lag = palette_lag
         self.open_lag = open_lag
         self.close_lag = close_lag
+        self.close_frame = close_frame
         self.max_opens = max_opens
         self.open_panel: Optional[str] = None
         self.dialog_shown = False
@@ -321,7 +329,8 @@ class SnapshotPane(FakePane):
                 return
             if self.open_panel == "/mcp":
                 self.closes += 1
-            self.frames = [self.screen] * self.close_lag
+            trailing = self.screen if self.close_frame is None else _screen(self.close_frame)
+            self.frames = [trailing] * self.close_lag
             self.open_panel, self.buffer, self.search = None, "", ""
             self.screen = _screen("idle")
             if self.closes == self.dialog_after_close:
@@ -349,6 +358,7 @@ class SnapshotPane(FakePane):
             if self.buffer == "/mcp" and self.palette_fails_at == len(self.snapshots) + 1:
                 self.screen = _screen("palette_slash_menu")
             elif self.buffer in self.typed:
+                self.frames = [self.screen] * self.palette_lag
                 self.screen = _screen(self.typed[self.buffer])
 
     def get_history(self, *_args, **_kwargs):
@@ -440,7 +450,8 @@ async def test_a_server_that_never_finishes_loading_refuses_before_tools_is_read
     """The reopens end at ``provider_init_timeout`` in a refusal, never in a
     ``/tools`` read: with a per-tool grant, a ``/tools`` panel read while the
     server loads would show none of its tools and pass blind. 45 s is past the
-    old fixed wait of about 20 s; 60 s is the default, as docs/kiro-cli.md shows."""
+    old fixed wait of about 20 s; 60 s is the default. Reads cost no time here; for
+    opens that do, see ``test_the_deadline_counts_the_time_spent_inside_each_open``."""
     pane = SnapshotPane(str(cwd), states=("loading",))
     provider = _provider(allowed=PER_TOOL[0])
     with pytest.raises(KiroAttestationError) as excinfo:
@@ -494,12 +505,21 @@ async def test_a_palette_that_does_not_appear_on_a_reopen_refuses(cwd):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("dialog", ["approval", "trust_dialog", "unrecognised_selector"])
+@pytest.mark.parametrize(
+    "dialog",
+    ["approval", "trust_dialog", "unrecognised_selector", "approval_below_the_prompt"],
+)
 @pytest.mark.parametrize(
     "states", [("loading", "running"), ("running",)], ids=["between_opens", "before_tools"]
 )
 async def test_a_dialog_once_mcp_closes_refuses_and_nothing_is_typed_into_it(cwd, dialog, states):
-    screen = _unrecognised_selector() if dialog == "unrecognised_selector" else dialog
+    """``approval_below_the_prompt`` is drawn under a visible prompt: a dialog on
+    screen refuses even when the prompt's placeholder shows above it."""
+    screens = {
+        "unrecognised_selector": _unrecognised_selector(),
+        "approval_below_the_prompt": _screen("idle").rstrip("\n") + "\n" + _screen("approval"),
+    }
+    screen = screens.get(dialog, dialog)
     pane = SnapshotPane(str(cwd), states=states, dialog_after_close=1, dialog=screen)
     provider = _provider()
     with pytest.raises(KiroAttestationError) as excinfo:
@@ -548,21 +568,142 @@ async def test_a_prompt_that_does_not_come_back_after_mcp_closes_refuses(cwd):
     assert pane.keys == _keys(1, tools=False)
 
 
+#: Screens after Escape that are neither the ``/mcp`` panel nor the empty prompt.
+_NEITHER_PANEL_NOR_PROMPT = {"busy_screen": "busy_1", "blank_redraw": "\n" * 40}
+
+
 @pytest.mark.asyncio
-async def test_each_mcp_open_is_logged_at_debug_with_no_other_screen_text(cwd, caplog):
+@pytest.mark.parametrize("frame", list(_NEITHER_PANEL_NOR_PROMPT))
+@pytest.mark.parametrize(
+    "states", [("loading", "running"), ("running",)], ids=["between_opens", "before_tools"]
+)
+async def test_a_screen_that_is_neither_the_panel_nor_the_prompt_after_escape_refuses(
+    cwd, frame, states
+):
+    """Escape must bring back the empty prompt, not merely take the panel away: a
+    blank redraw, or a screen with no prompt, held for the whole wait refuses,
+    and nothing more is typed into it (not ``/mcp``, not ``/tools``)."""
+    from cli_agent_orchestrator.providers import kiro_cli
+
+    pane = SnapshotPane(
+        str(cwd),
+        states=states,
+        close_lag=kiro_cli.V3_ATTEST_READS,
+        close_frame=_NEITHER_PANEL_NOR_PROMPT[frame],
+    )
+    provider = _provider()
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane, provider=provider)
+    assert str(excinfo.value) == "kiro_v3_mcp_not_ready: the prompt did not return after /mcp"
+    assert pane.keys == _keys(1, tools=False)
+    assert pane.tools_shown == []
+    assert provider.identity_verified is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frame", list(_NEITHER_PANEL_NOR_PROMPT))
+async def test_a_screen_without_the_prompt_is_waited_out_within_the_render_wait(cwd, frame):
+    from cli_agent_orchestrator.providers import kiro_cli
+
+    pane = SnapshotPane(
+        str(cwd),
+        states=("loading", "running"),
+        close_lag=kiro_cli.V3_ATTEST_READS - 1,
+        close_frame=_NEITHER_PANEL_NOR_PROMPT[frame],
+    )
+    provider = await _launch(pane)
+    assert provider.identity_verified is True
+    assert pane.snapshots == ["loading", "running"]
+    assert pane.keys == _keys(2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("init_timeout", "opens", "reported", "ends_at"), [(10, 4, 12, 12.0), (60, 13, 62, 61.5)]
+)
+async def test_the_deadline_counts_the_time_spent_inside_each_open(
+    cwd, init_timeout, opens, reported, ends_at
+):
+    """Live, typing ``/mcp``, drawing its panel and getting the prompt back take
+    time. Here each open spends 0.5 s on the palette, 1 s on the panel's frame
+    and 1 s on the prompt after Escape. The deadline counts that time too, from
+    the first ``/mcp`` key, and the refusal comes at the first check after it
+    has passed: never more than one open's waits late. The 60 s case is the
+    example in docs/kiro-cli.md."""
+    from cli_agent_orchestrator.providers import kiro_cli
+
+    pane = SnapshotPane(str(cwd), states=("loading",), palette_lag=1, open_lag=2, close_lag=2)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane, init_timeout=init_timeout)
+    assert str(excinfo.value) == (
+        f"kiro_v3_mcp_not_ready: MCP servers still loading after {reported} s "
+        f"({opens} opens of /mcp): ['cao-mcp-server']"
+    )
+    assert pane.clock.now == ends_at
+    # One open's waits: the palette, the panel's frame and the prompt, each at most
+    # V3_ATTEST_READS reads apart by V3_ATTEST_READ_INTERVAL_S.
+    one_open = 3 * (kiro_cli.V3_ATTEST_READS - 1) * kiro_cli.V3_ATTEST_READ_INTERVAL_S
+    assert init_timeout <= pane.clock.now <= init_timeout + one_open
+    assert pane.snapshots == ["loading"] * opens
+    assert pane.keys == _keys(opens, tools=False)
+
+
+@pytest.mark.asyncio
+async def test_each_mcp_open_is_logged_at_debug(cwd, caplog):
     pane = SnapshotPane(str(cwd), states=("loading", "running"))
     with caplog.at_level(logging.DEBUG, logger=_KC):
         await _launch(pane)
-    records = [r for r in caplog.records if r.name == _KC]
-    opens = [r for r in records if "/mcp open" in r.getMessage()]
+    opens = [r for r in caplog.records if r.name == _KC and "/mcp open" in r.getMessage()]
     assert [r.getMessage() for r in opens] == [
         "kiro_cli: terminal t1234567 /mcp open 1 at 0.0 s: cao-mcp-server loading (0 tools)",
         "kiro_cli: terminal t1234567 /mcp open 2 at 1.0 s: cao-mcp-server running (34 tools)",
     ]
     assert {r.levelno for r in opens} == {logging.DEBUG}
-    logged = "\n".join(r.getMessage() for r in records)
-    for screen_text in ("/private/tmp", "mcp.json", "To edit local configs", "type to filter"):
-        assert screen_text not in logged
+
+
+#: Every message CAO may log while a v3 launch is attested in these tests. Any
+#: other record, such as a panel row or title, could carry screen text.
+_ATTESTATION_LOG_SHAPES = (
+    re.compile(r"Profile 'v3ro' not loadable by CAO; skipping --model resolution: no profile"),
+    re.compile(r"Profile 'v3ro' sets no Kiro effort: no profile"),
+    re.compile(
+        r"kiro_cli: terminal t1234567 /mcp open \d+ at \d+\.\d s: "
+        r"[\w-]+ (?:loading|running) \(\d+ tools\)(?:, [\w-]+ (?:loading|running) \(\d+ tools\))*"
+    ),
+)
+#: Text that only a pane's screen holds: panel titles, headings, columns and glyphs.
+_SCREEN_ONLY = ("/mcp list", "Configured Servers", "Source", "local", "◌", "●", "✗", "esc to")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"states": ("loading", "running")},
+        {"states": ("loading",)},
+        {"states": ("loading", "failed")},
+        {"states": ("loading", "decoys")},
+        {"states": ("loading", "running"), "dialog_after_close": 1},
+        {"states": ("loading", "running"), "palette_fails_at": 2},
+        {"states": ("loading", "running"), "close_lag": 6, "close_frame": "busy_1"},
+    ],
+    ids=["attests", "deadline", "failed", "new_servers", "dialog", "palette", "no_prompt"],
+)
+async def test_nothing_but_known_messages_is_logged_while_attesting(cwd, caplog, spec):
+    """No screen text reaches the log on any path: each record from CAO is one of
+    the known messages, and none holds a panel's title, heading, columns or glyphs."""
+    pane = SnapshotPane(str(cwd), **spec)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            await _launch(pane, init_timeout=10)
+        except KiroAttestationError:
+            pass
+    records = [r for r in caplog.records if r.name.startswith("cli_agent_orchestrator")]
+    assert records
+    for record in records:
+        message = record.getMessage()
+        assert any(shape.fullmatch(message) for shape in _ATTESTATION_LOG_SHAPES), message
+        assert not any(text in message for text in _SCREEN_ONLY), message
 
 
 @pytest.mark.asyncio

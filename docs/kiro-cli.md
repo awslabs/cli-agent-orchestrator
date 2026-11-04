@@ -97,7 +97,8 @@ After kiro-cli starts, and before any task is typed:
 - CAO reads the agent file's grant again (it must still fit the launch), then
   types `/mcp`: exactly the configured MCP servers must be running, each with a
   tool. While a server is still loading, CAO closes `/mcp` and opens it again,
-  for up to `provider_init_timeout` (see *How long CAO waits for MCP servers*).
+  until `provider_init_timeout` has passed (see *How long CAO waits for MCP
+  servers*).
   Only then does it type `/tools`, so a server's tools are on that panel when it
   is read: every tool tag must be one that the grant's tools carry, and every
   MCP tool must be one the grant names (`@server`, or `@server/tool` for a
@@ -134,11 +135,14 @@ panel again would never show a server that has since started. So CAO:
 3. waits 1 s, then 2 s, then 3 s before each later try, and opens `/mcp` again;
 4. stops as soon as every server is running, and goes on to `/tools`.
 
-If a server is still loading once `provider_init_timeout` has passed since the
-first open (60 s by default), the launch is refused, for example:
+CAO checks the time after each open. If a server is still loading at the first
+check after `provider_init_timeout` has passed since the first open (60 s by
+default), the launch is refused. The open under way finishes first, so the
+refusal comes a few seconds after the timeout (at most about 8 s). The message
+says how long CAO waited and how often it opened `/mcp`, for example:
 
 ```text
-kiro_v3_mcp_not_ready: MCP servers still loading after 60 s (22 opens of /mcp): ['cao-mcp-server']
+kiro_v3_mcp_not_ready: MCP servers still loading after 62 s (13 opens of /mcp): ['cao-mcp-server']
 ```
 
 A failed, extra or missing server refuses at once, without another try. So does
@@ -154,9 +158,12 @@ seconds) where `cao-server` runs, with `CAO_PROVIDER_INIT_TIMEOUT=120`, or in
 ```
 
 The same setting is also how long CAO waits for the agent prompt at startup
-(see [Configuration](configuration.md)). Each open of `/mcp` is logged at debug
-level with the time since the first open and each server's status, so the
-server log shows how long a server took to start.
+(see [Configuration](configuration.md)).
+
+**To see how long a server took to start**, run `cao-server` with
+`CAO_LOG_LEVEL=DEBUG`. CAO then logs each open of `/mcp` with the time since the
+first open and each server's status. At the default level, `INFO`, these lines
+are left out.
 
 ### Supported kiro-cli versions
 

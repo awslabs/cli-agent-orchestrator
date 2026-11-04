@@ -428,8 +428,9 @@ V3_ATTEST_READ_INTERVAL_S = 0.5
 # v3's ``/mcp`` panel is a snapshot of Kiro's server list, taken as it opens: an
 # open panel never changes, so reading it again cannot show a server that has
 # since connected. A server still loading is checked again by closing ``/mcp``
-# and opening it again, 1 s after the first open, then 2 s, then every 3 s,
-# until ``provider_init_timeout`` has passed since the first open.
+# and opening it again, 1 s after the first open, then 2 s, then every 3 s. It
+# refuses at the first check after ``provider_init_timeout`` has passed since
+# the first open: up to one open's waits (about 7.5 s) after the timeout.
 V3_MCP_REOPEN_DELAY_S = 1.0
 V3_MCP_REOPEN_DELAY_MAX_S = 3.0
 
@@ -1085,8 +1086,11 @@ class KiroCliProvider(BaseProvider):
         server that has since connected. So while a server is loading, the
         panel is closed (Escape, then the prompt must be back) and opened
         again, each time typed and checked like the first, with a short wait
-        in between, until ``provider_init_timeout`` has passed since the first
-        open; a server still loading then refuses.
+        in between. The time is checked after each open's palette and panel
+        reads: a server still loading at the first check after
+        ``provider_init_timeout`` has passed since the first open refuses. So
+        the refusal can come up to one open's waits (about 7.5 s) after the
+        timeout, never later.
 
         Anything else that is not running (a failed, extra or missing server,
         or a layout CAO cannot read) refuses at once, with no further open. So
