@@ -826,6 +826,14 @@ class RunStepResponse(BaseModel):
     terminal_id: str
     last_message: str
     status: str
+    torn_down: bool = Field(
+        default=False,
+        description=(
+            "True only when the server deleted the worker terminal it created "
+            "(issue #1203). Defaults to False, so an older server that omits it "
+            "reads as not torn down."
+        ),
+    )
     replayed: bool = Field(
         default=False,
         description=(
@@ -5578,6 +5586,7 @@ async def run_step(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
             status=response_status,
+            torn_down=result.torn_down,
         )
     except ReplayDivergenceError as e:
         # FR-3's surfacing (BR-6/BR-7, TD-3/TD-4). 409 rather than 502/504 because
