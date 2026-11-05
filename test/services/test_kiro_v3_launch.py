@@ -649,7 +649,7 @@ async def _create_to_completion(repo, *, version):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", ["2.36.0", "3.0.0"])
+@pytest.mark.parametrize("version", ["2.36.0", "2.37.0", "3.0.0"])
 async def test_the_launch_response_names_an_opted_in_pending_version(
     opted_in, agents, repo, version
 ):

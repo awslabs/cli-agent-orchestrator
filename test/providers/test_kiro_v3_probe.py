@@ -277,11 +277,11 @@ async def test_create_refuses_an_unsupported_version_before_allocation():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", ["2.36.0", "3.0.0"])
+@pytest.mark.parametrize("version", ["2.36.0", "2.37.0", "3.0.0"])
 async def test_a_pending_version_refuses_v3_before_allocation(version):
     """A version allow-listed but pending operator verification (#1167) is not admitted.
 
-    3.0.0 runs through the real probe on its own captured help, so that help passes
+    Each runs through the real probe on its own captured help, so that help passes
     the probe and the refusal comes from the pending entry, not a missing flag.
     """
     from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3UnverifiedVersionError
