@@ -152,12 +152,13 @@ async def test_prebind_failure_ends_claim_and_allows_new_claim(runtime_store, mo
         monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: 0)
         monkeypatch.setattr(terminal_service, "count_runtime_allocated_terminals", lambda: 1)
     elif failure == "key":
-        expected = terminal_service.IdempotencyKeyConflict
+        # A key hit on a stored row that does not validate fails before bind.
+        expected = terminal_service.TerminalRecordCorruptError
         args["idempotency_key"] = "key"
         monkeypatch.setattr(
             terminal_service,
             "get_idempotency_record",
-            lambda _: Mock(terminal_id="dddddddd", request_fingerprint="wrong"),
+            lambda _: Mock(terminal_id="dddddddd", request_fingerprint="any"),
         )
         monkeypatch.setattr(terminal_service, "get_terminal", lambda _: dict(id="dddddddd"))
     elif failure in ("load", "cancel"):
@@ -253,7 +254,9 @@ async def test_different_claim_is_not_an_idempotent_replay(runtime_store):
         idempotency_key="key",
     )
     assert first.id == CHILD
-    with pytest.raises(terminal_service.IdempotencyKeyConflict):
+    # A different claim is a different request, so it has its own empty slot
+    # under the key and never resolves to the first claim's terminal (#944).
+    with pytest.raises(terminal_service.IdempotencyKeyNotFound):
         await terminal_service.create_terminal(
             "claude_code",
             name,
@@ -261,6 +264,7 @@ async def test_different_claim_is_not_an_idempotent_replay(runtime_store):
             caller_id=CALLER,
             claim_id="b" * 32,
             idempotency_key="key",
+            lookup_only=True,
         )
     assert database.get_ephemeral_agent(name)["state"] == "launched"
 

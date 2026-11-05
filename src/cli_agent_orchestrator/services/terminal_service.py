@@ -268,9 +268,14 @@ _DEFERRED_INIT_SIDECAR_LOCK = threading.RLock()
 class IdempotencyKeyNotFound(Exception):
     """A ``lookup_only`` create found no live terminal for its idempotency key.
 
-    Review on PR #773. Surfaced as HTTP 404 by both create endpoints. Not a
-    ``ValueError`` for the same reason as ``IdempotencyKeyConflict`` below: the
-    endpoints already give ``ValueError`` other meanings.
+    Review on PR #773. Surfaced as HTTP 404 by both create endpoints. Since
+    issue #944 this also covers a key that IS in use but by a different request:
+    keys are scoped by request fingerprint (see ``_scoped_idempotency_key``), so
+    an unused key and a key held by someone else are the same empty slot and
+    answer the same 404. Not a ``ValueError``: ``create_session`` maps
+    ``ValueError`` to 400 and ``create_terminal_in_session`` maps it to 404, and
+    in ``create_session`` that arm sits FIRST, so a ``ValueError`` subclass would
+    be swallowed into a 400 before this exception's own arm could see it.
     """
 
 
@@ -314,28 +319,6 @@ def _failed_replay_error(
         "deferred: delete it using this terminal_id",
         terminal_id=terminal_id,
     )
-
-
-class IdempotencyKeyConflict(Exception):
-    """An idempotency key was reused for a DIFFERENT request.
-
-    Review on PR #634, issue #616. Surfaced as HTTP 409 by both create
-    endpoints -- the same shape Stripe and AWS use
-    (``IdempotentParameterMismatch``) rather than silently serving the first
-    call's result to a caller who asked for something else.
-
-    Subclasses ``Exception`` and NOT ``ValueError``, deliberately. Every
-    ``ValueError`` out of ``create_terminal`` is already spoken for by the
-    endpoints: ``create_session`` maps it to 400 and
-    ``create_terminal_in_session`` maps it to 404, and in ``create_session``
-    that arm sits FIRST -- so a ``ValueError`` subclass would be swallowed
-    into a 400 before any 409 arm could see it, and a later reorder could
-    silently re-break it. As a plain ``Exception`` the only ordering
-    requirement is that its arm precede the catch-all 500, which no reorder
-    of the ``ValueError``-family arms can violate. This also matches the
-    dominant convention in this repo (``WorktreeError(Exception)``,
-    ``ProviderError(Exception)``).
-    """
 
 
 class TerminalRecordCorruptError(Exception):
@@ -1219,12 +1202,13 @@ def _request_fingerprint(
     had before the fields existed. Both are hashed because each decides the
     created terminal's recorded ceiling, i.e. a privilege, exactly as
     ``allowed_tools`` does: two keyed creates that differ only in the bounding
-    terminal must collide (409), not resolve to the first one's terminal.
+    terminal must not resolve to the first one's terminal.
 
-    Review on PR #634, issue #616. Stored alongside the key so a later call
-    presenting the same key can be told apart: same fingerprint is a RETRY
-    (return the existing terminal), different fingerprint is a COLLISION
-    (raise ``IdempotencyKeyConflict``).
+    Review on PR #634, issue #616. A later call presenting the same key is a
+    RETRY only if its fingerprint matches. Since issue #944 the fingerprint is
+    part of the stored key itself (``_scoped_idempotency_key``), so a call with
+    the same key but a different fingerprint never sees the first call's
+    mapping at all: it lands in its own, empty slot.
 
     REQUESTED values, not resolved ones, and that is load-bearing. The key
     check runs before ``create_terminal`` resolves the working directory,
@@ -1234,14 +1218,15 @@ def _request_fingerprint(
     requested-vs-requested is the comparison that matches, and fingerprinting
     resolved values would spuriously conflict a legitimate retry issued from
     a different process cwd (whose ``working_directory=None`` resolves
-    differently) -- a false 409 on the exact case this feature serves.
+    differently) -- a lost replay (a second worker) on the exact case this
+    feature serves.
 
     ``caller_id`` is one of the fields, which is what makes a CROSS-CALLER
     collision a mismatch rather than a silent hand-off of someone else's
-    worker: two supervisors reusing ``job-1`` fingerprint differently and the
-    second gets a loud 409. It is deliberately NOT additionally scoped in the
-    primary key -- see the accepted residuals in ``create_terminal``'s
-    docstring for the one case this cannot separate.
+    worker: two supervisors reusing ``job-1`` fingerprint differently, so each
+    gets its own terminal under its own scoped key (issue #944). See the
+    accepted residuals in ``create_terminal``'s docstring for the one case this
+    cannot separate.
 
     ``env_vars`` and ``resume_session_id`` are hashed for the same reason, and
     ``env_vars`` has the sharpest precedent of any field here: ``RunStepRequest``
@@ -1305,7 +1290,7 @@ def _request_fingerprint(
       parameter accepts the enum OR a plain string -- ``api/main.py`` forwards
       a query string while ``parse_kiro_engine`` returns the member, and the
       same logical request arriving by those two routes must produce ONE digest
-      or a legitimate retry 409s. The ``kas`` alias canonicalises to ``v3`` for
+      or a legitimate retry misses its replay. The ``kas`` alias canonicalises to ``v3`` for
       the same reason: a retry spelled ``kas`` and one spelled ``v3`` are one
       request (#1167).
 
@@ -1365,8 +1350,9 @@ def _request_fingerprint(
     # scheduling. Unhashed, seeding a key for task A and retrying the otherwise
     # identical request with task B handed back A's terminal and discarded B
     # entirely: no conflict, no delivery, no log line. Hashed, that second call
-    # is a 409, which is what both the endpoint's "exact request" contract and
-    # the CLI's own help text already promise.
+    # is a different request with its own terminal (issue #944), which is what
+    # both the endpoint's "exact request" contract and the CLI's own help text
+    # already promise: a key replays only the exact request that claimed it.
     #
     # The orchestration type rides along because it selects HOW the message is
     # delivered, so the same text under a different type is a different
@@ -1377,7 +1363,7 @@ def _request_fingerprint(
     # AFTER creation by `_send_direct_input_handoff`/`_run_step_and_build_result`
     # rather than passed here -- `initial_message` is None on both attempts, so
     # a handoff retry still reuses its worker. That asymmetry is the honest one:
-    # these endpoints own delivery and can therefore conflict on it; the handoff
+    # these endpoints own delivery and can therefore distinguish on it; the handoff
     # path does not, and deduplicating ITS submission needs the durable run
     # record tracked separately (#715), not this fingerprint.
     if initial_message_orchestration_type is None:
@@ -1415,6 +1401,24 @@ def _request_fingerprint(
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
+
+
+def _scoped_idempotency_key(idempotency_key: str, request_fingerprint: str) -> str:
+    """Return the storage key for ``idempotency_key`` under ``request_fingerprint``.
+
+    Issue #944. The caller's key alone used to be the stored key, and a create
+    whose fingerprint differed from the stored one was refused with 409 while an
+    unused key answered 404 (``lookup_only``) or 201 (keyed create). The
+    difference told any WRITE-scoped caller whether some other request had
+    claimed a key, without allocating anything. Scoping the stored key by the
+    fingerprint removes the signal at its source: a mismatched request finds no
+    mapping, exactly as for an unused key. A keyed create then creates its own
+    terminal (idempotent for its own retries), and a ``lookup_only`` answers 404.
+
+    The fingerprint is a fixed-width sha256 hexdigest and comes FIRST, so the
+    caller-controlled key cannot forge the boundary between the two parts.
+    """
+    return f"{request_fingerprint}:{idempotency_key}"
 
 
 # A single 32-bit draw is already unlikely to repeat; ten fresh draws after a
@@ -1809,7 +1813,10 @@ async def create_terminal(
             no live terminal. The same fingerprint check as any other replay
             applies, so this is not a fingerprint-blind lookup. The returned
             terminal may still be initializing: it is an identity for
-            inspection and cleanup, not permission to send input.
+            inspection and cleanup, not permission to send input. A key that
+            is unused and a key claimed by a DIFFERENT request both raise
+            ``IdempotencyKeyNotFound`` (issue #944), so a lookup cannot tell
+            whether someone else is using a key.
         idempotency_key: Review on PR #634, issue #616. When given and a PRIOR
             call already created a terminal for the SAME KEY **and the same
             request**, that terminal is returned as-is and nothing else in
@@ -1824,12 +1831,15 @@ async def create_terminal(
 
             The key does NOT identify the request on its own -- it is matched
             together with a fingerprint of ELEVEN fields (see
-            ``_request_fingerprint``). Presenting a key that a DIFFERENT
-            request already claimed raises ``IdempotencyKeyConflict``
-            (HTTP 409) rather than handing back a terminal that answers
-            someone else's question. A key whose terminal no longer exists is
-            treated as stale and simply creates fresh -- that is not a
-            conflict.
+            ``_request_fingerprint``), and the pair is the stored key (see
+            ``_scoped_idempotency_key``, issue #944). Presenting a key that a
+            DIFFERENT request already claimed therefore creates a fresh
+            terminal for THIS request, idempotent for its own retries, rather
+            than handing back a terminal that answers someone else's question.
+            It is deliberately not refused: a 409 there, against a 201 or 404
+            for an unused key, told a caller whether the key was in use. A key
+            whose terminal no longer exists is treated as stale and simply
+            creates fresh.
 
             THE FIELD SET IS CLOSED BY ENUMERATION, not by however many review
             rounds happened to run. Every caller-reachable parameter of BOTH
@@ -1914,30 +1924,15 @@ async def create_terminal(
             A first call carrying an invalid engine raises before any terminal
             or key row is written, so a key hit implies the STORED engine was
             valid -- and any later differing engine now mismatches the
-            fingerprint and is refused.
+            fingerprint, misses the replay, and reaches the validator itself.
 
-            ACCEPTED MISATTRIBUTION, recorded rather than left silent. Two
-            cases, only one of which is this change's:
-
-            - USED key + invalid engine: was 200 (the bypass above), now 409
-              "this key was already used for a different request". So the
-              operator is told to change their KEY when their ENGINE is what
-              is wrong. Accepted rather than fixed, because reaching the real
-              validator means loading the agent profile and running the Kiro
-              capability probe -- a ``subprocess.run`` -- which is exactly the
-              work this short-circuit exists to skip; paying it on every retry
-              would trade away the property the feature is FOR in exchange for
-              a better message. The request is refused either way; only the
-              stated reason is imprecise.
-            - FRESH key + invalid engine: 404 on
-              ``POST /sessions/{name}/terminals`` (400 on ``POST /sessions``),
-              because the validator raises a BARE ``ValueError`` -- not a
-              ``KiroCapabilityError`` -- so it falls past that route's 400 arm
-              to its generic "not found" arm. That is PRE-EXISTING, is
-              unchanged by this change, and is deliberately not fixed here --
-              correcting it means reworking error mapping this change does not
-              own. Noted only so the 409 above is not mistaken for a
-              regression from a 400 that never existed.
+            A USED key + invalid engine is therefore rejected exactly as a
+            FRESH key + invalid engine is: 404 on
+            ``POST /sessions/{name}/terminals`` (400 on ``POST /sessions``),
+            because the validator raises a BARE ``ValueError`` -- not a
+            ``KiroCapabilityError`` -- so it falls past that route's 400 arm to
+            its generic "not found" arm. That mapping is PRE-EXISTING and
+            deliberately not fixed here.
 
             This resolves an apparent tension with the commit directly beneath
             this one, which stopped ``engine`` being forwarded to a non-Kiro
@@ -1987,8 +1982,8 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
-        IdempotencyKeyConflict: If ``idempotency_key`` was already used for a
-            different request (surfaced as HTTP 409 by both create endpoints)
+        IdempotencyKeyNotFound: If ``lookup_only`` and no terminal is
+            recorded for this key AND this request (HTTP 404)
         TerminalRecordCorruptError: If the terminal a key maps to has a stored
             row that does not satisfy the ``Terminal`` model (HTTP 500)
         TerminalLimitError: If the node's tracked-terminal cap (CAO_MAX_TERMINALS /
@@ -2083,6 +2078,7 @@ async def _create_terminal_unguarded(
 
     description = normalize_description(description, truncate=True)
     request_fingerprint: Optional[str] = None
+    storage_key: Optional[str] = None
     if idempotency_key:
         request_fingerprint = _request_fingerprint(
             provider,
@@ -2103,7 +2099,11 @@ async def _create_terminal_unguarded(
             caller_ceiling=caller_ceiling,
             delegating_terminal_id=delegating_terminal_id,
         )
-        existing_record = get_idempotency_record(idempotency_key)
+        # Issue #944: look up, store and delete under the fingerprint-scoped
+        # key, never the bare one. A different request under the same key
+        # finds nothing here, the same as a key nobody has used.
+        storage_key = _scoped_idempotency_key(idempotency_key, request_fingerprint)
+        existing_record = get_idempotency_record(storage_key)
         existing_terminal_id = existing_record.terminal_id if existing_record else None
         if existing_terminal_id is not None:
             # Only the LOOKUP is guarded. `Terminal(**row)` is deliberately
@@ -2148,7 +2148,7 @@ async def _create_terminal_unguarded(
                 # if a concurrent caller already replaced the mapping, this
                 # deletes nothing and this attempt's own insert below is the
                 # one that raises IntegrityError instead.
-                delete_idempotency_key(idempotency_key, existing_terminal_id)
+                delete_idempotency_key(storage_key, existing_terminal_id)
                 logger.info(
                     "idempotency_key %r maps to terminal %r, which no longer exists; "
                     "creating a new terminal",
@@ -2156,30 +2156,12 @@ async def _create_terminal_unguarded(
                     existing_terminal_id,
                 )
             else:
-                # Reached ONLY once the mapped terminal is confirmed to still
-                # exist, and that ordering is the whole point: the stale-key
-                # branch above already fell through, so a key whose terminal is
-                # gone is never compared and never conflicts. Checking the
-                # fingerprint first would 409 the legitimate case this feature
-                # was built for -- an operator reusing a key from a job that
-                # already finished.
-                if existing_record is not None and (
-                    existing_record.request_fingerprint != request_fingerprint
-                ):
-                    # A different request under the same key is operator error,
-                    # not a retry, and returning the stored terminal here is not
-                    # a merely-wrong return value: _handoff_impl feeds it
-                    # straight into reuse_terminal_id, so this caller's prompt
-                    # would be delivered into the OTHER caller's running worker,
-                    # in that worker's session, under its tool restrictions --
-                    # and this caller's teardown would then delete it.
-                    raise IdempotencyKeyConflict(
-                        f"idempotency_key {idempotency_key!r} was already used for a "
-                        "different request; use a distinct key"
-                    )
+                # The mapped terminal still exists. No fingerprint comparison is
+                # needed: the storage key already includes the fingerprint, so
+                # only this same request can have produced this mapping.
                 # A genuine retry: same key, same request. Return the terminal
                 # the first call produced without doing any real work -- the
-                # property haofeif signed off on, unchanged by the check above.
+                # property haofeif signed off on.
                 #
                 # If that first call is a synchronous create still inside
                 # provider.initialize(), wait for it first: the replay must
@@ -3044,7 +3026,7 @@ async def _create_terminal_unguarded(
                             defer_init and deferred_delete_on_failure is False
                         ),
                         session_incarnation_id=session_incarnation_id,
-                        idempotency_key=idempotency_key,
+                        idempotency_key=storage_key,
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
                         delegate_tools=delegate_tools,

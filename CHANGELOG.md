@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
+  now stored scoped by the request fingerprint, so a request that reuses a key another, different
+  request already claimed gets its own slot. On `POST /sessions` and
+  `POST /sessions/{session_name}/terminals` such a request now creates a fresh terminal (201,
+  idempotent for its own retries) instead of answering 409, and with `lookup_only=true` it answers
+  404, the same as an unused key. Stored key values change, so a keyed retry that spans the
+  upgrade creates a new terminal once instead of replaying.
 - **The ambient AG-UI stream sends generative UI as `CUSTOM` `cao.generative_ui`, not
   `GENERATIVE_UI`.** AG-UI 1.0 has no `GENERATIVE_UI` event type, and its processing rules say a
   producer "MUST NOT emit an event type the protocol does not describe" (`CUSTOM` and `RAW` exist
