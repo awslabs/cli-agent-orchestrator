@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Local-only end-to-end check of the CAO Dojo page against a real cao-server
 # and a real Claude Code agent: approve, then a fresh agent and reject, then a
-# run with nothing pending. Exits 0 only if every assertion passes. Not wired
+# run with nothing pending, then an answer CAO skips because the prompt is no
+# longer pending. Exits 0 only if every assertion passes. Not wired
 # into CI; it needs cao, a logged-in `claude`, and Playwright's Chromium.
 #
 #   examples/ag-ui/cao-dojo/tools/e2e-local.sh
@@ -244,6 +245,7 @@ fresh_agent
 phase reject
 cao shutdown --session "cao-$SESSION" >/dev/null 2>&1 || true
 phase none
+phase skipped
 
 if [ "$result" -eq 0 ]; then echo "e2e-local: PASS"; else echo "e2e-local: FAIL"; fi
 exit "$result"

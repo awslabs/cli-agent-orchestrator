@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **The ambient AG-UI stream sends generative UI as `CUSTOM` `cao.generative_ui`, not
+  `GENERATIVE_UI`.** AG-UI 1.0 has no `GENERATIVE_UI` event type, and its processing rules say a
+  producer "MUST NOT emit an event type the protocol does not describe" (`CUSTOM` and `RAW` exist
+  for that). `GET /agui/v1/stream` now sends an allow-listed `emit_ui` component as `event: CUSTOM`
+  with a spec `CustomEvent` body, `{"type": "CUSTOM", "name": "cao.generative_ui", "value":
+  {component, props, event_id, terminal_id, session_name, timestamp, traceparent}}`, the same name
+  and value the run plane already used. There is no compatibility flag. A client that listened for
+  `GENERATIVE_UI` must listen for `CUSTOM` and read `value` when `name` is `cao.generative_ui`; the
+  in-tree consumers (the EventSource viewer, the CAO Dojo page and its e2e driver, and the dashboard
+  `showcase.sh` gate) are updated. Off-list components are still refused as `RAW` with
+  `rejected_component`. `docs/agui.md` no longer claims that any AG-UI client renders these frames.
+- **The `[agui]` extra now needs `ag-ui-protocol>=1.0.0`** (was `>=0.1.19`), because the run plane
+  declares `protocolVersion` on `RUN_STARTED` from the SDK's 1.0 constant. An install that pins an
+  older SDK now gets a resolver conflict, or HTTP 501 from `POST /agui/v1/run`.
+- **A `resume[]` entry for an unknown interrupt id now ends `RUN_FINISHED` instead of `RUN_ERROR`.**
+  As AG-UI 1.0 asks, the run proceeds without the entry and CAO logs a server-side warning; an answer
+  to an expired interrupt is skipped the same way. A client that used `RUN_ERROR` to detect a bad id
+  no longer gets one; it reads `RUN_FINISHED.result.skippedResume` instead, which lists each skipped
+  entry as `{interruptId, reason}` with `reason` `unknown` (also used for an evicted id) or
+  `expired`. The key is absent when nothing was skipped.
+- **`agui_stream.AGUI_GENERATIVE_UI` is removed from `__all__`**, and the constant itself is gone,
+  because the `GENERATIVE_UI` event type it named is no longer sent. Use `AGUI_CUSTOM` and
+  `CAO_GENERATIVE_UI_EVENT_NAME`.
+
 - **Kiro ephemeral helpers on v3** (#1167 Phase 2, #1074 phase 5; preview, pending the operator
   checklist). `kiro_cli` can now be listed in `ephemeral.allowed_providers` (an operator opt-in; the
   default stays `claude_code`), and a create reports `enforcement: "hard"`. A Kiro helper is not yet

@@ -180,11 +180,13 @@ async def test_empty_or_non_json_body_is_rejected_with_422(construct, raw):
 
 
 @pytest.mark.asyncio
-async def test_resume_with_unknown_interrupt_id_ends_with_run_error(construct):
+async def test_resume_with_unknown_interrupt_id_still_finishes(construct):
+    # AG-UI 1.0: the run proceeds without an unrecognised entry (#1191), and
+    # the body still ends.
     frames = await _post_run(_body(resume=[_approve("nonexistent-id")]))
 
-    assert [f["type"] for f in frames] == ["RUN_STARTED", "RUN_ERROR"]
-    assert "nonexistent-id" in frames[-1]["message"]
+    assert [f["type"] for f in frames] == ["RUN_STARTED", "STATE_SNAPSHOT", "RUN_FINISHED"]
+    assert frames[-1]["outcome"] == {"type": "success"}
 
 
 @pytest.fixture

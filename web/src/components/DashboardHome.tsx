@@ -10,6 +10,7 @@ import { OutputViewer } from './OutputViewer'
 import { AgentDescription } from './AgentDescription'
 import { FleetStatusCard } from './FleetStatusCard'
 import { FleetWorkers } from './FleetWorkers'
+import { HealthCard } from './HealthCard'
 import { parseServerTime } from '../time'
 
 const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
@@ -291,8 +292,9 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
         </button>
       </div>
 
-      {/* Fleet */}
+      {/* Server and fleet */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <HealthCard />
         <FleetStatusCard />
       </div>
 

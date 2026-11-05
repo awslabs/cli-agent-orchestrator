@@ -39,7 +39,7 @@ typed events:
 | a2a_delegation | `TOOL_CALL_START` | Cross-agent A2A task; closer also synthesizes `TOOL_CALL_RESULT` |
 | file modification | `STATE_DELTA` (RFC 6902) against a fleet `STATE_SNAPSHOT` | |
 | error | `RUN_ERROR` | |
-| agent-authored UI | `GENERATIVE_UI` | |
+| agent-authored UI | `CUSTOM` with `name: "cao.generative_ui"` | Off-list component: `RAW` with `rejected_component` |
 
 [1] **L1 Cleanup A (TOOL_CALL lifecycle):** Handoff records with
 `orchestration_type` of `handoff` or `assign` now map to `TOOL_CALL_START`
@@ -171,16 +171,32 @@ as the original stream -- no duplicate closers, no orphan frames.
 
 ## Generative UI
 
-Any agent in the fleet — regardless of provider — can author a UI intent and
-have it rendered uniformly by any AG-UI client. The safety model is what makes
+Any agent in the fleet — regardless of provider — can author a UI intent, and
+a client that knows CAO's `cao.generative_ui` event renders it the same way
+whichever provider wrote it. The safety model is what makes
 that shippable over *untrusted* agents: an agent may only emit a **closed
 allow-list of named components with JSON props** — no HTML, no script, no
 `eval`, no iframe. An off-list component is **refused, never rendered**.
 
 **Wire path.** An agent calls the `emit_ui` MCP tool (or
 `POST /agui/v1/emit_ui`) → the intent rides a CAO event as a `ui` block
-(`{component, props}`) → the AG-UI adapter maps it to a typed `GENERATIVE_UI`
-frame → `GET /agui/v1/stream` emits it → any AG-UI client renders it.
+(`{component, props}`) → the AG-UI adapter maps it to a `CUSTOM` event named
+`cao.generative_ui` → `GET /agui/v1/stream` emits it → a client that handles
+that name renders it.
+
+AG-UI 1.0 defines no generative-UI event type, and a producer "MUST NOT emit an
+event type the protocol does not describe" (`CUSTOM` and `RAW` exist for that).
+The frame is therefore a spec `CustomEvent`. A stock AG-UI client receives it
+and can ignore it; it renders nothing unless it handles `cao.generative_ui`.
+Both planes use the same name and value:
+
+```text
+event: CUSTOM
+data: {"type": "CUSTOM", "name": "cao.generative_ui",
+       "value": {"component": "progress", "props": {"label": "demo", "value": 0.5},
+                 "event_id": "...", "terminal_id": "...", "session_name": "...",
+                 "timestamp": "...", "traceparent": null}}
+```
 
 **Server-side validation** (`services/agui_stream.py`): the closed allow-list
 `GENERATIVE_UI_COMPONENTS = {approval_card, choice_prompt, diff_summary,
@@ -208,7 +224,7 @@ falling back to an inert placeholder for anything unknown.
 [`examples/ag-ui/ag-ui-dashboard/`](../examples/ag-ui/ag-ui-dashboard) is a credentials-free,
 runnable demonstration: `run.sh` starts a `cao-server` with the surface enabled
 and `showcase.sh` drives all six allow-listed components plus an off-list
-refusal through `emit_ui`, gating on the `GENERATIVE_UI` frames actually
+refusal through `emit_ui`, gating on the `CUSTOM` `cao.generative_ui` frames actually
 arriving on the live SSE stream (so it doubles as a deployment smoke test). Teach
 an agent the component vocabulary with the bundled
 [`agui-author`](../skills/agui-author/SKILL.md) skill.
@@ -230,7 +246,7 @@ wire dialect, consumer shape, and intended use:
 
 The **ambient plane** is the `GET /agui/v1/stream` SSE endpoint. It speaks
 CAO's own AG-UI dialect: `event:` + `data:` frames with UPPER_SNAKE event types
-(`STATE_SNAPSHOT`, `STATE_DELTA`, `STEP_STARTED`, `GENERATIVE_UI`, etc.) and an
+(`STATE_SNAPSHOT`, `STATE_DELTA`, `STEP_STARTED`, `CUSTOM`, etc.) and an
 `id:` cursor for replay. Any `EventSource`-compatible client (browser-native or
 library-based) connects, hydrates from the initial `STATE_SNAPSHOT`, then folds
 live frames into its projection.
@@ -250,19 +266,45 @@ clients expect.
 A client POSTs a `RunAgentInput` (required: `threadId`, `runId` and `messages`,
 where an empty array is valid; optional: `resume[]`) and
 receives a lifecycle-legal stream: `RUN_STARTED`, then `STATE_SNAPSHOT`, then
-`RUN_FINISHED`. The response body ends right after `RUN_FINISHED` (or
-`RUN_ERROR`), because a stock AG-UI client completes a run only when the body
-ends. If open approval interrupts exist, the outcome is
+`RUN_FINISHED`. `RUN_STARTED` carries `threadId`, `runId` and
+`protocolVersion: "1.0"`, the declaration AG-UI 1.0 requires of a producer. The
+value comes from the installed `ag-ui-protocol` SDK, which is why the `[agui]`
+extra needs `ag-ui-protocol>=1.0.0`. The response body ends right after
+`RUN_FINISHED` (or `RUN_ERROR`), because a stock AG-UI client completes a run
+only when the body ends. If open approval interrupts exist, the outcome is
 `{type: "interrupt", interrupts: [...]}`, and the client re-POSTs with a
 `resume[]` array to resolve them. Each entry is
-`{interruptId, status: "resolved" | "cancelled", payload: {approved: bool} | {editedArgs}}`;
+`{interruptId, status: "resolved" | "cancelled", payload: {approved: bool, editedArgs?: string}}`;
 `status` is required, `cancelled` is treated as a deny, and a body that is not a
-valid `RunAgentInput` is rejected with HTTP 422 before the stream starts. A
+valid `RunAgentInput` is rejected with HTTP 422 before the stream starts.
+
+Each interrupt's `responseSchema` is built for that interrupt. It always lists
+`approved` (boolean) and has `"required": ["approved"]`. It lists `editedArgs`
+only when that interrupt offers `edit`; its presence is the signal that a
+client may show edit UI. For CAO, `editedArgs` is a **string: the edited answer
+text**, typed into the agent's prompt in place of a yes/no answer. It is not
+replacement tool arguments. A resume entry that names an interrupt CAO did not
+raise (or no longer retains), or that answers one that has expired, is skipped
+with a server-side warning and the run proceeds, as AG-UI 1.0 asks of a
+producer; whatever is still pending is reported again. The run also lists each
+such entry on its `RUN_FINISHED`, in `result`:
+`{"skippedResume": [{"interruptId": "<id>", "reason": "unknown" | "expired"}]}`.
+`reason` is `unknown` for an id CAO never raised or no longer retains (an
+evicted interrupt is indistinguishable from one never raised), and `expired`
+for an answer to an interrupt that expired. The list carries ids and reasons
+only, never prompt text, and rides either outcome, `success` or `interrupt`.
+When nothing is skipped, `RUN_FINISHED` has no `result` key. `skippedResume`
+appears only on `RUN_FINISHED`; a run that exits with `RUN_ERROR` carries no
+list. Abandoning an
+expired interrupt (`status: "cancelled"`) and re-sending an answer for an
+interrupt that is already resolved are skipped without a warning and are not
+listed. A
 non-empty `resume[]` gets HTTP 404 when the server has no approval bridge (the
 AG-UI surface was off when it started), as `POST /agui/v1/interrupts/{id}/resume`
 does. Once `resume[]` is delivered and nothing is
-left pending, the outcome is `{type: "success"}`. That means the decision
-reached the agent, not that the agent finished. If the agent prompts again, the
+left pending, the outcome is `{type: "success"}`. That means every entry that
+named a pending interrupt was delivered; skipped entries are logged and listed
+in `result.skippedResume`. It does not mean the agent finished. If the agent prompts again, the
 next run returns the new interrupt. `messages[]` is not read. Live fleet
 activity (`STATE_DELTA`, `STEP_STARTED/FINISHED`, `TOOL_CALL_START/END`,
 `CUSTOM`) is on the ambient plane, `GET /agui/v1/stream`. Embedders that call
