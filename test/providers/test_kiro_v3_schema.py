@@ -3,8 +3,8 @@
 Each allow-listed kiro-cli version maps to one pinned engine schema, CAO's
 reading of that engine's agent-file keys, rules, capabilities and tool tags.
 Any other version refuses v3. The 0.66.70 entry is frozen here as the Phase 1
-design records it; 2.36.0 ships the same engine and is pending operator
-verification. Provisional (#1167).
+design records it; 2.36.0, 2.37.0 and 3.0.0 ship the same engine and are pending
+operator verification. Provisional (#1167).
 """
 
 from __future__ import annotations
@@ -23,20 +23,20 @@ from cli_agent_orchestrator.providers.kiro_v3_schema import (
 )
 
 
-def test_the_allow_list_pins_2_35_1_and_marks_2_36_0_and_2_37_0_pending():
-    assert set(SUPPORTED_KIRO_CLI_VERSIONS) == {"2.35.1", "2.36.0", "2.37.0"}
+def test_the_allow_list_pins_2_35_1_and_marks_2_36_0_2_37_0_and_3_0_0_pending():
+    assert set(SUPPORTED_KIRO_CLI_VERSIONS) == {"2.35.1", "2.36.0", "2.37.0", "3.0.0"}
     assert SUPPORTED_KIRO_CLI_VERSIONS["2.35.1"].pending_operator_verification is False
-    for pending in ("2.36.0", "2.37.0"):
+    for pending in ("2.36.0", "2.37.0", "3.0.0"):
         entry = SUPPORTED_KIRO_CLI_VERSIONS[pending]
         assert entry.pending_operator_verification is True
         assert "pending operator verification" in entry.basis
         assert "cannot widen" in entry.basis
         # The same object, unchanged: a pending entry can't widen the render.
         assert entry.schema is KAS_0_66_70
-    for version in ("2.35.1", "2.36.0", "2.37.0"):
+    for version in ("2.35.1", "2.36.0", "2.37.0", "3.0.0"):
         assert kiro_v3_schema_for_cli_version(version) is KAS_0_66_70
     assert pinned_kiro_v3_schemas() == (KAS_0_66_70,)
-    for version in (None, "", "2.35", "2.35.1 ", "v2.35.1"):
+    for version in (None, "", "2.35", "2.35.1 ", "v2.35.1", "3.0", "3", "v3.0.0", "3.0.0 "):
         with pytest.raises(KiroV3UnsupportedVersionError):
             kiro_v3_schema_for_cli_version(version)
 
@@ -121,7 +121,7 @@ def test_the_unsupported_version_refusal_names_the_supported_versions_and_v2():
     message = str(excinfo.value)
     assert message.startswith("kiro_v3_unsupported_version:")
     assert "kiro-cli 2.38.0" in message
-    assert "2.35.1, 2.36.0, 2.37.0" in message
+    assert "2.35.1, 2.36.0, 2.37.0, 3.0.0" in message
     assert "engine 'v2'" in message
     assert excinfo.value.version == "2.38.0"
 
@@ -162,14 +162,17 @@ def test_a_launch_admits_a_measured_version_and_holds_a_pending_one():
 
 
 @pytest.mark.parametrize("allow_unverified", [False, True])
-@pytest.mark.parametrize("version", [None, "", "2.38.0", "2.37", "2.35.1 ", "v2.37.0"])
+@pytest.mark.parametrize(
+    "version",
+    [None, "", "2.38.0", "2.37", "2.35.1 ", "v2.37.0", "2.37.1", "3.0.1", "3.0", "v3.0.0"],
+)
 def test_a_launch_refuses_a_version_outside_the_allow_list(version, allow_unverified):
     """The operator opt-in admits pending entries only, never an unknown version."""
     with pytest.raises(KiroV3UnsupportedVersionError):
         require_launchable_kiro_v3_version(version, allow_unverified=allow_unverified)
 
 
-@pytest.mark.parametrize("version", ["2.36.0", "2.37.0"])
+@pytest.mark.parametrize("version", ["2.36.0", "2.37.0", "3.0.0"])
 def test_a_pending_version_refuses_unless_opted_in_under_its_own_entry(version):
     with pytest.raises(KiroV3UnverifiedVersionError) as excinfo:
         require_launchable_kiro_v3_version(version)
