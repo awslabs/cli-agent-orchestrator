@@ -7,7 +7,8 @@
   answerable approval card described in #1109. No npm, no framework, no
   build step. It:
     - opens an EventSource on GET /agui/v1/stream?since=… (the live stream) and
-      renders fleet state and the six allow-listed GENERATIVE_UI components;
+      renders fleet state and the six allow-listed generative-UI components
+      (CUSTOM events named "cao.generative_ui");
     - renders approval_card with Approve and Reject buttons;
     - posts POST /agui/v1/run (the run plane: fetch-based SSE) to collect open
       interrupts, and resumes one with
@@ -86,6 +87,7 @@
   .gcard[data-state="approved"] { border-color: var(--ok); }
   .gcard[data-state="rejected"] { border-color: var(--err); }
   .gcard[data-state="settled"] { opacity: 0.6; }
+  .gcard[data-state="skipped"] { opacity: 0.6; border-style: dashed; }
   .fields { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; font-size: 13px; }
   .fields dt { color: var(--muted); }
   .fields dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
@@ -164,8 +166,12 @@
     approval_card: true, choice_prompt: true, diff_summary: true,
     progress: true, metric: true, agent_card: true,
   });
+  // AG-UI 1.0 has no generative-UI event type: CAO sends CUSTOM with this
+  // name and the component in `value` (services/agui_stream.py
+  // CAO_GENERATIVE_UI_EVENT_NAME).
+  var GENERATIVE_UI_NAME = "cao.generative_ui";
   var STREAM_EVENTS = [
-    "STATE_SNAPSHOT", "STATE_DELTA", "GENERATIVE_UI",
+    "STATE_SNAPSHOT", "STATE_DELTA", "CUSTOM",
     "RUN_STARTED", "RUN_FINISHED", "STEP_STARTED", "STEP_FINISHED",
     "TOOL_CALL_START", "TOOL_CALL_END", "TEXT_MESSAGE_CONTENT", "RUN_ERROR",
   ];
@@ -334,6 +340,7 @@
     approved: "approved",
     rejected: "rejected",
     settled: "no longer pending",
+    skipped: "answer not used",
   };
   function setCardState(card, state, note) {
     card.setAttribute("data-state", state);
@@ -488,7 +495,7 @@
     line.appendChild(el("span", "le", type));
     var desc = "";
     try {
-      if (type === "GENERATIVE_UI") desc = data.component;
+      if (type === "CUSTOM") desc = data.name === GENERATIVE_UI_NAME ? (data.value || {}).component : data.name;
       else if (type === "STATE_SNAPSHOT") desc = "snapshot: " + ((data.snapshot && data.snapshot.sessions || []).length) + " session(s)";
       else if (type === "STATE_DELTA") desc = (data.delta || []).length + " patch op(s)";
       else if (type === "RUN_FINISHED") desc = "outcome: " + ((data.outcome && data.outcome.type) || "—");
@@ -516,7 +523,7 @@
     var sseId = ev.lastEventId || "";
     var ownId = sseId && sseId !== prevStreamId ? sseId : "";
     prevStreamId = sseId;
-    var id = stateFrame ? null : data.event_id || ownId;
+    var id = stateFrame ? null : data.event_id || (data.value && data.value.event_id) || ownId;
     if (id) {
       if (seenIds.has(id)) return;
       seenIds.add(id);
@@ -533,8 +540,9 @@
       } catch (e) {
         logEvent("page", "PATCH_REJECTED", { message: e.message + "; fleet state unchanged" });
       }
-    } else if (type === "GENERATIVE_UI") {
-      addComponent(data.component, data.props);
+    } else if (type === "CUSTOM" && data.name === GENERATIVE_UI_NAME) {
+      var ui = data.value && typeof data.value === "object" ? data.value : {};
+      addComponent(ui.component, ui.props);
     }
   }
   function buildStreamUrl(base, tok) {
@@ -604,12 +612,13 @@
   }
 
   // The run plane: fetch-based SSE over POST /agui/v1/run (data:-only frames).
-  function addRunResult(terminal, outcome, detail) {
+  function addRunResult(terminal, outcome, detail, skipped) {
     dropEmpty(els.runs);
     var row = el("div", "run");
     row.setAttribute("data-testid", "run-result");
     row.setAttribute("data-terminal", terminal);
     if (outcome) row.setAttribute("data-outcome", outcome);
+    if (skipped && skipped.length) row.setAttribute("data-skipped", skipped.join(" "));
     row.appendChild(el("div", "rt", terminal + (outcome ? " · outcome: " + outcome : "")));
     if (detail) row.appendChild(el("div", "rd", detail));
     els.runs.insertBefore(row, els.runs.firstChild);
@@ -649,9 +658,28 @@
       if ((state === "pending" || state === "sending") && openIds.indexOf(id) < 0) setCardState(card, "settled");
     });
   }
+  // Ids of the resume entries CAO did not use, from RUN_FINISHED.result
+  // (an unknown, evicted or expired interrupt). Ids only; nothing else is read.
+  function skippedIds(data) {
+    var r = data && data.result;
+    var list = r && typeof r === "object" && Array.isArray(r.skippedResume) ? r.skippedResume : [];
+    return list
+      .filter(function (s) { return s && typeof s.interruptId === "string"; })
+      .map(function (s) { return s.interruptId; });
+  }
   function onRunFinished(data, decided, openAtStart) {
     var outcome = data.outcome && data.outcome.type;
-    if (decided) setCardState(decided.card, decided.approved ? "approved" : "rejected", "RUN_FINISHED");
+    var skipped = skippedIds(data);
+    // A skipped answer was not used, so the card is neither approved nor
+    // rejected: it goes to a neutral state that says why.
+    skipped.forEach(function (id) {
+      var card = cards.get(id);
+      if (card) setCardState(card, "skipped", "this prompt was no longer pending");
+    });
+    var decidedSkipped = decided && skipped.indexOf(decided.card.getAttribute("data-interrupt-id")) >= 0;
+    if (decided && !decidedSkipped) {
+      setCardState(decided.card, decided.approved ? "approved" : "rejected", "answer sent");
+    }
     if (outcome === "interrupt") {
       var open = (data.outcome.interrupts || []).map(function (intr) {
         var card = addApprovalCard(interruptToProps(intr));
@@ -659,13 +687,23 @@
         return String(intr.id);
       });
       reconcile(open, openAtStart);
-      addRunResult("RUN_FINISHED", outcome, open.length + " approval(s) waiting");
+      addRunResult("RUN_FINISHED", outcome, open.length + " approval(s) waiting" + skippedNote(skipped), skipped);
     } else {
       reconcile([], openAtStart);
-      addRunResult("RUN_FINISHED", outcome || "—", decided
-        ? (decided.approved ? "approval delivered to the agent" : "rejection delivered to the agent")
-        : "nothing is waiting for approval");
+      var detail = decidedSkipped
+        ? "answer not used: this prompt was no longer pending"
+        : decided
+          ? (decided.approved ? "approval sent" : "rejection sent") + skippedNote(skipped)
+          : skipped.length
+            ? skipped.length + " answer(s) not used: no longer pending"
+            : "nothing is waiting for approval";
+      addRunResult("RUN_FINISHED", outcome || "—", detail, skipped);
     }
+  }
+  function skippedNote(skipped) {
+    return skipped.length
+      ? " · " + skipped.length + " answer(s) not used: no longer pending"
+      : "";
   }
   function runAgentInput(extra) {
     var prompt = (els.prompt.value || "").trim();
