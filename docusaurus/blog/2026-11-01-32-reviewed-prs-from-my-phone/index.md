@@ -72,7 +72,7 @@ Part of every review is mutation testing: deliberately breaking the code in smal
 
 A broken version the tests miss isn't a footnote. It becomes a new test.
 
-After several rounds of back and forth, a change reaches the stage where it's ready for another maintainer (or agent) to review, with nearly all findings already fixed. On the Saturday exemption above, the Publisher agent wrapped up with four minor nits, three of which went out in the very next push.
+After several rounds of back and forth, a change reaches the stage where it's ready for another maintainer (or agent) to review, with nearly all findings already fixed. On the Saturday exemption above, the review ended with four minor nits, and the Publisher pushed three of them in the very next push.
 
 One catch worth naming. On the work to support Kiro CLI's newest engine (the biggest PR I pushed from my phone), a reviewer found that a file path with a specific character would make a standard Unix tool misread it as a variable assignment and launch the wrong program. This problem was caught before any human saw the code, and got fixed with a test. Across that track's second phase, three review rounds also deliberately broke the isolation and launch code 111 separate ways.
 
