@@ -116,7 +116,9 @@ def test_unrecognized_mcp_layouts_refuse(fixture):
     ("row", "outcome"),
     [
         (McpServerRow("cao-mcp-server", "● running", 34), ()),
-        (McpServerRow("cao-mcp-server", "⠋ loading", 0), ("cao-mcp-server",)),
+        # Kiro's bundled TUI draws ◌ (o with icons off); only the word is relied on.
+        (McpServerRow("cao-mcp-server", "◌ loading", 0), ("cao-mcp-server",)),
+        (McpServerRow("cao-mcp-server", "o loading", 0), ("cao-mcp-server",)),
         (McpServerRow("cao-mcp-server", "✗ failed", 0), "failed"),
         (McpServerRow("cao-mcp-server", "● running", 0), "0 tools"),
     ],
