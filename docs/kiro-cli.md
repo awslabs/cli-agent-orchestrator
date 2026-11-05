@@ -95,13 +95,16 @@ After kiro-cli starts, and before any task is typed:
 - the header names the agent (as on v2);
 - the workspace check runs again;
 - CAO reads the agent file's grant again (it must still fit the launch), then
-  types `/mcp` and reads it until no server is still loading: exactly the
-  configured MCP servers must be running, each with a tool. Only then does it
-  type `/tools`, so a server's tools are on that panel when it is read: every
-  tool tag must be one that the grant's tools carry, and every MCP tool must be
-  one the grant names (`@server`, or `@server/tool` for a single tool). The
-  tags come from the pinned engine schema: `fs_write` gives the `code` tool,
-  which carries `read` as well as `write`, so a write-only grant shows both.
+  types `/mcp`: exactly the configured MCP servers must be running, each with a
+  tool. While a server is still loading, CAO closes `/mcp` and opens it again,
+  until `provider_init_timeout` has passed (see *How long CAO waits for MCP
+  servers*).
+  Only then does it type `/tools`, so a server's tools are on that panel when it
+  is read: every tool tag must be one that the grant's tools carry, and every
+  MCP tool must be one the grant names (`@server`, or `@server/tool` for a
+  single tool). The tags come from the pinned engine schema: `fs_write` gives
+  the `code` tool, which carries `read` as well as `write`, so a write-only
+  grant shows both.
 
 Only then does the terminal accept input. If any check fails, no task is typed
 and the window is closed.
@@ -115,6 +118,53 @@ The launch command is:
 
 `--effort` comes from the profile's `kiroConfig.effort`, when set.
 
+### How long CAO waits for MCP servers
+
+**Why it matters.** An MCP server such as `cao-mcp-server` needs a few seconds
+to start after kiro-cli does. CAO types no task until every configured server
+is running: before that, `/tools` doesn't list the server's tools, so CAO
+couldn't check them.
+
+**What CAO does.** Kiro v3's `/mcp` panel shows the servers as they were when
+the panel opened, and it never changes while it stays open. Reading an open
+panel again would never show a server that has since started. So CAO:
+
+1. opens `/mcp` and reads it;
+2. if a server is still loading, closes the panel (Escape) and waits for the
+   prompt to come back;
+3. waits 1 s, then 2 s, then 3 s before each later try, and opens `/mcp` again;
+4. stops as soon as every server is running, and goes on to `/tools`.
+
+CAO checks the time after each open. If a server is still loading at the first
+check after `provider_init_timeout` has passed since the first open (60 s by
+default), the launch is refused. The open under way finishes first, so the
+refusal comes a few seconds after the timeout (at most about 8 s). The message
+says how long CAO waited and how often it opened `/mcp`, for example:
+
+```text
+kiro_v3_mcp_not_ready: MCP servers still loading after 62 s (13 opens of /mcp): ['cao-mcp-server']
+```
+
+A failed, extra or missing server refuses at once, without another try. So does
+a dialog that appears after `/mcp` closes: CAO never answers it, and types
+nothing more.
+
+**To wait longer** for a slow server, raise `provider_init_timeout` (in
+seconds) where `cao-server` runs, with `CAO_PROVIDER_INIT_TIMEOUT=120`, or in
+`settings.json`:
+
+```json
+{ "server": { "provider_init_timeout": 120 } }
+```
+
+The same setting is also how long CAO waits for the agent prompt at startup
+(see [Configuration](configuration.md)).
+
+**To see how long a server took to start**, run `cao-server` with
+`CAO_LOG_LEVEL=DEBUG`. CAO then logs each open of `/mcp` with the time since the
+first open and each server's status. At the default level, `INFO`, these lines
+are left out.
+
 ### Supported kiro-cli versions
 
 | kiro-cli | v3 engine | Status |
@@ -122,9 +172,15 @@ The launch command is:
 | 2.35.1 | `@kiro/agent` 0.66.70 | measured |
 | 2.36.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 | 2.37.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
+| 3.0.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 
 Any other version refuses v3; v2 is not affected. A new kiro-cli release needs a
 CAO update before v3 runs on it.
+
+Every pending version runs the same v3 engine as 2.35.1, so CAO checks it with the
+same rules. Each was added by reading its installed engine and help screens, without
+running a chat. What a pending version still lacks is a live run of the operator
+checklist.
 
 ### Pending versions (operator only)
 
@@ -172,7 +228,7 @@ The message never names a path on the server (it may be a shared server); the se
 | `kiro_v3_trust_dialog` | kiro-cli asked to trust the workspace anyway, including when that dialog was declined and Kiro exited | report it; CAO never answers that dialog |
 | `kiro_v3_startup_dialog` | kiro-cli showed a dialog or a selector at startup that CAO doesn't answer: one it has no pattern for, the approval picker, or v2's "Switch to V3" offer | report it with a screenshot |
 | `kiro_v3_tools_mismatch` | `/tools` shows a tag or MCP tool the grant does not allow, shows no tools, or shows a layout CAO can't read (a clipped list too); the `/tools` palette didn't appear; the launch allows every tool; or the agent file is no longer a v3 universal file, or its grant no longer fits the launch | reinstall; if it persists, report it |
-| `kiro_v3_mcp_not_ready` | `/mcp` shows an extra, failed or missing server, one still loading after about 20 s, or a layout CAO can't read; the `/mcp` palette didn't appear; or the prompt didn't come back after the panels | check that the server starts on its own, then retry |
+| `kiro_v3_mcp_not_ready` | `/mcp` shows an extra, failed or missing server, one still loading once `provider_init_timeout` has passed (see *How long CAO waits for MCP servers*), or a layout CAO can't read; the `/mcp` palette didn't appear; a dialog appeared after `/mcp` closed; or the prompt didn't come back after a panel | check that the server starts on its own; for a slow server, raise `provider_init_timeout`; then retry |
 | `kiro_v3_mcp_not_ready` (ungranted servers) | the agent file configures an MCP server its grant doesn't name | `cao install <name> --provider kiro_cli --engine v3` |
 
 ### FAQ

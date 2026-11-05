@@ -69,7 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.kiro/agents`, and the workspace's `.kiro/` holds no configuration; after the header, CAO
   reads `/mcp` until no server is loading, then `/tools`, before any task. **Not yet a
   supported configuration:** v3 support is claimed only once the live operator checklist has passed.
-  A kiro-cli version still pending operator verification (2.36.0, 2.37.0) refuses unless the operator sets
+  A kiro-cli version still pending operator verification (2.36.0, 2.37.0, 3.0.0; each ships the
+  same v3 engine, `@kiro/agent` 0.66.70, as 2.35.1) refuses unless the operator sets
   `kiro.v3_allow_unverified_versions: true` (provisional, for running the checklist on it); such a
   launch logs a warning and its response carries `launch_notes`.
   Also: `cao launch` now shows the server's refusal reason instead of "Failed to connect", and the

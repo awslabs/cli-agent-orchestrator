@@ -29,16 +29,32 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         #   `Task` is a silent no-op);
         # - Monitor runs arbitrary shell scripts in the background ("I used
         #   the Monitor tool" to write the forbidden file);
-        # - BashOutput/KillShell are the Bash family's companions.
+        # - BashOutput/KillShell are the Bash family's companions. Claude Code
+        #   2.1.318 calls them GetTask (check on a background command) and
+        #   TaskStop (stop a background task; KillShell/KillBash are its legacy
+        #   aliases), so the current names are denied too;
+        # - PowerShell is Claude Code's other shell (Windows).
         # Privilege-equivalence: anything these can do, Bash can too, so
         # profiles allowed execute_bash lose nothing by keeping them.
-        "execute_bash": ["Bash", "BashOutput", "KillShell", "Task", "Agent", "Monitor"],
-        "fs_read": ["Read"],
+        "execute_bash": [
+            "Bash",
+            "BashOutput",
+            "KillShell",
+            "TaskStop",
+            "GetTask",
+            "PowerShell",
+            "Task",
+            "Agent",
+            "Monitor",
+        ],
+        # LSP answers definitions, references, symbols and hover text from the
+        # source files, so it reads file contents and gates with fs_read.
+        "fs_read": ["Read", "LSP"],
         # NotebookEdit writes .ipynb files — it must gate with fs_write or a
         # write-restricted agent keeps a file-modification path.
         "fs_write": ["Edit", "Write", "NotebookEdit"],
         "fs_list": ["Glob", "Grep"],
-        "fs_*": ["Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep"],
+        "fs_*": ["Read", "LSP", "Edit", "Write", "NotebookEdit", "Glob", "Grep"],
         # Network access. WebSearch gates here too: both reach the network and
         # are the agent's exfiltration/SSRF surface, so a profile without
         # web_fetch loses both. Note: the subagent tool (`Task`/`Agent`) is
@@ -123,6 +139,52 @@ for _provider, _mapping in TOOL_MAPPING.items():
     for _native_list in _mapping.values():
         tools.update(_native_list)
     ALL_NATIVE_TOOLS[_provider] = tools
+
+# Claude Code built-ins that no CAO grant maps to, removed from every
+# restricted Claude Code session whatever its grant. They are Claude Code's
+# own coordination channels, and each one does a job CAO already does through
+# its own tools, outside CAO's view:
+# - SendMessage / ListAgents / SendFile / FetchInboxMessage: Claude Code's own
+#   agent messaging. It reaches Claude Code subagents and teammates, other
+#   local Claude sessions on the machine and the account's cloud sessions,
+#   not CAO terminals. A CAO helper that replied with SendMessage instead of
+#   CAO's send_message lost its answer ("Not sent — no agent named '<id>' is
+#   reachable"), and a restricted agent could ask an unrestricted session to
+#   act for it. CAO's MCP send_message (`mcp__cao-mcp-server__send_message`)
+#   is not affected: a Claude Code deny matches by exact name, a legacy alias,
+#   a `*` glob or an `mcp__<server>` prefix, and every name here is a bare
+#   built-in name (no `*`, `_` or `mcp__`), so none can reach it.
+# - Workflow: deterministic multi-subagent orchestration. It starts
+#   subagents, the route by which a restricted agent escaped through Agent
+#   (the execute_bash note above), and it duplicates CAO's own workflows.
+# - CronCreate / CronDelete / CronList / ScheduleWakeup: prompts the session
+#   schedules for itself to run later, after CAO has seen the turn end.
+# - RemoteTrigger: scheduled cloud agent routines.
+# - EnterWorktree / ExitWorktree: create a git worktree and move the session
+#   out of the working directory CAO launched it in.
+# - TeamCreate / TeamDelete: agent teams. Claude Code 2.1.318 lists both as
+#   removed (a deny rule naming them only writes a debug-log line); earlier
+#   builds that had teams expose them.
+# The subagent tool itself (Agent/Task) still follows execute_bash above.
+# "*" (unrestricted) keeps everything: get_disallowed_tools returns [] first.
+ALWAYS_DISALLOWED: Dict[str, Tuple[str, ...]] = {
+    "claude_code": (
+        "SendMessage",
+        "ListAgents",
+        "SendFile",
+        "FetchInboxMessage",
+        "Workflow",
+        "CronCreate",
+        "CronDelete",
+        "CronList",
+        "ScheduleWakeup",
+        "RemoteTrigger",
+        "EnterWorktree",
+        "ExitWorktree",
+        "TeamCreate",
+        "TeamDelete",
+    ),
+}
 
 
 def _get_role_defaults(role: str) -> List[str] | None:
@@ -618,7 +680,9 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
         allowed: List of CAO tool names that are ALLOWED
 
     Returns:
-        List of provider-native tool names that should be BLOCKED
+        List of provider-native tool names that should be BLOCKED: every
+        mapped native tool the grant does not cover, plus the provider's
+        ``ALWAYS_DISALLOWED`` built-ins, which no grant short of ``"*"`` keeps.
     """
     if "*" in allowed:
         return []
@@ -638,8 +702,8 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
 
     # Everything in ALL_NATIVE_TOOLS that is NOT allowed should be blocked
     all_tools = ALL_NATIVE_TOOLS.get(provider, set())
-    disallowed = sorted(all_tools - allowed_native)
-    return disallowed
+    disallowed = (all_tools - allowed_native) | set(ALWAYS_DISALLOWED.get(provider, ()))
+    return sorted(disallowed)
 
 
 def get_allowed_tools(provider: str, allowed: List[str]) -> List[str]:

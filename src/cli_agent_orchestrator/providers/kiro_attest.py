@@ -6,7 +6,9 @@ before a v3 terminal is recorded as verified, CAO opens both panels in the
 verified pane and checks what the engine actually loaded:
 
 * ``/mcp list`` shows exactly the configured servers, each running with at
-  least one tool; it is read first, again until no server is still loading;
+  least one tool; it is checked first, and opened again until no server is
+  still loading (v3's panel is a snapshot taken as it opens, so reading an
+  open panel again never shows a change);
 * then, on ``/tools``, every builtin tag is one the grant implies, and every MCP
   row belongs to a granted server (and tool).
 
@@ -42,8 +44,8 @@ _MCP_TITLE = re.compile(r"^\s*/mcp list · (\d+) configured\s*$")
 _MCP_HEADING = re.compile(r"^\s*Configured Servers\s*$")
 _MCP_COLUMNS = re.compile(r"^\s*Name\s+Source\s+Status\s+Details\s*$")
 # Status is a glyph and a word ("● running", "✗ failed"); a server still
-# starting reads "<glyph> loading" (glyph not captured yet), so only the word
-# is relied on for that state.
+# starting reads "◌ loading" in Kiro's bundled TUI (not yet captured live), so
+# only the word is relied on for that state.
 _MCP_ROW = re.compile(r"^\s*(\S+)\s{2,}(\S+)\s{2,}(\S+ \S+)\s{2,}(.*?)\s*$")
 _MCP_TOOL_COUNT = re.compile(r"^(\d+) tools?$")
 _SEARCH = re.compile(r"^\s*search:\s+type to filter\s*$")
@@ -209,8 +211,8 @@ def check_tools_panel(
 def check_mcp_panel(servers: Dict[str, McpServerRow], expected: Iterable[str]) -> Tuple[str, ...]:
     """Require exactly the ``expected`` servers, each running with a tool.
 
-    Returns the servers still loading (the caller reads again until its
-    timeout); raises on anything else.
+    Returns the servers still loading (the caller opens the panel again until
+    its timeout); raises on anything else.
     """
     wanted = set(expected)
     extra = sorted(set(servers) - wanted)

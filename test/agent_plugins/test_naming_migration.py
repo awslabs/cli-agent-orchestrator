@@ -132,6 +132,12 @@ _VOCABULARY_BACKLOG_DOCS = [
     "cursor-cli.md",  # a Cursor plugin manifest — third-party, qualifying it would be wrong
     "opencode-cli.md",  # OpenCode's own plugin system (its Node.js prerequisite) — same reason
     "minimax-code.md",  # MiniMax's own "Plugin" schema and user-installed Plugins — same reason
+    # Its one bare "plugin" is the operator's Claude Code plugins (the subagent bullet:
+    # "can be any agent in the operator's Claude Code agent store or plugins"). That is
+    # Claude Code's own extension system, not a CAO agent plugin, so no CAO qualifier fits.
+    # The doc does not cite CAO agent plugins, so it stays out of
+    # _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS.
+    "tool-restrictions.md",
 ]
 
 #: Third-party-plugin docs that **also** legitimately reference CAO's agent

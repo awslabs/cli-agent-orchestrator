@@ -472,7 +472,10 @@ v3 (see [Kiro v3](kiro-cli.md#kiro-v3-preview)). Each launch gets its own CAO-ow
 
 Before any task is typed, CAO checks that the header names the agent, that the home and
 your `~/.kiro` markers are unchanged, and that `/tools` and `/mcp list` show only what
-the per-launch file grants and `cao-mcp-server`. Every refusal and its fix is in the
+the per-launch file grants and `cao-mcp-server`. While `cao-mcp-server` is still starting,
+CAO opens `/mcp list` again until it runs, or until `provider_init_timeout` (60 s by
+default) has passed; see [How long CAO waits for MCP servers](kiro-cli.md#how-long-cao-waits-for-mcp-servers).
+Every refusal and its fix is in the
 [Kiro helper symptom table](kiro-cli.md#when-a-helper-is-refused). CAO's own refusals
 before the window are `ephemeral_policy` errors. The probe's refusals before the window
 (an unsupported kiro-cli version, or a missing wrapper flag) keep their capability-error

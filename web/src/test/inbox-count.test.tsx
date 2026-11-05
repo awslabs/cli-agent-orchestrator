@@ -12,6 +12,7 @@ vi.mock('../components/InboxPanel', () => ({
 vi.mock('../components/TerminalView', () => ({ TerminalView: () => null }))
 vi.mock('../components/OutputViewer', () => ({ OutputViewer: () => null }))
 vi.mock('../components/FleetStatusCard', () => ({ FleetStatusCard: () => null }))
+vi.mock('../components/HealthCard', () => ({ HealthCard: () => null }))
 const session = { id: 'synthetic-session', name: 'synthetic-session', status: 'active' }
 const initialStore = useStore.getState()
 function terminal(id: string, count?: number): TerminalMeta {

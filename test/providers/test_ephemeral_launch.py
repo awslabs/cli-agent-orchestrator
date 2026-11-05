@@ -227,6 +227,9 @@ def test_recorded_profile_prompt_tools_and_cleanup(create_store, monkeypatch, pr
         args = shlex.split(command.split("; ")[-1])
         blocked = [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
         assert blocked == get_disallowed_tools("claude_code", tools)
+        # Claude Code's own messaging tool is cut; CAO's send_message is not.
+        assert "SendMessage" in blocked and "ListAgents" in blocked
+        assert [tool for tool in blocked if tool.startswith(("mcp__", "@"))] == []
         prompt_file = env[2] / "tmp" / "eeeeeeee.prompt"
         assert prompt_file.read_text() == profile.system_prompt
         config = json.loads((env[2] / "tmp" / "eeeeeeee.mcp.json").read_text())
