@@ -91,7 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dialog refuses (no key is ever sent into a dialog). After Escape, CAO now checks on the pane that
   the empty prompt is back, as after `/mcp`. The read is bounded by `provider_init_timeout`, which
   it shares with the final prompt wait, so a successful v3 init stays within about 4T+19.5s of
-  waits, plus its backend calls (`utils/init_allowance.py`). A scrolling panel refuses in a herdr
+  waits, plus about 60 backend calls (`utils/init_allowance.py`). Each call is several tmux or herdr
+  processes, about 0.1s idle and 0.2s under load, so the proof prices them at 0.25s: the client's
+  wait covers a worst-case successful v3 start only up to a `provider_init_timeout` of about 90s,
+  and above that, on a heavily loaded machine, `cao launch` can report a failure while the server
+  goes on to start the agent (a documented gap; the default 60s has about two minutes spare). A
+  scrolling panel refuses in a herdr
   pane over about 97 rows, and in a pane under 12 rows: Kiro keeps the old rows above the pane by
   default, so after one Down the read no longer follows the last screen. The
   layout, scroll rows and keys are taken from kiro-cli 3.0.0's bundled terminal UI, the same as

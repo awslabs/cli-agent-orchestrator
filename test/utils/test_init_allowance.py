@@ -7,6 +7,7 @@ Every allowance has to move when ``provider_init_timeout`` moves, which is only
 true if it is DERIVED from it rather than written down a second time.
 """
 
+import inspect
 import math
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -164,26 +165,34 @@ def test_init_allowance_covers_kimi_cli_successful_init(t):
     assert init_allowance(None, settings) >= kimi_init_cost
 
 
-#: The stated per-call bound for a backend call (a pane read, a key or a status
-#: poll) on the Kiro v3 init path; tmux ``capture-pane`` measured at about 15-25ms.
-_BACKEND_CALL_S = 0.1
+#: What one backend call on the Kiro v3 init path (a pane read, a key or a status
+#: poll) is priced at. One call is several processes: 4 tmux processes for a read
+#: (``list-sessions``, ``list-windows``, ``list-panes``, ``capture-pane``), 5 for a
+#: key, 3 herdr processes for any call. Measured through ``TmuxBackend``: about
+#: 0.1s idle, about 0.2s under load (median 0.18s, p90 0.25s at load average 15).
+_BACKEND_CALL_S = 0.25
+
+#: The largest ``provider_init_timeout`` (whole seconds) at which the client's wait
+#: still covers a worst-case successful Kiro v3 init at ``_BACKEND_CALL_S`` per
+#: call: while Antigravity's 370s floor sets the budget, 4T + 34.5 <= 398 holds
+#: up to T = 90.875s. Above it the gap is documented (``docs/kiro-cli.md``, Kiro
+#: v3's known limitations) and left to a follow-up. Any change to the allowance,
+#: the Kiro v3 waits or their call count moves this, and the boundary test fails.
+_KIRO_V3_COVERED_T_MAX_S = 90
 
 
-@pytest.mark.parametrize("t", [1, 5, 30, 60, 76, 77, 92, 93, 120, 300, 600])
-def test_init_allowance_covers_kiro_v3_successful_init(t):
-    """A successful Kiro v3 ``initialize``: the shell, startup, ``/mcp`` and final
-    prompt waits (T each), plus its fixed waits beyond them: the identity reads,
-    the ``/mcp`` loop's last open and its close after T, and the ``/tools`` read,
-    which shares the final prompt wait's T but can end one screen, the prompt
-    check and that wait's floor past it (``_INIT_PHASES``'s comment). Plus the
-    backend calls outside those waits, at ``_BACKEND_CALL_S`` each. After the
-    server's confirm-and-resubmit loop the client must still be waiting. The
-    waits and read counts are the provider's own constants, so a longer one
-    there fails this."""
-    import inspect
+def _kiro_v3_worst_successful_init_s(t: int) -> float:
+    """A worst-case successful Kiro v3 ``initialize`` at ``provider_init_timeout`` t.
 
+    The shell, startup, ``/mcp`` and final prompt waits (T each), plus the fixed
+    waits beyond them: the identity reads, the ``/mcp`` loop's last open and its
+    close after T, and the ``/tools`` read, which shares the final prompt wait's
+    T but can end one screen, the prompt check and that wait's floor past it
+    (``_INIT_PHASES``'s comment). Plus the backend calls outside those waits, at
+    ``_BACKEND_CALL_S`` each. The waits and read counts are the provider's own
+    constants, so a longer one there moves this.
+    """
     from cli_agent_orchestrator.providers import kiro_cli
-    from cli_agent_orchestrator.services import terminal_service
     from cli_agent_orchestrator.utils.terminal import wait_until_status
 
     render = kiro_cli.V3_ATTEST_RENDER_WAIT_S
@@ -216,11 +225,43 @@ def test_init_allowance_covers_kiro_v3_successful_init(t):
         + 4
     )
     assert calls == 60
+    return 4 * t + fixed + calls * _BACKEND_CALL_S
+
+
+def _client_init_wait_s(t: int) -> float:
+    """What the client waits for init at T, after the server's confirm-and-resubmit loop."""
+    from cli_agent_orchestrator.services import terminal_service
+
     confirm = terminal_service._DEFERRED_SUBMIT_CONFIRM_TIMEOUT * (
         1 + terminal_service._DEFERRED_SUBMIT_MAX_RESUBMITS
     )
-    settings = dict(_SETTINGS, provider_init_timeout=t)
-    assert init_allowance(None, settings) - confirm >= 4 * t + fixed + calls * _BACKEND_CALL_S
+    return init_allowance(None, dict(_SETTINGS, provider_init_timeout=t)) - confirm
+
+
+@pytest.mark.parametrize("t", [1, 5, 30, 60, 76, 77, 89, _KIRO_V3_COVERED_T_MAX_S])
+def test_init_allowance_covers_kiro_v3_successful_init(t):
+    """Up to ``_KIRO_V3_COVERED_T_MAX_S``, the client is still waiting when a
+    worst-case successful Kiro v3 init ends, on a loaded machine."""
+    assert _client_init_wait_s(t) >= _kiro_v3_worst_successful_init_s(t)
+
+
+def test_init_allowance_kiro_v3_covered_up_to_its_boundary():
+    """The documented gap, pinned: covered at the boundary, not one second above
+    it. The default T=60s has about two minutes spare."""
+    t = _KIRO_V3_COVERED_T_MAX_S
+    assert _client_init_wait_s(t) >= _kiro_v3_worst_successful_init_s(t)
+    assert _client_init_wait_s(t + 1) < _kiro_v3_worst_successful_init_s(t + 1)
+    spare_at_default = _client_init_wait_s(60) - _kiro_v3_worst_successful_init_s(60)
+    assert 110 <= spare_at_default <= 130
+
+
+@pytest.mark.parametrize("t", [_KIRO_V3_COVERED_T_MAX_S + 1, 92, 93, 120, 300, 600])
+def test_init_allowance_kiro_v3_gap_above_the_boundary_is_real(t):
+    """Above the boundary, a worst-case successful Kiro v3 init on a loaded
+    machine outlasts the client's wait: the documented gap, not a claim of
+    coverage. Closing it (a larger allowance, or fewer processes per call) is a
+    follow-up; when that lands, these fail and the boundary moves."""
+    assert _client_init_wait_s(t) < _kiro_v3_worst_successful_init_s(t)
 
 
 def test_init_allowance_floors_are_the_provider_modules_constants():

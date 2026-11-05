@@ -337,6 +337,13 @@ The message never names a path on the server (it may be a shared server); the se
 | `kiro_v3_mcp_not_ready` | `/mcp` shows an extra, failed or missing server, one still loading once `provider_init_timeout` has passed (see *How long CAO waits for MCP servers*), or a layout CAO can't read; the `/mcp` palette didn't appear; a dialog appeared after `/mcp` closed; or the prompt didn't come back after a panel | check that the server starts on its own; for a slow server, raise `provider_init_timeout`; then retry |
 | `kiro_v3_mcp_not_ready` (ungranted servers) | the agent file configures an MCP server its grant doesn't name | `cao install <name> --provider kiro_cli --engine v3` |
 
+### Known limitations
+
+With `provider_init_timeout` above about 90 s, on a heavily loaded machine, a
+successful v3 start can take longer than the client waits for it: `cao launch`
+then reports a failure while the server goes on to start the agent. At the
+default 60 s there are about two minutes to spare.
+
 ### FAQ
 
 **Will my v2 agents change?** No. Only `cao install --engine v3`, or a profile
