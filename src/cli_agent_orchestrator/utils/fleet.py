@@ -40,12 +40,13 @@ from cli_agent_orchestrator.constants import (
     ELASTIC_BROKER_URL_ENV,
 )
 
-# Connect fast, read patiently. A broker is normally one port-forward away, so a
-# slow connect means it is not there; a slow read means a worker is thinking.
+# Connect fast, read patiently (except status polling, below). A broker is normally
+# one port-forward away, so a slow connect means it is not there; a slow read means
+# a worker is thinking.
 _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 60.0
 # Polling a worker's terminal status should fail fast so stalled reads don't
-# overrun the caller's timeout budget (matches local poll_until_done timeout).
+# overrun the caller's timeout budget (matches local wait_until_terminal_status timeout).
 _STATUS_READ_TIMEOUT = 5.0
 
 
@@ -249,6 +250,11 @@ class FleetClient:
         raise_for_status: bool = True,
         timeout: Optional[tuple[float, Optional[float]]] = None,
     ) -> requests.Response:
+        """Issue an HTTP request to the broker.
+
+        A ``None`` read element in ``timeout`` (e.g. ``(_CONNECT_TIMEOUT, None)``) is
+        reserved for streaming reads such as log tailing.
+        """
         try:
             response = requests.request(
                 method,

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Remote worker status polling no longer overruns `--timeout` by up to 60s.** (#1059)
+  `FleetClient.terminal_status` now defaults its read timeout to 5.0s (matching the local
+  terminal poll ceiling in `wait_until_terminal_status`) instead of inheriting the module-wide
+  60s read timeout, keeping stalled broker responses bounded within the caller's poll budget.
+
+
 - **Kiro ephemeral helpers on v3** (#1167 Phase 2, #1074 phase 5; preview, pending the operator
   checklist). `kiro_cli` can now be listed in `ephemeral.allowed_providers` (an operator opt-in; the
   default stays `claude_code`), and a create reports `enforcement: "hard"`. A Kiro helper is not yet

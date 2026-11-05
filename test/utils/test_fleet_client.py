@@ -18,6 +18,8 @@ operator time rather than merely returning the wrong value:
 - **`follow_logs` sets no read timeout**, because a quiet log is not a stalled
   one -- and a 60s read timeout on a followed log looks exactly like a worker
   that died.
+- **`terminal_status` fails fast with a 5s read timeout**, matching the local
+  status poll budget so stalled broker reads do not overrun `--timeout`.
 
 There is no live broker anywhere in this file, and no `kubernetes` import. That
 is the module's design claim -- four HTTP routes and one token -- so stubbing
@@ -330,6 +332,7 @@ class TestProxiedRoutes:
             return_value=_response(payload={"id": "t1", "status": "completed"}),
         ) as mock_request:
             assert client.terminal_status("w1", "t1") == "completed"
+            # Status polling caps the read at 5.0s to stay within the caller poll budget
             assert mock_request.call_args.kwargs["timeout"] == (5.0, 5.0)
 
     def test_terminal_status_allows_custom_read_timeout(self, client):
@@ -338,6 +341,7 @@ class TestProxiedRoutes:
             return_value=_response(payload={"id": "t1", "status": "idle"}),
         ) as mock_request:
             assert client.terminal_status("w1", "t1", read_timeout=2.5) == "idle"
+            # Disambiguate connect (5.0s) vs custom read timeout (2.5s)
             assert mock_request.call_args.kwargs["timeout"] == (5.0, 2.5)
 
 
