@@ -3912,6 +3912,20 @@ def _bind_unlaunched(plan: LaunchPlan | None) -> None:
             logger.warning("Decision launch cleanup bind failed", exc_info=True)
 
 
+def _idempotent_create_failed_response(exc: IdempotentCreateFailed) -> JSONResponse:
+    """The 424 for a keyed replay of a failed original create (review on PR #773).
+
+    ``detail`` stays the cause string. ``terminal_id`` names the failed
+    terminal's row when its rollback retained it for a deferred provider
+    cleanup, so the caller has a handle to delete it, and is null otherwise
+    (issue #943).
+    """
+    return JSONResponse(
+        status_code=status.HTTP_424_FAILED_DEPENDENCY,
+        content={"detail": str(exc), "terminal_id": exc.terminal_id},
+    )
+
+
 def _set_launch_note(response: Response, plan: LaunchPlan | None) -> None:
     if plan is not None:
         try:
@@ -3941,7 +3955,7 @@ async def create_session(
     resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Terminal:
+) -> Terminal | JSONResponse:
     """Create a new session with exactly one terminal.
 
     When ``memory_manager`` is truthy, a sidecar ``memory_manager`` terminal is
@@ -4176,7 +4190,7 @@ async def create_session(
         # A replay of a create whose initialization failed (review on PR #773).
         # A distinct status, so the caller reports that cause and does not
         # mistake it for a retryable server error.
-        raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(e))
+        return _idempotent_create_failed_response(e)
     except IdempotencyKeyConflict as e:
         # The key was already used for a DIFFERENT request (review on PR #634,
         # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
@@ -4330,7 +4344,7 @@ async def create_terminal_in_session(
     claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Terminal:
+) -> Terminal | JSONResponse:
     """Create additional terminal in existing session.
 
     ``defer_init=true``: return as soon as the tmux window is created and the
@@ -4501,7 +4515,7 @@ async def create_terminal_in_session(
         # A replay of a create whose initialization failed (review on PR #773).
         # A distinct status, so the caller reports that cause and does not
         # mistake it for a retryable server error.
-        raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(e))
+        return _idempotent_create_failed_response(e)
     except IdempotencyKeyConflict as e:
         # The key was already used for a DIFFERENT request (review on PR #634,
         # issue #616) — 409, not the 404 the generic ValueError arm below would
@@ -4568,7 +4582,7 @@ async def create_terminal_in_session_as_operator(
     idempotency_key: Optional[str] = None,
     body: Optional[OperatorTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Terminal:
+) -> Terminal | JSONResponse:
     """Add a terminal to an EXISTING session as the operator.
 
     The sibling ``POST /sessions/{name}/terminals`` is how a running terminal
@@ -4643,7 +4657,7 @@ async def create_terminal_in_session_as_operator(
     except IdempotentCreateFailed as e:
         # A keyed replay of a failed original, as on the other create routes
         # (review on PR #773).
-        raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(e))
+        return _idempotent_create_failed_response(e)
     except IdempotencyKeyConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (

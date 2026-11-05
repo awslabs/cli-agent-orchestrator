@@ -281,7 +281,39 @@ class IdempotentCreateFailed(Exception):
     caller can tell "the create you are replaying failed, here is why" from an
     ordinary server error and report that cause instead of retrying. The failed
     create has already been rolled back; this allocates nothing.
+
+    ``terminal_id`` is set when that rollback kept the failed terminal's row
+    because its provider deferred cleanup (issue #943): the row is then the
+    only handle an operator has to find and delete it.
     """
+
+    def __init__(self, message: str, terminal_id: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.terminal_id = terminal_id
+
+
+def _failed_replay_error(
+    terminal_id: str, idempotency_key: str, error: BaseException
+) -> IdempotentCreateFailed:
+    """Build the replay's error for a failed original, naming a retained row.
+
+    The waiter settles only after the original's rollback, so a row that still
+    exists here was kept on purpose (a deferred provider cleanup) and is
+    surfaced so it can be removed (issue #943).
+    """
+    message = (
+        f"terminal {terminal_id!r} for idempotency_key "
+        f"{idempotency_key!r} failed to initialize: {error}"
+    )
+    try:
+        get_terminal(terminal_id)
+    except ValueError:
+        return IdempotentCreateFailed(message)
+    return IdempotentCreateFailed(
+        f"{message}; its terminal record was retained because provider cleanup was "
+        "deferred: delete it using this terminal_id",
+        terminal_id=terminal_id,
+    )
 
 
 class IdempotencyKeyConflict(Exception):
@@ -2097,9 +2129,8 @@ async def _create_terminal_unguarded(
                 if waiter is not None and not lookup_only:
                     await waiter.settled.wait()
                     if waiter.error is not None:
-                        raise IdempotentCreateFailed(
-                            f"terminal {existing_terminal_id!r} for idempotency_key "
-                            f"{idempotency_key!r} failed to initialize: {waiter.error}"
+                        raise _failed_replay_error(
+                            existing_terminal_id, idempotency_key, waiter.error
                         ) from waiter.error
                 # The key's mapping outlived the terminal it pointed to (e.g.
                 # a completed-and-torn-down handoff, retried long after the
@@ -2163,9 +2194,8 @@ async def _create_terminal_unguarded(
                 if waiter is not None and not lookup_only:
                     await waiter.settled.wait()
                     if waiter.error is not None:
-                        raise IdempotentCreateFailed(
-                            f"terminal {existing_terminal_id!r} for idempotency_key "
-                            f"{idempotency_key!r} failed to initialize: {waiter.error}"
+                        raise _failed_replay_error(
+                            existing_terminal_id, idempotency_key, waiter.error
                         ) from waiter.error
                     row = get_terminal(existing_terminal_id)
                 try:
@@ -3312,8 +3342,6 @@ async def _create_terminal_unguarded(
         return terminal
 
     except Exception as e:
-        if sync_init_waiter is not None:
-            sync_init_waiter.settle(e)
         # A delegation-ceiling refusal (#948, Steps 0c/0d) is raised before
         # anything is allocated: the launch was refused, not attempted.
         _bind_decision_launch(
@@ -3332,15 +3360,22 @@ async def _create_terminal_unguarded(
         # backend rollback was its own ``await`` inside this handler, so a
         # cancellation landing there unwound the handler with the row,
         # provider registration and worktree still in place.
-        await _await_uncancellable(
-            _roll_back_failed_create,
-            terminal_id,
-            session_name,
-            rollback_window_name,
-            session_created=session_created,
-            window_created=window_created,
-            worktree_repo_root=worktree_repo_root,
-        )
+        #
+        # The waiter settles only once the rollback is done (issue #943), so a
+        # replay that wakes on the failure sees whether the row was retained.
+        try:
+            await _await_uncancellable(
+                _roll_back_failed_create,
+                terminal_id,
+                session_name,
+                rollback_window_name,
+                session_created=session_created,
+                window_created=window_created,
+                worktree_repo_root=worktree_repo_root,
+            )
+        finally:
+            if sync_init_waiter is not None:
+                sync_init_waiter.settle(e)
         raise
     finally:
         # Every exit, including cancellation, settles the waiter so no replay

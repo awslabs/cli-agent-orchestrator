@@ -353,6 +353,42 @@ class TestTerminalCreationWithWorkingDirectory:
 
         assert response.status_code == 424, response.text
         assert "failed to initialize" in response.json()["detail"]
+        assert response.json()["terminal_id"] is None
+
+    @pytest.mark.parametrize(
+        "endpoint,target",
+        [
+            ("/sessions", "session_service.create_session"),
+            ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
+            ("/sessions/test-session/terminals:operator", "terminal_service.create_terminal"),
+        ],
+    )
+    def test_replay_424_names_a_retained_failed_terminal(self, client, endpoint, target):
+        """Issue #943: when the failed original's row was retained for a
+        deferred provider cleanup, the 424 carries its terminal_id next to the
+        unchanged string detail."""
+        from cli_agent_orchestrator.services.terminal_service import IdempotentCreateFailed
+
+        failed = IdempotentCreateFailed(
+            "terminal 't1' for idempotency_key 'k' failed to initialize", terminal_id="t1"
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(f"cli_agent_orchestrator.api.main.{target}", new=AsyncMock(side_effect=failed)),
+        ):
+            params = {"provider": "kiro_cli", "agent_profile": "analyst", "idempotency_key": "k"}
+            if endpoint.endswith("/terminals"):
+                params["caller_id"] = "dcba8765"
+            response = client.post(endpoint, params=params)
+
+        assert response.status_code == 424, response.text
+        assert response.json() == {
+            "detail": "terminal 't1' for idempotency_key 'k' failed to initialize",
+            "terminal_id": "t1",
+        }
 
     @pytest.mark.parametrize(
         "endpoint,target",
