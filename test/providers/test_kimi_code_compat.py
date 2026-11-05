@@ -32,6 +32,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 
 try:
@@ -2202,17 +2203,26 @@ class TestA41TrustBound:
     def test_socket_is_skipped(self, tmp_path, caplog):
         """A unix socket must be skipped, not copied."""
 
-        source = self._source(tmp_path / "src")
-        trust = source / TRUST_DIR_NAME
-        (trust / "wd_real_record").write_text("{}")
-        sock_path = trust / "wd_socket"
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # The source lives in a short directory under /tmp, not tmp_path: an
+        # AF_UNIX path is capped at 104 bytes on macOS (108 on Linux), and the
+        # macOS per-user TMPDIR alone is about 50, so a socket under tmp_path
+        # failed to bind with "AF_UNIX path too long" before the code under
+        # test ran.
+        short_root = Path(tempfile.mkdtemp(prefix="kimi-", dir="/tmp"))
         try:
-            sock.bind(str(sock_path))
-            with caplog.at_level(logging.WARNING):
-                result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build()
+            source = self._source(short_root / "src")
+            trust = source / TRUST_DIR_NAME
+            (trust / "wd_real_record").write_text("{}")
+            sock_path = trust / "wd_socket"
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.bind(str(sock_path))
+                with caplog.at_level(logging.WARNING):
+                    result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build()
+            finally:
+                sock.close()
         finally:
-            sock.close()
+            shutil.rmtree(short_root, ignore_errors=True)
 
         runtime_trust = result.home / TRUST_DIR_NAME
         assert not (runtime_trust / "wd_socket").exists()

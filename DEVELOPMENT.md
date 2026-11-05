@@ -80,6 +80,29 @@ The Vite dev server proxies API calls to the backend at `localhost:9889`. Make s
 > [CONTRIBUTING.md](CONTRIBUTING.md#recording-test-fixtures-safely). A gitleaks
 > scan gates every PR; run it locally with `scripts/security-scan.sh gitleaks`.
 
+**The suite never touches your real home.** `test/conftest.py` points `HOME` at a
+throwaway directory for the whole session and unsets the variables that relocate
+CAO's or a provider's config root (`CAO_HOME_DIR`, `CAO_TMP_DIR`, `KIRO_HOME`,
+`CODEX_HOME`, `GROK_HOME`, the `XDG_*_HOME` dirs and others), so
+`~/.aws/cli-agent-orchestrator`, `~/.gemini`, `~/.kiro` and the rest resolve under
+it, as on a fresh CI runner. Exactly two things are kept:
+
+- a root variable that already points under the system temp directory, such as
+  `CAO_HOME_DIR=$(mktemp -d) uv run pytest ...`; a root anywhere else, inside or
+  outside your home, is unset;
+- `RUSTUP_HOME` and `CARGO_HOME`, which keep pointing at your `~/.rustup` and
+  `~/.cargo` so `test_no_ffi_guard` can run `cargo metadata`. cargo may update its
+  own `~/.cargo/.global-cache` while it does.
+
+The suite also never runs a coding-agent CLI for memory compilation or lint: the
+LLM client is stubbed to "none" unless a test installs its own.
+
+Sessions that select E2E tests or `test_kiro_cli_integration.py` keep the real
+`HOME`, because they drive authenticated provider CLIs. `CAO_TEST_REAL_HOME=1`
+keeps it for any session and `CAO_TEST_REAL_HOME=0` forces isolation; a single
+test opts out with `@pytest.mark.real_home`. Under `pytest -n`, each worker takes
+the controller's decision, so `-n` with E2E keeps the real `HOME` too.
+
 ### Unit Tests
 
 Most tests mock external dependencies, but the default invocation is not unit-only: its
