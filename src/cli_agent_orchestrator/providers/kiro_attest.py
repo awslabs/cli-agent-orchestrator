@@ -18,7 +18,10 @@ verified pane and checks what the engine actually loaded:
   (``join_tools_pages``): every row the title declares, each seen once.
   Kiro draws a scrolling panel taller than the pane, so its title is read from
   the pane's recent lines; only one ``/tools`` title may be in them, and
-  nothing but blank rows may follow the panel's footer.
+  nothing but blank rows may follow the panel's footer. By default Kiro keeps
+  the scrollback and repaints only the pane, so rows above the pane can hold
+  old text under that one title: the one-row check (``check_tools_page``) is
+  what rejects those; the one-title rule rejects copies of the panel.
 
 The parsers are pure and fail closed: any layout they do not recognize
 (v2's per-tool panels, the slash palette, a clipped list) is a refusal, never
@@ -148,7 +151,8 @@ def parse_tools_page(screen: str) -> ToolsPage:
     ``screen`` may hold lines from above the pane: Kiro draws a scrolling panel
     taller than the pane (see ``KiroCliProvider._read_v3_tools_screen``). So
     exactly one ``/tools`` title must be in it, and the panel must be the last
-    thing drawn: below its footer, only blank rows (Kiro keeps three).
+    thing drawn: below its footer, only blank rows (Kiro keeps three). Rows
+    above the pane may still be stale; ``check_tools_page`` rejects those.
     """
     body = _body(screen, _TOOLS_TITLE)
     if body is None:
@@ -197,7 +201,10 @@ def check_tools_page(page: ToolsPage, previous: Optional[ToolsPage] = None) -> N
     must have the same title and the same number of rows, all but the top row
     of ``previous`` at its top, and one row ``previous`` did not show at its
     bottom. A frame that still shows the old screen, one drawn halfway, one
-    that moved by more than one row, or a list that changed, refuses.
+    that moved by more than one row, or a list that changed, refuses. So do
+    old rows left above the pane under the one title, which is what Kiro's
+    default redraw leaves on a pane under 12 rows: this check, not the
+    one-title rule, is what keeps them out.
     """
     if previous is None:
         if page.more_above:

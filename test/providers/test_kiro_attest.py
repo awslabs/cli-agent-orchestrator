@@ -404,7 +404,7 @@ def test_a_scrolling_frame_parses_only_with_the_rows_above_the_pane(height):
 
 def test_old_frames_left_in_the_scrollback_refuse():
     """A terminal that kept every frame's overflow would hold two titles."""
-    pane = KiroPane(24, keep_old_overflow=True)
+    pane = KiroPane(24, redraw="keep_old")
     pane.draw(frame(LIVE_ROWS, height=24, offset=0))
     pane.draw(frame(LIVE_ROWS, height=24, offset=1))
     with pytest.raises(KiroAttestationError, match="no complete /tools panel on screen"):
@@ -421,3 +421,29 @@ def test_anything_but_blank_rows_below_the_footer_refuses(below):
     assert str(excinfo.value) == (
         "kiro_v3_tools_mismatch: something is drawn below the /tools panel"
     )
+
+
+@pytest.mark.parametrize("height", [11, 9, 5])
+def test_on_kiros_default_redraw_stale_rows_above_a_small_pane_are_caught_by_the_shift_check(
+    height,
+):
+    """What rejects stale rows. Kiro's default redraw keeps the scrollback: below
+    12 rows the first Down changes a row above the pane, so only the pane is
+    repainted. The read still holds exactly one title and parses as a panel,
+    so the one-title rule doesn't catch it; the one-row check does."""
+    pane = KiroPane(height)
+    pane.draw(frame(LIVE_ROWS, height=height, offset=0))
+    first = parse_tools_page(pane.capture(-100))
+    pane.draw(frame(LIVE_ROWS, height=height, offset=1))
+    for screen in (pane.capture(-100), pane.recent(100)):
+        assert screen.count("/tools · 36 tags") == 1
+        stale = parse_tools_page(screen)
+        # Not the screen Kiro drew: old rows, or the old frame's header with no ``↑ more``.
+        assert (stale.rows, stale.more_above) != (tuple((n, s) for n, s, _ in LIVE_ROWS[1:6]), True)
+        with pytest.raises(KiroAttestationError, match="did not move down by one row"):
+            check_tools_page(stale, first)
+    # A clearing redraw writes the whole frame, and the same screen follows.
+    clearing = KiroPane(height, redraw="clear")
+    clearing.draw(frame(LIVE_ROWS, height=height, offset=0))
+    clearing.draw(frame(LIVE_ROWS, height=height, offset=1))
+    check_tools_page(parse_tools_page(clearing.capture(-100)), first)

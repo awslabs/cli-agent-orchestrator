@@ -18,7 +18,11 @@ So this draws the panel from the TUI's own layout code, which is the same in
   over three reserved rows (``BELOW``: the hidden copy hint's row, its margin
   and the input frame's margin). So a frame whose list scrolls is two or three
   rows taller than the pane even before the chrome, and its top rows, the
-  title among them, go above the pane's top row (``KiroPane``).
+  title among them, go above the pane's top row (``KiroPane``);
+* Kiro's default renderer keeps the scrollback (``chat.preserveScrollback``
+  is on unless set, and CAO's helper home leaves it alone). It repaints only
+  the pane's own rows, so rows above the pane keep the text they had when
+  they left it (``KiroPane``'s ``viewport_tail`` mode).
 
 ``LIVE_ROWS`` are the 36 tags of that live run's helper (``fs_read`` and
 ``@cao-mcp-server``): the 2.35.1 capture's ``read`` and 34 ``cao-mcp-server``
@@ -156,29 +160,72 @@ class KiroPane:
     """A pane ``height`` rows tall that Kiro draws frames into.
 
     A frame taller than the pane leaves its top rows above the pane's top row,
-    in the scrollback. Kiro's renderer clears the scrollback (``CSI 3 J``) when
-    it redraws an overflowing frame, so by default the scrollback holds only
-    the current frame's overflow; ``keep_old_overflow`` keeps every earlier
-    frame's overflow too, as a terminal that ignores that clear would.
+    in the scrollback. How a later frame is drawn is ``redraw``:
+
+    * ``viewport_tail``, Kiro's default (``chat.preserveScrollback`` on): the
+      scrollback is never cleared. A frame whose first change is on the pane
+      is rewritten from the pane's top row down, so rows a growing frame
+      pushes off the top carry the new frame's text. A frame whose first
+      change is above the pane ("off-screen-change") has only its last
+      ``height`` rows painted onto the pane, and the rows above keep their
+      old text: what a read sees there is stale.
+    * ``clear`` (``chat.preserveScrollback`` off): the scrollback is cleared
+      (``CSI 3 J``) and the whole frame written again, so the scrollback holds
+      only the current frame's overflow.
+    * ``keep_old``: ``clear`` on a terminal that ignores that clear, so every
+      frame's overflow stays.
     """
 
-    def __init__(self, height: int, *, keep_old_overflow: bool = False) -> None:
+    REDRAWS = ("viewport_tail", "clear", "keep_old")
+
+    def __init__(self, height: int, *, redraw: str = "viewport_tail") -> None:
+        assert redraw in self.REDRAWS, redraw
         self.height = height
-        self.keep_old_overflow = keep_old_overflow
+        self.redraw = redraw
         self.scrollback: List[str] = []
         self.visible: List[str] = [""] * height
+        self._frame: Optional[List[str]] = None
+        #: The frame row on the pane's top row (negative: blank rows above a short frame).
+        self._top = 0
+
+    def _write(self, lines: Sequence[str]) -> None:
+        """Write ``lines`` from the pane's top row: rows past its bottom scroll the top up."""
+        lines = list(lines)
+        overflow = max(0, len(lines) - self.height)
+        self.scrollback += lines[:overflow]
+        self._top = max(0, self._top) + overflow
+        shown = lines[overflow:]
+        self.visible = shown + [""] * (self.height - len(shown))
 
     def draw(self, lines: Sequence[str]) -> None:
         lines = list(lines)
-        overflow = max(0, len(lines) - self.height)
-        if not self.keep_old_overflow:
-            self.scrollback = []
-        self.scrollback += lines[:overflow]
-        self.visible = [""] * (self.height - len(lines[overflow:])) + lines[overflow:]
+        previous, self._frame = self._frame, lines
+        if self.redraw != "viewport_tail" or previous is None:
+            if self.redraw != "keep_old":
+                self.scrollback = []
+            overflow = max(0, len(lines) - self.height)
+            self.scrollback += lines[:overflow]
+            self._top = len(lines) - self.height
+            shown = lines[overflow:]
+            self.visible = [""] * (self.height - len(shown)) + shown
+            return
+        first_change = next(
+            (i for i, (old, new) in enumerate(zip(previous, lines)) if old != new),
+            min(len(previous), len(lines)),
+        )
+        if first_change >= self._top:
+            self._write(lines[max(0, self._top) :])
+            return
+        # Off-screen change: paint the frame's last rows onto the pane only.
+        self._top = len(lines) - self.height
+        shown = lines[-self.height :]
+        self.visible = [""] * (self.height - len(shown)) + shown
 
     def copy(self) -> "KiroPane":
-        twin = KiroPane(self.height, keep_old_overflow=self.keep_old_overflow)
+        twin = KiroPane(self.height, redraw=self.redraw)
         twin.scrollback, twin.visible = list(self.scrollback), list(self.visible)
+        twin._frame = None if self._frame is None else list(self._frame)
+        twin._top = self._top
         return twin
 
     def capture(self, start: int) -> str:

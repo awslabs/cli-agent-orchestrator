@@ -445,8 +445,14 @@ V3_ATTEST_RENDER_WAIT_S = (V3_ATTEST_READS - 1) * V3_ATTEST_READ_INTERVAL_S
 # frame, with three reserved rows below it, so the panel is always taller than
 # the pane and its title is pushed above the pane's top row. Each ``/tools``
 # read is therefore the pane plus its recent scrollback: on tmux the visible
-# pane and this many lines above it, on herdr the last this many lines.
-# Provisional; on herdr a scrolling panel in a pane over about 97 rows refuses.
+# pane and this many lines above it, on herdr the last this many lines. By
+# default (``chat.preserveScrollback`` on) Kiro repaints only the pane, so
+# rows above it keep the text they had when they left it: on a pane of 12
+# rows or more those are only the chrome, the title, its divider and the
+# search row, which don't change as the list scrolls; below 12 rows the read
+# is old rows under the one title, and the one-row check refuses it after
+# one Down. Provisional; on herdr a scrolling panel in a pane over about 97
+# rows refuses.
 V3_TOOLS_READ_LINES = 100
 _V3_TOOLS_DIALOG = "a dialog appeared on /tools; it was not answered and nothing more was typed"
 

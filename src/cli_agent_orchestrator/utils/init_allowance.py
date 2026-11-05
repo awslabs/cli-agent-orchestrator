@@ -45,21 +45,29 @@ from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_sto
 # only one render wait (2.5s) as a floor, so the read, the prompt check after
 # it and the wait end at most about 7.5s past that T (one screen's render
 # wait, the prompt check and the floor), where a list that fits took 5s. So a
-# successful v3 init can take up to about 4T+19.5s
-# (``test_init_allowance_covers_kiro_v3_successful_init``). The fourth T is
-# therefore no longer pure margin: v3 uses it, and the fixed overshoot is
-# covered by the fixed delivery-confirmation headroom added below, not by this
-# linear term.
+# successful v3 init can spend up to about 4T+19.5s in its waits and sleeps.
+# Those 19.5s count sleeps only. About 60 backend calls (pane reads, keys and
+# status polls, each a tmux or herdr command) also fall outside the T-bounded
+# waits: the 5 identity reads, about 31 in the ``/mcp`` loop's last open and its
+# closes, about 18 after the last ``/tools`` Down, and a few between phases.
+# At a stated bound of 0.1s per call (tmux ``capture-pane`` measured at about
+# 15-25ms; herdr's ``pane read`` not measured), they add about 6s, so about
+# 4T+25.5s in all (``test_init_allowance_covers_kiro_v3_successful_init``).
+# The fourth T is therefore no longer pure margin: v3 uses it, and the fixed
+# overshoot is covered by the fixed delivery-confirmation headroom added below,
+# not by this linear term.
 _INIT_PHASES = 4
 
 # Worst case of the server's confirm-and-resubmit loop after a send
 # (``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` x (1 + ``_DEFERRED_SUBMIT_MAX_RESUBMITS``)
 # = 32s) with headroom for the pre-dispatch work (memory injection) and polling.
 # Once T is large enough that ``_INIT_PHASES * T`` sets the budget, this
-# headroom also has to absorb Kiro v3's fixed overshoot beyond 4T, about 19.5s
-# (see ``_INIT_PHASES``): 60 - 32 leaves 28s, so about 8.5s remain for the
-# pre-dispatch work and polling. Lowering this, or adding a fixed wait to the
-# Kiro v3 init path, needs that sum checked again.
+# headroom also has to absorb Kiro v3's fixed overshoot beyond 4T: about 19.5s
+# of waits plus about 6s of backend calls at 0.1s each (see ``_INIT_PHASES``).
+# 60 - 32 leaves 28s, so about 2.5s remain for the pre-dispatch work and
+# polling at that per-call bound (about 7s at the measured tmux call times).
+# Lowering this, adding a fixed wait or more pane reads to the Kiro v3 init
+# path, or a slower backend, needs that sum checked again.
 _DELIVERY_CONFIRM_ALLOWANCE = 60
 
 # Connect budget for a synchronous create. Kept small and SEPARATE from the read

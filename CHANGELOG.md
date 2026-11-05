@@ -90,8 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed or hidden row, a duplicate, a wrong count, a second title, text below the panel or a
   dialog refuses (no key is ever sent into a dialog). After Escape, CAO now checks on the pane that
   the empty prompt is back, as after `/mcp`. The read is bounded by `provider_init_timeout`, which
-  it shares with the final prompt wait, so a successful v3 init stays within about 4T+19.5s
-  (`utils/init_allowance.py`). A scrolling panel in a herdr pane over about 97 rows refuses. The
+  it shares with the final prompt wait, so a successful v3 init stays within about 4T+19.5s of
+  waits, plus its backend calls (`utils/init_allowance.py`). A scrolling panel refuses in a herdr
+  pane over about 97 rows, and in a pane under 12 rows: Kiro keeps the old rows above the pane by
+  default, so after one Down the read no longer follows the last screen. The
   layout, scroll rows and keys are taken from kiro-cli 3.0.0's bundled terminal UI, the same as
   2.37.0's, and no scrolled panel has been read end to end live yet. See "How CAO reads a long
   tool list" in `docs/kiro-cli.md`.

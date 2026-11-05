@@ -17,7 +17,6 @@ import re
 import shlex
 from pathlib import Path
 from test.providers.kiro_tools_panel import (
-    CHROME,
     LIVE_ROWS,
     KiroPane,
     frame,
@@ -1058,7 +1057,9 @@ class ScrollingToolsPane(SnapshotPane):
     ``↓ more`` (its last rows are never shown), and ``declared`` overrides the
     title's count. ``scroll_lag`` reads still show the old pane after a Down,
     and ``tools_first_frames`` are what reads show after the ``/tools`` Enter.
-    ``keep_old_overflow`` keeps every frame's overflow in the scrollback.
+    ``redraw`` is how ``KiroPane`` draws each frame: Kiro's default
+    ``viewport_tail`` (old rows above the pane keep their text), ``clear`` or
+    ``keep_old``.
     After the ``/tools`` Escape, ``tools_close_lag`` reads show
     ``tools_close_frame`` (or the old panel), and ``dialog_after_tools_close``
     shows a dialog instead of the prompt.
@@ -1083,7 +1084,7 @@ class ScrollingToolsPane(SnapshotPane):
         reachable: Optional[int] = None,
         scroll_lag: int = 0,
         tools_first_frames: Sequence[str] = (),
-        keep_old_overflow: bool = False,
+        redraw: str = "viewport_tail",
         tools_close_lag: int = 0,
         tools_close_frame: Optional[str] = None,
         dialog_after_tools_close: bool = False,
@@ -1109,7 +1110,7 @@ class ScrollingToolsPane(SnapshotPane):
         self.tools_close_lag = tools_close_lag
         self.tools_close_frame = tools_close_frame
         self.dialog_after_tools_close = dialog_after_tools_close
-        self.term = KiroPane(height, keep_old_overflow=keep_old_overflow)
+        self.term = KiroPane(height, redraw=redraw)
         #: Old panes a read shows before ``term``: a redraw trailing a Down.
         self.stale: List[KiroPane] = []
         self.offset = 0
@@ -1247,35 +1248,38 @@ def test_the_scrolling_pane_moves_by_one_row_and_stops_at_the_ends(cwd):
     assert pane.keys_after_tools_closed == ["Down"]
 
 
-@pytest.mark.parametrize("height", [5, 13, 14, 24, 30, 44])
-def test_a_scrolling_frame_is_taller_than_the_pane_so_its_title_is_above_it(cwd, height):
+@pytest.mark.parametrize(
+    ("redraw", "height"),
+    [("viewport_tail", h) for h in (12, 13, 14, 24, 30, 44)]
+    + [("clear", h) for h in (5, 9, 13, 14, 24, 30, 44)],
+)
+def test_a_scrolling_frame_is_taller_than_the_pane_so_its_title_is_above_it(cwd, redraw, height):
     """What 3.0.0's layout means for a read: the frame is the chrome, the panel
     and three reserved rows; with the list scrolling it is taller than the pane,
     so the pane's own rows never hold the title. tmux's visible read misses it;
-    the pane plus its recent scrollback holds it once."""
-    pane = ScrollingToolsPane(str(cwd), height=height)
+    the pane plus its recent scrollback holds it once, and on Kiro's default
+    redraw (12 rows or more) or the clearing one it reads as the whole frame."""
+    from cli_agent_orchestrator.providers.kiro_attest import parse_tools_page
+
+    pane = ScrollingToolsPane(str(cwd), height=height, redraw=redraw)
     _type(pane, [*"/mcp", "Enter", "Escape", *"/tools", "Enter"])
-    # The first frame: the chrome, the title and its divider are above the pane.
-    assert len(pane.term.scrollback) == len(CHROME) + 2 + (visible_rows(height) + 9 - height)
-    for _ in range(last_offset(36, height) + 1):
+    shown = visible_rows(height)
+    for offset in range(last_offset(36, height) + 1):
+        assert pane.offset == offset
         visible = pane.read_as("tmux", visible_only=True)
         assert len(visible.split("\n")) == height
         assert "/tools · 36 tags" not in visible
-        assert pane.read_as("tmux", tail_lines=100).count("/tools · 36 tags") == 1
-        assert pane.read_as("herdr", tail_lines=100).count("/tools · 36 tags") == 1
-        both_rows = 0 < pane.offset < last_offset(36, height)
-        # With both scroll rows showing, one more row is above the pane.
-        assert len(pane.term.scrollback) == len(CHROME) + 2 + both_rows + (
-            visible_rows(height) + 9 - height
-        )
+        for backend in BACKENDS:
+            whole = pane.read_as(backend, tail_lines=100)
+            assert whole.count("/tools · 36 tags") == 1
+            page = parse_tools_page(whole)
+            assert page.rows == tuple((n, src) for n, src, _ in LIVE_ROWS[offset : offset + shown])
         _type(pane, ["Down"])
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize(
-    ("height", "downs"), [(30, 15), (24, 21), (14, 31), (13, 31), (9, 31), (5, 31)]
-)
+@pytest.mark.parametrize(("height", "downs"), [(30, 15), (24, 21), (14, 31), (13, 31), (12, 31)])
 async def test_regression_a_tools_list_longer_than_the_pane_is_read_screen_by_screen(
     cwd, backend, height, downs
 ):
@@ -1284,7 +1288,8 @@ async def test_regression_a_tools_list_longer_than_the_pane_is_read_screen_by_sc
     did. CAO refused it as ``unrecognized row '↓ more'``. Now it presses Down
     until no row is left below, one key per screen read, and checks all 36.
     Kiro draws the scrolling panel taller than the pane, so the title is read
-    from the pane's recent scrollback, on tmux as on herdr, at any height."""
+    from the pane's recent scrollback, on tmux as on herdr, on any pane of 12
+    rows or more under Kiro's default redraw."""
     from cli_agent_orchestrator.providers import kiro_cli
 
     pane = ScrollingToolsPane(str(cwd), backend=backend, height=height)
@@ -1298,6 +1303,40 @@ async def test_regression_a_tools_list_longer_than_the_pane_is_read_screen_by_sc
     assert provider.attestation.tags == ("read",)
     # Every read of the open panel reached back into the scrollback.
     assert set(pane.tools_reads) == {(False, kiro_cli.V3_TOOLS_READ_LINES)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("height", [11, 9, 5])
+async def test_a_pane_under_12_rows_refuses_after_one_down(cwd, backend, height):
+    """Kiro's default redraw keeps the scrollback: below 12 rows the list's own
+    rows sit above the pane, and the first Down's change (the ``↑ more`` row)
+    is above it too, so Kiro repaints the pane only and the rows above keep
+    their old text. CAO reads one title over a mix of old and new rows, and the
+    one-row check refuses it after one Down; Escape is the last key."""
+    pane = ScrollingToolsPane(str(cwd), backend=backend, height=height)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch_helper_grant(pane)
+    assert (
+        str(excinfo.value)
+        == "kiro_v3_tools_mismatch: the /tools panel did not move down by one row"
+    )
+    assert pane.keys == _scroll_keys(1)
+    assert pane.keys_after_tools_closed == [] and pane.keys_into_dialog == []
+    assert pane.provider.identity_verified is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("height", [13, 9, 5])
+async def test_with_kiro_clearing_its_scrollback_small_panes_attest(cwd, backend, height):
+    """The non-default redraw (``chat.preserveScrollback`` off): Kiro clears the
+    scrollback and writes the whole frame again, so every read is one coherent
+    frame and even a 5-row pane attests."""
+    pane = ScrollingToolsPane(str(cwd), backend=backend, height=height, redraw="clear")
+    provider = await _launch_helper_grant(pane)
+    assert provider.identity_verified is True
+    assert pane.keys == _scroll_keys(31)
 
 
 @pytest.mark.asyncio
@@ -1336,7 +1375,10 @@ def _duplicated() -> List[tuple]:
     [
         ({"skip_at": 4}, 4, "the /tools panel did not move down by one row"),
         ({"stuck_at": 4}, 4, "the /tools panel did not move down by one row"),
-        ({"change_at": 4}, 4, "the /tools panel did not move down by one row"),
+        # Kiro's default redraw leaves the old title (36) above the pane: the
+        # bound catches the 37th row. A clearing redraw shows the new count at once.
+        ({"change_at": 4}, 15, "the /tools panel shows more rows than the 36 it declares"),
+        ({"change_at": 4, "redraw": "clear"}, 4, "the /tools panel did not move down by one row"),
         ({"reachable": 14}, 14, "the panel declares 36 tags but 35 are visible"),
         ({"declared": 37}, 15, "the panel declares 37 tags but 36 are visible"),
         (
@@ -1350,13 +1392,14 @@ def _duplicated() -> List[tuple]:
             "the /tools panel shows more rows than the 36 it declares",
         ),
         # A terminal that keeps every frame's overflow: two titles after a Down.
-        ({"keep_old_overflow": True}, 1, "no complete /tools panel on screen"),
+        ({"redraw": "keep_old"}, 1, "no complete /tools panel on screen"),
         ({"notice_below_at": 3}, 3, "something is drawn below the /tools panel"),
     ],
     ids=[
         "row_skipped",
         "did_not_scroll",
         "list_changed",
+        "list_changed_clear",
         "row_hidden",
         "count",
         "twice",
@@ -1509,7 +1552,7 @@ async def test_a_dialog_while_tools_scrolls_refuses_and_no_key_is_sent_into_it(c
     [
         ({"dialog_below_at": 2}, "something is drawn below the /tools panel"),
         (
-            {"dialog_above_at": 2, "height": 14},
+            {"dialog_above_at": 2, "height": 14, "redraw": "clear"},
             "a dialog appeared on /tools; it was not answered and nothing more was typed",
         ),
     ],
@@ -1519,8 +1562,8 @@ async def test_a_dialog_drawn_with_the_panel_stops_the_scroll_and_is_not_answere
     cwd, fault, detail
 ):
     """The panel still reads cleanly. Below it, the panel is no longer the last
-    thing drawn; above it, only the dialog check stops CAO. Either way no
-    Down and no Escape is sent."""
+    thing drawn; above it (written into the read by a clearing redraw), only
+    the dialog check stops CAO. Either way no Down and no Escape is sent."""
     from cli_agent_orchestrator.providers.kiro_cli import kiro_v3_dialog
 
     pane = ScrollingToolsPane(str(cwd), **fault)

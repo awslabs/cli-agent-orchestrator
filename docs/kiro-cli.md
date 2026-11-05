@@ -193,7 +193,20 @@ recent scrollback:
 
 Each read must hold exactly one `/tools` title, and nothing but blank rows may
 follow the panel's footer, so the panel CAO reads is the last thing on the pane.
-Old frames left in the scrollback show as a second title, and refuse.
+
+**Old rows above the pane.** By default Kiro keeps the scrollback (its
+`chat.preserveScrollback` setting is on, and CAO leaves it alone). When a frame
+changes, Kiro repaints only the pane's own rows, so rows already above the pane
+keep the text they had when they left it.
+- **On a pane of 12 rows or more,** those rows are only the notices, the title,
+  its divider and the search row, which don't change while the list scrolls. So
+  the read is the whole current panel.
+- **Below 12 rows,** the list's own rows go above the pane too, and after the
+  first Down the read is old rows under the one title. CAO refuses it.
+
+What keeps old rows out is the check that each screen is the last one moved by
+exactly one row: the "one title" rule only catches copies of the panel, as a
+terminal that kept every frame's overflow would leave.
 
 **What CAO does.**
 
@@ -210,7 +223,8 @@ Old frames left in the scrollback show as a second title, and refuse.
    tag and MCP tool allowed by the grant.
 
 For example, on a 30-row pane Kiro shows 21 of the 36 tags, so CAO presses Down
-15 times; on a 24-row pane, 21 times. This is the same on tmux and herdr.
+15 times; on a 24-row pane, 21 times. This is the same on tmux and herdr. On a
+pane under 12 rows it refuses after one Down (see above).
 
 Down is the only key CAO sends into the panel. It sends it only when the screen
 it has just read shows the panel with `↓ more` and no dialog. CAO never types
@@ -229,7 +243,7 @@ task is typed:
 
 | The message ends with | What happened | Fix |
 |---|---|---|
-| `the /tools panel did not move down by one row` | a screen skipped a row, didn't redraw within the wait, or showed a change in its rows or its count while CAO read it | retry; if it persists, report it |
+| `the /tools panel did not move down by one row` | a screen skipped a row, didn't redraw within the wait, or showed a change in its rows or its count while CAO read it; or the pane is under 12 rows tall, so the read held old rows above the pane | make the pane at least 12 rows tall; otherwise retry, and if it persists, report it |
 | `the panel declares N tags but M are visible` | some rows the title counts were never shown | report it |
 | `the /tools panel shows [...] more than once` | the same row appeared twice | report it |
 | `the /tools panel shows more rows than the N it declares` | the list went on past the count in its title | report it |
@@ -247,11 +261,12 @@ read isn't.
 **Not yet seen live.** This follows the code of Kiro's own terminal UI in
 kiro-cli 3.0.0, which is the same in 2.37.0. That covers the `↑ more` and
 `↓ more` rows, the one-row Down, the title that counts every row, the three
-rows kept below the panel, and how an overflowing frame is redrawn: Kiro clears
-the scrollback and writes the whole frame again, so the scrollback holds one
-copy of the panel's top. A live helper run's herdr history did show the top of
-an open panel, title included, above the pane. But no scrolled `/tools` panel
-has been read end to end on a live run yet, on either backend. If Kiro draws it
+rows kept below the panel, and how an overflowing frame is redrawn: by default
+Kiro repaints only the pane and keeps the rows above it as they were (with
+`chat.preserveScrollback` off it clears the scrollback and writes the whole
+frame again instead). A live helper run's herdr history did show the top of an
+open panel, title included, above the pane. But no scrolled `/tools` panel has
+been read end to end on a live run yet, on either backend. If Kiro draws it
 differently, CAO refuses the launch: it never passes a list it didn't read in
 full. With Kiro's icons turned off (`v more`), or in its screen-reader layout,
 the panel is refused too.

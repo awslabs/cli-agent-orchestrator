@@ -7,6 +7,7 @@ Every allowance has to move when ``provider_init_timeout`` moves, which is only
 true if it is DERIVED from it rather than written down a second time.
 """
 
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -163,17 +164,27 @@ def test_init_allowance_covers_kimi_cli_successful_init(t):
     assert init_allowance(None, settings) >= kimi_init_cost
 
 
+#: The stated per-call bound for a backend call (a pane read, a key or a status
+#: poll) on the Kiro v3 init path; tmux ``capture-pane`` measured at about 15-25ms.
+_BACKEND_CALL_S = 0.1
+
+
 @pytest.mark.parametrize("t", [1, 5, 30, 60, 76, 77, 92, 93, 120, 300, 600])
 def test_init_allowance_covers_kiro_v3_successful_init(t):
     """A successful Kiro v3 ``initialize``: the shell, startup, ``/mcp`` and final
     prompt waits (T each), plus its fixed waits beyond them: the identity reads,
     the ``/mcp`` loop's last open and its close after T, and the ``/tools`` read,
     which shares the final prompt wait's T but can end one screen, the prompt
-    check and that wait's floor past it (``_INIT_PHASES``'s comment). After the
+    check and that wait's floor past it (``_INIT_PHASES``'s comment). Plus the
+    backend calls outside those waits, at ``_BACKEND_CALL_S`` each. After the
     server's confirm-and-resubmit loop the client must still be waiting. The
-    waits are the provider's own constants, so a longer one there fails this."""
+    waits and read counts are the provider's own constants, so a longer one
+    there fails this."""
+    import inspect
+
     from cli_agent_orchestrator.providers import kiro_cli
     from cli_agent_orchestrator.services import terminal_service
+    from cli_agent_orchestrator.utils.terminal import wait_until_status
 
     render = kiro_cli.V3_ATTEST_RENDER_WAIT_S
     identity = (kiro_cli.IDENTITY_HEADER_READS - 1) * kiro_cli.IDENTITY_HEADER_READ_INTERVAL_S
@@ -181,11 +192,35 @@ def test_init_allowance_covers_kiro_v3_successful_init(t):
     tools_past_t = 3 * render  # the last screen, the prompt check, the final wait's floor
     fixed = identity + mcp_past_t + tools_past_t
     assert fixed == 19.5
+
+    reads = kiro_cli.V3_ATTEST_READS
+    poll = inspect.signature(wait_until_status).parameters["polling_interval"].default
+    calls = (
+        kiro_cli.IDENTITY_HEADER_READS
+        # /mcp after its last deadline check: the previous close (Escape and its
+        # prompt reads), the next open (its keys, palette reads, Enter, panel
+        # reads), then that open's close.
+        + (1 + reads)
+        + (len("/mcp") + reads + 1 + reads)
+        + (1 + reads)
+        # /tools after its last Down check: the Down, its screen's reads, the
+        # close's read and Escape, the prompt reads, the final wait's polls.
+        + 1
+        + reads
+        + 2
+        + reads
+        + math.ceil(render / poll)
+        # Between phases: the shell and startup waits' last polls, the shell
+        # command name, the launch command, the cwd re-check, the header read.
+        + 2
+        + 4
+    )
+    assert calls == 60
     confirm = terminal_service._DEFERRED_SUBMIT_CONFIRM_TIMEOUT * (
         1 + terminal_service._DEFERRED_SUBMIT_MAX_RESUBMITS
     )
     settings = dict(_SETTINGS, provider_init_timeout=t)
-    assert init_allowance(None, settings) - confirm >= 4 * t + fixed
+    assert init_allowance(None, settings) - confirm >= 4 * t + fixed + calls * _BACKEND_CALL_S
 
 
 def test_init_allowance_floors_are_the_provider_modules_constants():
