@@ -108,6 +108,95 @@ async def test_an_unrouted_launch_records_its_own_provider_only(runtime_store):
     assert database.get_launch_record(CHILD)["provider"] == "claude_code"
 
 
+# Routed helpers through the REAL provider manager: the helper cut follows the CLI that
+# runs, not the request's provider or the claim's, and a flag sent to the wrong provider
+# would make the manager refuse the launch. Only each provider's initialize() is replaced,
+# to capture the command it would type.
+
+HELPER_CUT = (
+    "Agent",
+    "Task",
+    "Monitor",
+    "Skill",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
+
+
+@pytest.fixture
+def real_providers(runtime_store, monkeypatch):
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    env, name, backend, _ = runtime_store
+    monkeypatch.setattr(claude_code, "CAO_HOME_DIR", env[2])
+    monkeypatch.setattr(codex, "CAO_HOME_DIR", env[2])
+    built = {}
+
+    async def claude_init(self):
+        built["claude_code"] = self._build_claude_command()
+
+    async def codex_init(self):
+        built["codex"] = self._build_codex_command()
+
+    monkeypatch.setattr(claude_code.ClaudeCodeProvider, "initialize", claude_init)
+    monkeypatch.setattr(codex.CodexProvider, "initialize", codex_init)
+    manager = ProviderManager()
+    monkeypatch.setattr(terminal_service, "provider_manager", manager)
+    return env, name, manager, built
+
+
+def _blocked(command):
+    args = shlex.split(command.split("; ")[-1])
+    return [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
+
+
+@pytest.mark.asyncio
+async def test_a_codex_helper_routed_to_claude_code_gets_the_helper_cut(real_providers):
+    from cli_agent_orchestrator.utils.tool_mapping import get_launch_disallowed_tools
+
+    env, _, manager, built = real_providers
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    name = create(env, {**SPEC, "provider": "codex"})["name"]
+    claimed = claim(env, name)["claim_id"]
+    terminal = await terminal_service.create_terminal(
+        "codex",
+        name,
+        session_name="cao-session",
+        caller_id=CALLER,
+        claim_id=claimed,
+        launch_plan=LaunchPlan(model="claude_code-medium", provider="claude_code"),
+    )
+    assert terminal.provider == "claude_code" and terminal.ephemeral is True
+    provider = manager._providers[CHILD]
+    assert isinstance(provider, claude_code.ClaudeCodeProvider) and provider._ephemeral is True
+    blocked = _blocked(built["claude_code"])
+    for tool in HELPER_CUT:
+        assert blocked.count(tool) == 1, tool
+    (bound,) = bound_events(name)
+    assert bound["provider"] == "claude_code"
+    assert bound["disallowed_tools"] == blocked
+    assert blocked == get_launch_disallowed_tools(
+        "claude_code", terminal.allowed_tools, ephemeral=True
+    )
+    assert database.get_ephemeral_agent(name)["provider"] == "codex"
+
+
+@pytest.mark.asyncio
+async def test_a_claude_code_helper_routed_to_codex_launches_without_the_flag(real_providers):
+    env, name, manager, built = real_providers
+    claimed = claim(env, name)["claim_id"]
+    terminal = await launch(env, name, ROUTED, claimed=claimed)
+    assert terminal.provider == "codex" and terminal.ephemeral is True
+    provider = manager._providers[CHILD]
+    assert isinstance(provider, codex.CodexProvider)
+    assert "claude_code" not in built and "--disallowedTools" not in built["codex"]
+    (bound,) = bound_events(name)
+    assert bound["provider"] == "codex"
+    assert "disallowed_tools" not in bound
+    assert database.get_ephemeral_agent(name)["provider"] == "claude_code"
+
+
 # The guard: a plan that names a provider for anything but a claimed ephemeral launch is a bug,
 # refused before any allocation.
 

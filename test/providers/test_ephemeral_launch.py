@@ -264,11 +264,19 @@ _EPHEMERAL_HELPER_CUT = (
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
-async def test_F1_a_helper_launch_carries_the_helper_cut_and_records_it(
-    create_store, monkeypatch, provider_name
+@pytest.mark.parametrize(
+    "provider_name, stored, launched",
+    [
+        ("claude_code", ["fs_read"], None),
+        ("codex", ["fs_read"], None),
+        # A launch may narrow the stored grant; the archive records the narrowed list.
+        ("claude_code", ["fs_read", "fs_list"], ["fs_read", "@cao-mcp-server"]),
+    ],
+)
+async def test_a_helper_launch_carries_the_helper_cut_and_records_it(
+    create_store, monkeypatch, provider_name, stored, launched
 ):
-    """Ruling 376 F1, end to end: the Claude Code helper's argv carries the seven
+    """End to end: the Claude Code helper's argv carries the seven
     once and its bound event records that exact list; a Codex helper is unchanged."""
     import shlex
     from test.services.test_ephemeral_claim import audit
@@ -279,7 +287,7 @@ async def test_F1_a_helper_launch_carries_the_helper_cut_and_records_it(
 
     env = create_store
     env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
-    name = create(env, {**SPEC, "provider": provider_name})["name"]
+    name = create(env, {**SPEC, "provider": provider_name, "tools": stored})["name"]
     token = env[0].claim_ephemeral_agent(name, {}, CALLER)["claim_id"]
     module = claude_code if provider_name == "claude_code" else codex
     monkeypatch.setattr(module, "CAO_HOME_DIR", env[2])
@@ -320,9 +328,16 @@ async def test_F1_a_helper_launch_carries_the_helper_cut_and_records_it(
 
     monkeypatch.setattr(service.provider_manager, "create_provider", factory)
     terminal = await service.create_terminal(
-        provider_name, name, session_name="cao-session", caller_id=CALLER, claim_id=token
+        provider_name,
+        name,
+        session_name="cao-session",
+        caller_id=CALLER,
+        claim_id=token,
+        **({"allowed_tools": launched} if launched is not None else {}),
     )
     (bound,) = [e for e in audit(name)["events"] if e["event"] == "bound"]
+    if launched is not None:
+        assert terminal.allowed_tools == launched and bound["effective_tools"] == launched
     args = shlex.split(seen["command"].split("; ")[-1])
     blocked = [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
     if provider_name == "claude_code":
@@ -333,6 +348,9 @@ async def test_F1_a_helper_launch_carries_the_helper_cut_and_records_it(
         assert blocked == get_launch_disallowed_tools(
             "claude_code", terminal.allowed_tools, ephemeral=True
         )
+        if launched is not None:
+            # The narrowed grant dropped fs_list, so the recorded list must cut it too.
+            assert "Glob" in blocked and "Grep" in blocked
     else:
         assert "ephemeral" not in seen["kwargs"]
         assert "disallowed_tools" not in bound

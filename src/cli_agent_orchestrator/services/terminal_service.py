@@ -3163,9 +3163,9 @@ async def _create_terminal_unguarded(
             else None
         )
         # Only a Kiro helper passes its launch, and only a Claude Code helper the
-        # ephemeral flag (ruling 376, F1), so every other call is unchanged. The
-        # flag is the bind above, the fact that marks this terminal ephemeral,
-        # never the profile text.
+        # ephemeral flag, so every other call is unchanged. The flag is the bind
+        # above, the fact that marks this terminal ephemeral, never the profile
+        # text, and it keys on the provider that actually runs.
         provider_launch_options: dict[str, Any] = (
             {"kiro_launch": kiro_launch} if kiro_launch is not None else {}
         )

@@ -603,7 +603,7 @@ class TestClaudeCodeBuiltinAgentToolsCut:
         assert set(result).isdisjoint(CLAUDE_CODE_ALWAYS_CUT)
 
 
-# The seven Claude Code built-ins an ephemeral helper never gets (ruling 376, F1),
+# The seven Claude Code built-ins an ephemeral helper never gets,
 # written out so a name dropped from the code fails these tests.
 EPHEMERAL_HELPER_CUT = (
     "Agent",

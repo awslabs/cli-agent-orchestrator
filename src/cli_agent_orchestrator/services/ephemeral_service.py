@@ -1881,8 +1881,8 @@ def bind_ephemeral_agent(
         # #1099 (provisional): a routed launch's bound event names the provider that ran.
         if launched_provider not in (None, row["provider"]):
             bound_facts["provider"] = launched_provider
-        # Ruling 376 F1: a Claude Code helper's --disallowedTools, computed by the
-        # function its launch command uses.
+        # A Claude Code helper's --disallowedTools, computed by the function its
+        # launch command uses, so the record is the list the helper ran with.
         runs_on = launched_provider if launched_provider is not None else row["provider"]
         if runs_on == "claude_code":
             bound_facts["disallowed_tools"] = get_launch_disallowed_tools(

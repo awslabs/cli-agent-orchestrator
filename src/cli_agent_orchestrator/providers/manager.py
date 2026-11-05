@@ -87,9 +87,9 @@ class ProviderManager:
         ``kiro_launch`` is an ephemeral Kiro helper's per-launch home and
         kiro-cli (#1167 Phase 2); only ``kiro_cli`` accepts it.
 
-        ``ephemeral`` marks an ephemeral Claude Code helper's launch (ruling 376,
-        F1): the caller sets it from the launch's ephemeral binding, the fact that
-        marks the terminal ephemeral, never from the profile text. Only
+        ``ephemeral`` marks an ephemeral Claude Code helper's launch: the caller
+        sets it from the launch's ephemeral binding, the fact that marks the
+        terminal ephemeral, never from the profile text. Only
         ``claude_code`` accepts it; Kiro helpers are told apart by ``kiro_launch``
         and Codex helpers launch as before.
         """

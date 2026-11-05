@@ -567,9 +567,9 @@ class ClaudeCodeProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
-        # An ephemeral helper's launch (ruling 376, F1). Set by the provider
-        # manager from the launch's ephemeral binding, never from the profile:
-        # the launch also cuts tool_mapping.EPHEMERAL_ALWAYS_DISALLOWED.
+        # An ephemeral helper's launch. Set by the provider manager from the
+        # launch's ephemeral binding, never from the profile: the launch also
+        # cuts tool_mapping.EPHEMERAL_ALWAYS_DISALLOWED.
         self._ephemeral = ephemeral is True
         # When set, the launched claude process resumes this Claude Code
         # session id (--resume <sid>) instead of starting a fresh

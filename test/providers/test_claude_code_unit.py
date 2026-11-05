@@ -2188,7 +2188,7 @@ _HELPER_ATOMS = ["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"]
 
 
 class TestClaudeCodeEphemeralHelperArgv:
-    """An ephemeral helper's argv cuts the seven, whatever its grant (ruling 376 F1).
+    """An ephemeral helper's argv cuts the seven, whatever its grant.
 
     The flag is the provider manager's, from the launch's ephemeral binding; the
     profile text never decides it.

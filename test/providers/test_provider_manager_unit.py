@@ -106,7 +106,7 @@ def test_create_provider_minimax_code_forwards_launch_configuration():
 
 
 def test_create_provider_claude_code_passes_the_ephemeral_flag():
-    """Ruling 376 F1: only the caller's flag marks a Claude Code helper's launch."""
+    """Only the caller's flag marks a Claude Code helper's launch."""
     from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 
     manager = ProviderManager()
@@ -129,6 +129,39 @@ def test_create_provider_refuses_the_ephemeral_flag_for_other_providers(provider
     with pytest.raises(ValueError, match="only for the claude_code provider"):
         manager.create_provider(provider_type, "t1", "s1", "w1", agent_profile="a", ephemeral=True)
     assert "t1" not in manager._providers
+
+
+@pytest.mark.parametrize("role", ["supervisor", "reviewer", "developer"])
+@patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+def test_installed_claude_code_role_grants_through_the_manager_get_no_helper_cut(mock_load, role):
+    """An installed restricted grant, built by the real manager, keeps its own deny list."""
+    import shlex
+
+    from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+    from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+
+    profile = MagicMock()
+    profile.model = None
+    profile.system_prompt = None
+    profile.mcpServers = None
+    profile.permissionMode = None
+    mock_load.return_value = profile
+    grant = list(ROLE_TOOL_DEFAULTS[role])
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value,
+        f"t-{role}",
+        "s1",
+        "w1",
+        agent_profile="agent",
+        allowed_tools=grant,
+    )
+    assert provider._ephemeral is False
+    args = shlex.split(provider._build_claude_command().split("; ")[-1])
+    blocked = [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
+    for tool in ("Skill", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode"):
+        assert tool not in blocked, tool
+    assert blocked == get_disallowed_tools("claude_code", grant)
 
 
 def test_create_provider_unknown_type_raises():

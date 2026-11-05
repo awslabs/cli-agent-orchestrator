@@ -187,7 +187,7 @@ ALWAYS_DISALLOWED: Dict[str, Tuple[str, ...]] = {
 }
 
 # Claude Code built-ins an EPHEMERAL Claude Code helper never gets, whatever its
-# grant (architect ruling 376, F1). A helper is a one-shot worker that CAO sized:
+# grant. A helper is a one-shot worker that CAO sized:
 # the end of its turn is its answer, and it answers its creator with
 # send_message. Each of these works against that:
 # - Agent / Task (the subagent tool) and Monitor: native subagents run at a
