@@ -34,10 +34,14 @@ from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_sto
 # path legitimately spans several T-bounded phases. The longest that scales
 # with T is about 3T: Claude's shell wait + startup-prompt handler outer cap +
 # readiness wait (``claude_code.initialize``), and Kimi's shell wait + two
-# phases of ``max(120, T)`` once T >= 120 (``kimi_cli.initialize``). Kiro's is
-# 2T (``kiro_cli.initialize``; the 4T ``--legacy-ui`` retry that an earlier
-# version of this comment cited was removed in #691). The fourth T is margin
-# for settle time and for the event loop being busy with other creates.
+# phases of ``max(120, T)`` once T >= 120 (``kimi_cli.initialize``). Kiro's v1/v2
+# path is 2T (``kiro_cli.initialize``; the 4T ``--legacy-ui`` retry that an
+# earlier version of this comment cited was removed in #691), but Kiro's v3
+# path adds the ``/mcp`` reopen loop and a final prompt wait, each bounded by
+# T, plus about 10s of fixed overshoot (#1167) -- so a successful v3 init can
+# take up to about 4T+10s. The fourth T is therefore no longer pure margin: v3
+# uses it, and the 10s of fixed overshoot is covered by the fixed
+# delivery-confirmation headroom added below, not by this linear term.
 _INIT_PHASES = 4
 
 # Worst case of the server's confirm-and-resubmit loop after a send

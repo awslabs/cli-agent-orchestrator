@@ -420,9 +420,9 @@ def kiro_v3_startup_selector(output: str) -> bool:
     return not any(re.search(NEW_TUI_IDLE_PATTERN, line) for line in lines[footers[-1] + 1 :])
 
 
-# Reads of the pane during the v3 attestation (#1167), about 3 s each time: for
-# the typed palette, for a panel's frame after Enter, and for the prompt after
-# Escape closes ``/mcp``. Provisional.
+# Reads of the pane during the v3 attestation (#1167), about 2.5 s each time
+# (6 reads, 5 intervals): for the typed palette, for a panel's frame after
+# Enter, and for the prompt after Escape closes ``/mcp``. Provisional.
 V3_ATTEST_READS = 6
 V3_ATTEST_READ_INTERVAL_S = 0.5
 # v3's ``/mcp`` panel is a snapshot of Kiro's server list, taken as it opens: an
@@ -1129,7 +1129,7 @@ class KiroCliProvider(BaseProvider):
                 backend.send_special_key(self.session_name, self.window_name, "Escape")
                 raise KiroAttestationError(
                     "kiro_v3_mcp_not_ready",
-                    f"MCP servers still loading after {elapsed:.0f} s "
+                    f"MCP servers still loading after {elapsed:.1f} s "
                     f"({opens} open{'' if opens == 1 else 's'} of /mcp): {list(loading)}",
                 )
             await self._close_v3_mcp_panel()
@@ -1140,7 +1140,12 @@ class KiroCliProvider(BaseProvider):
             delay = min(delay * 2, V3_MCP_REOPEN_DELAY_MAX_S)
 
     async def _read_v3_mcp_panel(self, screen: str) -> Dict[str, McpServerRow]:
-        """Parse the ``/mcp list`` panel just opened, reading again while its frame trails."""
+        """Parse the ``/mcp list`` panel just opened, reading again while its frame trails.
+
+        Tolerance for a slow-rendering body is about 2.5 s (``V3_ATTEST_READS``
+        reads), down from the old loop's ~20 s; intentional and symmetric with
+        ``/tools``, and it fails closed (refuse, never accept) on a slow render.
+        """
         reads = 1
         while True:
             try:
