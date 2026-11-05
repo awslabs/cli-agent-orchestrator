@@ -1170,6 +1170,28 @@ async def test_shadow_note_never_claims_a_match_with_provider_route_bound_to_mat
     assert before == after == "ran on claude-sonnet-5-5 (auto: medium 0.90)"
 
 
+@pytest.mark.asyncio
+async def test_shadow_note_never_claims_a_match_on_a_capped_launch(tmp_path):
+    notes = {}
+    for mode in ("off", "shadow"):
+        h = Harness(tmp_path, mode)
+        h.configure(features=mode)
+        features(h, read_only="yes")
+        h.decider.answers["model.route"] = "large"
+        plan = await h.launch(h.request(max_tier="medium"), drain=False)
+        h.last_engine.bind_launch(plan, terminal_id="t1", model=plan.model, honored=True)
+        before = h.last_engine.launch_note(plan)
+        await h.last_engine.runner.drain()
+        notes[mode] = (before, h.last_engine.launch_note(plan))
+        assert (plan.provider, plan.model) == (None, "claude-sonnet-5-5")
+    model = h.only("model.route")
+    assert (model["outcome"], model["candidate_value"]) == ("capped", "medium")
+    # The would-be match is recorded on the capped row, and never reaches the note.
+    assert (model["match_rule"], model["match_covered"]) == ("covered", ["read_only"])
+    off_note = "ran on claude-sonnet-5-5 (auto: large 0.90, capped to medium)"
+    assert notes["shadow"] == notes["off"] == (off_note, off_note)
+
+
 # The features gate, the match's size and the reserved name.
 
 
