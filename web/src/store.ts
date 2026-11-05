@@ -81,6 +81,7 @@ interface Store {
   // poll cannot produce an unhandled rejection.
   fetchWorkflowRuns: () => Promise<string | null>
   selectWorkflowRun: (runId: string | null) => Promise<void>
+  refreshSelectedRun: () => Promise<void>
   // Workflow run controls. Each surfaces a snackbar,
   // refreshes the run list, and (re)selects the affected run so the detail pane
   // follows it live. startWorkflowRun resolves to a StartRunOutcome.
@@ -269,6 +270,20 @@ export const useStore = create<Store>((set, get) => ({
       set({ selectedRun: null })
       get().showSnackbar({ type: 'error', message: e?.message || 'Failed to load run' })
     }
+  },
+
+  // Re-read the selected run's inspection (state + steps) in place. Unlike
+  // selectWorkflowRun it neither blanks the pane nor resets the timeline, so the
+  // detail can poll it while a run is live. Same stale-response guard; a failed
+  // read keeps the last snapshot and the next poll retries.
+  refreshSelectedRun: async () => {
+    const runId = get().selectedRunId
+    if (!runId || !get().selectedRun) return
+    try {
+      const inspection = await api.inspectWorkflowRun(runId)
+      if (get().selectedRunId !== runId) return
+      set({ selectedRun: inspection })
+    } catch { /* keep the last snapshot */ }
   },
 
   startWorkflowRun: async (nameOrPath, inputs, runId) => {
