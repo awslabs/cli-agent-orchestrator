@@ -1111,6 +1111,23 @@ async def test_the_hint_alone_is_the_note_when_nothing_else_renders(h):
 
 
 @pytest.mark.asyncio
+async def test_features_on_with_both_route_points_off_ask_once_and_can_only_hint(tmp_path):
+    # The mode table's row: one feature call and four records, no match, only the hint.
+    plans = {}
+    for mode in ("off", "on"):
+        h = Harness(tmp_path, mode)
+        h.configure(features=mode, route="off", model="off", effort="off")
+        features(h, long_context="yes", read_only="yes", needs_network="yes")
+        plans[mode] = await h.launch(h.request(network=False))
+    assert [request.points for request in h.decider.requests] == [FEATURE_POINTS]
+    assert [row["point"] for row in h.rows()] == list(FEATURE_POINTS)
+    assert all(row["match_rule"] is None for row in h.rows())
+    assert plans["on"].hints == ("needs_network",)
+    assert plan_values(plans["on"])[:3] == plan_values(plans["off"])[:3]
+    assert plan_values(plans["off"]) == ("claude-sonnet-5-5", None, None, ())
+
+
+@pytest.mark.asyncio
 async def test_shadow_features_never_add_a_hint(h):
     h.configure(features="shadow")
     features(h, needs_network="yes")

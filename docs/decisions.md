@@ -387,6 +387,7 @@ helper's tier, but only to a model you declared in `decisions.match` and only up
 | on | on, bound to `match` | on | The match picks the CLI and the tier |
 | on | on, bound to `match` | off, shadow or an explicit tier | The match picks the CLI at the helper's tier. No raise. |
 | on | off, shadow, one option or another decider | on | The CLI is decided as before; the match picks the tier on it, which can rise |
+| on | off | off | Nothing is matched, but each launch still makes one feature call and records the four answers. Only the network hint can come of it. |
 
 ### Records of a match
 
