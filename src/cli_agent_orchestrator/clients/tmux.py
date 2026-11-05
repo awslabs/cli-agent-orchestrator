@@ -468,18 +468,46 @@ def web_view_attach_argv(
     """
     view = view_name or f"{WEB_VIEW_PREFIX}{uuid.uuid4().hex[:12]}"
     argv = [
-        "tmux", "-u",
-        "new-session", "-d", "-s", view, "-n", _WEB_VIEW_PLACEHOLDER, "sleep 60", ";",
-        "set-option", "-t", view, WEB_VIEW_OWNER_OPTION, session_name, ";",
-        "link-window", "-s", source_window, "-t", f"{view}:", ";",
-        "kill-window", "-t", f"{view}:{_WEB_VIEW_PLACEHOLDER}", ";",
+        "tmux",
+        "-u",
+        "new-session",
+        "-d",
+        "-s",
+        view,
+        "-n",
+        _WEB_VIEW_PLACEHOLDER,
+        "sleep 60",
+        ";",
+        "set-option",
+        "-t",
+        view,
+        WEB_VIEW_OWNER_OPTION,
+        session_name,
+        ";",
+        "link-window",
+        "-s",
+        source_window,
+        "-t",
+        f"{view}:",
+        ";",
+        "kill-window",
+        "-t",
+        f"{view}:{_WEB_VIEW_PLACEHOLDER}",
+        ";",
     ]
     if pane_id:
         argv += ["select-pane", "-t", pane_id, ";"]
     argv += [
-        "attach-session", "-t", view, ";",
+        "attach-session",
+        "-t",
+        view,
+        ";",
         # Only once attached: set on an unattached session it destroys it at once.
-        "set-option", "-t", view, "destroy-unattached", "on",
+        "set-option",
+        "-t",
+        view,
+        "destroy-unattached",
+        "on",
     ]
     return argv
 

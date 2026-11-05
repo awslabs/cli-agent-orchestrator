@@ -392,12 +392,15 @@ class TestWebViewArgv:
 
 class TestWebViewCleanup:
     def test_kill_session_kills_its_views_first_and_only_its_own(self, tmux):
-        listing = MagicMock(returncode=0, stdout=[
-            "caoweb-a|cao-s",
-            "caoweb-b|cao-other",
-            "caoweb-c|",
-            "personal|cao-s",
-        ])
+        listing = MagicMock(
+            returncode=0,
+            stdout=[
+                "caoweb-a|cao-s",
+                "caoweb-b|cao-other",
+                "caoweb-c|",
+                "personal|cao-s",
+            ],
+        )
         tmux.server.cmd.return_value = listing
         tmux.server.sessions.get.return_value = None  # session itself already gone
 
