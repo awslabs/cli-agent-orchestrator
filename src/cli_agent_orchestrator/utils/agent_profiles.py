@@ -1,5 +1,6 @@
 """Agent profile utilities."""
 
+import errno
 import hashlib
 import logging
 import os
@@ -586,6 +587,30 @@ def installed_profile_exists(agent_name: str) -> bool:
     return True
 
 
+# errnos that mean "nothing at this path", as opposed to "can't look".
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
+def _path_exists(path: Path) -> bool:
+    """``Path.exists()``, but a permission fault raises instead of reading as absent.
+
+    Python 3.11-3.13 raise ``PermissionError`` from ``exists()`` when a parent
+    directory denies access; 3.14 returns ``False``. The store reader below relies
+    on the raise: it is what ``load_agent_profile`` wraps into the RuntimeError a
+    sandboxed caller falls back on, and what keeps "can't read the store" from
+    being reported as "no such profile". Keep the 3.11-3.13 rule on every version.
+    """
+    try:
+        path.stat()
+    except OSError as exc:
+        if exc.errno in _ABSENT_ERRNOS:
+            return False
+        raise
+    except ValueError:
+        return False
+    return True
+
+
 def _read_installed_agent_profile_source(agent_name: str) -> str:
     """Raw installed lookup for namespace collision checks and the guarded reader."""
     _validate_agent_name(agent_name)
@@ -607,17 +632,17 @@ def _read_installed_agent_profile_source(agent_name: str) -> str:
     # anything that sneaks past (e.g. symlinks resolving outside the root).
     if normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
         local_profile = _safe_join(LOCAL_AGENT_STORE_DIR, f"{agent_name}.md")
-        if local_profile is not None and local_profile.exists():
+        if local_profile is not None and _path_exists(local_profile):
             return local_profile.read_text(encoding="utf-8")
 
     def _lookup_in_directory(directory: Path) -> str | None:
-        if not directory.exists():
+        if not _path_exists(directory):
             return None
         flat = _safe_join(directory, f"{agent_name}.md")
-        if flat is not None and flat.exists():
+        if flat is not None and _path_exists(flat):
             return flat.read_text(encoding="utf-8")
         nested = _safe_join(directory, agent_name, "agent.md")
-        if nested is not None and nested.exists():
+        if nested is not None and _path_exists(nested):
             return nested.read_text(encoding="utf-8")
         return None
 

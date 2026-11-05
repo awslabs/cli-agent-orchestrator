@@ -28,6 +28,7 @@ import re
 import time
 import uuid
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
+from urllib.parse import quote
 
 import requests
 
@@ -655,7 +656,7 @@ def _fetch_profile_from_server(profile_name: str) -> Any:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
     response = requests.get(
-        f"{API_BASE_URL}/agents/profiles/{profile_name}",
+        f"{API_BASE_URL}/agents/profiles/{quote(profile_name, safe='')}",
         headers=_auth_headers() or None,
         timeout=_mcp_timeout(),
     )
@@ -691,7 +692,9 @@ def _load_child_profile(child_profile_name: str) -> Any:
                 exc.__context__,
                 fallback_exc,
             )
-            raise exc
+        # Bare raise outside the inner handler: re-raises the original error with its
+        # OSError context intact (raising it inside would chain fallback_exc instead).
+        raise
 
 
 def _resolve_child_provider(agent_profile: str, fallback_provider: str) -> str:
@@ -703,8 +706,9 @@ def _resolve_child_provider(agent_profile: str, fallback_provider: str) -> str:
     ``_load_child_profile``, a child pinned to another CLI would silently launch
     on the supervisor's. When the local read fails only because the store is
     unreadable, read the pin from cao-server's copy instead; every other outcome
-    is exactly ``resolve_provider``'s (which re-reads the profile; the extra
-    read is a cheap local file).
+    is exactly ``resolve_provider``'s, which re-reads the profile. Reserved
+    ephemeral names never fall back: they fail with FileNotFoundError or
+    EphemeralProfileUnavailable, not an unreadable-store error.
     """
     from cli_agent_orchestrator.utils.agent_profiles import (
         load_launch_profile,
