@@ -1153,6 +1153,84 @@ async def test_shadow_note_never_claims_a_match_with_provider_route_bound_to_mat
     assert before == after == "ran on claude-sonnet-5-5 (auto: medium 0.90)"
 
 
+# The features gate, the match's size and the reserved name.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["on", "shadow"])
+async def test_an_installed_launch_never_asks_the_features(h, state):
+    from cli_agent_orchestrator.decisions.engine import DelegationRequest
+    from cli_agent_orchestrator.decisions.targets import TargetKind
+
+    h.configure(features=state)
+    features(h, long_context="yes", needs_network="yes")
+    # An installed launch without a model asks model.route only (docs: "Only ephemeral
+    # launches ask the features").
+    req = DelegationRequest(
+        "assign", "claude_code", None, None, BRIEF, target_kind=TargetKind.INSTALLED
+    )
+    plan = await h.launch(req)
+    assert [request.points for request in h.decider.requests] == [("model.route",)]
+    assert [row["point"] for row in h.rows()] == ["model.route"]
+    model = h.only("model.route")
+    assert (model["outcome"], model["match_rule"], model["match_from"]) == ("applied", None, None)
+    assert plan.model == "claude-sonnet-5-5" and plan.hints == ()
+
+
+@pytest.mark.asyncio
+async def test_the_match_starts_at_the_deciders_size_not_the_launch_tier(h):
+    # Here sonnet covers long_context too and is cheaper: a band from the launch's own
+    # medium tier would pick it, below the decider's large.
+    catalog = json.loads(json.dumps(CATALOG))
+    catalog["models"]["claude_code"]["claude-sonnet-5-5"]["context_tokens"] = 600000
+    h.configure(route="off", catalog=catalog)
+    h.decider.answers["model.route"] = "large"
+    features(h, long_context="yes")
+    plan = await h.launch(h.request(fields=("model.route", "effort.route"), launch_tier="medium"))
+    model = h.only("model.route")
+    assert (model["answer"], model["candidate_value"], model["match_from"]) == (
+        "large",
+        "large",
+        "large",
+    )
+    assert (model["match_pick"], model["applied_value"]) == ("claude_code/large", "large")
+    assert plan.model == "claude-opus-5-5"
+    h.last_engine.bind_launch(plan, terminal_id="t1", model=plan.model, honored=True)
+    # Covered at the decider's own size: no arrow.
+    assert h.last_engine.launch_note(plan) == (
+        "ran on claude-opus-5-5 (auto: large 0.90, matched long_context)"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["on", "shadow"])
+async def test_model_and_effort_bound_to_match_never_ask_a_package_named_match(h, state):
+    from cli_agent_orchestrator.decisions.settings import PointSettings
+    from cli_agent_orchestrator.decisions.types import PointState
+
+    impostor = Decider("match")
+    h.extra = {"match": lambda: impostor}
+    h.configure(features="off", route="off")
+    h.settings = dataclasses.replace(
+        h.settings,
+        points={
+            **h.settings.points,
+            "model.route": PointSettings(PointState(state), "match"),
+            "effort.route": PointSettings(PointState(state), "match"),
+        },
+    )
+    plan = await h.launch(h.request(fields=("model.route", "effort.route")))
+    assert impostor.requests == [] and h.decider.requests == []
+    for point in ("model.route", "effort.route"):
+        row = h.only(point)
+        assert (row["state"], row["decider"], row["reason"]) == (
+            state,
+            None,
+            "decider_unavailable",
+        )
+    assert plan is None or (plan.model, plan.effort) == ("claude-sonnet-5-5", None)
+
+
 # AC20: decider-neutral.
 
 

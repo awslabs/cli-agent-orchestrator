@@ -380,6 +380,16 @@ def test_a_short_key_is_unavailable(tmp_path):
     assert cat.read_hash_key(path) is None
 
 
+@pytest.mark.parametrize("size", [31, 33, 64])
+def test_a_key_of_any_length_but_32_is_unavailable_never_cut(tmp_path, size):
+    # The store refuses such a key, so the CLI's hash must not exist under it either.
+    path = tmp_path / "decision-hash.key"
+    path.write_bytes(bytes(range(size)))
+    assert cat.read_hash_key(path) is None
+    path.write_bytes(bytes(range(32)))
+    assert cat.read_hash_key(path) == bytes(range(32))
+
+
 def test_check_reports_problems_and_notes():
     value = block()
     value["models"]["codex"]["gpt-old"] = {"context_tokens": 1, "cost": "low"}
