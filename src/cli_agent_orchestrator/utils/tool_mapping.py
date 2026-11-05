@@ -186,6 +186,37 @@ ALWAYS_DISALLOWED: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
+# Claude Code built-ins an EPHEMERAL Claude Code helper never gets, whatever its
+# grant (architect ruling 376, F1). A helper is a one-shot worker that CAO sized:
+# the end of its turn is its answer, and it answers its creator with
+# send_message. Each of these works against that:
+# - Agent / Task (the subagent tool) and Monitor: native subagents run at a
+#   model and effort CAO did not choose, can be any of the operator's native
+#   Claude Code agents, and run in the background; Monitor wakes the session
+#   later. Either can still be working after the helper's answer is due.
+# - Skill: the operator's native skill catalog, and a skill can run as a forked
+#   subagent. A helper's profile says ``skills: []``; CAO skills stay reachable
+#   through the load_skill MCP tool.
+# - AskUserQuestion / EnterPlanMode / ExitPlanMode: dialogs that wait for a
+#   person. A helper has no user, only its creator, so a dialog in its pane is a
+#   silent stall.
+# Installed Claude Code profiles do not get this list (Agent, Task and Monitor
+# keep following execute_bash for them), and neither does any other provider.
+# The flag that selects it is set by create_terminal from the launch's ephemeral
+# binding, the fact that marks the terminal ephemeral, and passed through the
+# provider manager; it is never read from the profile text.
+EPHEMERAL_ALWAYS_DISALLOWED: Dict[str, Tuple[str, ...]] = {
+    "claude_code": (
+        "Agent",
+        "Task",
+        "Monitor",
+        "Skill",
+        "AskUserQuestion",
+        "EnterPlanMode",
+        "ExitPlanMode",
+    ),
+}
+
 
 def _get_role_defaults(role: str) -> List[str] | None:
     """Look up allowedTools for a role: settings.json first, then the built-ins.
@@ -704,6 +735,25 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
     all_tools = ALL_NATIVE_TOOLS.get(provider, set())
     disallowed = (all_tools - allowed_native) | set(ALWAYS_DISALLOWED.get(provider, ()))
     return sorted(disallowed)
+
+
+def get_launch_disallowed_tools(
+    provider: str, allowed: Optional[List[str]], *, ephemeral: bool = False
+) -> List[str]:
+    """The provider-native deny list for one launch.
+
+    An installed launch (``ephemeral=False``) gets exactly what it always got:
+    :func:`get_disallowed_tools` for a restricted grant, and nothing for ``None``
+    or a ``"*"`` grant. An ephemeral helper also gets the provider's
+    ``EPHEMERAL_ALWAYS_DISALLOWED`` built-ins, whatever its grant. Sorted and
+    without duplicates, so a name both lists hold appears once.
+    """
+    cut: Set[str] = set()
+    if allowed is not None and "*" not in allowed:
+        cut.update(get_disallowed_tools(provider, allowed))
+    if ephemeral:
+        cut.update(EPHEMERAL_ALWAYS_DISALLOWED.get(provider, ()))
+    return sorted(cut)
 
 
 def get_allowed_tools(provider: str, allowed: List[str]) -> List[str]:

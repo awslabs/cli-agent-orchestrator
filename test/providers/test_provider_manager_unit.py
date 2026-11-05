@@ -105,6 +105,32 @@ def test_create_provider_minimax_code_forwards_launch_configuration():
     assert manager.get_provider("t1") is provider
 
 
+def test_create_provider_claude_code_passes_the_ephemeral_flag():
+    """Ruling 376 F1: only the caller's flag marks a Claude Code helper's launch."""
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    manager = ProviderManager()
+    helper = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value, "t1", "s1", "w1", agent_profile=None, ephemeral=True
+    )
+    installed = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value, "t2", "s1", "w2", agent_profile=None
+    )
+    assert isinstance(helper, ClaudeCodeProvider) and helper._ephemeral is True
+    assert isinstance(installed, ClaudeCodeProvider) and installed._ephemeral is False
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [ProviderType.CODEX.value, ProviderType.KIRO_CLI.value, ProviderType.COPILOT_CLI.value],
+)
+def test_create_provider_refuses_the_ephemeral_flag_for_other_providers(provider_type):
+    manager = ProviderManager()
+    with pytest.raises(ValueError, match="only for the claude_code provider"):
+        manager.create_provider(provider_type, "t1", "s1", "w1", agent_profile="a", ephemeral=True)
+    assert "t1" not in manager._providers
+
+
 def test_create_provider_unknown_type_raises():
     manager = ProviderManager()
     with pytest.raises(ValueError, match="Unknown provider type"):

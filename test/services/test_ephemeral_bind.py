@@ -19,6 +19,17 @@ from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.utils.tool_mapping import get_launch_disallowed_tools
+
+EPHEMERAL_HELPER_CUT = (
+    "Agent",
+    "Task",
+    "Monitor",
+    "Skill",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
 
 CHILD = "eeeeeeee"
 
@@ -63,6 +74,40 @@ async def test_owner_launch_is_bound_and_marked_ephemeral(runtime_store, with_cl
     assert audit(name)["events"][-1]["terminal_id"] == CHILD
     assert audit(name)["events"][-1]["effective_tools"] == terminal.allowed_tools
     assert factory.call_args.args[5] == terminal.allowed_tools
+    # Ruling 376 F1: the bind is what marks the launch a helper's, and its bound
+    # event records the deny list the launch command will carry.
+    assert factory.call_args.kwargs["ephemeral"] is True
+    recorded = audit(name)["events"][-1]["disallowed_tools"]
+    assert recorded == get_launch_disallowed_tools(
+        "claude_code", terminal.allowed_tools, ephemeral=True
+    )
+    for tool in EPHEMERAL_HELPER_CUT + ("SendMessage", "ListAgents", "Workflow"):
+        assert recorded.count(tool) == 1, tool
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowed_tools", [None, ["fs_read", "@cao-mcp-server"]])
+async def test_an_installed_profile_that_reads_like_a_helper_is_not_a_helper(
+    runtime_store, allowed_tools
+):
+    """Ruling 376 F1: the flag comes from the bind, never from the profile text."""
+    from cli_agent_orchestrator.services.ephemeral_service import FENCE_SENTENCE
+
+    env, name, backend, factory = runtime_store
+    tools_line = "allowedTools:\n  - fs_read\n  - '@cao-mcp-server'\n" if allowed_tools else ""
+    (env[3] / "ordinary.md").write_text(
+        "---\nname: ordinary\ndescription: ephemeral helper\nprovider: claude_code\n"
+        + tools_line
+        + "---\n"
+        + FENCE_SENTENCE
+        + "\nTask.\n"
+    )
+    terminal = await terminal_service.create_terminal(
+        "claude_code", "ordinary", session_name="cao-session"
+    )
+    assert terminal.ephemeral is False
+    assert "ephemeral" not in factory.call_args.kwargs
+    assert database.get_ephemeral_agent(name)["state"] != "launched"
 
 
 @pytest.mark.parametrize(

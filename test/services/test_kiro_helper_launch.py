@@ -229,6 +229,11 @@ async def test_a_helper_launches_on_v3_from_its_sealed_home_before_the_window(ki
 
     kwargs = kiro.factory.call_args.kwargs
     assert kwargs["engine"] == KiroEngine.V3
+    # Ruling 376 F1 is Claude Code's: a Kiro helper gets no ephemeral flag and its
+    # bound event records no Claude Code deny list.
+    assert "ephemeral" not in kwargs
+    (bound,) = [e for e in audit(kiro.name)["events"] if e["event"] == "bound"]
+    assert "disallowed_tools" not in bound
     launch_object = kwargs["kiro_launch"]
     assert launch_object.home.home == home()
     assert launch_object.grant == ("@cao-mcp-server", "fs_list", "fs_read")

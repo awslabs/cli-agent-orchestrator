@@ -206,7 +206,10 @@ def test_recorded_profile_prompt_tools_and_cleanup(create_store, monkeypatch, pr
     from test.services.test_ephemeral_service import CALLER, SPEC, create
 
     from cli_agent_orchestrator.services import ephemeral_service
-    from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+    from cli_agent_orchestrator.utils.tool_mapping import (
+        get_disallowed_tools,
+        get_launch_disallowed_tools,
+    )
 
     env = create_store
     env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
@@ -215,7 +218,8 @@ def test_recorded_profile_prompt_tools_and_cleanup(create_store, monkeypatch, pr
     module = claude_code if provider_name == "claude_code" else codex
     cls = module.ClaudeCodeProvider if provider_name == "claude_code" else module.CodexProvider
     monkeypatch.setattr(module, "CAO_HOME_DIR", env[2])
-    provider = cls("eeeeeeee", "cao-session", "child", name, allowed_tools=tools)
+    helper = {"ephemeral": True} if provider_name == "claude_code" else {}
+    provider = cls("eeeeeeee", "cao-session", "child", name, allowed_tools=tools, **helper)
     profile = (
         provider._load_profile() if provider_name == "claude_code" else provider._try_load_profile()
     )
@@ -226,7 +230,10 @@ def test_recorded_profile_prompt_tools_and_cleanup(create_store, monkeypatch, pr
         command = provider._build_claude_command(profile)
         args = shlex.split(command.split("; ")[-1])
         blocked = [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
-        assert blocked == get_disallowed_tools("claude_code", tools)
+        assert blocked == get_launch_disallowed_tools("claude_code", tools, ephemeral=True)
+        assert set(get_disallowed_tools("claude_code", tools)) < set(blocked)
+        for tool in _EPHEMERAL_HELPER_CUT:
+            assert blocked.count(tool) == 1, tool
         # Claude Code's own messaging tool is cut; CAO's send_message is not.
         assert "SendMessage" in blocked and "ListAgents" in blocked
         assert [tool for tool in blocked if tool.startswith(("mcp__", "@"))] == []
@@ -243,6 +250,93 @@ def test_recorded_profile_prompt_tools_and_cleanup(create_store, monkeypatch, pr
         assert prompt_file.stat().st_mode & 0o777 == 0o600
         provider.cleanup()
         assert not prompt_file.exists()
+
+
+_EPHEMERAL_HELPER_CUT = (
+    "Agent",
+    "Task",
+    "Monitor",
+    "Skill",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
+async def test_F1_a_helper_launch_carries_the_helper_cut_and_records_it(
+    create_store, monkeypatch, provider_name
+):
+    """Ruling 376 F1, end to end: the Claude Code helper's argv carries the seven
+    once and its bound event records that exact list; a Codex helper is unchanged."""
+    import shlex
+    from test.services.test_ephemeral_claim import audit
+    from test.services.test_ephemeral_service import CALLER, SPEC, create
+
+    from cli_agent_orchestrator.services import terminal_service as service
+    from cli_agent_orchestrator.utils.tool_mapping import get_launch_disallowed_tools
+
+    env = create_store
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    name = create(env, {**SPEC, "provider": provider_name})["name"]
+    token = env[0].claim_ephemeral_agent(name, {}, CALLER)["claim_id"]
+    module = claude_code if provider_name == "claude_code" else codex
+    monkeypatch.setattr(module, "CAO_HOME_DIR", env[2])
+    backend = Mock()
+    backend.session_exists.return_value = True
+    backend.create_window.return_value = "child"
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    monkeypatch.setattr(service, "generate_terminal_id", lambda: "eeeeeeee")
+    monkeypatch.setattr(service, "_resolve_working_directory", lambda _: str(env[2]))
+    monkeypatch.setattr(service, "build_skill_catalog", lambda _: None)
+    monkeypatch.setattr(service, "get_herdr_inbox_service", lambda: None)
+    seen = {}
+
+    def factory(*args, **kwargs):
+        seen["kwargs"] = kwargs
+        if provider_name == "claude_code":
+            provider = claude_code.ClaudeCodeProvider(
+                *args[1:5],
+                allowed_tools=args[5],
+                skill_prompt=kwargs["skill_prompt"],
+                ephemeral=kwargs.get("ephemeral", False),
+            )
+        else:
+            provider = codex.CodexProvider(
+                *args[1:5], allowed_tools=args[5], skill_prompt=kwargs["skill_prompt"]
+            )
+
+        async def init():
+            seen["command"] = (
+                provider._build_claude_command()
+                if provider_name == "claude_code"
+                else provider._build_codex_command()
+            )
+
+        provider.initialize = init
+        return provider
+
+    monkeypatch.setattr(service.provider_manager, "create_provider", factory)
+    terminal = await service.create_terminal(
+        provider_name, name, session_name="cao-session", caller_id=CALLER, claim_id=token
+    )
+    (bound,) = [e for e in audit(name)["events"] if e["event"] == "bound"]
+    args = shlex.split(seen["command"].split("; ")[-1])
+    blocked = [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
+    if provider_name == "claude_code":
+        assert seen["kwargs"]["ephemeral"] is True
+        for tool in _EPHEMERAL_HELPER_CUT:
+            assert blocked.count(tool) == 1, tool
+        assert blocked == bound["disallowed_tools"]
+        assert blocked == get_launch_disallowed_tools(
+            "claude_code", terminal.allowed_tools, ephemeral=True
+        )
+    else:
+        assert "ephemeral" not in seen["kwargs"]
+        assert "disallowed_tools" not in bound
+        assert blocked == []
 
 
 @pytest.mark.asyncio
