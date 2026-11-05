@@ -826,12 +826,20 @@ class EphemeralClaim(NamedTuple):
 class _ClaimRefused(ValueError):
     """Carry only the policy relay's public rule and message to the handler."""
 
-    def __init__(self, rule: str, message: str, status_code: Optional[int] = None):
+    def __init__(
+        self,
+        rule: str,
+        message: str,
+        status_code: Optional[int] = None,
+        terminal_id: Optional[str] = None,
+    ):
         super().__init__(message)
         self.rule = rule
         # The HTTP status behind a generic refusal, so handoff can tell a failed
         # original (424) from an unknown outcome (review on PR #773).
         self.status_code = status_code
+        # The failed original's retained terminal, named by a 424 (issue #943).
+        self.terminal_id = terminal_id
 
 
 def _local_claim_refusal(rule: str, detail: str = "") -> _ClaimRefused:
@@ -1140,6 +1148,9 @@ def _create_terminal(
                 "unexpected_failure",
                 f"ephemeral launch failed ({response.status_code})",
                 status_code=response.status_code,
+                terminal_id=(
+                    _retained_terminal_id(response) if response.status_code == 424 else None
+                ),
             )
         response.raise_for_status()
         terminal = response.json()
@@ -1795,6 +1806,30 @@ class _HandoffCreateUnresolved(Exception):
     """
 
 
+class _HandoffCreateFailed(RuntimeError):
+    """A replay found the original create failed (HTTP 424), with its cause.
+
+    ``terminal_id`` names the failed terminal when cao-server retained its row
+    for a deferred provider cleanup, so the caller can report it for deletion
+    (issue #943).
+    """
+
+    def __init__(self, message: str, terminal_id: Optional[str] = None):
+        super().__init__(message)
+        self.terminal_id = terminal_id
+
+
+def _retained_terminal_id(response: Optional[requests.Response]) -> Optional[str]:
+    """Return the ``terminal_id`` a 424 names for a retained failed terminal."""
+    if response is None:
+        return None
+    try:
+        terminal_id = response.json().get("terminal_id")
+    except (AttributeError, ValueError):
+        return None
+    return terminal_id if isinstance(terminal_id, str) and terminal_id else None
+
+
 def _http_error_detail(exc: requests.exceptions.HTTPError) -> str:
     """Return the ``detail`` cao-server sent with an error response, if any."""
     if exc.response is None:
@@ -1868,7 +1903,9 @@ def _create_handoff_terminal(
         except requests.exceptions.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
             if status_code == 424:
-                raise RuntimeError(_http_error_detail(exc)) from exc
+                raise _HandoffCreateFailed(
+                    _http_error_detail(exc), _retained_terminal_id(exc.response)
+                ) from exc
             if saw_timeout:
                 raise _HandoffCreateUnresolved(str(exc)) from exc
             raise
@@ -2363,8 +2400,20 @@ async def _handoff_impl(
             success=False,
             rule=exc.rule,
             message=str(exc),
-            terminal_id=terminal_id,
+            terminal_id=terminal_id or exc.terminal_id,
             output=None,
+            job_id=None,
+            pending=None,
+        )
+
+    except _HandoffCreateFailed as e:
+        # The original create failed. Its terminal is named only when its row
+        # was retained for a deferred provider cleanup (issue #943).
+        return HandoffResult(
+            success=False,
+            message=f"Handoff failed: {str(e)}",
+            output=None,
+            terminal_id=e.terminal_id,
             job_id=None,
             pending=None,
         )
