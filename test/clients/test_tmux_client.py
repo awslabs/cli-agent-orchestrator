@@ -940,8 +940,10 @@ class TestKillSession:
         """
         mock_session = MagicMock()
         tmux.server.sessions.get.return_value = mock_session
-        # 1st verify: still listed -> must sleep and retry. 2nd: gone -> True.
+        # First the browser-view lookup (none open). Then the 1st verify: still
+        # listed -> must sleep and retry. 2nd: gone -> True.
         tmux.server.cmd.side_effect = [
+            _cmd_result(0, stdout=[]),
             _cmd_result(0, stdout=["cao-ses"]),
             _cmd_result(0, stdout=[]),
         ]
@@ -957,7 +959,7 @@ class TestKillSession:
         # Exactly one retry: it slept once, between the alive verify and the
         # one that confirmed absence.
         assert sleeps == [tmux._KILL_SESSION_VERIFY_INTERVAL_SECONDS]
-        assert tmux.server.cmd.call_count == 2
+        assert tmux.server.cmd.call_count == 3
 
     def test_kill_session_lookup_error_during_verify_is_not_gone(self, tmux, monkeypatch):
         """A transient lookup error during the verification poll must NOT be

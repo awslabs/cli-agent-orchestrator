@@ -67,18 +67,14 @@ class TestWebAttach:
     def test_window_mode_target_stays_a_pure_function(self, client):
         backend = TmuxBackend(client=client)
 
-        assert backend.prepare_web_attach("ses", "win") == [
-            "tmux",
-            "-u",
-            "attach-session",
-            "-t",
-            "ses:win",
-        ]
-        client.attach_command.assert_not_called()
+        argv = backend.prepare_web_attach("ses", "win")
+        link = argv.index("link-window")
+        assert argv[link + 1 : link + 3] == ["-s", "ses:win"]
+        client.web_view_attach_command.assert_not_called()
 
     def test_pane_mode_asks_tmux_where_the_terminal_is(self, client):
         backend = TmuxBackend(client=client, spawn_mode="pane")
 
         backend.prepare_web_attach("ses", "coder-3")
 
-        client.attach_command.assert_called_once_with("ses", "coder-3")
+        client.web_view_attach_command.assert_called_once_with("ses", "coder-3")

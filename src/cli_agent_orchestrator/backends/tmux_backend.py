@@ -17,6 +17,7 @@ from cli_agent_orchestrator.clients.tmux import (
     DEFAULT_PANE_LAYOUT,
     PaneSpawnUnavailable,
     TmuxClient,
+    web_view_attach_argv,
 )
 from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
 
@@ -225,12 +226,17 @@ class TmuxBackend(TerminalBackend):
         subprocess.run(["tmux", "attach-session", "-t", session_name], check=True)
 
     def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
-        """Return the tmux command used by the browser PTY WebSocket."""
+        """Return the tmux command used by the browser PTY WebSocket.
+
+        Attaches a private view session rather than the agent's session itself,
+        so several browser terminals on one session each keep their own window
+        (see ``web_view_attach_argv``).
+        """
         if self._spawn_mode != "pane":
-            return ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"]
+            return web_view_attach_argv(session_name, f"{session_name}:{window_name}")
         # Only pane mode has to ask tmux where the terminal is; the window-mode
         # target is a pure function of its arguments and stays one.
-        return self._client.attach_command(session_name, window_name)
+        return self._client.web_view_attach_command(session_name, window_name)
 
     # --- Pipe-pane ---
 
