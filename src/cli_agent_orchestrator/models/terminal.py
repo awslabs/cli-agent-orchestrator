@@ -280,3 +280,6 @@ class AgentStepResult(BaseModel):
     terminal_id: str
     last_message: str
     status: TerminalStatus
+    # True only when run_agent_step itself deleted the worker terminal it created
+    # (issue #1203). False for reused terminals, teardown=False, and a failed delete.
+    torn_down: bool = False

@@ -683,24 +683,35 @@ async def test_claimed_default_handoff_preserves_real_worker_outcome(
     )
     original_post = orchestration.requests.post
     responses = []
+    payloads = []
 
     def record_run_step(url, **kwargs):
         response = original_post(url, **kwargs)
         if url.endswith("/run-step"):
             responses.append(response)
+            payloads.append(kwargs["json"])
         return response
 
     monkeypatch.setattr(orchestration.requests, "post", record_run_step)
     result = await invoke("default", name)
     assert responses[-1].status_code == {"timeout": 504, "error": 502}[outcome]
     monkeypatch.setattr(orchestration.requests, "post", lambda *a, **k: responses[-1])
-    legacy = await orchestration._run_step_and_build_result({}, name, "claude_code", 600, 0)
+    legacy = await orchestration._run_step_and_build_result(
+        payloads[-1], name, "claude_code", 600, 0
+    )
     assert not result["success"] and result["rule"] is None
     assert result["message"] == legacy.message
     assert result["terminal_id"] == legacy.terminal_id == CHILD
+    job_id = payloads[-1]["job_id"]
     expected = {
-        "timeout": "Handoff timed out after 600 seconds",
-        "error": f"Handoff failed: worker errored (terminal {CHILD} reached ERROR status)",
+        "timeout": (
+            f"Handoff timed out after 600 seconds (job {job_id}). "
+            f"Worker terminal {CHILD} was not torn down."
+        ),
+        "error": (
+            f"Handoff failed: worker errored (terminal {CHILD} reached ERROR status) "
+            f"(job {job_id}). Worker terminal {CHILD} was not torn down."
+        ),
     }
     assert result["message"] == expected[outcome]
     for forbidden in [
@@ -728,10 +739,13 @@ async def test_claimed_handoff_known_worker_kind_without_id_keeps_existing_text(
     import requests
 
     post = orchestration.requests.post
+    job_ids = []
 
     def worker_response(url, **kwargs):
         if url.endswith("/claim"):
             return post(url, **kwargs)
+        if url.endswith("/run-step"):
+            job_ids.append(kwargs["json"]["job_id"])
         response = requests.Response()
         response.status_code = status
         response._content = json.dumps(
@@ -742,10 +756,11 @@ async def test_claimed_handoff_known_worker_kind_without_id_keeps_existing_text(
     monkeypatch.setattr(orchestration.requests, "post", worker_response)
     result = await invoke("default", launch_http[0][1])
     assert not result["success"] and result["rule"] is None and result["terminal_id"] is None
+    # No terminal id is known, so no teardown sentence; the job id is still named.
     assert result["message"] == (
-        "Handoff timed out after 600 seconds"
+        f"Handoff timed out after 600 seconds (job {job_ids[-1]})"
         if kind == "timeout"
-        else "Handoff failed: worker errored (worker outcome)"
+        else f"Handoff failed: worker errored (worker outcome) (job {job_ids[-1]})"
     )
 
 
@@ -878,10 +893,13 @@ async def test_claimed_handoff_legacy_worker_status_is_not_launch_failure(
     import requests
 
     original_post = orchestration.requests.post
+    job_ids = []
 
     def legacy_response(url, **kwargs):
         if url.endswith("/claim"):
             return original_post(url, **kwargs)
+        if url.endswith("/run-step"):
+            job_ids.append(kwargs["json"]["job_id"])
         response = requests.Response()
         response.status_code = status
         response._content = json.dumps({"detail": "legacy worker failure"}).encode()
@@ -891,9 +909,9 @@ async def test_claimed_handoff_legacy_worker_status_is_not_launch_failure(
     result = await invoke("default", launch_http[0][1])
     assert not result["success"] and result["rule"] is None
     assert result["message"] == (
-        "Handoff timed out after 600 seconds"
+        f"Handoff timed out after 600 seconds (job {job_ids[-1]})"
         if status == 504
-        else "Handoff failed: worker errored (legacy worker failure)"
+        else f"Handoff failed: worker errored (legacy worker failure) (job {job_ids[-1]})"
     )
 
 

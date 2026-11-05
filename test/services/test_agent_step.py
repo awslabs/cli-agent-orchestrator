@@ -16,6 +16,7 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.services.agent_step import (
     StepExecutionError,
+    _best_effort_teardown,
     run_agent_step,
 )
 from cli_agent_orchestrator.services.terminal_service import OutputMode
@@ -601,6 +602,116 @@ class TestFailureRaises:
         with create:
             with pytest.raises(ValueError, match="session not found"):
                 asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+
+
+class TestTeardownOutcome:
+    """Issue #1203: the step result says whether run_agent_step deleted the worker."""
+
+    def test_best_effort_teardown_returns_true_when_delete_succeeds(self):
+        with (
+            patch(f"{_MODULE}.terminal_service.exit_terminal_cli", return_value=None),
+            patch(f"{_MODULE}.terminal_service.delete_terminal", return_value=True),
+        ):
+            assert asyncio.run(_best_effort_teardown("abc12345", None)) is True
+
+    def test_best_effort_teardown_returns_false_when_delete_is_deferred(self):
+        """delete_terminal returns False (no raise) when cleanup is deferred and the
+        row is retained for a retry. The terminal is not gone, so not torn down."""
+        with (
+            patch(f"{_MODULE}.terminal_service.exit_terminal_cli", return_value=None),
+            patch(f"{_MODULE}.terminal_service.delete_terminal", return_value=False),
+        ):
+            assert asyncio.run(_best_effort_teardown("abc12345", None)) is False
+
+    def test_best_effort_teardown_returns_false_when_delete_raises(self):
+        with (
+            patch(f"{_MODULE}.terminal_service.exit_terminal_cli", return_value=None),
+            patch(
+                f"{_MODULE}.terminal_service.delete_terminal",
+                side_effect=RuntimeError("tmux gone"),
+            ),
+        ):
+            assert asyncio.run(_best_effort_teardown("abc12345", None)) is False
+
+    def test_step_that_deletes_its_terminal_reports_torn_down(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create, send, delete, get_output, exit_cli, wait, status:
+            result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        assert result.torn_down is True
+
+    def test_failed_delete_after_successful_step_reports_not_torn_down(self):
+        create, send, _delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        delete = patch(
+            f"{_MODULE}.terminal_service.delete_terminal",
+            side_effect=Exception("kill failed"),
+        )
+        with create, send, delete, get_output, exit_cli, wait, status:
+            result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.torn_down is False
+
+    def test_teardown_disabled_reports_not_torn_down(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create, send, delete as m_delete, get_output, exit_cli, wait, status:
+            result = asyncio.run(run_agent_step("kiro_cli", "dev", "x", teardown=False))
+        m_delete.assert_not_called()
+        assert result.torn_down is False
+
+    def test_reused_terminal_reports_not_torn_down(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.COMPLETED,
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
+        ):
+            result = asyncio.run(
+                run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99")
+            )
+        m_delete.assert_not_called()
+        assert result.torn_down is False
+
+
+class TestTimeoutAndErrorKeepWorker:
+    """Issue #1203: a worker that timed out or errored is left alive, and its output
+    is not persisted. Pins existing behavior that the handoff messages now describe."""
+
+    @pytest.mark.parametrize(
+        "final_status,kind",
+        [(TerminalStatus.PROCESSING, "timeout"), (TerminalStatus.ERROR, "error")],
+    )
+    def test_worker_is_not_torn_down_and_nothing_is_persisted(self, final_status, kind):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=final_status,
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(f"{_MODULE}.upsert_handoff_result") as m_upsert,
+        ):
+            with pytest.raises(StepExecutionError) as exc_info:
+                asyncio.run(
+                    run_agent_step("kiro_cli", "dev", "x", timeout=0, job_id="cafe1234" * 4)
+                )
+        assert exc_info.value.kind == kind
+        assert exc_info.value.terminal_id == "abc12345"
+        m_delete.assert_not_called()
+        m_exit.assert_not_called()
+        m_upsert.assert_not_called()
 
 
 class TestDurablePersistenceBeforeTeardown:
