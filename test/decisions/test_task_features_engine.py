@@ -55,6 +55,17 @@ NO_FEATURES = {
     "task.needs_network": "no",
 }
 ALL_POINTS = frozenset({"model.route", "effort.route", "provider.route", *FEATURE_POINTS})
+# The eight nullable decision_records columns #1199 adds.
+MATCH_COLUMNS = (
+    "match_rule",
+    "match_needs",
+    "match_covered",
+    "match_tiebreak",
+    "match_from",
+    "match_pick",
+    "catalog_version",
+    "catalog_hash",
+)
 
 
 class Decider:
@@ -273,25 +284,17 @@ def test_AC1_plans_and_records_match_1174_byte_for_byte(tmp_path):
         ).read_text()
     )
     result = scenarios.run(tmp_path, with_new_columns=True)
-    # The new columns are NULL on every one of those rows (11 rows in 6 scenarios).
+    # This PR's columns are NULL on every one of those rows (11 rows in 6 scenarios). Only
+    # they are checked: a column another change adds to main is that change's to test.
     new_rows = [row for scenario in result.values() for row in scenario.pop("new_columns")]
     assert len(new_rows) == sum(len(scenario["rows"]) for scenario in result.values()) == 11
-    assert all(set(row.values()) == {None} and len(row) == 8 for row in new_rows)
+    assert all(all(row[c] is None for c in MATCH_COLUMNS) for row in new_rows)
     assert json.loads(json.dumps(result, default=list)) == golden
     from cli_agent_orchestrator.clients.database import DecisionRecordModel
 
     added = scenarios.new_columns(tmp_path)
-    assert added == {
-        "match_rule",
-        "match_needs",
-        "match_covered",
-        "match_tiebreak",
-        "match_from",
-        "match_pick",
-        "catalog_version",
-        "catalog_hash",
-    }
-    assert all(DecisionRecordModel.__table__.columns[c].nullable for c in added)
+    assert set(MATCH_COLUMNS) <= added, set(MATCH_COLUMNS) - added
+    assert all(DecisionRecordModel.__table__.columns[c].nullable for c in MATCH_COLUMNS)
 
 
 # AC2: nothing new leaves.
@@ -553,6 +556,57 @@ async def test_AC6_only_the_options_codex_never_appears(h):
     assert "codex" not in json.dumps(plan_values(plan))
     sent = json.dumps([dataclasses.asdict(r) for r in h.decider.requests], default=list)
     assert "codex" not in sent
+
+
+# #810, as amended on 2026-11-05: a decider can never raise a helper's tier, providers or tools.
+# CAO's own match may raise the tier, only to a model the operator declared and only up to
+# ephemeral.max_tier, and never raises providers or tools. Here codex covers every need better,
+# and provider.route isn't the match's: the tier match stays on the creator's CLI.
+UNDECLARED_OPUS = {
+    "version": 1,
+    "models": {
+        "claude_code": {"claude-sonnet-5-5": {"context_tokens": 200000, "cost": "medium"}},
+        "codex": CATALOG["models"]["codex"],
+    },
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route,max_tier,catalog,tier",
+    [
+        ("off", "large", CATALOG, "large"),
+        ("off", "medium", CATALOG, "medium"),
+        ("off", "large", UNDECLARED_OPUS, "medium"),
+        ("on", "large", CATALOG, "large"),
+        ("on", "medium", CATALOG, "medium"),
+    ],
+    ids=["raised", "max_tier_medium", "opus_undeclared", "decider_route", "decider_max_medium"],
+)
+async def test_810_the_match_raises_only_the_tier_on_the_helpers_cli(
+    h, route, max_tier, catalog, tier
+):
+    # "on" binds provider.route to the third-party decider, which answers the creator's CLI.
+    h.configure(route=route, route_decider="feat", catalog=catalog)
+    h.decider.answers["provider.route"] = "claude_code"
+    features(h, long_context="yes", read_only="yes")
+    plan = await h.launch(h.request(max_tier=max_tier))
+    # Never another CLI: the plan names none, and every record ran on the creator's.
+    assert plan.provider is None
+    assert {row["provider"] for row in h.rows()} == {"claude_code"}
+    assert all(row["decider"] != "match" for row in h.rows("provider.route"))
+    # The tier only, up to max_tier, and only to a declared model.
+    model = h.only("model.route")
+    assert (model["answer"], model["applied_value"]) == ("medium", tier)
+    assert plan.model == TIERS["claude_code"][tier]
+    if tier != "medium":
+        assert plan.model in catalog["models"]["claude_code"]
+        assert model["match_pick"] == f"claude_code/{tier}"
+    else:
+        assert model["match_rule"] == "no_cover" and model["match_pick"] is None
+    # Never tools: a plan carries none, and the request's network grant is only read.
+    assert [f.name for f in dataclasses.fields(LaunchPlan) if "tool" in f.name] == []
+    assert plan.hints == ()
 
 
 # The CLI half: provider.route answered by match.

@@ -2,8 +2,10 @@
 
 This module runs unchanged on #1174's head and on this branch. Its output on the base is the
 golden file ``test/fixtures/decisions_1174_ac1_golden.json``; test_task_features_engine.py
-checks that this branch produces the same plans, records and requests, apart from the new
-columns, which must be NULL. Regenerate the golden only from the base commit:
+checks that this branch produces the same plans, records and requests in #1174's columns, and
+that #1199's eight match columns are NULL. It names those eight rather than counting the new
+columns, so a column another change adds to main doesn't fail it. Regenerate the golden only
+from the base commit:
 
     <base>/.venv/bin/python -B test/decisions/_ac1_1174_scenarios.py <scratch-dir>
 """

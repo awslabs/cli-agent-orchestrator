@@ -125,6 +125,56 @@ def test_update_match_writes_only_rows_without_a_match(store):
     assert store.events == []
 
 
+MATCH = {
+    "match_rule": "covered",
+    "match_needs": ["read_only"],
+    "match_covered": ["read_only"],
+    "match_tiebreak": "only",
+    "match_pick": "codex/medium",
+    "catalog_version": 1,
+    "catalog_canonical": CATALOG,
+}
+
+
+def test_update_match_names_the_key_its_catalog_hash_is_under(store):
+    from cli_agent_orchestrator.decisions import catalog
+    from cli_agent_orchestrator.decisions.catalog import load_catalog
+    from cli_agent_orchestrator.decisions.hashing import rotate_key
+
+    loaded = load_catalog({"decisions": {"match": {"version": 1}}})
+    # A row hashed with no message has no key id yet: the update gives it the hash's.
+    bare = store.insert({**BASE}, None)
+    assert store.get(bare)["hash_key_id"] is None
+    store.update_match((bare,), MATCH)
+    row = store.get(bare)
+    key = catalog.read_hash_key(store.key_path)
+    assert (row["catalog_hash"], row["hash_key_id"]) == catalog.catalog_hash(loaded, key)
+    # A row inserted under the old key, then the key is rotated before the shadow update.
+    old = store.insert({**BASE}, BRIEF)
+    before = store.get(old)
+    rotate_key(store.key_path)
+    fresh = store.insert({**BASE}, BRIEF)
+    store.update_match((old, fresh), MATCH)
+    kept, matched = store.get(old), store.get(fresh)
+    # The old row keeps its key id and message hash, and gets no hash under another key.
+    assert (kept["hash_key_id"], kept["message_hash"]) == (
+        before["hash_key_id"],
+        before["message_hash"],
+    )
+    assert kept["match_rule"] is None and kept["catalog_hash"] is None
+    # The row under the current key gets the match, its hash under the key it names.
+    new_key = catalog.read_hash_key(store.key_path)
+    assert new_key != key
+    assert matched["match_rule"] == "covered"
+    assert (matched["catalog_hash"], matched["hash_key_id"]) == catalog.catalog_hash(
+        loaded, new_key
+    )
+    # An invalid catalog has no hash, so the update needs no key and writes any unmatched row.
+    store.update_match((old,), {"match_rule": "catalog_invalid", "catalog_version": None})
+    assert store.get(old)["match_rule"] == "catalog_invalid"
+    assert store.get(old)["hash_key_id"] == before["hash_key_id"]
+
+
 def test_update_match_refuses_any_other_column(store, caplog):
     record_id = store.insert({**BASE}, BRIEF)
     store.update_match((record_id,), {"match_rule": "covered", "outcome": "fallback"})

@@ -12,9 +12,13 @@ attribute chains through an imported package alias (``decisions.catalog``). It i
 one hop deep: a value computed at run time, or a module reached through another module's
 attributes, is outside what any AST check can see.
 
-``EXEMPT`` names the modules that use the bare word ``match`` for something else, and exactly
-how many times each does. A new ``match`` literal in one of them still fails, and so does an
-entry that no longer matches its module.
+``"match_catalog"``, ``"decisions.match"`` and the ``.match_catalog`` field fail in any module
+outside the readers. The bare key ``"match"`` is a common word (Kiro v3's permission rules use
+it, for one), so it fails only where it can be the settings key: anywhere in the decisions
+package; anywhere in a module that names the ``decisions`` settings key (``"decisions"`` or
+``"_decisions"``); or as the key read from an expression that names ``decisions``
+(``x["match"]``, ``x.get("match")``, ``"match" in x``). So an unrelated ``"match"`` elsewhere
+never trips the guard, and no module has to be listed.
 
 AC20. No module under ``src/`` names a decider ``jev`` or ``jevk5``: core never branches on
 which decider answered (D9). The design scopes this to ``src/``; ``test/`` legitimately builds
@@ -24,7 +28,6 @@ fakes under those names to prove that neutrality.
 from __future__ import annotations
 
 import ast
-from collections import Counter
 from importlib.util import resolve_name
 from pathlib import Path
 
@@ -49,17 +52,19 @@ IMPORTERS = {
     },
     MATCHER: READERS | {"cli_agent_orchestrator/decisions/engine.py"},
 }
-KEY_WORDS = ("match", "match_catalog")
-# Modules that name the bare key "match" for something other than decisions.match, with the
-# exact number of such literals and why. Only the bare key is allowed: "match_catalog",
-# "decisions.match" and the .match_catalog field still fail in these modules too.
-KIRO_RULE_KEY = "Kiro v3 permission-rule key `match`, not `decisions.match`"
-EXEMPT = {
-    "cli_agent_orchestrator/providers/kiro_v3_schema.py": (1, KIRO_RULE_KEY),
-    "cli_agent_orchestrator/services/kiro_v3_validate.py": (3, KIRO_RULE_KEY),
-    "cli_agent_orchestrator/utils/tool_mapping.py": (2, KIRO_RULE_KEY),
-}
+BARE = "match"
 BARE_KEY = "names 'match'"
+# Where a bare "match" can only be the settings key: the decisions package.
+DECISIONS_PACKAGE = "cli_agent_orchestrator/decisions/"
+# The settings key of the decisions block, and settings_service's copy of it.
+DECISIONS_KEYS = ("decisions", "_decisions")
+# The modules whose bare "match" is something else today, so the structural rule must pass
+# them; the guard's own test checks it still sees their literals.
+UNRELATED_MATCH = (
+    "cli_agent_orchestrator/providers/kiro_v3_schema.py",
+    "cli_agent_orchestrator/services/kiro_v3_validate.py",
+    "cli_agent_orchestrator/utils/tool_mapping.py",
+)
 DECIDER_NAMES = ("jev", "jevk5")
 
 
@@ -87,8 +92,43 @@ def _protected(name: str) -> str | None:
     return None
 
 
-def _literal(node: ast.expr | None) -> str | None:
+def _literal(node: object) -> str | None:
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _names_decisions(node: ast.AST) -> bool:
+    """Whether an expression names the decisions block: a name, attribute or string key."""
+    for part in ast.walk(node):
+        if isinstance(part, ast.Name) and part.id in DECISIONS_KEYS:
+            return True
+        if isinstance(part, ast.Attribute) and part.attr in DECISIONS_KEYS:
+            return True
+        if _literal(part) in DECISIONS_KEYS:
+            return True
+    return False
+
+
+def _keyed_reads(tree: ast.AST) -> set[int]:
+    """The bare "match" literals read as a key from an expression that names decisions."""
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and _literal(node.slice) == BARE:
+            if _names_decisions(node.value):
+                found.add(id(node.slice))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            first = node.args[0] if node.args else None
+            if (
+                node.func.attr in ("get", "pop", "setdefault")
+                and _literal(first) == BARE
+                and _names_decisions(node.func.value)
+            ):
+                found.add(id(first))
+        elif isinstance(node, ast.Compare) and _literal(node.left) == BARE:
+            if isinstance(node.ops[0], (ast.In, ast.NotIn)) and _names_decisions(
+                node.comparators[0]
+            ):
+                found.add(id(node.left))
+    return found
 
 
 def scan(source: str, relative: str) -> dict[str, list[str]]:
@@ -98,6 +138,11 @@ def scan(source: str, relative: str) -> dict[str, list[str]]:
     package = module if relative.endswith("__init__.py") else module.rpartition(".")[0]
     docstrings = _docstrings(tree)
     findings: dict[str, list[str]] = {"reads": [], "imports": [], "names": []}
+    # Where a bare "match" can be the settings key (see the module docstring).
+    bare_anywhere = relative.startswith(DECISIONS_PACKAGE) or any(
+        _literal(node) in DECISIONS_KEYS for node in ast.walk(tree) if id(node) not in docstrings
+    )
+    keyed = _keyed_reads(tree)
     aliases: dict[str, str] = {}
 
     def imported(target: str, line: int) -> None:
@@ -156,7 +201,11 @@ def scan(source: str, relative: str) -> dict[str, list[str]]:
             if id(node) in docstrings:
                 continue
             text = node.value
-            if relative not in READERS and (text in KEY_WORDS or "decisions.match" in text):
+            if relative not in READERS and (
+                text == "match_catalog"
+                or "decisions.match" in text
+                or (text == BARE and (bare_anywhere or id(node) in keyed))
+            ):
                 findings["reads"].append(f"{relative}:{node.lineno}: names {text!r}")
             if text.strip().lower() in DECIDER_NAMES:
                 findings["names"].append(f"{relative}:{node.lineno}: names the decider {text!r}")
@@ -174,32 +223,11 @@ def _scan_src() -> dict[str, list[str]]:
     return total
 
 
-def _bare_key_counts(reads: list[str]) -> Counter[str]:
-    """How many bare ``match`` literals each module names, from the ``reads`` findings."""
-    return Counter(
-        finding.split(":", 1)[0] for finding in reads if finding.endswith(": " + BARE_KEY)
-    )
-
-
-def _unexempted(reads: list[str]) -> list[str]:
-    """The findings left once each EXEMPT module's allowed bare ``match`` literals are removed.
-
-    Only up to the allowed count is removed, so an extra literal in an exempt module stays.
-    """
-    allowance = {relative: count for relative, (count, _) in EXEMPT.items()}
-    left = []
-    for finding in reads:
-        relative = finding.split(":", 1)[0]
-        if finding.endswith(": " + BARE_KEY) and allowance.get(relative, 0) > 0:
-            allowance[relative] -= 1
-            continue
-        left.append(finding)
-    return left
-
-
 def test_AC19_only_the_matcher_validator_cli_and_hash_read_decisions_match():
     findings = _scan_src()
-    assert _unexempted(findings["reads"]) == [], _unexempted(findings["reads"])
+    # A bare "match" fails only where it can be the settings key: rename it, or read the
+    # catalog through decisions.catalog.
+    assert findings["reads"] == [], findings["reads"]
     assert findings["imports"] == [], findings["imports"]
     # Not vacuous: the readers do read it, and the scan sees them.
     for relative in READERS:
@@ -211,29 +239,56 @@ def test_AC19_only_the_matcher_validator_cli_and_hash_read_decisions_match():
     )
 
 
-def test_AC19_each_exemption_is_exact_and_covers_only_the_bare_key():
-    counts = _bare_key_counts(_scan_src()["reads"])
-    for relative, (count, reason) in EXEMPT.items():
-        assert (SRC / relative).is_file(), relative
-        assert reason.strip(), relative
-        assert relative not in READERS, relative
-        # Exact: one more literal is a new reader, one fewer is a stale entry.
-        assert counts[relative] == count, (relative, counts[relative], count)
-    # The exemption removes only the allowed bare keys from an exempt module.
-    relative = "cli_agent_orchestrator/utils/tool_mapping.py"
-    extra = scan(
-        "A = {'match': 1}\nB = 'match'\nC = 'match'\nD = 'match_catalog'\n"
-        "E = 'decisions.match'\ndef f(s):\n    return s.match_catalog\n",
-        relative,
+def test_AC19_a_bare_match_fails_only_where_it_can_be_the_settings_key():
+    unrelated = (
+        "A = {'match': 1}\nB = ('match', 'exclude')\ndef f(rule):\n    return rule['match']\n"
+    )
+    # An unrelated "match" outside the decisions package passes, with no list to keep.
+    assert scan(unrelated, OUTSIDE)["reads"] == []
+    # The same source fails in the decisions package, and in a module naming the block's key.
+    assert len(scan(unrelated, "cli_agent_orchestrator/decisions/x.py")["reads"]) == 3
+    for key in ("'decisions'", "'_decisions'"):
+        named = unrelated + f"K = {key}\n"
+        assert len(scan(named, OUTSIDE)["reads"]) == 3, key
+    # A key read from an expression naming decisions fails, whatever else the module says.
+    for source in (
+        "def f(decisions):\n    return decisions['match']\n",
+        "def f(s):\n    return s.decisions.get('match')\n",
+        "def f(s):\n    return s._decisions.pop('match', None)\n",
+        "def f(s):\n    return 'match' not in s._decisions\n",
+        "def f(load):\n    return load()['decisions'].setdefault('match', {})\n",
+    ):
+        found = scan(source, OUTSIDE)["reads"]
+        assert found == [f"{OUTSIDE}:2: {BARE_KEY}"], (source, found)
+    # The same reads from anything else pass.
+    for source in (
+        "def f(rule):\n    return rule.pop('match', None)\n",
+        "def f(rule, decisions):\n    return 'match' in rule or decisions\n",
+    ):
+        assert scan(source, OUTSIDE)["reads"] == [], source
+    # The other words fail anywhere outside the readers, even beside an unrelated "match".
+    others = scan(
+        unrelated + "D = 'match_catalog'\nE = 'decisions.match'\ndef g(s):\n"
+        "    return s.match_catalog\n",
+        OUTSIDE,
     )["reads"]
-    assert len(extra) == 6, extra
-    # Three bare keys against an allowance of two leave one; the other words are never exempt.
-    left = sorted(finding.split(": ", 1)[1] for finding in _unexempted(extra))
-    assert left == sorted(
-        [BARE_KEY, "names 'match_catalog'", "names 'decisions.match'", "reads .match_catalog"]
-    ), left
-    # And never from a module that isn't listed.
-    assert _unexempted(scan("A = 'match'\n", OUTSIDE)["reads"]) == [f"{OUTSIDE}:1: names 'match'"]
+    assert sorted(finding.split(": ", 1)[1] for finding in others) == sorted(
+        ["names 'match_catalog'", "names 'decisions.match'", "reads .match_catalog"]
+    ), others
+    # Docstrings never count, for either word.
+    assert scan('"""Reads decisions["match"]."""\nK = "decisions"\n', OUTSIDE)["reads"] == []
+    assert scan('"""decisions"""\n' + unrelated, OUTSIDE)["reads"] == []
+
+
+def test_AC19_the_guard_sees_the_unrelated_match_literals_it_passes():
+    # Not vacuous: each module whose bare "match" is something else has such literals, and
+    # the scan reports them as soon as the context could make them the settings key.
+    for relative in UNRELATED_MATCH:
+        source = (SRC / relative).read_text(encoding="utf-8")
+        assert relative not in READERS, relative
+        assert scan(source, relative)["reads"] == [], relative
+        assert scan(source, DECISIONS_PACKAGE + "moved.py")["reads"], relative
+        assert scan(source + "K = 'decisions'\n", relative)["reads"], relative
 
 
 def test_AC20_no_src_module_names_jev_or_jevk5():

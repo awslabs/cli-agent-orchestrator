@@ -1,16 +1,21 @@
 """#1199 (provisional): CAO's built-in matcher, which picks a helper's CLI and tier locally.
 
 A decider describes the task with four yes/no features; this module combines the routing ones
-with the operator's local catalog (``decisions.catalog``) to pick a (CLI, tier) pair. It is a
+with the operator's local catalog (``decisions.match``) to pick a (CLI, tier) pair. It is a
 pure function: no I/O, no network call, no settings read of its own. It is the reserved
 answerer ``match`` for ``provider.route``, the way ``fixed_table`` is built in, but it is not a
 plugin and is never resolved through the decider registry.
 
-It can never widen anything. It picks only from the options it is given (#1174's, already
-filtered by allowed_providers, the equivalence set, the tools and the effort), only tiers in
-the band it is given (never below the size answer, never above the ceiling), and only models
-``model_tiers`` maps. It never sees or changes tools. A defensive check refuses a pick whose
-enforcement label would pair advisory with hard or sandboxed.
+It can never widen anything. It picks only from the options it is given (provider.route's
+options, #1099: already filtered by allowed_providers, the equivalence set, the tools and the
+effort), only tiers in the band it is given (never below the size answer, never above the
+ceiling), and only models ``model_tiers`` maps; a pick always covers a need, so its model is
+one the operator declared. It never sees or changes tools. A defensive check refuses a pick
+whose enforcement label would pair advisory with hard or sandboxed.
+
+#810, as amended on 2026-11-05: a decider can never raise a helper's tier, providers or tools.
+This match, CAO's own local code, may raise the tier, only to a declared model and only up to
+``ephemeral.max_tier``. It never raises providers or tools.
 
 The rule, in order: no needs → ``none_needed``; the candidates are every option × band tier
 that ``model_tiers`` maps; the best cover the most important need first (long_context, then
@@ -149,6 +154,10 @@ def match(inputs: MatchInputs) -> MatchResult:
     found = candidates(inputs)
     if not found:
         return _default("no_cover", inputs, needs, found)
+    # The cover vectors compare left to right: the most important need first, which is the
+    # documented rule, not the most needs covered. With all three needs, a model covering only
+    # long_context beats one covering deep_reasoning and read_only. A known limitation (see
+    # docs/decisions.md); a rule that covers the most needs is a follow-up. Not changed here.
     best_cover = max(candidate.cover for candidate in found)
     if not any(best_cover):
         return _default("no_cover", inputs, needs, found)
@@ -158,7 +167,7 @@ def match(inputs: MatchInputs) -> MatchResult:
         tiebreak, remaining = _break_tie(remaining, inputs)
     (pick,) = remaining
     covered = tuple(need for need, bit in zip(needs, pick.cover) if bit)
-    # Defensive: the options already keep advisory and hard or sandboxed apart (#1174).
+    # Defensive: the options already keep advisory and hard or sandboxed apart (#1099).
     fallback_label = inputs.labels.get(inputs.fallback)
     pick_label = inputs.labels.get(pick.provider)
     if (

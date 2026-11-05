@@ -453,7 +453,10 @@ def test_never_widens(drawn):
     if result.picked:
         assert result.tier in given_inputs.tiers
         # The model always comes from model_tiers; a declaration never adds one.
-        assert given_inputs.model_tiers[result.provider][result.tier]
+        model = given_inputs.model_tiers[result.provider][result.tier]
+        assert model
+        # And a pick is always a model the operator declared (#810).
+        assert given_inputs.catalog.facts(result.provider, model) is not None
         assert set(result.covered) <= set(given_inputs.needs) and result.covered
         assert result.tiebreak in TIEBREAKS
     else:
@@ -463,6 +466,56 @@ def test_never_widens(drawn):
         assert candidate.provider in given_inputs.options
         assert candidate.tier in given_inputs.tiers
         assert candidate.model == given_inputs.model_tiers[candidate.provider][candidate.tier]
+
+
+# #810, as amended on 2026-11-05: a decider can never raise a helper's tier, providers or tools.
+# CAO's own match may raise the tier, only to a model the operator declared and only up to
+# ephemeral.max_tier (the band's ceiling), and never raises providers or tools.
+
+
+@settings(max_examples=400, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(match_inputs())
+def test_810_on_the_helpers_own_cli_the_match_raises_only_the_tier(drawn):
+    given_inputs, ceiling = drawn
+    from dataclasses import replace
+
+    # The tier match: the engine passes only the CLI already chosen.
+    fallback = given_inputs.fallback
+    one = replace(
+        given_inputs, options=(fallback,), labels={fallback: given_inputs.labels[fallback]}
+    )
+    result = match(one)
+    # Never another CLI.
+    assert result.provider == fallback
+    assert all(candidate.provider == fallback for candidate in result.candidates)
+    # Never below the size, never above max_tier.
+    assert TIERS.index(one.size) <= TIERS.index(result.tier) <= TIERS.index(ceiling)
+    if result.tier != one.size:
+        # A raise is a pick, to a model model_tiers maps and the operator declared.
+        assert result.picked and one.tiers != (one.size,)
+        model = one.model_tiers[fallback][result.tier]
+        assert one.catalog.facts(fallback, model) is not None
+
+
+def test_810_a_raise_needs_a_declaration_even_when_model_tiers_maps_the_model():
+    # cc-l is mapped and the only model with a long window, but undeclared: nothing rises.
+    undeclared = catalog({"claude_code": {"cc-m": decl(200000, "low")}})
+    result = match(inputs(undeclared, ("long_context",)))
+    assert (result.rule, result.tier) == ("no_cover", "medium")
+    declared = catalog({"claude_code": {"cc-m": decl(200000, "low"), "cc-l": decl(900000, "high")}})
+    result = match(inputs(declared, ("long_context",)))
+    assert (result.rule, result.tier) == ("covered", "large")
+
+
+def test_810_the_match_has_no_tool_input_or_output():
+    from dataclasses import fields
+
+    from cli_agent_orchestrator.decisions.match import MatchResult
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
+    # Structural: nothing the match reads or returns, and nothing a plan carries, is a tool.
+    for kind in (MatchInputs, MatchResult, LaunchPlan):
+        assert [f.name for f in fields(kind) if "tool" in f.name] == [], kind
 
 
 @settings(max_examples=400, deadline=None)
@@ -525,6 +578,7 @@ _EXPECTED = [
 ]
 
 
+@pytest.mark.slow
 def test_AC10_the_pick_is_identical_under_hash_seeds_0_to_7():
     for seed in range(8):
         env = {**os.environ, "PYTHONHASHSEED": str(seed)}

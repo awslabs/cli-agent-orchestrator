@@ -227,6 +227,11 @@ class DecisionStore:
         Only the match columns are written, and only where match_rule is still NULL, so a
         shadow feature job can add its would-be match to rows already finished at launch,
         and nothing ever overwrites one. Records only; nothing is emitted.
+
+        A row's one hash_key_id names the key of its message hash and its catalog hash. The
+        catalog hash is computed here under the current key, so it is written only onto a row
+        whose hash_key_id names that key, or that has none yet and gets it. A row hashed under
+        a key rotated since (``cao decisions purge --rotate-key``) is left without a match.
         """
         try:
             data: dict[Any, Any] = dict(values)
@@ -234,14 +239,20 @@ class DecisionStore:
             self._lists(data)
             if set(data) - set(MATCH_COLUMNS) - {"hash_key_id"}:
                 raise ValueError("update_match writes the match columns only")
-            data.pop("hash_key_id", None)
+            key_id = data.pop("hash_key_id", None)
             data["updated_at"] = datetime.now(timezone.utc)
+            model = database.DecisionRecordModel
             with self.sessions() as db:
                 for record_id in record_ids:
-                    db.query(database.DecisionRecordModel).filter(
-                        database.DecisionRecordModel.id == record_id,
-                        database.DecisionRecordModel.match_rule.is_(None),
-                    ).update(data)
+                    query = db.query(model).filter(
+                        model.id == record_id, model.match_rule.is_(None)
+                    )
+                    if key_id is None:
+                        query.update(data)
+                    else:
+                        query.filter(
+                            or_(model.hash_key_id == key_id, model.hash_key_id.is_(None))
+                        ).update({**data, "hash_key_id": key_id})
                 db.commit()
         except Exception:
             logger.warning("Decision match update failed")

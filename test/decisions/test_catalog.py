@@ -159,16 +159,66 @@ BAD_DECLARATIONS = [
 def test_AC11_bad_declaration_dropped_with_key_path(case, declaration, warning, caplog):
     value = block()
     value["models"]["codex"]["gpt-x"] = declaration
+    load(block())
+    caplog.clear()
     loaded = load(value)
     assert loaded.valid
     assert loaded.facts("codex", "gpt-x") is None
     # The good declarations around it survive.
     assert loaded.model_count() == 3
     assert warning in loaded.warnings
-    cat._warned.discard(warning)
-    caplog.clear()
-    load(value)
     assert any(warning in record.getMessage() for record in caplog.records)
+
+
+def _warned(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("Decision match")]
+
+
+def test_a_problem_warns_once_while_it_lasts_and_again_when_it_comes_back(caplog):
+    broken = block()
+    broken["models"]["codex"]["gpt-x"] = {"context_tokens": 0, "cost": "low"}
+    warning = (
+        "decisions.match.models.codex.gpt-x.context_tokens must be an integer from 1 to "
+        "100000000; declaration dropped"
+    )
+    load(block())
+    caplog.clear()
+    load(broken)
+    assert _warned(caplog) == ["Decision match catalog: " + warning]
+    # The same catalog, read on every launch, warns once.
+    caplog.clear()
+    load(broken)
+    load(broken)
+    assert _warned(caplog) == []
+    # Fixed, then broken again the same way: it warns again.
+    load(block())
+    caplog.clear()
+    load(broken)
+    assert _warned(caplog) == ["Decision match catalog: " + warning]
+    # A structural error, fixed and back, too; and an absent block counts as fixed.
+    caplog.clear()
+    load(block(version=2))
+    load(block(version=2))
+    load_catalog({}, TIERS)
+    load(block(version=2))
+    assert (
+        _warned(caplog)
+        == [
+            "Decision match catalog: decisions.match.version must be 1; matching is off for every "
+            "launch"
+        ]
+        * 2
+    )
+    # A second problem warns alone; the one still there doesn't warn again.
+    twice = copy.deepcopy(broken)
+    twice["models"]["codex"]["gpt-y"] = {"context_tokens": 1, "cost": "free"}
+    load(broken)
+    caplog.clear()
+    load(twice)
+    assert _warned(caplog) == [
+        "Decision match catalog: decisions.match.models.codex.gpt-y.cost must be low, medium or "
+        "high; declaration dropped"
+    ]
 
 
 def test_bad_model_ids_and_providers_are_dropped_without_echoing_them():
@@ -412,6 +462,7 @@ print(json.dumps([loaded.canonical(), loaded.warnings, loaded.ignore_features,
 """
 
 
+@pytest.mark.slow
 def test_catalog_output_is_identical_under_hash_seeds_0_to_7():
     outputs = set()
     for seed in range(8):

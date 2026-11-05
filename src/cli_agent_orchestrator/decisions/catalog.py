@@ -41,7 +41,10 @@ DEFAULT_LONG_CONTEXT_TOKENS = 500_000
 LONG_CONTEXT_TOKENS_RANGE = (1_000, 100_000_000)
 CONTEXT_TOKENS_RANGE = (1, 100_000_000)
 _SAFE_SEGMENT = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
-_warned: set[str] = set()
+# The problems the previous load reported. A load warns only about the ones that one didn't
+# have: an unchanged catalog read on every launch warns once, and a problem that was fixed and
+# comes back, the same way or not, warns again.
+_last_problems: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -109,10 +112,13 @@ def _path(*segments: object) -> str:
     return ".".join(("decisions", "match") + tuple(_segment(s) for s in segments))
 
 
-def _warn_once(message: str) -> None:
-    if message not in _warned:
-        _warned.add(message)
-        logger.warning("Decision match catalog: %s", message)
+def _report(problems: list[str]) -> None:
+    """Warn about each problem the previous load didn't have, then remember this load's."""
+    global _last_problems
+    for message in problems:
+        if message not in _last_problems:
+            logger.warning("Decision match catalog: %s", message)
+    _last_problems = frozenset(problems)
 
 
 def _is_int(value: object, bounds: tuple[int, int]) -> bool:
@@ -154,7 +160,7 @@ def _declaration(provider: str, model: str, value: object) -> tuple[ModelFacts |
 
 
 def _invalid(reason: str) -> MatchCatalog:
-    _warn_once(reason + "; matching is off for every launch")
+    _report([reason + "; matching is off for every launch"])
     return MatchCatalog(version=None, invalid=reason)
 
 
@@ -169,6 +175,7 @@ def load_catalog(
     """
     decisions = raw.get("decisions")
     if not isinstance(decisions, dict) or "match" not in decisions:
+        _report([])
         return MatchCatalog()
     block = decisions["match"]
     if not isinstance(block, dict):
@@ -221,8 +228,7 @@ def load_catalog(
                 f"{_path('models', provider, model)} is unreachable: no model_tiers.{provider} "
                 "tier maps it, so it is never used"
             )
-    for warning in warnings:
-        _warn_once(warning)
+    _report(warnings)
     return MatchCatalog(
         version=CATALOG_VERSION,
         long_context_tokens=threshold,

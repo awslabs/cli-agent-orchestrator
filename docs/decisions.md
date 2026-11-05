@@ -68,7 +68,12 @@ assign tool result. CLI handoff includes it when returning early with
 | Model cannot be vouched for | `ran on provider default (auto: fallback, not_honored)` |
 | Matched, tier raised | `ran on claude-opus-5-5 (auto: medium 0.90, matched long_context -> large)` |
 | Matched to another CLI | `ran on gpt-5.5-pro (auto: medium 0.90, matched long_context+read_only -> codex large)` |
+| Matched at the decider's size | `ran on gpt-5.5 (auto: medium 0.90, matched read_only)` |
 | Network hint added | `...; the task may need network access, and this helper has no web_fetch` |
+
+A matched note has an arrow only when the match changed something: ` -> <tier>` when the tier
+rose, ` -> <cli> <tier>` when the helper moved to another CLI. A need covered at the decider's
+size on the same CLI adds just `, matched <needs>`.
 
 The note names a model only when the bound terminal records it and the provider
 honors it. Otherwise it says `provider default`. Fallback reasons are fixed
@@ -356,10 +361,10 @@ ID that no `model_tiers` tier maps is **unreachable**. It's kept and warned abou
 1. **Needs.** The routing features answered `yes` at or above `confidence_threshold`, minus
    `ignore_features`. With none, the helper runs as today (`none_needed`).
 2. **Candidates.** Every CLI in the launch's options, at every tier in the band, that
-   `model_tiers` maps. The options are #1174's: the creator's CLI plus the members of its
-   equivalence set that pass every policy rule. The band runs from the decider's size (never
-   below it) up to `max_tier`, but only when `model.route` is on and its answer was applied or
-   capped. Otherwise the band is the helper's own tier, and only the CLI can change.
+   `model_tiers` maps. The options are `provider.route`'s (#1099): the creator's CLI plus the
+   members of its equivalence set that pass every policy rule. The band runs from the decider's
+   size (never below it) up to `max_tier`, but only when `model.route` is on and its answer was
+   applied or capped. Otherwise the band is the helper's own tier, and only the CLI can change.
 3. **Best cover.** The candidates covering the most important need first (`long_context`,
    then `deep_reasoning`, then `read_only`). If none covers any need, the helper runs as today
    (`no_cover`).
@@ -369,6 +374,11 @@ ID that no `model_tiers` tier maps is **unreachable**. It's kept and warned abou
 The match never widens anything: no CLI outside the options, no tier outside the band, no model
 outside `model_tiers`, and the tools are never read or changed. A defensive check refuses a pick
 that would pair an `advisory` CLI with a `hard` or `sandboxed` one (`rejected`).
+
+**What may rise (#810).** #810's rule is amended for the match, and only for the tier. A decider
+still can never raise a helper's tier, providers or tools. CAO's own local match may raise a
+helper's tier, but only to a model you declared in `decisions.match` and only up to
+`ephemeral.max_tier`. It never raises providers or tools.
 
 | `task.features` | `provider.route` | `model.route` | What happens |
 | --- | --- | --- | --- |
@@ -712,6 +722,10 @@ need an interactive terminal. CAO's own agent-facing tools offer no consent.
   equivalence set validates, so the local match can raise a helper's tier on the creator's CLI but
   can't move it to another CLI. `cao decisions match` has no `declare` or `forget` verbs yet;
   edit `decisions.match` in `settings.json`.
+- The match meets the most important need first, not the most needs. With all three routing
+  needs, a model covering only `long_context` beats one covering `deep_reasoning` and
+  `read_only`; `match_covered` names what the pick covers. A rule that covers the most needs is a
+  follow-up.
 - Terminal records expose the launched model and whether it was honored, independently of decision state; decision fields stay in operator records.
 - If a policy tightens between a launch and `create_terminal`'s own idempotent retry, the retry can be refused before replaying the existing terminal. This does not occur with an identity policy. Each replayed delegation create writes its own `not_launched` row; in shadow or on the decider is asked again.
 - A direct API delegation to a reserved ephemeral name without a claim, carrying a per-call model, is refused at the delegation site with HTTP 400 "set the tier in the spec instead of a per-call model". The response names no reason code and no decision record is written. The ephemeral launch policy never sees the request, so it does not log the refusal either. Assign and handoff refuse reserved names before sending any request. A claimed launch with a per-call model asks no decider and is refused, and logged, by the ephemeral policy itself.
