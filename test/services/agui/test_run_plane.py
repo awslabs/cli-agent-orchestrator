@@ -5,7 +5,7 @@ Covers:
 - EventEncoder framing (data:-only camelCase with type field)
 - Interrupt outcome emission
 - Resume round-trip via run plane
-- Uncovered/expired interrupt -> RUN_ERROR
+- Unknown/expired resume entry -> skipped with a warning, run proceeds
 - 501 behaviour when ag-ui-protocol is absent (mocked)
 - Lifecycle legality (RUN_STARTED first, RUN_FINISHED/ERROR last)
 """
@@ -385,7 +385,7 @@ async def test_run_plane_resume_cancelled_maps_to_deny():
 
 @pytest.mark.asyncio
 async def test_run_plane_resume_unknown_interrupt():
-    """resume[] referencing unknown interrupt produces RUN_ERROR."""
+    """resume[] referencing an unknown interrupt is skipped; the run finishes (#1191)."""
     from cli_agent_orchestrator.services.agui.run_plane import run_plane_stream
 
     emitter = RecordingUiEmitter()
@@ -409,9 +409,8 @@ async def test_run_plane_resume_unknown_interrupt():
     )
     parsed = _parse_frames(frames)
 
-    assert parsed[0]["type"] == "RUN_STARTED"
-    assert parsed[1]["type"] == "RUN_ERROR"
-    assert "nonexistent-id" in parsed[1]["message"]
+    assert [p["type"] for p in parsed] == ["RUN_STARTED", "RUN_FINISHED"]
+    assert parsed[1]["outcome"] == {"type": "success"}
 
 
 @pytest.mark.asyncio

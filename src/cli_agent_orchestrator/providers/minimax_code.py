@@ -28,6 +28,9 @@ from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_confi
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
+# MiniMax Code uses qualified provider/model keys, including for API-key routing.
+MINIMAX_CODE_DEFAULT_MODEL = "minimax/MiniMax-M3"
+
 _PLUGIN_NAME = "cao-orchestrator"
 #: Imported from the delivery table rather than re-declared here: the plugin
 #: pipeline must skip a server this serializer would raise on, and two copies of
@@ -290,8 +293,6 @@ class MiniMaxCodeProvider(BaseProvider):
 
     @staticmethod
     def _apply_model_config(data_dir: Path, model: Optional[str]) -> None:
-        if not model or not model.strip():
-            return
         config_path = data_dir / "config.yaml"
         try:
             loaded = (
@@ -305,7 +306,15 @@ class MiniMaxCodeProvider(BaseProvider):
             loaded = {}
         if not isinstance(loaded, dict):
             raise ProviderError("MiniMax Code config.yaml must contain a mapping")
-        loaded["defaultModel"] = model.strip()
+        selected = model.strip() if model else ""
+        if not selected:
+            # Leave saved selections and their provider-specific settings byte-for-byte intact.
+            if loaded.get("defaultModel"):
+                return
+            selected = MINIMAX_CODE_DEFAULT_MODEL
+        elif "/" not in selected:
+            selected = f"minimax/{selected}"
+        loaded["defaultModel"] = selected
         config_path.write_text(
             yaml.safe_dump(loaded, sort_keys=False, allow_unicode=True),
             encoding="utf-8",

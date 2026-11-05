@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **The ambient AG-UI stream sends generative UI as `CUSTOM` `cao.generative_ui`, not
+  `GENERATIVE_UI`.** AG-UI 1.0 has no `GENERATIVE_UI` event type, and its processing rules say a
+  producer "MUST NOT emit an event type the protocol does not describe" (`CUSTOM` and `RAW` exist
+  for that). `GET /agui/v1/stream` now sends an allow-listed `emit_ui` component as `event: CUSTOM`
+  with a spec `CustomEvent` body, `{"type": "CUSTOM", "name": "cao.generative_ui", "value":
+  {component, props, event_id, terminal_id, session_name, timestamp, traceparent}}`, the same name
+  and value the run plane already used. There is no compatibility flag. A client that listened for
+  `GENERATIVE_UI` must listen for `CUSTOM` and read `value` when `name` is `cao.generative_ui`; the
+  in-tree consumers (the EventSource viewer, the CAO Dojo page and its e2e driver, and the dashboard
+  `showcase.sh` gate) are updated. Off-list components are still refused as `RAW` with
+  `rejected_component`. `docs/agui.md` no longer claims that any AG-UI client renders these frames.
+- **The `[agui]` extra now needs `ag-ui-protocol>=1.0.0`** (was `>=0.1.19`), because the run plane
+  declares `protocolVersion` on `RUN_STARTED` from the SDK's 1.0 constant. An install that pins an
+  older SDK now gets a resolver conflict, or HTTP 501 from `POST /agui/v1/run`.
+- **A `resume[]` entry for an unknown interrupt id now ends `RUN_FINISHED` instead of `RUN_ERROR`.**
+  As AG-UI 1.0 asks, the run proceeds without the entry and CAO logs a server-side warning; an answer
+  to an expired interrupt is skipped the same way. A client that used `RUN_ERROR` to detect a bad id
+  no longer gets one; it reads `RUN_FINISHED.result.skippedResume` instead, which lists each skipped
+  entry as `{interruptId, reason}` with `reason` `unknown` (also used for an evicted id) or
+  `expired`. The key is absent when nothing was skipped.
+- **`agui_stream.AGUI_GENERATIVE_UI` is removed from `__all__`**, and the constant itself is gone,
+  because the `GENERATIVE_UI` event type it named is no longer sent. Use `AGUI_CUSTOM` and
+  `CAO_GENERATIVE_UI_EVENT_NAME`.
+
 - **Kiro ephemeral helpers on v3** (#1167 Phase 2, #1074 phase 5; preview, pending the operator
   checklist). `kiro_cli` can now be listed in `ephemeral.allowed_providers` (an operator opt-in; the
   default stays `claude_code`), and a create reports `enforcement: "hard"`. A Kiro helper is not yet
@@ -300,6 +324,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim.
 
+- `POST /sessions` and `POST /sessions/{session_name}/terminals` accept
+  `lookup_only=true` with an `idempotency_key`: the request returns the terminal
+  that key already committed, without waiting for it to initialize and without
+  creating anything (404 when nothing is committed, 400 without a key) (#773).
 - `examples/decision-model-host`: hosts the open-weight JevK5-4B decision model behind
   a loopback-only `/v1/systemone` API. Locally, it uses llama.cpp, with Metal or the CPU.
   On AWS, a CDK stack creates a single GPU instance with no IAM resources. Its services
@@ -542,6 +570,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test enumerates every create call site and fails on one that neither defers init nor derives
   its budget. `GET /health` now reports the server's `provider_init_timeout` so an operator can
   check that a client on another host sees the same value (#710).
+- `cao agent handoff` no longer loses the worker when provider startup
+  outlasts the client's create timeout. The create is retried under one
+  idempotency key with the full timeout each time (sized per profile by #710),
+  and cao-server holds a replay until the original initialization finishes, so
+  input is sent only to a ready worker. If startup outlasts every attempt, the
+  handoff fails but reports the worker's terminal ID and sends it no input; if
+  the original startup failed, that cause is reported and no second worker is
+  started. A keyed replay of a create whose initialization failed answers 424
+  with the cause, and a keyed replay no longer publishes `post_create_session`
+  again (#773).
 - Inbox delivery no longer types a queued message into an open user-answer dialog (#896). With
   `CAO_EAGER_INBOX_DELIVERY=true`, a message for a Claude Code terminal sitting in
   WAITING_USER_ANSWER was pasted into the AskUserQuestion dialog, marked DELIVERED, and the

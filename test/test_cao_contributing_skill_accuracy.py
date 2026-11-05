@@ -1139,9 +1139,7 @@ _BACKTICK_SPAN_PATTERN = r"`([^`]+)`"
 # precisely the state the review found.
 DEPENDENCY_SECTION_REQUIRED_PATH = "scripts/dependency_security.py"
 
-DEPENDENCY_SECURITY_ACTION = (
-    REPO_ROOT / ".github" / "actions" / "dependency-security" / "action.yml"
-)
+INSTALL_TRIVY_ACTION = REPO_ROOT / ".github" / "actions" / "install-trivy" / "action.yml"
 
 
 def _dependency_section() -> str | None:
@@ -1173,23 +1171,19 @@ def _dependency_section_paths() -> set[str]:
     return paths
 
 
-TRIVY_SETUP_ACTION = "aquasecurity/setup-trivy@"
-
-
 def _pinned_trivy_version(action_text: str) -> str | None:
-    """The ``with.version`` of the step that installs Trivy, without its ``v``.
+    """The ``TRIVY_VERSION`` env value of ``install-trivy/action.yml``'s one step, without its ``v``.
 
-    Read from that step rather than from the first ``version:`` in the file,
-    which would pick up any other step's pin listed above it.
+    aquasecurity/setup-trivy#42: install-trivy/action.yml is the one place CI pins
+    the Trivy version; every setup-trivy/trivy-action call site defers to it rather
+    than pinning its own copy.
     """
     action = yaml.safe_load(action_text) or {}
-    steps = (action.get("runs") or {}).get("steps") or []
-    for step in steps:
-        if not str(step.get("uses", "")).startswith(TRIVY_SETUP_ACTION):
-            continue
-        match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", str((step.get("with") or {}).get("version", "")))
-        return match.group(1) if match else None
-    return None
+    steps = ((action.get("runs") or {}).get("steps")) or [{}]
+    env = steps[0].get("env") or {}
+    version = env.get("TRIVY_VERSION")
+    match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", str(version or ""))
+    return match.group(1) if match else None
 
 
 class TestDependencySectionMatchesTheRepo:
@@ -1232,36 +1226,23 @@ class TestDependencySectionMatchesTheRepo:
         assert path.exists(), f"{quoted!r} is named but does not exist"
 
     def test_security_md_names_the_trivy_version_ci_pins(self):
-        pinned = _pinned_trivy_version(DEPENDENCY_SECURITY_ACTION.read_text(encoding="utf-8"))
-        assert pinned, "the dependency-security action no longer pins a Trivy version"
+        pinned = _pinned_trivy_version(INSTALL_TRIVY_ACTION.read_text(encoding="utf-8"))
+        assert pinned, "install-trivy/action.yml no longer sets TRIVY_VERSION in its step env"
         security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
         assert f"Trivy {pinned}" in security, (
             f"the skill sends readers to SECURITY.md for the Trivy version, but SECURITY.md "
             f"does not name the pinned {pinned}"
         )
 
-    def test_the_trivy_version_is_read_from_the_trivy_step(self):
-        """Another step's ``version:`` must not be mistaken for Trivy's.
-
-        The real action happens to list the Trivy step first, so the tree alone
-        cannot show the difference. This puts a different step's ``version:``
-        ahead of it.
-        """
-        action = (
-            "runs:\n"
-            "  using: composite\n"
-            "  steps:\n"
-            "    - name: Set up something else\n"
-            "      uses: example/setup-tool@0000000000000000000000000000000000000000\n"
-            "      with:\n"
-            "        version: v9.9.9\n"
-            "    - name: Install Trivy\n"
-            "      uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567\n"
-            "      with:\n"
-            "        version: v0.70.0\n"
-        )
+    def test_the_trivy_version_is_read_from_the_step_env(self):
+        """A missing or malformed ``runs.steps[0].env.TRIVY_VERSION`` must not silently pass."""
+        action = 'runs:\n  steps:\n    - env:\n        TRIVY_VERSION: "0.70.0"\n'
         assert _pinned_trivy_version(action) == "0.70.0"
-        assert _pinned_trivy_version(action.replace("aquasecurity/setup-trivy", "x/y")) is None
+        assert _pinned_trivy_version("runs:\n  steps:\n    - {}\n") is None
+        assert (
+            _pinned_trivy_version('runs:\n  steps:\n    - env:\n        TRIVY_VERSION: "latest"\n')
+            is None
+        )
 
 
 # --- Absolute self-links, which CI's link checker does not see ----------------
@@ -1716,3 +1697,37 @@ class TestTheGithubSlugRule:
 # EVERY file in the skill directory -- a strict superset of a single ``SKILL.md``
 # text comparison. Removed rather than kept after confirming that test id is
 # collected; re-add only if cao-contributing ever leaves ``SHIPPED_SKILLS``.
+
+
+class TestThePackagedSkillRebuildStepKeepsThePin:
+    """Checklist item 7 is the one-command rebuild, not a hand-restore (#1152).
+
+    Before ``--keep-committed-pin`` existed the item told contributors to run
+    ``make agent-plugin`` and then restore the version strings by hand, a step
+    that moved ten version sites in #1121's replay. The item must name the
+    one command, and that command must be real.
+    """
+
+    def _item_seven(self) -> str:
+        match = re.search(r"^7\. .*?(?=^8\. )", _skill_text(), flags=re.S | re.M)
+        assert match, "Checklist item 7 was not found; update this test."
+        return match.group(0)
+
+    def test_item_seven_names_the_keep_pin_rebuild(self):
+        item = self._item_seven()
+        assert "make agent-plugin-keep-pin" in item
+        assert "--keep-committed-pin" in item
+
+    def test_item_seven_no_longer_tells_anyone_to_restore_versions_by_hand(self):
+        item = self._item_seven()
+        assert "restore the version strings" not in item
+        assert "No flag keeps it" not in item
+        assert not re.search(
+            r"`make agent-plugin`(?!-)", item
+        ), "Item 7 still tells contributors to run the pin-moving rebuild."
+
+    def test_the_quoted_make_target_exists_and_passes_the_flag(self):
+        makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+        recipe = re.search(r"^agent-plugin-keep-pin:\n\t(.+)$", makefile, flags=re.M)
+        assert recipe, "Makefile has no agent-plugin-keep-pin target."
+        assert "build_agent_plugin.py --keep-committed-pin" in recipe.group(1)

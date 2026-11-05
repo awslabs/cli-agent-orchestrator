@@ -6,7 +6,8 @@
 // stream while the run is non-terminal.
 
 import { useEffect, useState } from 'react'
-import { Loader2, Radio } from 'lucide-react'
+import { Loader2, Radio, Ban, RotateCcw, ShieldCheck } from 'lucide-react'
+import { api } from '../../api'
 import type { RunInspection, RunSummaryRow } from '../../api'
 import { useStore } from '../../store'
 import { useEventFollow } from './useEventFollow'
@@ -14,9 +15,11 @@ import { StepSummary } from './StepSummary'
 import { WorkflowTimeline } from './WorkflowTimeline'
 import { SyncedTerminalPane } from './SyncedTerminalPane'
 import { FailureDetail } from './FailureDetail'
+import { RunArtifacts } from './RunArtifacts'
 import { RunComparison } from './RunComparison'
 import { DiagnosticsExportButton } from './DiagnosticsExportButton'
 import { DeleteRunButton } from './DeleteRunButton'
+import { RunResultPanel } from './RunResultPanel'
 import { runCue } from './stateCues'
 
 interface RunDetailProps {
@@ -42,6 +45,30 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
   const addWorkflowGap = useStore(s => s.addWorkflowGap)
   const followConnected = useStore(s => s.followConnected)
   const setFollowConnected = useStore(s => s.setFollowConnected)
+  const cancelWorkflowRun = useStore(s => s.cancelWorkflowRun)
+  const resumeWorkflowRun = useStore(s => s.resumeWorkflowRun)
+  const showSnackbar = useStore(s => s.showSnackbar)
+  // Guards the cancel/resume buttons against double-submit while the request is
+  // in flight (both actions re-fetch + re-select the run when they settle).
+  const [acting, setActing] = useState(false)
+  // Set when Resume came back approval_required (the script changed since its
+  // plan was approved); offers the same human Approve step as the launcher.
+  const [resumePlanId, setResumePlanId] = useState<string | null>(null)
+  useEffect(() => setResumePlanId(null), [run.run_id])
+  const resume = async () => {
+    const outcome = await resumeWorkflowRun(run.run_id)
+    setResumePlanId(outcome && 'approvalPlanId' in outcome ? outcome.approvalPlanId : null)
+  }
+  const approveAndResume = async () => {
+    if (!resumePlanId) return
+    try {
+      await api.approveWorkflowPlan(resumePlanId)
+    } catch (e: any) {
+      showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to approve plan' })
+      return
+    }
+    await resume()
+  }
 
   // Live-follow only while the run has not gone terminal (a finished run has a
   // complete durable timeline already loaded; no stream to open).
@@ -103,12 +130,54 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
           </span>
         )}
         <div className="ml-auto flex items-center gap-2">
+          {!isTerminal && (
+            <button
+              type="button"
+              disabled={acting}
+              onClick={async () => { setActing(true); try { await cancelWorkflowRun(run.run_id) } finally { setActing(false) } }}
+              className="inline-flex items-center gap-1 rounded-lg border border-amber-700/60 px-2 py-1 text-xs text-amber-300 hover:bg-amber-900/30 disabled:opacity-50"
+            >
+              <Ban size={13} aria-hidden="true" /> Cancel
+            </button>
+          )}
+          {(effectiveState === 'failed' || effectiveState === 'cancelled') && (
+            <button
+              type="button"
+              disabled={acting}
+              onClick={async () => { setActing(true); try { await resume() } finally { setActing(false) } }}
+              className="inline-flex items-center gap-1 rounded-lg border border-emerald-700/60 px-2 py-1 text-xs text-emerald-300 hover:bg-emerald-900/30 disabled:opacity-50"
+            >
+              <RotateCcw size={13} aria-hidden="true" /> Resume
+            </button>
+          )}
           <DiagnosticsExportButton runId={run.run_id} />
           <DeleteRunButton runId={run.run_id} workflowName={run.workflow_name} />
         </div>
       </div>
 
+      {resumePlanId && (
+        <div role="alert" className="rounded-lg border border-amber-700/60 bg-amber-950/30 p-3 space-y-2">
+          <p className="text-sm text-amber-200">
+            The workflow changed since its plan was approved, so resuming needs a new approval.
+          </p>
+          <p className="text-xs text-gray-400">
+            Plan id: <code className="break-all font-mono text-gray-300">{resumePlanId}</code>
+          </p>
+          <button
+            type="button"
+            disabled={acting}
+            onClick={async () => { setActing(true); try { await approveAndResume() } finally { setActing(false) } }}
+            className="inline-flex items-center gap-2 rounded-lg bg-amber-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50"
+          >
+            <ShieldCheck size={14} aria-hidden="true" /> Approve &amp; resume
+          </button>
+        </div>
+      )}
+
       <FailureDetail run={run} />
+
+      <RunResultPanel runId={run.run_id} terminal={isTerminal} state={effectiveState} />
+      <RunArtifacts runId={run.run_id} terminal={isTerminal} />
 
       {/* Steps */}
       <div className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-3">

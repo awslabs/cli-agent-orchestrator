@@ -234,13 +234,13 @@ to rediscover.
 7. If you touched `skills/`, run `uv run python scripts/sync_skills.py` so the packaged mirror
    stays in lockstep (`test/test_skill_packaging_parity.py` enforces it). A skill that also
    ships in a plugin package under `agent-plugin/` has a *third* copy: rebuild it with
-   `make agent-plugin` and commit `agent-plugin/`, or the Unit Tests job's
-   `make check-agent-plugin` step goes red. The rebuild pins the version in `pyproject.toml`,
-   which can run ahead of the pin the committed packages carry; the release workflow's
-   `regenerate-agent-plugin` job moves that pin after publishing, so a contributor PR should
-   not. No flag keeps it, so read `git diff agent-plugin/` — if the only change beyond your
-   skill edit is the version moving, restore the version strings — and finish with
-   `make check-agent-plugin`.
+   `make agent-plugin-keep-pin` (`build_agent_plugin.py --keep-committed-pin`), commit
+   `agent-plugin/`, and finish with `make check-agent-plugin`, or the Unit Tests job's step
+   of that name goes red. It rebuilds at the version the committed packages already pin,
+   because the release workflow's `regenerate-agent-plugin` job moves that pin after
+   publishing and a contributor PR should not; it contacts no PyPI, and it refuses with the
+   reason when the committed packages disagree. `git diff agent-plugin/` should then show
+   only your skill edit.
 8. **Commits:** only when asked; sign if the repo expects it; keep the subject concise and
    Conventional-Commits style; never force-push to `main`.
 9. **Open the PR, then watch its CI run to completion** and fix any red gate before calling

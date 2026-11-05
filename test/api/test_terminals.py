@@ -331,6 +331,37 @@ class TestTerminalCreationWithWorkingDirectory:
             ("/sessions/test-session/terminals:operator", "terminal_service.create_terminal"),
         ],
     )
+    def test_replay_of_a_failed_original_is_424(self, client, endpoint, target):
+        """Review on PR #773: a keyed replay of a create whose initialization
+        failed answers 424 on every create route, not a retryable 500."""
+        from cli_agent_orchestrator.services.terminal_service import IdempotentCreateFailed
+
+        failed = IdempotentCreateFailed(
+            "terminal 't1' for idempotency_key 'k' failed to initialize"
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(f"cli_agent_orchestrator.api.main.{target}", new=AsyncMock(side_effect=failed)),
+        ):
+            params = {"provider": "kiro_cli", "agent_profile": "analyst", "idempotency_key": "k"}
+            if endpoint.endswith("/terminals"):
+                params["caller_id"] = "dcba8765"  # the in-session route requires one
+            response = client.post(endpoint, params=params)
+
+        assert response.status_code == 424, response.text
+        assert "failed to initialize" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "endpoint,target",
+        [
+            ("/sessions", "session_service.create_session"),
+            ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
+            ("/sessions/test-session/terminals:operator", "terminal_service.create_terminal"),
+        ],
+    )
     @pytest.mark.parametrize("kind", ["agent_not_found", "identity_mismatch"])
     def test_kiro_agent_identity_refusal_is_a_bad_request(self, client, endpoint, target, kind):
         """A Kiro launch whose agent kiro-cli would not run (#1074) is a configuration

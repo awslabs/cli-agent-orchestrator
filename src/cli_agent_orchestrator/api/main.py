@@ -8,6 +8,7 @@ import os
 import pty
 import re
 import signal
+import stat
 import struct
 import subprocess
 import termios
@@ -199,6 +200,8 @@ from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     IdempotencyKeyConflict,
+    IdempotencyKeyNotFound,
+    IdempotentCreateFailed,
     OutputMode,
     TerminalInputBlockedError,
     _notify_elastic_terminal_ended,
@@ -2267,8 +2270,9 @@ async def agui_stream(
     shares the exact same source as ``/events`` — the in-process ``SseBus`` fed
     by the ``EventLogPublisher`` — but re-maps each normalized six-primitive
     record onto AG-UI typed events via ``agui_stream.to_agui_event`` before it
-    hits the wire, so any AG-UI-compatible client renders CAO with no custom
-    adapter code.
+    hits the wire. Every frame is named by an AG-UI 1.0 event type; generative
+    UI rides on ``CUSTOM`` with ``name="cao.generative_ui"``, which a client
+    renders only if it knows that name.
 
     Each SSE frame is a *named* AG-UI event: ``event: <AGUI_TYPE>`` +
     ``data: <json>``. Message bodies are never carried (the ring buffer stores
@@ -2514,7 +2518,8 @@ async def agui_emit_ui(
     An agent — via the ``emit_ui`` MCP tool — declares a component from the
     frozen allow-list; the intent is validated **server-side** here and
     published onto the fleet event bus, where ``agui_stream.to_agui_event`` maps
-    it to a ``GENERATIVE_UI`` frame on ``/agui/v1/stream``. Off-list components
+    it to a ``CUSTOM`` frame named ``cao.generative_ui`` on ``/agui/v1/stream``
+    (AG-UI 1.0 defines no generative-UI event type). Off-list components
     and oversized/non-serializable props are rejected (400) so a bad intent
     never reaches the bus. Requires ``cao:write`` when auth is enabled.
     """
@@ -2668,9 +2673,10 @@ async def agui_run(
     mutating interrupt state). Otherwise ``cao:read`` is the floor.
 
     After a ``resume[]`` run, ``RUN_FINISHED`` with outcome ``success`` means
-    the decision was delivered to the terminal, not that the agent finished
-    its work. A later permission prompt arrives as an interrupt on the next
-    run.
+    every entry that named a pending interrupt was delivered; skipped entries
+    are logged and listed in ``result.skippedResume``. It does not mean the
+    agent finished its work. A later
+    permission prompt arrives as an interrupt on the next run.
 
     Returns 501 when the ``ag-ui-protocol`` package is not installed (the
     [agui] optional extra was not included at install time).
@@ -3913,6 +3919,7 @@ async def create_session(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -4012,8 +4019,13 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        if lookup_only and not idempotency_key:
+            raise ValueError("lookup_only requires an idempotency_key")
+        # Passed only when set, so the ordinary create call stays
+        # byte-identical for every existing caller (review on PR #773).
+        optional_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
         launch_provider = provider
-        if body and body.delegation_message is not None:
+        if body and body.delegation_message is not None and not lookup_only:
             decision_provider = provider
             if decision_provider is None:
                 decision_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
@@ -4055,9 +4067,14 @@ async def create_session(
             **description_options,
             **_launch_options(launch_plan),
             caller_ceiling=body.caller_ceiling if body else None,
+            **optional_kwargs,
         )
 
-        if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
+        if (
+            not lookup_only
+            and memory_manager
+            and str(memory_manager).lower() in ("true", "1", "yes")
+        ):
             registry = get_plugin_registry(request)
             sidecar_provider = provider or DEFAULT_PROVIDER
             sidecar_session = result.session_name
@@ -4134,6 +4151,14 @@ async def create_session(
         _set_launch_note(response, launch_plan)
         return result
 
+    except IdempotencyKeyNotFound as e:
+        # lookup_only found nothing committed for this key (review on PR #773).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except IdempotentCreateFailed as e:
+        # A replay of a create whose initialization failed (review on PR #773).
+        # A distinct status, so the caller reports that cause and does not
+        # mistake it for a retryable server error.
+        raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(e))
     except IdempotencyKeyConflict as e:
         # The key was already used for a DIFFERENT request (review on PR #634,
         # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
@@ -4283,6 +4308,7 @@ async def create_terminal_in_session(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -4398,7 +4424,17 @@ async def create_terminal_in_session(
                     ),
                 )
 
-        if body and body.delegation_message is not None:
+        if lookup_only and not idempotency_key:
+            # A malformed request, not a missing resource: this endpoint maps
+            # ValueError to 404, so reject it here as a 400.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="lookup_only requires an idempotency_key",
+            )
+        # Passed only when set, so the ordinary create call stays
+        # byte-identical for every existing caller (review on PR #773).
+        lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
+        if body and not lookup_only and body.delegation_message is not None:
             launch_plan = await _prepare_delegation(
                 DelegationRequest(
                     kind="handoff" if body.delegation_kind else "assign",
@@ -4430,6 +4466,7 @@ async def create_terminal_in_session(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            **lookup_kwargs,
             claim_id=claim_id,
             **_launch_options(launch_plan),
         )
@@ -4439,6 +4476,14 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except IdempotencyKeyNotFound as e:
+        # lookup_only found nothing committed for this key (review on PR #773).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except IdempotentCreateFailed as e:
+        # A replay of a create whose initialization failed (review on PR #773).
+        # A distinct status, so the caller reports that cause and does not
+        # mistake it for a retryable server error.
+        raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(e))
     except IdempotencyKeyConflict as e:
         # The key was already used for a DIFFERENT request (review on PR #634,
         # issue #616) — 409, not the 404 the generic ValueError arm below would
@@ -4577,6 +4622,10 @@ async def create_terminal_in_session_as_operator(
         )
     except HTTPException:
         raise
+    except IdempotentCreateFailed as e:
+        # A keyed replay of a failed original, as on the other create routes
+        # (review on PR #773).
+        raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(e))
     except IdempotencyKeyConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
@@ -8261,6 +8310,175 @@ async def get_workflow_run_result_endpoint(
     if envelope is not None:
         body["failure_envelope"] = envelope
     return body
+
+
+# --- Run artifacts: read a report file a run was TOLD to write ------------------------
+#
+# A workflow commonly takes an input such as ``report=/tmp/report.md`` and writes its
+# deliverable there. These two routes let the web UI show that file without a shell.
+#
+# THREAT MODEL. This must not become an arbitrary file-read primitive, so a caller never
+# supplies a path. It names an INPUT of an existing run; the path is whatever that run's
+# durable ``inputs_json`` recorded at admission. The value is then only readable when its
+# fully resolved target (``os.path.realpath``, so every symlink is followed) is a regular
+# ``.md`` file DIRECTLY inside the artifact root (the system temp dir by default), and no
+# larger than ``WORKFLOW_ARTIFACT_MAX_BYTES``. A symlink placed in the root that points
+# elsewhere resolves outside it and is refused; ``O_NOFOLLOW`` on the open plus an
+# ``fstat`` regular-file check close the swap-after-check window.
+#
+# What remains readable: a ``.md`` file in the temp dir whose path some caller with
+# workflow-run scope chose as a run input. Starting a run already needs a scope at least
+# as wide as reading one, and a run's agents can read the temp dir themselves, so the
+# route grants no reach those callers lacked. Run-level outputs are not journaled (see
+# the ``/result`` docstring), so only declared inputs are eligible.
+
+WORKFLOW_ARTIFACT_MAX_BYTES = 256 * 1024
+WORKFLOW_ARTIFACT_SUFFIX = ".md"
+
+
+def _workflow_artifact_root() -> str:
+    """The one directory artifact reads are confined to (resolved; tests monkeypatch it)."""
+    import tempfile
+
+    return os.path.realpath(tempfile.gettempdir())
+
+
+def _run_input_values(run_id: str) -> Dict[str, Any]:
+    """The run's recorded inputs as a dict; 404 for an unknown run, ``{}`` if unparseable."""
+    from cli_agent_orchestrator.services import workflow_journal
+
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    try:
+        inputs = json.loads(row.inputs_json or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return inputs if isinstance(inputs, dict) else {}
+
+
+def _confined_artifact_path(value: str) -> Optional[str]:
+    """Resolved path when ``value`` names a ``.md`` directly in the artifact root, else None.
+
+    Pure path arithmetic - no existence check, no read. An absent file is still a confined
+    path (the caller reports 404 for it); a relative value is never confined, so a run
+    started from some working directory cannot make this resolve against the server's.
+    """
+    if not os.path.isabs(value):
+        return None
+    resolved = os.path.realpath(value)
+    if os.path.dirname(resolved) != _workflow_artifact_root():
+        return None
+    if not resolved.lower().endswith(WORKFLOW_ARTIFACT_SUFFIX):
+        return None
+    return resolved
+
+
+@app.get("/workflows/runs/{run_id}/artifacts")
+async def list_workflow_run_artifacts_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List the run inputs that name a readable report file (for the web UI's View report).
+
+    Returns ``{"run_id", "artifacts": [{"input", "path", "available", "size"}]}``: one row per
+    string input whose value passes the confinement rule of the artifact read (see the
+    threat model above). ``path`` echoes the recorded input value, not the resolved
+    target. ``available`` is true when the target exists as a regular file within the size
+    cap, and ``size`` is its byte size (``None`` when absent). Unknown run -> 404.
+    """
+    inputs = await asyncio.to_thread(_run_input_values, run_id)
+    artifacts: List[Dict[str, Any]] = []
+    for name, value in inputs.items():
+        if not isinstance(value, str):
+            continue
+        resolved = _confined_artifact_path(value)
+        if resolved is None:
+            continue
+        size: Optional[int] = None
+        available = False
+        try:
+            st = os.stat(resolved)
+            if stat.S_ISREG(st.st_mode):
+                size = st.st_size
+                available = size <= WORKFLOW_ARTIFACT_MAX_BYTES
+        except OSError:
+            pass
+        artifacts.append({"input": name, "path": value, "available": available, "size": size})
+    return {"run_id": run_id, "artifacts": artifacts}
+
+
+@app.get("/workflows/runs/{run_id}/artifacts/{input_name}")
+async def get_workflow_run_artifact_endpoint(
+    run_id: str,
+    input_name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the text of the report file a run input names (see the threat model above).
+
+    ``{"run_id", "input", "path", "size", "content"}``; ``content`` is UTF-8 with invalid
+    bytes replaced. Errors: unknown run 404; ``input_name`` not a string input of the run
+    400; value not a ``.md`` directly in the artifact root (after resolving symlinks) 403;
+    no such regular file 404; larger than ``WORKFLOW_ARTIFACT_MAX_BYTES`` 413 - refused
+    rather than truncated, so a reader never mistakes a prefix for the whole report.
+    """
+    inputs = await asyncio.to_thread(_run_input_values, run_id)
+    value = inputs.get(input_name)
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{input_name}' is not a string input of run '{run_id}'",
+        )
+    resolved = _confined_artifact_path(value)
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"input '{input_name}' does not name a {WORKFLOW_ARTIFACT_SUFFIX} file directly "
+                "in the workflow artifact directory"
+            ),
+        )
+
+    def _read() -> Dict[str, Any]:
+        try:
+            # O_NONBLOCK so a FIFO named like a report opens at once instead of blocking
+            # this worker thread until a writer appears; the fstat check then refuses it.
+            # It changes nothing for a regular file.
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            fd = os.open(resolved, flags)
+        except FileNotFoundError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such report file")
+        except OSError:
+            # O_NOFOLLOW refuses a symlink swapped in after the realpath check (ELOOP).
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="report file refused")
+        # Check the descriptor before wrapping it: os.fdopen refuses a directory with
+        # IsADirectoryError, which would surface as a 500 instead of a 404.
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such report file")
+        with os.fdopen(fd, "rb") as fh:
+            if st.st_size > WORKFLOW_ARTIFACT_MAX_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"report is {st.st_size} bytes; the limit is {WORKFLOW_ARTIFACT_MAX_BYTES}",
+                )
+            data = fh.read(WORKFLOW_ARTIFACT_MAX_BYTES + 1)
+        if len(data) > WORKFLOW_ARTIFACT_MAX_BYTES:
+            # Grew between fstat and read: same refusal, never a silent prefix.
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"report exceeds the {WORKFLOW_ARTIFACT_MAX_BYTES}-byte limit",
+            )
+        return {
+            "run_id": run_id,
+            "input": input_name,
+            "path": value,
+            "size": len(data),
+            "content": data.decode("utf-8", errors="replace"),
+        }
+
+    return await asyncio.to_thread(_read)
 
 
 @app.post("/workflows/runs/{run_id}/cancel")
