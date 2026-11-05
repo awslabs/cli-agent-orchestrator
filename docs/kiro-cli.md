@@ -340,9 +340,10 @@ The message never names a path on the server (it may be a shared server); the se
 ### Known limitations
 
 With `provider_init_timeout` above about 90 s, on a heavily loaded machine, a
-successful v3 start can take longer than the client waits for it: `cao launch`
-then reports a failure while the server goes on to start the agent. At the
-default 60 s there are about two minutes to spare.
+successful v3 start can take longer than the client waits for it: `cao launch`,
+or a supervisor's create of the agent, then reports a failure while the server
+goes on to start the agent. At the default 60 s there are about two minutes to
+spare.
 
 ### FAQ
 

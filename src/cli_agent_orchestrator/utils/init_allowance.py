@@ -52,9 +52,10 @@ from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_sto
 # closes, about 18 after the last ``/tools`` Down, and a few between phases.
 # One such call is several processes, not one: on tmux a read runs four
 # (``list-sessions``, ``list-windows``, ``list-panes``, ``capture-pane``) and a
-# key five; on herdr every call runs three. Measured through ``TmuxBackend``,
-# a call takes about 0.1s on an idle machine and about 0.2s under load (median
-# about 0.18s, p90 about 0.25s at a load average of 15). Priced at 0.25s per
+# key five; on herdr every call runs three. A call takes about 0.1s on an idle
+# machine (estimated: four processes at 15-25ms each) and, measured through
+# ``TmuxBackend`` at a load average of 15, about 0.2s under load (median about
+# 0.18s, p90 about 0.25s). Priced at 0.25s per
 # call, the calls add about 15s, so a worst-case successful v3 init is about
 # 4T+34.5s. The fourth T is therefore no longer pure margin: v3 uses it, and the
 # fixed overshoot has to fit in the delivery-confirmation headroom added below,

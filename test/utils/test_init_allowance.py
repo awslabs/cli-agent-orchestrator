@@ -168,8 +168,9 @@ def test_init_allowance_covers_kimi_cli_successful_init(t):
 #: What one backend call on the Kiro v3 init path (a pane read, a key or a status
 #: poll) is priced at. One call is several processes: 4 tmux processes for a read
 #: (``list-sessions``, ``list-windows``, ``list-panes``, ``capture-pane``), 5 for a
-#: key, 3 herdr processes for any call. Measured through ``TmuxBackend``: about
-#: 0.1s idle, about 0.2s under load (median 0.18s, p90 0.25s at load average 15).
+#: key, 3 herdr processes for any call. About 0.1s idle (estimated: 4 processes at
+#: 15-25ms each); measured through ``TmuxBackend`` under load (load average 15),
+#: about 0.2s (median 0.18s, p90 0.25s).
 _BACKEND_CALL_S = 0.25
 
 #: The largest ``provider_init_timeout`` (whole seconds) at which the client's wait

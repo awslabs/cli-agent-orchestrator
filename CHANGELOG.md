@@ -92,7 +92,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the empty prompt is back, as after `/mcp`. The read is bounded by `provider_init_timeout`, which
   it shares with the final prompt wait, so a successful v3 init stays within about 4T+19.5s of
   waits, plus about 60 backend calls (`utils/init_allowance.py`). Each call is several tmux or herdr
-  processes, about 0.1s idle and 0.2s under load, so the proof prices them at 0.25s: the client's
+  processes, about 0.1s idle (estimated) and 0.2s under load (measured), so the proof prices them
+  at 0.25s: the client's
   wait covers a worst-case successful v3 start only up to a `provider_init_timeout` of about 90s,
   and above that, on a heavily loaded machine, `cao launch` can report a failure while the server
   goes on to start the agent (a documented gap; the default 60s has about two minutes spare). A
