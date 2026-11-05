@@ -1337,6 +1337,12 @@ class DecisionEngine:
         note: str | None = None
         try:
             rows = [self.store.get(record_id) for record_id in (plan.record_ids if plan else ())]
+            # #1199: a match applies only with the task features on. In shadow, the background
+            # ask later writes the would-be match onto these same rows; the note never shows it.
+            applied = any(
+                row is not None and row.get("point") in FEATURE_POINTS and row.get("state") == "on"
+                for row in rows
+            )
             # #1199: whether a match moved this launch to another CLI, for the note.
             moved = any(
                 row is not None
@@ -1347,7 +1353,7 @@ class DecisionEngine:
                 for row in rows
             )
             for row in rows:
-                note = render_note(row, moved=moved) if row else None
+                note = render_note(row, moved=moved, matched=applied) if row else None
                 if note:
                     break
         except Exception:
@@ -1403,7 +1409,14 @@ def _matched(row: Mapping[str, Any], moved: bool) -> str:
     return text
 
 
-def render_note(row: Mapping[str, Any], *, moved: bool = False) -> str | None:
+def render_note(
+    row: Mapping[str, Any], *, moved: bool = False, matched: bool = False
+) -> str | None:
+    """The delegation note for a model.route row; ``matched`` when this launch applied a match.
+
+    #1199: the match text needs ``matched``, because a shadow launch's rows also get the
+    would-be match, written after the launch.
+    """
     if (
         row.get("point") != "model.route"
         or row.get("state") != "on"
@@ -1423,5 +1436,5 @@ def render_note(row: Mapping[str, Any], *, moved: bool = False) -> str | None:
         text = f"{prefix} (auto: {row['answer']} {row['confidence']:.2f}"
         if outcome == "capped":
             text += f", capped to {row['candidate_value']}"
-        return text + _matched(row, moved) + ")"
+        return text + (_matched(row, moved) if matched else "") + ")"
     return None

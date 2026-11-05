@@ -1118,6 +1118,41 @@ async def test_shadow_features_never_add_a_hint(h):
     assert plan.hints == ()
 
 
+@pytest.mark.asyncio
+async def test_shadow_note_never_claims_a_match(tmp_path):
+    h = Harness(tmp_path)
+    h.configure(features="shadow", route="off")
+    features(h, long_context="yes")
+    plan = await h.launch(h.request(fields=("model.route", "effort.route")), drain=False)
+    h.last_engine.bind_launch(plan, terminal_id="t1", model=plan.model, honored=True)
+    before = h.last_engine.launch_note(plan)
+    await h.last_engine.runner.drain()
+    after = h.last_engine.launch_note(plan)
+    assert plan.model == "claude-sonnet-5-5"
+    # Without the fix, after adds ", matched long_context -> large".
+    assert before == after == "ran on claude-sonnet-5-5 (auto: medium 0.90)"
+
+
+@pytest.mark.asyncio
+async def test_shadow_note_never_claims_a_match_with_provider_route_bound_to_match(tmp_path):
+    h = Harness(tmp_path)
+    h.configure(features="shadow")
+    features(h, long_context="yes", read_only="yes")
+    plan = await h.launch(drain=False)
+    h.last_engine.bind_launch(plan, terminal_id="t1", model=plan.model, honored=True)
+    before = h.last_engine.launch_note(plan)
+    await h.last_engine.runner.drain()
+    after = h.last_engine.launch_note(plan)
+    assert (plan.provider, plan.model) == (None, "claude-sonnet-5-5")
+    # The would-be match is still recorded on the rows `on` would have matched.
+    for point in ("provider.route", "model.route"):
+        assert (h.only(point)["match_rule"], h.only(point)["match_pick"]) == (
+            "covered",
+            "codex/large",
+        )
+    assert before == after == "ran on claude-sonnet-5-5 (auto: medium 0.90)"
+
+
 # AC20: decider-neutral.
 
 
