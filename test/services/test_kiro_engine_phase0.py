@@ -48,7 +48,7 @@ async def test_capability_probe_does_not_block_event_loop():
     def blocking_probe(engine: KiroEngine, requested: set[str]) -> KiroCapabilities:
         probe_started.set()
         assert release_probe.wait(timeout=2)
-        return KiroCapabilities(version="3.0.0", flags=frozenset({"--v3", "--agent"}))
+        return KiroCapabilities(version="3.0.1", flags=frozenset({"--v3", "--agent"}))
 
     async def heartbeat() -> None:
         nonlocal heartbeat_ticks
@@ -85,7 +85,7 @@ async def test_capability_probe_does_not_block_event_loop():
         ticks_while_blocked = heartbeat_ticks
         release_probe.set()
 
-        # Version 3.0.0 is not on the v3 allow-list (#1167).
+        # Version 3.0.1 is not on the v3 allow-list (#1167).
         with pytest.raises(KiroV3Refusal, match="kiro_v3_unsupported_version"):
             await create_task
         await heartbeat_task

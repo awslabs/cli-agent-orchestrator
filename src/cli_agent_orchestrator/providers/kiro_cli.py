@@ -24,7 +24,7 @@ import re
 import shlex
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -33,6 +33,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.kiro_attest import (
     KiroAttestationError,
+    McpServerRow,
     check_mcp_panel,
     check_tools_panel,
     palette_shows_only,
@@ -408,7 +409,8 @@ def kiro_v3_startup_selector(output: str) -> bool:
 
     Covers dialogs CAO has no pattern for (the uncaptured v3 trust-all consent
     is the expected one): the startup wait refuses on it instead of waiting out
-    the init timeout. Used at startup only; status parsing does not read it.
+    the init timeout. Used at startup, and after the attestation closes a
+    ``/mcp`` panel; status parsing does not read it.
     """
     lines = [line.rstrip() for line in strip_terminal_escapes(output).splitlines() if line.strip()]
     lines = lines[-V3_DIALOG_BOTTOM_LINES:]
@@ -418,12 +420,19 @@ def kiro_v3_startup_selector(output: str) -> bool:
     return not any(re.search(NEW_TUI_IDLE_PATTERN, line) for line in lines[footers[-1] + 1 :])
 
 
-# Reads of the pane during the v3 attestation (#1167): for the typed palette
-# and each panel, then for MCP servers still loading. Provisional, about 3 s
-# and 20 s.
+# Reads of the pane during the v3 attestation (#1167), about 3 s each time: for
+# the typed palette, for a panel's frame after Enter, and for the prompt after
+# Escape closes ``/mcp``. Provisional.
 V3_ATTEST_READS = 6
 V3_ATTEST_READ_INTERVAL_S = 0.5
-V3_MCP_LOADING_READS = 40
+# v3's ``/mcp`` panel is a snapshot of Kiro's server list, taken as it opens: an
+# open panel never changes, so reading it again cannot show a server that has
+# since connected. A server still loading is checked again by closing ``/mcp``
+# and opening it again, 1 s after the first open, then 2 s, then every 3 s. It
+# refuses at the first check after ``provider_init_timeout`` has passed since
+# the first open: up to one open's waits (about 7.5 s) after the timeout.
+V3_MCP_REOPEN_DELAY_S = 1.0
+V3_MCP_REOPEN_DELAY_MAX_S = 3.0
 
 
 @dataclass(frozen=True)
@@ -1069,6 +1078,103 @@ class KiroCliProvider(BaseProvider):
         backend.send_special_key(self.session_name, self.window_name, "Enter")
         return await self._read_screen()
 
+    async def _wait_v3_mcp_running(self, servers: List[str]) -> Dict[str, McpServerRow]:
+        """Open ``/mcp`` until no server is still loading; return its rows (#1167).
+
+        v3's ``/mcp`` panel is a snapshot of Kiro's server list, taken as it
+        opens: an open panel never changes, so reading it again cannot show a
+        server that has since connected. So while a server is loading, the
+        panel is closed (Escape, then the prompt must be back) and opened
+        again, each time typed and checked like the first, with a short wait
+        in between. The time is checked after each open's palette and panel
+        reads: a server still loading at the first check after
+        ``provider_init_timeout`` has passed since the first open refuses. So
+        the refusal can come up to one open's waits (about 7.5 s) after the
+        timeout, never later.
+
+        Anything else that is not running (a failed, extra or missing server,
+        or a layout CAO cannot read) refuses at once, with no further open. So
+        do a palette that does not appear and a dialog on screen once a panel
+        closes. Every refusal leaves the panel closed.
+        """
+        backend = get_backend()
+        timeout = float(get_server_settings()["provider_init_timeout"])
+        start = time.monotonic()
+        delay = V3_MCP_REOPEN_DELAY_S
+        opens = 0
+        while True:
+            opens += 1
+            screen = await self._open_v3_panel("/mcp")
+            try:
+                rows = await self._read_v3_mcp_panel(screen)
+                loading = check_mcp_panel(rows, servers)
+            except KiroAttestationError:
+                backend.send_special_key(self.session_name, self.window_name, "Escape")
+                raise
+            elapsed = time.monotonic() - start
+            # Server names come from the agent file and statuses from the
+            # panel's own columns; no other screen text is logged.
+            logger.debug(
+                "kiro_cli: terminal %s /mcp open %d at %.1f s: %s",
+                self.terminal_id,
+                opens,
+                elapsed,
+                ", ".join(
+                    f"{name} {row.status.split()[-1]} ({row.tools} tools)"
+                    for name, row in sorted(rows.items())
+                )
+                or "no servers",
+            )
+            if loading and elapsed >= timeout:
+                backend.send_special_key(self.session_name, self.window_name, "Escape")
+                raise KiroAttestationError(
+                    "kiro_v3_mcp_not_ready",
+                    f"MCP servers still loading after {elapsed:.0f} s "
+                    f"({opens} open{'' if opens == 1 else 's'} of /mcp): {list(loading)}",
+                )
+            await self._close_v3_mcp_panel()
+            if not loading:
+                return rows
+            remaining = timeout - (time.monotonic() - start)
+            await asyncio.sleep(max(0.0, min(delay, remaining)))
+            delay = min(delay * 2, V3_MCP_REOPEN_DELAY_MAX_S)
+
+    async def _read_v3_mcp_panel(self, screen: str) -> Dict[str, McpServerRow]:
+        """Parse the ``/mcp list`` panel just opened, reading again while its frame trails."""
+        reads = 1
+        while True:
+            try:
+                return parse_mcp_panel(screen)
+            except KiroAttestationError:
+                if reads >= V3_ATTEST_READS:
+                    raise
+            reads += 1
+            await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+            screen = await self._read_screen()
+
+    async def _close_v3_mcp_panel(self) -> None:
+        """Press Escape on the open ``/mcp`` panel; return once the empty prompt is back.
+
+        No other key is sent until then, so the next ``/mcp``, ``/tools`` or the
+        task is typed into the prompt. A dialog on screen instead refuses at
+        once and is not answered; so does a prompt that is not back within
+        the short render wait.
+        """
+        get_backend().send_special_key(self.session_name, self.window_name, "Escape")
+        for attempt in range(V3_ATTEST_READS):
+            if attempt:
+                await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+            screen = await self._read_screen()
+            if kiro_v3_dialog(screen) is not None or kiro_v3_startup_selector(screen):
+                raise KiroAttestationError(
+                    "kiro_v3_mcp_not_ready",
+                    "a dialog appeared after /mcp closed; it was not answered and "
+                    "nothing more was typed",
+                )
+            if re.search(NEW_TUI_IDLE_PATTERN, screen):
+                return
+        raise KiroAttestationError("kiro_v3_mcp_not_ready", "the prompt did not return after /mcp")
+
     async def _attestation_grant(self) -> tuple[list[str], list[str], list[str]]:
         """The grant and servers the panels are held to, and the launch's own allowlist.
 
@@ -1111,9 +1217,10 @@ class KiroCliProvider(BaseProvider):
         panels are compared with nor which servers they may show. Returns what
         the panels showed, for a helper's audit.
 
-        ``/mcp`` is read first, again until no server is still loading, and
-        only then ``/tools``: a loading server has no rows on ``/tools`` yet, so
-        a per-tool grant read before then would be checked against nothing.
+        ``/mcp`` is opened first, and opened again until no server is still
+        loading (see ``_wait_v3_mcp_running``), and only then ``/tools``: a
+        loading server has no rows on ``/tools`` yet, so a per-tool grant read
+        before then would be checked against nothing.
         """
         grant, servers, launch = await self._attestation_grant()
         exceeding = tools_exceeding(grant, launch)
@@ -1131,25 +1238,7 @@ class KiroCliProvider(BaseProvider):
         backend = get_backend()
         model = header_model(await self._read_screen(), self._agent_profile)
 
-        screen = await self._open_v3_panel("/mcp")
-        rows = {}
-        try:
-            for attempt in range(V3_MCP_LOADING_READS):
-                try:
-                    rows = parse_mcp_panel(screen)
-                    if not check_mcp_panel(rows, servers):
-                        break
-                except KiroAttestationError:
-                    if attempt == V3_MCP_LOADING_READS - 1:
-                        raise
-                    if attempt >= V3_ATTEST_READS and "/mcp list" not in screen:
-                        raise
-                await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
-                screen = await self._read_screen()
-            else:
-                raise KiroAttestationError("kiro_v3_mcp_not_ready", "MCP servers still loading")
-        finally:
-            backend.send_special_key(self.session_name, self.window_name, "Escape")
+        rows = await self._wait_v3_mcp_running(servers)
 
         screen = await self._open_v3_panel("/tools")
         for attempt in range(V3_ATTEST_READS):

@@ -387,7 +387,9 @@ if ENABLE_WORKING_DIRECTORY:
         3. Send the message to the terminal
         4. Monitor until completion
         5. Return the agent's response
-        6. Clean up the terminal with /exit
+        6. Report the teardown outcome. On success the result states whether the
+           worker terminal was torn down. On a timeout or worker error it names the
+           terminal and job and states the terminal was not torn down.
 
         ## Working Directory
 
@@ -503,7 +505,9 @@ else:
         2. Send the message to the terminal (starts in supervisor's current directory)
         3. Monitor until completion
         4. Return the agent's response
-        5. Clean up the terminal with /exit
+        5. Report the teardown outcome. On success the result states whether the
+           worker terminal was torn down. On a timeout or worker error it names the
+           terminal and job and states the terminal was not torn down.
 
         ## Model
 

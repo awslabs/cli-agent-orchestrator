@@ -283,6 +283,18 @@ def _get_cleanup_nudge() -> str:
     return ""
 
 
+def _teardown_sentence(terminal_id: Optional[str], torn_down: bool) -> str:
+    """State only whether the worker terminal was torn down (issue #1203).
+
+    No instruction and no liveness claim. Empty when no terminal is known, since
+    there is then no terminal to name.
+    """
+    if not terminal_id:
+        return ""
+    state = "was torn down" if torn_down else "was not torn down"
+    return f". Worker terminal {terminal_id} {state}."
+
+
 # --- Cross-node placement + callback routing (one-agent-per-pod topology) ---
 # A supervisor may delegate to a REMOTE CAO node by passing ``target_host`` to
 # assign/handoff. The worker terminal is then created on that node via its REST
@@ -1600,6 +1612,7 @@ async def _run_step_and_build_result(
     target_host: Optional[str] = None,
     *,
     response_sink: Optional[Callable[[requests.Response], None]] = None,
+    caller_deletes_terminal: bool = False,
 ) -> HandoffResult:
     """POST ``payload`` to ``/terminals/run-step`` and map the response to a HandoffResult.
 
@@ -1624,6 +1637,10 @@ async def _run_step_and_build_result(
     as before. ``target_host`` is needed here in ADDITION to ``base_url``
     because it is not merely a URL: it selects the connect-timeout shape and it
     is the name quoted back to the operator in the remote-cleanup hints below.
+
+    ``caller_deletes_terminal``: the caller deletes the terminal itself after this
+    returns (the early-terminal-id path). The success message then leaves out the
+    cleanup nudge, and the caller adds it back if its own delete fails.
     """
     known_terminal_id: Optional[str] = payload.get("reuse_terminal_id")
     # Read off the payload for the same reason ``reuse_terminal_id`` is: the
@@ -1713,6 +1730,10 @@ async def _run_step_and_build_result(
         # N-second timeout. The structured `kind` is authoritative; the
         # status code is only the fallback when an older server omits it
         # (504 -> timeout, 502 -> error).
+        # Only a worker that errored or ran long is named with its job and its
+        # teardown outcome. Every other failure path either tears the worker down
+        # server-side or has no worker, so this branch makes no claim about it.
+        worker_outcome = False
         if kind == "ephemeral_policy":
             msg = structured_detail
         # Generic text is only for failures before any worker is known; a launched
@@ -1727,28 +1748,49 @@ async def _run_step_and_build_result(
             rule = "unexpected_failure"
         elif kind == "error" or (kind is None and response.status_code == 502):
             msg = f"Handoff failed: worker errored ({structured_detail})"
+            worker_outcome = True
         elif kind == "timeout" or (kind is None and response.status_code == 504):
             msg = f"Handoff timed out after {timeout} seconds"
+            worker_outcome = True
         else:
             msg = f"Handoff failed: {structured_detail}"
         resolved_tid = tid or known_terminal_id
+        remote_cleaned = False
         if target_host and resolved_tid:
             # A failed/timed-out step leaves its terminal ALIVE server-side
             # (run_agent_step only tears down on success). Locally the
             # supervisor can delete_terminal it; remotely that terminal
             # occupies a max=1 worker pod's ONLY slot and the local delete
-            # cannot reach it — so clean it up here, best-effort.
-            if _cleanup_remote_terminal(base_url, resolved_tid):
+            # cannot reach it — so clean it up here, best-effort. Done before the
+            # message is built, because a successful cleanup means the worker WAS
+            # torn down, and the teardown sentence must say so.
+            remote_cleaned = _cleanup_remote_terminal(base_url, resolved_tid)
+        job_id_for_result: Optional[str] = None
+        if worker_outcome:
+            job_id_for_result = job_id
+            job_suffix = f" (job {job_id})" if job_id else ""
+            msg += job_suffix + _teardown_sentence(resolved_tid, torn_down=remote_cleaned)
+        if target_host and resolved_tid:
+            if remote_cleaned:
                 msg += f" (remote terminal {resolved_tid} on {target_host} cleaned up)"
             else:
+                # After the teardown sentence the period is already there; without it,
+                # the note starts with ". " as it always did.
+                lead = " " if worker_outcome else ". "
                 msg += (
-                    f". Cleanup of remote terminal {resolved_tid} failed — it still "
+                    f"{lead}Cleanup of remote terminal {resolved_tid} failed — it still "
                     f"occupies a slot on {target_host}; terminal {resolved_tid} lives "
                     f"on {target_host}; DELETE {base_url}/terminals/{resolved_tid} "
                     f"(or delete_terminal('{resolved_tid}', target_host='{target_host}'))."
                 )
         return HandoffResult(
-            success=False, message=msg, rule=rule, output=None, terminal_id=resolved_tid
+            success=False,
+            message=msg,
+            rule=rule,
+            output=None,
+            terminal_id=resolved_tid,
+            job_id=job_id_for_result,
+            pending=None,
         )
 
     if response_sink is not None:
@@ -1768,13 +1810,19 @@ async def _run_step_and_build_result(
 
     execution_time = time.time() - start_time
     placement = f" on node {target_host}" if target_host else ""
+    # A missing field (an older server) reads as not torn down: the conservative wording.
+    torn_down = data.get("torn_down") is True
+    # Suppressed when the worker was torn down. The early-terminal-id caller deletes its
+    # own terminal after this returns, so it adds the nudge itself if that delete fails.
+    nudge = "" if (torn_down or caller_deletes_terminal) else _get_cleanup_nudge()
     return HandoffResult(
         success=True,
         # None for a provider "auto" claim: the provider that ran is in GET /terminals/<id>.
         message=f"Successfully handed off to {agent_profile}"
         + (f" ({provider})" if provider else "")
         + f"{placement} in {execution_time:.2f}s"
-        + _get_cleanup_nudge(),
+        + _teardown_sentence(terminal_id, torn_down)
+        + nudge,
         output=output,
         terminal_id=terminal_id,
     )
@@ -2337,7 +2385,12 @@ async def _handoff_impl(
         if provider == ProviderType.KIRO_CLI.value and engine is not None:
             payload["engine"] = engine
         result = await _run_step_and_build_result(
-            payload, agent_profile, provider, timeout, start_time
+            payload,
+            agent_profile,
+            provider,
+            timeout,
+            start_time,
+            caller_deletes_terminal=True,
         )
         if result.success:
             # Best-effort, mirroring run_agent_step's own teardown philosophy
@@ -2348,12 +2401,23 @@ async def _handoff_impl(
             # so the operator can inspect/recover it via status/result/cancel,
             # which is the entire point of surfacing terminal_id early.
             cleanup = _delete_terminal_impl(terminal_id, check_binding=False)
-            if not cleanup.get("success"):
+            torn_down = bool(cleanup.get("success"))
+            if not torn_down:
                 logger.warning(
                     "handoff: post-success teardown of terminal %s failed: %s",
                     terminal_id,
                     cleanup.get("message"),
                 )
+            # The step result said "not torn down" because the server was told
+            # teardown=False. Replace that with what this delete actually did.
+            message = result.message.replace(
+                _teardown_sentence(terminal_id, torn_down=False),
+                _teardown_sentence(terminal_id, torn_down=torn_down),
+            )
+            if not torn_down:
+                # The terminal is still there, so the cleanup nudge still applies.
+                message += _get_cleanup_nudge()
+            result.message = message
         if result.success:
             result.message = _append_decision_note(result.message, notes)
         return result
