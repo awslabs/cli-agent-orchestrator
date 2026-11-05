@@ -113,6 +113,14 @@ permissionMode: auto
 You review code for quality and correctness.
 ```
 
+### Tool Restrictions
+
+CAO turns an agent's `allowedTools` into `--disallowedTools` flags. The full mapping is in [Tool Restrictions](tool-restrictions.md#how-tool-restrictions-are-enforced-implementation-detail).
+
+Claude Code also has its own tools for messaging other agents, starting subagent workflows, scheduling prompts for later and switching into git worktrees: `SendMessage`, `ListAgents`, `SendFile`, `FetchInboxMessage`, `Workflow`, `CronCreate`, `CronDelete`, `CronList`, `ScheduleWakeup`, `RemoteTrigger`, `EnterWorktree`, `ExitWorktree`, `TeamCreate` and `TeamDelete`. None of them goes through CAO. So CAO removes all of them from every Claude Code agent whose grant is not `"*"`, the `developer` default included.
+
+The reason is practical. A Claude Code helper once answered with Claude Code's own `SendMessage` instead of CAO's `send_message`. The answer went nowhere, and its supervisor waited for nothing. CAO's own MCP tools, `send_message` among them, are not affected. See [Claude Code built-ins CAO always removes](tool-restrictions.md#claude-code-built-ins-cao-always-removes).
+
 ## Eager Inbox Delivery
 
 Claude Code's Ink TUI buffers pasted input even while the agent is processing. CAO exploits this to deliver queued inbox messages during PROCESSING, eliminating inter-turn latency. Enable with `CAO_EAGER_INBOX_DELIVERY=true`. WAITING_USER_ANSWER is excluded: Claude Code's Ink Select widget would consume the paste as the dialog's answer (issue #896), so the message is held until the dialog closes.
@@ -192,6 +200,10 @@ uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k ClaudeCode 
 4. **Status Stuck on ERROR**:
    - Attach to tmux session and check terminal output
    - Verify Claude Code starts correctly in a regular terminal first
+
+5. **An agent's answer never arrives, and its pane shows `Not sent — no agent named '<id>' is reachable`**:
+   - The agent used Claude Code's own `SendMessage`, not CAO's `send_message`
+   - CAO builds with the [always-removed list](tool-restrictions.md#claude-code-built-ins-cao-always-removes) cut that tool at launch; relaunch the agent on such a build
 
 ### Agent-plugin MCP working directory
 

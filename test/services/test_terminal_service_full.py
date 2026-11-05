@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import threading
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -1698,6 +1699,101 @@ class TestReplayDuringInitializationBehaviour:
         # no second provider is started for the key.
         with pytest.raises(terminal_service.IdempotentCreateFailed, match="timed out after 180"):
             await asyncio.wait_for(replay, timeout=2)
+        mock_provider_manager.create_provider.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cleanup_deferred", [True, False])
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    async def test_replay_names_the_terminal_a_deferred_cleanup_retained(
+        self,
+        mock_lookup,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_get_terminal,
+        mock_db_delete,
+        cleanup_deferred,
+    ):
+        """Issue #943: when the failed original's provider cleanup is deferred,
+        its rollback keeps the row, and the replay's 424 must name that
+        terminal so an operator can delete it. A completed cleanup deletes the
+        row, and the replay names nothing: the replay only reads the row once
+        the rollback has finished."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        deleted = threading.Event()
+        mock_db_delete.side_effect = lambda *a, **k: deleted.set()
+
+        def get_row(terminal_id):
+            if deleted.is_set():
+                raise ValueError(f"Terminal '{terminal_id}' not found")
+            return dict(_PRIOR_ROW, id=terminal_id)
+
+        mock_get_terminal.side_effect = get_row
+
+        committed = asyncio.Event()
+        release_init = asyncio.Event()
+        mock_db_create.side_effect = lambda *a, **k: None
+
+        async def initialize():
+            committed.set()
+            await release_init.wait()
+            raise TimeoutError("Grok CLI initialization timed out after 180.0 seconds")
+
+        mock_provider = AsyncMock()
+        mock_provider.initialize.side_effect = initialize
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_provider_manager.cleanup_provider.return_value = False if cleanup_deferred else None
+        mock_lookup.side_effect = lambda key: (
+            _record(terminal_id="test1234") if committed.is_set() else None
+        )
+
+        original = asyncio.ensure_future(
+            create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
+        )
+        await asyncio.wait_for(committed.wait(), timeout=2)
+        replay = asyncio.ensure_future(
+            create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
+        )
+        await asyncio.sleep(0.1)
+        release_init.set()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(original, timeout=2)
+        with pytest.raises(terminal_service.IdempotentCreateFailed) as exc_info:
+            await asyncio.wait_for(replay, timeout=2)
+
+        assert deleted.is_set() is not cleanup_deferred
+        if cleanup_deferred:
+            assert exc_info.value.terminal_id == "test1234"
+            assert "retained" in str(exc_info.value)
+        else:
+            assert exc_info.value.terminal_id is None
+            assert "retained" not in str(exc_info.value)
+        assert "timed out after 180" in str(exc_info.value)
         mock_provider_manager.create_provider.assert_called_once()
 
 

@@ -2078,6 +2078,103 @@ class TestClaudeCodeProviderPermissionMode:
         assert "Bash" in command
 
 
+# Claude Code's own agent-messaging and agent-spawning built-ins (always cut on a
+# restricted grant) and the shell companions now mapped to execute_bash.
+_AGENT_TOOLS_CUT = (
+    "SendMessage",
+    "ListAgents",
+    "SendFile",
+    "FetchInboxMessage",
+    "Workflow",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "RemoteTrigger",
+    "EnterWorktree",
+    "ExitWorktree",
+    "TeamCreate",
+    "TeamDelete",
+)
+_SHELL_COMPANIONS_CUT = ("TaskStop", "GetTask", "PowerShell")
+
+
+def _helper_profile(mock_load):
+    mock_profile = MagicMock()
+    mock_profile.model = None
+    mock_profile.system_prompt = None
+    mock_profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+    mock_profile.permissionMode = None
+    mock_load.return_value = mock_profile
+    return mock_profile
+
+
+def _blocked(command: str) -> list:
+    args = shlex.split(command.split("; ")[-1])
+    return [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
+
+
+class TestClaudeCodeBuiltinAgentToolsArgv:
+    """The launch argv cuts Claude Code's own agent tools on a restricted grant.
+
+    A live helper granted ``fs_read`` and ``@cao-mcp-server`` replied with
+    Claude Code's built-in ``SendMessage``, which no CAO terminal receives, so
+    its answer was lost. CAO's ``send_message`` must stay available.
+    """
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_helper_argv_cuts_each_new_tool(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-cut", "sess", "win", "agent", allowed_tools=["fs_read", "@cao-mcp-server"]
+        )
+        command = provider._build_claude_command()
+        blocked = _blocked(command)
+        for tool in _AGENT_TOOLS_CUT + _SHELL_COMPANIONS_CUT:
+            assert blocked.count(tool) == 1, tool
+        assert "Read" not in blocked
+        assert "LSP" not in blocked
+        assert [tool for tool in blocked if tool.startswith(("mcp__", "@"))] == []
+        # send_message is still on offer: the one MCP server is loaded and only
+        # it, and nothing names it in the deny list.
+        config = _extract_mcp_config(command)
+        assert set(config["mcpServers"]) == {"cao-mcp-server"}
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_developer_default_loses_only_the_agent_tools(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-dev",
+            "sess",
+            "win",
+            "agent",
+            allowed_tools=["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
+        )
+        command = provider._build_claude_command()
+        assert _blocked(command) == sorted(_AGENT_TOOLS_CUT)
+        _extract_mcp_config(command)
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_unrestricted_argv_has_no_disallowed_tools(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider("term-yolo", "sess", "win", "agent", allowed_tools=["*"])
+        command = provider._build_claude_command()
+        assert "--disallowedTools" not in command
+        _extract_mcp_config(command)
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_mcp_entries_are_skipped(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-mcp", "sess", "win", "agent", allowed_tools=["@cao-mcp-server", "@other"]
+        )
+        command = provider._build_claude_command()
+        blocked = _blocked(command)
+        assert "Bash" in blocked and "Read" in blocked and "SendMessage" in blocked
+        assert [tool for tool in blocked if tool.startswith(("mcp__", "@"))] == []
+        _extract_mcp_config(command)
+
+
 class TestClaudeCodeProviderYoloRootRegression:
     """Regression tests for yolo + root/non-root --dangerously-skip-permissions logic.
 
