@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from test.providers.kiro_tools_panel import LIVE_ROWS, last_offset, render
+from test.providers.kiro_tools_panel import LIVE_ROWS, KiroPane, frame, last_offset, render
 from types import MappingProxyType
 
 import pytest
@@ -385,3 +385,39 @@ def test_each_screen_must_be_the_last_one_moved_down_by_one_row(page):
 def test_a_screen_after_the_last_one_refuses():
     with pytest.raises(KiroAttestationError, match="did not move down by one row"):
         check_tools_page(_page("bcdef"), _page("abcde", below=False))
+
+
+@pytest.mark.parametrize("height", [5, 14, 24, 30])
+def test_a_scrolling_frame_parses_only_with_the_rows_above_the_pane(height):
+    """Kiro draws a scrolling panel taller than the pane: its title is above the
+    pane's top row. The pane alone refuses; the pane plus its recent scrollback
+    parses, on either backend's read."""
+    pane = KiroPane(height)
+    pane.draw(frame(LIVE_ROWS, height=height, offset=1))
+    with pytest.raises(KiroAttestationError, match="no complete /tools panel on screen"):
+        parse_tools_page(pane.capture(0))
+    for screen in (pane.capture(-100), pane.recent(100)):
+        page = parse_tools_page(screen)
+        assert (page.more_above, page.more_below) == (True, True)
+        assert page.rows[0] == (LIVE_ROWS[1][0], LIVE_ROWS[1][1])
+
+
+def test_old_frames_left_in_the_scrollback_refuse():
+    """A terminal that kept every frame's overflow would hold two titles."""
+    pane = KiroPane(24, keep_old_overflow=True)
+    pane.draw(frame(LIVE_ROWS, height=24, offset=0))
+    pane.draw(frame(LIVE_ROWS, height=24, offset=1))
+    with pytest.raises(KiroAttestationError, match="no complete /tools panel on screen"):
+        parse_tools_page(pane.capture(-100))
+
+
+@pytest.mark.parametrize("below", ["• Kiro is checking for updates", "  ❯ Allow once"])
+def test_anything_but_blank_rows_below_the_footer_refuses(below):
+    """The panel must be the last thing drawn: Kiro keeps only blank rows under it."""
+    screen = render(LIVE_ROWS, height=24, offset=3)
+    parse_tools_page(screen)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        parse_tools_page(f"{screen}\n\n{below}\n")
+    assert str(excinfo.value) == (
+        "kiro_v3_tools_mismatch: something is drawn below the /tools panel"
+    )

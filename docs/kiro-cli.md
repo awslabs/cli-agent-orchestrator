@@ -139,10 +139,12 @@ panel again would never show a server that has since started. So CAO:
 CAO checks the time after each open. If a server is still loading at the first
 check after `provider_init_timeout` has passed since the first open (60 s by
 default), the launch is refused. On that refusal path the open's close/prompt
-wait does not run — CAO sends a bare Escape and raises — so only the open's
-palette and panel reads add to the timeout; the refusal comes a few seconds
-after it (at most about 8 s). The message says how long CAO waited and how
-often it opened `/mcp`, for example:
+wait does not run (CAO sends a bare Escape and raises). The time after the
+timeout is this open's palette and panel reads, plus the close of the previous
+open if that close was still running when the timeout passed. So the refusal
+comes at most about 7.5 s after the timeout. On a pass, `/tools` is read next,
+with its own bound (see *How CAO reads a long tool list*). The message says how
+long CAO waited and how often it opened `/mcp`, for example:
 
 ```text
 kiro_v3_mcp_not_ready: MCP servers still loading after 61.5 s (13 opens of /mcp): ['cao-mcp-server']
@@ -175,8 +177,23 @@ a row it didn't see could be a tool the grant doesn't allow. But a long list
 doesn't fit on one screen. Kiro shows as many rows as fit, which is the pane's
 height minus nine (at least five), and draws `↓ more` below them. A helper with
 just `fs_read` and `@cao-mcp-server` already has 36 tags: `read`, plus the 35
-tools of `cao-mcp-server`. That needs a pane at least 45 rows tall to fit on
-one screen.
+tools of `cao-mcp-server`.
+
+**Where the panel's top goes.** Kiro draws the panel in place of the input box,
+under the session's notices and with three blank rows kept below it. So once
+the list scrolls, the panel is always two or three rows taller than the pane,
+and its top rows, the title among them, go above the pane's top row into its
+scrollback. A list that doesn't scroll can overflow too: on CAO's 50-row tmux
+panes, more than about 40 tags do. So every `/tools` read is the pane plus its
+recent scrollback:
+- **tmux:** the visible pane and the 100 lines above it (`capture-pane -S -100`);
+- **herdr:** the pane's last 100 lines (`pane read --source recent --lines 100`).
+  A scrolling panel in a herdr pane taller than about 97 rows doesn't fit in
+  that read, and refuses.
+
+Each read must hold exactly one `/tools` title, and nothing but blank rows may
+follow the panel's footer, so the panel CAO reads is the last thing on the pane.
+Old frames left in the scrollback show as a second title, and refuse.
 
 **What CAO does.**
 
@@ -185,44 +202,59 @@ one screen.
    list by one row, and reads the screen again. The new screen must be the old
    one moved by exactly one row: the same title, the same number of rows, the
    old rows without the top one, and one new row at the bottom. A screen that
-   hasn't redrawn yet is read again, every 0.5 s for up to about 3 s.
-3. At the screen with no `↓ more` left, it presses Escape and joins the rows.
+   hasn't redrawn yet is read again, every 0.5 s for up to about 2.5 s.
+3. At the screen with no `↓ more` left, it joins the rows and presses Escape,
+   then waits for the empty prompt to come back on the pane, as after `/mcp`.
 4. It checks the joined list just as it checks a list that fits: no row twice,
    exactly as many rows as the title declares (`/tools · 36 tags`), and every
    tag and MCP tool allowed by the grant.
 
 For example, on a 30-row pane Kiro shows 21 of the 36 tags, so CAO presses Down
-15 times. CAO's tmux sessions start 50 rows tall, which fits 41 rows. A herdr
-pane is as tall as its place in the layout.
+15 times; on a 24-row pane, 21 times. This is the same on tmux and herdr.
 
 Down is the only key CAO sends into the panel. It sends it only when the screen
 it has just read shows the panel with `↓ more` and no dialog. CAO never types
 into the panel's search box. If a dialog appears, CAO refuses without pressing
 anything, not even Escape.
 
-The whole read is bounded by `provider_init_timeout` (60 s by default; see *How
-long CAO waits for MCP servers*), counted from the first `/tools` key and
-checked before each Down.
+**How long it may take.** The read is bounded by `provider_init_timeout` (60 s
+by default; see *How long CAO waits for MCP servers*), counted from the first
+`/tools` key and checked before each Down, so a refusal on time comes at most
+one screen's wait (about 2.5 s) after it. The read and CAO's final wait for the
+prompt share that one timeout: a long scroll shortens the final wait, down to
+about 2.5 s, instead of adding a timeout of its own.
 
 **When it refuses.** Each of these starts with `kiro_v3_tools_mismatch`, and no
 task is typed:
 
 | The message ends with | What happened | Fix |
 |---|---|---|
-| `the /tools panel did not move down by one row` | a screen skipped a row, didn't redraw within the wait, or the list changed while CAO read it | retry; if it persists, report it |
+| `the /tools panel did not move down by one row` | a screen skipped a row, didn't redraw within the wait, or showed a change in its rows or its count while CAO read it | retry; if it persists, report it |
 | `the panel declares N tags but M are visible` | some rows the title counts were never shown | report it |
 | `the /tools panel shows [...] more than once` | the same row appeared twice | report it |
 | `the /tools panel shows more rows than the N it declares` | the list went on past the count in its title | report it |
 | `the /tools panel was still scrolling after N s (M of N tags read)` | `provider_init_timeout` passed before the last screen | make the pane taller, or raise `provider_init_timeout` |
-| `no complete /tools panel on screen` | among other causes, a pane under 14 rows tall: the panel is then taller than the pane, and its title is cut off | make the pane taller |
+| `no complete /tools panel on screen` | among other causes: the panel's title wasn't in the read (a herdr pane over about 97 rows), or the read held two titles (old frames left in the scrollback) | make the herdr pane shorter; if it persists, report it |
+| `something is drawn below the /tools panel` | the panel wasn't the last thing on the pane | report it, with a screenshot |
 | `a dialog appeared on /tools; it was not answered and nothing more was typed` | a dialog came up while CAO read the list | report it, with a screenshot |
+| `the prompt did not return after /tools` | after Escape, the empty prompt didn't come back within about 2.5 s | retry; if it persists, report it |
+| `a dialog appeared after /tools closed; it was not answered and nothing more was typed` | a dialog came up instead of the prompt | report it, with a screenshot |
+
+A change that keeps the count and touches only rows CAO has already scrolled
+past isn't seen, just as a change made right after a list that fits has been
+read isn't.
 
 **Not yet seen live.** This follows the code of Kiro's own terminal UI in
-kiro-cli 3.0.0, which is the same in 2.37.0: the `↑ more` and `↓ more` rows, the
-one-row Down, and the title that counts every row. No scrolled `/tools` panel
-has been captured on a live run yet. If Kiro draws it differently, CAO refuses
-the launch: it never passes a list it didn't read in full. With Kiro's icons
-turned off (`v more`), or in its screen-reader layout, the panel is refused too.
+kiro-cli 3.0.0, which is the same in 2.37.0. That covers the `↑ more` and
+`↓ more` rows, the one-row Down, the title that counts every row, the three
+rows kept below the panel, and how an overflowing frame is redrawn: Kiro clears
+the scrollback and writes the whole frame again, so the scrollback holds one
+copy of the panel's top. A live helper run's herdr history did show the top of
+an open panel, title included, above the pane. But no scrolled `/tools` panel
+has been read end to end on a live run yet, on either backend. If Kiro draws it
+differently, CAO refuses the launch: it never passes a list it didn't read in
+full. With Kiro's icons turned off (`v more`), or in its screen-reader layout,
+the panel is refused too.
 
 ### Supported kiro-cli versions
 

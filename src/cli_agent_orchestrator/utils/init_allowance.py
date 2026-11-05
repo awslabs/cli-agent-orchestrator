@@ -38,15 +38,28 @@ from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_sto
 # path is 2T (``kiro_cli.initialize``; the 4T ``--legacy-ui`` retry that an
 # earlier version of this comment cited was removed in #691), but Kiro's v3
 # path adds the ``/mcp`` reopen loop and a final prompt wait, each bounded by
-# T, plus about 10s of fixed overshoot (#1167) -- so a successful v3 init can
-# take up to about 4T+10s. The fourth T is therefore no longer pure margin: v3
-# uses it, and the 10s of fixed overshoot is covered by the fixed
-# delivery-confirmation headroom added below, not by this linear term.
+# T, plus about 17s of fixed waits (the success close after the last ``/mcp``
+# check, the ``/tools`` read and the identity reads) -- so up to about 4T+17s
+# (#1167). A ``/tools`` list too long for the pane adds about 2.5s more: it is
+# read screen by screen within the T of that final prompt wait, which keeps
+# only one render wait (2.5s) as a floor, so the read, the prompt check after
+# it and the wait end at most about 7.5s past that T (one screen's render
+# wait, the prompt check and the floor), where a list that fits took 5s. So a
+# successful v3 init can take up to about 4T+19.5s
+# (``test_init_allowance_covers_kiro_v3_successful_init``). The fourth T is
+# therefore no longer pure margin: v3 uses it, and the fixed overshoot is
+# covered by the fixed delivery-confirmation headroom added below, not by this
+# linear term.
 _INIT_PHASES = 4
 
 # Worst case of the server's confirm-and-resubmit loop after a send
 # (``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` x (1 + ``_DEFERRED_SUBMIT_MAX_RESUBMITS``)
 # = 32s) with headroom for the pre-dispatch work (memory injection) and polling.
+# Once T is large enough that ``_INIT_PHASES * T`` sets the budget, this
+# headroom also has to absorb Kiro v3's fixed overshoot beyond 4T, about 19.5s
+# (see ``_INIT_PHASES``): 60 - 32 leaves 28s, so about 8.5s remain for the
+# pre-dispatch work and polling. Lowering this, or adding a fixed wait to the
+# Kiro v3 init path, needs that sum checked again.
 _DELIVERY_CONFIRM_ALLOWANCE = 60
 
 # Connect budget for a synchronous create. Kept small and SEPARATE from the read

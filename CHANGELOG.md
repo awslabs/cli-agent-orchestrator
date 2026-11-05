@@ -80,13 +80,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Kiro v3 reads a `/tools` list longer than the pane** (#1167). Kiro shows as many rows as fit,
   the pane's height minus nine (at least five), with `↓ more` below them. A helper with `fs_read`
   and `@cao-mcp-server` already has 36 tags, so on a pane under 45 rows tall every v3 launch of it
-  was refused with `kiro_v3_tools_mismatch: unrecognized row '↓ more'`. CAO now presses Down, the only key it
-  sends into the panel, once per screen. Each new screen must be the last one moved by exactly one
-  row, and the joined rows must hold every row the title declares, each once, before the grant check.
-  Nothing is loosened: a skipped, changed or hidden row, a duplicate, a wrong count or a dialog
-  refuses (no key is ever sent into a dialog). The read is bounded by `provider_init_timeout`, and a
-  pane under 14 rows tall refuses. The scroll rows and keys are taken from kiro-cli 3.0.0's bundled
-  terminal UI, the same as 2.37.0's, and haven't yet been captured live. See "How CAO reads a long
+  was refused with `kiro_v3_tools_mismatch: unrecognized row '↓ more'`. CAO now presses Down, the
+  only key it sends into the panel, once per screen. Each new screen must be the last one moved by
+  exactly one row, and the joined rows must hold every row the title declares, each once, before
+  the grant check. Kiro draws a scrolling panel taller than the pane, so its title sits in the
+  pane's scrollback: every `/tools` read is now the pane plus its recent scrollback (on tmux the
+  pane and 100 lines above it, on herdr the last 100 lines). The read must hold exactly one
+  `/tools` title, with nothing but blank rows below the panel. Nothing is loosened: a skipped,
+  changed or hidden row, a duplicate, a wrong count, a second title, text below the panel or a
+  dialog refuses (no key is ever sent into a dialog). After Escape, CAO now checks on the pane that
+  the empty prompt is back, as after `/mcp`. The read is bounded by `provider_init_timeout`, which
+  it shares with the final prompt wait, so a successful v3 init stays within about 4T+19.5s
+  (`utils/init_allowance.py`). A scrolling panel in a herdr pane over about 97 rows refuses. The
+  layout, scroll rows and keys are taken from kiro-cli 3.0.0's bundled terminal UI, the same as
+  2.37.0's, and no scrolled panel has been read end to end live yet. See "How CAO reads a long
   tool list" in `docs/kiro-cli.md`.
 
 - **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3

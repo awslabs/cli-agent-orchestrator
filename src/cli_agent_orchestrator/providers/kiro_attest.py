@@ -16,6 +16,9 @@ verified pane and checks what the engine actually loaded:
   (``parse_tools_page``), each screen must be the one before it moved down by
   exactly one row, and the joined rows are checked as one panel
   (``join_tools_pages``): every row the title declares, each seen once.
+  Kiro draws a scrolling panel taller than the pane, so its title is read from
+  the pane's recent lines; only one ``/tools`` title may be in them, and
+  nothing but blank rows may follow the panel's footer.
 
 The parsers are pure and fail closed: any layout they do not recognize
 (v2's per-tool panels, the slash palette, a clipped list) is a refusal, never
@@ -128,15 +131,32 @@ def _body(screen: str, title: re.Pattern[str]) -> Optional[List[str]]:
     return None
 
 
+def _lines_to_footer(screen: str) -> List[str]:
+    """``screen``'s lines up to and including the ``/tools`` panel's footer."""
+    lines = screen.splitlines()
+    start = next(i for i, line in enumerate(lines) if _TOOLS_TITLE.match(line))
+    end = next(i for i in range(start, len(lines)) if _CLOSE.match(lines[i]))
+    return lines[: end + 1]
+
+
 def parse_tools_page(screen: str) -> ToolsPage:
     """Parse one screen of the v3 ``/tools · N tags`` panel; refuse any other layout.
 
     Only the rows on screen are read: the declared count is checked once every
     screen of a scrolling list has been joined (``join_tools_pages``).
+
+    ``screen`` may hold lines from above the pane: Kiro draws a scrolling panel
+    taller than the pane (see ``KiroCliProvider._read_v3_tools_screen``). So
+    exactly one ``/tools`` title must be in it, and the panel must be the last
+    thing drawn: below its footer, only blank rows (Kiro keeps three).
     """
     body = _body(screen, _TOOLS_TITLE)
     if body is None:
         raise KiroAttestationError("kiro_v3_tools_mismatch", "no complete /tools panel on screen")
+    if any(line.strip() for line in screen.splitlines()[len(_lines_to_footer(screen)) :]):
+        raise KiroAttestationError(
+            "kiro_v3_tools_mismatch", "something is drawn below the /tools panel"
+        )
     match = _TOOLS_TITLE.match(body[0])
     assert match is not None
     declared = int(match.group(1))
