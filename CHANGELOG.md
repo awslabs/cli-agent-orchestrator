@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`agui_stream.AGUI_GENERATIVE_UI` is removed from `__all__`**, and the constant itself is gone,
   because the `GENERATIVE_UI` event type it named is no longer sent. Use `AGUI_CUSTOM` and
   `CAO_GENERATIVE_UI_EVENT_NAME`.
+- **Fix: a Kiro v3 launch no longer refuses every time while `cao-mcp-server` is still
+  connecting** (#1167, #1218). Kiro v3's `/mcp` panel is a snapshot taken when it opens, so
+  reading an already-open panel again could never show a server that connects after that. CAO
+  now closes and reopens `/mcp` while a server is still loading, until every server is running or
+  `provider_init_timeout` has passed since the first open.
 
 - **Kiro ephemeral helpers on v3** (#1167 Phase 2, #1074 phase 5; preview, pending the operator
   checklist). `kiro_cli` can now be listed in `ephemeral.allowed_providers` (an operator opt-in; the

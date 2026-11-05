@@ -137,12 +137,14 @@ panel again would never show a server that has since started. So CAO:
 
 CAO checks the time after each open. If a server is still loading at the first
 check after `provider_init_timeout` has passed since the first open (60 s by
-default), the launch is refused. The open under way finishes first, so the
-refusal comes a few seconds after the timeout (at most about 8 s). The message
-says how long CAO waited and how often it opened `/mcp`, for example:
+default), the launch is refused. On that refusal path the open's close/prompt
+wait does not run — CAO sends a bare Escape and raises — so only the open's
+palette and panel reads add to the timeout; the refusal comes a few seconds
+after it (at most about 8 s). The message says how long CAO waited and how
+often it opened `/mcp`, for example:
 
 ```text
-kiro_v3_mcp_not_ready: MCP servers still loading after 62 s (13 opens of /mcp): ['cao-mcp-server']
+kiro_v3_mcp_not_ready: MCP servers still loading after 61.5 s (13 opens of /mcp): ['cao-mcp-server']
 ```
 
 A failed, extra or missing server refuses at once, without another try. So does

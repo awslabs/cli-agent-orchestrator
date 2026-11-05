@@ -458,7 +458,7 @@ async def test_a_server_that_never_finishes_loading_refuses_before_tools_is_read
         await _launch(pane, grant=PER_TOOL, provider=provider, init_timeout=init_timeout)
     assert excinfo.value.code == "kiro_v3_mcp_not_ready"
     assert str(excinfo.value) == (
-        f"kiro_v3_mcp_not_ready: MCP servers still loading after {init_timeout} s "
+        f"kiro_v3_mcp_not_ready: MCP servers still loading after {init_timeout:.1f} s "
         f"({opens} opens of /mcp): ['cao-mcp-server']"
     )
     assert pane.clock.now == init_timeout
@@ -619,7 +619,8 @@ async def test_a_screen_without_the_prompt_is_waited_out_within_the_render_wait(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("init_timeout", "opens", "reported", "ends_at"), [(10, 4, 12, 12.0), (60, 13, 62, 61.5)]
+    ("init_timeout", "opens", "reported", "ends_at"),
+    [(10, 4, "12.0", 12.0), (60, 13, "61.5", 61.5)],
 )
 async def test_the_deadline_counts_the_time_spent_inside_each_open(
     cwd, init_timeout, opens, reported, ends_at
