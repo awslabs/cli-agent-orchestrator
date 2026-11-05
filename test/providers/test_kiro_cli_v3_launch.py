@@ -4,8 +4,10 @@ No Kiro runs. The fake pane shows the captured 2.35.1 screens in the order a
 real launch would draw them, driven by the keys CAO sends. Every refusal must
 leave ``identity_verified`` False and type no task text; the only keys ever
 sent are the launch command and the two slash commands with their Enter and
-Escape (``/mcp`` once per open). ``SnapshotPane`` freezes an open ``/mcp``
-panel, as Kiro v3 does, and the provider runs on a fake clock.
+Escape (``/mcp`` once per open), and Down while a ``/tools`` list longer
+than the pane scrolls. ``SnapshotPane`` freezes an open ``/mcp`` panel, as
+Kiro v3 does, ``ScrollingToolsPane`` scrolls ``/tools`` as Kiro v3 does, and
+the provider runs on a fake clock.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import logging
 import re
 import shlex
 from pathlib import Path
+from test.providers.kiro_tools_panel import LIVE_ROWS, last_offset, render
 from typing import Iterable, List, Optional, Sequence
 from unittest.mock import patch
 
@@ -671,9 +674,25 @@ _ATTESTATION_LOG_SHAPES = (
         r"kiro_cli: terminal t1234567 /mcp open \d+ at \d+\.\d s: "
         r"[\w-]+ (?:loading|running) \(\d+ tools\)(?:, [\w-]+ (?:loading|running) \(\d+ tools\))*"
     ),
+    re.compile(
+        r"kiro_cli: terminal t1234567 /tools read: \d+ tags, \d+ on screen at a time, \d+ Down"
+    ),
 )
 #: Text that only a pane's screen holds: panel titles, headings, columns and glyphs.
-_SCREEN_ONLY = ("/mcp list", "Configured Servers", "Source", "local", "◌", "●", "✗", "esc to")
+_SCREEN_ONLY = (
+    "/mcp list",
+    "Configured Servers",
+    "Source",
+    "local",
+    "◌",
+    "●",
+    "✗",
+    "esc to",
+    "/tools ·",
+    "↑",
+    "↓",
+    "@cao-mcp-server/",
+)
 
 
 @pytest.mark.asyncio
@@ -987,3 +1006,393 @@ async def test_the_v2_launch_is_unchanged(cwd):
     assert pane.command == "kiro-cli chat --agent-engine v2 --trust-all-tools --agent v3ro"
     assert pane.keys == []
     assert provider.identity_verified is True
+
+
+# A /tools list longer than the pane (kiro-cli 3.0.0) --------------------------
+
+#: The live 3.0.0 helper's grant: 36 tags on ``/tools``, more than fit.
+HELPER = (["fs_read", "@cao-mcp-server"], ["cao-mcp-server"])
+_EXTRA_ROWS = tuple((f"@cao-mcp-server/zz_extra_{n}", "mcp", "An extra tool.") for n in range(4))
+
+
+class ScrollingToolsPane(SnapshotPane):
+    """A pane too short for its ``/tools`` list, as on the live 3.0.0 helper run.
+
+    ``/tools`` opens at its first row, and Down and Up move it by one row,
+    stopping at its ends, drawn by ``kiro_tools_panel`` as Kiro's TUI draws it;
+    the panel is live, so a list that changes is redrawn. ``cao-mcp-server``
+    runs from the first ``/mcp`` open. Faults, by the number of the Down they
+    come at: ``skip_at`` moves the list by two rows, ``stuck_at`` not at all,
+    ``change_at`` adds a tool to the list (and to its title), ``dialog_at``
+    puts a dialog on screen and ``dialog_below_at`` draws one below the panel.
+    ``reachable`` stops Down short of the last screen, which is drawn with no
+    ``↓ more`` (its last rows are never shown), and ``declared`` overrides the
+    title's count. ``scroll_lag`` reads still show the old screen after a Down,
+    and ``tools_first_frames`` are what reads show after the ``/tools`` Enter
+    before the panel's own frame.
+    """
+
+    def __init__(
+        self,
+        cwd: str,
+        *,
+        rows: Sequence[tuple] = LIVE_ROWS,
+        height: int = 30,
+        declared: Optional[int] = None,
+        skip_at: Optional[int] = None,
+        stuck_at: Optional[int] = None,
+        change_at: Optional[int] = None,
+        dialog_at: Optional[int] = None,
+        dialog_below_at: Optional[int] = None,
+        reachable: Optional[int] = None,
+        scroll_lag: int = 0,
+        tools_first_frames: Sequence[str] = (),
+        **kwargs,
+    ):
+        kwargs.setdefault("states", ("running",))
+        super().__init__(cwd, **kwargs)
+        self.rows = list(rows)
+        self.height = height
+        self.declared = declared
+        self.skip_at = skip_at
+        self.stuck_at = stuck_at
+        self.change_at = change_at
+        self.dialog_at = dialog_at
+        self.dialog_below_at = dialog_below_at
+        self.reachable = reachable
+        self.scroll_lag = scroll_lag
+        self.tools_first_frames = list(tools_first_frames)
+        self.offset = 0
+        self.downs = 0
+        self.tools_closed = False
+        #: Keys sent once Escape had closed ``/tools``.
+        self.keys_after_tools_closed: List[str] = []
+        #: Down or Up sent while ``/tools`` was not the open panel.
+        self.scroll_keys_elsewhere: List[str] = []
+
+    def _last(self) -> int:
+        last = last_offset(len(self.rows), self.height)
+        return last if self.reachable is None else min(last, self.reachable)
+
+    def _draw(self) -> str:
+        cut_short = self.reachable is not None and self.offset >= self._last()
+        return render(
+            self.rows,
+            height=self.height,
+            offset=self.offset,
+            declared=self.declared,
+            more_below=False if cut_short else None,
+        )
+
+    def _open(self, panel: str, screen: str) -> None:
+        if panel == "/tools":
+            self.offset = 0
+            screen = self._draw()
+        super()._open(panel, screen)
+        if panel == "/tools" and self.tools_first_frames:
+            self.frames = list(self.tools_first_frames)
+
+    def send_special_key(self, _session, _window, key):
+        if self.tools_closed:
+            self.keys_after_tools_closed.append(key)
+        if key not in ("Down", "Up") or self.dialog_shown:
+            was_tools = self.open_panel == "/tools"
+            super().send_special_key(_session, _window, key)
+            self.tools_closed = self.tools_closed or (was_tools and self.open_panel is None)
+            return
+        self.keys.append(key)
+        if self.open_panel != "/tools":
+            self.scroll_keys_elsewhere.append(key)
+            return
+        old = self.screen
+        if key == "Down":
+            self.downs += 1
+            step = {self.skip_at: 2, self.stuck_at: 0}.get(self.downs, 1)
+            self.offset = min(self._last(), self.offset + step)
+            if self.downs == self.change_at:
+                self.rows.append(("@cao-mcp-server/zz_new", "mcp", "A tool that just appeared."))
+        else:
+            self.offset = max(0, self.offset - 1)
+        self.frames = [old] * self.scroll_lag
+        self.screen = self._draw()
+        if self.downs == self.dialog_below_at:
+            self.screen = f"{self.screen}\n{_screen(self.dialog)}"
+        if self.downs == self.dialog_at:
+            self.dialog_shown = True
+            self.screen = _screen(self.dialog)
+
+
+def _scroll_keys(downs: int, *, escape: bool = True) -> List[str]:
+    """One ``/mcp`` open, then ``/tools`` scrolled ``downs`` times and closed."""
+    return [*_keys(1, tools=False), *"/tools", "Enter", *["Down"] * downs] + (
+        ["Escape"] if escape else []
+    )
+
+
+async def _launch_helper_grant(pane, **kwargs):
+    provider = _provider(allowed=HELPER[0])
+    try:
+        await _launch(pane, grant=HELPER, provider=provider, **kwargs)
+    finally:
+        pane.provider = provider
+    return provider
+
+
+def test_the_scrolling_pane_moves_by_one_row_and_stops_at_the_ends(cwd):
+    """The double itself, against the TUI's rules (``kiro_tools_panel``)."""
+    pane = ScrollingToolsPane(str(cwd), height=24)
+    _type(pane, [*"/mcp", "Enter", "Escape", *"/tools", "Enter"])
+    assert "↑ more" not in pane.get_history() and "   ↓ more" in pane.get_history()
+    _type(pane, ["Up"])
+    assert pane.offset == 0
+    _type(pane, ["Down"] * 30)
+    assert pane.offset == 21 and "   ↓ more" not in pane.get_history()
+    assert "/tools · 36 tags" in pane.get_history()
+    _type(pane, ["Escape", "Down"])
+    assert pane.scroll_keys_elsewhere == ["Down"]
+    assert pane.keys_after_tools_closed == ["Down"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("height", "downs"), [(30, 15), (24, 21), (14, 31)])
+async def test_regression_a_tools_list_longer_than_the_pane_is_read_screen_by_screen(
+    cwd, height, downs
+):
+    """The live 3.0.0 refusal: a helper with ``fs_read`` and ``@cao-mcp-server``
+    has 36 tags, more than fit, and Kiro drew ``↓ more`` below the rows that
+    did. CAO refused it as ``unrecognized row '↓ more'``. Now it presses Down
+    until no row is left below, one key per screen read, and checks all 36."""
+    pane = ScrollingToolsPane(str(cwd), height=height)
+    provider = await _launch_helper_grant(pane)
+    assert provider.identity_verified is True
+    assert pane.keys == _scroll_keys(downs)
+    assert pane.offset == last_offset(36, height)
+    assert pane.keys_after_tools_closed == [] and pane.scroll_keys_elsewhere == []
+    assert pane.search == "" and pane.open_panel is None
+    assert pane.texts == [pane.command]
+    assert provider.attestation.tags == ("read",)
+
+
+@pytest.mark.asyncio
+async def test_every_tag_on_every_screen_is_held_to_the_grant(cwd):
+    """A tool that only the last screen shows still refuses, after Escape."""
+    names = [name for name, source, _ in LIVE_ROWS if source == "mcp"]
+    assert names[-1] == "@cao-mcp-server/workflow_wait"
+    grant = (["fs_read", *names[:-1]], ["cao-mcp-server"])
+    pane = ScrollingToolsPane(str(cwd))
+    provider = _provider(allowed=grant[0])
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch(pane, grant=grant, provider=provider)
+    assert str(excinfo.value) == (
+        "kiro_v3_tools_mismatch: MCP tool @cao-mcp-server/workflow_wait is not granted"
+    )
+    assert pane.keys == _scroll_keys(15)
+    assert provider.identity_verified is False
+    # The same list with that tool granted attests.
+    pane = ScrollingToolsPane(str(cwd))
+    provider = _provider(allowed=["fs_read", *names])
+    await _launch(pane, grant=(["fs_read", *names], ["cao-mcp-server"]), provider=provider)
+    assert provider.identity_verified is True
+
+
+def _duplicated() -> List[tuple]:
+    rows = list(LIVE_ROWS)
+    rows[30] = rows[2]
+    return rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault", "downs", "detail"),
+    [
+        ({"skip_at": 4}, 4, "the /tools panel did not move down by one row"),
+        ({"stuck_at": 4}, 4, "the /tools panel did not move down by one row"),
+        ({"change_at": 4}, 4, "the /tools panel did not move down by one row"),
+        ({"reachable": 14}, 14, "the panel declares 36 tags but 35 are visible"),
+        ({"declared": 37}, 15, "the panel declares 37 tags but 36 are visible"),
+        (
+            {"rows": _duplicated()},
+            15,
+            "the /tools panel shows ['@cao-mcp-server/assign'] more than once",
+        ),
+        (
+            {"rows": LIVE_ROWS + _EXTRA_ROWS, "declared": 36},
+            15,
+            "the /tools panel shows more rows than the 36 it declares",
+        ),
+    ],
+    ids=[
+        "row_skipped",
+        "did_not_scroll",
+        "list_changed",
+        "row_hidden",
+        "count",
+        "twice",
+        "endless",
+    ],
+)
+async def test_a_missing_screen_a_duplicated_or_hidden_tag_or_a_wrong_count_refuses(
+    cwd, fault, downs, detail
+):
+    pane = ScrollingToolsPane(str(cwd), **fault)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch_helper_grant(pane)
+    assert str(excinfo.value) == f"kiro_v3_tools_mismatch: {detail}"
+    # The panel is closed with one Escape, and nothing follows it.
+    assert pane.keys == _scroll_keys(downs)
+    assert pane.keys_after_tools_closed == []
+    assert pane.provider.identity_verified is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("lag", "attests"), [(5, True), (6, False)])
+async def test_a_screen_trailing_a_down_is_read_again_within_the_render_wait(cwd, lag, attests):
+    from cli_agent_orchestrator.providers import kiro_cli
+
+    assert lag in (kiro_cli.V3_ATTEST_READS - 1, kiro_cli.V3_ATTEST_READS)
+    pane = ScrollingToolsPane(str(cwd), scroll_lag=lag)
+    if attests:
+        provider = await _launch_helper_grant(pane)
+        assert provider.identity_verified is True
+        assert pane.keys == _scroll_keys(15)
+        return
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch_helper_grant(pane)
+    assert (
+        str(excinfo.value)
+        == "kiro_v3_tools_mismatch: the /tools panel did not move down by one row"
+    )
+    assert pane.keys == _scroll_keys(1)
+
+
+@pytest.mark.asyncio
+async def test_a_tools_list_still_scrolling_at_provider_init_timeout_refuses(cwd):
+    """Live, each screen takes time to draw. Here the palette trails the typed
+    ``/tools`` by one read (0.5 s), the panel's first frame its Enter by two
+    (1 s) and each later screen its Down by one (0.5 s). On a 14-row pane 36
+    tags need 31 Downs; with a 5 s timeout, counted from the first ``/tools``
+    key, CAO stops before the first Down after it and closes the panel. It is
+    never more than one screen's render wait late."""
+    from cli_agent_orchestrator.providers import kiro_cli
+
+    pane = ScrollingToolsPane(str(cwd), height=14, scroll_lag=1, palette_lag=1, open_lag=2)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch_helper_grant(pane, init_timeout=5)
+    assert str(excinfo.value) == (
+        "kiro_v3_tools_mismatch: the /tools panel was still scrolling after 5 s "
+        "(12 of 36 tags read)"
+    )
+    assert pane.keys == _scroll_keys(7)
+    # The one /mcp open took 1.5 s (its palette and its panel's frame) before /tools.
+    tools_time = pane.clock.now - 1.5
+    one_screen = (kiro_cli.V3_ATTEST_READS - 1) * kiro_cli.V3_ATTEST_READ_INTERVAL_S
+    assert 5 <= tools_time <= 5 + one_screen
+    assert tools_time == 5.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("short_frames", "attests"), [(5, True), (6, False)])
+async def test_a_panel_that_fits_but_is_first_drawn_short_is_read_again(cwd, short_frames, attests):
+    """A list that fits needs no Down, and its first frame is held to its title as
+    before: a frame drawn one row short is read again within the render wait."""
+    full = render(LIVE_ROWS, height=50)
+    short = "\n".join(line for line in full.splitlines() if "/workflow_wait " not in line)
+    assert "↓ more" not in full and short != full
+    pane = ScrollingToolsPane(str(cwd), height=50, tools_first_frames=[short] * short_frames)
+    if attests:
+        provider = await _launch_helper_grant(pane)
+        assert provider.identity_verified is True
+        assert pane.keys == _scroll_keys(0)
+        return
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch_helper_grant(pane)
+    assert str(excinfo.value) == (
+        "kiro_v3_tools_mismatch: the panel declares 36 tags but 35 are visible"
+    )
+    assert pane.keys == _scroll_keys(0)
+
+
+@pytest.mark.asyncio
+async def test_a_pane_too_short_for_the_panel_refuses_without_scrolling(cwd):
+    """Below 14 rows the panel is taller than the pane and its title is cut off."""
+    pane = ScrollingToolsPane(str(cwd), height=12)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch_helper_grant(pane)
+    assert str(excinfo.value) == "kiro_v3_tools_mismatch: no complete /tools panel on screen"
+    assert pane.keys == _scroll_keys(0)
+
+
+@pytest.mark.asyncio
+async def test_a_dialog_while_tools_scrolls_refuses_and_no_key_is_sent_into_it(cwd):
+    pane = ScrollingToolsPane(str(cwd), dialog_at=3)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch_helper_grant(pane)
+    assert str(excinfo.value) == "kiro_v3_tools_mismatch: no complete /tools panel on screen"
+    assert pane.keys == _scroll_keys(3, escape=False)
+    assert pane.keys_into_dialog == []
+    assert pane.provider.identity_verified is False
+
+
+@pytest.mark.asyncio
+async def test_a_dialog_drawn_below_the_panel_stops_the_scroll_and_is_not_answered(cwd):
+    """The panel still reads cleanly above it, so only the dialog check stops CAO."""
+    from cli_agent_orchestrator.providers.kiro_cli import kiro_v3_dialog
+
+    pane = ScrollingToolsPane(str(cwd), dialog_below_at=2)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch_helper_grant(pane)
+    assert kiro_v3_dialog(pane.screen) == "approval"
+    assert str(excinfo.value) == (
+        "kiro_v3_tools_mismatch: a dialog appeared on /tools; it was not answered "
+        "and nothing more was typed"
+    )
+    assert pane.keys == _scroll_keys(2, escape=False)
+    assert pane.provider.identity_verified is False
+
+
+@pytest.mark.asyncio
+async def test_a_dialog_after_the_last_screen_refuses_and_is_not_answered(cwd):
+    """The last screen read cleanly, but by the time Escape is due a dialog is up."""
+    pane = ScrollingToolsPane(str(cwd), dialog_below_at=15)
+    with pytest.raises(KiroAttestationError) as excinfo:
+        await _launch_helper_grant(pane)
+    assert "a dialog appeared on /tools" in str(excinfo.value)
+    assert pane.keys == _scroll_keys(15, escape=False)
+
+
+@pytest.mark.parametrize("height", [14, 24, 30])
+def test_no_screen_of_a_scrolling_tools_panel_reads_as_a_dialog(height):
+    from cli_agent_orchestrator.providers.kiro_cli import kiro_v3_dialog, kiro_v3_startup_selector
+
+    for offset in range(last_offset(len(LIVE_ROWS), height) + 1):
+        screen = render(LIVE_ROWS, height=height, offset=offset)
+        assert kiro_v3_dialog(screen) is None
+        assert not kiro_v3_startup_selector(screen)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [{}, {"skip_at": 4}, {"reachable": 14}, {"height": 14, "scroll_lag": 1}],
+    ids=["attests", "row_skipped", "row_hidden", "deadline"],
+)
+async def test_reading_a_scrolling_tools_panel_logs_counts_only(cwd, caplog, fault):
+    pane = ScrollingToolsPane(str(cwd), **fault)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            await _launch_helper_grant(pane, init_timeout=5)
+        except KiroAttestationError:
+            pass
+    records = [r for r in caplog.records if r.name.startswith("cli_agent_orchestrator")]
+    assert records
+    for record in records:
+        message = record.getMessage()
+        assert any(shape.fullmatch(message) for shape in _ATTESTATION_LOG_SHAPES), message
+        assert not any(text in message for text in _SCREEN_ONLY), message
+    read = [r.getMessage() for r in records if "/tools read" in r.getMessage()]
+    if not fault:
+        assert read == [
+            "kiro_cli: terminal t1234567 /tools read: 36 tags, 21 on screen at a time, 15 Down"
+        ]
+    else:
+        assert read == []

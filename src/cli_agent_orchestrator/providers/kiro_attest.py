@@ -10,19 +10,27 @@ verified pane and checks what the engine actually loaded:
   still loading (v3's panel is a snapshot taken as it opens, so reading an
   open panel again never shows a change);
 * then, on ``/tools``, every builtin tag is one the grant implies, and every MCP
-  row belongs to a granted server (and tool).
+  row belongs to a granted server (and tool). A list longer than the pane
+  scrolls: Kiro draws ``↑ more`` and ``↓ more`` rows around the rows that fit,
+  and Down moves the list by one row. So the panel is read one screen per Down
+  (``parse_tools_page``), each screen must be the one before it moved down by
+  exactly one row, and the joined rows are checked as one panel
+  (``join_tools_pages``): every row the title declares, each seen once.
 
 The parsers are pure and fail closed: any layout they do not recognize
 (v2's per-tool panels, the slash palette, a clipped list) is a refusal, never
 a pass. Provisional (#1167): the codes ``kiro_v3_tools_mismatch`` and
-``kiro_v3_mcp_not_ready`` and the panel shapes, captured on kiro-cli 2.35.1.
+``kiro_v3_mcp_not_ready`` and the panel shapes, captured on kiro-cli 2.35.1;
+the ``/tools`` scroll rows are read from kiro-cli 3.0.0's bundled TUI, not
+captured live.
 """
 
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from cli_agent_orchestrator.providers.kiro_v3_schema import (
     KiroV3EngineSchema,
@@ -40,6 +48,13 @@ _TOOLS_TITLE = re.compile(r"^\s*/tools · (\d+) tags?\s*$")
 _TOOLS_COLUMNS = re.compile(r"^\s*Name\s+Source\s+Description\s*$")
 _TOOLS_ROW = re.compile(r"^\s*(\S+)\s{2,}(builtin|mcp)(?:\s{2,}.*)?$")
 _NO_TOOLS = re.compile(r"^\s*No tools available\s*$")
+# A /tools list longer than the pane shows ``max(rows - 9, 5)`` rows at a time;
+# kiro-cli 3.0.0's TUI draws these two rows around them (``  ↑ more`` above the
+# column header, ``  ↓ more`` below the last row) while more rows are above or
+# below. Only the Unicode glyphs are recognized (icons off draws ``^``/``v``,
+# which refuses, as ``* running`` does on /mcp).
+_TOOLS_MORE_ABOVE = re.compile(r"^\s*↑ more\s*$")
+_TOOLS_MORE_BELOW = re.compile(r"^\s*↓ more\s*$")
 _MCP_TITLE = re.compile(r"^\s*/mcp list · (\d+) configured\s*$")
 _MCP_HEADING = re.compile(r"^\s*Configured Servers\s*$")
 _MCP_COLUMNS = re.compile(r"^\s*Name\s+Source\s+Status\s+Details\s*$")
@@ -78,6 +93,21 @@ class ToolsPanel:
 
 
 @dataclass(frozen=True)
+class ToolsPage:
+    """One screen of the ``/tools`` panel.
+
+    ``rows`` are the ``(name, source)`` rows on screen, top to bottom;
+    ``more_above`` and ``more_below`` say whether Kiro drew its ``↑ more`` or
+    ``↓ more`` row, that is, whether the list scrolls on past this screen.
+    """
+
+    declared: int
+    rows: Tuple[Tuple[str, str], ...]
+    more_above: bool
+    more_below: bool
+
+
+@dataclass(frozen=True)
 class McpServerRow:
     name: str
     status: str
@@ -98,8 +128,12 @@ def _body(screen: str, title: re.Pattern[str]) -> Optional[List[str]]:
     return None
 
 
-def parse_tools_panel(screen: str) -> ToolsPanel:
-    """Parse the v3 ``/tools · N tags`` panel; refuse any other layout."""
+def parse_tools_page(screen: str) -> ToolsPage:
+    """Parse one screen of the v3 ``/tools · N tags`` panel; refuse any other layout.
+
+    Only the rows on screen are read: the declared count is checked once every
+    screen of a scrolling list has been joined (``join_tools_pages``).
+    """
     body = _body(screen, _TOOLS_TITLE)
     if body is None:
         raise KiroAttestationError("kiro_v3_tools_mismatch", "no complete /tools panel on screen")
@@ -111,25 +145,103 @@ def parse_tools_panel(screen: str) -> ToolsPanel:
         rows = rows[1:]
     if rows and _NO_TOOLS.match(rows[0]):
         raise KiroAttestationError("kiro_v3_tools_mismatch", "the agent has no tools available")
+    more_above = bool(rows) and _TOOLS_MORE_ABOVE.match(rows[0]) is not None
+    if more_above:
+        rows = rows[1:]
     if not rows or not _TOOLS_COLUMNS.match(rows[0]):
         raise KiroAttestationError("kiro_v3_tools_mismatch", "unrecognized /tools layout")
-    tags: Set[str] = set()
-    mcp_tools: Set[str] = set()
-    for row in rows[1:]:
+    rows = rows[1:]
+    more_below = bool(rows) and _TOOLS_MORE_BELOW.match(rows[-1]) is not None
+    if more_below:
+        rows = rows[:-1]
+    if (more_above or more_below) and not rows:
+        raise KiroAttestationError("kiro_v3_tools_mismatch", "unrecognized /tools layout")
+    tools: List[Tuple[str, str]] = []
+    for row in rows:
         parsed = _TOOLS_ROW.match(row)
         if parsed is None:
             raise KiroAttestationError(
                 "kiro_v3_tools_mismatch", f"unrecognized row {row.strip()!r}"
             )
         name, source = parsed.groups()
-        (tags if source == "builtin" else mcp_tools).add(name)
-    if len(tags) + len(mcp_tools) != declared:
-        # A clipped or scrolled list could hide a row; never pass on a partial read.
+        tools.append((name, source))
+    return ToolsPage(declared, tuple(tools), more_above, more_below)
+
+
+def check_tools_page(page: ToolsPage, previous: Optional[ToolsPage] = None) -> None:
+    """Refuse unless ``page`` can be the next screen read of one ``/tools`` panel.
+
+    With no ``previous``, the panel has just opened, so it must start at its
+    first row (no ``↑ more``). Otherwise ``page`` was read after one Down on
+    ``previous``, and Kiro's Down moves a scrolling list by one row: so it
+    must have the same title and the same number of rows, all but the top row
+    of ``previous`` at its top, and one row ``previous`` did not show at its
+    bottom. A frame that still shows the old screen, one drawn halfway, one
+    that moved by more than one row, or a list that changed, refuses.
+    """
+    if previous is None:
+        if page.more_above:
+            raise KiroAttestationError(
+                "kiro_v3_tools_mismatch", "the /tools panel did not start at its first row"
+            )
+        return
+    if not (
+        previous.more_below
+        and page.more_above
+        and page.declared == previous.declared
+        and len(page.rows) == len(previous.rows) >= 1
+        and page.rows[:-1] == previous.rows[1:]
+        and page.rows[-1] not in previous.rows
+    ):
+        raise KiroAttestationError(
+            "kiro_v3_tools_mismatch", "the /tools panel did not move down by one row"
+        )
+
+
+def join_tools_pages(pages: Sequence[ToolsPage]) -> ToolsPanel:
+    """Join the screens of one ``/tools`` panel, read one Down apart, and check them.
+
+    The first screen must be the top of the list and the last its bottom
+    (no ``↓ more``); every later screen must follow the one before it
+    (``check_tools_page``), so only its bottom row is new.
+    The joined rows must hold no row twice and exactly the count the title
+    declares. A clipped, scrolled or partly read list refuses: never pass on
+    a partial read.
+    """
+    if not pages:
+        raise KiroAttestationError("kiro_v3_tools_mismatch", "no /tools panel was read")
+    first = pages[0]
+    check_tools_page(first)
+    rows = list(first.rows)
+    for previous, page in zip(pages, pages[1:]):
+        check_tools_page(page, previous)
+        rows.append(page.rows[-1])
+    if pages[-1].more_below:
+        raise KiroAttestationError(
+            "kiro_v3_tools_mismatch", "the /tools panel has rows below the last screen read"
+        )
+    twice = sorted(name for (name, _), count in Counter(rows).items() if count > 1)
+    if twice:
+        raise KiroAttestationError(
+            "kiro_v3_tools_mismatch", f"the /tools panel shows {twice} more than once"
+        )
+    if len(rows) != first.declared:
         raise KiroAttestationError(
             "kiro_v3_tools_mismatch",
-            f"the panel declares {declared} tags but {len(tags) + len(mcp_tools)} are visible",
+            f"the panel declares {first.declared} tags but {len(rows)} are visible",
         )
+    tags = {name for name, source in rows if source == "builtin"}
+    mcp_tools = {name for name, source in rows if source != "builtin"}
     return ToolsPanel(frozenset(tags), frozenset(mcp_tools))
+
+
+def parse_tools_panel(screen: str) -> ToolsPanel:
+    """Parse a v3 ``/tools · N tags`` panel that fits on one screen; refuse any other.
+
+    A panel that scrolls refuses here: read it screen by screen and join the
+    screens with ``join_tools_pages``.
+    """
+    return join_tools_pages([parse_tools_page(screen)])
 
 
 def parse_mcp_panel(screen: str) -> Dict[str, McpServerRow]:
@@ -253,11 +365,15 @@ def palette_shows_only(screen: str, command: str) -> bool:
 __all__ = [
     "KiroAttestationError",
     "McpServerRow",
+    "ToolsPage",
     "ToolsPanel",
     "check_mcp_panel",
+    "check_tools_page",
     "check_tools_panel",
     "granted_tags",
+    "join_tools_pages",
     "palette_shows_only",
     "parse_mcp_panel",
+    "parse_tools_page",
     "parse_tools_panel",
 ]

@@ -104,7 +104,8 @@ After kiro-cli starts, and before any task is typed:
   MCP tool must be one the grant names (`@server`, or `@server/tool` for a
   single tool). The tags come from the pinned engine schema: `fs_write` gives
   the `code` tool, which carries `read` as well as `write`, so a write-only
-  grant shows both.
+  grant shows both. A list too long for the pane is read screen by screen (see
+  *How CAO reads a long tool list*).
 
 Only then does the terminal accept input. If any check fails, no task is typed
 and the window is closed.
@@ -166,6 +167,62 @@ The same setting is also how long CAO waits for the agent prompt at startup
 `CAO_LOG_LEVEL=DEBUG`. CAO then logs each open of `/mcp` with the time since the
 first open and each server's status. At the default level, `INFO`, these lines
 are left out.
+
+### How CAO reads a long tool list
+
+**Why it matters.** CAO must see every row of `/tools` before it types a task:
+a row it didn't see could be a tool the grant doesn't allow. But a long list
+doesn't fit on one screen. Kiro shows as many rows as fit, which is the pane's
+height minus nine (at least five), and draws `↓ more` below them. A helper with
+just `fs_read` and `@cao-mcp-server` already has 36 tags: `read`, plus the 35
+tools of `cao-mcp-server`. That needs a pane at least 45 rows tall to fit on
+one screen.
+
+**What CAO does.**
+
+1. It opens `/tools` and reads the first screen.
+2. While that screen ends in `↓ more`, it presses Down once, which moves Kiro's
+   list by one row, and reads the screen again. The new screen must be the old
+   one moved by exactly one row: the same title, the same number of rows, the
+   old rows without the top one, and one new row at the bottom. A screen that
+   hasn't redrawn yet is read again, every 0.5 s for up to about 3 s.
+3. At the screen with no `↓ more` left, it presses Escape and joins the rows.
+4. It checks the joined list just as it checks a list that fits: no row twice,
+   exactly as many rows as the title declares (`/tools · 36 tags`), and every
+   tag and MCP tool allowed by the grant.
+
+For example, on a 30-row pane Kiro shows 21 of the 36 tags, so CAO presses Down
+15 times. CAO's tmux sessions start 50 rows tall, which fits 41 rows. A herdr
+pane is as tall as its place in the layout.
+
+Down is the only key CAO sends into the panel. It sends it only when the screen
+it has just read shows the panel with `↓ more` and no dialog. CAO never types
+into the panel's search box. If a dialog appears, CAO refuses without pressing
+anything, not even Escape.
+
+The whole read is bounded by `provider_init_timeout` (60 s by default; see *How
+long CAO waits for MCP servers*), counted from the first `/tools` key and
+checked before each Down.
+
+**When it refuses.** Each of these starts with `kiro_v3_tools_mismatch`, and no
+task is typed:
+
+| The message ends with | What happened | Fix |
+|---|---|---|
+| `the /tools panel did not move down by one row` | a screen skipped a row, didn't redraw within the wait, or the list changed while CAO read it | retry; if it persists, report it |
+| `the panel declares N tags but M are visible` | some rows the title counts were never shown | report it |
+| `the /tools panel shows [...] more than once` | the same row appeared twice | report it |
+| `the /tools panel shows more rows than the N it declares` | the list went on past the count in its title | report it |
+| `the /tools panel was still scrolling after N s (M of N tags read)` | `provider_init_timeout` passed before the last screen | make the pane taller, or raise `provider_init_timeout` |
+| `no complete /tools panel on screen` | among other causes, a pane under 14 rows tall: the panel is then taller than the pane, and its title is cut off | make the pane taller |
+| `a dialog appeared on /tools; it was not answered and nothing more was typed` | a dialog came up while CAO read the list | report it, with a screenshot |
+
+**Not yet seen live.** This follows the code of Kiro's own terminal UI in
+kiro-cli 3.0.0, which is the same in 2.37.0: the `↑ more` and `↓ more` rows, the
+one-row Down, and the title that counts every row. No scrolled `/tools` panel
+has been captured on a live run yet. If Kiro draws it differently, CAO refuses
+the launch: it never passes a list it didn't read in full. With Kiro's icons
+turned off (`v more`), or in its screen-reader layout, the panel is refused too.
 
 ### Supported kiro-cli versions
 
@@ -229,7 +286,7 @@ The message never names a path on the server (it may be a shared server); the se
 | `kiro_v3_workspace_config:<entry>` | the workspace's `.kiro/` (or a parent's) holds configuration v3 would load, an entry CAO does not know, a symlink, or can't be read | remove it, use a worktree without it, or `--engine v2` |
 | `kiro_v3_trust_dialog` | kiro-cli asked to trust the workspace anyway, including when that dialog was declined and Kiro exited | report it; CAO never answers that dialog |
 | `kiro_v3_startup_dialog` | kiro-cli showed a dialog or a selector at startup that CAO doesn't answer: one it has no pattern for, the approval picker, or v2's "Switch to V3" offer | report it with a screenshot |
-| `kiro_v3_tools_mismatch` | `/tools` shows a tag or MCP tool the grant does not allow, shows no tools, or shows a layout CAO can't read (a clipped list too); the `/tools` palette didn't appear; the launch allows every tool; or the agent file is no longer a v3 universal file, or its grant no longer fits the launch | reinstall; if it persists, report it |
+| `kiro_v3_tools_mismatch` | `/tools` shows a tag or MCP tool the grant does not allow, shows no tools, or shows a layout CAO can't read (a clipped list too); a list too long for the pane could not be read in full (see *How CAO reads a long tool list*); the `/tools` palette didn't appear; the launch allows every tool; or the agent file is no longer a v3 universal file, or its grant no longer fits the launch | reinstall; if it persists, report it |
 | `kiro_v3_mcp_not_ready` | `/mcp` shows an extra, failed or missing server, one still loading once `provider_init_timeout` has passed (see *How long CAO waits for MCP servers*), or a layout CAO can't read; the `/mcp` palette didn't appear; a dialog appeared after `/mcp` closed; or the prompt didn't come back after a panel | check that the server starts on its own; for a slow server, raise `provider_init_timeout`; then retry |
 | `kiro_v3_mcp_not_ready` (ungranted servers) | the agent file configures an MCP server its grant doesn't name | `cao install <name> --provider kiro_cli --engine v3` |
 

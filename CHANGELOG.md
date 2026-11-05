@@ -77,6 +77,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Also: `cao launch` now shows the server's refusal reason instead of "Failed to connect", and the
   memory wiki compiler's Kiro call pins `--agent-engine v2`.
 
+- **Kiro v3 reads a `/tools` list longer than the pane** (#1167). Kiro shows as many rows as fit,
+  the pane's height minus nine (at least five), with `↓ more` below them. A helper with `fs_read`
+  and `@cao-mcp-server` already has 36 tags, so on a pane under 45 rows tall every v3 launch of it
+  was refused with `kiro_v3_tools_mismatch: unrecognized row '↓ more'`. CAO now presses Down, the only key it
+  sends into the panel, once per screen. Each new screen must be the last one moved by exactly one
+  row, and the joined rows must hold every row the title declares, each once, before the grant check.
+  Nothing is loosened: a skipped, changed or hidden row, a duplicate, a wrong count or a dialog
+  refuses (no key is ever sent into a dialog). The read is bounded by `provider_init_timeout`, and a
+  pane under 14 rows tall refuses. The scroll rows and keys are taken from kiro-cli 3.0.0's bundled
+  terminal UI, the same as 2.37.0's, and haven't yet been captured live. See "How CAO reads a long
+  tool list" in `docs/kiro-cli.md`.
+
 - **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3
   `Default` fallback** (#1167). A Kiro header with extra columns between the model and the context
   gauge, such as `<agent> · claude-haiku-5.5 · low · ◔ 2%` on the v2 engine with `--effort`, or
