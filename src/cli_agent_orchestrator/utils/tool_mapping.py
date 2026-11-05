@@ -151,8 +151,9 @@ for _provider, _mapping in TOOL_MAPPING.items():
 #   CAO's send_message lost its answer ("Not sent — no agent named '<id>' is
 #   reachable"), and a restricted agent could ask an unrestricted session to
 #   act for it. CAO's MCP send_message (`mcp__cao-mcp-server__send_message`)
-#   is a different name and is not affected; Claude Code matches deny rules
-#   by exact tool name.
+#   is not affected: a Claude Code deny matches by exact name, a legacy alias,
+#   a `*` glob or an `mcp__<server>` prefix, and every name here is a bare
+#   built-in name (no `*`, `_` or `mcp__`), so none can reach it.
 # - Workflow: deterministic multi-subagent orchestration. It starts
 #   subagents, the route by which a restricted agent escaped through Agent
 #   (the execute_bash note above), and it duplicates CAO's own workflows.

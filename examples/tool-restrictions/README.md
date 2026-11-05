@@ -211,7 +211,8 @@ tool_restrictions_supervisor (role: supervisor → @cao-mcp-server, fs_read, fs_
   │
   ├─ handoff("tool_restrictions_developer")
   │    → Developer profile resolves role: developer → full access
-  │    → Claude Code launched with no --disallowedTools
+  │    → Claude Code launched with only the always-removed Claude Code built-ins
+  │      in --disallowedTools (see docs/tool-restrictions.md)
   │
   └─ handoff("tool_restrictions_reviewer")
        → Reviewer profile resolves role: reviewer → read-only

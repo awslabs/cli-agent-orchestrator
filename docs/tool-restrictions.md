@@ -366,12 +366,14 @@ On every restricted grant, the list also carries the Claude Code built-ins descr
 
 **What is not affected.**
 
-- CAO's own MCP tools. Claude Code matches a deny against the tool's exact name, and CAO's `send_message` is named `mcp__cao-mcp-server__send_message`, so it stays available to any agent granted `@cao-mcp-server`.
+- CAO's own MCP tools. A Claude Code deny matches a tool by its exact name, a legacy alias, a `*` glob or an `mcp__<server>` prefix. Every name CAO adds is a bare built-in name, so none can reach CAO's `send_message`, which is named `mcp__cao-mcp-server__send_message`; it stays available to any agent granted `@cao-mcp-server`.
 - `ToolSearch`. Claude Code may load MCP tools, CAO's included, through it.
 - Unrestricted agents (`"*"` or `--yolo`). They keep every tool, as before.
-- Claude Code's subagent tool (`Agent`, formerly `Task`). It still follows `execute_bash`, as described in [Known Limitations #1](#known-limitations).
+- Claude Code's subagent tool (`Agent`, formerly `Task`). It still follows `execute_bash`, as described in [Known Limitations #1](#known-limitations). A subagent can be given its own model and effort, can be any agent in the operator's Claude Code agent store or plugins, and on Claude Code 2.1.318 runs in the background, so its work is outside CAO's sizing and records. Because `SendMessage` is removed, an agent can no longer send follow-up messages to a subagent it started; the subagent still returns its result.
 
 Some of these tools are switched on only for some accounts or settings. Where one is off, its deny has nothing to remove. Claude Code 2.1.318 knows every name on the list (`TeamCreate` and `TeamDelete` as removed tools), so it warns about none of them.
+
+An older Claude Code that lacks one of these names prints `Permission deny rule "<name>" matches no known tool — check for typos.` when it starts. The warning is harmless: a deny for a tool the build does not have removes nothing.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
@@ -467,7 +469,8 @@ Supervisor (role: supervisor → @cao-mcp-server, fs_read, fs_list; delegates *)
   │
   ├─ assign("developer")
   │    → Developer profile: role: developer → full access, fits inside *
-  │    → Claude Code launched with no --disallowedTools; its ceiling: its own list
+  │    → Claude Code launched with only the always-removed Claude Code built-ins in
+  │      --disallowedTools (see "Claude Code built-ins CAO always removes"); its ceiling: its own list
   │
   └─ handoff("reviewer")
        → Reviewer profile: role: reviewer → read-only, fits inside *

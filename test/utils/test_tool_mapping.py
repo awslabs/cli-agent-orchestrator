@@ -429,6 +429,49 @@ _CLAUDE_CODE_MAPPING_BEFORE = {
     "web_fetch": ["WebFetch", "WebSearch"],
 }
 
+# Every other provider's mapping on the base, frozen so a change to any of them
+# fails test_other_providers_are_unchanged rather than moving its expectation.
+_OTHER_PROVIDER_MAPPINGS_BEFORE = {
+    "antigravity_cli": {
+        "execute_bash": ["run_shell_command"],
+        "fs_read": ["read_file", "list_directory", "search_file_content", "glob"],
+        "fs_write": ["write_file", "replace"],
+        "fs_list": ["list_directory", "glob", "search_file_content"],
+        "fs_*": [
+            "read_file",
+            "write_file",
+            "replace",
+            "list_directory",
+            "search_file_content",
+            "glob",
+        ],
+        "web_fetch": ["web_fetch", "google_web_search"],
+    },
+    "copilot_cli": {
+        "execute_bash": ["shell"],
+        "fs_read": ["read"],
+        "fs_write": ["write"],
+        "fs_list": ["list", "grep"],
+        "fs_*": ["read", "write", "list", "grep"],
+    },
+    "grok_cli": {
+        "execute_bash": ["Bash"],
+        "fs_read": ["Read", "NotebookRead"],
+        "fs_write": ["Edit", "Write", "NotebookEdit"],
+        "fs_list": ["Grep", "Glob"],
+        "fs_*": ["Read", "NotebookRead", "Edit", "Write", "NotebookEdit", "Grep", "Glob"],
+        "web_fetch": ["WebFetch", "WebSearch"],
+    },
+    "kiro_cli": {
+        "execute_bash": ["execute_bash", "shell", "subagent", "use_aws"],
+        "fs_read": ["fs_read", "read", "knowledge"],
+        "fs_write": ["fs_write", "write", "code"],
+        "fs_list": ["glob", "grep"],
+        "fs_*": ["fs_read", "read", "knowledge", "fs_write", "write", "code", "glob", "grep"],
+        "web_fetch": ["web_fetch", "web_search"],
+    },
+}
+
 # Newly mapped Claude Code 2.1.318 built-ins and the CAO tools that keep them.
 _NEWLY_MAPPED = {
     "TaskStop": {"execute_bash"},
@@ -482,10 +525,10 @@ class TestClaudeCodeBuiltinAgentToolsCut:
     def test_cao_mcp_tools_are_never_named(self, allowed):
         """CAO's send_message stays reachable whatever the grant.
 
-        Claude Code matches a deny rule by the exact tool name (or a whole
-        ``mcp__<server>`` prefix rule), and treats a name with ``_`` as an MCP
-        name. Every cut name is a bare built-in name, so none can reach
-        ``mcp__cao-mcp-server__send_message``.
+        A Claude Code 2.1.318 deny matches by exact name, a legacy alias, a
+        ``*`` glob or an ``mcp__<server>`` prefix, and treats a name with ``_``
+        as an MCP name. Every cut name is a bare built-in name, so none can
+        reach ``mcp__cao-mcp-server__send_message``.
         """
         disallowed = get_disallowed_tools("claude_code", allowed)
         assert "mcp__cao-mcp-server__send_message" not in disallowed
@@ -538,15 +581,23 @@ class TestClaudeCodeBuiltinAgentToolsCut:
         without_bash = get_disallowed_tools("claude_code", ["fs_read"])
         assert "Agent" in without_bash and "Task" in without_bash
 
-    @pytest.mark.parametrize("provider", sorted(set(ALL_NATIVE_TOOLS) - {"claude_code"}))
+    def test_no_other_provider_was_added_or_removed(self):
+        assert set(TOOL_MAPPING) - {"claude_code"} == set(_OTHER_PROVIDER_MAPPINGS_BEFORE)
+
+    @pytest.mark.parametrize("provider", sorted(_OTHER_PROVIDER_MAPPINGS_BEFORE))
     @pytest.mark.parametrize("allowed", _RESTRICTED_GRANTS)
     def test_other_providers_are_unchanged(self, provider, allowed):
-        mapping = TOOL_MAPPING[provider]
+        """Pinned to the frozen base mappings, not the live table, so an edit to
+        another provider's mapping fails here."""
+        mapping = _OTHER_PROVIDER_MAPPINGS_BEFORE[provider]
+        every = {tool for tools in mapping.values() for tool in tools}
         kept = set()
         for cao_tool in allowed:
             kept.update(mapping.get(cao_tool, []))
+        assert ALL_NATIVE_TOOLS[provider] == every
         result = get_disallowed_tools(provider, allowed)
-        assert result == sorted(ALL_NATIVE_TOOLS[provider] - kept)
+        assert result == sorted(every - kept)
+        assert get_allowed_tools(provider, allowed) == sorted(kept)
         assert set(result).isdisjoint(CLAUDE_CODE_ALWAYS_CUT)
 
 
