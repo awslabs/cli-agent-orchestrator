@@ -642,6 +642,27 @@ def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
         return False
 
 
+def _is_unreadable_store_error(exc: BaseException) -> bool:
+    """True for ``load_agent_profile``'s RuntimeError wrapping an OS-level read error.
+
+    ``load_agent_profile`` wraps without ``from``, so the OSError is on __context__.
+    """
+    return isinstance(exc, RuntimeError) and isinstance(exc.__context__, OSError)
+
+
+def _fetch_profile_from_server(profile_name: str) -> Any:
+    """Fetch a parsed agent profile from cao-server's ``GET /agents/profiles/{name}``."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    response = requests.get(
+        f"{API_BASE_URL}/agents/profiles/{profile_name}",
+        headers=_auth_headers() or None,
+        timeout=_mcp_timeout(),
+    )
+    response.raise_for_status()
+    return AgentProfile.model_validate(response.json())
+
+
 def _load_child_profile(child_profile_name: str) -> Any:
     """Load a child's agent profile, asking cao-server when this process can't read it.
 
@@ -654,24 +675,15 @@ def _load_child_profile(child_profile_name: str) -> Any:
     runs on the same profile it would have read locally. FileNotFoundError and parse
     errors still propagate unchanged.
     """
-    from cli_agent_orchestrator.models.agent_profile import AgentProfile
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
     try:
         return load_agent_profile(child_profile_name)
     except RuntimeError as exc:
-        # load_agent_profile wraps the underlying error without `from`, so the
-        # OSError is on __context__.
-        if not isinstance(exc.__context__, OSError):
+        if not _is_unreadable_store_error(exc):
             raise
         try:
-            response = requests.get(
-                f"{API_BASE_URL}/agents/profiles/{child_profile_name}",
-                headers=_auth_headers() or None,
-                timeout=_mcp_timeout(),
-            )
-            response.raise_for_status()
-            return AgentProfile.model_validate(response.json())
+            return _fetch_profile_from_server(child_profile_name)
         except Exception as fallback_exc:
             logger.warning(
                 "Profile '%s' unreadable locally (%s) and cao-server fallback failed: %s",
@@ -680,6 +692,45 @@ def _load_child_profile(child_profile_name: str) -> Any:
                 fallback_exc,
             )
             raise exc
+
+
+def _resolve_child_provider(agent_profile: str, fallback_provider: str) -> str:
+    """``resolve_provider`` that survives a sandboxed agent store.
+
+    ``resolve_provider`` treats any load failure as "no provider pinned" and
+    returns the fallback (the supervisor's provider), which the client then sends
+    as an explicit ``provider=`` the server honours. Under the same sandbox as
+    ``_load_child_profile``, a child pinned to another CLI would silently launch
+    on the supervisor's. When the local read fails only because the store is
+    unreadable, read the pin from cao-server's copy instead; every other outcome
+    is exactly ``resolve_provider``'s (which re-reads the profile; the extra
+    read is a cheap local file).
+    """
+    from cli_agent_orchestrator.utils.agent_profiles import (
+        load_launch_profile,
+        provider_from_profile,
+    )
+
+    try:
+        load_launch_profile(agent_profile)
+    except RuntimeError as exc:
+        if _is_unreadable_store_error(exc):
+            try:
+                profile = _fetch_profile_from_server(agent_profile)
+            except Exception as fallback_exc:
+                logger.warning(
+                    "Profile '%s' unreadable locally (%s) and cao-server fallback failed: "
+                    "%s; using provider '%s'",
+                    agent_profile,
+                    exc.__context__,
+                    fallback_exc,
+                    fallback_provider,
+                )
+                return fallback_provider
+            return provider_from_profile(profile, agent_profile, fallback_provider)
+    except Exception:  # noqa: BLE001 - every other outcome is resolve_provider's to judge
+        pass
+    return resolve_provider(agent_profile, fallback_provider=fallback_provider)
 
 
 def _resolve_child_allowed_tools(
@@ -1100,7 +1151,9 @@ def _create_terminal(
         provider = (
             claim.provider
             if claim is not None
-            else resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+            else _resolve_child_provider(
+                agent_profile, fallback_provider=terminal_metadata["provider"]
+            )
         )
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
@@ -1237,7 +1290,7 @@ def _create_terminal(
             if idempotency_key
             else generate_session_name()
         )
-        provider = resolve_provider(agent_profile, fallback_provider=provider)
+        provider = _resolve_child_provider(agent_profile, fallback_provider=provider)
         params = {
             "provider": provider,
             "agent_profile": agent_profile,
@@ -1403,7 +1456,7 @@ def _resolve_handoff_provider(
     current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
         return HandoffContext(
-            provider=resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
+            provider=_resolve_child_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
             session_name=None,
             caller_id=None,
             allowed_tools=None,
@@ -1425,7 +1478,9 @@ def _resolve_handoff_provider(
             claim.effective_tools,
             claim.claim_id,
         )
-    provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+    provider = _resolve_child_provider(
+        agent_profile, fallback_provider=terminal_metadata["provider"]
+    )
     # Resolve the child's allowed-tools via the same inheritance the old path
     # used; _resolve_child_allowed_tools returns a comma-separated string (or
     # None for unrestricted), which we split into the list the payload expects.

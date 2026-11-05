@@ -279,3 +279,42 @@ class TestUnreadableProfileFallsBackToServer:
             _resolve_child_allowed_tools(["fs_read"], "x")
 
         mock_get.assert_not_called()
+
+
+class TestResolveChildProviderUnreadableStore:
+    """The provider pin must survive the same sandbox as the allowed-tools read."""
+
+    @patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=5.0)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_unreadable_store_reads_pin_from_server(self, mock_load, mock_get, _timeout):
+        from cli_agent_orchestrator.utils.orchestration import _resolve_child_provider
+
+        mock_load.side_effect = _unreadable("claude_worker")
+        mock_get.return_value = MagicMock(
+            json=lambda: {"name": "claude_worker", "description": "d", "provider": "claude_code"}
+        )
+
+        assert _resolve_child_provider("claude_worker", "kiro_cli") == "claude_code"
+
+    @patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=5.0)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_server_failure_keeps_fallback(self, mock_load, mock_get, _timeout):
+        from cli_agent_orchestrator.utils.orchestration import _resolve_child_provider
+
+        mock_load.side_effect = _unreadable("claude_worker")
+        mock_get.side_effect = ConnectionError("down")
+
+        assert _resolve_child_provider("claude_worker", "kiro_cli") == "kiro_cli"
+
+    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="codex")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_readable_store_defers_to_resolve_provider(self, mock_load, mock_get, mock_rp):
+        from cli_agent_orchestrator.utils.orchestration import _resolve_child_provider
+
+        mock_load.return_value = (MagicMock(), None)
+
+        assert _resolve_child_provider("w", "kiro_cli") == "codex"
+        mock_get.assert_not_called()

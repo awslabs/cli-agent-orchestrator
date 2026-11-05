@@ -710,6 +710,13 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
         # will surface a clear error later.  Fall back for now.
         return fallback_provider
 
+    return provider_from_profile(profile, agent_profile_name, fallback_provider)
+
+
+def provider_from_profile(
+    profile: AgentProfile, agent_profile_name: str, fallback_provider: str
+) -> str:
+    """Return the profile's pinned provider if valid, else ``fallback_provider``."""
     if profile.provider:
         if profile.provider in PROVIDERS:
             return profile.provider
