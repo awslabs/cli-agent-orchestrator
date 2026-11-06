@@ -347,7 +347,10 @@ class TestKillReachesThePane:
 
 
 class TestWebViewAttachCommand:
-    def test_links_the_panes_window_and_focuses_the_pane(self, tmux):
+    def test_links_the_panes_window_without_selecting_a_pane(self, tmux):
+        """The WebSocket handler selects the pane (one active pane per window,
+        not per client), so the chain carries no pane target that could fail
+        after the view exists."""
         pane = marked_pane("coder-3", "%4")
         pane.window.window_id = "@2"
         tmux.server.sessions.get.return_value = session_with(panes=[pane])
@@ -355,8 +358,7 @@ class TestWebViewAttachCommand:
         argv = tmux.web_view_attach_command("ses", "coder-3")
 
         assert argv[argv.index("link-window") + 2] == "@2"
-        assert argv[argv.index("select-pane") + 2] == "%4"
-        assert argv.index("select-pane") < argv.index("attach-session")
+        assert "select-pane" not in argv and "%4" not in argv
 
     def test_window_terminal_links_its_window(self, tmux):
         tmux.server.sessions.get.return_value = session_with(window=MagicMock())
@@ -365,6 +367,41 @@ class TestWebViewAttachCommand:
 
         assert argv[argv.index("link-window") + 2] == "ses:win"
         assert "select-pane" not in argv
+
+
+class TestWebViewInputFocus:
+    def test_a_pane_terminal_names_its_window_and_pane(self, tmux):
+        pane = marked_pane("coder-3", "%4")
+        pane.window.window_id = "@2"
+        tmux.server.sessions.get.return_value = session_with(panes=[pane])
+
+        assert tmux.web_view_input_focus("ses", "coder-3") == ("@2", "%4")
+
+    def test_a_window_terminal_needs_no_focus(self, tmux):
+        tmux.server.sessions.get.return_value = session_with(window=MagicMock())
+
+        assert tmux.web_view_input_focus("ses", "win") is None
+
+    def test_select_pane_targets_the_pane(self, tmux):
+        tmux.server.cmd.return_value = MagicMock(returncode=0, stderr=[])
+
+        tmux.select_pane("%4")
+
+        tmux.server.cmd.assert_called_once_with("select-pane", "-t", "%4")
+
+    @pytest.mark.parametrize("bad", ["4", "%4; kill-server", "ses:win", "", "%"])
+    def test_select_pane_refuses_anything_but_a_pane_id(self, tmux, bad):
+        with pytest.raises(ValueError):
+            tmux.select_pane(bad)
+        tmux.server.cmd.assert_not_called()
+
+    def test_select_pane_failure_raises(self, tmux):
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
+        tmux.server.cmd.return_value = MagicMock(returncode=1, stderr=["can't find pane: %4"])
+
+        with pytest.raises(TmuxLookupError):
+            tmux.select_pane("%4")
 
 
 class TestWebViewArgv:
@@ -379,6 +416,35 @@ class TestWebViewArgv:
         assert argv.index("kill-window") < argv.index("attach-session")
         # destroy-unattached only after attaching: set earlier it kills the view.
         assert argv.index("destroy-unattached") > argv.index("attach-session")
+
+    @pytest.mark.parametrize(
+        "option,value",
+        [
+            # create_session sets mouse on agent sessions (#546); a view starts
+            # from tmux's global default (off), and xterm.js then turns wheel
+            # ticks into Up/Down keys sent to the agent.
+            ("mouse", "on"),
+            # The client exits when the view is destroyed, whatever tmux.conf says.
+            ("detach-on-destroy", "on"),
+        ],
+    )
+    def test_view_sets_session_options_before_attaching(self, option, value):
+        from cli_agent_orchestrator.clients.tmux import web_view_attach_argv
+
+        argv = web_view_attach_argv("cao-s", "cao-s:w", view_name="caoweb-x")
+
+        at = argv.index(option)
+        assert argv[at - 3 : at + 2] == ["set-option", "-t", "caoweb-x", option, value]
+        assert at < argv.index("attach-session")
+
+    def test_web_view_owner_maps_only_views(self):
+        from cli_agent_orchestrator.clients.tmux import web_view_owner
+
+        owners = {"caoweb-x": "cao-s"}
+        assert web_view_owner("caoweb-x", owners.get) == "cao-s"
+        assert web_view_owner("caoweb-gone", owners.get) is None
+        assert web_view_owner("cao-s", owners.get) == "cao-s"
+        assert web_view_owner(None, owners.get) is None
 
     def test_view_names_never_look_like_cao_sessions(self):
         from cli_agent_orchestrator.clients.tmux import web_view_attach_argv

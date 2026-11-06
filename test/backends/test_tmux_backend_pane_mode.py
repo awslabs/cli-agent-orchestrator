@@ -78,3 +78,17 @@ class TestWebAttach:
         backend.prepare_web_attach("ses", "coder-3")
 
         client.web_view_attach_command.assert_called_once_with("ses", "coder-3")
+
+    def test_window_mode_input_needs_no_focus(self, client):
+        backend = TmuxBackend(client=client)
+
+        assert backend.web_input_focus("ses", "win") is None
+        client.web_view_input_focus.assert_not_called()
+
+    def test_pane_mode_input_focus_comes_from_tmux(self, client):
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+        client.web_view_input_focus.return_value = ("@2", "%4")
+
+        assert backend.web_input_focus("ses", "coder-3") == ("@2", "%4")
+        backend.focus_web_input("%4")
+        client.select_pane.assert_called_once_with("%4")

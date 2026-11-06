@@ -12,6 +12,7 @@ import stat
 import struct
 import subprocess
 import termios
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -9180,6 +9181,16 @@ def _ws_input_refusal(
     return metadata, terminal_service.terminal_input_refusal(terminal_id, metadata)
 
 
+# Which browser terminal last focused each shared input scope (a tmux window in
+# pane spawn mode), and when. tmux keeps one active pane per window, not per
+# client, so a pane terminal re-selects its own pane before forwarding input
+# whenever another connection selected since, or its own selection is older than
+# _WEB_INPUT_REFOCUS_S (an operator in a real terminal may have moved it; that
+# change is invisible here). One tmux call per switch or pause, not per key.
+_WEB_INPUT_FOCUS: Dict[str, Tuple[object, float]] = {}
+_WEB_INPUT_REFOCUS_S = 2.0
+
+
 @app.websocket("/terminals/{terminal_id}/ws")
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
@@ -9353,6 +9364,50 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4004, reason="Failed to attach terminal")
         return
 
+    try:
+        input_focus = await asyncio.to_thread(
+            get_backend().web_input_focus, session_name, window_name
+        )
+    except Exception as e:  # noqa: BLE001 — degrade to the attach's own routing
+        logger.warning(f"Could not resolve input focus for terminal {terminal_id}: {e}")
+        input_focus = None
+    if not (
+        isinstance(input_focus, tuple)
+        and len(input_focus) == 2
+        and all(isinstance(part, str) for part in input_focus)
+    ):
+        input_focus = None
+    focus_token = object()
+    focus_failure_logged = False
+
+    async def _focus_input() -> bool:
+        """Make this terminal's pane the one its input reaches; False if it can't."""
+        nonlocal focus_failure_logged
+        if input_focus is None:
+            return True
+        scope, target = input_focus
+        holder = _WEB_INPUT_FOCUS.get(scope)
+        now = time.monotonic()
+        if (
+            holder is not None
+            and holder[0] is focus_token
+            and now - holder[1] < _WEB_INPUT_REFOCUS_S
+        ):
+            return True
+        try:
+            await asyncio.to_thread(get_backend().focus_web_input, target)
+        except Exception as e:  # noqa: BLE001 — never route input to a pane we could not select
+            if not focus_failure_logged:
+                focus_failure_logged = True
+                logger.warning(
+                    "Dropping WebSocket input for terminal %r: could not focus its pane (%s)",
+                    terminal_id,
+                    e,
+                )
+            return False
+        _WEB_INPUT_FOCUS[scope] = (focus_token, now)
+        return True
+
     # Create PTY pair for backend attach
     master_fd, slave_fd = pty.openpty()
 
@@ -9377,6 +9432,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         env=pty_env,
     )
     os.close(slave_fd)
+    # Pane mode: the view shows the whole shared window; select this
+    # terminal's pane so its cursor, and its input, start on the right agent.
+    await _focus_input()
 
     # Make master_fd non-blocking for event-driven reads
     flag = fcntl.fcntl(master_fd, fcntl.F_GETFL)
@@ -9461,6 +9519,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                     if not await _input_allowed():
                         # Dropped: zero bytes reach the PTY (#1074).
                         continue
+                    if not await _focus_input():
+                        # Dropped: never deliver keys to another agent's pane.
+                        continue
                     raw = payload["data"].encode()
                     # Write in chunks to avoid overflowing the PTY buffer
                     chunk_size = 1024
@@ -9501,6 +9562,10 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             os.close(master_fd)
         except OSError:
             pass
+        if input_focus is not None:
+            holder = _WEB_INPUT_FOCUS.get(input_focus[0])
+            if holder is not None and holder[0] is focus_token:
+                del _WEB_INPUT_FOCUS[input_focus[0]]
         # Terminate tmux attach (just detaches, doesn't kill the session)
         proc.terminate()
         try:

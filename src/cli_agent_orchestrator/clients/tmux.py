@@ -453,21 +453,35 @@ def is_web_view_session(name: Optional[str]) -> bool:
 def web_view_attach_argv(
     session_name: str,
     source_window: str,
-    pane_id: Optional[str] = None,
     view_name: Optional[str] = None,
 ) -> List[str]:
     """tmux argv that attaches a fresh view session showing ``source_window``.
 
     ``source_window`` is a tmux window target (``session:window`` or ``@id``).
-    ``pane_id`` additionally focuses one pane of that window (pane spawn mode).
     A new session needs an initial window; a short-lived placeholder is created,
     replaced by the linked window, and killed before anything attaches. Bare
     ``;`` arguments separate tmux commands within the one invocation. If the
     link fails, tmux stops the sequence before attaching and the placeholder
     session exits with its ``sleep``.
+
+    A view is a new session, so it starts from tmux's *global* options, not the
+    agent session's. Two of those matter here and are set on the view itself:
+      * ``mouse on``: what ``create_session`` sets on agent sessions (#546).
+        Without it xterm.js turns wheel ticks into Up/Down keys, which walk the
+        agent's prompt history or move a permission menu's selection.
+      * ``detach-on-destroy on``: when the view is destroyed (its window was
+        killed) the client exits instead of switching to another session, so
+        "self-closing" holds whatever the operator's tmux.conf says.
+
+    Pane spawn mode needs no pane selection here: the window holds every pane
+    and tmux keeps one active pane per window, not per client, so the WebSocket
+    handler selects the terminal's pane itself (see ``web_view_input_focus``).
+    Keeping the chain free of a pane target also means a pane that vanishes
+    mid-attach cannot stop the chain after the view exists, which would have
+    left the view behind without ``destroy-unattached``.
     """
     view = view_name or f"{WEB_VIEW_PREFIX}{uuid.uuid4().hex[:12]}"
-    argv = [
+    return [
         "tmux",
         "-u",
         "new-session",
@@ -484,6 +498,18 @@ def web_view_attach_argv(
         WEB_VIEW_OWNER_OPTION,
         session_name,
         ";",
+        "set-option",
+        "-t",
+        view,
+        "mouse",
+        "on",
+        ";",
+        "set-option",
+        "-t",
+        view,
+        "detach-on-destroy",
+        "on",
+        ";",
         "link-window",
         "-s",
         source_window,
@@ -494,10 +520,6 @@ def web_view_attach_argv(
         "-t",
         f"{view}:{_WEB_VIEW_PLACEHOLDER}",
         ";",
-    ]
-    if pane_id:
-        argv += ["select-pane", "-t", pane_id, ";"]
-    argv += [
         "attach-session",
         "-t",
         view,
@@ -509,7 +531,23 @@ def web_view_attach_argv(
         "destroy-unattached",
         "on",
     ]
-    return argv
+
+
+def web_view_owner(
+    name: Optional[str], read_owner: Callable[[str], Optional[str]]
+) -> Optional[str]:
+    """The agent session a session name stands for, seen from inside its pane.
+
+    Inside an agent's pane, ``tmux display-message -p '#S'`` names the most
+    recently active session holding the pane's window. While a browser view
+    of that window is attached, that is the ``caoweb-*`` view, not the agent's
+    session. Views carry their owner in WEB_VIEW_OWNER_OPTION; ``read_owner``
+    reads it. Any other name is returned unchanged.
+    """
+    if not is_web_view_session(name):
+        return name
+    owner = read_owner(name)  # type: ignore[arg-type]
+    return owner or None
 
 
 def _require_cao_session_name(session_name: str, action: str) -> None:
@@ -1067,28 +1105,57 @@ class TmuxClient:
             logger.warning(f"Could not resolve a pane for {window_target}: {e}")
         return window_target
 
+    def _web_view_pane(self, session_name: str, terminal_name: str) -> Optional[Tuple[str, str]]:
+        """``(window_id, pane_id)`` when the terminal lives as a pane, else None.
+
+        A terminal with a window of its own is not a pane; a lookup that will
+        not read is treated as "not a pane" so the attach falls back to the
+        window target, which tmux then reports as missing in pane mode.
+        """
+        try:
+            session = self._find_session(session_name)
+            if session is None or self._find_window(session, session_name, terminal_name):
+                return None
+            pane = self._find_marked_pane(session, session_name, terminal_name)
+        except TmuxLookupError:
+            return None
+        if pane is None or not pane.pane_id or not pane.window.window_id:
+            return None
+        return pane.window.window_id, pane.pane_id
+
     def web_view_attach_command(self, session_name: str, terminal_name: str) -> List[str]:
         """``web_view_attach_argv`` for a terminal that may live as a pane.
 
         A terminal without a window of its own is a marked pane, so the view
-        links the pane's window and focuses the pane (``select-pane`` alone would
-        not move the view to that window; linking it as the view's only window
-        does).
+        links the pane's window. The pane itself is selected by the WebSocket
+        handler (``web_view_input_focus``), not here.
         """
-        pane = None
-        try:
-            session = self._find_session(session_name)
-            if session is not None and (
-                self._find_window(session, session_name, terminal_name) is None
-            ):
-                pane = self._find_marked_pane(session, session_name, terminal_name)
-        except TmuxLookupError:
-            pane = None
-        pane_id = pane.pane_id if pane is not None else None
-        window_id = pane.window.window_id if pane is not None else None
-        if pane_id is None or window_id is None:
+        located = self._web_view_pane(session_name, terminal_name)
+        if located is None:
             return web_view_attach_argv(session_name, f"{session_name}:{terminal_name}")
-        return web_view_attach_argv(session_name, window_id, pane_id)
+        return web_view_attach_argv(session_name, located[0])
+
+    def web_view_input_focus(
+        self, session_name: str, terminal_name: str
+    ) -> Optional[Tuple[str, str]]:
+        """``(window_id, pane_id)`` a browser terminal must select before its input.
+
+        Only a pane terminal has one: its window is shared with other agents'
+        panes, and keys go to whichever pane is active in that window.
+        """
+        return self._web_view_pane(session_name, terminal_name)
+
+    def select_pane(self, pane_id: str) -> None:
+        """Make ``pane_id`` the active pane of its window.
+
+        ``pane_id`` must be a tmux-issued ``%N`` id; anything else is refused
+        before it reaches tmux.
+        """
+        if not re.fullmatch(r"%\d+", pane_id or ""):
+            raise ValueError(f"not a tmux pane id: {pane_id!r}")
+        result = self.server.cmd("select-pane", "-t", pane_id)
+        if result.returncode != 0:
+            raise TmuxLookupError("; ".join(result.stderr) or f"select-pane {pane_id} failed")
 
     def kill_web_views(self, session_name: str) -> None:
         """Kill every browser view session showing a window of ``session_name``.
