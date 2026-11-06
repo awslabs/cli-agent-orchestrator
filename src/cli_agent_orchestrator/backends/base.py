@@ -7,7 +7,7 @@ Core services depend only on this ABC, never on a concrete backend directly.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -447,6 +447,20 @@ class TerminalBackend(ABC):
             TerminalBackendError: If the backend cannot prepare the attachment
         """
         ...
+
+    def web_input_focus(self, session_name: str, window_name: str) -> Optional[Tuple[str, str]]:
+        """What a browser terminal must focus before its input reaches the agent.
+
+        Returns ``(scope, target)``: ``scope`` names what several terminals
+        share (one focus per scope), ``target`` is what this terminal must
+        focus. None means input needs no focusing, the default: the attach
+        already routes it to the right agent.
+        """
+        return None
+
+    def focus_web_input(self, target: str) -> None:
+        """Focus ``target`` (from ``web_input_focus``) so input reaches it."""
+        return None
 
     # --- Pipe-pane (logging) ---
 

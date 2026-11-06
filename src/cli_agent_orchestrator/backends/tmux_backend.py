@@ -6,7 +6,7 @@ no alternative is configured.
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
@@ -17,6 +17,7 @@ from cli_agent_orchestrator.clients.tmux import (
     DEFAULT_PANE_LAYOUT,
     PaneSpawnUnavailable,
     TmuxClient,
+    web_view_attach_argv,
 )
 from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
 
@@ -225,12 +226,31 @@ class TmuxBackend(TerminalBackend):
         subprocess.run(["tmux", "attach-session", "-t", session_name], check=True)
 
     def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
-        """Return the tmux command used by the browser PTY WebSocket."""
+        """Return the tmux command used by the browser PTY WebSocket.
+
+        Attaches a private view session rather than the agent's session itself,
+        so several browser terminals on one session each keep their own window
+        (see ``web_view_attach_argv``).
+        """
         if self._spawn_mode != "pane":
-            return ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"]
+            return web_view_attach_argv(session_name, f"{session_name}:{window_name}")
         # Only pane mode has to ask tmux where the terminal is; the window-mode
         # target is a pure function of its arguments and stays one.
-        return self._client.attach_command(session_name, window_name)
+        return self._client.web_view_attach_command(session_name, window_name)
+
+    def web_input_focus(self, session_name: str, window_name: str) -> Optional[Tuple[str, str]]:
+        """``(window_id, pane_id)`` for a pane terminal, None in window mode.
+
+        In pane mode several agents are panes of one window, and tmux keeps one
+        active pane per window, not per client: keys from any browser terminal
+        on that window go to whichever pane was selected last.
+        """
+        if self._spawn_mode != "pane":
+            return None
+        return self._client.web_view_input_focus(session_name, window_name)
+
+    def focus_web_input(self, target: str) -> None:
+        self._client.select_pane(target)
 
     # --- Pipe-pane ---
 

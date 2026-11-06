@@ -275,6 +275,9 @@ export interface TerminalMeta {
   agent_profile: string | null
   created_at: string | null
   last_active: string | null
+  /** Live status, lowercase (`idle`, `processing`, ...). Set by GET /sessions/{name}
+      from the status monitor; absent on other routes that return terminal rows. */
+  status?: string | null
 }
 
 /**

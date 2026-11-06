@@ -83,14 +83,14 @@ class TestTmuxBackendDelegation:
         assert len(result) == 1
         mock_client.list_sessions.assert_called_once()
 
-    def test_prepare_web_attach_returns_window_target(self, backend):
-        assert backend.prepare_web_attach("cao-test", "developer-abcd") == [
-            "tmux",
-            "-u",
-            "attach-session",
-            "-t",
-            "cao-test:developer-abcd",
-        ]
+    def test_prepare_web_attach_links_the_window_into_a_private_view(self, backend):
+        argv = backend.prepare_web_attach("cao-test", "developer-abcd")
+        # Never attaches the agent's own session: that would switch its one
+        # current window for every other client (#workspace split panes).
+        assert "cao-test" not in argv[argv.index("attach-session") + 2]
+        link = argv.index("link-window")
+        assert argv[link + 1 : link + 3] == ["-s", "cao-test:developer-abcd"]
+        assert argv[argv.index("@cao_web_view_of") + 1] == "cao-test"
 
     def test_kill_session_delegates(self, backend, mock_client):
         mock_client.kill_session.return_value = True
