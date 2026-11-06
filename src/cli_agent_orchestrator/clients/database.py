@@ -3931,9 +3931,13 @@ def create_delegation_edge(
             message_id=message_id,
         )
         db.add(row)
+        # Read the edge back from the flushed row, before commit expires it. A
+        # reload after commit raised ObjectDeletedError in test runs and would
+        # turn a stored edge into a failed create.
+        db.flush()
+        edge = _edge_from_row(row)
         db.commit()
-        db.refresh(row)
-        return _edge_from_row(row)
+        return edge
 
 
 def mark_assign_edges_delivered(worker_id: str) -> int:
