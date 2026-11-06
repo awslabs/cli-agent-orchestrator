@@ -4,11 +4,13 @@ import pytest
 
 from cli_agent_orchestrator.utils.tool_mapping import (
     ALL_NATIVE_TOOLS,
+    EPHEMERAL_ALWAYS_DISALLOWED,
     KIRO_BUILTIN_CHROME,
     TOOL_MAPPING,
     format_tool_summary,
     get_allowed_tools,
     get_disallowed_tools,
+    get_launch_disallowed_tools,
     granted_mcp_servers,
     kiro_agent_tools,
     resolve_allowed_tools,
@@ -599,6 +601,71 @@ class TestClaudeCodeBuiltinAgentToolsCut:
         assert result == sorted(every - kept)
         assert get_allowed_tools(provider, allowed) == sorted(kept)
         assert set(result).isdisjoint(CLAUDE_CODE_ALWAYS_CUT)
+
+
+# The seven Claude Code built-ins an ephemeral helper never gets,
+# written out so a name dropped from the code fails these tests.
+EPHEMERAL_HELPER_CUT = (
+    "Agent",
+    "Task",
+    "Monitor",
+    "Skill",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
+
+_HELPER_ATOMS = ["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"]
+_HELPER_GRANTS = (
+    [[atom, "@cao-mcp-server"] for atom in _HELPER_ATOMS]
+    + [[atom] for atom in _HELPER_ATOMS]
+    + [_HELPER_ATOMS + ["@cao-mcp-server"], ["@cao-mcp-server"], []]
+)
+
+
+class TestEphemeralClaudeCodeHelperCut:
+    """An ephemeral Claude Code helper never gets subagents, Monitor, skills,
+    questions or plan mode, whatever its grant; nothing else changes."""
+
+    @pytest.mark.parametrize("allowed", _HELPER_GRANTS)
+    def test_every_helper_grant_cuts_the_seven(self, allowed):
+        cut = get_launch_disallowed_tools("claude_code", allowed, ephemeral=True)
+        for tool in EPHEMERAL_HELPER_CUT:
+            assert cut.count(tool) == 1, tool
+        assert cut == sorted(
+            set(get_disallowed_tools("claude_code", allowed)) | set(EPHEMERAL_HELPER_CUT)
+        )
+
+    @pytest.mark.parametrize("allowed", [["*"], None])
+    def test_a_helper_loses_the_seven_even_unrestricted(self, allowed):
+        assert get_launch_disallowed_tools("claude_code", allowed, ephemeral=True) == sorted(
+            EPHEMERAL_HELPER_CUT
+        )
+
+    @pytest.mark.parametrize("allowed", _RESTRICTED_GRANTS + _HELPER_GRANTS)
+    def test_installed_launches_are_unchanged(self, allowed):
+        assert get_launch_disallowed_tools("claude_code", allowed) == get_disallowed_tools(
+            "claude_code", allowed
+        )
+
+    def test_installed_developer_default_and_star_are_unchanged(self):
+        developer = ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
+        assert get_launch_disallowed_tools("claude_code", developer) == sorted(
+            CLAUDE_CODE_ALWAYS_CUT
+        )
+        assert get_launch_disallowed_tools("claude_code", ["*"]) == []
+        assert get_launch_disallowed_tools("claude_code", None) == []
+
+    @pytest.mark.parametrize("provider", ["codex", "kiro_cli", "copilot_cli", "grok_cli"])
+    @pytest.mark.parametrize("allowed", _HELPER_GRANTS)
+    def test_no_other_provider_gets_the_helper_cut(self, provider, allowed):
+        assert get_launch_disallowed_tools(
+            provider, allowed, ephemeral=True
+        ) == get_disallowed_tools(provider, allowed)
+
+    def test_the_helper_cut_is_keyed_to_claude_code_only(self):
+        assert set(EPHEMERAL_ALWAYS_DISALLOWED) == {"claude_code"}
+        assert EPHEMERAL_ALWAYS_DISALLOWED["claude_code"] == EPHEMERAL_HELPER_CUT
 
 
 class TestGrantedMcpServers:
