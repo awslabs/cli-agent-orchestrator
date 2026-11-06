@@ -24,7 +24,14 @@ from cli_agent_orchestrator.providers.kiro_v3_schema import (
 
 
 def test_the_allow_list_pins_2_35_1_and_marks_2_36_0_2_37_0_and_3_0_0_pending():
-    assert set(SUPPORTED_KIRO_CLI_VERSIONS) == {"2.35.1", "2.36.0", "2.37.0", "3.0.0"}
+    assert set(SUPPORTED_KIRO_CLI_VERSIONS) == {
+        "2.35.1",
+        "2.36.0",
+        "2.37.0",
+        "2.37.1",
+        "3.0.0",
+        "3.1.0",
+    }
     assert SUPPORTED_KIRO_CLI_VERSIONS["2.35.1"].pending_operator_verification is False
     for pending in ("2.36.0", "2.37.0", "3.0.0"):
         entry = SUPPORTED_KIRO_CLI_VERSIONS[pending]
@@ -35,7 +42,7 @@ def test_the_allow_list_pins_2_35_1_and_marks_2_36_0_2_37_0_and_3_0_0_pending():
         assert entry.schema is KAS_0_66_70
     for version in ("2.35.1", "2.36.0", "2.37.0", "3.0.0"):
         assert kiro_v3_schema_for_cli_version(version) is KAS_0_66_70
-    assert pinned_kiro_v3_schemas() == (KAS_0_66_70,)
+    assert tuple(s.engine for s in pinned_kiro_v3_schemas()) == ("kas-0.66.70", "kas-0.66.91")
     for version in (None, "", "2.35", "2.35.1 ", "v2.35.1", "3.0", "3", "v3.0.0", "3.0.0 "):
         with pytest.raises(KiroV3UnsupportedVersionError):
             kiro_v3_schema_for_cli_version(version)
@@ -121,7 +128,7 @@ def test_the_unsupported_version_refusal_names_the_supported_versions_and_v2():
     message = str(excinfo.value)
     assert message.startswith("kiro_v3_unsupported_version:")
     assert "kiro-cli 2.38.0" in message
-    assert "2.35.1, 2.36.0, 2.37.0, 3.0.0" in message
+    assert "2.35.1, 2.36.0, 2.37.0, 2.37.1, 3.0.0, 3.1.0" in message
     assert "engine 'v2'" in message
     assert excinfo.value.version == "2.38.0"
 
@@ -164,7 +171,7 @@ def test_a_launch_admits_a_measured_version_and_holds_a_pending_one():
 @pytest.mark.parametrize("allow_unverified", [False, True])
 @pytest.mark.parametrize(
     "version",
-    [None, "", "2.38.0", "2.37", "2.35.1 ", "v2.37.0", "2.37.1", "3.0.1", "3.0", "v3.0.0"],
+    [None, "", "2.38.0", "2.37", "2.35.1 ", "v2.37.0", "3.2.0", "3.0.1", "3.0", "v3.0.0"],
 )
 def test_a_launch_refuses_a_version_outside_the_allow_list(version, allow_unverified):
     """The operator opt-in admits pending entries only, never an unknown version."""
@@ -191,3 +198,99 @@ def test_every_version_refusal_is_a_v3_refusal_and_a_value_error():
         assert isinstance(error, KiroV3Refusal) and isinstance(error, ValueError)
         assert str(error).startswith(f"{error.code}: ")
     assert KiroV3Refusal.code == "kiro_v3_refused"
+
+
+@pytest.mark.parametrize("version, engine", [("2.37.1", "kas-0.66.70"), ("3.1.0", "kas-0.66.91")])
+def test_new_pending_versions_lookup_refuse_by_default_and_admit_only_with_opt_in(version, engine):
+    schema = kiro_v3_schema_for_cli_version(version)
+    assert schema.engine == engine
+    with pytest.raises(KiroV3UnverifiedVersionError) as excinfo:
+        require_launchable_kiro_v3_version(version)
+    assert excinfo.value.code == "kiro_v3_unverified_version"
+    entry = require_launchable_kiro_v3_version(version, allow_unverified=True)
+    assert entry.schema is schema and entry.pending_operator_verification is True
+    assert "pending operator verification" in entry.basis
+
+
+def test_0_66_91_records_unmodelled_tools_without_selecting_them():
+    schema = kiro_v3_schema_for_cli_version("3.1.0")
+    assert schema.unmodelled_tools == {
+        "control_bash_process": (frozenset({"shell", "@builtin"}), "shell"),
+        "list_processes": (frozenset({"shell", "@builtin"}), None),
+        "get_process_output": (frozenset({"shell", "@builtin"}), None),
+        "code_index_build": (frozenset({"spec", "@builtin"}), "fs_read"),
+        "code_index_explore": (frozenset({"spec", "@builtin"}), "fs_read"),
+        "job_list": (frozenset({"@builtin"}), None),
+        "job_cancel": (frozenset({"@builtin"}), None),
+    }
+    assert KAS_0_66_70.unmodelled_tools == {}
+    assert schema.tags is KAS_0_66_70.tags
+    for field in (
+        "agent_keys",
+        "v2_only_keys",
+        "rule_keys",
+        "effects",
+        "capabilities",
+        "meta_capabilities",
+        "mcp_server_fields",
+        "tool_ids",
+        "worst_case_selectors",
+        "selects_nothing",
+        "always_added",
+        "always_added_known",
+        "fallback_agents",
+        "fallback_reasons",
+    ):
+        assert getattr(schema, field) == getattr(KAS_0_66_70, field)
+    for entry in (
+        set(schema.tags)
+        | set(schema.tool_ids)
+        | set(schema.worst_case_selectors)
+        | set(schema.unmodelled_tools)
+    ):
+        assert schema.select(entry) == KAS_0_66_70.select(entry)
+        assert schema.select(entry).isdisjoint(schema.unmodelled_tools)
+
+
+@pytest.mark.parametrize("mask", range(64))
+@pytest.mark.parametrize("mcp", [False, True])
+def test_new_schema_keeps_every_grant_render_byte_identical(mask, mcp):
+    from unittest.mock import patch
+
+    from cli_agent_orchestrator.providers.kiro_attest import granted_tags
+    from cli_agent_orchestrator.services import install_service
+    from cli_agent_orchestrator.services.install_service import kiro_universal_agent_config
+    from cli_agent_orchestrator.utils import tool_mapping
+
+    schema = kiro_v3_schema_for_cli_version("3.1.0")
+    atoms = ("fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch", "fs_*")
+    grant = [atom for i, atom in enumerate(atoms) if mask & (1 << i)]
+    if mcp:
+        grant += ["@cao-mcp-server", "@other/tool"]
+
+    def render(schemas):
+        with patch.object(install_service, "pinned_kiro_v3_schemas", return_value=schemas):
+            config = kiro_universal_agent_config(
+                name="reviewer",
+                description="reviewer",
+                prompt="Review.",
+                allowed_tools=grant,
+                mcp_servers={
+                    "cao-mcp-server": {"command": "/fixture/cao-mcp-server"},
+                    "other": {"command": "/fixture/other"},
+                },
+                resources=[],
+                model=None,
+            )
+        return config.model_dump_json(indent=2).encode()
+
+    assert granted_tags(grant, (schema,)) == granted_tags(grant, (KAS_0_66_70,))
+    assert tool_mapping.kiro_v3_effective_tools(
+        tool_mapping.kiro_universal_tools(grant),
+        tool_mapping.kiro_v3_excluded_tools(grant, (schema,)),
+        schema,
+    ).isdisjoint(schema.unmodelled_tools)
+    old = render((KAS_0_66_70,))
+    assert render((schema,)) == render(pinned_kiro_v3_schemas()) == old
+    for version in ("2.35.1", "2.36.0", "2.37.0", "2.37.1", "3.0.0"):
+        assert render((kiro_v3_schema_for_cli_version(version),)) == old

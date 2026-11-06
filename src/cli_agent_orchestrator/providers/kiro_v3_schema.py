@@ -80,6 +80,12 @@ class KiroV3EngineSchema:
     #: The reasons in ``agent "<n>" <reason>, using "default"``.
     fallback_reasons: Tuple[str, ...] = ()
 
+    #: Static inventory only. The render, selection, granted tags and exact
+    #: sets must not read this field: W2a preserves every existing render.
+    unmodelled_tools: Mapping[str, Tuple[frozenset[str], Optional[str]]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
     def select(self, entry: str) -> frozenset[str]:
         """The built-in tool ids one ``tools`` entry may select, worst case.
 
@@ -194,6 +200,49 @@ KAS_0_66_70 = KiroV3EngineSchema(
 )
 
 
+# W1-short review §2 pins these values. CAO's tags and all render-facing
+# fields are equal to 0.66.70; the extra inventory is deliberately not selected.
+# Non-data changes: ris rejects unrecorded session consent; switchMode changes
+# skill bookkeeping; memory-sync org refresh adds an MCP reconcile trigger
+# (default off). c2s_render_architecture and subagent_response were removed;
+# the XDG_CACHE_HOME c2s store is unchanged.
+# Windows execute_pwsh/control_pwsh_process remain shell-capability variants.
+# MCP disclosure tool_load/tool_call/load_resource retain read, @builtin and
+# @mcp-disclosure tags with no capability. They stay outside CAO's read map.
+KAS_0_66_91 = KiroV3EngineSchema(
+    engine="kas-0.66.91",
+    agent_keys=KAS_0_66_70.agent_keys,
+    v2_only_keys=KAS_0_66_70.v2_only_keys,
+    rule_keys=KAS_0_66_70.rule_keys,
+    effects=KAS_0_66_70.effects,
+    capabilities=KAS_0_66_70.capabilities,
+    meta_capabilities=KAS_0_66_70.meta_capabilities,
+    mcp_server_fields=KAS_0_66_70.mcp_server_fields,
+    tags=_TAGS_0_66_70,
+    tool_ids=KAS_0_66_70.tool_ids,
+    worst_case_selectors=KAS_0_66_70.worst_case_selectors,
+    selects_nothing=KAS_0_66_70.selects_nothing,
+    always_added=KAS_0_66_70.always_added,
+    always_added_known=KAS_0_66_70.always_added_known,
+    fallback_agents=KAS_0_66_70.fallback_agents,
+    fallback_reasons=KAS_0_66_70.fallback_reasons,
+    unmodelled_tools=MappingProxyType(
+        {
+            "control_bash_process": (frozenset({"shell", "@builtin"}), "shell"),
+            "list_processes": (frozenset({"shell", "@builtin"}), None),
+            "get_process_output": (frozenset({"shell", "@builtin"}), None),
+            # _h("c2s") gated; code_index_build may write .kiro/specs/ under
+            # KIRO_C2S_DEEP_ANALYSIS=1 and spend model credits.
+            "code_index_build": (frozenset({"spec", "@builtin"}), "fs_read"),
+            "code_index_explore": (frozenset({"spec", "@builtin"}), "fs_read"),
+            # UNIVERSAL_BACKGROUND_TOOL / jobTools gated.
+            "job_list": (frozenset({"@builtin"}), None),
+            "job_cancel": (frozenset({"@builtin"}), None),
+        }
+    ),
+)
+
+
 @dataclass(frozen=True)
 class KiroCliVersionEntry:
     """One allow-listed kiro-cli release and the engine schema it ships."""
@@ -248,6 +297,21 @@ SUPPORTED_KIRO_CLI_VERSIONS: Mapping[str, KiroCliVersionEntry] = MappingProxyTyp
                 "so it cannot widen the render, tags or rules; pending operator verification"
             ),
         ),
+        # W1-short review §2: pending until operator checks OC1–OC19 pass.
+        "2.37.1": KiroCliVersionEntry(
+            cli_version="2.37.1",
+            schema=KAS_0_66_70,
+            pending_operator_verification=True,
+            basis=(
+                "static: engine package byte-identical to 2.35.1's "
+                "(acp-server.js sha256 bf79b2b0fa7ae68653abdf117b4a4dbf064fec6fa7ca49500115f3f2f67581b1, "
+                "externals 99bf8b686ced7f999ffc2733565fdb92d895705272454445b46a6286db17b14c, "
+                "package.json 017660a7415dc49d09c0d2503fc4a1e475c219a2641f1ed218996c499fb61e42, "
+                "17-file package list a2c68bd4…); the tree differs from 2.37.0's in tslib "
+                "only; reuses KAS_0_66_70 unchanged, so it cannot widen the render, tags "
+                "or rules; pending operator verification"
+            ),
+        ),
         # PENDING OPERATOR VERIFICATION. Derived statically, never run, as for
         # 2.37.0. This release ships the same engine, @kiro/agent 0.66.70: the
         # 17-file @kiro/agent package, acp-server.js included, is byte-identical
@@ -275,6 +339,20 @@ SUPPORTED_KIRO_CLI_VERSIONS: Mapping[str, KiroCliVersionEntry] = MappingProxyTyp
                 "(semver, tslib) that the engine doesn't load; reuses KAS_0_66_70 "
                 "unchanged, so it cannot widen the render, tags or rules; pending "
                 "operator verification"
+            ),
+        ),
+        # W1-short review §2: pending until operator checks OC1–OC19 pass.
+        "3.1.0": KiroCliVersionEntry(
+            cli_version="3.1.0",
+            schema=KAS_0_66_91,
+            pending_operator_verification=True,
+            basis=(
+                "static: a different engine, @kiro/agent 0.66.91 "
+                "(acp-server.js sha256 e359aeb393a4a3c7daf8b64d9d457362bcccd9799c660e379b06c12e391fc30b, "
+                "externals a7914c971f11604ae3b0f066220a57f1a35137f6dfa323b6e000d4ff6ef02db8, "
+                "package.json f7e29484e475d65c4219935d31e6e5609232ff0561e1b4370a0675e6d30fe6c1), "
+                "derived statically by a bounded review; tag maps equal to KAS_0_66_70's "
+                "for CAO's tags, so renders are unchanged; pending operator verification"
             ),
         ),
     }
