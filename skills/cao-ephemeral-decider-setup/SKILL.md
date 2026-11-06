@@ -1,8 +1,8 @@
 ---
 name: cao-ephemeral-decider-setup
-description: Set up ephemeral agents and an installed decider (worked example
-  cao-decider-jev; also works for any other installed decider package) for a
-  user, end to end, on an existing CAO install. Covers preflight, installing
+description: Set up ephemeral agents and an installed decider (any decider
+  package that provides a cao.deciders entry point) for a user, end to end,
+  on an existing CAO install. Covers preflight, installing
   the decider into cao-server's own environment, the per-provider tier table,
   a safe edit of the ephemeral settings block, handing consent to the human,
   the server/MCP restart, shadow vs on, a smoke test, provider caveats and
@@ -20,11 +20,11 @@ refuses every provider's launches; a stale MCP connection fails with no hint tha
 fix it. This skill walks an agent through every step in order, up to the one step that is
 human-only: granting consent.
 
-**Decider-generic.** Everything below works for any installed decider package; `cao-decider-jev`
-(entry-point name `jev`) is the worked example. CAO bundles and endorses no decider. A published
-`cao-decider-jev` release is tracked in #1182 — until then, install from whatever source the user
-already has (a git checkout, a wheel, a private index), never one this skill invents. **Never
-resolve a decider by a bare, guessed name from PyPI** — see step 3.
+**Decider-generic.** This works for any installed decider package: `<decider-name>` is its
+`cao.deciders` entry-point name (as `cao decisions status` shows it), `<exact-distribution-name>` its
+exact distribution name from its own docs. CAO bundles and endorses no decider. A published decider
+release is tracked in #1182; until then, install from the user's own source (a git checkout, a
+wheel, a private index). **Never resolve a decider by a bare, guessed name from PyPI** — see step 3.
 
 **Scope.** This skill is setup mechanics only. Whether to delegate to an ephemeral agent at all is
 `cao-agent-routing`'s job. Authoring a decider package is out of scope entirely.
@@ -123,13 +123,13 @@ the user if it isn't obvious.
 
 ## 3. Install the decider into cao-server's environment
 
-**Never let an agent resolve a decider package from a bare, guessed name.** PyPI can (and in the
-case of the worked example, does) already host an unrelated package under the short name a user
-might say out loud. Use only the decider's exact distribution name as given by the user or the
-package's own docs — for the worked example that is **`cao-decider-jev`** (import module
-`cao_decider_jev`, `cao.deciders` entry-point name `jev`), never the bare name `jev`. Where the
-decider isn't published anywhere reachable yet, say so plainly and point to #1182 — don't invent a
-source.
+**Never let an agent resolve a decider package from a bare, guessed name.** PyPI can already host an
+unrelated package under the short name a user might say out loud, or under a similar-looking name.
+Use only the decider's exact distribution name as given by the user or the package's own docs —
+**`<exact-distribution-name>`**, never the short entry-point name `<decider-name>` or a near
+spelling: a decider with entry point `acme` might ship as `cao-decider-acme` while an unrelated
+`acme` already sits on PyPI. If it isn't published anywhere reachable, say so, point to #1182 and
+don't invent a source.
 
 The decider package must load inside the **same Python environment `cao-server` runs from** —
 `"$CAO_PY"` from step 2, not whatever environment the agent's own shell has active. Patterns A and B
@@ -146,8 +146,8 @@ and ask the user how that environment is managed; install the decider only the w
 
 | Pattern | Command | Survives `cao update` / `uv tool upgrade`? | Also touches CAO itself? |
 | --- | --- | --- | --- |
-| A: re-run the tool install with the receipt's own source and every `--with` | `uv tool install <CAO source> <each existing extra> --with "<decider-dist>" --reinstall`, mapped from the receipt as below | **Only for an unpinned PyPI install.** `uv` records every `--with` package in the receipt, and a plain `uv tool upgrade` (or `cao update` on an unpinned registry install) reinstalls it too. **For a git or version-pinned install, `cao update` rebuilds the receipt without `--with` at all**; for a local install it refuses and prints a reinstall hint that has no `--with` either (a current CAO gap — see below) | Yes — this reinstalls CAO itself, which may upgrade it unintentionally |
-| B: `uv pip install` straight into the tool's venv | `uv pip install --python "$CAO_PY" "<decider-dist>"` | **No.** The receipt never records it, so the next `uv tool upgrade` (or any `cao update`) rebuilds the venv from the receipt alone and silently drops the decider | No — leaves CAO's own version untouched |
+| A: re-run the tool install with the receipt's own source and every `--with` | `uv tool install <CAO source> <each existing extra> --with "<exact-distribution-name>" --reinstall`, mapped from the receipt as below | **Only for an unpinned PyPI install.** `uv` records every `--with` package in the receipt, and a plain `uv tool upgrade` (or `cao update` on an unpinned registry install) reinstalls it too. **For a git or version-pinned install, `cao update` rebuilds the receipt without `--with` at all**; for a local install it refuses and prints a reinstall hint that has no `--with` either (a current CAO gap — see below) | Yes — this reinstalls CAO itself, which may upgrade it unintentionally |
+| B: `uv pip install` straight into the tool's venv | `uv pip install --python "$CAO_PY" "<exact-distribution-name>"` | **No.** The receipt never records it, so the next `uv tool upgrade` (or any `cao update`) rebuilds the venv from the receipt alone and silently drops the decider | No — leaves CAO's own version untouched |
 
 **Pattern A must keep the install's source and its extras.** Read the receipt's `requirements`
 list. The `cli-agent-orchestrator` entry gives `<CAO source>`:
@@ -188,16 +188,16 @@ print([e.name for e in entry_points(group='cao.deciders')])
 "
 ```
 
-`jev` must appear in that list. An empty list, or an import error, means the decider went into the
+`<decider-name>` must appear in that list. An empty list, or an import error, means the decider went into the
 wrong interpreter. The running server only picks it up after the restart in step 7.
 
-After pattern A, this confirms the receipt recorded the decider — by the exact quoted name, since
-`grep -q jev` would also match an unrelated `cao-decider-jev-extra`. Pattern B is never recorded,
+After pattern A, this confirms the receipt recorded the decider — by the exact quoted name, since an
+unquoted `grep -q cao-decider-acme` would also match an unrelated `cao-decider-acme-extra`. Pattern B is never recorded,
 so it prints "NOT recorded": reinstall after every CAO upgrade. Either way, re-run the entry-point
 check after any `cao update`:
 
 ```bash
-grep -q '"<decider-dist>"' "$(uv tool dir)/cli-agent-orchestrator/uv-receipt.toml" \
+grep -q '"<exact-distribution-name>"' "$(uv tool dir)/cli-agent-orchestrator/uv-receipt.toml" \
   && echo "recorded" || echo "NOT recorded"
 ```
 
@@ -289,44 +289,45 @@ nothing — the check below names it. Get the user's explicit OK before touching
 ## 6. Hand consent to the human
 
 **Consent is human-only. An agent must never run the consent command, type into its prompt, or set
-an API key on the user's behalf.** `cao decisions enable <name>` (which runs the decider's own
+an API key on the user's behalf.** `cao decisions enable <decider-name>` (which runs the decider's own
 consent command) needs an interactive TTY precisely so that an agent with shell access cannot drive
 it non-interactively.
 
 Give the user this exact block to run themselves, in a real terminal:
 
 ```bash
-cao decisions enable jev
+cao decisions enable <decider-name>
 ```
 
 If the decider needs an API key and doesn't have one yet, the decider package's own hidden-prompt
 command is also theirs to run — check its own docs or `--help` for the exact subcommand. Run the
 console script directly, by its full path in the tool's own venv (normally *not* on the agent's
 `PATH` unless the install used `--with-executables-from`), or through CAO's own forwarding form for
-its status/consent/revoke surface (`cao decisions show <name> -- --help`, forwarding to the
+its status/consent/revoke surface (`cao decisions show <decider-name> -- --help`, forwarding to the
 package's `status` subcommand — see [Decider packages](../../docs/decisions.md#decider-packages)):
 
 ```bash
-"$(dirname "$CAO_PY")/cao-decider-jev" --help
+"$(dirname "$CAO_PY")/cao-decider-<decider-name>" --help
 ```
 
 You may check **whether** a key is present without ever seeing or printing its value — using the
 decider's own status/key-check command, not a guess at an environment variable name (`cao env list`
 prints every managed variable's *value*, and nothing in CAO's own environment layer is specific to
-any one decider). For the worked example, that is the package's own shape-only check (presence and
-length, never the value):
+any one decider). Take the subcommand from the package's own `--help` or docs; it must be a
+shape-only check (presence and length, never the value):
 
 ```bash
-"$(dirname "$CAO_PY")/cao-decider-jev" key check
+"$(dirname "$CAO_PY")/cao-decider-<decider-name>" <key-check-subcommand>
 ```
 
-Use the equivalent for whatever decider is installed; don't invent an environment-variable name.
+Don't invent a subcommand or an environment-variable name.
 Never echo a value, `cat` a key-bearing file, or run a bare `env`/`printenv` (see [Safety](#12-safety)).
 
-Consent itself doesn't turn routing on, but a decider's consent command may also set a point: Jev's
-sets `model.route` to `shadow`, and leaves `effort.route` off. Moving points is step 8. It is not a
-consent action, so the agent may run it — but only with the user's OK, like every other
-settings write in this skill.
+Consent itself doesn't turn routing on, but a decider's consent command may also set a point, for
+example put `model.route` into `shadow` and leave `effort.route` off. Check `cao decisions status`
+afterwards to see where each point now stands. Moving points is step 8. It is not a consent
+action, so the agent may run it — but only with the user's OK, like every other settings write in
+this skill.
 
 ## 7. Restart the server, reconnect MCP
 
@@ -352,9 +353,9 @@ sees what that interpreter's own `cao` reports:
 "$(dirname "$CAO_PY")/cao" decisions status | "$CAO_PY" -c "import json,sys; print([d['name'] for d in json.load(sys.stdin)['installed_deciders']])"
 ```
 
-`jev` must be in the list. If step 2 fell back to the uv tool path, re-run step 2's interpreter
+`<decider-name>` must be in the list. If step 2 fell back to the uv tool path, re-run step 2's interpreter
 check now that a server is up. Don't use the server log as proof: its `Decision settings: …
-points=model.route=shadow:jev` line shows the *binding*, which reads the same whether or not the
+points=model.route=shadow:<decider-name>` line shows the *binding*, which reads the same whether or not the
 package is installed. The final proof is in step 8: after a real launch in shadow, no record has
 `reason: decider_unavailable`.
 
@@ -367,19 +368,19 @@ restart the agent's own terminal/session. Confirm the tool is visible before dec
 
 ## 8. Shadow versus on
 
-`cao decisions set model.route <state> --decider <name>` and the matching `effort.route` call move
+`cao decisions set model.route <state> --decider <decider-name>` and the matching `effort.route` call move
 a point between three states — `off` (nothing asked, nothing recorded), `shadow` (the decider's
 answer is recorded but never applied — the child always runs on the fallback tier), and `on` (the
 decider's answer is applied, within `[min_tier, max_tier]`, if confident). Get the user's OK before
 this step too — it's a settings write like step 5, even though running it isn't itself a consent
 action.
 
-Always land in `shadow` first (Jev's consent may already have put `model.route` there — see step
+Always land in `shadow` first (the decider's consent may already have put `model.route` there — see step
 6; the command is safe to repeat):
 
 ```bash
-cao decisions set model.route shadow --decider jev
-cao decisions set effort.route shadow --decider jev
+cao decisions set model.route shadow --decider <decider-name>
+cao decisions set effort.route shadow --decider <decider-name>
 ```
 
 Let a few real launches happen, then read them **the shadow way**, not the "on" way — in shadow
@@ -400,8 +401,8 @@ shape of a working shadow phase, not a sign nothing is happening.
 Once the user agrees to flip to `on`:
 
 ```bash
-cao decisions set model.route on --decider jev
-cao decisions set effort.route on --decider jev
+cao decisions set model.route on --decider <decider-name>
+cao decisions set effort.route on --decider <decider-name>
 ```
 
 and re-read with step 9's reading, which does have a note and does distinguish `applied`/`capped`
@@ -470,10 +471,10 @@ cao decisions off
 Then set `ephemeral.enabled` back to `false` (step 1's backup is your restore point; if there was
 none, remove the file this setup created) and restart the server (step 7's checks again); remove
 the tier mappings this setup added (`cao decisions tier <provider> <tier> --unset` for each),
-unless the user wants to keep them; leave the decider **binding** (`--decider <name>` on the
+unless the user wants to keep them; leave the decider **binding** (`--decider <decider-name>` on the
 point) as is — `off` already stops it being asked; tell every other connected agent session that
 `create_ephemeral_agent` stays advertised until it reconnects MCP; leave consent revocation (`cao
-decisions disable <name>`) and uninstalling the decider package to the user, by policy; and remove
+decisions disable <decider-name>`) and uninstalling the decider package to the user, by policy; and remove
 the `settings.json.bak.*` files once the user confirms they no longer need them.
 
 ## 12. Safety
