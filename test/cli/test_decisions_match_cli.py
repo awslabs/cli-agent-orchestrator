@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import re
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -139,6 +141,74 @@ def test_check_fails_an_invalid_catalog(home):
     assert (
         result.output.strip() == "error catalog invalid: decisions.match.notes is not a known key"
     )
+
+
+def test_show_and_check_print_each_catalog_problem_once(home, caplog, monkeypatch):
+    from cli_agent_orchestrator.decisions import catalog as cat
+
+    bad = json.loads(json.dumps(CATALOG))
+    bad["models"]["codex"]["gpt-5.5"]["cost"] = "cheap"
+    bad["models"]["codex"]["gpt-old"] = {"context_tokens": 1, "cost": "low"}
+    settings_service._save(
+        {"model_tiers": TIERS, "ephemeral": EPHEMERAL, "decisions": {"match": bad}}
+    )
+    dropped = "decisions.match.models.codex.gpt-5.5.cost must be low, medium or high"
+    unreachable = "codex/gpt-old is unreachable"
+
+    def invoke(*args):
+        # A load warns only about problems the previous load didn't report: start each fresh.
+        monkeypatch.setattr(cat, "_last_problems", frozenset())
+        caplog.clear()
+        with caplog.at_level("WARNING", logger=cat.logger.name):
+            result = run(*args)
+        logged = [r.getMessage() for r in caplog.records if r.name == cat.logger.name]
+        return result, logged
+
+    result, logged = invoke("check")
+    assert result.exit_code == 1, result.output
+    assert logged == []
+    lines = result.stdout.splitlines()
+    assert [line for line in lines if dropped in line] == [f"WARN  {dropped}; declaration dropped"]
+    assert [line for line in lines if unreachable in line] == [
+        f"WARN  {unreachable}: no model_tiers.codex tier maps it, so it is never used"
+    ]
+    result, logged = invoke("show")
+    assert result.exit_code == 0 and logged == []
+    assert sum(dropped in line for line in result.stdout.splitlines()) == 1
+    result, logged = invoke("show", "--json")
+    assert logged == [] and len(json.loads(result.stdout)["warnings"]) == 2
+    # explain prints no warnings of its own, so its load still logs them: the log is live.
+    result, logged = invoke(
+        "explain", "--needs", "read_only", "--size", "medium", "--fallback", "codex"
+    )
+    assert result.exit_code == 0 and len(logged) == 2
+    assert all(dropped not in line for line in result.stdout.splitlines())
+    # A quiet load doesn't count as reported: the next load still warns.
+    from cli_agent_orchestrator.decisions import settings as decision_settings
+
+    monkeypatch.setattr(cat, "_last_problems", frozenset())
+    run("check")
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=cat.logger.name):
+        decision_settings.load_settings()
+    assert len([r for r in caplog.records if r.name == cat.logger.name]) == 2
+
+
+def test_the_quick_start_settings_cover_long_context_at_large(home):
+    doc = (Path(__file__).resolve().parents[2] / "docs" / "decisions.md").read_text()
+    section = doc[doc.index("### Quick start") : doc.index("### An example with Claude Code")]
+    (block,) = re.findall(r"```json\n(.*?)```", section, re.S)
+    settings_service._save(json.loads(block))
+    args = ["explain", "--needs", "long_context", "--size", "medium", "--options", "claude_code"]
+    result = run(*args, "--tier-auto")
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-1] == (
+        "rule: covered (long_context) · tie-break: only · pick: claude_code/large"
+    )
+    assert f"`cao decisions match {' '.join(args)} --tier-auto`" in section
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    ephemeral_service.validate_block(settings_service.get_ephemeral_settings())
 
 
 def test_explain_prints_the_candidate_table_and_the_pick(home):

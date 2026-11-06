@@ -185,7 +185,11 @@ def _hash_line(catalog: Any) -> tuple[str | None, str | None]:
 @click.option("--json", "as_json", is_flag=True, help="Print JSON.")
 def match_show(as_json: bool) -> None:
     """Show the validated catalog, its warnings and its hash."""
-    loaded = settings.load_settings().match_catalog
+    from cli_agent_orchestrator.decisions import catalog as cat
+
+    # The warnings are printed below, once; the load doesn't log them too.
+    with cat.problems_printed_by_caller():
+        loaded = settings.load_settings().match_catalog
     digest, key_id = _hash_line(loaded)
     if as_json:
         click.echo(
@@ -259,7 +263,9 @@ def match_check() -> None:
     from cli_agent_orchestrator.decisions import catalog as cat
     from cli_agent_orchestrator.utils.ephemeral_capabilities import ephemeral_providers
 
-    snapshot = settings.load_settings()
+    # Every problem is printed below as a WARN or error row, once; the load doesn't log them too.
+    with cat.problems_printed_by_caller():
+        snapshot = settings.load_settings()
     lines, problems = cat.check(snapshot.match_catalog, snapshot.model_tiers, ephemeral_providers())
     for level, text in lines:
         click.echo(f"{level:<5} {text}")

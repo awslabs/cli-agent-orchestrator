@@ -18,10 +18,11 @@ import hmac
 import json
 import logging
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from cli_agent_orchestrator.decisions.types import ROUTING_FEATURES
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -119,6 +120,27 @@ def _report(problems: list[str]) -> None:
         if message not in _last_problems:
             logger.warning("Decision match catalog: %s", message)
     _last_problems = frozenset(problems)
+
+
+@contextmanager
+def problems_printed_by_caller() -> Iterator[None]:
+    """Loads inside log no problems, and don't count as reported.
+
+    For `cao decisions match show` and `check`, which print every problem themselves: the
+    load's log line would repeat each one.
+    """
+    global _last_problems
+    previous = _last_problems
+
+    def drop(record: logging.LogRecord) -> bool:
+        return False
+
+    logger.addFilter(drop)
+    try:
+        yield
+    finally:
+        logger.removeFilter(drop)
+        _last_problems = previous
 
 
 def _is_int(value: object, bounds: tuple[int, int]) -> bool:

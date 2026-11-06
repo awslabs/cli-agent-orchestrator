@@ -121,12 +121,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advisory `task.needs_network`), in one request beside `model.route`'s, with the same task text
   and nothing new. CAO then matches the answers locally to the models you declare under
   `decisions.match` in `settings.json`, which is never sent anywhere. The match may raise a
-  helper's tier up to `max_tier`, never below the decider's size answer, and, with
+  helper's tier up to `ephemeral.max_tier`, never below the decider's size answer, and, with
   `provider.route` bound to the built-in `match` answerer, pick the CLI within your declared
   equivalence set. It never widens the options, never takes a model outside `model_tiers`, and
   never touches tools. #810's rule is amended for this, for the tier only: a decider still can't
   raise a tier, providers or tools, and CAO's own match may raise only the tier, to a declared
-  model and up to `max_tier`. `needs_network` only adds a hint to the delegation note. Any
+  model and up to `ephemeral.max_tier`. `needs_network` only adds a hint to the delegation note. Any
   doubt runs today's choice. Shadow records the would-be match. Records gain eight nullable
   `match_*` and `catalog_*` columns (an additive migration), and the new
   `cao decisions match show`, `check` and `explain` explain every pick. With today's capability

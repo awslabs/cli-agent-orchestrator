@@ -75,6 +75,11 @@ A matched note has an arrow only when the match changed something: ` -> <tier>` 
 rose, ` -> <cli> <tier>` when the helper moved to another CLI. A need covered at the decider's
 size on the same CLI adds just `, matched <needs>`.
 
+The note comes from the launch's `model.route` record, so it needs `model.route` on. With
+`provider.route` bound to `match` and `model.route` off, in shadow or given an explicit tier, a
+match that moves the helper to another CLI adds no note: the creator isn't told about the move.
+The helper's `provider.route` record shows it (`outcome` `applied`, `match_pick`).
+
 The note names a model only when the bound terminal records it and the provider
 honors it. Otherwise it says `provider default`. Fallback reasons are fixed
 values, including timeout, error, unsure and an unmapped tier. Normal delegation
@@ -240,14 +245,16 @@ decider's size.
 
 ### Quick start
 
-1. **Declare your models** in `settings.json`, next to the `model_tiers` that map them. There is
-   no CLI to write the catalog yet; edit the file.
+1. **Declare your models** in `settings.json`, next to the `model_tiers` that map them, and set
+   `ephemeral.max_tier`: it's the highest tier a match may raise a helper to. There is no CLI to
+   write the catalog yet; edit the file.
 
    ```json
    {
      "model_tiers": {
        "claude_code": {"medium": "claude-sonnet-5-5", "large": "claude-opus-5-5"}
      },
+     "ephemeral": {"min_tier": "medium", "default_tier": "medium", "max_tier": "large"},
      "decisions": {
        "match": {
          "version": 1,
@@ -263,7 +270,15 @@ decider's size.
    }
    ```
 
-   The windows and costs are your declarations; CAO doesn't verify them.
+   The windows and costs are your declarations; CAO doesn't verify them. Without
+   `ephemeral.max_tier` the tier never rises, so a need only the large model covers gets
+   `no_cover`. A helper with `model_tier: "auto"` needs `ephemeral.min_tier` and `max_tier`,
+   and `default_tier` must be set with `max_tier`; every tier from `min_tier` to `max_tier`
+   must be in `model_tiers`.
+
+   To see what a launch would get, without asking a decider:
+   `cao decisions match explain --needs long_context --size medium --options claude_code --tier-auto`
+   picks `claude_code/large` (`rule: covered`).
 
 2. **Check the declarations:** `cao decisions match check`. It names any declaration that
    `model_tiers` doesn't map, mapped models you haven't declared, and what covers `long_context`.

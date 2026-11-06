@@ -1074,6 +1074,23 @@ async def test_the_note_names_the_cli_when_the_match_moved_it(h):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["off", "shadow", "explicit"])
+async def test_a_cli_move_without_model_route_on_adds_no_note(h, model):
+    # docs/decisions.md says so: the note comes from an on-mode model.route record only.
+    h.configure(model="on" if model == "explicit" else model)
+    features(h, long_context="yes", read_only="yes")
+    req = h.request()
+    if model == "explicit":
+        req = dataclasses.replace(req, field_states={**req.field_states, "model.route": "medium"})
+    plan = await h.launch(req)
+    h.last_engine.bind_launch(plan, terminal_id="t1", model=plan.model, honored=True)
+    assert (plan.provider, plan.model) == ("codex", "gpt-5.5")
+    route = h.only("provider.route")
+    assert (route["outcome"], route["match_pick"]) == ("applied", "codex/medium")
+    assert h.last_engine.launch_note(plan) is None
+
+
 # AC18: network is advisory.
 
 
@@ -1113,15 +1130,16 @@ async def test_the_hint_alone_is_the_note_when_nothing_else_renders(h):
 @pytest.mark.asyncio
 async def test_features_on_with_both_route_points_off_ask_once_and_can_only_hint(tmp_path):
     # The mode table's row: one feature call and four records, no match, only the hint.
-    plans = {}
+    plans, harnesses = {}, {}
     for mode in ("off", "on"):
-        h = Harness(tmp_path, mode)
-        h.configure(features=mode, route="off", model="off", effort="off")
-        features(h, long_context="yes", read_only="yes", needs_network="yes")
-        plans[mode] = await h.launch(h.request(network=False))
-    assert [request.points for request in h.decider.requests] == [FEATURE_POINTS]
-    assert [row["point"] for row in h.rows()] == list(FEATURE_POINTS)
-    assert all(row["match_rule"] is None for row in h.rows())
+        harness = harnesses[mode] = Harness(tmp_path, mode)
+        harness.configure(features=mode, route="off", model="off", effort="off")
+        features(harness, long_context="yes", read_only="yes", needs_network="yes")
+        plans[mode] = await harness.launch(harness.request(network=False))
+    on = harnesses["on"]
+    assert [request.points for request in on.decider.requests] == [FEATURE_POINTS]
+    assert [row["point"] for row in on.rows()] == list(FEATURE_POINTS)
+    assert all(row["match_rule"] is None for row in on.rows())
     assert plans["on"].hints == ("needs_network",)
     assert plan_values(plans["on"])[:3] == plan_values(plans["off"])[:3]
     assert plan_values(plans["off"]) == ("claude-sonnet-5-5", None, None, ())
@@ -1172,19 +1190,19 @@ async def test_shadow_note_never_claims_a_match_with_provider_route_bound_to_mat
 
 @pytest.mark.asyncio
 async def test_shadow_note_never_claims_a_match_on_a_capped_launch(tmp_path):
-    notes = {}
+    notes, harnesses = {}, {}
     for mode in ("off", "shadow"):
-        h = Harness(tmp_path, mode)
-        h.configure(features=mode)
-        features(h, read_only="yes")
-        h.decider.answers["model.route"] = "large"
-        plan = await h.launch(h.request(max_tier="medium"), drain=False)
-        h.last_engine.bind_launch(plan, terminal_id="t1", model=plan.model, honored=True)
-        before = h.last_engine.launch_note(plan)
-        await h.last_engine.runner.drain()
-        notes[mode] = (before, h.last_engine.launch_note(plan))
+        harness = harnesses[mode] = Harness(tmp_path, mode)
+        harness.configure(features=mode)
+        features(harness, read_only="yes")
+        harness.decider.answers["model.route"] = "large"
+        plan = await harness.launch(harness.request(max_tier="medium"), drain=False)
+        harness.last_engine.bind_launch(plan, terminal_id="t1", model=plan.model, honored=True)
+        before = harness.last_engine.launch_note(plan)
+        await harness.last_engine.runner.drain()
+        notes[mode] = (before, harness.last_engine.launch_note(plan))
         assert (plan.provider, plan.model) == (None, "claude-sonnet-5-5")
-    model = h.only("model.route")
+    model = harnesses["shadow"].only("model.route")
     assert (model["outcome"], model["candidate_value"]) == ("capped", "medium")
     # The would-be match is recorded on the capped row, and never reaches the note.
     assert (model["match_rule"], model["match_covered"]) == ("covered", ["read_only"])
