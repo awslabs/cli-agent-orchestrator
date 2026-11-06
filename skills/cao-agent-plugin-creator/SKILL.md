@@ -163,7 +163,8 @@ because validation does.
 
 CAO's skill check is exactly three things: `name` is non-blank, `description` is
 non-blank (`src/cli_agent_orchestrator/models/skill.py`), and the folder name
-equals `name`. It does **not** check these Agent Skills limits:
+equals `name`. It does **not** enforce these Agent Skills limits, and
+`cao plugin validate` reports a skill that breaks one only as a `WARNING`:
 
 | Limit | Value |
 |---|---|
@@ -301,7 +302,8 @@ JSON report spells it in lowercase (`"severity": "fatal"`).
 | `WARNING` | Reported, and nothing was dropped; the package still loads. |
 
 A loadable package can still break the Agent Skills limits, because the validator
-does not check them. Run the measurement above, or the audit skill, as well.
+only warns about them. Read every `WARNING`, and run the measurement above or the
+audit skill as well.
 
 ## Step by step
 
