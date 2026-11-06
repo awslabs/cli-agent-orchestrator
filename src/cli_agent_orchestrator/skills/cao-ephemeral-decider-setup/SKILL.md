@@ -45,8 +45,9 @@ resolve a decider by a bare, guessed name from PyPI** — see step 3.
 12. [Safety](#12-safety)
 
 Stop and report back to the user at the first failed check in any step — don't guess past a
-refusal. Get the user's explicit OK before **any** step that writes `settings.json` or restarts the
-shared server (steps 4, 5, 7, 8 and 11) — see [Safety](#12-safety).
+refusal. Get the user's explicit OK before **any** step that installs into cao-server's
+environment, writes `settings.json` or restarts the shared server (steps 3, 4, 5, 7, 8 and 11) — see
+[Safety](#12-safety).
 
 ## 1. Back up `settings.json`
 
@@ -65,9 +66,9 @@ the user confirms the setup is done — they're plaintext copies of an operator-
 
 **The printed version number does not tell you whether this build supports ephemeral agents or
 decisions.** A git install of `main` and a published PyPI release can report the identical `cao
---version` string while one has the code and the other does not, and a PyPI release can simply
-predate the decision platform entirely (at the time of writing, the latest PyPI release, 2.5.4, has
-none of the commands probed below). Checking `--version` alone is the mistake to avoid.
+--version` string while one has the code and the other does not, and a PyPI release can predate
+the decision platform entirely (at the time of writing, PyPI's 2.5.4 has none of the commands probed
+below).
 
 **First, find the interpreter the running `cao-server` really uses** — every later check runs in
 it, never in a guessed path or the agent's own `uv run` venv. Take it from the process listening on
@@ -80,6 +81,10 @@ PID="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -n 1)"
 if [ -n "$PID" ]; then
   ps -o args= -p "$PID"   # e.g. /path/to/venv/bin/python3 /path/to/cao-server
   CAO_PY="$(ps -o args= -p "$PID" | awk '{print $1}')"
+  "$CAO_PY" -c 'import cli_agent_orchestrator' 2>/dev/null ||   # e.g. a macOS framework Python
+    CAO_PY="$(head -n 1 "$(ps -o args= -p "$PID" | awk '{print $2}')" | sed 's/^#! *//')"
+elif curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null; then
+  echo "/health answers but lsof sees no listener: the server may run as another user: stop and ask"
 else
   echo "no cao-server on port $PORT: using the uv tool path, unconfirmed"
   CAO_PY="$(uv tool dir)/cli-agent-orchestrator/bin/python3"
@@ -88,11 +93,12 @@ fi
 readlink -f "$(command -v cao)"; readlink -f "$(dirname "$CAO_PY")/cao"
 ```
 
-The import must succeed, and the last line must print one path twice (the `cao` on `PATH` is that
-server's own CLI). Otherwise — or if the path has spaces and `awk` cut it — stop and ask the user.
-If no server was running, tell the user the fallback is a guess until step 7 confirms it. If your
-shell drops variables between commands, start each later one with `CAO_PY=<that path>`. These are
-POSIX-shell commands; on Windows, stop and ask.
+If field 1 doesn't import CAO, the block reads the interpreter from field 2's shebang (the
+`cao-server` script). The import must then succeed, and the last line must print one path twice (the
+`cao` on `PATH` is that server's own CLI). Otherwise — or if a path has spaces and `awk` cut it —
+stop and ask the user. If no server was running, tell the user the fallback is a guess until step 7
+confirms it. If your shell drops variables between commands, start each later command with
+`CAO_PY='<that path>';` (note the semicolon), or paste the literal path. On Windows, stop and ask.
 
 Then probe for every command and field this skill goes on to use, and stop at the first one
 that fails — passing some but not all of these still means later steps fail confusingly instead of
@@ -199,9 +205,7 @@ grep -q '"<decider-dist>"' "$(uv tool dir)/cli-agent-orchestrator/uv-receipt.tom
 
 `cao decisions tier` maps one `(provider, tier)` pair to one model ID. **A missing tier anywhere in
 `allowed_providers` refuses *every* provider's create**, not just the one with the gap — the single
-most confusing failure mode in the whole setup. The refusal below names the exact missing
-`provider.tier`, so once you see it the fix is mechanical; the danger is not expecting the gap to
-block unrelated providers at all.
+most confusing failure mode in the whole setup.
 
 ```bash
 cao decisions tier claude_code small  <small-model-id>
@@ -238,12 +242,10 @@ whenever `min_tier`/`max_tier`/`default_tier` are set, not only after decisions 
 **There is no validated CLI for most of this block.** `cao config set ephemeral.<key> <value>`
 writes a scalar key straight into `settings.json` (verified: creates `{"ephemeral": {"enabled":
 true}}`, read back by `cao config get`) — prefer it over a hand edit for one scalar key such as
-`enabled`. It also writes a JSON list as a real list (`cao config set ephemeral.allowed_providers
-'["claude_code","codex"]'`). But it does **not** validate the value against CAO's own policy rules,
-and doesn't show up in `cao config list`, so a typo'd key name writes successfully and silently
-does nothing — the check below names it. Prefer `cao config set` for every key; hand-edit the file
-only when you can't use it. Get the user's explicit OK before touching this file either way — the
-backup you need is already in place from step 1.
+`enabled`, and for a JSON list (`cao config set ephemeral.allowed_providers '["claude_code","codex"]'`
+writes a real list); hand-edit only when you can't use it. It does **not** validate values against
+CAO's policy rules or show up in `cao config list`, so a typo'd key writes and silently does
+nothing — the check below names it. Get the user's explicit OK before touching this file either way.
 
 1. Edit only the `ephemeral` object. Keep every other top-level key as-is — `model_tiers`,
    `decisions`, and anything else in the file must survive untouched. At minimum you are likely
@@ -318,10 +320,8 @@ length, never the value):
 "$(dirname "$CAO_PY")/cao-decider-jev" key check
 ```
 
-Use the equivalent for whatever decider is actually installed — check its own `--help` or docs for
-the exact subcommand; don't invent an environment-variable name for it. Never echo a value, pipe a
-key-bearing file through `cat`, or print the environment with a bare `env`/`printenv` (see
-[Safety](#12-safety)).
+Use the equivalent for whatever decider is installed; don't invent an environment-variable name.
+Never echo a value, `cat` a key-bearing file, or run a bare `env`/`printenv` (see [Safety](#12-safety)).
 
 Consent itself doesn't turn routing on, but a decider's consent command may also set a point: Jev's
 sets `model.route` to `shadow`, and leaves `effort.route` off. Moving points is step 8. It is not a
@@ -358,13 +358,11 @@ points=model.route=shadow:jev` line shows the *binding*, which reads the same wh
 package is installed. The final proof is in step 8: after a real launch in shadow, no record has
 `reason: decider_unavailable`.
 
-**Your own MCP connection does not auto-refresh.** The CAO MCP server process this agent's own
-terminal is talking to registers `create_ephemeral_agent` once, at its own startup, and only if
-`ephemeral.enabled` was already true at that moment — a `cao-server` restart by itself is not the
-cause; an MCP process that started (or last reconnected) *before* `ephemeral.enabled` became true
-is what's stale, and that can be true with no server restart at all. In Claude Code, send `/mcp`
-and reconnect the CAO server; in other providers, restart the agent's own terminal/session. Confirm
-the tool is actually visible before declaring this step done. The same applies after
+**Your own MCP connection does not auto-refresh.** This agent's CAO MCP server process registers
+`create_ephemeral_agent` once, at its own startup, and only if `ephemeral.enabled` was already true
+then — so an MCP process started (or last reconnected) *before* that is stale, with or without a
+server restart. In Claude Code, send `/mcp` and reconnect the CAO server; in other providers,
+restart the agent's own terminal/session. Confirm the tool is visible before declaring this step done. The same applies after
 [Undo](#11-undo): other already-connected sessions keep seeing the tool until they reconnect.
 
 ## 8. Shadow versus on
@@ -490,6 +488,8 @@ the `settings.json.bak.*` files once the user confirms they no longer need them.
   other setting; the step-1 backup is always in place first.
 - **Restarting `cao-server` (step 7) needs the user's OK too** — it affects every live session, not
   just this one.
+- **Installing into cao-server's environment (step 3) needs the user's OK** — pattern A may upgrade
+  CAO itself, and pattern B puts third-party code into the running server's venv.
 
 ## Symptom → fix
 
