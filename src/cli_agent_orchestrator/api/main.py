@@ -1833,6 +1833,12 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # AG-UI ambient streams: backstop for launches whose shutdown reaches the
+    # lifespan before the streams close (uvicorn waits for connections first).
+    from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run
+
+    _ambient_run.request_stop(sticky=False)
+
     # Stop herdr inbox service on shutdown
     if herdr_inbox_task is not None:
         herdr_inbox_task.cancel()
@@ -2300,6 +2306,116 @@ async def _with_keepalive(events: Any, interval: float) -> Any:
             pending.cancel()
 
 
+# ``?framing=`` values the ambient stream accepts. ``cao-legacy`` is the pre-1.0
+# framing, deprecated and kept byte-identical (#1193 mode ``off``).
+AGUI_FRAMING_LEGACY = "cao-legacy"
+AGUI_STREAM_FRAMINGS = frozenset({AGUI_FRAMING_LEGACY})
+# RFC 9745 section 2.1: Deprecation is an Item Structured Header Field whose value
+# is a Date (RFC 9651 section 3.3.7, "@" + integer seconds since the epoch).
+# 1793750400 = 2026-11-04T00:00:00Z, when the legacy framing was deprecated.
+_AGUI_LEGACY_DEPRECATED_AT = 1793750400
+_AGUI_LEGACY_DEPRECATION_LINK = (
+    "<https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/agui.md#legacy-framing>"
+    '; rel="deprecation"; type="text/html"'
+)
+_AGUI_SUB_FRAME_ID_RE = re.compile(r"^([^.]+)\.(\d+)$")
+_AGUI_THREAD_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+
+def _agui_legacy_framing_headers() -> Dict[str, str]:
+    return {
+        "Deprecation": f"@{_AGUI_LEGACY_DEPRECATED_AT}",
+        "Link": _AGUI_LEGACY_DEPRECATION_LINK,
+    }
+
+
+def _agui_ambient_response(
+    *,
+    thread_id: str,
+    run_id: str,
+    since: Optional[str],
+    last_event_id: Optional[str],
+    fleet_snapshot: Any,
+    accept: Optional[str],
+    max_seconds: Optional[float],
+    state_baseline_known: bool,
+) -> Any:
+    """The AG-UI 1.0 conformant ambient run, shared by GET and POST /agui/v1/stream."""
+    from ag_ui.encoder import EventEncoder
+    from fastapi.responses import StreamingResponse
+
+    from cli_agent_orchestrator.clients.database import get_session_incarnation
+    from cli_agent_orchestrator.services.agui import run_plane
+    from cli_agent_orchestrator.services.agui.ambient_run import AmbientRun, ambient_stream
+    from cli_agent_orchestrator.services.event_log_service import get_event_log
+    from cli_agent_orchestrator.services.sse_bus import get_bus
+    from cli_agent_orchestrator.services.ui_state_service import diff_snapshot
+
+    encoder = EventEncoder(accept=accept or "text/event-stream")
+    content_type = encoder.get_content_type()
+    is_sse = content_type == "text/event-stream"
+
+    def encode(sse_id: Optional[str], event: Any) -> Any:
+        frame = encoder.encode(event)
+        if is_sse and sse_id is not None:
+            return f"id: {sse_id}\n{frame}"
+        return frame
+
+    def replay() -> List[Dict[str, Any]]:
+        # A CAO extension (docs/agui.md): choose which buffered records this NEW run
+        # narrates first. Failure-isolated, as on the legacy path.
+        try:
+            if since:
+                return list(get_event_log().history(since=since))
+            if last_event_id:
+                log = get_event_log()
+                # `<record id>.<n>` names a frame the conformant stream synthesized
+                # before that record's own frame (record ids are uuid4, never
+                # dotted). The client saw only part of the record, so the new run
+                # replays the record whole rather than everything or what follows.
+                sub = _AGUI_SUB_FRAME_ID_RE.match(last_event_id)
+                if sub:
+                    fresh = list(log.history())
+                    for i, record in enumerate(fresh):
+                        if str(record.get("id")) == sub.group(1):
+                            return fresh[i:]
+                return list(log.after_id(last_event_id))
+        except Exception:
+            logger.warning("agui_stream: history replay failed", exc_info=True)
+        return []
+
+    async def generator() -> Any:
+        bus = get_bus()
+        # Register before the replay and the snapshot, so nothing published in
+        # between is lost (the same seam the legacy path uses).
+        sub = bus.register(overflow_close=True)
+        run = AmbientRun(
+            thread_id,
+            run_id,
+            incarnation_of=get_session_incarnation,
+            state_baseline_known=state_baseline_known,
+            since=since,
+        )
+        try:
+            async for frame in ambient_stream(
+                run=run,
+                encode=encode,
+                is_sse=is_sse,
+                replay=replay(),
+                fleet_snapshot=fleet_snapshot,
+                diff=diff_snapshot,
+                bus=bus,
+                sub=sub,
+                keepalive_seconds=run_plane.RUN_PLANE_HEARTBEAT_SECONDS,
+                max_seconds=max_seconds,
+            ):
+                yield frame
+        finally:
+            bus.unregister(sub)
+
+    return StreamingResponse(generator(), media_type=content_type)
+
+
 @app.get("/agui/v1/stream")
 async def agui_stream(
     since: Optional[str] = Query(
@@ -2308,6 +2424,28 @@ async def agui_stream(
             "ISO-8601 lower bound. When set, buffered events after this "
             "timestamp are replayed (as AG-UI frames) before the live stream; "
             "clients dedupe by event id."
+        ),
+    ),
+    framing: Optional[str] = Query(
+        default=None,
+        description=(
+            "Wire framing. ``cao-legacy`` selects the pre-1.0 framing (named SSE "
+            "events, snake_case fields), which is deprecated and kept byte-identical."
+        ),
+    ),
+    thread_id: Optional[str] = Query(
+        default=None,
+        alias="threadId",
+        description="The application's thread id for this connection's run (1-128 of A-Z a-z 0-9 . _ : -).",
+    ),
+    max_seconds: Optional[int] = Query(
+        default=None,
+        alias="maxSeconds",
+        ge=1,
+        le=3600,
+        description=(
+            "End the run after this many seconds with the cancelled outcome (a limit "
+            "the producer enforces). Ignored with framing=cao-legacy."
         ),
     ),
     access_token: Optional[str] = Query(
@@ -2328,19 +2466,24 @@ async def agui_stream(
         ),
     ),
 ):
-    """Stream fleet events as AG-UI typed events (Server-Sent Events).
+    """Stream the fleet as one AG-UI 1.0 run (Server-Sent Events).
 
-    This is the L2 standalone-dashboard surface (consumed by any AG-UI client). It
-    shares the exact same source as ``/events`` — the in-process ``SseBus`` fed
-    by the ``EventLogPublisher`` — but re-maps each normalized six-primitive
-    record onto AG-UI typed events via ``agui_stream.to_agui_event`` before it
-    hits the wire. Every frame is named by an AG-UI 1.0 event type; generative
-    UI rides on ``CUSTOM`` with ``name="cao.generative_ui"``, which a client
-    renders only if it knows that name.
+    The ``EventSource`` convenience for ``POST /agui/v1/stream`` (the AG-UI
+    binding). It shares the exact same source as ``/events``, the in-process
+    ``SseBus`` fed by the ``EventLogPublisher``, and narrates each normalized
+    record as conformant AG-UI events (``services/agui/ambient_run.py``):
+    ``RUN_STARTED`` first, sessions and terminals as ``SUBAGENT_*``
+    invocations, delegations as tool calls, generative UI as ``CUSTOM``
+    ``cao.generative_ui``, and a ``RUN_FINISHED`` cancelled or ``RUN_ERROR``
+    close. Frames are ``data:``-only with ``type`` in the JSON; record frames
+    carry an ``id:`` cursor. Message bodies are never carried (the ring buffer
+    stores metadata only and the mapping redacts by construction).
 
-    Each SSE frame is a *named* AG-UI event: ``event: <AGUI_TYPE>`` +
-    ``data: <json>``. Message bodies are never carried (the ring buffer stores
-    metadata only and the mapping redacts by construction).
+    ``?framing=cao-legacy`` serves the deprecated pre-1.0 wire byte-for-byte
+    (named ``event:`` frames via ``agui_stream.to_agui_event``), with
+    ``Deprecation`` and ``Link`` headers. ``since`` / ``Last-Event-ID`` replay is
+    a CAO extension that chooses which buffered records the new run narrates
+    first (``docs/agui.md#replay``).
 
     Default-off: returns 404 unless the AG-UI surface is enabled via
     ``CAO_AGUI_ENABLED`` (or the MCP Apps surface is on). When auth is enabled,
@@ -2394,6 +2537,18 @@ async def agui_stream(
                 detail=f"Invalid ISO-8601 timestamp for 'since': {since!r}",
             )
 
+    # Validate ?framing= and ?threadId= at the boundary, before any stream starts.
+    if framing is not None and framing not in AGUI_STREAM_FRAMINGS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown framing {framing!r}; supported: {sorted(AGUI_STREAM_FRAMINGS)}",
+        )
+    if thread_id is not None and not _AGUI_THREAD_ID_RE.fullmatch(thread_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid threadId: 1-128 characters of A-Z a-z 0-9 . _ : -",
+        )
+
     from fastapi.responses import StreamingResponse
 
     from cli_agent_orchestrator.services import session_service
@@ -2424,6 +2579,22 @@ async def agui_stream(
             except Exception:
                 logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
         return build_dashboard_snapshot(sessions, terminals, list(scopes))
+
+    if framing != AGUI_FRAMING_LEGACY:
+        import uuid
+
+        from cli_agent_orchestrator.services.agui.ambient_run import DEFAULT_THREAD_ID
+
+        return _agui_ambient_response(
+            thread_id=thread_id or DEFAULT_THREAD_ID,
+            run_id=str(uuid.uuid4()),
+            since=since,
+            last_event_id=last_event_id,
+            fleet_snapshot=_fleet_snapshot,
+            accept="text/event-stream",
+            max_seconds=max_seconds,
+            state_baseline_known=True,
+        )
 
     def _sse(event_id: Optional[str], agui_type: str, data: Dict) -> str:
         """Format one SSE frame, with an ``id:`` cursor when the event has one."""
@@ -2560,7 +2731,171 @@ async def agui_stream(
         finally:
             bus.unregister(sub)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    headers: Dict[str, str] = {}
+    if framing == AGUI_FRAMING_LEGACY:
+        logger.warning(
+            "agui_stream: a client requested the deprecated ?framing=%s; see docs/agui.md#legacy-framing",
+            AGUI_FRAMING_LEGACY,
+        )
+        headers = _agui_legacy_framing_headers()
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
+
+
+def _agui_parse_protocol_version(value: Any) -> Optional[Tuple[int, int]]:
+    """``"MAJOR.MINOR"`` to a tuple, or ``None`` when it cannot be interpreted.
+
+    Only the published identifier form counts (versioning#version-negotiation):
+    ``"2"``, ``"2.0.0"`` and ``"draft"`` are uninterpretable, so the caller serves
+    them with a warning rather than refusing them. Each part is bounded to 9
+    digits, so an overlong number is uninterpretable too instead of reaching
+    ``int()``'s digit limit.
+    """
+    if not isinstance(value, str):
+        return None
+    m = re.fullmatch(r"([0-9]{1,9})\.([0-9]{1,9})", value)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+@app.post("/agui/v1/stream")
+async def agui_stream_post(
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """The ambient fleet run over AG-UI's HTTP+SSE binding (POST a ``RunAgentInput``).
+
+    The same conformant run as ``GET /agui/v1/stream``, but delivered the way the
+    binding contract requires: the request carries the ``RunAgentInput`` that opens
+    the exchange, so a stock ``HttpAgent`` can consume it.
+
+    - ``threadId`` and ``runId`` come from the input; ``RUN_STARTED`` echoes them.
+    - ``protocolVersion`` is read. A different major version is refused with 400
+      before the stream; a newer minor, or a value that cannot be interpreted, is
+      served with a warning (versioning#version-negotiation).
+    - A non-empty ``resume[]`` is refused with 400: the ambient run raises no
+      interrupts, so there is nothing to answer here. Answers go to
+      ``POST /agui/v1/run``.
+    - ``forwardedProps.cao`` takes CAO's options: ``since`` (ISO-8601 replay bound)
+      and ``maxSeconds`` (1-3600; the run then ends with the cancelled outcome).
+    - ``messages``, ``tools``, ``context`` and ``state`` are accepted and not used:
+      the ambient run observes the fleet.
+    """
+    _require_agui_enabled()
+
+    from cli_agent_orchestrator.services.agui.run_plane import AG_UI_AVAILABLE
+
+    if not AG_UI_AVAILABLE:
+        return JSONResponse(
+            status_code=501,
+            content={
+                "detail": (
+                    "ag-ui-protocol is not installed. "
+                    "Install with: pip install cli-agent-orchestrator[agui]"
+                )
+            },
+        )
+
+    try:
+        body = await request.json()
+    except ValueError as e:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "json_invalid",
+                    "loc": ("body",),
+                    "msg": "invalid JSON body",
+                    "ctx": {"error": str(e)},
+                }
+            ]
+        )
+
+    from cli_agent_orchestrator.services.agui.run_plane import RunAgentInput
+
+    try:
+        run_input = RunAgentInput.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            [{**err, "loc": ("body", *err["loc"])} for err in e.errors(include_url=False)]
+        )
+
+    raw_version = body.get("protocolVersion") if isinstance(body, dict) else None
+    if raw_version is not None:
+        parsed = _agui_parse_protocol_version(raw_version)
+        if parsed is None:
+            logger.warning(
+                "agui_stream: protocolVersion %.80r cannot be interpreted; serving as 1.0",
+                raw_version,
+            )
+        elif parsed[0] != 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"protocolVersion {raw_version!r} is not supported; this server speaks 1.0",
+            )
+        elif parsed[1] > 0:
+            logger.warning(
+                "agui_stream: client declared protocolVersion %r, newer than 1.0; serving 1.0",
+                raw_version,
+            )
+
+    if run_input.resume:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "resume[] is not accepted on /agui/v1/stream: the ambient run raises no "
+                "interrupts. Send answers to POST /agui/v1/run."
+            ),
+        )
+
+    forwarded = body.get("forwardedProps") if isinstance(body, dict) else None
+    cao_opts = forwarded.get("cao") if isinstance(forwarded, dict) else None
+    cao_opts = cao_opts if isinstance(cao_opts, dict) else {}
+    since = cao_opts.get("since")
+    if since is not None:
+        try:
+            text = str(since)
+            datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid ISO-8601 timestamp for forwardedProps.cao.since: {since!r}",
+            )
+    max_seconds = cao_opts.get("maxSeconds")
+    if max_seconds is not None and (
+        not isinstance(max_seconds, int)
+        or isinstance(max_seconds, bool)
+        or not 1 <= max_seconds <= 3600
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="forwardedProps.cao.maxSeconds must be an integer from 1 to 3600",
+        )
+
+    from cli_agent_orchestrator.services import session_service
+    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
+
+    scopes = list(_scopes)
+
+    def _fleet_snapshot() -> Dict:
+        sessions = session_service.list_sessions()
+        terminals: List[Dict] = []
+        for sess in sessions:
+            try:
+                terminals.extend(
+                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
+                )
+            except Exception:
+                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
+        return build_dashboard_snapshot(sessions, terminals, scopes)
+
+    return _agui_ambient_response(
+        thread_id=run_input.thread_id,
+        run_id=run_input.run_id,
+        since=str(since) if since is not None else None,
+        last_event_id=None,
+        fleet_snapshot=_fleet_snapshot,
+        accept=request.headers.get("accept"),
+        max_seconds=max_seconds,
+        state_baseline_known=not run_input.state,
+    )
 
 
 class EmitUIRequest(BaseModel):
@@ -2848,6 +3183,33 @@ async def agui_run(
         ),
         media_type=content_type,
     )
+
+
+# ---------------------------------------------------------------------------
+# Run plane capabilities (AG-UI 1.0 AgentCapabilities, #1192)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/agui/v1/capabilities")
+async def agui_capabilities(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Return the run plane's AG-UI 1.0 capabilities (GET /agui/v1/capabilities).
+
+    The body is one ``AgentCapabilities`` object in the 1.0 schema shape. AG-UI
+    leaves retrieval to the implementation, so CAO serves it beside
+    ``POST /agui/v1/run``, at the same ``cao:read`` floor. The declaration is
+    informative; the run's own events stay authoritative. It omits
+    ``humanInTheLoop.approveWithEdits`` (each interrupt's ``responseSchema``
+    says whether edit is accepted) and never declares ``transport.resumable``.
+
+    Returns 404 when the AG-UI surface is disabled.
+    """
+    _require_agui_enabled()
+
+    from cli_agent_orchestrator.services.agui.capabilities import build_capabilities
+
+    return build_capabilities()
 
 
 # Topology widget static bundle at /widgets/topology/ — the vanilla SSE-driven
@@ -11094,6 +11456,9 @@ def main():
     # ``uvicorn.error`` for WebSocket handshakes -- by
     # ``install_access_log_redaction()``, installed in the app lifespan so both
     # ``cao-server`` and ``uvicorn ...:app`` are covered.
+    from cli_agent_orchestrator.services.agui.ambient_run import install_uvicorn_exit_hook
+
+    install_uvicorn_exit_hook()
     uvicorn.run(
         app,
         host=host,

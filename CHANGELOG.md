@@ -33,10 +33,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/terminal-lifecycle.md`, which also now says retention is 14 days (it said 7), lists
   flow recycling (no snapshot), and gives the real snapshot directory.
 
+- **Breaking: `GET /agui/v1/stream` is now an AG-UI 1.0 conformant run by default, and
+  `POST /agui/v1/stream` is added** (#1193). Each connection is one run: `RUN_STARTED` first,
+  `data:`-only frames with `type` in the JSON (no `event:` lines), schema field names, integer
+  epoch-millisecond timestamps, and a `RUN_FINISHED` `{type: "cancelled"}` close (with
+  `metadata.cao.endReason` `max_seconds`, `server_stop` or `source_ended`) or a `RUN_ERROR` close
+  (`cao.stream_overflow`, `cao.stream_error`). Sessions and terminals are `SUBAGENT_*` invocations
+  (`terminal:<id>`, and `session:` plus a hash of the session incarnation); handoff, assign and
+  `a2a_delegation` are attributed `TOOL_CALL_START`/`END` pairs with no `TOOL_CALL_RESULT`;
+  `send_message` is `CUSTOM` `cao.message_dispatched`; an error with a terminal is
+  `SUBAGENT_ERROR`, one without is `CUSTOM` `cao.error`; a killed terminal or session is
+  `SUBAGENT_FINISHED` with `metadata.cao.endReason: "killed"`. The CAO envelope moves under
+  `metadata.cao`. The POST takes a `RunAgentInput`, echoes `threadId`/`runId`, refuses another
+  protocol major and a non-empty `resume` with `400`, and reads `forwardedProps.cao.since` and
+  `maxSeconds`; the GET takes `threadId` and `maxSeconds`. `?framing=cao-legacy` keeps the old
+  wire byte-for-byte, with `Deprecation` and `Link` headers; `AguiStreamReader` now requests it.
+  A client that listened for named events must switch to `onmessage` and read `type`; the in-tree
+  consumers (the EventSource viewer, the CAO Dojo page and its e2e driver, `showcase.sh` and
+  `record-demo.mjs`) are updated. On SIGINT/SIGTERM `cao-server` now closes open streams with
+  their cancelled close before it waits on connections. A `Last-Event-ID` that names a frame
+  synthesized before its record's own frame replays that record whole instead of the whole
+  buffer. `verify-ambient.mjs` checks the stream with the pinned `@ag-ui/client` `verifyEvents`
+  in the AC3 CI job. Event-log records for a session now carry
+  `detail.session_subagent_run_id` (the hashed session id, never the raw incarnation id), so a
+  replay keeps each record's incarnation; the AG-UI mappings drop it, and it is visible on the
+  MCP Apps `/events` stream as an added key.
+- **Run-plane interrupts name the terminal subagent that raised them** (#1193). Each `Interrupt` in
+  `RUN_FINISHED`'s interrupt outcome carries `subagentRunId: "terminal:<id>"`, the id the ambient
+  stream gives that terminal; it is omitted, never null, when an interrupt has no terminal.
+- **The CAO Dojo page follows the AG-UI 1.0 consumer rules.** Every `RunAgentInput` it sends
+  declares `protocolVersion: "1.0"`. Its resume list covers every interrupt of the run it continues:
+  when that run listed several approvals, a decided card is held until each has an answer, and then
+  one resume answers them all, on that run's `threadId`. A run that only collects starts a fresh
+  thread, so it never continues past an interrupt it does not answer. The page never abandons a
+  prompt on the operator's behalf, because on CAO an abandoned (`cancelled`) entry is a deny.
+- **The run plane passes `Interrupt.expiresAt` through when set.** The AG-UI 1.0 field mirrors
+  CAO's `Interrupt.expires_at` and is omitted when that is unset. Nothing in CAO sets it today: an
+  interrupt expires when its terminal leaves the waiting state, with no deadline known in advance, so
+  the key is absent on every current provider. Anything that sets it must use ISO 8601, the schema's
+  documented convention.
+- **Run-plane events carry only the fields the AG-UI 1.0 schema defines.** `POST /agui/v1/run` no
+  longer puts `threadId`/`runId` on `STATE_SNAPSHOT`, `STATE_DELTA`, `STEP_*`, `TOOL_CALL_*`,
+  `CUSTOM` and `RUN_ERROR`; only `RUN_STARTED` and `RUN_FINISHED` carry them, as the schema says. The
+  undescribed `stepId` on `STEP_STARTED`/`STEP_FINISHED` is gone too: the terminal id now travels as
+  `metadata.cao.terminalId` (one nested `cao` object, the shape the ambient stream uses). A client that read `threadId` or `runId` from those events should take
+  them from the enclosing `RUN_STARTED`.
+- **`GET /agui/v1/capabilities` declares the run plane's AG-UI 1.0 capabilities (#1192).** The body
+  is one `AgentCapabilities` object in the 1.0 schema shape: identity, `transport.streaming`,
+  `tools.clientProvided: false`, `state.snapshots`, and `humanInTheLoop` with `approvals` and
+  `interrupts`. `approveWithEdits` is omitted, because each interrupt's `responseSchema` says whether
+  edit is accepted, and `transport.resumable` is never declared. The route sits behind
+  `CAO_AGUI_ENABLED` at the `cao:read` floor, like `POST /agui/v1/run`.
 - **The ambient AG-UI stream sends generative UI as `CUSTOM` `cao.generative_ui`, not
   `GENERATIVE_UI`.** AG-UI 1.0 has no `GENERATIVE_UI` event type, and its processing rules say a
   producer "MUST NOT emit an event type the protocol does not describe" (`CUSTOM` and `RAW` exist
-  for that). `GET /agui/v1/stream` now sends an allow-listed `emit_ui` component as `event: CUSTOM`
+  for that). `GET /agui/v1/stream` with `?framing=cao-legacy` (the pre-1.0 wire; see the AG-UI 1.0
+  entry above for the default) now sends an allow-listed `emit_ui` component as `event: CUSTOM`
   with a spec `CustomEvent` body, `{"type": "CUSTOM", "name": "cao.generative_ui", "value":
   {component, props, event_id, terminal_id, session_name, timestamp, traceparent}}`, the same name
   and value the run plane already used. There is no compatibility flag. A client that listened for
@@ -102,6 +154,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launch logs a warning and its response carries `launch_notes`.
   Also: `cao launch` now shows the server's refusal reason instead of "Failed to connect", and the
   memory wiki compiler's Kiro call pins `--agent-engine v2`.
+
+- **Kiro v3 reads a `/tools` list longer than the pane** (#1167). Kiro shows as many rows as fit,
+  the pane's height minus nine (at least five), with `↓ more` below them. A helper with `fs_read`
+  and `@cao-mcp-server` already has 36 tags, so on a pane under 45 rows tall every v3 launch of it
+  was refused with `kiro_v3_tools_mismatch: unrecognized row '↓ more'`. CAO now presses Down, the
+  only key it sends into the panel, once per screen. Each new screen must be the last one moved by
+  exactly one row, and the joined rows must hold every row the title declares, each once, before
+  the grant check. Kiro draws a scrolling panel taller than the pane, so its title sits in the
+  pane's scrollback: every `/tools` read is now the pane plus its recent scrollback (on tmux the
+  pane and 100 lines above it, on herdr the last 100 lines). The read must hold exactly one
+  `/tools` title, with nothing but blank rows below the panel. Nothing is loosened: a skipped,
+  changed or hidden row, a duplicate, a wrong count, a second title, text below the panel or a
+  dialog refuses (no key is ever sent into a dialog). After Escape, CAO now checks on the pane that
+  the empty prompt is back, as after `/mcp`. The read is bounded by `provider_init_timeout`, which
+  it shares with the final prompt wait, so a successful v3 init stays within about 4T+19.5s of
+  waits, plus about 60 backend calls (`utils/init_allowance.py`). Each call is several tmux or herdr
+  processes, about 0.1s idle (estimated) and 0.2s under load (measured), so the proof prices them
+  at 0.25s: the client's
+  wait covers a worst-case successful v3 start only up to a `provider_init_timeout` of about 90s,
+  and above that, on a heavily loaded machine, `cao launch` can report a failure while the server
+  goes on to start the agent (a documented gap; the default 60s has about two minutes spare). A
+  scrolling panel refuses in a herdr
+  pane over about 97 rows, and in a pane under 12 rows: Kiro keeps the old rows above the pane by
+  default, so after one Down the read no longer follows the last screen. The
+  layout, scroll rows and keys are taken from kiro-cli 3.0.0's bundled terminal UI, the same as
+  2.37.0's, and no scrolled panel has been read end to end live yet. See "How CAO reads a long
+  tool list" in `docs/kiro-cli.md`.
 
 - **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3
   `Default` fallback** (#1167). A Kiro header with extra columns between the model and the context

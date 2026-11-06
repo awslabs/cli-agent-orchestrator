@@ -917,7 +917,10 @@ prints the exact URL (`LIVE VIEW: ...`) when it starts.
 The page polls the controller's `observe()` a few times a second. It serves only
 simulation state (positions, team states, parts, and command history, never a
 credential), and it needs no GPU or display. It loads its state from an address
-relative to its own, so it also works behind a forwarded port. On a remote host,
+relative to its own, so it also works behind a forwarded port. The page and its
+state are sent with `Cache-Control: no-store`, and each poll adds a changing
+query, so a CDN in front of the forward, such as the CloudFront address of a
+browser IDE, cannot keep showing an old floor. On a remote host,
 such as a browser IDE, forward the port first: in VS Code or code-server use the
 **Ports** panel, or `ssh -L 8767:127.0.0.1:8767 <host>`. Do not publish it on a
 public interface.

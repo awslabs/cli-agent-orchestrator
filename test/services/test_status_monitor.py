@@ -1131,6 +1131,68 @@ class TestScreenDetection:
         assert rendered is not None
         assert any("Kimi frame survived" in line for line in rendered)
 
+    @pytest.mark.parametrize("reset", ["\x1b[;r", "\x1b[0;0r", "\x1b[r"])
+    def test_scroll_region_reset_with_empty_params_restores_full_screen(self, reset):
+        """``CSI ; r`` resets the scroll region to the full screen, as in xterm and tmux.
+
+        pyte 0.8.2 parses the empty parameters as ``(0, 0)``, treats that as a
+        one-row region, ignores it, and so keeps the previous region. A later
+        cursor-down then stops at the old bottom margin. agy 1.5.0 ends its
+        ready frame with ``CSI 1;46 r ... CSI ; r``, then ``CSI 46 d``,
+        ``CSI 4 B`` and its "? for shortcuts" footer: with the stale margin,
+        the footer landed on row 46 and the row-50 "esc to cancel" was never
+        overwritten.
+        """
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "\x1b[50;1Hstale footer")
+            sm._feed_screen_locked(
+                "t1", "\x1b[1;46r" + reset + "\x1b[46d\x1b[K\x1b[4B\rlive footer"
+            )
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert rendered[49].startswith("live footer")
+        assert rendered[45].strip() == ""
+
+    @pytest.mark.parametrize("reset", ["\x1b[;r", "\x1b[0;0r", "\x1b[r"])
+    def test_scroll_region_reset_homes_the_cursor(self, reset):
+        """An accepted DECSTBM, including the reset, homes the cursor (VT-correct)."""
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "\x1b[1;46r\x1b[20;30H" + reset)
+        screen = sm._screens["t1"][0]
+        assert screen.margins is None
+        assert (screen.cursor.y, screen.cursor.x) == (0, 0)
+
+    def test_scroll_region_with_omitted_bottom_runs_to_the_last_line(self):
+        """``CSI 5 ; r`` is rows 5..end, not a stale or one-row region."""
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "\x1b[1;46r\x1b[5;r")
+        screen = sm._screens["t1"][0]
+        assert (screen.margins.top, screen.margins.bottom) == (4, screen.lines - 1)
+
+    def test_private_csi_r_is_ignored_not_raised(self):
+        """``CSI ? Pm r`` (restore DEC private modes) must not break the feed."""
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "\x1b[1;46r\x1b[?1;46rframe survived\r\n")
+        screen = sm._screens["t1"][0]
+        assert (screen.margins.top, screen.margins.bottom) == (0, 45)
+        rendered, _ = sm._screen_lines("t1")
+        assert any("frame survived" in line for line in rendered)
+
+    def test_scroll_region_with_real_bounds_still_clamps_cursor_down(self):
+        """A non-degenerate DECSTBM keeps clamping CUD at its bottom margin."""
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "\x1b[1;46r\x1b[46d\x1b[4B\rclamped")
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert rendered[45].startswith("clamped")
+
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_render_error_falls_back_to_raw_buffer_detection(self, mock_pm):
         class BrokenScreen:

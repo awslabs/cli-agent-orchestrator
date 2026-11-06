@@ -271,7 +271,9 @@ let fails = 0;
 async function poll() {
   const conn = document.getElementById("conn");
   try {
-    const r = await fetch("state", { cache: "no-store" });  // page-relative: keeps a proxy path prefix
+    // Page-relative, so it keeps a port forward's path prefix. The changing query is a new
+    // cache key on every poll, so a CDN in front of the forward cannot serve an old floor.
+    const r = await fetch("state?t=" + Date.now(), { cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     render(await r.json());
     fails = 0;

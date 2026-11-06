@@ -635,6 +635,41 @@ class StatusMonitor:
                     # consume the query/response shape exactly like private DSR.
                     return
 
+                def set_margins(
+                    self, top: Optional[int] = None, bottom: Optional[int] = None, **kwargs
+                ) -> None:
+                    # ``CSI ? Pm r`` is xterm's restore-DEC-private-modes, not
+                    # DECSTBM. pyte 0.8.2 dispatches it here with private=True,
+                    # which its set_margins does not accept; as with private
+                    # DSR/DA above, a passive compositor ignores it.
+                    if kwargs.get("private"):
+                        return
+                    # An omitted or zero DECSTBM parameter means its default:
+                    # top 1, bottom the last line. So ``CSI ; r`` (and
+                    # ``CSI 0 ; 0 r``) resets the scroll region to the full
+                    # screen in xterm and tmux, and ``CSI 5 ; r`` is 5..end.
+                    # pyte 0.8.2 parses the empty parameters as ``(0, 0)``, reads
+                    # that as a one-row region, ignores it, and keeps the
+                    # PREVIOUS region, so a later cursor-down stops at the old
+                    # bottom margin. agy 1.5.0 ends its ready frame with
+                    # ``CSI 1;46 r ... CSI ; r`` and then moves down to its
+                    # footer row: under the stale margin "? for shortcuts"
+                    # landed four rows too high and the old "esc to cancel"
+                    # stayed on the bottom row, so the screen read PROCESSING
+                    # after agy was idle and init timed out.
+                    #
+                    # This shim serves every screen-detecting provider. Like any
+                    # accepted DECSTBM it homes the cursor, now also on an empty
+                    # or zero ``CSI r`` (pyte's own reset path did not), which is
+                    # what a VT terminal does.
+                    top = top or 1
+                    bottom = bottom or self.lines
+                    if (top, bottom) == (1, self.lines):
+                        super().set_margins()
+                        self.cursor_position()
+                        return
+                    super().set_margins(top, bottom)
+
             screen = _StatusScreen(PYTE_SCREEN_COLS, PYTE_SCREEN_ROWS)
             stream = pyte.Stream(screen)
             scr = (screen, stream)

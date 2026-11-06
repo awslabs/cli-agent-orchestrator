@@ -75,9 +75,12 @@ ADMIN_ONLY = {
 # travels in a JSON body; ``/agui/v1/run`` serves a dashboard snapshot at the read
 # floor and escalates to ``cao:write`` inside the handler only when ``resume[]`` is
 # non-empty, which a stubbed handler cannot observe (``test_agui_run_endpoint``
-# pins that escalation).
+# pins that escalation). ``POST /agui/v1/stream`` is the AG-UI binding of the
+# ambient fleet stream: a read whose ``RunAgentInput`` travels in the body, and it
+# refuses a non-empty ``resume`` with 400, so it never escalates.
 READ_TIER_MUTATING = READ_TIER_MUTATING_ROUTES | {
     ("POST", "/agui/v1/run"),
+    ("POST", "/agui/v1/stream"),
     ("POST", "/internal/memory/recall"),
     ("POST", "/internal/memory/context"),
 }

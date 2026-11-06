@@ -3163,10 +3163,18 @@ async def _create_terminal_unguarded(
             if provider == ProviderType.CLAUDE_CODE.value and not resume_session_id
             else None
         )
-        # Only a Kiro helper passes its launch, so every other call is unchanged.
+        # Only a Kiro helper passes its launch, and only a Claude Code helper the
+        # ephemeral flag, so every other call is unchanged. The flag is the bind
+        # above, the fact that marks this terminal ephemeral, never the profile
+        # text, and it keys on the provider that actually runs.
         provider_launch_options: dict[str, Any] = (
             {"kiro_launch": kiro_launch} if kiro_launch is not None else {}
         )
+        if (
+            provider == ProviderType.CLAUDE_CODE.value
+            and ephemeral_state.bound_terminal_id == terminal_id
+        ):
+            provider_launch_options["ephemeral"] = True
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,

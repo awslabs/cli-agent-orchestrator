@@ -2175,6 +2175,96 @@ class TestClaudeCodeBuiltinAgentToolsArgv:
         _extract_mcp_config(command)
 
 
+_EPHEMERAL_HELPER_CUT = (
+    "Agent",
+    "Task",
+    "Monitor",
+    "Skill",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
+_HELPER_ATOMS = ["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"]
+
+
+class TestClaudeCodeEphemeralHelperArgv:
+    """An ephemeral helper's argv cuts the seven, whatever its grant.
+
+    The flag is the provider manager's, from the launch's ephemeral binding; the
+    profile text never decides it.
+    """
+
+    @pytest.mark.parametrize(
+        "allowed",
+        [[atom, "@cao-mcp-server"] for atom in _HELPER_ATOMS]
+        + [_HELPER_ATOMS + ["@cao-mcp-server"]],
+    )
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_helper_argv_cuts_each_of_the_seven_once(self, mock_load, allowed):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-eph", "sess", "win", "agent", allowed_tools=allowed, ephemeral=True
+        )
+        command = provider._build_claude_command()
+        blocked = _blocked(command)
+        for tool in _EPHEMERAL_HELPER_CUT + _AGENT_TOOLS_CUT:
+            assert blocked.count(tool) == 1, tool
+        assert len(blocked) == len(set(blocked))
+        assert [tool for tool in blocked if tool.startswith(("mcp__", "@"))] == []
+        assert set(_extract_mcp_config(command)["mcpServers"]) == {"cao-mcp-server"}
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_an_all_atoms_helper_loses_exactly_the_two_lists(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-all",
+            "sess",
+            "win",
+            "agent",
+            allowed_tools=_HELPER_ATOMS + ["@cao-mcp-server"],
+            ephemeral=True,
+        )
+        command = provider._build_claude_command()
+        assert _blocked(command) == sorted(_AGENT_TOOLS_CUT + _EPHEMERAL_HELPER_CUT)
+        _extract_mcp_config(command)
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_the_same_grant_installed_keeps_the_seven_it_maps(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-inst", "sess", "win", "agent", allowed_tools=["execute_bash", "@cao-mcp-server"]
+        )
+        command = provider._build_claude_command()
+        blocked = _blocked(command)
+        for tool in _EPHEMERAL_HELPER_CUT:
+            assert tool not in blocked, tool
+        _extract_mcp_config(command)
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_profile_text_that_reads_like_a_helper_does_not_set_the_flag(self, mock_load):
+        from cli_agent_orchestrator.services.ephemeral_service import FENCE_SENTENCE
+
+        profile = _helper_profile(mock_load)
+        profile.name = "Ramones-log_triage-3f9a"
+        profile.description = "ephemeral helper"
+        profile.system_prompt = FENCE_SENTENCE + "\nTask."
+        provider = ClaudeCodeProvider(
+            "term-text", "sess", "win", "agent", allowed_tools=["execute_bash"]
+        )
+        blocked = _blocked(provider._build_claude_command())
+        for tool in ("Skill", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "Agent"):
+            assert tool not in blocked, tool
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_installed_developer_default_and_star_are_unchanged(self, mock_load):
+        _helper_profile(mock_load)
+        developer = ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
+        dev = ClaudeCodeProvider("term-dv", "sess", "win", "agent", allowed_tools=developer)
+        assert _blocked(dev._build_claude_command()) == sorted(_AGENT_TOOLS_CUT)
+        star = ClaudeCodeProvider("term-st", "sess", "win", "agent", allowed_tools=["*"])
+        assert "--disallowedTools" not in star._build_claude_command()
+
+
 class TestClaudeCodeProviderYoloRootRegression:
     """Regression tests for yolo + root/non-root --dangerously-skip-permissions logic.
 

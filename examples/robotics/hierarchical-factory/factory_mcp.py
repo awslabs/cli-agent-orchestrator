@@ -45,6 +45,15 @@ def allowed_hosts() -> list[str] | None:
     return [name for name in names if name] or None
 
 
+# The live view must never be cached. A port forward can put a CDN in front of
+# the controller (the AWS workshop's code editor forwards ports through
+# CloudFront, which caches a response without cache headers for up to a day),
+# and a cached /state freezes the page on the first floor it saw while the run
+# goes on. no-store on both routes, and a changing query on every poll in
+# viewer.html, keep each request on the controller.
+NO_STORE = {"Cache-Control": "no-store, max-age=0"}
+
+
 def viewer_page() -> str:
     """The live view, with the robot pictures inlined, so that it loads nothing else."""
     sprites = {
@@ -149,11 +158,11 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
     # agent already sees, never a credential.
     @server.custom_route("/", methods=["GET"], include_in_schema=False)
     async def viewer(_request: Request) -> HTMLResponse:
-        return HTMLResponse(viewer_page())
+        return HTMLResponse(viewer_page(), headers=NO_STORE)
 
     @server.custom_route("/state", methods=["GET"], include_in_schema=False)
     async def state(_request: Request) -> JSONResponse:
-        return JSONResponse(world.observe())
+        return JSONResponse(world.observe(), headers=NO_STORE)
 
     def zone() -> str:
         token = get_access_token()
