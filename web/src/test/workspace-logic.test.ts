@@ -11,7 +11,7 @@ import {
   retainTerminals,
   setPaneCount,
 } from '../workspace/layout'
-import { TerminalPool } from '../workspace/terminalPool'
+import { DEFAULT_POOL_SIZE, TerminalPool } from '../workspace/terminalPool'
 import { stepFontSize } from '../workspace/workspaceStore'
 import type { XtermSession } from '../components/terminal/xtermSession'
 
@@ -92,9 +92,9 @@ describe('layout', () => {
 
 describe('TerminalPool', () => {
   function fakeFactory() {
-    const made: Record<string, XtermSession & { dispose: ReturnType<typeof vi.fn> }> = {}
+    const made: Record<string, Omit<XtermSession, 'closed'> & { closed: boolean; dispose: ReturnType<typeof vi.fn> }> = {}
     const factory = vi.fn((id: string, _fontSize?: number) => {
-      const s = { terminalId: id, element: document.createElement('div'), fit: vi.fn(), focus: vi.fn(), setFontSize: vi.fn(), dispose: vi.fn() }
+      const s = { terminalId: id, element: document.createElement('div'), closed: false, fit: vi.fn(), focus: vi.fn(), setFontSize: vi.fn(), dispose: vi.fn() }
       made[id] = s
       return s
     })
@@ -143,6 +143,55 @@ describe('TerminalPool', () => {
     expect(made.t1.dispose).toHaveBeenCalled()
     expect(made.t2.dispose).not.toHaveBeenCalled()
     expect(pool.size()).toBe(2)
+    pool.disposeAll()
+  })
+
+  it('never evicts an on-screen session, even when it is the least recently used', () => {
+    const { factory, made } = fakeFactory()
+    const pool = new TerminalPool(factory, 2)
+    const p1 = document.createElement('div')
+    const p2 = document.createElement('div')
+    const p3 = document.createElement('div')
+    pool.attach('t1', p1) // oldest, and stays on screen
+    pool.attach('t2', p2)
+    pool.detach('t2', p2)
+    pool.attach('t3', p2) // over the cap: t2 is the only off-screen session
+    expect(made.t2.dispose).toHaveBeenCalled()
+    pool.attach('t4', p3) // over the cap with everything on screen: nothing goes
+    expect(made.t1.dispose).not.toHaveBeenCalled()
+    expect(made.t3.dispose).not.toHaveBeenCalled()
+    expect(pool.size()).toBe(3)
+    pool.disposeAll()
+  })
+
+  it('keeps at most six live terminals by default', () => {
+    const { factory } = fakeFactory()
+    const pool = new TerminalPool(factory)
+    const pane = document.createElement('div')
+    for (let i = 0; i < 9; i++) {
+      pool.attach(`t${i}`, pane)
+      pool.detach(`t${i}`, pane)
+    }
+    expect(DEFAULT_POOL_SIZE).toBe(6)
+    expect(pool.size()).toBe(6)
+    pool.disposeAll()
+  })
+
+  it('replaces a session whose socket closed, so showing it again reconnects', () => {
+    const { factory, made } = fakeFactory()
+    const pool = new TerminalPool(factory, 3)
+    const pane = document.createElement('div')
+    pool.attach('t1', pane)
+    const first = made.t1
+    pool.detach('t1', pane)
+    first.closed = true
+
+    pool.attach('t1', pane)
+
+    expect(factory).toHaveBeenCalledTimes(2)
+    expect(first.dispose).toHaveBeenCalled()
+    expect(made.t1).not.toBe(first)
+    expect(pane.contains(made.t1.element)).toBe(true)
     pool.disposeAll()
   })
 

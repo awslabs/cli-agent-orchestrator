@@ -13,7 +13,7 @@ vi.mock('../components/terminal/xtermSession', () => ({
     fontSizes[id] = fontSize
     const element = document.createElement('div')
     element.dataset.terminal = id
-    return { terminalId: id, element, fit: () => {}, focus: () => {}, setFontSize: (px: number) => { fontSizes[id] = px }, dispose: () => element.remove() }
+    return { terminalId: id, element, closed: false, fit: () => {}, focus: () => {}, setFontSize: (px: number) => { fontSizes[id] = px }, dispose: () => element.remove() }
   },
 }))
 
@@ -167,5 +167,38 @@ describe('WorkspacePanel', () => {
     await screen.findByRole('tablist', { name: 'Agents in cao-alpha' })
     expect(screen.getByRole('button', { name: 'Smaller terminal text' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Larger terminal text' })).not.toBeDisabled()
+  })
+
+  it('Ctrl+K opens the switcher outside a terminal but is left to the shell inside one', async () => {
+    render(<WorkspacePanel />)
+    await screen.findByRole('tablist', { name: 'Agents in cao-alpha' })
+
+    const xterm = document.createElement('div')
+    xterm.className = 'xterm'
+    const input = document.createElement('textarea')
+    xterm.appendChild(input)
+    document.body.appendChild(xterm)
+    input.focus()
+    fireEvent.keyDown(input, { key: 'k', ctrlKey: true })
+    expect(screen.queryByRole('dialog', { name: 'Jump to agent' })).toBeNull()
+
+    input.blur()
+    xterm.remove()
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true })
+    expect(await screen.findByRole('dialog', { name: 'Jump to agent' })).toBeInTheDocument()
+  })
+
+  it('keeps the last good view when a poll fails with anything but 404', async () => {
+    render(<WorkspacePanel />)
+    await screen.findByRole('tablist', { name: 'Agents in cao-alpha' })
+    vi.mocked(api.getSession).mockImplementation(async () => {
+      throw Object.assign(new Error('500 Internal Server Error'), { status: 500 })
+    })
+
+    await poll()
+
+    const tabs = screen.getByRole('tablist', { name: 'Agents in cao-alpha' })
+    expect(within(tabs).getByRole('tab', { name: /supervisor/ })).toBeInTheDocument()
+    expect(within(screen.getByRole('complementary', { name: 'Sessions' })).getByText('cao-beta')).toBeInTheDocument()
   })
 })

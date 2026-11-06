@@ -31,6 +31,13 @@ export class TerminalPool {
   /** Show `terminalId` inside `container`, creating the session if needed. */
   attach(terminalId: string, container: HTMLElement): XtermSession {
     let session = this.sessions.get(terminalId)
+    // A session whose socket closed (server restart, network drop, detach)
+    // can no longer reach the agent: replace it so showing the agent again
+    // reconnects, as opening the old overlay did.
+    if (session?.closed) {
+      this.drop(terminalId)
+      session = undefined
+    }
     if (!session) {
       session = this.factory(terminalId, this.fontSize)
       this.sessions.set(terminalId, session)

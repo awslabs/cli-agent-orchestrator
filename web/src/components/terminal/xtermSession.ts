@@ -18,6 +18,8 @@ export interface XtermSession {
   /** Refit to the current container size and tell the server the new size. */
   fit: () => void
   focus: () => void
+  /** True once the socket has closed; the session can no longer reach the agent. */
+  readonly closed: boolean
   /** Change the font size; refits so rows/cols follow (and tmux with them). */
   setFontSize: (px: number) => void
   dispose: () => void
@@ -83,7 +85,9 @@ export function createXtermSession(terminalId: string, fontSize = DEFAULT_FONT_S
   ws.onmessage = (e) => {
     if (e.data instanceof ArrayBuffer) term.write(new Uint8Array(e.data))
   }
+  let closed = false
   ws.onclose = () => {
+    closed = true
     term.write('\r\n\x1b[33m[Connection closed]\x1b[0m\r\n')
   }
 
@@ -120,6 +124,9 @@ export function createXtermSession(terminalId: string, fontSize = DEFAULT_FONT_S
   return {
     terminalId,
     element,
+    get closed() {
+      return closed
+    },
     fit,
     focus: () => term.focus(),
     setFontSize: (px: number) => {
