@@ -282,7 +282,8 @@ the panel is refused too.
 | 3.0.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 | 3.1.0 | `@kiro/agent` 0.66.91 | pending operator verification: refused at launch unless the operator opts in (below) |
 
-2.37.1 and 3.1.0 remain pending until the operator's live checks OC1–OC19 pass.
+2.37.1 and 3.1.0 remain pending until the operator checklist (OC1–OC19,
+[#1167](https://github.com/awslabs/cli-agent-orchestrator/issues/1167)) passes.
 Until then, they are admitted only with `kiro.v3_allow_unverified_versions`.
 3.1.0 pins `KAS_0_66_91`; every agent and helper render remains byte-identical.
 The 3.1.0 probe is tested against captured help. No 2.37.1 help capture is

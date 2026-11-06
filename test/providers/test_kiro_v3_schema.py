@@ -23,7 +23,7 @@ from cli_agent_orchestrator.providers.kiro_v3_schema import (
 )
 
 
-def test_the_allow_list_pins_2_35_1_and_marks_2_36_0_2_37_0_and_3_0_0_pending():
+def test_the_allow_list_pins_2_35_1_and_marks_every_other_row_pending():
     assert set(SUPPORTED_KIRO_CLI_VERSIONS) == {
         "2.35.1",
         "2.36.0",
@@ -33,7 +33,7 @@ def test_the_allow_list_pins_2_35_1_and_marks_2_36_0_2_37_0_and_3_0_0_pending():
         "3.1.0",
     }
     assert SUPPORTED_KIRO_CLI_VERSIONS["2.35.1"].pending_operator_verification is False
-    for pending in ("2.36.0", "2.37.0", "3.0.0"):
+    for pending in ("2.36.0", "2.37.0", "2.37.1", "3.0.0"):
         entry = SUPPORTED_KIRO_CLI_VERSIONS[pending]
         assert entry.pending_operator_verification is True
         assert "pending operator verification" in entry.basis
@@ -212,7 +212,7 @@ def test_new_pending_versions_lookup_refuse_by_default_and_admit_only_with_opt_i
     assert "pending operator verification" in entry.basis
 
 
-def test_0_66_91_records_unmodelled_tools_without_selecting_them():
+def test_0_66_91_records_tools_outside_caos_select_model():
     schema = kiro_v3_schema_for_cli_version("3.1.0")
     assert schema.unmodelled_tools == {
         "control_bash_process": (frozenset({"shell", "@builtin"}), "shell"),
@@ -223,6 +223,7 @@ def test_0_66_91_records_unmodelled_tools_without_selecting_them():
         "job_list": (frozenset({"@builtin"}), None),
         "job_cancel": (frozenset({"@builtin"}), None),
     }
+    # An empty inventory means unrecorded, not absent from the engine.
     assert KAS_0_66_70.unmodelled_tools == {}
     assert schema.tags is KAS_0_66_70.tags
     for field in (
@@ -252,7 +253,7 @@ def test_0_66_91_records_unmodelled_tools_without_selecting_them():
         assert schema.select(entry).isdisjoint(schema.unmodelled_tools)
 
 
-@pytest.mark.parametrize("mask", range(64))
+@pytest.mark.parametrize("mask", range(128))
 @pytest.mark.parametrize("mcp", [False, True])
 def test_new_schema_keeps_every_grant_render_byte_identical(mask, mcp):
     from unittest.mock import patch
@@ -263,7 +264,7 @@ def test_new_schema_keeps_every_grant_render_byte_identical(mask, mcp):
     from cli_agent_orchestrator.utils import tool_mapping
 
     schema = kiro_v3_schema_for_cli_version("3.1.0")
-    atoms = ("fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch", "fs_*")
+    atoms = ("fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch", "fs_*", "@builtin")
     grant = [atom for i, atom in enumerate(atoms) if mask & (1 << i)]
     if mcp:
         grant += ["@cao-mcp-server", "@other/tool"]
