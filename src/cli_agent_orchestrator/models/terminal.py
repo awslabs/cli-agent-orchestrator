@@ -190,6 +190,16 @@ class Terminal(BaseModel):
             "Separate from consumer metadata so clients cannot overwrite lifecycle truth."
         ),
     )
+    launch_notes: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Notes on how this launch was admitted, for the operator. Today only a Kiro "
+            "v3 launch on a kiro-cli version still pending operator verification, "
+            "admitted by the operator opt-in kiro.v3_allow_unverified_versions "
+            "(#1167, provisional). Response-only, never persisted; None when there is "
+            "nothing to note."
+        ),
+    )
     memory_manager: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
@@ -270,3 +280,6 @@ class AgentStepResult(BaseModel):
     terminal_id: str
     last_message: str
     status: TerminalStatus
+    # True only when run_agent_step itself deleted the worker terminal it created
+    # (issue #1203). False for reused terminals, teardown=False, and a failed delete.
+    torn_down: bool = False

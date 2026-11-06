@@ -201,9 +201,17 @@ class TestTerminalOperations:
 
         assert result is False
 
+    @patch("cli_agent_orchestrator.clients.database._finalize_launch_records_best_effort")
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_delete_terminal(self, mock_session_class):
-        """Test deleting a terminal."""
+    def test_delete_terminal(self, mock_session_class, mock_finalize):
+        """Test deleting a terminal.
+
+        ``_finalize_launch_records_best_effort`` (issue #1082) is mocked out: it
+        runs its own separate SessionLocal() + commit() AFTER this one, which
+        would otherwise double the commit count this test pins. Its own
+        behavior is covered in test/clients/test_launch_record.py and
+        test/services/test_launch_record_integration.py.
+        """
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)
         mock_session.__exit__ = MagicMock(return_value=False)
@@ -213,10 +221,11 @@ class TestTerminalOperations:
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
-        result = delete_terminal("test123")
+        result = delete_terminal("test123", end_reason="deleted")
 
         assert result is True
         mock_session.commit.assert_called_once()
+        mock_finalize.assert_called_once_with(["test123"], "deleted")
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminal_not_found(self, mock_session_class):
@@ -230,7 +239,7 @@ class TestTerminalOperations:
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
-        result = delete_terminal("nonexistent")
+        result = delete_terminal("nonexistent", end_reason="deleted")
 
         assert result is False
 
@@ -450,7 +459,7 @@ class TestTerminalOperations:
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
-        result = delete_terminals_by_session("cao-session")
+        result = delete_terminals_by_session("cao-session", end_reason="session_teardown")
 
         assert result == 2
 
@@ -2656,7 +2665,7 @@ class TestListTerminalsInSessions:
         """
         self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
         self._add(db, "20000000", "cao-alpha", agent_profile="developer")
-        delete_terminal("20000000")  # frees the max rowid
+        delete_terminal("20000000", end_reason="deleted")  # frees the max rowid
         self._add(db, "10000000", "cao-alpha", agent_profile="developer")
 
         result = list_terminals_in_sessions(["cao-alpha"])

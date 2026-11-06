@@ -40,7 +40,14 @@ def _encoder():
         (rp._AGUI_STEP_FINISHED, {"terminal_id": "t1"}),
         (rp._AGUI_TOOL_CALL_START, {"tool_call_id": "tc1", "tool_call_name": "handoff"}),
         (rp._AGUI_TOOL_CALL_END, {"tool_call_id": "tc1"}),
-        (rp._AGUI_GENERATIVE_UI, {"component": "approval_card", "props": {}}),
+        (
+            rp._AGUI_CUSTOM,
+            {
+                "type": "CUSTOM",
+                "name": "cao.generative_ui",
+                "value": {"component": "approval_card", "props": {}},
+            },
+        ),
         (rp._AGUI_TEXT_MESSAGE_CONTENT, {"content": "hi"}),
         (rp._AGUI_RAW, {"foo": "bar"}),
         (rp._AGUI_RUN_ERROR, {"message": "boom"}),

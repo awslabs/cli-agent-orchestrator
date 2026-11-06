@@ -22,11 +22,14 @@ from cli_agent_orchestrator.api.main import (
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services import session_service, terminal_service
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
+    IdempotencyKeyNotFound,
+    IdempotentCreateFailed,
     TerminalRecordCorruptError,
 )
 from cli_agent_orchestrator.utils.skills import SkillNameError
@@ -54,6 +57,21 @@ class TestHealthCheck:
         assert components["cao"] == "ok"
         assert components["herdr"] in ("ok", "unavailable")
         assert components["claude"] in ("ok", "unavailable")
+
+    def test_health_reports_the_package_version(self, client):
+        """GET /health carries the installed version (shown by the web UI's server card)."""
+        with patch("importlib.metadata.version", return_value="9.9.9"):
+            data = client.get("/health").json()
+        assert data["version"] == "9.9.9"
+
+    def test_health_version_falls_back_when_not_installed(self, client):
+        """An uninstalled source tree reports 'unknown' rather than failing the health check."""
+        from importlib.metadata import PackageNotFoundError
+
+        with patch("importlib.metadata.version", side_effect=PackageNotFoundError):
+            response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["version"] == "unknown"
 
     def test_health_reports_terminal_backend_tmux(self, client):
         """GET /health reports terminal_backend matching the active backend (tmux)."""
@@ -215,6 +233,14 @@ class TestAgentProviders:
         assert providers_dict["omp"]["binary"] == "omp"
         assert providers_dict["grok_cli"]["binary"] == "grok"
         assert providers_dict["mcode"]["binary"] == "mcode"
+
+    def test_list_providers_preserves_common_wire_contract(self, client):
+        """Provider discovery has the same shape consumed by the web and Rust clients."""
+        response = client.get("/agents/providers")
+
+        assert response.status_code == 200
+        for provider in response.json():
+            assert set(provider) == {"name", "binary", "installed"}
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────
@@ -536,6 +562,86 @@ class TestCreateSession:
         assert response.status_code == 201
         assert mock_create.call_args.kwargs["idempotency_key"] is None
 
+    def test_replay_of_a_failed_create_is_424_with_the_cause(self, client):
+        """Review on PR #773: distinct from a plain 500, so the caller reports
+        the original failure instead of retrying it."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=IdempotentCreateFailed("terminal 'a' failed to initialize: boom")
+            )
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 424
+        assert "failed to initialize: boom" in response.json()["detail"]
+
+    def test_lookup_only_without_a_key_is_400(self, client):
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock()
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "lookup_only": "true",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "lookup_only requires" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_lookup_only_is_forwarded_and_a_miss_is_404(self, client):
+        """Review on PR #773: ``lookup_only`` reaches the service, and a key
+        with nothing committed is a 404 -- not the 400 this endpoint gives a
+        ValueError, and never a create."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")
+            )
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "lookup_only": "true",
+                },
+            )
+
+        assert response.status_code == 404
+        assert mock_svc.create_session.call_args.kwargs["lookup_only"] is True
+
+    def test_lookup_only_does_not_ask_the_decider(self, client):
+        """Review on PR #773: a lookup never launches, so a delegation_message
+        sent with it must not reach prepare_launch."""
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main.prepare_launch", new=AsyncMock()) as decider,
+        ):
+            mock_svc.create_session = AsyncMock(
+                side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")
+            )
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "lookup_only": "true",
+                },
+                json={"delegation_message": "do the task", "delegation_kind": "handoff"},
+            )
+
+        assert response.status_code == 404
+        decider.assert_not_called()
+
     def test_idempotency_key_conflict_is_409_not_400(self, client):
         """A reused key for a DIFFERENT request must surface as 409.
 
@@ -622,8 +728,8 @@ class TestCreateSession:
             )
 
         assert response.status_code == 201
-        assert response.json()["engine"] == "kas"
-        assert mock_svc.create_session.call_args.kwargs["engine"] == "kas"
+        assert response.json()["engine"] == "v3"
+        assert mock_svc.create_session.call_args.kwargs["engine"] is KiroEngine.V3
 
     def test_create_session_passes_model_and_initial_message(self, client):
         """The launch override and first task reach the session service, while
@@ -1231,6 +1337,91 @@ class TestCreateTerminalInSession:
         assert response.status_code == 500
         assert "Failed to create terminal" in response.json()["detail"]
 
+    def test_replay_of_a_failed_create_is_424_with_the_cause(self, client):
+        """Review on PR #773: distinct from a plain 500, so the caller reports
+        the original failure instead of retrying it."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=IdempotentCreateFailed("terminal 'a' failed to initialize: boom")
+            )
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 424
+        assert "failed to initialize: boom" in response.json()["detail"]
+
+    def test_lookup_only_without_a_key_is_400_not_404(self, client):
+        """This endpoint maps ValueError to 404, which would read as a missing
+        session; a lookup with no key is a bad request."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock()
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "lookup_only": "true",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "lookup_only requires" in response.json()["detail"]
+        mock_svc.create_terminal.assert_not_called()
+
+    def test_lookup_only_is_forwarded_and_a_miss_is_404(self, client):
+        """Review on PR #773: same contract as POST /sessions."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")
+            )
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "lookup_only": "true",
+                },
+            )
+
+        assert response.status_code == 404
+        assert mock_svc.create_terminal.call_args.kwargs["lookup_only"] is True
+
+    def test_lookup_only_does_not_ask_the_decider(self, client):
+        """Review on PR #773: same contract as POST /sessions."""
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main._prepare_delegation", new=AsyncMock()
+            ) as decider,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")
+            )
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "lookup_only": "true",
+                },
+                json={"delegation_message": "do the task", "delegation_kind": "handoff"},
+            )
+
+        assert response.status_code == 404
+        decider.assert_not_called()
+
     def test_idempotency_key_conflict_is_409_not_404(self, client):
         """A reused key for a DIFFERENT request must surface as 409.
 
@@ -1768,7 +1959,9 @@ class TestDeleteTerminal:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
+        mock_svc.delete_terminal.assert_called_once_with(
+            "abcd1234", registry=ANY, end_reason="deleted"
+        )
 
     def test_delete_terminal_deferred_cleanup_is_conflict(self, client):
         """HTTP 200 + success:false would hide a still-retryable Grok home."""

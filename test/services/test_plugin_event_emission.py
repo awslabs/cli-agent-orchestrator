@@ -159,7 +159,9 @@ class TestSessionPluginEvents:
 
         mock_capture.side_effect = record_snapshot
         mock_dismantle.side_effect = lambda *_args, **_kwargs: call_order.append("dismantle")
-        mock_db_delete_terminal.side_effect = lambda *_: call_order.append("db_delete") or True
+        mock_db_delete_terminal.side_effect = (
+            lambda *_, **__: call_order.append("db_delete") or True
+        )
         registry.dispatch.side_effect = record_dispatch
 
         result = delete_session("cao-demo", registry=registry)
@@ -404,7 +406,7 @@ class TestSessionPluginEvents:
             "agent_profile": "developer",
         }
         # The first terminal's row delete fails transiently; the peer's works.
-        mock_db_delete.side_effect = lambda tid: (
+        mock_db_delete.side_effect = lambda tid, **_: (
             (_ for _ in ()).throw(RuntimeError("database is locked")) if tid == "aaaa1111" else True
         )
         mock_sweep.return_value = None  # the sweep succeeds
@@ -621,10 +623,12 @@ class TestTerminalPluginEvents:
             "agent_profile": "developer",
         }
         mock_provider_manager.cleanup_provider.side_effect = lambda *_: call_order.append("cleanup")
-        mock_db_delete_terminal.side_effect = lambda *_: call_order.append("db_delete") or True
+        mock_db_delete_terminal.side_effect = (
+            lambda *_, **__: call_order.append("db_delete") or True
+        )
         registry.dispatch.side_effect = record_dispatch
 
-        deleted = delete_terminal("abcd1234", registry=registry)
+        deleted = delete_terminal("abcd1234", registry=registry, end_reason="deleted")
 
         assert deleted is True
         assert call_order[-2:] == ["db_delete", "dispatch"]
@@ -652,7 +656,7 @@ class TestTerminalPluginEvents:
         mock_db_delete_terminal.side_effect = RuntimeError("db delete failed")
 
         with pytest.raises(RuntimeError, match="db delete failed"):
-            delete_terminal("abcd1234", registry=registry)
+            delete_terminal("abcd1234", registry=registry, end_reason="deleted")
 
         registry.dispatch.assert_not_awaited()
 

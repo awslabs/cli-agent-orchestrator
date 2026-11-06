@@ -11,7 +11,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -70,16 +70,23 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 # after "/effort" (GH #459 follow-up). Without this, the reset defeats the
 # "[ \t]*$" end anchor and the exclusion silently stops firing on styled
 # output, even though it passes on the plain-text unit fixtures.
-_ANSI_OPT = r"(?:\x1b\[[0-9;]*m)*"
+#
+# Every run here is possessive (``*+``/``++``): each is followed by a token it
+# cannot consume (ESC after blanks, a word character after SGR codes, "·" after
+# a word...), so giving characters back can never produce a match, and refusing
+# to removes the backtracking. Before, a response marker followed by a long run
+# of SGR codes re-ran this lookahead tail once per code the outer run gave back:
+# quadratic in the run (CWE-1333).
+_ANSI_OPT = r"(?:\x1b\[[0-9;]*m)*+"
 _EFFORT_FOOTER_TAIL = (
     _ANSI_OPT
-    + r"\w+"
+    + r"\w++"
     + _ANSI_OPT
-    + r"[ \t]*·[ \t]*"
+    + r"[ \t]*+·[ \t]*+"
     + _ANSI_OPT
     + r"/effort"
     + _ANSI_OPT
-    + r"[ \t]*$"
+    + r"[ \t]*+$"
 )
 # Response marker at the START of a line, for message EXTRACTION only (not
 # status detection). Matches the legacy "⏺" (U+23FA) and the newest TUI's
@@ -101,7 +108,7 @@ _EFFORT_FOOTER_TAIL = (
 # is unaffected (adding "●" there could fire COMPLETED mid-stream while a
 # response is still rendering).
 EXTRACTION_RESPONSE_PATTERN = re.compile(
-    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*(?![ \t]*" + _EFFORT_FOOTER_TAIL + r")\s+",
+    r"^[ \t]*+" + _ANSI_OPT + r"[⏺●]" + _ANSI_OPT + r"(?![ \t]*+" + _EFFORT_FOOTER_TAIL + r")\s+",
     re.MULTILINE,
 )
 # Own-line effort-footer, e.g. "● high · /effort" (glyph + the tail shape
@@ -119,7 +126,14 @@ EFFORT_FOOTER_LINE_PATTERN = re.compile(r"^[ \t]*[⏺●][ \t]*" + _EFFORT_FOOTE
 # Claude Code TUI cycles its spinner glyph through "· ✢ * ✶ ✻ ✽", so ~1 in 6
 # captured frames shows a bare "*". Omitting it left a live "* Cultivating…"
 # frame invisible to every processing detector (false IDLE/COMPLETED mid-turn).
-PROCESSING_PATTERN = r"[✶✢✽✻✳·*].*\u2026"
+#
+# Anchored at the start of the line, with the spinner itself in group 1 (read
+# it through _iter_spinner_matches). Unanchored, the search restarted at every
+# glyph on a line and re-scanned the rest of the line for the ellipsis each
+# time: quadratic in the line's length (CWE-1333). The first glyph on a line
+# stands for all of them -- an ellipsis after any later glyph is also after the
+# first -- so group 1 is exactly the match the unanchored form returned.
+PROCESSING_PATTERN = r"(?m)^[^✶✢✽✻✳·*\n]*+([✶✢✽✻✳·*][^\n]*\u2026)"
 # Structural PROCESSING indicator (reference pattern — get_status uses an
 # inline last-separator-anchored version to avoid false positives from
 # mid-conversation compaction events like "✢ Compacting conversation…"):
@@ -195,7 +209,16 @@ IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # turn INSTEAD of the old ⏺ response marker, so it is the COMPLETED signal there.
 # The ``·`` glyph is intentionally excluded from the leading class so footer
 # lines like "high · /effort" cannot false-match.
-COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s*s\b"
+#
+# Anchored where a segment starts (a line start, or just after an ellipsis --
+# the two characters the body cannot cross) and skipping possessively to the
+# segment's first glyph. Unanchored, the search restarted at every glyph and
+# re-scanned the rest of the segment for "for Ns": quadratic (CWE-1333). A
+# summary after any later glyph in the segment is also after the first, so the
+# pattern matches exactly where it did; its one caller only asks whether it does.
+COMPLETION_SUMMARY_PATTERN = (
+    r"(?m)(?:^|(?<=…))[^✶✢✽✻✳\n…]*+[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s*s\b"
+)
 # get_status completion detection tolerates the duration being CLIPPED off by
 # the raw redraw ("✻ Crunched for " with no "Ns"): past-tense glyph + "for",
 # no ellipsis (so a live "…ing…" spinner never matches). · and * stay excluded
@@ -203,7 +226,14 @@ COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s
 # COMPLETION_SUMMARY_PATTERN (which extraction keeps strict to trim only real
 # stat lines), and only ever turns IDLE/PROCESSING into COMPLETED — the safe
 # direction — and only after the live-spinner PROCESSING checks have passed.
-GET_STATUS_COMPLETION_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\b"
+#
+# Anchored where a segment starts -- a line start or just after an ellipsis,
+# the two characters the body cannot cross -- with the summary in group 1 (read
+# it through _iter_spinner_matches). Unanchored, the search restarted at every
+# glyph in a segment and re-scanned the rest of the segment for "for": quadratic
+# (CWE-1333). A segment's first glyph stands for all of them, so group 1 is
+# exactly the match the unanchored form returned.
+GET_STATUS_COMPLETION_PATTERN = r"(?m)(?:^|(?<=…))[^✶✢✽✻✳\n…]*+([✶✢✽✻✳][^\n…]*\bfor\b)"
 # Background-task wait line, e.g. "✻ Waiting for 1 dynamic workflow to finish".
 # The newest TUI renders this while a backgrounded task (Workflow tool, bash
 # task) keeps running AFTER the turn's text response has printed and the input
@@ -303,10 +333,86 @@ TURN_END_GATE_FRAMES = 4
 # lines are tolerated (not arbitrary content), so a "❯ my task" echo or a
 # "⏺ response"/compaction line between separators still cannot match, and the
 # {0,2} bound keeps the match local so it cannot span two distinct separators.
+#
+# The old unanchored form, r"─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯]...",
+# restarted at every "─" of a rule row and, from each, tried every split of the
+# row between ``─{8,}`` and ``[^\n]*``: cubic in the row's length for one long
+# rule, and ~0.2 s per status poll on a realistic buffer of full-width rules
+# (CWE-1333). Now the attempt starts at the line start and skips possessively
+# to the FIRST run of 8+ "─" on the row (any later run would reach the same next
+# line, so it cannot match where the first does not), with the box in group 1.
+# Every run is possessive because each is followed by a character it cannot
+# consume. .search() finds a box exactly when the old form did; for the box's
+# span, use _iter_new_tui_boxes.
+_NEW_TUI_BOX_BELOW_TOP = (
+    r"(?:[ \t\xa0]*+\n){0,2}+[ \t]*+[>❯][ \t\xa0]*+\n(?:[ \t\xa0]*+\n){0,2}+[ \t]*+─{8,}+"
+)
 NEW_TUI_BOX_PATTERN = re.compile(
-    r"─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯][ \t\xa0]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}",
+    r"^(?:[^─\n]++|─{1,7}+(?!─))*+(─{8,}+[^\n]*+\n" + _NEW_TUI_BOX_BELOW_TOP + ")",
     re.MULTILINE,
 )
+_NEW_TUI_BOX_RULE_RUN = re.compile("─{8}")
+_NEW_TUI_BOX_BELOW_TOP_RE = re.compile(_NEW_TUI_BOX_BELOW_TOP)
+
+
+def _iter_new_tui_boxes(text: str) -> Iterator[tuple[int, int]]:
+    """``(start, end)`` of each new-TUI input box, as the old ``finditer`` reported them.
+
+    A box starts at the first run of 8+ "─" at or after the scan position, and
+    its top rule runs to the end of that line; the rows below are matched once,
+    anchored. When they do not form a box, no later run on the same line can
+    start one (it would reach the same next line), so the scan moves to the next
+    line -- one pass over the text. After a box the scan resumes at its end,
+    which may be mid-line, exactly where ``re.finditer`` resumed.
+    """
+    pos = 0
+    while True:
+        run = _NEW_TUI_BOX_RULE_RUN.search(text, pos)
+        if run is None:
+            return
+        eol = text.find("\n", run.start())
+        if eol == -1:
+            return
+        below = _NEW_TUI_BOX_BELOW_TOP_RE.match(text, eol + 1)
+        if below is None:
+            pos = eol + 1
+            continue
+        yield run.start(), below.end()
+        pos = below.end()
+
+
+class _SpinnerMatch:
+    """Group 1 of a line-anchored spinner pattern, read as the old unanchored match.
+
+    PROCESSING_PATTERN and GET_STATUS_COMPLETION_PATTERN start each attempt where
+    a line (or segment) starts and capture the spinner in group 1, so a search no
+    longer restarts at every glyph. Their callers compare positions with other
+    markers, so this presents group 1 the way the unanchored patterns presented
+    the whole match.
+    """
+
+    __slots__ = ("_match",)
+
+    def __init__(self, match: "re.Match[str]") -> None:
+        self._match = match
+
+    def start(self) -> int:
+        return self._match.start(1)
+
+    def end(self) -> int:
+        return self._match.end(1)
+
+    def group(self, index: int = 0) -> str:
+        if index:
+            raise IndexError("a spinner match has only the whole-match group")
+        return self._match.group(1)
+
+
+def _iter_spinner_matches(pattern: str, text: str) -> Iterator[_SpinnerMatch]:
+    for match in re.finditer(pattern, text):
+        yield _SpinnerMatch(match)
+
+
 # Live spinner in the new TUI: spinner glyph + a gerund ("…ing") + the … ellipsis,
 # e.g. "✻ Cultivating…", "· Swirling…". Tighter than PROCESSING_PATTERN so the
 # version status bar ("· latest:…") is not mistaken for a live spinner.
@@ -340,12 +446,26 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+" + 
 # no line-start anchor. Built from _SPINNER_VERB so the "-" / "'" default verbs
 # ("✢ Dilly-dallying…") are a live spinner here too; a plain "\w*ing\b" let
 # them read COMPLETED after "✻ Pondered for 8s" (PR #975 review, P3-4).
-AFTER_SUMMARY_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r"[^\n]*…")
+#
+# Anchored at the line start and skipping possessively past every glyph that is
+# NOT followed by a spinner verb: unanchored, the search restarted at every
+# glyph and re-scanned the rest of the line (CWE-1333). The first glyph that is
+# followed by a verb stands for every later one -- the verb cannot run past a
+# glyph, so a later spinner's "…" is also after the first one's verb -- so it
+# matches exactly where it did; its caller only asks whether it does.
+AFTER_SUMMARY_SPINNER_PATTERN = re.compile(
+    r"(?m)^(?:[^✶✢✽✻✳·*\n]++|[✶✢✽✻✳·*](?![ \t]+" + _SPINNER_VERB + r"))*+"
+    r"[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r"[^\n]*…"
+)
 # Any glyph + ellipsis, for get_status()'s walk back from the last separator:
 # deliberately loose (no verb, "·" included, "*" excluded) because it is applied
 # only to the lines between the last two separators, where the newest TUI
 # draws nothing but the live turn. Named so the busy-pattern guard sees it.
-SEPARATOR_WALK_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·][^\n]*\u2026")
+# Anchored at the line start, skipping possessively to the first glyph: an
+# ellipsis after any later glyph is also after the first, so it matches exactly
+# where the unanchored form did, without re-scanning the line from every glyph
+# (CWE-1333). Its caller only asks whether it matches.
+SEPARATOR_WALK_SPINNER_PATTERN = re.compile(r"(?m)^[^✶✢✽✻✳·\n]*+[✶✢✽✻✳·][^\n]*\u2026")
 # Live spinner under Claude Code's prefersReducedMotion setting (GH #908): the
 # animated glyph is replaced by a static "●", e.g. "● Leavening… (running
 # UserPromptSubmit hook)" or "● Sublimating… (12s · ↓ 300 tokens)". "●" is also
@@ -378,15 +498,31 @@ SEPARATOR_WALK_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·][^\n]*\u2026")
 # frame position cannot separate is a settled "●" status row directly above
 # the box with no summary painted; it reads PROCESSING, the #908 direction,
 # until a live capture of such a turn says otherwise.
+#
+# Two changes keep the scan linear (CWE-1333); the pattern matches exactly the
+# lines it did before, and every caller only asks whether it matches:
+# - The text before the "…" is skipped possessively, stopping at the first "…"
+#   that the status follows, instead of ``[^\n]*`` backtracking to every "…" on
+#   the line (and ``[ \t]+`` sharing its spaces with it).
+# - The hook gap stops where the next "… (running " starts. As ``[^)\n]*`` it ran
+#   on to the end of the line from every such fragment, so a line of them was
+#   quadratic. A hook word after a later fragment is still found, from that
+#   fragment.
+_REDUCED_MOTION_HOOK_GAP = r"(?:[^)\n…]|…(?![ \t]+\(running[ \t]))*"
 _REDUCED_MOTION_STATUS = (
-    r"(?:running[ \t][^)\n]*\bhooks?\b"
+    r"(?:running[ \t]" + _REDUCED_MOTION_HOOK_GAP + r"\bhooks?\b"
     r"|\d+(?:\.\d+)?[smhd]\b"
     r"|(?:[↓↑][ \t]*)?[\d.,]+[kmb]?[ \t]+tokens\b"
     r"|thinking\b|thought[ \t]+for\b"
     r"|esc[ \t]+to[ \t]+interrupt\b)"
 )
+_REDUCED_MOTION_AFTER_ELLIPSIS = r"[ \t]+\(" + _REDUCED_MOTION_STATUS
 REDUCED_MOTION_SPINNER_PATTERN = re.compile(
-    r"^[ \t]*●[ \t]+[^\n]*…[ \t]+\(" + _REDUCED_MOTION_STATUS, re.MULTILINE
+    r"^[ \t]*+●[ \t]++(?:[^\n…]++|…(?!"
+    + _REDUCED_MOTION_AFTER_ELLIPSIS
+    + r"))*+…"
+    + _REDUCED_MOTION_AFTER_ELLIPSIS,
+    re.MULTILINE,
 )
 
 
@@ -402,6 +538,15 @@ class ClaudeCodeProvider(BaseProvider):
     ) -> bool:
         return not (profile and profile.native_agent)
 
+    @classmethod
+    def honors_effort(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+    ) -> bool:
+        # The --agent branch drops claudeConfig, and with it --effort.
+        return not (profile and profile.native_agent)
+
     _TAIL_HASH_LINES = 30
 
     def __init__(
@@ -413,21 +558,38 @@ class ClaudeCodeProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
         resume_session_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        ephemeral: bool = False,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # An ephemeral helper's launch. Set by the provider manager from the
+        # launch's ephemeral binding, never from the profile: the launch also
+        # cuts tool_mapping.EPHEMERAL_ALWAYS_DISALLOWED.
+        self._ephemeral = ephemeral is True
         # When set, the launched claude process resumes this Claude Code
         # session id (--resume <sid>) instead of starting a fresh
         # conversation. Used to re-open a supervisor conversation inside a
         # new CAO session (durable-orchestra recovery).
         self._resume_session_id = resume_session_id
+        # Issue #1082 (provisional): a CAO-generated id for a FRESH launch
+        # (never set together with ``resume_session_id`` -- the caller only
+        # generates one when there is nothing to resume), passed as
+        # ``--session-id`` so a later usage adapter can join this terminal to
+        # the provider's own session log by id instead of working directory
+        # and start time.
+        self._session_id = session_id
         # Explicit per-call override for profile.model (see launch()'s own
         # --model resolution below) -- e.g. a handoff/assign caller pinning a
         # specific model for one worker without needing a dedicated profile.
         self._model = model
+        # A decided effort for this launch only (#1068 C, #1083): the launch plan's
+        # effort, applied in place of claudeConfig.effort. Never written to the profile.
+        self._effort = effort
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
@@ -546,6 +708,11 @@ class ClaudeCodeProvider(BaseProvider):
         # session id was validated at the API boundary.
         if self._resume_session_id:
             command_parts.extend(["--resume", self._resume_session_id])
+        elif self._session_id:
+            # Issue #1082 (provisional): only on a FRESH launch -- mutually
+            # exclusive with --resume, same as the two ids are mutually
+            # exclusive on self.
+            command_parts.extend(["--session-id", self._session_id])
 
         # Route based on profile state
         native = getattr(profile, "native_agent", None) if profile else None
@@ -570,6 +737,8 @@ class ClaudeCodeProvider(BaseProvider):
             command_parts.extend(["--agent", self._agent_profile])
             if self._model:
                 command_parts.extend(["--model", self._model])
+            if self._effort:
+                command_parts.extend(["--effort", str(self._effort)])
         elif profile is not None:
             # Full CAO profile with config decomposition. self._model is an
             # explicit per-call override (handoff/assign's own `model`
@@ -588,10 +757,16 @@ class ClaudeCodeProvider(BaseProvider):
             # depending on the machine-global effortLevel in
             # ~/.claude/settings.json.
             claude_config = getattr(profile, "claudeConfig", None)
+            # self._effort is a decided value for this launch only (#1068 C, #1083) and
+            # wins over the profile's static claudeConfig.effort, giving exactly one
+            # --effort; it is never written back into the profile.
+            profile_effort = (
+                claude_config.get("effort") if isinstance(claude_config, dict) else None
+            )
+            effort = self._effort or profile_effort
+            if effort:
+                command_parts.extend(["--effort", str(effort)])
             if isinstance(claude_config, dict):
-                effort = claude_config.get("effort")
-                if effort:
-                    command_parts.extend(["--effort", str(effort)])
                 fallback_model = claude_config.get("fallback_model")
                 if fallback_model:
                     command_parts.extend(["--fallback-model", str(fallback_model)])
@@ -657,12 +832,18 @@ class ClaudeCodeProvider(BaseProvider):
         # still prevents the agent from using the blocked tools entirely.
         # Treat a present-but-empty list as deny-all (same as Grok). A falsy
         # check used to skip the flags entirely for allowed_tools=[].
-        if self._allowed_tools is not None and "*" not in self._allowed_tools:
-            from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+        # The list also carries Claude Code's own agent-messaging and
+        # agent-spawning built-ins (tool_mapping.ALWAYS_DISALLOWED), which every
+        # restricted grant loses, the developer default included. An ephemeral
+        # helper also loses tool_mapping.EPHEMERAL_ALWAYS_DISALLOWED, whatever
+        # its grant; an installed launch's list is unchanged.
+        from cli_agent_orchestrator.utils.tool_mapping import get_launch_disallowed_tools
 
-            disallowed = get_disallowed_tools("claude_code", self._allowed_tools)
-            for tool in disallowed:
-                command_parts.extend(["--disallowedTools", tool])
+        disallowed = get_launch_disallowed_tools(
+            "claude_code", self._allowed_tools, ephemeral=self._ephemeral
+        )
+        for tool in disallowed:
+            command_parts.extend(["--disallowedTools", tool])
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters
@@ -1159,7 +1340,7 @@ class ClaudeCodeProvider(BaseProvider):
         if _sep_positions:
             _tail = output[_sep_positions[-1] :]
             _last_summary = None
-            for _m in re.finditer(GET_STATUS_COMPLETION_PATTERN, _tail):
+            for _m in _iter_spinner_matches(GET_STATUS_COMPLETION_PATTERN, _tail):
                 if "Waiting" in _m.group(0):
                     continue  # background-wait line, not a completion summary (GH #392)
                 _last_summary = _m
@@ -1190,8 +1371,8 @@ class ClaudeCodeProvider(BaseProvider):
 
         # Find the LAST occurrence of each marker for fallback position checks.
         last_processing = None
-        for m in re.finditer(PROCESSING_PATTERN, output):
-            last_processing = m
+        for spinner in _iter_spinner_matches(PROCESSING_PATTERN, output):
+            last_processing = spinner
 
         last_idle = None
         for m in re.finditer(IDLE_PROMPT_PATTERN, output):
@@ -1205,10 +1386,10 @@ class ClaudeCodeProvider(BaseProvider):
         # drops the ⏺ marker and shows this past-tense summary above the ❯ box
         # after a finished turn.
         last_completion = None
-        for m in re.finditer(GET_STATUS_COMPLETION_PATTERN, output):
-            if "Waiting" in m.group(0):
+        for summary in _iter_spinner_matches(GET_STATUS_COMPLETION_PATTERN, output):
+            if "Waiting" in summary.group(0):
                 continue  # background-wait line, not a completion summary (GH #392)
-            last_completion = m
+            last_completion = summary
 
         # FALLBACK PROCESSING: spinner visible AND no separator follows it yet
         if last_processing and not re.search(r"\u2500{20,}", output):
@@ -1288,9 +1469,9 @@ class ClaudeCodeProvider(BaseProvider):
         # Older builds (no box) fall through to the legacy ⏺-based logic unchanged.
         input_box = None
         if last_idle is not None:
-            for m in NEW_TUI_BOX_PATTERN.finditer(output):
-                if m.start() <= last_idle.start() < m.end():
-                    input_box = m
+            for box_start, box_end in _iter_new_tui_boxes(output):
+                if box_start <= last_idle.start() < box_end:
+                    input_box = (box_start, box_end)
         if input_box is not None:
             # Walk up from the box to the newest conversation row: footer chrome
             # ("⎿ Tip: …" hints and the rows they WRAP onto — PR #975 review,
@@ -1303,7 +1484,7 @@ class ClaudeCodeProvider(BaseProvider):
             # footer from false-matching COMPLETED via
             # EXTRACTION_RESPONSE_PATTERN). _newest_conversation_row is the one
             # definition of that row, shared with get_status_from_screen.
-            above_lines = output[: input_box.start()].rstrip("\n").split("\n")
+            above_lines = output[: input_box[0]].rstrip("\n").split("\n")
             newest_row = self._newest_conversation_row(above_lines)
             if newest_row is not None and (
                 NEW_TUI_BOX_SPINNER_PATTERN.search(newest_row)
@@ -1674,7 +1855,9 @@ class ClaudeCodeProvider(BaseProvider):
     _COMPOSER_RAIL_RE = re.compile(r"─{8,}")
     # The prompt row inside the box: the glyph, then a space / NBSP (the TUI
     # renders "❯\xa0"), then the first row of the text; or the bare glyph.
-    _COMPOSER_PROMPT_RE = re.compile(r"^[ \t]*[>❯](?:[ \t\xa0]+(.*)|[ \t\xa0]*)$")
+    # The indent before the text is possessive: ``.*`` would take any blanks it
+    # gave back, so splitting them differently can never change the match.
+    _COMPOSER_PROMPT_RE = re.compile(r"^[ \t]*[>❯](?:[ \t\xa0]++(.*)|[ \t\xa0]*)$")
     # Placeholder the empty box shows: ❯ Try "fix typecheck errors"
     _COMPOSER_PLACEHOLDER_RE = re.compile(r'^Try "[^"]*"$')
 

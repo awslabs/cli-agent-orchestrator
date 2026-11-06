@@ -34,8 +34,10 @@ see [Configuration](configuration.md) and [Security](../SECURITY.md).
 ### Events and AG-UI
 
 - `/events` and `/events/history` expose server events.
-- `/agui/v1/stream` and `/agui/v1/emit_ui` provide the AG-UI stream and
-  generative UI input.
+- `GET`/`POST /agui/v1/stream` serve the fleet as an AG-UI 1.0 run, and
+  `/agui/v1/emit_ui` takes generative UI input. `POST /agui/v1/run` is the run
+  plane for approval interrupts, and `GET /agui/v1/capabilities` returns its
+  AG-UI 1.0 `AgentCapabilities`.
 
 See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 
@@ -45,7 +47,8 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 - `POST /ephemeral-agents/{name}/claim?caller_id=<creator-terminal-id>` claims it under a lease,
   rechecks policy and finalizes the profile. Its body accepts optional `idempotency_key`,
   `claim_id` and `model`; per-call models refuse. It returns the claim, provider and stored tools,
-  or a matching launched terminal with `replayed: true`.
+  and `provider_auto` (whether the spec declared `provider: "auto"`), or a matching launched
+  terminal with `replayed: true`.
 - `POST /sessions/{session}/terminals` launches it with `agent_profile`, `caller_id`, `provider`
   and optional `claim_id` query parameters. Claims are 32 lowercase hexadecimal characters.
   `POST /sessions` has no caller or claim parameter and refuses a created, pending ephemeral
@@ -187,7 +190,11 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   sidecar's outcome on the response as `memory_manager`
   (`{"state": "scheduled" | "refused", "detail"}`); a primary whose ceiling does
   not cover the sidecar's `@cao-mcp-server, fs_read, fs_list` gets `refused` and
-  no sidecar. `POST /sessions` and `POST /terminals/run-step` accept
+  no sidecar. A create's response may carry `launch_notes`, a list of strings for
+  the operator; today only a Kiro v3 launch that the operator's
+  `kiro.v3_allow_unverified_versions` opt-in admitted on a kiro-cli version still
+  pending verification (provisional, #1167). It is never persisted and is `null`
+  otherwise. `POST /sessions` and `POST /terminals/run-step` accept
   `caller_ceiling` in the JSON body for a caller on another node (remote
   `assign`/`handoff`); it is rejected together with a local `caller_id`, it is
   required when the body's `env_vars` carry `CAO_CALLBACK_TERMINAL_ID` (the
@@ -383,6 +390,14 @@ The spec-route scope checks apply when authentication is enabled.
   assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
   run — not only a finished one. No run-level `output` field is returned (run-level output
   is not journaled); per-step outputs are on `steps[].output`.
+- `GET /workflows/runs/{run_id}/artifacts` lists the run's string inputs that name a report
+  file the web UI can show: `{run_id, artifacts: [{input, path, available, size}]}`.
+  `GET /workflows/runs/{run_id}/artifacts/{input_name}` returns that file as
+  `{run_id, input, path, size, content}`. The caller names an **input**, never a path:
+  the recorded value must resolve (symlinks followed) to a regular `.md` file directly in
+  the system temp dir and be at most 256 KiB. Unknown run 404; undeclared or non-string
+  input 400; a path outside that directory or not `.md` 403; no such file 404; too large
+  413 (refused, never truncated).
 - `POST /workflows/runs/{run_id}/cancel` cooperatively cancels a run;
   `POST /workflows/runs/{run_id}/resume` re-drives a crashed/failed one.
 - `POST /workflows/runs/{run_id}/steps/{step_id}:replay` re-executes **one** recorded step
@@ -461,6 +476,18 @@ Releasing workers and shutting the fleet down stay CLI actions (`cao worker rele
   "disabled" internally, and reporting that as 404 would tell the caller a
   configuration story about a filesystem fault. These are the routes the
   `report_outcome` / `list_outcomes` MCP tools call.
+  `POST /outcomes` also takes an optional `launch_terminal_id` (the MCP
+  tool's `terminal_id`), which links the outcome to that terminal's launch
+  record. The link is checked against the stored record before anything is
+  written: only a self-report (`source_terminal_id` equals
+  `launch_terminal_id`) or the launch's direct creator (the record's
+  `caller_id`) may link. The route answers **403** and writes nothing when
+  records exist for that id and none is bound to the reporter, or when
+  `launch_terminal_id` comes without a `source_terminal_id`. When
+  `launch_terminal_id` is sent, the response carries `launch_linked`: `true`
+  if the outcome was joined to a launch record, and `false` if it was written
+  without a link (no record for the id, a self-report on a launch that has
+  already ended, or a link that could not be read or written).
 - `/internal/memory/*` serves the memory tools on a node that does not own the
   database (`CAO_MEMORY_API_URL`). Its `key` is validated leniently and then
   normalised, matching what the tools have always done in-process — the strict

@@ -34,6 +34,15 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
 
+# herdr's four resolvable agent states. Shared by ``get_native_status`` (a
+# poll) and ``HerdrInboxService`` (the event stream) so both read one mapping.
+HERDR_AGENT_STATUS_TO_TERMINAL_STATUS: Dict[str, TerminalStatus] = {
+    "working": TerminalStatus.PROCESSING,
+    "blocked": TerminalStatus.WAITING_USER_ANSWER,
+    "done": TerminalStatus.COMPLETED,
+    "idle": TerminalStatus.IDLE,
+}
+
 # Herdr CLI subcommands that _run_herdr is allowed to invoke.
 _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
     {
@@ -68,6 +77,11 @@ _HERDR_ALLOWED_FLAGS = frozenset(
         "--workspace",
     }
 )
+
+
+def herdr_arg_is_safe(value: str) -> bool:
+    """True when ``value`` passes the herdr argument sanitizer (``_SAFE_ARG_RE``)."""
+    return _SAFE_ARG_RE.fullmatch(value) is not None
 
 
 def _sanitize_herdr_args(args: List[str]) -> List[str]:
@@ -345,6 +359,18 @@ class HerdrBackend(TerminalBackend):
 
         logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
         return window_name
+
+    def restore_session_env(self, session_name: str, key: str, launch_value: str) -> None:
+        """Nothing to restore: herdr's ``--env`` reaches only the pane it launches.
+
+        Measured on herdr 0.9.3 (#1074, provisional): a workspace created with
+        ``--env KEY=…`` gives ``KEY`` to its root pane only. Later tabs, with or
+        without an ``--env`` of their own, and a split of that root pane start
+        without it. herdr keeps no workspace environment, so a later tab gets
+        exactly what it would have had without ``launch_value``: its own
+        ``--env`` (``_build_env_args``) over the herdr server's environment.
+        """
+        logger.debug(f"restore_session_env({key}) is a no-op for herdr (session={session_name})")
 
     def session_exists(self, session_name: str) -> bool:
         """Check if a workspace with the given label exists."""
@@ -904,16 +930,11 @@ class HerdrBackend(TerminalBackend):
         except (json.JSONDecodeError, AttributeError):
             return None
 
-        if agent_status == "working":
-            return TerminalStatus.PROCESSING
-        if agent_status == "blocked":
-            return TerminalStatus.WAITING_USER_ANSWER
-        if agent_status == "done":
-            return TerminalStatus.COMPLETED
-        if agent_status == "idle":
-            return TerminalStatus.IDLE
-        # "unknown" and any unrecognized value: unresolvable at backend level.
-        return None
+        # "unknown" and any unrecognized (or non-string) value: unresolvable at
+        # backend level.
+        if not isinstance(agent_status, str):
+            return None
+        return HERDR_AGENT_STATUS_TO_TERMINAL_STATUS.get(agent_status)
 
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve CAO terminal_id to herdr pane_id.

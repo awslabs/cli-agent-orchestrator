@@ -34,6 +34,7 @@ from cli_agent_orchestrator.utils.init_allowance import (
     init_allowance,
     synchronous_create_timeout,
 )
+from cli_agent_orchestrator.utils.orchestration import _extract_error_detail
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
     sync_backend_from_server,
@@ -164,9 +165,9 @@ def _parse_env_pairs(pairs):
 @click.option(
     "--engine",
     "engine",
-    type=click.Choice(["v2", "kas"], case_sensitive=True),
+    type=click.Choice(["v2", "v3", "kas"], case_sensitive=True),
     default=None,
-    help="Explicit Kiro engine (default: profile engine or v2).",
+    help="Explicit Kiro engine (default: profile engine or v2; 'kas' is an alias of 'v3').",
 )
 @click.option(
     "--allowed-tools",
@@ -511,7 +512,16 @@ def launch(
             post_kwargs["json"] = body
 
         response = api_http.post(url, **post_kwargs)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except api_http.exceptions.HTTPError as exc:
+            # The server answered, so this is a refusal and not a connection
+            # failure: show its reason (a 400's ``detail``, e.g. an unavailable
+            # Kiro engine) instead of the generic "Failed to connect" arm below.
+            detail = _extract_error_detail(response, str(exc))
+            raise click.ClickException(
+                f"cao-server refused the launch ({response.status_code}): {detail}"
+            ) from exc
 
         terminal = response.json()
 
@@ -534,6 +544,15 @@ def launch(
                     fg="yellow",
                 )
             )
+
+        # Launch notes (#1167, provisional): today only a Kiro v3 launch that the
+        # operator's kiro.v3_allow_unverified_versions opt-in admitted on a
+        # kiro-cli version still pending verification. Said where the operator is.
+        notes = terminal.get("launch_notes") if isinstance(terminal, dict) else None
+        if isinstance(notes, list):
+            for note in notes:
+                if isinstance(note, str) and note:
+                    click.echo(click.style(f"  WARNING: {note}", fg="yellow"))
 
         # Attach to tmux session unless headless. Wait for the provider to
         # finish initializing first — otherwise tmux attach races with the

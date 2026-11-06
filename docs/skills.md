@@ -26,6 +26,8 @@ python-testing/
 └── SKILL.md
 ```
 
+A skill may also carry a `references/` folder of Markdown pages that `SKILL.md` links to, for detail the agent reads only when it needs it. `cao-provider`, `cao-plugin` and `cao-contributing` are built-in skills that do this. `cao skills add` copies the whole folder, so these pages install with the skill.
+
 `SKILL.md` has two required frontmatter fields — `name` and `description` — followed by the skill content in Markdown:
 
 ```markdown
@@ -98,6 +100,8 @@ CAO ships with built-in skills including:
 | `cao-agent-routing` | Finds the best installed profile for specialist work before delegation |
 | `cao-supervisor-protocols` | Multi-agent orchestration patterns for supervisors: `assign`, `handoff`, idle-based message delivery |
 | `cao-worker-protocols` | Worker-side callback and completion rules for assigned and handed-off tasks |
+| `cao-agent-plugin-creator` | Authors a new Agent Plugins 1.0.0 package from an empty directory: the `plugin.json` manifest, `skills/`, and an optional `mcp.json` |
+| `cao-agent-plugin-audit` | Audits an existing Agent Plugins 1.0.0 package against the vendored schemas and the Agent Skills limits that `cao plugin validate` does not check, using a bundled validator that needs no CAO install |
 
 ## Extra Skill Directories
 

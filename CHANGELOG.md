@@ -14,6 +14,167 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an extraction error. **Behaviour change:** synchronous `cao session send` exits 1
   when fetching the answer fails, instead of silently exiting 0. Ctrl-C still exits 130.
 
+- **Breaking: `GET /agui/v1/stream` is now an AG-UI 1.0 conformant run by default, and
+  `POST /agui/v1/stream` is added** (#1193). Each connection is one run: `RUN_STARTED` first,
+  `data:`-only frames with `type` in the JSON (no `event:` lines), schema field names, integer
+  epoch-millisecond timestamps, and a `RUN_FINISHED` `{type: "cancelled"}` close (with
+  `metadata.cao.endReason` `max_seconds`, `server_stop` or `source_ended`) or a `RUN_ERROR` close
+  (`cao.stream_overflow`, `cao.stream_error`). Sessions and terminals are `SUBAGENT_*` invocations
+  (`terminal:<id>`, and `session:` plus a hash of the session incarnation); handoff, assign and
+  `a2a_delegation` are attributed `TOOL_CALL_START`/`END` pairs with no `TOOL_CALL_RESULT`;
+  `send_message` is `CUSTOM` `cao.message_dispatched`; an error with a terminal is
+  `SUBAGENT_ERROR`, one without is `CUSTOM` `cao.error`; a killed terminal or session is
+  `SUBAGENT_FINISHED` with `metadata.cao.endReason: "killed"`. The CAO envelope moves under
+  `metadata.cao`. The POST takes a `RunAgentInput`, echoes `threadId`/`runId`, refuses another
+  protocol major and a non-empty `resume` with `400`, and reads `forwardedProps.cao.since` and
+  `maxSeconds`; the GET takes `threadId` and `maxSeconds`. `?framing=cao-legacy` keeps the old
+  wire byte-for-byte, with `Deprecation` and `Link` headers; `AguiStreamReader` now requests it.
+  A client that listened for named events must switch to `onmessage` and read `type`; the in-tree
+  consumers (the EventSource viewer, the CAO Dojo page and its e2e driver, `showcase.sh` and
+  `record-demo.mjs`) are updated. On SIGINT/SIGTERM `cao-server` now closes open streams with
+  their cancelled close before it waits on connections. A `Last-Event-ID` that names a frame
+  synthesized before its record's own frame replays that record whole instead of the whole
+  buffer. `verify-ambient.mjs` checks the stream with the pinned `@ag-ui/client` `verifyEvents`
+  in the AC3 CI job. Event-log records for a session now carry
+  `detail.session_subagent_run_id` (the hashed session id, never the raw incarnation id), so a
+  replay keeps each record's incarnation; the AG-UI mappings drop it, and it is visible on the
+  MCP Apps `/events` stream as an added key.
+- **Run-plane interrupts name the terminal subagent that raised them** (#1193). Each `Interrupt` in
+  `RUN_FINISHED`'s interrupt outcome carries `subagentRunId: "terminal:<id>"`, the id the ambient
+  stream gives that terminal; it is omitted, never null, when an interrupt has no terminal.
+- **The CAO Dojo page follows the AG-UI 1.0 consumer rules.** Every `RunAgentInput` it sends
+  declares `protocolVersion: "1.0"`. Its resume list covers every interrupt of the run it continues:
+  when that run listed several approvals, a decided card is held until each has an answer, and then
+  one resume answers them all, on that run's `threadId`. A run that only collects starts a fresh
+  thread, so it never continues past an interrupt it does not answer. The page never abandons a
+  prompt on the operator's behalf, because on CAO an abandoned (`cancelled`) entry is a deny.
+- **The run plane passes `Interrupt.expiresAt` through when set.** The AG-UI 1.0 field mirrors
+  CAO's `Interrupt.expires_at` and is omitted when that is unset. Nothing in CAO sets it today: an
+  interrupt expires when its terminal leaves the waiting state, with no deadline known in advance, so
+  the key is absent on every current provider. Anything that sets it must use ISO 8601, the schema's
+  documented convention.
+- **Run-plane events carry only the fields the AG-UI 1.0 schema defines.** `POST /agui/v1/run` no
+  longer puts `threadId`/`runId` on `STATE_SNAPSHOT`, `STATE_DELTA`, `STEP_*`, `TOOL_CALL_*`,
+  `CUSTOM` and `RUN_ERROR`; only `RUN_STARTED` and `RUN_FINISHED` carry them, as the schema says. The
+  undescribed `stepId` on `STEP_STARTED`/`STEP_FINISHED` is gone too: the terminal id now travels as
+  `metadata.cao.terminalId` (one nested `cao` object, the shape the ambient stream uses). A client that read `threadId` or `runId` from those events should take
+  them from the enclosing `RUN_STARTED`.
+- **`GET /agui/v1/capabilities` declares the run plane's AG-UI 1.0 capabilities (#1192).** The body
+  is one `AgentCapabilities` object in the 1.0 schema shape: identity, `transport.streaming`,
+  `tools.clientProvided: false`, `state.snapshots`, and `humanInTheLoop` with `approvals` and
+  `interrupts`. `approveWithEdits` is omitted, because each interrupt's `responseSchema` says whether
+  edit is accepted, and `transport.resumable` is never declared. The route sits behind
+  `CAO_AGUI_ENABLED` at the `cao:read` floor, like `POST /agui/v1/run`.
+- **The ambient AG-UI stream sends generative UI as `CUSTOM` `cao.generative_ui`, not
+  `GENERATIVE_UI`.** AG-UI 1.0 has no `GENERATIVE_UI` event type, and its processing rules say a
+  producer "MUST NOT emit an event type the protocol does not describe" (`CUSTOM` and `RAW` exist
+  for that). `GET /agui/v1/stream` with `?framing=cao-legacy` (the pre-1.0 wire; see the AG-UI 1.0
+  entry above for the default) now sends an allow-listed `emit_ui` component as `event: CUSTOM`
+  with a spec `CustomEvent` body, `{"type": "CUSTOM", "name": "cao.generative_ui", "value":
+  {component, props, event_id, terminal_id, session_name, timestamp, traceparent}}`, the same name
+  and value the run plane already used. There is no compatibility flag. A client that listened for
+  `GENERATIVE_UI` must listen for `CUSTOM` and read `value` when `name` is `cao.generative_ui`; the
+  in-tree consumers (the EventSource viewer, the CAO Dojo page and its e2e driver, and the dashboard
+  `showcase.sh` gate) are updated. Off-list components are still refused as `RAW` with
+  `rejected_component`. `docs/agui.md` no longer claims that any AG-UI client renders these frames.
+- **The `[agui]` extra now needs `ag-ui-protocol>=1.0.0`** (was `>=0.1.19`), because the run plane
+  declares `protocolVersion` on `RUN_STARTED` from the SDK's 1.0 constant. An install that pins an
+  older SDK now gets a resolver conflict, or HTTP 501 from `POST /agui/v1/run`.
+- **A `resume[]` entry for an unknown interrupt id now ends `RUN_FINISHED` instead of `RUN_ERROR`.**
+  As AG-UI 1.0 asks, the run proceeds without the entry and CAO logs a server-side warning; an answer
+  to an expired interrupt is skipped the same way. A client that used `RUN_ERROR` to detect a bad id
+  no longer gets one; it reads `RUN_FINISHED.result.skippedResume` instead, which lists each skipped
+  entry as `{interruptId, reason}` with `reason` `unknown` (also used for an evicted id) or
+  `expired`. The key is absent when nothing was skipped.
+- **`agui_stream.AGUI_GENERATIVE_UI` is removed from `__all__`**, and the constant itself is gone,
+  because the `GENERATIVE_UI` event type it named is no longer sent. Use `AGUI_CUSTOM` and
+  `CAO_GENERATIVE_UI_EVENT_NAME`.
+- **Fix: a Kiro v3 launch no longer refuses every time while `cao-mcp-server` is still
+  connecting** (#1167, #1218). Kiro v3's `/mcp` panel is a snapshot taken when it opens, so
+  reading an already-open panel again could never show a server that connects after that. CAO
+  now closes and reopens `/mcp` while a server is still loading, until every server is running or
+  `provider_init_timeout` has passed since the first open.
+
+- **Kiro ephemeral helpers on v3** (#1167 Phase 2, #1074 phase 5; preview, pending the operator
+  checklist). `kiro_cli` can now be listed in `ephemeral.allowed_providers` (an operator opt-in; the
+  default stays `claude_code`), and a create reports `enforcement: "hard"`. A Kiro helper is not yet
+  a `provider.route` target: a set naming `kiro_cli` refuses with
+  `policy_config_error:provider_route`. Helpers run on the v3
+  engine only (`engine=v2` refuses), each from its own CAO-owned `KIRO_HOME` under
+  `$CAO_HOME_DIR/ephemeral/kiro/<terminal_id>/`, created after the bind and before the window. The
+  agent file is the same universal file `cao install --engine v3` writes, for the helper's tools plus
+  `@cao-mcp-server`, with a tool-less universal `cao-null` default; both pass CAO's v3 validator and
+  are sealed read-only. CAO never changes `~/.kiro`: it only checks whether Kiro's two legacy-copy
+  sources and their markers exist. An unlistable empty `powers/` placeholder stops Kiro's powers copy,
+  and a helper is refused when Kiro would copy an unmigrated secret store. After the header, a changed
+  placeholder or a new marker refuses before any task, and so does a workspace check that now also
+  refuses the home folder itself. `/tools` and `/mcp list` are held to the helper's own file. The
+  command assigns `KIRO_HOME` and runs one absolute kiro-cli, the one the probe ran. Release stops
+  every process whose `KIRO_HOME` is the home, records what changed, and removes the home. When a
+  process cannot be proven gone, the home stays and the operator retries the delete; the sweep
+  removes it only once the terminal row is gone. Installed Kiro launches are unchanged.
+
+- **Kiro helpers: `effort: "auto"` is decided at launch** (#1167, #1083). A Kiro helper with
+  `effort: "auto"` now asks `effort.route`, as Claude Code and Codex do, and the decided level
+  reaches kiro-cli as `--effort` for that launch only. An unusable answer runs the stored effort,
+  and the decision record names the reason. kiro-cli checks the decided level against the model, as it
+  does a stored effort, and a launch it refuses is not retried on the stored effort, so keep
+  `min_effort` and `max_effort` to levels your Kiro models accept. Installed Kiro agents are unchanged.
+
+- **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
+  API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one
+  universal agent file with v3 tool exclusions and deny rules. A v3 launch is refused before
+  anything is allocated unless the kiro-cli version is supported, the agent file on disk is CAO's
+  own render for its grant, `KIRO_HOME` is the default, `CAO_AGENTS_DIR` (if set) is
+  `~/.kiro/agents`, and the workspace's `.kiro/` holds no configuration; after the header, CAO
+  reads `/mcp` until no server is loading, then `/tools`, before any task. **Not yet a
+  supported configuration:** v3 support is claimed only once the live operator checklist has passed.
+  A kiro-cli version still pending operator verification (2.36.0, 2.37.0, 3.0.0; each ships the
+  same v3 engine, `@kiro/agent` 0.66.70, as 2.35.1) refuses unless the operator sets
+  `kiro.v3_allow_unverified_versions: true` (provisional, for running the checklist on it); such a
+  launch logs a warning and its response carries `launch_notes`.
+  Also: `cao launch` now shows the server's refusal reason instead of "Failed to connect", and the
+  memory wiki compiler's Kiro call pins `--agent-engine v2`.
+
+- **Kiro v3 reads a `/tools` list longer than the pane** (#1167). Kiro shows as many rows as fit,
+  the pane's height minus nine (at least five), with `↓ more` below them. A helper with `fs_read`
+  and `@cao-mcp-server` already has 36 tags, so on a pane under 45 rows tall every v3 launch of it
+  was refused with `kiro_v3_tools_mismatch: unrecognized row '↓ more'`. CAO now presses Down, the
+  only key it sends into the panel, once per screen. Each new screen must be the last one moved by
+  exactly one row, and the joined rows must hold every row the title declares, each once, before
+  the grant check. Kiro draws a scrolling panel taller than the pane, so its title sits in the
+  pane's scrollback: every `/tools` read is now the pane plus its recent scrollback (on tmux the
+  pane and 100 lines above it, on herdr the last 100 lines). The read must hold exactly one
+  `/tools` title, with nothing but blank rows below the panel. Nothing is loosened: a skipped,
+  changed or hidden row, a duplicate, a wrong count, a second title, text below the panel or a
+  dialog refuses (no key is ever sent into a dialog). After Escape, CAO now checks on the pane that
+  the empty prompt is back, as after `/mcp`. The read is bounded by `provider_init_timeout`, which
+  it shares with the final prompt wait, so a successful v3 init stays within about 4T+19.5s of
+  waits, plus about 60 backend calls (`utils/init_allowance.py`). Each call is several tmux or herdr
+  processes, about 0.1s idle (estimated) and 0.2s under load (measured), so the proof prices them
+  at 0.25s: the client's
+  wait covers a worst-case successful v3 start only up to a `provider_init_timeout` of about 90s,
+  and above that, on a heavily loaded machine, `cao launch` can report a failure while the server
+  goes on to start the agent (a documented gap; the default 60s has about two minutes spare). A
+  scrolling panel refuses in a herdr
+  pane over about 97 rows, and in a pane under 12 rows: Kiro keeps the old rows above the pane by
+  default, so after one Down the read no longer follows the last screen. The
+  layout, scroll rows and keys are taken from kiro-cli 3.0.0's bundled terminal UI, the same as
+  2.37.0's, and no scrolled panel has been read end to end live yet. See "How CAO reads a long
+  tool list" in `docs/kiro-cli.md`.
+
+- **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3
+  `Default` fallback** (#1167). A Kiro header with extra columns between the model and the context
+  gauge, such as `<agent> · claude-haiku-5.5 · low · ◔ 2%` on the v2 engine with `--effort`, or
+  `<agent> · <model> · thinking · low · ◔ 1%` on v3 with a pinned thinking model, used to read as no
+  header, so the launch was refused as `header_not_found`. Up to three short extra columns are now
+  read. The v3 engine's fallback agent, `Default` (`default` in its notice), has read, write, shell
+  and web tools; a header naming it, or an explicit request for it, is refused like `kiro_default`.
+  A launch is also refused, before any task is typed, when the screen shows kiro-cli's notice that
+  it did not load the requested agent (`agent "<name>" not found, using "kiro_default"` on v2,
+  `… using "default"` and its variants on v3), even under a header that names that agent; a notice
+  naming another agent leaves the header to decide. Elided and wrapped names still refuse. See
+  `docs/kiro-cli.md`, troubleshooting item 7.
 - **Kiro launches refuse an agent that kiro-cli would not run** (#1074). kiro-cli does not fail on
   an unknown `--agent`. It prints `agent "<name>" not found, using "kiro_default"` and starts its
   built-in default agent, which has every built-in tool, so launching a profile that was not
@@ -230,7 +391,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Ephemeral agents accept `model_tier: "auto"` (#1068). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `model.route` for that name only; explicit and omitted tiers never ask. Off and shadow launch on `ephemeral.default_tier`; on applies a confident answer capped into `[min_tier, max_tier]`, and falls back on any unusable answer. `auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier` (`auto_requires_bounds`) and a `claim_lease_seconds` of at least `decisions.on_timeout_ms / 1000 + 30`. The ephemeral archive records the decision record ids. `effort: "auto"` still refuses.
+- Ephemeral agents accept `provider: "auto"` (#1099, provisional). Create resolves it to the creator's provider, the fallback that the response, the registry row, the live profile and the archive keep. At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `provider.route` first, within the options CAO computes from the fallback's `ephemeral.provider_route` set, then ask the other `auto` fields for the provider it chose. On, a confident answer among the options runs the launch on that provider through its launch plan only: its own tier table maps the model and the plan carries the effort; nothing shared names it, and the decision record, the terminal, the archive's `bound` event and the launch record name the provider that ran. A pre-bind recheck refuses a decided provider the policy no longer allows with `policy_changed_since_create:<rule>`, including the new `provider_not_equivalent`, and collects the name; no other provider is ever tried, and a launch that fails before the bind for any other reason (the node cap, the delegation ceiling, the owner's own 400, a lapsed lease, a crash) leaves the name pending with its stored values. `claim_lease_seconds` counts one more wait. The claim response gains `provider_auto`, and for an `auto` claim the MCP helpers shape text the same way whichever CLI runs: the default `handoff` always adds the `[CAO Handoff]` banner, `assign` drops the sender suffix from an `@`-leading task, and the `handoff` success message names no provider. With today's providers nothing is routed, since no set validates.
+
+- Ephemeral settings accept `ephemeral.provider_route.equivalent` (#1099, provisional): disjoint sets of providers a decider may choose between for a `provider: "auto"` spec, empty by default. A set names two or more supported providers that `provider.route` can route to (not `kiro_cli` yet) and never mixes an `advisory` provider with a `hard` or `sandboxed` one; any other block, including an unknown key inside it, refuses every create and claim with `policy_config_error:provider_route`. With today's providers no set validates. The create response's `enforcement` now comes from one label helper that the validation reads too.
+
+- Decision points gain `provider.route`, "Which CLI should run this task?" (#1099). It is off by default. CAO computes its options for each launch and sends them as `DecisionRequest.options`, which is null on every other point's request; `CONTRACT_VERSION` is unchanged, but a decider that sends the whole request now sends one more `"options": null` key. An answer outside the options falls back as `invalid_answer`, and a launch with one option asks nothing and records the new reason `single_option`. The fallback source `creator` names the creator's provider. Records gain three nullable columns, `options`, `fallback_enforcement` and `applied_enforcement`, written only on `provider.route` records; the upgrade adds them without a backfill. The launch plan carries a decided provider that differs from the fallback. A decider that declares every point is asked `provider.route` once it is on.
+
+- Ephemeral agents accept `effort: "auto"` (#1083). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `effort.route` for that name only; explicit and omitted efforts never ask. Off and shadow launch on `ephemeral.default_effort`; on passes a confident answer, capped into `[min_effort, max_effort]`, to the provider for that launch only, as for the decided model, and falls back on any unusable answer; the live profile keeps the stored effort. `auto` needs both `ephemeral.min_effort` and `ephemeral.max_effort` (`auto_requires_bounds`). With both fields `auto`, `model.route` and `effort.route` are asked in turn, and `claim_lease_seconds` must be at least `2 * decisions.on_timeout_ms / 1000 + 30`. The `auto_requires_decision_platform` refusal is retired.
+
+- Ephemeral agents accept an optional `ephemeral.min_effort` floor (#1083). An explicit effort below it refuses with `effort_below_policy`, and a stored effort or provider default below a floor raised since create refuses at claim with `policy_changed_since_create:effort_below_policy`.
+
+- Decision policy bounds take an optional effort floor (#1083, #810): an explicit effort below it is refused as `below_floor`, and a decider answer below it is capped up to it. The launch plan carries an on-mode `effort.route` answer, applied or capped. Providers declare `honors_effort`; only Claude Code (outside a native agent), Codex and Kiro helpers do, and `effort.route` is recorded as `not_honored`, without asking, for any other provider.
+
+- Ephemeral agents accept `model_tier: "auto"` (#1068). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `model.route` for that name only; explicit and omitted tiers never ask. Off and shadow launch on `ephemeral.default_tier`; on applies a confident answer capped into `[min_tier, max_tier]`, and falls back on any unusable answer. `auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier` (`auto_requires_bounds`) and a `claim_lease_seconds` of at least `decisions.on_timeout_ms / 1000 + 30`. The ephemeral archive records the decision record ids.
 
 - Decision policy bounds take an optional model tier floor (#1068, #810): an explicit tier below it is refused as `below_floor`, a decider answer below it is capped up to it, and mappings are required from the floor to the ceiling. A delegation to an ephemeral target can carry the creator's description, redacted, in `profile_description`.
 
@@ -242,6 +415,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim.
 
+- `POST /sessions` and `POST /sessions/{session_name}/terminals` accept
+  `lookup_only=true` with an `idempotency_key`: the request returns the terminal
+  that key already committed, without waiting for it to initialize and without
+  creating anything (404 when nothing is committed, 400 without a key) (#773).
 - `examples/decision-model-host`: hosts the open-weight JevK5-4B decision model behind
   a loopback-only `/v1/systemone` API. Locally, it uses llama.cpp, with Metal or the CPU.
   On AWS, a CDK stack creates a single GPU instance with no IAM resources. Its services
@@ -255,6 +432,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
   run-step transport does not yet receive that credential; subprocess credential delivery
   remains a separate security-boundary decision.
+- Launch records (#1082): CAO writes one content-free record per terminal launch to a new
+  `launch_records` table (labels, timings, ids and the reported outcome, never prompts or output)
+  and keeps it after teardown, with the reason the launch ended. `launch_status_events` records
+  status changes for a provisional busy-time figure. `report_outcome` takes an optional
+  `terminal_id` and returns `launch_linked`, and `POST /outcomes` takes `launch_terminal_id`: only a
+  self-report or the launch's direct creator may link, and the route answers `403`, writing
+  nothing, when records exist for that id and none is bound to the reporter. **Behaviour change:**
+  a fresh Claude Code launch now always gets a CAO-generated `--session-id` (never together with
+  `--resume`), so a Claude Code CLI too old to know the flag fails every fresh launch.
 
 ### Changed
 
@@ -341,7 +527,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained. There is no background sweep, so keep the feature disabled outside testing.
   The live files and archive can be deleted by exact path while no ephemeral
   terminal exists. Reserved names also refuse remote placement with
-  `remote_placement_not_allowed`. `effort: "auto"` still requires the decision platform.
+  `remote_placement_not_allowed`.
 - Advanced CodeQL analysis for same-repository and fork pull requests, with
   Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
   weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
@@ -475,6 +661,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test enumerates every create call site and fails on one that neither defers init nor derives
   its budget. `GET /health` now reports the server's `provider_init_timeout` so an operator can
   check that a client on another host sees the same value (#710).
+- `cao agent handoff` no longer loses the worker when provider startup
+  outlasts the client's create timeout. The create is retried under one
+  idempotency key with the full timeout each time (sized per profile by #710),
+  and cao-server holds a replay until the original initialization finishes, so
+  input is sent only to a ready worker. If startup outlasts every attempt, the
+  handoff fails but reports the worker's terminal ID and sends it no input; if
+  the original startup failed, that cause is reported and no second worker is
+  started. A keyed replay of a create whose initialization failed answers 424
+  with the cause, and a keyed replay no longer publishes `post_create_session`
+  again (#773).
 - Inbox delivery no longer types a queued message into an open user-answer dialog (#896). With
   `CAO_EAGER_INBOX_DELIVERY=true`, a message for a Claude Code terminal sitting in
   WAITING_USER_ANSWER was pasted into the AskUserQuestion dialog, marked DELIVERED, and the

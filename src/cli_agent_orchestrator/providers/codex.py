@@ -67,7 +67,34 @@ MCP_TOOL_CALL_PATTERN = r"^[^\S\n]*•\s+Called\s+[\w-]+\.[\w-]+\("
 USER_PREFIX_PATTERN = r"^(?:You\b|[›»][^\S\n]*\S)"
 # Strict idle prompt pattern for extraction: matches empty prompt lines only.
 # Distinguishes "› " (idle) from "› user message" (user input with text).
-IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|»|codex>)\s*$"
+#
+# The indent is horizontal whitespace only (``[^\S\n]*+``, possessive). It was
+# ``^\s*``: searched over a whole response with re.MULTILINE, every line start
+# in a run of blank lines began an attempt whose ``\s*`` re-scanned the rest of
+# the run -- quadratic in the run's length (CWE-1333). On a single line (the
+# re.match callers) the two forms are identical. A MULTILINE search now starts
+# at the prompt's own line rather than at the first blank line above it; use
+# _strict_idle_prompt_start for the old start offset.
+IDLE_PROMPT_STRICT_PATTERN = r"^[^\S\n]*+(?:❯|›|»|codex>)\s*$"
+_IDLE_PROMPT_STRICT_RE = re.compile(IDLE_PROMPT_STRICT_PATTERN, re.MULTILINE)
+
+
+def _strict_idle_prompt_start(text: str) -> Optional[int]:
+    """Where ``re.search(r"^\\s*(?:❯|›|»|codex>)\\s*$", text, re.MULTILINE)`` matched.
+
+    The old pattern's ``\\s*`` let a match start at the first line of the blank
+    run above the prompt. Find the prompt line with the linear pattern, then walk
+    back over that run once: the old match started at the first line start after
+    the last non-whitespace character before the prompt (or at 0).
+    """
+    match = _IDLE_PROMPT_STRICT_RE.search(text)
+    if match is None:
+        return None
+    content_end = len(text[: match.start()].rstrip())
+    if content_end == 0:
+        return 0
+    return text.index("\n", content_end) + 1
+
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
@@ -111,7 +138,16 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d{1,3}%\s+left|·\s+[
 # between the bullet and the following text either way. [^\n]* already
 # tolerates zero-or-more characters before the "(", so the only gap was the
 # glyph itself.
-TUI_PROGRESS_PATTERN = r"[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
+#
+# Anchored at the line start, skipping possessively to the line's FIRST glyph:
+# unanchored, the search restarted at every "•"/"◦" on a line and re-scanned the
+# rest of it for the "(… esc to interrupt)" status, quadratic in the line's
+# length (CWE-1333). A status after any later glyph is also after the first, so
+# the pattern matches exactly the text it matched before; every caller only
+# asks whether it matches.
+TUI_PROGRESS_PATTERN = (
+    r"(?m)^[^•◦\n]*+[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
+)
 
 # Codex 0.155 and later end each successful turn with a dim completion footer
 # below the final message: the time at which the turn ended, after "Worked for
@@ -131,9 +167,13 @@ _FOOTER_CLOCK = (
 )
 # The time is never left out: for a live turn without a saved time, Codex uses
 # the current time. So "Worked for 2s" with no time is reply text, not a footer.
+#
+# ``[^\n]*+`` after the date is possessive: the trailing ``[^\S\n]*$`` would
+# only re-take blanks it gave back, so splitting them differently can never
+# change the match.
 COMPLETION_FOOTER_PATTERN = (
     rf"^[^\S\n]*(?:Worked for {_FOOTER_DURATION}[^\S\n]*[•·][^\S\n]*)?{_FOOTER_CLOCK}"
-    rf"(?:[^\S\n]*[•·][^\n]*)?[^\S\n]*$"
+    rf"(?:[^\S\n]*[•·][^\n]*+)?[^\S\n]*$"
 )
 # The first release that draws the completion footer.
 COMPLETION_FOOTER_MIN_VERSION = (0, 155, 0)
@@ -164,6 +204,7 @@ TURN_ACTIVITY_PATTERN = r"^[^\S\n]*[•◦└■]"
 # interpolates absolute CODEX_HOME paths into it. Verified against codex-cli
 # 0.162.1 and 0.163.0.
 CONFIG_PROFILE_ERROR_PATTERN = r"cannot be used while.*contains legacy"
+_CONFIG_PROFILE_ERROR_LEAD = "cannot be used while"
 # The same phrase with every space removed, matched against text that has had
 # ALL its whitespace removed. tmux wraps codex's one-line message at the exact
 # pane column, inside words when that is where the column falls ("co" /
@@ -171,7 +212,18 @@ CONFIG_PROFILE_ERROR_PATTERN = r"cannot be used while.*contains legacy"
 # cannot know whether a wrap fell inside a word or on a space tmux then
 # trimmed. Comparing with no whitespace on either side makes detection
 # independent of the pane width.
-_CONFIG_PROFILE_ERROR_COMPACT = re.compile(CONFIG_PROFILE_ERROR_PATTERN.replace(" ", ""))
+#
+# Each attempt starts at a line start and skips to the line's FIRST occurrence of
+# the lead phrase: unanchored, the search restarted at every occurrence and
+# re-scanned the rest of the line for the second phrase (CWE-1333). A second
+# phrase after any later lead is also after the first, so it matches exactly
+# where it did; its caller only asks whether it matches.
+_CONFIG_PROFILE_ERROR_COMPACT = re.compile(
+    r"(?m)^(?:(?!"
+    + re.escape(_CONFIG_PROFILE_ERROR_LEAD.replace(" ", ""))
+    + r").)*+"
+    + CONFIG_PROFILE_ERROR_PATTERN.replace(" ", "")
+)
 # How many pane rows a rejection that still carries the pane's soft wraps may
 # span. Observed at 5 rows on an 80-column pane with a short CODEX_HOME. A
 # capture taken with get_history(join_wrapped=True) holds the message as ONE
@@ -250,7 +302,12 @@ STARTUP_PROMPT_BOTTOM_LINES = 15
 # 6 reads 0.5s apart give a redraw ~3s to complete -- generous for a TUI
 # write, and small next to provider_init_timeout.
 POST_READINESS_TRANSITIONAL_REREADS = 6
-STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+# The indent is horizontal whitespace only (possessive): with ``^\s*`` a
+# MULTILINE search began an attempt at every line of a blank run and re-scanned
+# the rest of the run from each (CWE-1333). Callers only ask whether it matches,
+# and a bullet the old ``\s*`` reached from a blank line above is still found
+# from its own line.
+STARTUP_ACTIVITY_PATTERN = r"^[^\S\n]*+•[^\S\n]+\S"
 # A turn's own structure, as opposed to a bare `•` bullet: the tree
 # continuation under a tool row, the dim secondary row, and the error cell that
 # ends a failed turn. Codex never draws any of these outside a turn, so unlike
@@ -1332,6 +1389,15 @@ class CodexProvider(BaseProvider):
     ) -> bool:
         return True
 
+    @classmethod
+    def honors_effort(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+    ) -> bool:
+        # codexConfig.model_reasoning_effort is emitted as a -c override.
+        return True
+
     # Codex redraws its inline TUI in place. The append-only pipe-pane stream
     # therefore retains transient progress frames (notably MCP startup) after
     # they have been erased from the visible terminal. Route status detection
@@ -1361,6 +1427,7 @@ class CodexProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -1374,6 +1441,10 @@ class CodexProvider(BaseProvider):
         self._launched_codex_profile: Optional[str] = None
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
+        # A decided effort for this launch only (#1068 C, #1083): the launch plan's
+        # effort, merged into codexConfig as model_reasoning_effort. Never written
+        # back to the profile.
+        self._effort = effort
         # The release in the startup banner, and whether it ends each turn with
         # COMPLETION_FOOTER_PATTERN. initialize() sets both. A provider rebuilt
         # after a cao-server restart does not run initialize(), and keeps the
@@ -1831,9 +1902,15 @@ class CodexProvider(BaseProvider):
             # (e.g. "features.fast_mode"); values are serialized to TOML
             # scalars. Emitted last so they take precedence over CAO's own
             # overrides and the profile/config defaults on key conflicts.
-            if profile.codexConfig:
-                for key, value in profile.codexConfig.items():
-                    command_parts.extend(["-c", _toml_override(key, value)])
+            # self._effort is a decided value for this launch only (#1068 C, #1083): merged
+            # into a copy of codexConfig, so it wins on a key conflict and is emitted even
+            # when codexConfig is empty, giving exactly one model_reasoning_effort override.
+            # It is never written back to the profile.
+            codex_config = dict(profile.codexConfig) if profile.codexConfig else {}
+            if self._effort:
+                codex_config["model_reasoning_effort"] = self._effort
+            for key, value in codex_config.items():
+                command_parts.extend(["-c", _toml_override(key, value)])
 
         # Suppress the startup update dialog at the source. Placed last so it
         # wins even if a profile sets check_for_update_on_startup=true.
@@ -2892,13 +2969,9 @@ class CodexProvider(BaseProvider):
             # Find extraction boundary: empty idle prompt or TUI footer area.
             # With --no-alt-screen, the TUI footer (› hint + status bar) has no
             # empty idle prompt. Use cutoff_pos as the boundary when TUI is present.
-            idle_after = re.search(
-                IDLE_PROMPT_STRICT_PATTERN,
-                clean_output[response_start:],
-                re.MULTILINE,
-            )
-            if idle_after:
-                end_pos = response_start + idle_after.start()
+            idle_after = _strict_idle_prompt_start(clean_output[response_start:])
+            if idle_after is not None:
+                end_pos = response_start + idle_after
             elif tui_footer_detected:
                 end_pos = cutoff_pos
             else:
@@ -2939,12 +3012,8 @@ class CodexProvider(BaseProvider):
         last_match = matches[-1]
         start_pos = last_match.end()
 
-        idle_after = re.search(
-            IDLE_PROMPT_STRICT_PATTERN,
-            clean_output[start_pos:],
-            re.MULTILINE,
-        )
-        end_pos = start_pos + idle_after.start() if idle_after else len(clean_output)
+        idle_after = _strict_idle_prompt_start(clean_output[start_pos:])
+        end_pos = start_pos + idle_after if idle_after is not None else len(clean_output)
 
         final_answer = self._strip_completion_footer(clean_output[start_pos:end_pos])
 

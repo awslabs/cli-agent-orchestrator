@@ -7,9 +7,14 @@
 //   node e2e-local.mjs approve   card appears; Approve writes approved-by-dojo.txt
 //   node e2e-local.mjs reject    card appears; Reject leaves no file
 //   node e2e-local.mjs none      nothing pending: the run still finishes, no
-//                                pending card; an unknown interrupt is RUN_ERROR
+//                                pending card; a resume for an unknown interrupt
+//                                is skipped and the run still finishes
 //   node e2e-local.mjs page      no server: the page's own state handling, with a
 //                                scripted EventSource and a stubbed run
+//   node e2e-local.mjs skipped   no agent: a card for an id CAO never raised is
+//                                emitted through POST /agui/v1/emit_ui; Approve
+//                                is skipped, RUN_FINISHED.result lists the id,
+//                                and the card shows "answer not used"
 //
 // Environment (e2e-local.sh sets these):
 //   PAGE_URL        the served index.html (not used by the page phase)
@@ -38,8 +43,8 @@ try {
 }
 
 const phase = process.argv[2];
-if (!["approve", "reject", "none", "page"].includes(phase)) {
-  console.error("usage: node e2e-local.mjs <approve|reject|none|page>");
+if (!["approve", "reject", "none", "page", "skipped"].includes(phase)) {
+  console.error("usage: node e2e-local.mjs <approve|reject|none|page|skipped>");
   process.exit(2);
 }
 if (phase === "page") process.exit(await pagePhase());
@@ -129,12 +134,30 @@ page.on("requestfinished", async (r) => {
       ? "RUN_FINISHED"
       : null;
   r._run.outcome = body.match(/"outcome":\{"type":"(\w+)"/)?.[1] ?? null;
+  r._run.skipped = skippedOf(body);
   r._run.body = body;
   r._run.end = Date.now();
 });
 page.on("requestfailed", (r) => {
   if (r._run) r._run.end = Date.now();
 });
+
+// The interrupt ids RUN_FINISHED.result.skippedResume lists, read as JSON.
+function skippedOf(body) {
+  for (const line of body.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    let frame;
+    try {
+      frame = JSON.parse(line.slice(5));
+    } catch {
+      continue;
+    }
+    if (frame?.type !== "RUN_FINISHED") continue;
+    const list = frame.result?.skippedResume;
+    return Array.isArray(list) ? list.map((s) => s?.interruptId) : [];
+  }
+  return [];
+}
 
 async function agentStatus() {
   const res = await fetch(`${CAO_URL}/sessions/cao-dojo-demo/terminals`);
@@ -186,7 +209,8 @@ try {
     await shot("2-settled");
     await hold();
 
-    // An unknown interrupt must surface as RUN_ERROR, not a hang.
+    // AG-UI 1.0: a resume entry for an interrupt CAO did not raise is skipped
+    // with a server-side warning, and the run proceeds instead of erroring.
     await page.evaluate(() =>
       window.__caoDojo.resume("00000000-0000-0000-0000-000000000000", {
         approved: true,
@@ -194,21 +218,103 @@ try {
     );
     check(await runsSettled(2), "the unknown-interrupt run ended");
     check(
-      runs[1]?.terminal === "RUN_ERROR",
-      "an unknown interrupt yields RUN_ERROR",
+      runs[1]?.terminal === "RUN_FINISHED" && runs[1]?.outcome === "success",
+      "an unknown interrupt is skipped: RUN_FINISHED with a success outcome",
     );
-    await page
-      .locator('[data-testid="run-result"][data-terminal="RUN_ERROR"]')
-      .first()
+    check(
+      JSON.stringify(runs[1]?.skipped) ===
+        JSON.stringify(["00000000-0000-0000-0000-000000000000"]),
+      `RUN_FINISHED.result.skippedResume lists the id (got ${JSON.stringify(runs[1]?.skipped)})`,
+    );
+    // Wait for the page to render this run's result before counting, so the
+    // no-RUN_ERROR check cannot pass just because nothing was drawn yet.
+    await results.nth(1).waitFor({ timeout: SETTLE_MS });
+    check(
+      (await page
+        .locator('[data-testid="run-result"][data-terminal="RUN_ERROR"]')
+        .count()) === 0,
+      "the page shows no RUN_ERROR",
+    );
+    check(
+      (await results.first().getAttribute("data-skipped")) ===
+        "00000000-0000-0000-0000-000000000000",
+      "the page's run result names the skipped id",
+    );
+    await shot("3-unknown-interrupt-skipped");
+    await hold();
+  } else if (phase === "skipped") {
+    // A card whose interrupt CAO never raised. It arrives over the real stream
+    // (an allow-listed approval_card sent through POST /agui/v1/emit_ui), and
+    // answering it resumes an id the server does not know.
+    const id = `e2e-skipped-${Date.now()}`;
+    const emitted = await fetch(`${CAO_URL}/agui/v1/emit_ui`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        component: "approval_card",
+        props: {
+          interrupt_id: id,
+          reason: "kiro-cli:permission_request",
+          options: ["approve", "deny"],
+          provider: "kiro_cli",
+        },
+      }),
+    });
+    check(emitted.status === 200, `POST /agui/v1/emit_ui accepted the card (HTTP ${emitted.status})`);
+    const card = page.locator(
+      `[data-testid="approval-card"][data-interrupt-id="${id}"]`,
+    );
+    const streamed = await card
+      .and(pending)
       .waitFor({ timeout: SETTLE_MS })
       .then(
-        () => check(true, "the page shows RUN_ERROR"),
-        () => check(false, "the page shows RUN_ERROR"),
+        () => true,
+        () => false,
       );
-    await shot("3-run-error");
+    if (!check(streamed, "the card arrived over the stream, pending"))
+      throw new Error("no card");
+    await shot("1-card");
+    await hold();
+
+    await card.getByTestId("approval-approve").click();
+    check(await runsSettled(1), `the resume run ended within ${SETTLE_MS / 1000}s`);
+    check(
+      runs[0]?.resume && runs[0]?.terminal === "RUN_FINISHED" && runs[0]?.outcome === "success",
+      "the resume run ends RUN_FINISHED with a success outcome, not RUN_ERROR",
+    );
+    check(
+      JSON.stringify(runs[0]?.skipped) === JSON.stringify([id]),
+      `RUN_FINISHED.result.skippedResume lists the id (got ${JSON.stringify(runs[0]?.skipped)})`,
+    );
+    const state = await card
+      .and(page.locator('[data-state="skipped"]'))
+      .waitFor({ timeout: SETTLE_MS })
+      .then(
+        () => "skipped",
+        async () => card.getAttribute("data-state"),
+      );
+    check(state === "skipped", `the card is in the skipped state (got ${state})`);
+    const cardText = await card.innerText();
+    check(
+      /answer not used/.test(cardText) && /this prompt was no longer pending/.test(cardText),
+      `the card says the answer was not used and why (got ${JSON.stringify(cardText.split("\n").pop())})`,
+    );
+    check(
+      (await page
+        .locator(
+          `[data-interrupt-id="${id}"][data-state="approved"], [data-interrupt-id="${id}"][data-state="rejected"]`,
+        )
+        .count()) === 0,
+      "the card is not shown approved or rejected",
+    );
+    check(
+      (await results.first().getAttribute("data-skipped")) === id,
+      "the page's run result names the skipped id",
+    );
+    await shot("2-skipped");
     await hold();
   } else {
-    // The card must come from the stream's GENERATIVE_UI frame, so
+    // The card must come from the stream's cao.generative_ui frame, so
     // wait for this interrupt's card before the page posts any run. Earlier
     // phases' cards replay too, hence matching on the id e2e-local.sh probed.
     const id = process.env.E2E_INTERRUPT_ID;
@@ -385,10 +491,14 @@ async function pagePhase() {
         if (this.onopen) this.onopen({});
       }
       // Like a real EventSource, a frame with no id: line reports the last id
-      // seen on this object, across events and reconnects.
+      // seen on this object, across events and reconnects. AG-UI 1.0 frames are
+      // unnamed, so the event type travels in the data: an object payload is
+      // sent as {type, ...data}; a string payload is sent verbatim.
       emit(type, data, id) {
         if (id) this.lastEventId = id;
-        const ev = { data: typeof data === "string" ? data : JSON.stringify(data), lastEventId: this.lastEventId || "" };
+        const body = typeof data === "string" ? data : JSON.stringify({ type, ...data });
+        const ev = { data: body, lastEventId: this.lastEventId || "" };
+        if (this.onmessage) this.onmessage(ev);
         (this.listeners[type] || []).forEach((fn) => fn(ev));
       }
       fail(readyState) {
@@ -416,8 +526,15 @@ async function pagePhase() {
     "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization",
     "Access-Control-Allow-Methods": "POST",
   };
+  // Every POST body the page sent to the stubbed run plane, parsed.
+  const runRequests = [];
   await page.route("http://*.test/agui/v1/run", async (route) => {
     if (route.request().method() === "OPTIONS") return route.fulfill({ status: 204, headers: cors });
+    try {
+      runRequests.push(JSON.parse(route.request().postData() ?? "null"));
+    } catch {
+      runRequests.push(null);
+    }
     if (holdRun) await holdRun;
     return route.fulfill({
       status: 200,
@@ -443,15 +560,33 @@ async function pagePhase() {
   };
   const emit = (type, data, id) =>
     page.evaluate(([t, d, i]) => window.__es.emit(t, d, i), [type, data, id]);
+  // A generative-UI frame as cao-server sends it: AG-UI CUSTOM named
+  // cao.generative_ui, the component in `value`, and the CAO record id in
+  // metadata.cao.eventId (what the page dedupes on). A string is spliced in raw
+  // so a test can send JSON that JSON.stringify cannot produce (e.g. 1e999).
+  const emitUi = (ui, id) =>
+    emit(
+      "CUSTOM",
+      typeof ui === "string"
+        ? `{"type":"CUSTOM","name":"cao.generative_ui","value":${ui}` +
+            (id ? `,"metadata":{"cao":{"eventId":${JSON.stringify(id)}}}` : "") +
+            "}"
+        : {
+            name: "cao.generative_ui",
+            value: ui,
+            ...(id ? { metadata: { cao: { eventId: id } } } : {}),
+          },
+      id,
+    );
 
   try {
     await page.goto(`${origin}/index.html`);
     await connect();
 
     // 1. The 40-card cap never prunes a pending card.
-    await emit("GENERATIVE_UI", card("keep-me"), "e1");
+    await emitUi(card("keep-me"), "e1");
     for (let i = 0; i < 45; i++) {
-      await emit("GENERATIVE_UI", { component: "metric", props: { label: "m" + i, value: i } }, "m" + i);
+      await emitUi({ component: "metric", props: { label: "m" + i, value: i } }, "m" + i);
     }
     expect((await stateOf("keep-me")) === "pending", "a pending card survives the 40-item cap");
 
@@ -470,7 +605,7 @@ async function pagePhase() {
 
     // 3. A resolved card stays resolved when a reconnect replays its frame.
     await connect();
-    await emit("GENERATIVE_UI", card("done-1"), "d1");
+    await emitUi(card("done-1"), "d1");
     runBody = finished({ type: "success" });
     await page
       .locator('[data-interrupt-id="done-1"] [data-testid="approval-approve"]')
@@ -483,8 +618,8 @@ async function pagePhase() {
       "a stubbed RUN_FINISHED marks the card approved",
     );
     await connect();
-    await emit("GENERATIVE_UI", card("done-1"), "d1");
-    await emit("GENERATIVE_UI", card("done-1"), "d1-again");
+    await emitUi(card("done-1"), "d1");
+    await emitUi(card("done-1"), "d1-again");
     const replayed = await stateOf("done-1");
     expect(replayed !== null && replayed !== "pending", `a replayed resolved card is not pending (got ${replayed})`);
 
@@ -507,9 +642,13 @@ async function pagePhase() {
     expect((await page.locator('[data-testid="approval-card"]').count()) === 0, "connect() clears the cards");
 
     // 6. A non-finite progress value never renders "NaN%" or "Infinity%".
-    await emit("GENERATIVE_UI", '{"component":"progress","props":{"label":"p","value":1e999}}', "p1");
+    await emitUi('{"component":"progress","props":{"label":"p","value":1e999}}', "p1");
     const progress = await page.locator("#components").innerText();
     expect(!/NaN%|Infinity%/.test(progress), "a non-finite progress value is not shown as a percentage");
+    expect(
+      (await page.locator("#components .gcard .gtype", { hasText: "progress" }).count()) === 1,
+      "the raw-string frame still reaches the cards (one progress card)",
+    );
 
     // 7. A transient error after the stream opened says reconnecting.
     await emit("STATE_SNAPSHOT", { snapshot: { sessions: [], terminals: [] } }, "x1");
@@ -518,15 +657,16 @@ async function pagePhase() {
     expect(/reconnecting/i.test(status) && !/no CAO server/.test(status), `a transient error shows reconnecting (got "${status}")`);
 
     // 8. STATE_SNAPSHOT and STATE_DELTA carry no id: line, so they report the
-    // previous record's id. They must never be deduped; records still are.
+    // previous record's id. They must never be deduped; records still are
+    // (on metadata.cao.eventId, across EventSource's own reconnects).
     await connect();
     const record = (n) => ({ component: "metric", props: { label: "rec-" + n, value: n } });
     for (const n of [1, 2, 3]) {
       if (n > 1) await page.evaluate(() => { window.__es.fail(0); window.__es.open(); });
-      await emit("GENERATIVE_UI", record(n), "evt-" + n);
+      await emitUi(record(n), "evt-" + n);
       await emit("STATE_SNAPSHOT", { snapshot: { sessions: [{ name: "conn-" + n, status: "idle" }], terminals: [] } });
       await emit("STATE_DELTA", { delta: [{ op: "add", path: "/sessions/-", value: { name: "delta-" + n, status: "idle" } }] });
-      if (n === 3) await emit("GENERATIVE_UI", record(2), "evt-2");
+      if (n === 3) await emitUi(record(2), "evt-2");
     }
     const fleet = await page.locator("#fleet .sname").allInnerTexts();
     expect(
@@ -540,13 +680,13 @@ async function pagePhase() {
     // while the run is in flight is newer than that list and must stay pending;
     // a card that was open when the run started and is not listed is settled.
     await connect();
-    await emit("GENERATIVE_UI", card("early"), "c-early");
+    await emitUi(card("early"), "c-early");
     let release;
     holdRun = new Promise((r) => { release = r; });
     runBody = finished({ type: "success" });
     await page.locator("#send").click();
     await page.waitForTimeout(200);
-    await emit("GENERATIVE_UI", card("late"), "c-late");
+    await emitUi(card("late"), "c-late");
     release();
     holdRun = null;
     await page
@@ -561,16 +701,150 @@ async function pagePhase() {
       "the late card's Approve stays enabled",
     );
 
-    // 10. Session-end closer frames have no id: line either. After a record
+    // 10. A RUN_FINISHED that lists the decided card in result.skippedResume
+    // puts it in the neutral skipped state, never approved or rejected.
+    await connect();
+    await emitUi(card("gone-1"), "g1");
+    runBody =
+      `data: ${JSON.stringify({ type: "RUN_STARTED" })}\n\n` +
+      `data: ${JSON.stringify({
+        type: "RUN_FINISHED",
+        result: { skippedResume: [{ interruptId: "gone-1", reason: "unknown" }] },
+        outcome: { type: "success" },
+      })}\n\n`;
+    await page
+      .locator('[data-interrupt-id="gone-1"] [data-testid="approval-reject"]')
+      .click();
+    expect(
+      await page
+        .locator('[data-interrupt-id="gone-1"][data-state="skipped"]')
+        .waitFor({ timeout: 5_000 })
+        .then(() => true, () => false),
+      "a skipped answer marks the card skipped, not rejected",
+    );
+    expect(
+      /this prompt was no longer pending/.test(
+        await page.locator('[data-interrupt-id="gone-1"]').innerText(),
+      ),
+      "the skipped card says the prompt was no longer pending",
+    );
+    runBody = finished({ type: "success" });
+
+    // 11. Session-end closer frames have no id: line either. After a record
     // they report its id, and must still reach the log.
     await connect();
-    await emit("GENERATIVE_UI", record(10), "evt-10");
+    await emitUi(record(10), "evt-10");
     await emit("TOOL_CALL_END", { toolCallId: "t1", message: "closer-one" });
     await emit("TOOL_CALL_END", { toolCallId: "t2", message: "closer-two" });
     const logText = await page.locator("#log").innerText();
     expect(
       /closer-one/.test(logText) && /closer-two/.test(logText),
       "frames without an id: line after a record are logged, not dropped",
+    );
+
+    // 12. AG-UI 1.0 basic/run-input.mdx: "a consumer implementing this version
+    // MUST declare the version it speaks here". Every run body says 1.0.
+    await connect();
+    runRequests.length = 0;
+    runBody = finished({ type: "success" });
+    await page.locator("#send").click();
+    await page.locator('[data-testid="run-result"]').first().waitFor({ timeout: 5_000 }).catch(() => {});
+    expect(
+      runRequests.length === 1 && runRequests[0]?.protocolVersion === "1.0",
+      `the run input declares protocolVersion "1.0" (got ${JSON.stringify(runRequests[0]?.protocolVersion)})`,
+    );
+
+    // 13. basic/patterns/interrupt-resume.mdx: "The resume list MUST cover every
+    // interrupt of the run being continued". With two interrupts open, deciding
+    // one sends nothing; deciding the second sends one resume covering both.
+    await connect();
+    const interrupt = (id) => ({
+      id,
+      reason: "claude-code:permission_request",
+      metadata: { options: ["approve", "deny"], provider: "claude_code", terminalId: "t-" + id },
+    });
+    runBody = finished({ type: "interrupt", interrupts: [interrupt("multi-a"), interrupt("multi-b")] });
+    await page.locator("#send").click();
+    await page
+      .locator('[data-interrupt-id="multi-b"][data-state="pending"]')
+      .waitFor({ timeout: 5_000 })
+      .catch(() => {});
+    const multiThread = runRequests.at(-1)?.threadId;
+    runRequests.length = 0;
+    runBody = finished({ type: "success" });
+    await page.locator('[data-interrupt-id="multi-a"] [data-testid="approval-approve"]').click();
+    await page.waitForTimeout(300);
+    expect(runRequests.length === 0, `deciding one of two interrupts sends nothing yet (sent ${runRequests.length})`);
+    expect((await stateOf("multi-a")) === "held", `the decided card is held (got ${await stateOf("multi-a")})`);
+    await page.locator('[data-interrupt-id="multi-b"] [data-testid="approval-reject"]').click();
+    await page
+      .locator('[data-interrupt-id="multi-b"][data-state="rejected"]')
+      .waitFor({ timeout: 5_000 })
+      .catch(() => {});
+    const sent = runRequests.length === 1 ? runRequests[0].resume : null;
+    expect(
+      JSON.stringify(sent) ===
+        JSON.stringify([
+          { interruptId: "multi-a", status: "resolved", payload: { approved: true } },
+          { interruptId: "multi-b", status: "resolved", payload: { approved: false } },
+        ]),
+      `one resume covers both interrupts, in order (got ${JSON.stringify(runRequests.map((r) => r?.resume))})`,
+    );
+    expect(
+      typeof multiThread === "string" && runRequests[0]?.threadId === multiThread,
+      "the resume continues the interrupted run's thread",
+    );
+    expect(
+      (await stateOf("multi-a")) === "approved" && (await stateOf("multi-b")) === "rejected",
+      `both cards settle as decided (got ${await stateOf("multi-a")}, ${await stateOf("multi-b")})`,
+    );
+
+    // 14. A collecting run sent while a decision is held starts a fresh thread
+    // (it must not continue past the interrupts it does not answer), and when its
+    // interrupt outcome replaces the list, decisions for ids still listed are
+    // kept and the rest dropped; the resume then covers the new list on the new
+    // run's thread.
+    await connect();
+    runRequests.length = 0;
+    runBody = finished({ type: "interrupt", interrupts: [interrupt("keep-a"), interrupt("gone-b")] });
+    await page.locator("#send").click();
+    await page
+      .locator('[data-interrupt-id="gone-b"][data-state="pending"]')
+      .waitFor({ timeout: 5_000 })
+      .catch(() => {});
+    const firstThread = runRequests.at(-1)?.threadId;
+    await page.locator('[data-interrupt-id="keep-a"] [data-testid="approval-approve"]').click();
+    expect((await stateOf("keep-a")) === "held", `the decided card is held (got ${await stateOf("keep-a")})`);
+    runRequests.length = 0;
+    runBody = finished({ type: "interrupt", interrupts: [interrupt("keep-a"), interrupt("new-c")] });
+    await page.locator("#send").click();
+    await page
+      .locator('[data-interrupt-id="new-c"][data-state="pending"]')
+      .waitFor({ timeout: 5_000 })
+      .catch(() => {});
+    const secondThread = runRequests[0]?.threadId;
+    expect(
+      runRequests.length === 1 && !runRequests[0].resume && typeof secondThread === "string" && secondThread !== firstThread,
+      `the collecting run uses a fresh threadId, not the interrupted run's (${secondThread} vs ${firstThread})`,
+    );
+    expect((await stateOf("keep-a")) === "held", `a decision for an id still listed is kept (got ${await stateOf("keep-a")})`);
+    expect((await stateOf("gone-b")) === "settled", `a card the new list dropped is settled (got ${await stateOf("gone-b")})`);
+    runRequests.length = 0;
+    runBody = finished({ type: "success" });
+    await page.locator('[data-interrupt-id="new-c"] [data-testid="approval-reject"]').click();
+    await page
+      .locator('[data-interrupt-id="new-c"][data-state="rejected"]')
+      .waitFor({ timeout: 5_000 })
+      .catch(() => {});
+    expect(
+      runRequests.length === 1 &&
+        runRequests[0].threadId === secondThread &&
+        JSON.stringify(runRequests[0].resume) ===
+          JSON.stringify([
+            { interruptId: "keep-a", status: "resolved", payload: { approved: true } },
+            { interruptId: "new-c", status: "resolved", payload: { approved: false } },
+          ]),
+      `the resume covers the new list on its thread (got ${JSON.stringify(runRequests.map((r) => [r?.threadId, r?.resume]))})`,
     );
   } catch (error) {
     expect(false, `driver error: ${error.message.split("\n")[0]}`);

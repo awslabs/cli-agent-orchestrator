@@ -8,6 +8,8 @@ import asyncio
 import logging
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
@@ -29,6 +31,81 @@ if TYPE_CHECKING:
     from cli_agent_orchestrator.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
+
+
+# The one thread that writes tmux status transitions (issue #1082). Detection
+# runs on the event loop (the quiescence handlers) as well as on worker
+# threads, and a SQLite commit can wait up to the driver's 5 s lock timeout,
+# so the write never runs on the loop. One thread fed in transition order also
+# keeps each terminal's rows in that order: compute_busy_seconds reads them
+# by id. Created on first use.
+_status_event_writer: Optional[ThreadPoolExecutor] = None
+_status_event_writer_lock = threading.Lock()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _status_event_executor() -> ThreadPoolExecutor:
+    global _status_event_writer
+    with _status_event_writer_lock:
+        if _status_event_writer is None:
+            _status_event_writer = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="cao-launch-status"
+            )
+        return _status_event_writer
+
+
+def _write_status_transition(terminal_id: str, status: str, observed_at: datetime) -> None:
+    try:
+        from cli_agent_orchestrator.clients import database
+
+        database.record_launch_status_event(terminal_id, status, observed_at)
+    except Exception:
+        logger.debug("Launch status event recording failed for %s", terminal_id, exc_info=True)
+
+
+def _queue_status_transition(terminal_id: str, status: "TerminalStatus") -> Optional[Future]:
+    """Hand one tmux status transition to the writer thread (issue #1082).
+
+    Call it in the critical section that decided the change: ``observed_at``
+    is then the transition time, and the queue order is the transition order.
+    herdr terminals never reach this: their transitions come from herdr's own
+    ``agent_status`` events (``HerdrInboxService``), not from polling
+    ``get_status()``. Side-effect only: never raises, so a recording failure
+    can never affect the status any caller observes.
+    """
+    try:
+        return _status_event_executor().submit(
+            _write_status_transition, terminal_id, status.value, _utcnow()
+        )
+    except Exception:
+        logger.debug("Launch status event recording failed for %s", terminal_id, exc_info=True)
+        return None
+
+
+def _wait_for_status_write_off_loop(write: Optional[Future]) -> None:
+    """Let a worker-thread caller return only once its row is written, as when
+    it wrote inline. On the event loop, never wait.
+
+    The wait is deliberate: it keeps parity with the old inline write, so a
+    caller that reads the row back right after the transition finds it. It
+    runs outside the monitor lock, and only on a real transition, but under
+    SQLite lock contention it can add up to the driver's 5 s timeout to that
+    worker thread's call.
+    """
+    if write is None:
+        return
+    try:
+        asyncio.get_running_loop()
+        return
+    except RuntimeError:
+        pass
+    try:
+        write.result()
+    except Exception:
+        logger.debug("Launch status event recording failed", exc_info=True)
 
 
 # Statuses that represent a stable "ready" state — the agent has finished
@@ -388,6 +465,7 @@ class StatusMonitor:
             if detected == TerminalStatus.WAITING_USER_ANSWER:
                 self._waiting_generation[terminal_id] = self._capture_generation.get(terminal_id, 0)
             changed = self._apply_detection_locked(terminal_id, detected)
+            status_write = _queue_status_transition(terminal_id, detected) if changed else None
             if (
                 not changed
                 and detected == TerminalStatus.PROCESSING
@@ -406,6 +484,9 @@ class StatusMonitor:
             # re-enter StatusMonitor while the latch state is mid-update.
             bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
+            # Off the loop, wait for the row on purpose (see the helper);
+            # queued above, so the write order is already fixed.
+            _wait_for_status_write_off_loop(status_write)
         return True
 
     def _apply_detection_locked(self, terminal_id: str, detected: TerminalStatus) -> bool:
@@ -415,8 +496,9 @@ class StatusMonitor:
         ONE critical section (the stale-PROCESSING capture path revalidating its
         generation) can do so without a check-then-apply gap for
         notify_input_sent to slip through. Returns True when the status changed;
-        the caller must then publish the change on the bus AFTER releasing the
-        lock (see _apply_detection for why).
+        the caller must then queue the change with _queue_status_transition
+        while it still holds the lock, and publish it on the bus AFTER
+        releasing the lock (see _apply_detection for why).
         """
         last = self._last_status.get(terminal_id)
 
@@ -552,6 +634,41 @@ class StatusMonitor:
                     # provider, so DA replies have no useful side effect here;
                     # consume the query/response shape exactly like private DSR.
                     return
+
+                def set_margins(
+                    self, top: Optional[int] = None, bottom: Optional[int] = None, **kwargs
+                ) -> None:
+                    # ``CSI ? Pm r`` is xterm's restore-DEC-private-modes, not
+                    # DECSTBM. pyte 0.8.2 dispatches it here with private=True,
+                    # which its set_margins does not accept; as with private
+                    # DSR/DA above, a passive compositor ignores it.
+                    if kwargs.get("private"):
+                        return
+                    # An omitted or zero DECSTBM parameter means its default:
+                    # top 1, bottom the last line. So ``CSI ; r`` (and
+                    # ``CSI 0 ; 0 r``) resets the scroll region to the full
+                    # screen in xterm and tmux, and ``CSI 5 ; r`` is 5..end.
+                    # pyte 0.8.2 parses the empty parameters as ``(0, 0)``, reads
+                    # that as a one-row region, ignores it, and keeps the
+                    # PREVIOUS region, so a later cursor-down stops at the old
+                    # bottom margin. agy 1.5.0 ends its ready frame with
+                    # ``CSI 1;46 r ... CSI ; r`` and then moves down to its
+                    # footer row: under the stale margin "? for shortcuts"
+                    # landed four rows too high and the old "esc to cancel"
+                    # stayed on the bottom row, so the screen read PROCESSING
+                    # after agy was idle and init timed out.
+                    #
+                    # This shim serves every screen-detecting provider. Like any
+                    # accepted DECSTBM it homes the cursor, now also on an empty
+                    # or zero ``CSI r`` (pyte's own reset path did not), which is
+                    # what a VT terminal does.
+                    top = top or 1
+                    bottom = bottom or self.lines
+                    if (top, bottom) == (1, self.lines):
+                        super().set_margins()
+                        self.cursor_position()
+                        return
+                    super().set_margins(top, bottom)
 
             screen = _StatusScreen(PYTE_SCREEN_COLS, PYTE_SCREEN_ROWS)
             stream = pyte.Stream(screen)
@@ -1206,6 +1323,7 @@ class StatusMonitor:
                     return TerminalStatus.UNKNOWN
 
         revoked_ready = False
+        revoke_write: Optional[Future] = None
         with self._lock:
             cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             if cached in (
@@ -1218,6 +1336,7 @@ class StatusMonitor:
                     self._processing_generation[terminal_id] = self._capture_generation.get(
                         terminal_id, 0
                     )
+                    revoke_write = _queue_status_transition(terminal_id, TerminalStatus.PROCESSING)
             # When cached status is PROCESSING, the debounced detection may be
             # stuck: TUI providers (kiro-cli) can send escape sequences
             # continuously after becoming idle, preventing the 200ms quiescence
@@ -1233,6 +1352,7 @@ class StatusMonitor:
             bus.publish(
                 f"terminal.{terminal_id}.status", {"status": TerminalStatus.PROCESSING.value}
             )
+            _wait_for_status_write_off_loop(revoke_write)
 
         if cached == TerminalStatus.PROCESSING and buffer:
             fresh, generation = self._redetect(terminal_id, buffer)
@@ -1288,6 +1408,7 @@ class StatusMonitor:
                         # section — a check-then-apply gap would let notify_input_sent
                         # slip between them, and the stale verdict would consume the arm
                         # it just set, latch-blocking the new turn's genuine PROCESSING.
+                        status_write: Optional[Future] = None
                         with self._lock:
                             current_last_status = self._last_status.get(terminal_id)
                             generation_current = (
@@ -1321,6 +1442,10 @@ class StatusMonitor:
                                     changed = self._apply_detection_locked(
                                         terminal_id, fresh_capture
                                     )
+                                    if changed:
+                                        status_write = _queue_status_transition(
+                                            terminal_id, fresh_capture
+                                        )
                             else:
                                 self._confirmed_stale_capture_commit.pop(terminal_id, None)
                         if apply_ok:
@@ -1333,6 +1458,7 @@ class StatusMonitor:
                                     f"Terminal {terminal_id} status changed: "
                                     f"{fresh_capture.value}"
                                 )
+                                _wait_for_status_write_off_loop(status_write)
                             return fresh_capture
                         logger.debug(
                             f"get_status [{terminal_id}]: fresh capture-pane result "

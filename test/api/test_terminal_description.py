@@ -78,7 +78,7 @@ def test_clear_and_delete(description_db):
     assert terminal_service.update_description("abcd1234", "Review")
     assert terminal_service.update_description("abcd1234", "   ")
     assert db.get_terminal_metadata("abcd1234")["description"] is None
-    assert db.delete_terminal("abcd1234")
+    assert db.delete_terminal("abcd1234", end_reason="deleted")
     assert not terminal_service.update_description("abcd1234", "Again")
     assert db.get_terminal_metadata("abcd1234") is None
 

@@ -176,7 +176,7 @@ When you run `cao launch` without `--yolo` or `--auto-approve`, CAO shows a summ
 ```
 Agent 'code_supervisor' launching on claude_code:
   Allowed:  @cao-mcp-server, fs_read, fs_list
-  Blocked:  Agent, Bash, BashOutput, Edit, KillShell, Monitor, NotebookEdit, Task, WebFetch, WebSearch, Write
+  Blocked:  Agent, Bash, BashOutput, CronCreate, CronDelete, CronList, Edit, EnterWorktree, ExitWorktree, FetchInboxMessage, GetTask, KillShell, ListAgents, Monitor, NotebookEdit, PowerShell, RemoteTrigger, ScheduleWakeup, SendFile, SendMessage, Task, TaskStop, TeamCreate, TeamDelete, WebFetch, WebSearch, Workflow, Write
   Delegates: ALL TOOLS (unrestricted)
   Enforcement: native (the provider refuses blocked tools)
   Directory: /home/user/my-project
@@ -192,7 +192,7 @@ If no `role` or `allowedTools` is set in the profile, the prompt includes an add
 ```
 Agent 'my_agent' launching on claude_code:
   Allowed:  @builtin, fs_*, execute_bash, web_fetch, @cao-mcp-server
-  Blocked:  (none)
+  Blocked:  CronCreate, CronDelete, CronList, EnterWorktree, ExitWorktree, FetchInboxMessage, ListAgents, RemoteTrigger, ScheduleWakeup, SendFile, SendMessage, TeamCreate, TeamDelete, Workflow
   Delegates: @builtin, fs_*, execute_bash, web_fetch, @cao-mcp-server
   Enforcement: native (the provider refuses blocked tools)
   Directory: /home/user/my-project
@@ -206,6 +206,8 @@ Agent 'my_agent' launching on claude_code:
 
 Proceed? [Y/n]
 ```
+
+On Claude Code, even the full `developer` grant blocks a short list of Claude Code's own messaging and agent tools. See [Claude Code built-ins CAO always removes](#claude-code-built-ins-cao-always-removes) for why.
 
 ### `--auto-approve` vs `--yolo`
 
@@ -231,8 +233,8 @@ CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, 
 
 | CAO Tool | Claude Code | Copilot CLI | Grok Build CLI | Kiro CLI (`tools` at install) |
 |----------|-------------|-------------|----------------|-------------------------------|
-| `execute_bash` | `Bash` | `shell` | `Bash` | `shell`, `subagent`, `use_aws` (+ alias `execute_bash`) |
-| `fs_read` | `Read` | `read` | `Read`, `NotebookRead` | `read`, `knowledge` (+ alias `fs_read`) |
+| `execute_bash` | `Bash` and its family (see [Known Limitations #1](#known-limitations)) | `shell` | `Bash` | `shell`, `subagent`, `use_aws` (+ alias `execute_bash`) |
+| `fs_read` | `Read`, `LSP` | `read` | `Read`, `NotebookRead` | `read`, `knowledge` (+ alias `fs_read`) |
 | `fs_write` | `Edit`, `Write` | `write` | `Edit`, `Write`, `NotebookEdit` | `write`, `code` (+ alias `fs_write`) |
 | `fs_list` | `Glob`, `Grep` | `list`, `grep` | `Grep`, `Glob` | `glob`, `grep` |
 | `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) | `WebFetch`, `WebSearch` + disabled web search | `web_fetch`, `web_search` |
@@ -333,7 +335,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 
 **Soft enforcement** = a system prompt tells the agent not to use certain tools. The agent may still attempt them. Use hard-enforcement providers for security-critical work.
 
-**Ephemeral agents** have their own provider table, because not every provider runs them. A create response's `enforcement` field reports `hard` on Claude Code and `advisory` on Codex, and Kiro ephemerals are refused. See [Ephemeral agents](ephemeral-agents.md#create-surface-and-stored-files).
+**Ephemeral agents** have their own provider table, because not every provider runs them. A create response's `enforcement` field reports `hard` on Claude Code and Kiro CLI and `advisory` on Codex. A Kiro CLI ephemeral helper is Hard (v3, per-launch file): a CAO-written universal agent file under a per-launch `KIRO_HOME`, whose `tools` and `excludedTools` limit what v3 exposes and whose rules deny every capability outside the grant, with the TUI header and the `/tools` and `/mcp list` panels checked before the task; `--trust-all-tools` only removes prompts. See [Ephemeral agents](ephemeral-agents.md#kiro-helpers).
 
 ### What "hard" looks like per provider
 
@@ -342,7 +344,40 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 claude --dangerously-skip-permissions --disallowedTools Bash --disallowedTools Edit --disallowedTools Write
 ```
 
+On every restricted grant, the list also carries the Claude Code built-ins described in [Claude Code built-ins CAO always removes](#claude-code-built-ins-cao-always-removes).
+
 `permissionMode` is a separate axis from `--disallowedTools`: `permissionMode` controls which permission tier the session runs under (unconditional bypass vs. classifier-gated tiers like `auto`), while `--disallowedTools` enforces the per-tool denylist. The two stack — a profile can set `permissionMode: auto` *and* a tool denylist, and both apply on the launch command. See [Permission Mode Override](claude-code.md#permission-mode-override) for full details.
+
+#### Claude Code built-ins CAO always removes
+
+**Why.** Claude Code has its own tools for talking to other agents, starting agents and scheduling work. None of them goes through CAO. A CAO agent that uses one steps outside what CAO can see and control, and an answer sent that way never reaches the CAO terminal that asked for it. This was seen live: a Claude Code helper sent its answer with Claude Code's own `SendMessage` instead of CAO's `send_message`. Claude Code replied `Not sent — no agent named '<supervisor id>' is reachable`, and the supervisor never got the answer.
+
+**What CAO does.** Whenever an agent's grant is restricted (anything other than `"*"`), CAO adds these tools to `--disallowedTools`, whatever else the grant allows. The `developer` default is included.
+
+| Claude Code tool | What it does | CAO's own way to do it |
+|------------------|--------------|------------------------|
+| `SendMessage`, `ListAgents` | Send messages to, and list, Claude Code subagents, teammates, other Claude sessions on the same machine and the account's cloud sessions | `send_message`; `list_siblings` with the `discovery` grant |
+| `SendFile`, `FetchInboxMessage` | Send files to another Claude Code session; read messages relayed from it | `send_message` |
+| `Workflow` | Run a script that starts and coordinates many subagents | [Workflows](workflows.md), `assign`, `handoff` |
+| `CronCreate`, `CronDelete`, `CronList`, `ScheduleWakeup` | Schedule prompts for the session to run later, after CAO has seen its turn end | [Flows](flows.md) (scheduled tasks) |
+| `RemoteTrigger` | Manage scheduled cloud agent routines | (none; out of scope for a CAO agent) |
+| `EnterWorktree`, `ExitWorktree` | Create a git worktree and move the session out of the directory CAO started it in | The launch's working directory |
+| `TeamCreate`, `TeamDelete` | Agent teams, in Claude Code builds that still have them | `assign`, `handoff` |
+
+**What is not affected.**
+
+- CAO's own MCP tools. A Claude Code deny matches a tool by its exact name, a legacy alias, a `*` glob or an `mcp__<server>` prefix. Every name CAO adds is a bare built-in name, so none can reach CAO's `send_message`, which is named `mcp__cao-mcp-server__send_message`; it stays available to any agent granted `@cao-mcp-server`.
+- `ToolSearch`. Claude Code may load MCP tools, CAO's included, through it.
+- Unrestricted agents (`"*"` or `--yolo`). They keep every tool, as before.
+- Claude Code's subagent tool (`Agent`, formerly `Task`). It still follows `execute_bash`, as described in [Known Limitations #1](#known-limitations). A subagent can be given its own model and effort, can be any agent in the operator's Claude Code agent store or plugins, and on Claude Code 2.1.318 runs in the background, so its work is outside CAO's sizing and records. Because `SendMessage` is removed, an agent can no longer send follow-up messages to a subagent it started; the subagent still returns its result. An ephemeral Claude Code helper never gets the subagent tool, whatever its grant; see [Ephemeral agents](ephemeral-agents.md#claim-launch-and-release).
+
+Some of these tools are switched on only for some accounts or settings. Where one is off, its deny has nothing to remove. Claude Code 2.1.318 knows every name on the list (`TeamCreate` and `TeamDelete` as removed tools), so it warns about none of them.
+
+An older Claude Code that lacks one of these names prints `Permission deny rule "<name>" matches no known tool — check for typos.` when it starts. The warning is harmless: a deny for a tool the build does not have removes nothing.
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| A Claude Code agent's pane shows `Not sent — no agent named '<id>' is reachable` and its supervisor gets nothing | The agent used Claude Code's own `SendMessage`, on a CAO build from before this cut | Upgrade CAO, then relaunch the agent: the cut applies at launch |
 
 **Kiro CLI** — Writes both `allowedTools` and `tools` into the agent JSON at install time:
 ```json
@@ -358,6 +393,31 @@ applied. An unrestricted policy writes `tools: ["*"]`; a profile that sets its
 own `tools` list keeps it. Enforcement is therefore install-time: change the
 profile, re-run `cao install`. Profiles installed before CAO wrote `tools`
 still carry `["*"]`; `cao launch` warns when it finds one.
+
+**Kiro CLI, v3 engine (preview, pending the operator checklist)** — `cao install
+… --engine v3` writes one universal file: the v2 fields above, plus
+`excludedTools` and `permissions.rules`. v3 selects tools by id and by tag, and
+its `read` tag also brings `code`, which can write files. So for v3:
+
+| CAO atom | Added to `tools` (v3 ids) | v3 tools the agent gets | Denied when not granted |
+|---|---|---|---|
+| `fs_read` | `read_file`, `list_directory` | the same | `fs_read`, `diagnostics`, `context`, `skill` (when `fs_list` is not granted either) |
+| `fs_list` | `file_search`, `grep_search` | the same | as `fs_read` |
+| `fs_write` | `fs_append`, `str_replace`, `delete_file` | those, `fs_write` and `code` | `fs_write` |
+| `execute_bash` | `invoke_sub_agent` | that, `execute_bash` and the per-agent `subagent/…` tools | `shell`, `subagent` |
+| `web_fetch` | `remote_web_search` | that and `web_fetch` | `web_fetch`, `web_search` |
+| `@server`, `@server/tool` | unchanged | that server's (or tool's) MCP tools | every other MCP tool |
+
+`tools` never holds the `read` tag; `excludedTools` removes everything the
+remaining entries could reach beyond the grant (`code` unless `fs_write` is
+granted, and always `knowledge`). The file configures only the MCP servers the
+grant names. A server named only by single tools (`@cao-mcp-server/send_message`)
+is configured too, and its rule allows just those tools. Every capability
+outside the grant gets an unconditional deny, and `power` and `workflow` are
+always denied. CAO checks the file on disk at every v3 launch and refuses one
+that differs, so enforcement on v3 is install-time plus a launch-time check,
+and the pane's own `/tools` and `/mcp` panels are read before the first task.
+See [Kiro v3 (preview)](kiro-cli.md#kiro-v3-preview).
 
 **Copilot CLI** — Adds `--deny-tool` flags that override `--allow-all`:
 ```bash
@@ -409,7 +469,8 @@ Supervisor (role: supervisor → @cao-mcp-server, fs_read, fs_list; delegates *)
   │
   ├─ assign("developer")
   │    → Developer profile: role: developer → full access, fits inside *
-  │    → Claude Code launched with no --disallowedTools; its ceiling: its own list
+  │    → Claude Code launched with only the always-removed Claude Code built-ins in
+  │      --disallowedTools (see "Claude Code built-ins CAO always removes"); its ceiling: its own list
   │
   └─ handoff("reviewer")
        → Reviewer profile: role: reviewer → read-only, fits inside *
@@ -467,7 +528,7 @@ Remote placement (`assign`/`handoff` with `target_host`): the target node has no
 
 ## Known Limitations
 
-1. **Claude Code tool mapping is nearly complete, with MCP tools the remaining gap.** The current mapping covers `Bash` (and its `Task`/`Agent`/`Monitor`/`BashOutput`/`KillShell` execution family), `Read`, `Edit`, `Write`, `Glob`, `Grep`, and — via `web_fetch` — [`WebFetch`](https://code.claude.com/docs/en/permissions#webfetch) and `WebSearch`. The subagent tool is intentionally **not** a separate category: it is folded into `execute_bash`, because a subagent spawns with its own full toolset and can run shell, so exposing it standalone would let a profile grant subagent access without `execute_bash` and re-open that escape. Claude Code **renamed this tool from `Task` to `Agent`**, so both names are denied — current builds expose only `Agent`, so denying just `Task` would be a silent no-op. Provider MCP tools remain unmapped (see limitation #2) — they cannot be blocked via `--disallowedTools`.
+1. **Claude Code tool mapping is nearly complete, with MCP tools the remaining gap.** The current mapping covers `Bash` (and its `Task`/`Agent`/`Monitor`/`BashOutput`/`KillShell`/`TaskStop`/`GetTask`/`PowerShell` execution family), `Read` and `LSP`, `Edit`, `Write`, `Glob`, `Grep`, and — via `web_fetch` — [`WebFetch`](https://code.claude.com/docs/en/permissions#webfetch) and `WebSearch`. `TaskStop` and `GetTask` are Claude Code's current names for the background-task companions (`KillShell` is now an alias of `TaskStop`), and `LSP` reads source files to answer definitions, references and hover text. Claude Code's own messaging and agent tools are not part of any grant: CAO always removes them (see [Claude Code built-ins CAO always removes](#claude-code-built-ins-cao-always-removes)). The subagent tool is intentionally **not** a separate category: it is folded into `execute_bash`, because a subagent spawns with its own full toolset and can run shell, so exposing it standalone would let a profile grant subagent access without `execute_bash` and re-open that escape. Claude Code **renamed this tool from `Task` to `Agent`**, so both names are denied — current builds expose only `Agent`, so denying just `Task` would be a silent no-op. Provider MCP tools remain unmapped (see limitation #2) — they cannot be blocked via `--disallowedTools`.
 
 2. **`@cao-mcp-server` is server-level, not per-tool control.** Grok restricted profiles translate it to an allow rule for the configured CAO MCP server; other providers generally treat it as an intent marker. No provider currently blocks individual MCP tools: once the server is available, its `handoff`, `assign`, `send_message`, and `answer_user_prompt` tools are all exposed. **CAO enforces the server-level grant on its own side for `assign`, `handoff` and `assign_elastic`** (see [MCP-side enforcement](#mcp-side-enforcement-for-tools-that-launch-an-agent) above), so a profile without `@cao-mcp-server` cannot use them even where the provider still exposes them. `send_message` and `answer_user_prompt` are not gated this way. `answer_user_prompt` is exposed by the MCP server, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
 

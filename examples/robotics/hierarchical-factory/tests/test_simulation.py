@@ -72,6 +72,7 @@ def test_the_committed_scene_has_three_teams_of_the_planned_kinds_and_sizes():
         (lambda d: d["teams"]["west"].update(input="west_middle"), "raw store"),
         (lambda d: d["teams"]["middle"].update(min_cycle_seconds=20), "must not exceed"),
         (lambda d: d["teams"]["east"].update(max_batch=5), "max_batch"),
+        (lambda d: d["teams"]["east"].update(max_routine_moves=None), "max_routine_moves"),
         (lambda d: d["places"]["middle_east"].update(capacity=2), "capacity of the input buffer"),
         (lambda d: d["teams"]["east"].update(run_to=[4.3, 0]), "stay inside its zone"),
         (lambda d: d["teams"]["middle"]["slots"].pop("b2"), "exactly one team"),
@@ -132,6 +133,12 @@ def test_a_program_needs_the_formation_and_valid_limits():
     assert (
         world.start_shipping("east", "ship-3", 8, 2, ["run", "run"])["reason"]
         == "routine_needs_one_run"
+    )
+    assert (
+        world.start_shipping(
+            "east", "ship-7", 8, 2, ["spin", "turn", "spin", "turn", "spin", "turn", "run"]
+        )["reason"]
+        == "routine_too_long"
     )
     assert world.set_pace("east", "pace-1", 4)["reason"] == "wrong_team_kind"
     assert world.start_line("west", "line-3", 8, 2)["status"] == "running"
@@ -276,6 +283,12 @@ def test_stop_interrupts_programs_and_locks_the_run():
     run(world, 2)
     assert {name: (robot.x, robot.y) for name, robot in world.robots.items()} == poses
     assert world.form_team("west", "form-9", "queue")["reason"] == "stopped"
+    # A program that the stop interrupted reports stopped, not its last status.
+    assert {zone: world.team_status(zone)["status"] for zone in FORMATIONS} == {
+        "west": "stopped",
+        "middle": "stopped",
+        "east": "stopped",
+    }
     assert world.set_pace("west", "pace-9", 4)["reason"] == "stopped"
 
 

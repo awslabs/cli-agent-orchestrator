@@ -4,12 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.manager import ProviderManager
 from cli_agent_orchestrator.providers.omp import OmpProvider
 
@@ -103,6 +103,65 @@ def test_create_provider_minimax_code_forwards_launch_configuration():
 
     assert isinstance(provider, MiniMaxCodeProvider)
     assert manager.get_provider("t1") is provider
+
+
+def test_create_provider_claude_code_passes_the_ephemeral_flag():
+    """Only the caller's flag marks a Claude Code helper's launch."""
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    manager = ProviderManager()
+    helper = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value, "t1", "s1", "w1", agent_profile=None, ephemeral=True
+    )
+    installed = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value, "t2", "s1", "w2", agent_profile=None
+    )
+    assert isinstance(helper, ClaudeCodeProvider) and helper._ephemeral is True
+    assert isinstance(installed, ClaudeCodeProvider) and installed._ephemeral is False
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [ProviderType.CODEX.value, ProviderType.KIRO_CLI.value, ProviderType.COPILOT_CLI.value],
+)
+def test_create_provider_refuses_the_ephemeral_flag_for_other_providers(provider_type):
+    manager = ProviderManager()
+    with pytest.raises(ValueError, match="only for the claude_code provider"):
+        manager.create_provider(provider_type, "t1", "s1", "w1", agent_profile="a", ephemeral=True)
+    assert "t1" not in manager._providers
+
+
+@pytest.mark.parametrize("role", ["supervisor", "reviewer", "developer"])
+@patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+def test_installed_claude_code_role_grants_through_the_manager_get_no_helper_cut(mock_load, role):
+    """An installed restricted grant, built by the real manager, keeps its own deny list."""
+    import shlex
+
+    from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+    from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+
+    profile = MagicMock()
+    profile.model = None
+    profile.system_prompt = None
+    profile.mcpServers = None
+    profile.permissionMode = None
+    mock_load.return_value = profile
+    grant = list(ROLE_TOOL_DEFAULTS[role])
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value,
+        f"t-{role}",
+        "s1",
+        "w1",
+        agent_profile="agent",
+        allowed_tools=grant,
+    )
+    assert provider._ephemeral is False
+    args = shlex.split(provider._build_claude_command().split("; ")[-1])
+    blocked = [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
+    for tool in ("Skill", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode"):
+        assert tool not in blocked, tool
+    assert blocked == get_disallowed_tools("claude_code", grant)
 
 
 def test_create_provider_unknown_type_raises():
@@ -443,8 +502,9 @@ def test_get_provider_marks_kiro_initialized_on_restore():
     assert provider._initialized is True
 
 
-def test_get_provider_rejects_persisted_kas_before_provider_construction():
-    """A persisted KAS terminal is never restored as a runnable provider."""
+@pytest.mark.parametrize("stored", ["v3", "kas"])
+def test_get_provider_restores_a_persisted_v3_terminal(stored):
+    """A persisted v3 row (either spelling) restores a v3 provider: no relaunch, no re-check."""
     manager = ProviderManager()
 
     with (
@@ -455,16 +515,14 @@ def test_get_provider_rejects_persisted_kas_before_provider_construction():
                 "tmux_session": "s1",
                 "tmux_window": "w1",
                 "agent_profile": "developer",
-                "engine": "kas",
+                "engine": stored,
             },
         ),
-        patch("cli_agent_orchestrator.providers.manager.KiroCliProvider") as provider_class,
+        patch.object(manager, "create_provider") as create_provider,
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
-            manager.get_provider("t1")
+        manager.get_provider("t1")
 
-    provider_class.assert_not_called()
-    assert "t1" not in manager._providers
+    assert create_provider.call_args.kwargs["engine"] is KiroEngine.V3
 
 
 def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():
@@ -548,3 +606,95 @@ def test_create_provider_resume_session_id_rejected_for_other_providers():
             agent_profile=None,
             resume_session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
         )
+
+
+def test_create_provider_session_id_reaches_claude_code():
+    """Issue #1082: a fresh-launch session_id reaches ClaudeCodeProvider."""
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value,
+        terminal_id="t-fresh",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+    )
+
+    assert isinstance(provider, ClaudeCodeProvider)
+    assert provider._session_id == "11d55034-bb41-46ca-8686-59a9dbff16b5"
+
+
+def test_create_provider_session_id_rejected_for_other_providers():
+    """session_id is claude_code-only, same restriction as resume_session_id."""
+    manager = ProviderManager()
+    with pytest.raises(Exception, match="session_id is only supported"):
+        manager.create_provider(
+            ProviderType.CODEX.value,
+            terminal_id="t-bad",
+            tmux_session="s1",
+            tmux_window="w1",
+            agent_profile=None,
+            session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+        )
+
+
+# A decided per-launch effort (#1068 C, #1083 ruling) reaches only the two providers that
+# honor it; every other provider still constructs with the parameter ignored.
+
+
+def test_create_provider_effort_reaches_claude_code():
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value,
+        terminal_id="t-effort-cc",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        effort="high",
+    )
+
+    assert isinstance(provider, ClaudeCodeProvider)
+    assert provider._effort == "high"
+
+
+def test_create_provider_effort_reaches_codex():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CODEX.value,
+        terminal_id="t-effort-codex",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        effort="high",
+    )
+
+    assert isinstance(provider, CodexProvider)
+    assert provider._effort == "high"
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [
+        ProviderType.COPILOT_CLI.value,
+        ProviderType.HERMES.value,
+        ProviderType.OMP.value,
+        ProviderType.MOCK_CLI.value,
+    ],
+)
+def test_create_provider_effort_is_ignored_by_other_providers(provider_type):
+    # None of these providers declare an effort config; passing effort must not raise.
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        provider_type,
+        terminal_id="t-effort-other",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        effort="high",
+    )
+
+    assert manager.get_provider("t-effort-other") is provider

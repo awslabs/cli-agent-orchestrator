@@ -381,7 +381,7 @@ class TestTheWebAttachIsOutputOnlyUntilVerified:
             ws = await _attach(
                 [
                     _frame("input", data="EARLY"),
-                    lambda: delete_terminal(_TID),
+                    lambda: delete_terminal(_TID, end_reason="deleted"),
                     _frame("input", data="GONE-ROW-CANARY"),
                 ],
             )

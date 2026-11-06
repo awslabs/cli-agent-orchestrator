@@ -226,7 +226,7 @@ class TestDeleteTerminalHerdrUnregistration:
         m = delete_mocks
 
         # Act
-        result = delete_terminal(TERMINAL_ID)
+        result = delete_terminal(TERMINAL_ID, end_reason="deleted")
 
         # Assert
         m.service.unregister_terminal.assert_called_once_with(TERMINAL_ID)
@@ -243,7 +243,7 @@ class TestDeleteTerminalHerdrUnregistration:
         m.get_herdr_inbox_service.return_value = None
 
         # Act
-        result = delete_terminal(TERMINAL_ID)
+        result = delete_terminal(TERMINAL_ID, end_reason="deleted")
 
         # Assert
         m.service.unregister_terminal.assert_not_called()

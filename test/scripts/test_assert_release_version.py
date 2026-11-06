@@ -68,13 +68,19 @@ def _index_args(run: str) -> list:
     return re.findall(r"--index\s+(\S+)", run)
 
 
+#: The release chain runs on a `release` event or a `release` dispatch (#652), so both get
+#: the release-event check; `test/scripts/test_publish_chain.py` evaluates these conditions.
+RELEASE_CHAIN_IF = "github.event_name == 'release' || inputs.environment == 'release'"
+SINGLE_INDEX_IF = "github.event_name != 'release' && inputs.environment != 'release'"
+
+
 def _release_step() -> Dict[str, Any]:
-    (step,) = [s for s in _guard_steps() if s.get("if") == "github.event_name == 'release'"]
+    (step,) = [s for s in _guard_steps() if s.get("if") == RELEASE_CHAIN_IF]
     return step
 
 
 def _dispatch_step() -> Dict[str, Any]:
-    (step,) = [s for s in _guard_steps() if s.get("if") == "github.event_name != 'release'"]
+    (step,) = [s for s in _guard_steps() if s.get("if") == SINGLE_INDEX_IF]
     return step
 
 
@@ -410,7 +416,7 @@ class TestPublishWorkflowRunsTheGuardFirst:
     def test_there_is_one_step_per_event_and_neither_interpolates_into_run(self):
         """`GITHUB_REF_NAME` and the target index come from the environment, never
         `${{ }}` inside `run:`, so nothing from the event can be executed as shell."""
-        assert len(_guard_steps()) == 2, "one step for release events, one for manual dispatch"
+        assert len(_guard_steps()) == 2, "one step for the release chain, one for a single index"
         for step in _guard_steps():
             assert "${{" not in step["run"]
 
@@ -435,8 +441,9 @@ class TestPublishWorkflowRunsTheGuardFirst:
         assert _index_args(step["run"]) == ['"$TARGET_INDEX"', '"$TARGET_INDEX"']
 
     def test_the_dispatch_step_compares_the_tag_when_dispatched_from_one(self):
-        """The pypi environment is restricted to v* tags, so the PyPI escape hatch always
-        runs on a tag ref; it must get the same tag/tree comparison a release does."""
+        """The pypi environment's policy admits `main` and `v*` tags (read 2026-11-02), so the
+        PyPI escape hatch may run on a tag; there it gets the tag/tree comparison a release
+        does."""
         run = _dispatch_step()["run"]
         assert '"$GITHUB_REF_TYPE" = "tag"' in run
         assert '--tag "$GITHUB_REF_NAME"' in run

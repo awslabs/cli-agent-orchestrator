@@ -80,6 +80,29 @@ The Vite dev server proxies API calls to the backend at `localhost:9889`. Make s
 > [CONTRIBUTING.md](CONTRIBUTING.md#recording-test-fixtures-safely). A gitleaks
 > scan gates every PR; run it locally with `scripts/security-scan.sh gitleaks`.
 
+**The suite never touches your real home.** `test/conftest.py` points `HOME` at a
+throwaway directory for the whole session and unsets the variables that relocate
+CAO's or a provider's config root (`CAO_HOME_DIR`, `CAO_TMP_DIR`, `KIRO_HOME`,
+`CODEX_HOME`, `GROK_HOME`, the `XDG_*_HOME` dirs and others), so
+`~/.aws/cli-agent-orchestrator`, `~/.gemini`, `~/.kiro` and the rest resolve under
+it, as on a fresh CI runner. Exactly two things are kept:
+
+- a root variable that already points under the system temp directory, such as
+  `CAO_HOME_DIR=$(mktemp -d) uv run pytest ...`; a root anywhere else, inside or
+  outside your home, is unset;
+- `RUSTUP_HOME` and `CARGO_HOME`, which keep pointing at your `~/.rustup` and
+  `~/.cargo` so `test_no_ffi_guard` can run `cargo metadata`. cargo may update its
+  own `~/.cargo/.global-cache` while it does.
+
+The suite also never runs a coding-agent CLI for memory compilation or lint: the
+LLM client is stubbed to "none" unless a test installs its own.
+
+Sessions that select E2E tests or `test_kiro_cli_integration.py` keep the real
+`HOME`, because they drive authenticated provider CLIs. `CAO_TEST_REAL_HOME=1`
+keeps it for any session and `CAO_TEST_REAL_HOME=0` forces isolation; a single
+test opts out with `@pytest.mark.real_home`. Under `pytest -n`, each worker takes
+the controller's decision, so `-n` with E2E keeps the real `HOME` too.
+
 ### Unit Tests
 
 Most tests mock external dependencies, but the default invocation is not unit-only: its
@@ -305,7 +328,7 @@ Create a pull request on GitHub. CI will automatically run tests and code qualit
 Runs on all pushes to `main` and all PRs targeting `main`:
 - **Unit tests**: Python 3.11, 3.12 matrix with coverage
 - **Code quality**: black, isort, ruff, mypy — all blocking; mypy via a per-file ratchet (see [SKILL.md](skills/cao-contributing/SKILL.md))
-- **Security scan**: Trivy filesystem scan — fails on a finding of **any** severity (see [SECURITY.md](SECURITY.md#running-security-scans-locally) for why the workflow's `CRITICAL,HIGH` input is ignored)
+- **Security scan**: Trivy filesystem scan — fails on a committed secret of any severity, or on a fixable CRITICAL, HIGH or UNKNOWN (not yet scored) vulnerability; fixable MEDIUM and LOW vulnerabilities are uploaded to the Security tab without failing (see [SECURITY.md](SECURITY.md#running-security-scans-locally))
 - **Dependency Security**: Full locked npm, Bun, uv, and Cargo graphs, including dev dependencies and unfixed advisories; every HIGH/CRITICAL finding or scan error blocks. Also verifies the installed dependency mitigations. The Python 3.12 unit job runs a real-Trivy dev-inventory regression; see [SECURITY.md](SECURITY.md#full-dependency-gate).
 - **Dependency review**: License and vulnerability checks on PRs
 

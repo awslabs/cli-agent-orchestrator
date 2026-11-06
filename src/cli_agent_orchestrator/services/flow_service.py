@@ -96,7 +96,7 @@ def add_flow(file_path: str) -> Flow:
             raise ValueError(f"Invalid cron expression '{schedule}': {e}")
 
         # Construct the model before persisting the registration so front-matter
-        # engine values receive Pydantic's canonical v2/kas validation.
+        # engine values receive Pydantic's canonical v2/v3 validation (kas is read as v3).
         validated_flow = Flow(
             name=name,
             file_path=str(path),
@@ -210,7 +210,7 @@ def _is_terminal_busy(terminal_id: str) -> bool:
 
 def _delete_recycled_terminal_rows(terminal_ids: List[str]) -> None:
     """Release names only after the existing bulk deletion succeeds."""
-    if delete_terminals_by_ids(terminal_ids):
+    if delete_terminals_by_ids(terminal_ids, end_reason="session_teardown"):
         from cli_agent_orchestrator.services import ephemeral_service
 
         for terminal_id in terminal_ids:

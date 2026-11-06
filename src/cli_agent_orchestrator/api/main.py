@@ -8,6 +8,7 @@ import os
 import pty
 import re
 import signal
+import stat
 import struct
 import subprocess
 import termios
@@ -139,9 +140,9 @@ from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
-    KiroPhase0KASError,
 )
 from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -199,6 +200,8 @@ from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     IdempotencyKeyConflict,
+    IdempotencyKeyNotFound,
+    IdempotentCreateFailed,
     OutputMode,
     TerminalInputBlockedError,
     _notify_elastic_terminal_ended,
@@ -773,7 +776,8 @@ class RunStepRequest(BaseModel):
         return self
 
     engine: Optional[KiroEngine] = Field(
-        default=None, description="Explicit Kiro engine for this child step"
+        default=None,
+        description="Explicit Kiro engine for this child step ('kas' is an alias of 'v3')",
     )
 
     job_id: Optional[str] = Field(
@@ -823,6 +827,14 @@ class RunStepResponse(BaseModel):
     terminal_id: str
     last_message: str
     status: str
+    torn_down: bool = Field(
+        default=False,
+        description=(
+            "True only when the server deleted the worker terminal it created "
+            "(issue #1203). Defaults to False, so an older server that omits it "
+            "reads as not torn down."
+        ),
+    )
     replayed: bool = Field(
         default=False,
         description=(
@@ -1782,6 +1794,12 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # AG-UI ambient streams: backstop for launches whose shutdown reaches the
+    # lifespan before the streams close (uvicorn waits for connections first).
+    from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run
+
+    _ambient_run.request_stop(sticky=False)
+
     # Stop herdr inbox service on shutdown
     if herdr_inbox_task is not None:
         herdr_inbox_task.cancel()
@@ -2053,9 +2071,19 @@ async def health_check():
     backend = get_backend()
     backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
 
+    # The installed package version, so a client (the web UI's server card) can
+    # show what it is talking to without a shell. Same source as `cao --version`.
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        server_version = version("cli-agent-orchestrator")
+    except PackageNotFoundError:
+        server_version = "unknown"
+
     return {
         "status": "ok",
         "service": "cli-agent-orchestrator",
+        "version": server_version,
         "terminal_backend": backend_name,
         # Capabilities a peer node can rely on. ``delegation_ceiling``: this
         # node bounds created terminals by the caller's delegation ceiling and
@@ -2232,6 +2260,116 @@ async def _with_keepalive(events: Any, interval: float) -> Any:
             pending.cancel()
 
 
+# ``?framing=`` values the ambient stream accepts. ``cao-legacy`` is the pre-1.0
+# framing, deprecated and kept byte-identical (#1193 mode ``off``).
+AGUI_FRAMING_LEGACY = "cao-legacy"
+AGUI_STREAM_FRAMINGS = frozenset({AGUI_FRAMING_LEGACY})
+# RFC 9745 section 2.1: Deprecation is an Item Structured Header Field whose value
+# is a Date (RFC 9651 section 3.3.7, "@" + integer seconds since the epoch).
+# 1793750400 = 2026-11-04T00:00:00Z, when the legacy framing was deprecated.
+_AGUI_LEGACY_DEPRECATED_AT = 1793750400
+_AGUI_LEGACY_DEPRECATION_LINK = (
+    "<https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/agui.md#legacy-framing>"
+    '; rel="deprecation"; type="text/html"'
+)
+_AGUI_SUB_FRAME_ID_RE = re.compile(r"^([^.]+)\.(\d+)$")
+_AGUI_THREAD_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+
+def _agui_legacy_framing_headers() -> Dict[str, str]:
+    return {
+        "Deprecation": f"@{_AGUI_LEGACY_DEPRECATED_AT}",
+        "Link": _AGUI_LEGACY_DEPRECATION_LINK,
+    }
+
+
+def _agui_ambient_response(
+    *,
+    thread_id: str,
+    run_id: str,
+    since: Optional[str],
+    last_event_id: Optional[str],
+    fleet_snapshot: Any,
+    accept: Optional[str],
+    max_seconds: Optional[float],
+    state_baseline_known: bool,
+) -> Any:
+    """The AG-UI 1.0 conformant ambient run, shared by GET and POST /agui/v1/stream."""
+    from ag_ui.encoder import EventEncoder
+    from fastapi.responses import StreamingResponse
+
+    from cli_agent_orchestrator.clients.database import get_session_incarnation
+    from cli_agent_orchestrator.services.agui import run_plane
+    from cli_agent_orchestrator.services.agui.ambient_run import AmbientRun, ambient_stream
+    from cli_agent_orchestrator.services.event_log_service import get_event_log
+    from cli_agent_orchestrator.services.sse_bus import get_bus
+    from cli_agent_orchestrator.services.ui_state_service import diff_snapshot
+
+    encoder = EventEncoder(accept=accept or "text/event-stream")
+    content_type = encoder.get_content_type()
+    is_sse = content_type == "text/event-stream"
+
+    def encode(sse_id: Optional[str], event: Any) -> Any:
+        frame = encoder.encode(event)
+        if is_sse and sse_id is not None:
+            return f"id: {sse_id}\n{frame}"
+        return frame
+
+    def replay() -> List[Dict[str, Any]]:
+        # A CAO extension (docs/agui.md): choose which buffered records this NEW run
+        # narrates first. Failure-isolated, as on the legacy path.
+        try:
+            if since:
+                return list(get_event_log().history(since=since))
+            if last_event_id:
+                log = get_event_log()
+                # `<record id>.<n>` names a frame the conformant stream synthesized
+                # before that record's own frame (record ids are uuid4, never
+                # dotted). The client saw only part of the record, so the new run
+                # replays the record whole rather than everything or what follows.
+                sub = _AGUI_SUB_FRAME_ID_RE.match(last_event_id)
+                if sub:
+                    fresh = list(log.history())
+                    for i, record in enumerate(fresh):
+                        if str(record.get("id")) == sub.group(1):
+                            return fresh[i:]
+                return list(log.after_id(last_event_id))
+        except Exception:
+            logger.warning("agui_stream: history replay failed", exc_info=True)
+        return []
+
+    async def generator() -> Any:
+        bus = get_bus()
+        # Register before the replay and the snapshot, so nothing published in
+        # between is lost (the same seam the legacy path uses).
+        sub = bus.register(overflow_close=True)
+        run = AmbientRun(
+            thread_id,
+            run_id,
+            incarnation_of=get_session_incarnation,
+            state_baseline_known=state_baseline_known,
+            since=since,
+        )
+        try:
+            async for frame in ambient_stream(
+                run=run,
+                encode=encode,
+                is_sse=is_sse,
+                replay=replay(),
+                fleet_snapshot=fleet_snapshot,
+                diff=diff_snapshot,
+                bus=bus,
+                sub=sub,
+                keepalive_seconds=run_plane.RUN_PLANE_HEARTBEAT_SECONDS,
+                max_seconds=max_seconds,
+            ):
+                yield frame
+        finally:
+            bus.unregister(sub)
+
+    return StreamingResponse(generator(), media_type=content_type)
+
+
 @app.get("/agui/v1/stream")
 async def agui_stream(
     since: Optional[str] = Query(
@@ -2240,6 +2378,28 @@ async def agui_stream(
             "ISO-8601 lower bound. When set, buffered events after this "
             "timestamp are replayed (as AG-UI frames) before the live stream; "
             "clients dedupe by event id."
+        ),
+    ),
+    framing: Optional[str] = Query(
+        default=None,
+        description=(
+            "Wire framing. ``cao-legacy`` selects the pre-1.0 framing (named SSE "
+            "events, snake_case fields), which is deprecated and kept byte-identical."
+        ),
+    ),
+    thread_id: Optional[str] = Query(
+        default=None,
+        alias="threadId",
+        description="The application's thread id for this connection's run (1-128 of A-Z a-z 0-9 . _ : -).",
+    ),
+    max_seconds: Optional[int] = Query(
+        default=None,
+        alias="maxSeconds",
+        ge=1,
+        le=3600,
+        description=(
+            "End the run after this many seconds with the cancelled outcome (a limit "
+            "the producer enforces). Ignored with framing=cao-legacy."
         ),
     ),
     access_token: Optional[str] = Query(
@@ -2260,18 +2420,24 @@ async def agui_stream(
         ),
     ),
 ):
-    """Stream fleet events as AG-UI typed events (Server-Sent Events).
+    """Stream the fleet as one AG-UI 1.0 run (Server-Sent Events).
 
-    This is the L2 standalone-dashboard surface (consumed by any AG-UI client). It
-    shares the exact same source as ``/events`` — the in-process ``SseBus`` fed
-    by the ``EventLogPublisher`` — but re-maps each normalized six-primitive
-    record onto AG-UI typed events via ``agui_stream.to_agui_event`` before it
-    hits the wire, so any AG-UI-compatible client renders CAO with no custom
-    adapter code.
+    The ``EventSource`` convenience for ``POST /agui/v1/stream`` (the AG-UI
+    binding). It shares the exact same source as ``/events``, the in-process
+    ``SseBus`` fed by the ``EventLogPublisher``, and narrates each normalized
+    record as conformant AG-UI events (``services/agui/ambient_run.py``):
+    ``RUN_STARTED`` first, sessions and terminals as ``SUBAGENT_*``
+    invocations, delegations as tool calls, generative UI as ``CUSTOM``
+    ``cao.generative_ui``, and a ``RUN_FINISHED`` cancelled or ``RUN_ERROR``
+    close. Frames are ``data:``-only with ``type`` in the JSON; record frames
+    carry an ``id:`` cursor. Message bodies are never carried (the ring buffer
+    stores metadata only and the mapping redacts by construction).
 
-    Each SSE frame is a *named* AG-UI event: ``event: <AGUI_TYPE>`` +
-    ``data: <json>``. Message bodies are never carried (the ring buffer stores
-    metadata only and the mapping redacts by construction).
+    ``?framing=cao-legacy`` serves the deprecated pre-1.0 wire byte-for-byte
+    (named ``event:`` frames via ``agui_stream.to_agui_event``), with
+    ``Deprecation`` and ``Link`` headers. ``since`` / ``Last-Event-ID`` replay is
+    a CAO extension that chooses which buffered records the new run narrates
+    first (``docs/agui.md#replay``).
 
     Default-off: returns 404 unless the AG-UI surface is enabled via
     ``CAO_AGUI_ENABLED`` (or the MCP Apps surface is on). When auth is enabled,
@@ -2325,6 +2491,18 @@ async def agui_stream(
                 detail=f"Invalid ISO-8601 timestamp for 'since': {since!r}",
             )
 
+    # Validate ?framing= and ?threadId= at the boundary, before any stream starts.
+    if framing is not None and framing not in AGUI_STREAM_FRAMINGS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown framing {framing!r}; supported: {sorted(AGUI_STREAM_FRAMINGS)}",
+        )
+    if thread_id is not None and not _AGUI_THREAD_ID_RE.fullmatch(thread_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid threadId: 1-128 characters of A-Z a-z 0-9 . _ : -",
+        )
+
     from fastapi.responses import StreamingResponse
 
     from cli_agent_orchestrator.services import session_service
@@ -2355,6 +2533,22 @@ async def agui_stream(
             except Exception:
                 logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
         return build_dashboard_snapshot(sessions, terminals, list(scopes))
+
+    if framing != AGUI_FRAMING_LEGACY:
+        import uuid
+
+        from cli_agent_orchestrator.services.agui.ambient_run import DEFAULT_THREAD_ID
+
+        return _agui_ambient_response(
+            thread_id=thread_id or DEFAULT_THREAD_ID,
+            run_id=str(uuid.uuid4()),
+            since=since,
+            last_event_id=last_event_id,
+            fleet_snapshot=_fleet_snapshot,
+            accept="text/event-stream",
+            max_seconds=max_seconds,
+            state_baseline_known=True,
+        )
 
     def _sse(event_id: Optional[str], agui_type: str, data: Dict) -> str:
         """Format one SSE frame, with an ``id:`` cursor when the event has one."""
@@ -2491,7 +2685,171 @@ async def agui_stream(
         finally:
             bus.unregister(sub)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    headers: Dict[str, str] = {}
+    if framing == AGUI_FRAMING_LEGACY:
+        logger.warning(
+            "agui_stream: a client requested the deprecated ?framing=%s; see docs/agui.md#legacy-framing",
+            AGUI_FRAMING_LEGACY,
+        )
+        headers = _agui_legacy_framing_headers()
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
+
+
+def _agui_parse_protocol_version(value: Any) -> Optional[Tuple[int, int]]:
+    """``"MAJOR.MINOR"`` to a tuple, or ``None`` when it cannot be interpreted.
+
+    Only the published identifier form counts (versioning#version-negotiation):
+    ``"2"``, ``"2.0.0"`` and ``"draft"`` are uninterpretable, so the caller serves
+    them with a warning rather than refusing them. Each part is bounded to 9
+    digits, so an overlong number is uninterpretable too instead of reaching
+    ``int()``'s digit limit.
+    """
+    if not isinstance(value, str):
+        return None
+    m = re.fullmatch(r"([0-9]{1,9})\.([0-9]{1,9})", value)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+@app.post("/agui/v1/stream")
+async def agui_stream_post(
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """The ambient fleet run over AG-UI's HTTP+SSE binding (POST a ``RunAgentInput``).
+
+    The same conformant run as ``GET /agui/v1/stream``, but delivered the way the
+    binding contract requires: the request carries the ``RunAgentInput`` that opens
+    the exchange, so a stock ``HttpAgent`` can consume it.
+
+    - ``threadId`` and ``runId`` come from the input; ``RUN_STARTED`` echoes them.
+    - ``protocolVersion`` is read. A different major version is refused with 400
+      before the stream; a newer minor, or a value that cannot be interpreted, is
+      served with a warning (versioning#version-negotiation).
+    - A non-empty ``resume[]`` is refused with 400: the ambient run raises no
+      interrupts, so there is nothing to answer here. Answers go to
+      ``POST /agui/v1/run``.
+    - ``forwardedProps.cao`` takes CAO's options: ``since`` (ISO-8601 replay bound)
+      and ``maxSeconds`` (1-3600; the run then ends with the cancelled outcome).
+    - ``messages``, ``tools``, ``context`` and ``state`` are accepted and not used:
+      the ambient run observes the fleet.
+    """
+    _require_agui_enabled()
+
+    from cli_agent_orchestrator.services.agui.run_plane import AG_UI_AVAILABLE
+
+    if not AG_UI_AVAILABLE:
+        return JSONResponse(
+            status_code=501,
+            content={
+                "detail": (
+                    "ag-ui-protocol is not installed. "
+                    "Install with: pip install cli-agent-orchestrator[agui]"
+                )
+            },
+        )
+
+    try:
+        body = await request.json()
+    except ValueError as e:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "json_invalid",
+                    "loc": ("body",),
+                    "msg": "invalid JSON body",
+                    "ctx": {"error": str(e)},
+                }
+            ]
+        )
+
+    from cli_agent_orchestrator.services.agui.run_plane import RunAgentInput
+
+    try:
+        run_input = RunAgentInput.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            [{**err, "loc": ("body", *err["loc"])} for err in e.errors(include_url=False)]
+        )
+
+    raw_version = body.get("protocolVersion") if isinstance(body, dict) else None
+    if raw_version is not None:
+        parsed = _agui_parse_protocol_version(raw_version)
+        if parsed is None:
+            logger.warning(
+                "agui_stream: protocolVersion %.80r cannot be interpreted; serving as 1.0",
+                raw_version,
+            )
+        elif parsed[0] != 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"protocolVersion {raw_version!r} is not supported; this server speaks 1.0",
+            )
+        elif parsed[1] > 0:
+            logger.warning(
+                "agui_stream: client declared protocolVersion %r, newer than 1.0; serving 1.0",
+                raw_version,
+            )
+
+    if run_input.resume:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "resume[] is not accepted on /agui/v1/stream: the ambient run raises no "
+                "interrupts. Send answers to POST /agui/v1/run."
+            ),
+        )
+
+    forwarded = body.get("forwardedProps") if isinstance(body, dict) else None
+    cao_opts = forwarded.get("cao") if isinstance(forwarded, dict) else None
+    cao_opts = cao_opts if isinstance(cao_opts, dict) else {}
+    since = cao_opts.get("since")
+    if since is not None:
+        try:
+            text = str(since)
+            datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid ISO-8601 timestamp for forwardedProps.cao.since: {since!r}",
+            )
+    max_seconds = cao_opts.get("maxSeconds")
+    if max_seconds is not None and (
+        not isinstance(max_seconds, int)
+        or isinstance(max_seconds, bool)
+        or not 1 <= max_seconds <= 3600
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="forwardedProps.cao.maxSeconds must be an integer from 1 to 3600",
+        )
+
+    from cli_agent_orchestrator.services import session_service
+    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
+
+    scopes = list(_scopes)
+
+    def _fleet_snapshot() -> Dict:
+        sessions = session_service.list_sessions()
+        terminals: List[Dict] = []
+        for sess in sessions:
+            try:
+                terminals.extend(
+                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
+                )
+            except Exception:
+                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
+        return build_dashboard_snapshot(sessions, terminals, scopes)
+
+    return _agui_ambient_response(
+        thread_id=run_input.thread_id,
+        run_id=run_input.run_id,
+        since=str(since) if since is not None else None,
+        last_event_id=None,
+        fleet_snapshot=_fleet_snapshot,
+        accept=request.headers.get("accept"),
+        max_seconds=max_seconds,
+        state_baseline_known=not run_input.state,
+    )
 
 
 class EmitUIRequest(BaseModel):
@@ -2513,7 +2871,8 @@ async def agui_emit_ui(
     An agent — via the ``emit_ui`` MCP tool — declares a component from the
     frozen allow-list; the intent is validated **server-side** here and
     published onto the fleet event bus, where ``agui_stream.to_agui_event`` maps
-    it to a ``GENERATIVE_UI`` frame on ``/agui/v1/stream``. Off-list components
+    it to a ``CUSTOM`` frame named ``cao.generative_ui`` on ``/agui/v1/stream``
+    (AG-UI 1.0 defines no generative-UI event type). Off-list components
     and oversized/non-serializable props are rejected (400) so a bad intent
     never reaches the bus. Requires ``cao:write`` when auth is enabled.
     """
@@ -2667,9 +3026,10 @@ async def agui_run(
     mutating interrupt state). Otherwise ``cao:read`` is the floor.
 
     After a ``resume[]`` run, ``RUN_FINISHED`` with outcome ``success`` means
-    the decision was delivered to the terminal, not that the agent finished
-    its work. A later permission prompt arrives as an interrupt on the next
-    run.
+    every entry that named a pending interrupt was delivered; skipped entries
+    are logged and listed in ``result.skippedResume``. It does not mean the
+    agent finished its work. A later
+    permission prompt arrives as an interrupt on the next run.
 
     Returns 501 when the ``ag-ui-protocol`` package is not installed (the
     [agui] optional extra was not included at install time).
@@ -2777,6 +3137,33 @@ async def agui_run(
         ),
         media_type=content_type,
     )
+
+
+# ---------------------------------------------------------------------------
+# Run plane capabilities (AG-UI 1.0 AgentCapabilities, #1192)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/agui/v1/capabilities")
+async def agui_capabilities(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Return the run plane's AG-UI 1.0 capabilities (GET /agui/v1/capabilities).
+
+    The body is one ``AgentCapabilities`` object in the 1.0 schema shape. AG-UI
+    leaves retrieval to the implementation, so CAO serves it beside
+    ``POST /agui/v1/run``, at the same ``cao:read`` floor. The declaration is
+    informative; the run's own events stay authoritative. It omits
+    ``humanInTheLoop.approveWithEdits`` (each interrupt's ``responseSchema``
+    says whether edit is accepted) and never declares ``transport.resumable``.
+
+    Returns 404 when the AG-UI surface is disabled.
+    """
+    _require_agui_enabled()
+
+    from cli_agent_orchestrator.services.agui.capabilities import build_capabilities
+
+    return build_capabilities()
 
 
 # Topology widget static bundle at /widgets/topology/ — the vanilla SSE-driven
@@ -3816,20 +4203,40 @@ async def _prepare_delegation(
                 policy=inputs.policy,
                 purpose=inputs.purpose,
                 description=inputs.description,
+                provider_options=inputs.provider_options,
             )
         )
-        if plan is not None:
-            # The operator may have changed the policy while the decider ran: recheck the
-            # launched tier before the bind, whatever the outcome.
-            try:
-                model = ephemeral_service.recheck_decided(
-                    name, claim_id, caller_id, _recorded_tier(plan), plan.model
-                )
-            except BaseException:
-                _bind_unlaunched(plan)
-                raise
-            if model is not None and model != plan.model:
-                plan = replace(plan, model=model)
+        # The operator may have changed the policy while the decider ran: recheck the
+        # launched values before the bind, whatever the outcome, and even when the engine
+        # returned no plan, as an effort-only launch can (#1083).
+        try:
+            decided = ephemeral_service.recheck_decided(
+                name,
+                claim_id,
+                caller_id,
+                _recorded_tier(plan) if plan is not None else None,
+                plan.effort if plan is not None else None,
+                plan.model if plan is not None else None,
+                # #1099: only the engine sets the provider; the recheck can only refuse it.
+                provider=plan.provider if plan is not None else None,
+            )
+        except BaseException:
+            _bind_unlaunched(plan)
+            raise
+        if decided is not None:
+            # #1083 Q1 (provisional): a decided effort applies to this launch only, through
+            # the launch plan, like the decided model (#1068 Q2). The live profile keeps the
+            # stored effort, so a launch that fails before the bind leaves nothing behind.
+            if decided.model is not None:
+                if plan is None:
+                    plan = LaunchPlan(model=decided.model)
+                elif decided.model != plan.model:
+                    plan = replace(plan, model=decided.model)
+            if decided.effort is not None:
+                if plan is None:
+                    plan = LaunchPlan(effort=decided.effort)
+                elif decided.effort != plan.effort:
+                    plan = replace(plan, effort=decided.effort)
     except DecisionInputError as error:
         raise ephemeral_service.decision_refusal(name, claim_id, caller_id, error) from None
     except BaseException:
@@ -3867,6 +4274,20 @@ def _bind_unlaunched(plan: LaunchPlan | None) -> None:
             logger.warning("Decision launch cleanup bind failed", exc_info=True)
 
 
+def _idempotent_create_failed_response(exc: IdempotentCreateFailed) -> JSONResponse:
+    """The 424 for a keyed replay of a failed original create (review on PR #773).
+
+    ``detail`` stays the cause string. ``terminal_id`` names the failed
+    terminal's row when its rollback retained it for a deferred provider
+    cleanup, so the caller has a handle to delete it, and is null otherwise
+    (issue #943).
+    """
+    return JSONResponse(
+        status_code=status.HTTP_424_FAILED_DEPENDENCY,
+        content={"detail": str(exc), "terminal_id": exc.terminal_id},
+    )
+
+
 def _set_launch_note(response: Response, plan: LaunchPlan | None) -> None:
     if plan is not None:
         try:
@@ -3892,10 +4313,11 @@ async def create_session(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Terminal:
+) -> Terminal | JSONResponse:
     """Create a new session with exactly one terminal.
 
     When ``memory_manager`` is truthy, a sidecar ``memory_manager`` terminal is
@@ -3991,8 +4413,13 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        if lookup_only and not idempotency_key:
+            raise ValueError("lookup_only requires an idempotency_key")
+        # Passed only when set, so the ordinary create call stays
+        # byte-identical for every existing caller (review on PR #773).
+        optional_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
         launch_provider = provider
-        if body and body.delegation_message is not None:
+        if body and body.delegation_message is not None and not lookup_only:
             decision_provider = provider
             if decision_provider is None:
                 decision_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
@@ -4034,9 +4461,14 @@ async def create_session(
             **description_options,
             **_launch_options(launch_plan),
             caller_ceiling=body.caller_ceiling if body else None,
+            **optional_kwargs,
         )
 
-        if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
+        if (
+            not lookup_only
+            and memory_manager
+            and str(memory_manager).lower() in ("true", "1", "yes")
+        ):
             registry = get_plugin_registry(request)
             sidecar_provider = provider or DEFAULT_PROVIDER
             sidecar_session = result.session_name
@@ -4113,6 +4545,14 @@ async def create_session(
         _set_launch_note(response, launch_plan)
         return result
 
+    except IdempotencyKeyNotFound as e:
+        # lookup_only found nothing committed for this key (review on PR #773).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except IdempotentCreateFailed as e:
+        # A replay of a create whose initialization failed (review on PR #773).
+        # A distinct status, so the caller reports that cause and does not
+        # mistake it for a retryable server error.
+        return _idempotent_create_failed_response(e)
     except IdempotencyKeyConflict as e:
         # The key was already used for a DIFFERENT request (review on PR #634,
         # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
@@ -4262,10 +4702,11 @@ async def create_terminal_in_session(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Terminal:
+) -> Terminal | JSONResponse:
     """Create additional terminal in existing session.
 
     ``defer_init=true``: return as soon as the tmux window is created and the
@@ -4377,7 +4818,17 @@ async def create_terminal_in_session(
                     ),
                 )
 
-        if body and body.delegation_message is not None:
+        if lookup_only and not idempotency_key:
+            # A malformed request, not a missing resource: this endpoint maps
+            # ValueError to 404, so reject it here as a 400.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="lookup_only requires an idempotency_key",
+            )
+        # Passed only when set, so the ordinary create call stays
+        # byte-identical for every existing caller (review on PR #773).
+        lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
+        if body and not lookup_only and body.delegation_message is not None:
             launch_plan = await _prepare_delegation(
                 DelegationRequest(
                     kind="handoff" if body.delegation_kind else "assign",
@@ -4409,6 +4860,7 @@ async def create_terminal_in_session(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            **lookup_kwargs,
             claim_id=claim_id,
             **_launch_options(launch_plan),
         )
@@ -4418,6 +4870,14 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except IdempotencyKeyNotFound as e:
+        # lookup_only found nothing committed for this key (review on PR #773).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except IdempotentCreateFailed as e:
+        # A replay of a create whose initialization failed (review on PR #773).
+        # A distinct status, so the caller reports that cause and does not
+        # mistake it for a retryable server error.
+        return _idempotent_create_failed_response(e)
     except IdempotencyKeyConflict as e:
         # The key was already used for a DIFFERENT request (review on PR #634,
         # issue #616) — 409, not the 404 the generic ValueError arm below would
@@ -4426,7 +4886,7 @@ async def create_terminal_in_session(
         # of the ValueError family can shadow it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
-        KiroPhase0KASError,
+        KiroV3Refusal,
         KiroCapabilityError,
         KiroAgentPathError,
         KiroAgentIdentityError,
@@ -4484,7 +4944,7 @@ async def create_terminal_in_session_as_operator(
     idempotency_key: Optional[str] = None,
     body: Optional[OperatorTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Terminal:
+) -> Terminal | JSONResponse:
     """Add a terminal to an EXISTING session as the operator.
 
     The sibling ``POST /sessions/{name}/terminals`` is how a running terminal
@@ -4556,10 +5016,14 @@ async def create_terminal_in_session_as_operator(
         )
     except HTTPException:
         raise
+    except IdempotentCreateFailed as e:
+        # A keyed replay of a failed original, as on the other create routes
+        # (review on PR #773).
+        return _idempotent_create_failed_response(e)
     except IdempotencyKeyConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
-        KiroPhase0KASError,
+        KiroV3Refusal,
         KiroCapabilityError,
         KiroAgentPathError,
         KiroAgentIdentityError,
@@ -5512,6 +5976,7 @@ async def run_step(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
             status=response_status,
+            torn_down=result.torn_down,
         )
     except ReplayDivergenceError as e:
         # FR-3's surfacing (BR-6/BR-7, TD-3/TD-4). 409 rather than 502/504 because
@@ -5615,7 +6080,7 @@ async def run_step(
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
     except (
-        KiroPhase0KASError,
+        KiroV3Refusal,
         KiroCapabilityError,
         KiroAgentPathError,
         KiroAgentIdentityError,
@@ -8242,6 +8707,175 @@ async def get_workflow_run_result_endpoint(
     return body
 
 
+# --- Run artifacts: read a report file a run was TOLD to write ------------------------
+#
+# A workflow commonly takes an input such as ``report=/tmp/report.md`` and writes its
+# deliverable there. These two routes let the web UI show that file without a shell.
+#
+# THREAT MODEL. This must not become an arbitrary file-read primitive, so a caller never
+# supplies a path. It names an INPUT of an existing run; the path is whatever that run's
+# durable ``inputs_json`` recorded at admission. The value is then only readable when its
+# fully resolved target (``os.path.realpath``, so every symlink is followed) is a regular
+# ``.md`` file DIRECTLY inside the artifact root (the system temp dir by default), and no
+# larger than ``WORKFLOW_ARTIFACT_MAX_BYTES``. A symlink placed in the root that points
+# elsewhere resolves outside it and is refused; ``O_NOFOLLOW`` on the open plus an
+# ``fstat`` regular-file check close the swap-after-check window.
+#
+# What remains readable: a ``.md`` file in the temp dir whose path some caller with
+# workflow-run scope chose as a run input. Starting a run already needs a scope at least
+# as wide as reading one, and a run's agents can read the temp dir themselves, so the
+# route grants no reach those callers lacked. Run-level outputs are not journaled (see
+# the ``/result`` docstring), so only declared inputs are eligible.
+
+WORKFLOW_ARTIFACT_MAX_BYTES = 256 * 1024
+WORKFLOW_ARTIFACT_SUFFIX = ".md"
+
+
+def _workflow_artifact_root() -> str:
+    """The one directory artifact reads are confined to (resolved; tests monkeypatch it)."""
+    import tempfile
+
+    return os.path.realpath(tempfile.gettempdir())
+
+
+def _run_input_values(run_id: str) -> Dict[str, Any]:
+    """The run's recorded inputs as a dict; 404 for an unknown run, ``{}`` if unparseable."""
+    from cli_agent_orchestrator.services import workflow_journal
+
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    try:
+        inputs = json.loads(row.inputs_json or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return inputs if isinstance(inputs, dict) else {}
+
+
+def _confined_artifact_path(value: str) -> Optional[str]:
+    """Resolved path when ``value`` names a ``.md`` directly in the artifact root, else None.
+
+    Pure path arithmetic - no existence check, no read. An absent file is still a confined
+    path (the caller reports 404 for it); a relative value is never confined, so a run
+    started from some working directory cannot make this resolve against the server's.
+    """
+    if not os.path.isabs(value):
+        return None
+    resolved = os.path.realpath(value)
+    if os.path.dirname(resolved) != _workflow_artifact_root():
+        return None
+    if not resolved.lower().endswith(WORKFLOW_ARTIFACT_SUFFIX):
+        return None
+    return resolved
+
+
+@app.get("/workflows/runs/{run_id}/artifacts")
+async def list_workflow_run_artifacts_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List the run inputs that name a readable report file (for the web UI's View report).
+
+    Returns ``{"run_id", "artifacts": [{"input", "path", "available", "size"}]}``: one row per
+    string input whose value passes the confinement rule of the artifact read (see the
+    threat model above). ``path`` echoes the recorded input value, not the resolved
+    target. ``available`` is true when the target exists as a regular file within the size
+    cap, and ``size`` is its byte size (``None`` when absent). Unknown run -> 404.
+    """
+    inputs = await asyncio.to_thread(_run_input_values, run_id)
+    artifacts: List[Dict[str, Any]] = []
+    for name, value in inputs.items():
+        if not isinstance(value, str):
+            continue
+        resolved = _confined_artifact_path(value)
+        if resolved is None:
+            continue
+        size: Optional[int] = None
+        available = False
+        try:
+            st = os.stat(resolved)
+            if stat.S_ISREG(st.st_mode):
+                size = st.st_size
+                available = size <= WORKFLOW_ARTIFACT_MAX_BYTES
+        except OSError:
+            pass
+        artifacts.append({"input": name, "path": value, "available": available, "size": size})
+    return {"run_id": run_id, "artifacts": artifacts}
+
+
+@app.get("/workflows/runs/{run_id}/artifacts/{input_name}")
+async def get_workflow_run_artifact_endpoint(
+    run_id: str,
+    input_name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the text of the report file a run input names (see the threat model above).
+
+    ``{"run_id", "input", "path", "size", "content"}``; ``content`` is UTF-8 with invalid
+    bytes replaced. Errors: unknown run 404; ``input_name`` not a string input of the run
+    400; value not a ``.md`` directly in the artifact root (after resolving symlinks) 403;
+    no such regular file 404; larger than ``WORKFLOW_ARTIFACT_MAX_BYTES`` 413 - refused
+    rather than truncated, so a reader never mistakes a prefix for the whole report.
+    """
+    inputs = await asyncio.to_thread(_run_input_values, run_id)
+    value = inputs.get(input_name)
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{input_name}' is not a string input of run '{run_id}'",
+        )
+    resolved = _confined_artifact_path(value)
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"input '{input_name}' does not name a {WORKFLOW_ARTIFACT_SUFFIX} file directly "
+                "in the workflow artifact directory"
+            ),
+        )
+
+    def _read() -> Dict[str, Any]:
+        try:
+            # O_NONBLOCK so a FIFO named like a report opens at once instead of blocking
+            # this worker thread until a writer appears; the fstat check then refuses it.
+            # It changes nothing for a regular file.
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            fd = os.open(resolved, flags)
+        except FileNotFoundError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such report file")
+        except OSError:
+            # O_NOFOLLOW refuses a symlink swapped in after the realpath check (ELOOP).
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="report file refused")
+        # Check the descriptor before wrapping it: os.fdopen refuses a directory with
+        # IsADirectoryError, which would surface as a 500 instead of a 404.
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such report file")
+        with os.fdopen(fd, "rb") as fh:
+            if st.st_size > WORKFLOW_ARTIFACT_MAX_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"report is {st.st_size} bytes; the limit is {WORKFLOW_ARTIFACT_MAX_BYTES}",
+                )
+            data = fh.read(WORKFLOW_ARTIFACT_MAX_BYTES + 1)
+        if len(data) > WORKFLOW_ARTIFACT_MAX_BYTES:
+            # Grew between fstat and read: same refusal, never a silent prefix.
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"report exceeds the {WORKFLOW_ARTIFACT_MAX_BYTES}-byte limit",
+            )
+        return {
+            "run_id": run_id,
+            "input": input_name,
+            "path": value,
+            "size": len(data),
+            "content": data.decode("utf-8", errors="replace"),
+        }
+
+    return await asyncio.to_thread(_read)
+
+
 @app.post("/workflows/runs/{run_id}/cancel")
 async def cancel_workflow_run_endpoint(
     run_id: str,
@@ -8734,6 +9368,7 @@ async def delete_terminal(
             terminal_service.delete_terminal,
             terminal_id,
             registry=get_plugin_registry(request),
+            end_reason="deleted",
         )
         if not success:
             raise HTTPException(
@@ -10118,6 +10753,9 @@ class OutcomeCreateBody(BaseModel):
     source_terminal_id: Optional[str] = None
     score: Optional[int] = None
     friction_notes: str = ""
+    # Issue #1082: joins this outcome to one launch record. The route checks
+    # the binding against the stored record (see create_outcome_endpoint).
+    launch_terminal_id: Optional[str] = None
 
 
 def _require_learning_enabled() -> None:
@@ -10165,6 +10803,7 @@ async def create_outcome_endpoint(
     )
 
     _require_learning_enabled()
+    link_record_id = _bound_launch_record_id(body)
     try:
         outcome = OutcomeService().record_outcome(
             session_name=body.session_name,
@@ -10187,7 +10826,74 @@ async def create_outcome_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    return {"success": True, "outcome": outcome}
+    if not body.launch_terminal_id:
+        return {"success": True, "outcome": outcome}
+    launch_linked = False
+    if link_record_id is not None:
+        # Best-effort join: never turns a recorded outcome into a failed
+        # response. ``link_launch_outcome`` already swallows its own
+        # exceptions; this try/except is defense in depth so a bad value can
+        # never surface as a 500 on an outcome already committed above.
+        try:
+            from cli_agent_orchestrator.clients.database import link_launch_outcome
+
+            launch_linked = link_launch_outcome(
+                link_record_id, body.success, cast(str, body.source_terminal_id)
+            )
+        except Exception as e:
+            logger.warning(f"Launch outcome link failed for {body.launch_terminal_id}: {e}")
+    return {"success": True, "outcome": outcome, "launch_linked": launch_linked}
+
+
+def _bound_launch_record_id(body: OutcomeCreateBody) -> Optional[int]:
+    """Authorise an outcome's launch link from the stored launch record (issue #1082).
+
+    Runs before the outcome is written, so a refusal writes nothing. The
+    stored record, which outlives teardown, is the authority, not the live
+    terminal row: a link is allowed only for a self-report or from the
+    launch's direct creator (its recorded ``caller_id``). The MCP tool's own
+    pre-check only stops live outsiders early.
+
+    - Records exist for the id but none is bound to the reporter: 403.
+    - ``launch_terminal_id`` without ``source_terminal_id``: 403 (fail closed).
+    - No record for the id (a remote worker's record lives on its own node, a
+      best-effort write failed, or it predates this table), or the binding
+      read raises: returns None, so the outcome is written but not linked.
+
+    Same trust class as #912: ``source_terminal_id`` is asserted by the
+    client and this API authorises by scope only, so this stops a confused or
+    prompt-injected agent working through the tool, not a direct HTTP caller
+    holding ``cao:write``.
+    """
+    if not body.launch_terminal_id:
+        return None
+    if not body.source_terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Refusing to link an outcome to launch {body.launch_terminal_id}: "
+                "no source_terminal_id names the reporter."
+            ),
+        )
+    try:
+        from cli_agent_orchestrator.clients.database import find_bound_launch_record
+
+        record_id, any_records = find_bound_launch_record(
+            body.launch_terminal_id, body.source_terminal_id
+        )
+    except Exception as e:
+        logger.warning(f"Launch outcome binding read failed for {body.launch_terminal_id}: {e}")
+        return None
+    if record_id is None and any_records:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Terminal {body.source_terminal_id} may not report an outcome for launch "
+                f"{body.launch_terminal_id}: only that terminal itself or the terminal that "
+                "created it may; refusing."
+            ),
+        )
+    return record_id
 
 
 class LessonCreateBody(BaseModel):
@@ -10636,6 +11342,9 @@ def main():
     # ``uvicorn.error`` for WebSocket handshakes -- by
     # ``install_access_log_redaction()``, installed in the app lifespan so both
     # ``cao-server`` and ``uvicorn ...:app`` are covered.
+    from cli_agent_orchestrator.services.agui.ambient_run import install_uvicorn_exit_hook
+
+    install_uvicorn_exit_hook()
     uvicorn.run(
         app,
         host=host,

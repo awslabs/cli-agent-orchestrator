@@ -224,7 +224,11 @@ def test_A_C3_A_C4_A_C5_A_C9_refusals(create_store, fault, rule, caplog):
             "auto_requires_bounds",
             ("model_tier=auto", "ephemeral.min_tier", "ephemeral.max_tier"),
         ),
-        ("effort", "auto_requires_decision_platform", ("effort",)),
+        (
+            "effort",
+            "auto_requires_bounds",
+            ("effort=auto", "ephemeral.min_effort", "ephemeral.max_effort"),
+        ),
     ],
 )
 def test_A_C6_auto_before_provider(create_store, field, rule, named):
@@ -465,7 +469,7 @@ def test_B_C2_effort_order_and_ceiling(create_store):
     )
     assert "effort=high" in err.detail and "ephemeral.max_effort=medium" in err.detail
     assert_no_create(
-        create_store, {**SPEC, "provider": "kiro_cli", "effort": "low"}, "provider_unsupported"
+        create_store, {**SPEC, "provider": "kimi_cli", "effort": "low"}, "provider_unsupported"
     )
 
 

@@ -345,7 +345,8 @@ if ENABLE_WORKING_DIRECTORY:
             description='Optional working directory where the agent should execute (e.g., "/path/to/workspace/src/Package")',
         ),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -386,7 +387,9 @@ if ENABLE_WORKING_DIRECTORY:
         3. Send the message to the terminal
         4. Monitor until completion
         5. Return the agent's response
-        6. Clean up the terminal with /exit
+        6. Report the teardown outcome. On success the result states whether the
+           worker terminal was torn down. On a timeout or worker error it names the
+           terminal and job and states the terminal was not torn down.
 
         ## Working Directory
 
@@ -462,7 +465,8 @@ else:
             le=3600,
         ),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -501,7 +505,9 @@ else:
         2. Send the message to the terminal (starts in supervisor's current directory)
         3. Monitor until completion
         4. Return the agent's response
-        5. Clean up the terminal with /exit
+        5. Report the teardown outcome. On success the result states whether the
+           worker terminal was torn down. On a timeout or worker error it names the
+           terminal and job and states the terminal was not torn down.
 
         ## Model
 
@@ -648,7 +654,8 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Optional working directory where the agent should execute"
         ),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -693,7 +700,8 @@ else:
         ),
         message: str = Field(description=_assign_message_field_desc),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -786,7 +794,10 @@ async def assign_elastic(
             "contains."
         ),
     ),
-    engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
+    engine: Optional[str] = Field(
+        default=None,
+        description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
+    ),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
     description: Annotated[
         Optional[str],
@@ -1016,9 +1027,10 @@ async def emit_ui(
 
     Lets an agent author a small, declarative UI intent (an approval card, a
     choice prompt, a diff summary, a progress/metric readout, …) that appears
-    live in any AG-UI client watching this fleet. The intent is validated
-    server-side against a frozen allow-list — arbitrary HTML/markup is never
-    accepted — so this is safe to call from any agent.
+    live on the fleet's AG-UI stream as a ``CUSTOM`` event named
+    ``cao.generative_ui``; a dashboard that handles that name renders it. The
+    intent is validated server-side against a frozen allow-list — arbitrary
+    HTML/markup is never accepted — so this is safe to call from any agent.
 
     Args:
         component: One of the allow-listed component names.
@@ -1769,7 +1781,7 @@ async def create_ephemeral_agent(
         WithJsonSchema(
             {
                 "anyOf": [
-                    {"type": "string", "enum": list(ephemeral_providers())},
+                    {"type": "string", "enum": [*ephemeral_providers(), "auto"]},
                     {"type": "null"},
                 ]
             }
@@ -1806,7 +1818,9 @@ async def create_ephemeral_agent(
     The CAO-recorded tool list is bounded by the creator's effective list.
     This is not an OS privilege boundary or a per-tool MCP restriction.
     Codex tools are advisory when the operator enables Codex, and the response's
-    ``enforcement`` field reports ``hard`` or ``advisory``. The feature defaults
+    ``enforcement`` field reports ``hard`` or ``advisory``. ``provider="auto"`` lets
+    the operator's decider choose the CLI at launch, within the operator's declared
+    provider sets; it falls back to your own provider. The feature defaults
     off; see docs/ephemeral-agents.md for the full honesty statement.
     """
     return await _create_ephemeral_from_arguments(
@@ -2272,6 +2286,16 @@ async def report_outcome(
             "Conclusions only — never transcripts, logs, or file contents. Max 1000 chars."
         ),
     ),
+    terminal_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Join this outcome to one launch (issue #1082): the terminal id of the "
+            "worker this unit of work was performed by. Must be your own terminal "
+            "or one you created directly via assign/handoff (still allowed after it "
+            "was deleted); anything else is refused. The result's launch_linked "
+            "says whether a launch record was joined."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Record the outcome of a unit of agent work (self-learning signal).
 
@@ -2289,6 +2313,13 @@ async def report_outcome(
                 "success": False,
                 "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
             }
+        if terminal_id:
+            # Stops a live outsider before anything is posted. POST /outcomes
+            # is the authority: it re-checks against the stored launch record,
+            # which also covers a torn-down target this lookup cannot see.
+            denial = _target_binding_denial(terminal_id)
+            if denial:
+                return {"success": False, "error": denial}
         payload = mcp_utils.post_body_json(
             "/outcomes",
             {
@@ -2300,12 +2331,16 @@ async def report_outcome(
                 "source_terminal_id": terminal_context["terminal_id"],
                 "score": score,
                 "friction_notes": friction_notes,
+                "launch_terminal_id": terminal_id,
             },
             timeout=_mcp_timeout(),
         )
         # Only the id: the route returns the whole record, and echoing it would
         # newly surface friction_notes back to the agent that wrote them.
-        return {"success": True, "outcome_id": payload["outcome"]["id"]}
+        result: Dict[str, Any] = {"success": True, "outcome_id": payload["outcome"]["id"]}
+        if terminal_id:
+            result["launch_linked"] = payload.get("launch_linked") is True
+        return result
     except requests.RequestException as e:
         return _outcome_tool_error(e, "Failed to record outcome")
     except Exception as e:

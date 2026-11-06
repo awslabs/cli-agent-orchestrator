@@ -20,6 +20,7 @@ import logging
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -33,12 +34,16 @@ _BACKOFF_MULTIPLIER = 2.0
 _KIRO_WORKING_THRESHOLD = 30.0  # seconds
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _delete_ghost_terminal_row(terminal_id: str) -> None:
     """Release a deleted ghost without altering reconciler sidecar handling."""
     from cli_agent_orchestrator.clients.database import delete_terminal
     from cli_agent_orchestrator.services import ephemeral_service
 
-    if delete_terminal(terminal_id):
+    if delete_terminal(terminal_id, end_reason="pane_closed"):
         ephemeral_service.release(terminal_id, "terminal_gone")
 
 
@@ -168,6 +173,11 @@ class HerdrInboxService:
         self._kiro_terminals: Set[str] = set()  # terminal_ids using kiro-cli
         self._working_since: Dict[str, float] = {}  # terminal_id → timestamp
 
+        # Busy-time accounting (issue #1082): the status last recorded per
+        # managed terminal. herdr repeats pane.updated for an unchanged
+        # agent_status, so only a change is written.
+        self._last_recorded_status: Dict[str, str] = {}  # terminal_id → status value
+
         # Workspace tracking for lifecycle events
         self._workspace_to_session: Dict[str, str] = {}  # workspace_id → session_name
         # A workspace-close cleanup whose DB read/teardown could not complete is
@@ -236,6 +246,7 @@ class HerdrInboxService:
             self._pane_to_terminal.pop(pane_id, None)
         self._kiro_terminals.discard(terminal_id)
         self._working_since.pop(terminal_id, None)
+        self._last_recorded_status.pop(terminal_id, None)
         logger.info(f"Unregistered terminal {terminal_id}")
 
     async def start(self) -> None:
@@ -435,7 +446,7 @@ class HerdrInboxService:
                     )
                     continue
                 try:
-                    if teardown_terminal(terminal_id) is False:
+                    if teardown_terminal(terminal_id, end_reason="pane_closed") is False:
                         complete = False
                         logger.warning(
                             "workspace.closed: cleanup deferred for terminal %s", terminal_id
@@ -455,6 +466,7 @@ class HerdrInboxService:
                 self._pane_to_terminal.pop(pane_id, None)
             self._kiro_terminals.discard(terminal_id)
             self._working_since.pop(terminal_id, None)
+            self._last_recorded_status.pop(terminal_id, None)
         return complete
 
     def _retry_pending_closed_sessions(self) -> None:
@@ -809,6 +821,7 @@ class HerdrInboxService:
                 self._terminal_to_pane.pop(terminal_id, None)
                 self._kiro_terminals.discard(terminal_id)
                 self._working_since.pop(terminal_id, None)
+                self._last_recorded_status.pop(terminal_id, None)
                 _retain_deferred_failure_tombstone(
                     terminal_id, on_cleanup_deferred=self._pending_tombstone_runtime_cleanup.add
                 )
@@ -866,6 +879,7 @@ class HerdrInboxService:
             self._terminal_to_pane.pop(terminal_id, None)
             self._kiro_terminals.discard(terminal_id)
             self._working_since.pop(terminal_id, None)
+            self._last_recorded_status.pop(terminal_id, None)
 
             if _retain_deferred_failure_tombstone(
                 terminal_id, on_cleanup_deferred=self._pending_tombstone_runtime_cleanup.add
@@ -951,11 +965,45 @@ class HerdrInboxService:
                 self._working_since.pop(terminal_id, None)
                 self._deliver(terminal_id)
                 delivered += 1
+            # A transition missed while disconnected surfaces here as the
+            # pane's current status (issue #1082 busy time).
+            await self._record_agent_status(terminal_id, pane.get("agent_status"), _utcnow())
 
         if delivered:
             logger.info("Settled-pane sweep: triggered delivery for %d pane(s)", delivered)
         else:
             logger.debug("Settled-pane sweep: no settled managed panes")
+
+    async def _record_agent_status(
+        self, terminal_id: str, agent_status: object, observed_at: datetime
+    ) -> None:
+        """Persist a managed pane's agent_status change for busy time (issue #1082).
+
+        herdr's own events are the source for herdr terminals: a transition is
+        recorded when herdr reports it, not when some caller happens to poll
+        ``get_status()``, which would leave a finished turn counted as busy
+        until the next poll. Deduplicated per terminal. The entry moves before
+        the write, so a failed best-effort write drops that one transition
+        rather than retrying it. The write runs off the event loop, stamped
+        with ``observed_at``.
+        """
+        from cli_agent_orchestrator.backends.herdr_backend import (
+            HERDR_AGENT_STATUS_TO_TERMINAL_STATUS,
+        )
+        from cli_agent_orchestrator.clients.database import record_launch_status_event
+
+        if not isinstance(agent_status, str):
+            return
+        status = HERDR_AGENT_STATUS_TO_TERMINAL_STATUS.get(agent_status)
+        if status is None or self._last_recorded_status.get(terminal_id) == status.value:
+            return
+        self._last_recorded_status[terminal_id] = status.value
+        try:
+            await asyncio.to_thread(
+                record_launch_status_event, terminal_id, status.value, observed_at
+            )
+        except Exception:
+            logger.debug("Launch status event recording failed for %s", terminal_id, exc_info=True)
 
     async def _connect(self) -> None:
         """Connect to the herdr socket."""
@@ -1014,6 +1062,9 @@ class HerdrInboxService:
             # matched herdr's real wire format — lifecycle cleanup silently never ran.)
             raw_event = event.get("event", "") or event.get("type", "")
             event_name = raw_event.replace("_", ".")
+            # Read before any dispatch below, so a busy-time transition is
+            # stamped when herdr reported it, not when its write lands.
+            observed_at = _utcnow()
 
             # Handle lifecycle events
             if event_name in ("pane.closed", "workspace.closed"):
@@ -1047,6 +1098,8 @@ class HerdrInboxService:
                 if terminal_id in self._kiro_terminals:
                     if terminal_id not in self._working_since:
                         self._working_since[terminal_id] = time.time()
+
+            await self._record_agent_status(terminal_id, status, observed_at)
 
     def _label_still_live(self, window_name: str) -> Optional[bool]:
         """Return tab liveness, or None when Herdr cannot establish it.
@@ -1215,6 +1268,7 @@ class HerdrInboxService:
                 self._terminal_to_pane.pop(terminal_id, None)
                 self._kiro_terminals.discard(terminal_id)
                 self._working_since.pop(terminal_id, None)
+                self._last_recorded_status.pop(terminal_id, None)
                 if _retain_deferred_failure_tombstone(
                     terminal_id, on_cleanup_deferred=self._pending_tombstone_runtime_cleanup.add
                 ):
@@ -1224,7 +1278,7 @@ class HerdrInboxService:
                     )
                 else:
                     try:
-                        teardown_terminal(terminal_id)
+                        teardown_terminal(terminal_id, end_reason="pane_closed")
                     except Exception as cleanup_exc:  # noqa: BLE001 — lifecycle is best-effort
                         logger.warning(
                             "pane.closed: DB-outage cleanup failed for terminal %s: %s",
@@ -1274,6 +1328,7 @@ class HerdrInboxService:
             self._terminal_to_pane.pop(terminal_id, None)
             self._kiro_terminals.discard(terminal_id)
             self._working_since.pop(terminal_id, None)
+            self._last_recorded_status.pop(terminal_id, None)
 
             # Creation-time external ownership protects the interval BEFORE a
             # failure marker is persisted; the durable failure protects it
@@ -1292,7 +1347,7 @@ class HerdrInboxService:
                 # direct DB delete, so a Grok private home can return explicit
                 # deferred cleanup and retain its terminal row for retry.
                 try:
-                    if teardown_terminal(terminal_id) is False:
+                    if teardown_terminal(terminal_id, end_reason="pane_closed") is False:
                         logger.warning("pane.closed: cleanup deferred for terminal %s", terminal_id)
                 except Exception as e:
                     logger.warning(f"pane.closed: failed to delete terminal {terminal_id}: {e}")

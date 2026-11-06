@@ -10,15 +10,17 @@ silence still arrives exactly once.
 from __future__ import annotations
 
 import asyncio
+from test._support.agui_stream_harness import LegacyFramingClient
 
 import pytest
-from fastapi.testclient import TestClient
 
 import cli_agent_orchestrator.api.main as main
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.services.agui import run_plane
 
-client = TestClient(app, base_url="http://localhost")
+# These tests pin the deprecated legacy wire (?framing=cao-legacy); the conformant
+# AG-UI 1.0 stream is covered by test_agui_stream_conformance.py.
+client = LegacyFramingClient(app, base_url="http://localhost")
 
 _EVENT = {
     "id": "evt-late",

@@ -180,7 +180,7 @@ class TestReconnectResume:
             # ``since`` is delegated to requests via ``params`` (which URL-encodes
             # it) rather than hand-concatenated into the URL string.
             assert "since" not in url_called
-            assert params == {"since": "2024-01-01T00:00:00Z"}
+            assert params == {"since": "2024-01-01T00:00:00Z", "framing": "cao-legacy"}
 
     def test_since_offset_timestamp_is_url_encoded(self):
         # ISO-8601 offsets contain ``+00:00``; a raw ``?since=`` string sends
@@ -195,7 +195,7 @@ class TestReconnectResume:
             list(reader.frames())
             url_called = mock_get.call_args[0][0]
             params = mock_get.call_args[1]["params"]
-            assert params == {"since": since}
+            assert params == {"since": since, "framing": "cao-legacy"}
 
         # Prove requests encodes the offset correctly (no server needed): the
         # prepared URL must carry ``%2B`` and never a raw ``+`` or space.
@@ -203,6 +203,17 @@ class TestReconnectResume:
         prepared.prepare_url(url_called, params)
         assert "since=2024-01-01T00%3A00%3A00%2B00%3A00" in prepared.url
         assert "+00:00" not in prepared.url
+
+
+class TestLegacyFramingPin:
+    """The reader parses the named-event legacy wire, so it asks for it explicitly."""
+
+    def test_reader_requests_the_legacy_framing(self):
+        reader = AguiStreamReader("http://localhost:8420")
+        with patch("cli_agent_orchestrator.services.agui.stream_reader.requests.get") as mock_get:
+            mock_get.return_value = _FakeResponse(["id: e1", "event: A", "data: {}", ""])
+            list(reader.frames())
+            assert mock_get.call_args[1]["params"] == {"framing": "cao-legacy"}
 
 
 class TestMalformedLineTolerance:
