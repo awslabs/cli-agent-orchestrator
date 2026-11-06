@@ -26,6 +26,15 @@ is not a valid `RunAgentInput` gets HTTP 422 before the stream starts.
 
 **Requires:** `CAO_AGUI_ENABLED=true`
 
+## Capabilities
+
+`GET /agui/v1/capabilities` returns the run plane's AG-UI 1.0
+`AgentCapabilities` object, so a client can check what the run plane supports
+before it sends a run. Like the other AG-UI routes it returns 404 unless
+`CAO_AGUI_ENABLED` is set, and needs `cao:read` when auth is on. A field left
+out is undeclared, not unsupported. The full object is in `docs/agui.md`
+(Capabilities).
+
 ## Lifecycle Frames
 
 Every run ends, and the response body closes right after its last frame (a
@@ -55,11 +64,10 @@ prompt as an interrupt. Live fleet activity is the ambient plane,
 | `STATE_SNAPSHOT` | Initial fleet state (always first after RUN_STARTED) |
 | `STATE_DELTA` | Incremental fleet updates |
 | `TOOL_CALL_START` | An orchestration tool was invoked |
-| `TOOL_CALL_END` | Tool completed (with `closed_by` disposition) |
+| `TOOL_CALL_END` | Tool completed (`toolCallId` only) |
 | `TOOL_CALL_RESULT` | Tool output |
 | `CUSTOM` (`name: "cao.generative_ui"`) | Your `emit_ui` intents, with `value` = `{component, props, ...}` |
-| `Interrupt` | Approval prompt — stream pauses until resumed |
-| `RUN_FINISHED` | Normal completion |
+| `RUN_FINISHED` | Run ends: `outcome.type` is `success`, or `interrupt` with the pending approval prompts in `outcome.interrupts` (see Interrupts) |
 | `RUN_ERROR` | Error (delivery failure, timeout, etc.) |
 
 ### Heartbeat
@@ -72,28 +80,56 @@ an event source into `run_plane_stream`; `POST /agui/v1/run` does not.
 ## Interrupts
 
 When a terminal enters `WAITING_USER_ANSWER`, CAO records an interrupt. The
-next run ends with `RUN_FINISHED` whose `outcome.interrupts` lists it. Each
-interrupt carries:
+next run ends with `RUN_FINISHED` whose `outcome.interrupts` lists it. An
+interrupt is not an event of its own and has no `type` field (the 1.0 schema
+closes `Interrupt`, so an extra key is invalid). This is a real frame from the
+run plane, with one interrupt raised by a `kiro_cli` terminal:
 
 ```json
 {
-  "type": "Interrupt",
-  "id": "<interrupt_id>",
-  "metadata": {
-    "terminalId": "<terminal_id>",
-    "sessionName": "<session_name>",
-    "reason": "<classified_reason>"
-  },
-  "responseSchema": {
-    "type": "object",
-    "properties": {
-      "approved": {"type": "boolean"},
-      "editedArgs": {"type": "string"}
-    },
-    "required": ["approved"]
+  "type": "RUN_FINISHED",
+  "threadId": "thread-m13",
+  "runId": "run-m13",
+  "outcome": {
+    "type": "interrupt",
+    "interrupts": [
+      {
+        "subagentRunId": "terminal:aaaa1111",
+        "id": "262ec508-7e0e-4c0a-977b-51d9585bc63d",
+        "reason": "kiro:permission_request",
+        "message": "",
+        "responseSchema": {
+          "type": "object",
+          "properties": {
+            "approved": {"type": "boolean", "description": "true=approve, false=deny"},
+            "editedArgs": {
+              "type": "string",
+              "description": "edited answer text, typed into the agent's prompt in place of yes/no"
+            }
+          },
+          "required": ["approved"]
+        },
+        "metadata": {
+          "provider": "kiro_cli",
+          "terminalId": "aaaa1111",
+          "sessionName": "s-1",
+          "options": ["approve", "deny", "edit"]
+        }
+      }
+    ]
   }
 }
 ```
+
+- `reason` is top-level: the classified prompt, `<provider>:<kind>`.
+- `message` is the prompt text CAO could extract, which may be empty.
+- `metadata` holds CAO's own detail: `provider`, `terminalId`, `sessionName`
+  and the `options` the prompt offers.
+- `subagentRunId` is `terminal:<id>`, the id the ambient stream
+  (`GET`/`POST /agui/v1/stream`) gives that terminal's `SUBAGENT_STARTED`, so a
+  client can tie the prompt to the invocation it already shows. It is absent,
+  never null, when an interrupt has no terminal. `RUN_*` frames never carry it.
+- `expiresAt` appears only when CAO knows a deadline, which today it does not.
 
 `responseSchema` is built per interrupt. `editedArgs` appears only when that
 interrupt offers `edit`, and it is the edited answer text typed into the
@@ -143,11 +179,17 @@ agent's prompt, not replacement tool arguments.
 
 ## Replay Contract
 
-`GET /agui/v1/stream?since=<ISO-8601>` replays events from the given timestamp.
-- `since` must be valid ISO-8601 (datetime comparison, not lexicographic)
-- Malformed `since` → HTTP 400
-- Reconnecting with `Last-Event-ID` deduplicates via `AguiStreamReader`
-- Multi-frame records get derived ids (`<rid>.<i>`) for correct dedup
+Each connection to `GET`/`POST /agui/v1/stream` is a new AG-UI run. A cursor
+(a CAO extension) only chooses which buffered records that run narrates first,
+before its `STATE_SNAPSHOT`:
+- `since` (`?since=` on GET, `forwardedProps.cao.since` on POST) must be valid
+  ISO-8601 (datetime comparison, not lexicographic); malformed → HTTP 400
+- `Last-Event-ID` (sent by a browser `EventSource` on its own) replays the
+  records after that id
+- Multi-frame records get derived ids (`<rid>.<i>`) on all but their last frame;
+  a `<rid>.<i>` cursor replays that record whole
+- `?framing=cao-legacy` serves the deprecated pre-1.0 wire, which
+  `AguiStreamReader` requests
 
 ## Observing the stream (read-only)
 

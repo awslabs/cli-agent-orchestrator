@@ -2,6 +2,7 @@
 
 import fnmatch
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -213,3 +214,60 @@ def validate_skill_folder(path: Path) -> SkillMetadata:
     """Validate a skill folder at an arbitrary filesystem path."""
     metadata, _ = _load_skill_folder(path)
     return metadata
+
+
+#: Agent Skills limits (agentskills.io). CAO's loader does not enforce these, so a
+#: skill that breaks one still loads here and may be rejected by another client.
+#: The values and the codes in :func:`agent_skills_limit_violations` match
+#: ``skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py``.
+AGENT_SKILLS_NAME_PATTERN = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+AGENT_SKILLS_NAME_MAX = 64
+AGENT_SKILLS_DESCRIPTION_MAX = 1024
+AGENT_SKILLS_BODY_MAX_LINES = 500
+AGENT_SKILLS_LIMIT_CODES = frozenset(
+    {"skill.name_pattern", "skill.name_length", "skill.description_length", "skill.body_length"}
+)
+
+
+def agent_skills_limit_violations(path: Path) -> List[Tuple[str, str]]:
+    """Return ``(code, message)`` for each Agent Skills limit a valid skill breaks.
+
+    ``path`` must already pass :func:`validate_skill_folder`. The body is counted
+    the way the audit skill counts it: the Markdown after the closing frontmatter
+    delimiter, stripped, in lines.
+    """
+    metadata, content = _load_skill_folder(path)
+    name, description = metadata.name, metadata.description
+    body_lines = len(content.splitlines())
+    violations: List[Tuple[str, str]] = []
+    if not AGENT_SKILLS_NAME_PATTERN.fullmatch(name):
+        violations.append(
+            (
+                "skill.name_pattern",
+                f"name {name!r} fails the Agent Skills pattern ^[a-z0-9]+(-[a-z0-9]+)*$",
+            )
+        )
+    if len(name) > AGENT_SKILLS_NAME_MAX:
+        violations.append(
+            (
+                "skill.name_length",
+                f"name is {len(name)} characters; the limit is {AGENT_SKILLS_NAME_MAX}",
+            )
+        )
+    if len(description) > AGENT_SKILLS_DESCRIPTION_MAX:
+        violations.append(
+            (
+                "skill.description_length",
+                f"description is {len(description)} characters; "
+                f"the limit is {AGENT_SKILLS_DESCRIPTION_MAX}",
+            )
+        )
+    if body_lines > AGENT_SKILLS_BODY_MAX_LINES:
+        violations.append(
+            (
+                "skill.body_length",
+                f"body is {body_lines} lines after the frontmatter; "
+                f"the limit is {AGENT_SKILLS_BODY_MAX_LINES}",
+            )
+        )
+    return violations

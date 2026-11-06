@@ -541,7 +541,8 @@ jobs:
       - name: Record dog-food demo (asserts the plugin pipeline; gates on drift)
         # Runs run.sh OFFLINE (no provider binary, network, or secrets) — CAO
         # installing its own `cao` plugin through its own pipeline — and asserts
-        # validate/add/install(Kiro+OpenCode)/remove, exporting
+        # validate/add/install(Kiro+OpenCode)/remove, then validate/add/remove for
+        # every other package in build_agent_plugin.py's PACKAGES, exporting
         # docs/media/agent-plugins-dogfood-demo.gif. A non-zero exit or a missing
         # PASS marker (the pipeline regressed) fails this job — the shift-left
         # gate. The live OpenCode observational step (CAO_DOGFOOD_LIVE=1, needs
@@ -586,6 +587,9 @@ jobs:
         # Boots a CAO_AGUI_ENABLED cao-server with a keyless mock_cli fleet,
         # POSTs a RunAgentInput to /agui/v1/run with the pinned @ag-ui/client
         # HttpAgent, and asserts a live frame is received (AC3 / spec task 17.2).
+        # It then checks the ambient stream (GET/POST /agui/v1/stream) with the
+        # same SDK's verifyEvents (verify-ambient.mjs): the streams the
+        # conformance tests capture, plus one live HttpAgent run.
         # Non-zero exit fails the job; the script cleans up the server on exit.
         run: ./examples/ag-ui/ag-ui-stock-client-live/run.sh
 

@@ -711,6 +711,25 @@ def _discover_skills(root_dir: Path) -> Tuple[List[DiscoveredSkill], List[Findin
             findings.append(tree_finding)
             continue
 
+        # The Agent Skills limits CAO's loader does not check (#1154). WARNING,
+        # not SKIPPED: CAO loads and delivers such a skill, but another client may
+        # reject the same package, so the author is told and nothing is dropped.
+        from cli_agent_orchestrator.utils.skills import agent_skills_limit_violations
+
+        for code, detail in agent_skills_limit_violations(child):
+            findings.append(
+                Finding(
+                    severity=Severity.WARNING,
+                    code=code,
+                    spec_ref="§7.1",
+                    message=(
+                        f"Skill '{child.name}' breaks an Agent Skills limit CAO does not "
+                        f"enforce, so another client may reject it: {detail}"
+                    ),
+                    path=f"{rel}/SKILL.md",
+                )
+            )
+
         discovered.append(
             DiscoveredSkill(
                 name=metadata.name,

@@ -1,8 +1,11 @@
 """AG-UI event-stream adapter for CAO.
 
 
-AG-UI clients (CopilotKit, the AG-UI Dojo, or a plain ``EventSource``) consume
-``GET /agui/v1/stream`` as an SSE stream of AG-UI typed events.
+This module is the per-record mapping behind the **legacy framing** of
+``GET /agui/v1/stream`` (``?framing=cao-legacy``): named ``event:`` frames with
+snake_case data. The default, AG-UI 1.0 conformant stream
+(``services/agui/ambient_run.py``) reuses its generative-UI extraction and its
+``to_agui_event`` mapping for ``RAW`` frames.
 
 Semantic event vocabulary
 =========================
@@ -124,6 +127,20 @@ _PRIMITIVE_KINDS = frozenset(
 )
 
 
+# The ``detail`` key the EventLogPublisher stamps a session record with: that
+# session's AG-UI ``subagentRunId`` (a hash, never the raw incarnation id), so the
+# conformant stream attributes a replayed record to the incarnation it was logged
+# under (``services/agui/ambient_run.py``). It is for that stream only: every
+# mapping here drops it, which keeps the legacy framing byte-identical.
+SESSION_SUBAGENT_RUN_ID_KEY = "session_subagent_run_id"
+
+
+def _without_stamp(detail: Dict[str, Any]) -> Dict[str, Any]:
+    if SESSION_SUBAGENT_RUN_ID_KEY not in detail:
+        return detail
+    return {k: v for k, v in detail.items() if k != SESSION_SUBAGENT_RUN_ID_KEY}
+
+
 def _base(event: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, Any]:
     """Common envelope fields carried on every primitive-path AG-UI event."""
     return {
@@ -139,7 +156,7 @@ def _base(event: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, Any]:
 def _from_primitive(event: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     """Map a normalized event record (by ``kind``) to AG-UI."""
     kind = event.get("kind", "other")
-    detail: Dict[str, Any] = event.get("detail") or {}
+    detail: Dict[str, Any] = _without_stamp(event.get("detail") or {})
     event_type = detail.get("event_type", "")
     is_session = event.get("terminal_id") is None
     data = _base(event, detail)
@@ -323,7 +340,7 @@ def _from_generative_ui(event: Dict[str, Any], ui: Dict[str, Any]) -> Tuple[str,
     malformed intent degrades to an empty (harmless) component rather than
     breaking the stream.
     """
-    detail: Dict[str, Any] = event.get("detail") or {}
+    detail: Dict[str, Any] = _without_stamp(event.get("detail") or {})
     component = ui.get("component")
     base = _base(event, detail)
 

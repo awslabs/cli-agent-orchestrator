@@ -63,7 +63,7 @@
         "Runs scripts/validate_agent_plugin.py with the package root as the positional argument",
         "Reports the exit status and the summary line",
         "Reports the bundled validator's result and CAO's verdict separately",
-        "States that CAO's validator does not check the name pattern, the 1024-character limit or the 500-line limit",
+        "States that CAO does not enforce the name pattern, the 1024-character limit or the 500-line limit, and at most warns about them",
         "Does not claim CAO rejects an over-limit skill"
       ]
     },

@@ -22,8 +22,8 @@ this skill is the operational checklist that mirrors what CI actually enforces.
 
 ## Golden rules (read these first)
 
-1. **Run Python tooling through `uv`.** `uv sync --all-extras --dev`, `uv run pytest …`,
-   `uv run mypy src/`, `uv run cao …`. There is no bare `pip` workflow, and the venv CI
+1. **Run Python tooling through `uv`.** `uv sync --locked --all-extras --dev`,
+   `uv run pytest …`, `uv run mypy src/`, `uv run cao …`. There is no bare `pip` workflow, and the venv CI
    builds is the one `uv` manages. Repo scripts are documented in their own text as plain
    `python scripts/<name>.py` (for example `scripts/sync_skills.py`, whose fix-up message
    and `test_skill_packaging_parity.py` both quote that form) — run them as
@@ -46,7 +46,7 @@ this skill is the operational checklist that mirrors what CI actually enforces.
 ## Local dev loop
 
 ```bash
-uv sync --all-extras --dev          # install (mirrors what CI does)
+uv sync --locked --all-extras --dev # install (mirrors what CI does)
 uv run pytest test/path/to/test_x.py   # run targeted tests while iterating
 uv run black src/ test/             # format (CI checks --check)
 uv run isort src/ test/             # import order (CI checks --check-only)
@@ -72,7 +72,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 
 | Job | Runs | Blocking? |
 |-----|------|-----------|
-| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-report=term-missing` | **Yes** |
+| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-branch --cov-fail-under=80 --cov-report=term-missing` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
 | **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check src/ test/ examples/`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all four; the mypy step's `continue-on-error` was removed in issue #1005) |
 | **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |

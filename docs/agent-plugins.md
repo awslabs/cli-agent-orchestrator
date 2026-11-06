@@ -284,6 +284,16 @@ the plugin root (`skill.link_escapes_root`), one whose target is missing
 of the package still install. A `skills/<name>` that is itself a symlink
 *contained* in the root stays permitted, as §4.1 requires.
 
+`cao plugin validate` also measures each loaded skill against the Agent Skills
+limits CAO's loader does not enforce: the name pattern `^[a-z0-9]+(-[a-z0-9]+)*$`
+(`skill.name_pattern`), a name of at most 64 characters (`skill.name_length`), a
+`description` of at most 1024 characters (`skill.description_length`), and a body
+of at most 500 lines after the frontmatter (`skill.body_length`). Each is a
+`WARNING`: CAO still loads and delivers the skill and the exit status is
+unchanged, but another Agent Skills client may reject it. The codes match the
+`cao-agent-plugin-audit` skill's validator, which reports the same conditions as
+failures.
+
 Copy-mode projections are assembled in a staging directory and moved into place
 with a single rename, so the projected path only ever contains a complete tree. A
 failed copy leaves nothing behind: unmarked content at a projected path would be
