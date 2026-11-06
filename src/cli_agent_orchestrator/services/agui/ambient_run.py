@@ -197,10 +197,15 @@ class AmbientRun:
         incarnation_of: Callable[[str], Optional[str]],
         state_baseline_known: bool = True,
         since: Optional[str] = None,
+        terminal_known: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.thread_id = thread_id
         self.run_id = run_id
         self._incarnation_of = incarnation_of
+        # Whether CAO knows a terminal this run has not seen yet. A sender or
+        # terminal_id that is neither open on the run nor known to CAO (a label
+        # such as "operator" or "supervisor") never becomes a subagent.
+        self._terminal_known = terminal_known
         self._state_baseline_known = state_baseline_known
         self._since = since
         self._snapshot_sent = False
@@ -498,22 +503,39 @@ class AmbientRun:
         return out
 
     def _owner_for(self, record: Dict[str, Any], out: List[Any]) -> Optional[str]:
-        """The invocation an event belongs to, announcing it first when needed."""
+        """The invocation an event belongs to, announcing it first when needed.
+
+        A terminal owns the event when the run has it open, or when CAO knows it
+        and its invocation has not finished on this run (then it is announced
+        first). Anything else (a label such as ``"operator"``, an id CAO does not
+        know, or a terminal whose invocation already finished) falls back to the
+        record's open session invocation, or to no tag: a finished id is never
+        reused and no phantom subagent is announced. The caller keeps the raw
+        sender in ``metadata.cao``.
+        """
         terminal_id = record.get("terminal_id")
         session = record.get("session_name") or ""
         if terminal_id:
             if terminal_id in self._terminals:
                 return self._terminals[terminal_id][0]
             sid = subagent_run_id_for_terminal(terminal_id)
-            if sid in self._finished:
-                return sid
-            out.extend(
-                self._open_terminal(
-                    terminal_id, session, name="terminal", provider=None, envelope={}, ts=None
+            if sid not in self._finished and self._is_known_terminal(terminal_id):
+                out.extend(
+                    self._open_terminal(
+                        terminal_id, session, name="terminal", provider=None, envelope={}, ts=None
+                    )
                 )
-            )
-            return sid
+                return sid
         return self._sessions.get(session)
+
+    def _is_known_terminal(self, terminal_id: str) -> bool:
+        if self._terminal_known is None:
+            return False
+        try:
+            return bool(self._terminal_known(terminal_id))
+        except Exception:  # a DB hiccup must not break the stream; attribute conservatively
+            logger.debug("ambient_run: terminal lookup failed for %s", terminal_id, exc_info=True)
+            return False
 
     def _close_calls_for_terminal(self, terminal_id: str, ts: Optional[int]) -> List[Any]:
         sid = self._terminals.get(terminal_id, (None, ""))[0]
@@ -598,6 +620,11 @@ class AmbientRun:
             if owner_session == session:
                 out.extend(self._close_terminal(terminal_id, session, reason, {}, ts))
         sid = self._sessions.pop(session)
+        # Calls the session itself owns (a sender that is not a terminal is kept on
+        # the receiver's session) close before the session finishes, even when the
+        # receiver lives in another session and is still running.
+        for cid in [c for c, call in self._calls.items() if call["owner"] == sid]:
+            out.append(self._end_call(cid, ts, "completion"))
         self._finished.add(sid)
         cao = _compact({**envelope, "sessionName": session or None, "endReason": reason})
         out.append(
