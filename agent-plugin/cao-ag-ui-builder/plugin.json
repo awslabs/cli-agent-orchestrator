@@ -1,0 +1,15 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "cao-ag-ui-builder",
+  "version": "2.5.3",
+  "description": "Emit-side AG-UI vocabulary for CLI Agent Orchestrator: the six allow-listed generative-UI components (approval_card, choice_prompt, diff_summary, progress, metric, agent_card) an agent sends with emit_ui, carried as CUSTOM `cao.generative_ui` frames. Describes CAO `main`; no released version carries this yet (#1198). Needs a local cao-server with the [agui] extra. No mcp.json.",
+  "repository": "https://github.com/awslabs/cli-agent-orchestrator",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cao",
+    "ag-ui",
+    "agui",
+    "generative-ui",
+    "approvals"
+  ]
+}
