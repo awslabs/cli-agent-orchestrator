@@ -21,11 +21,12 @@ from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.terminal_service import (
-    IdempotencyKeyConflict,
+    IdempotencyKeyNotFound,
     OutputMode,
     TerminalInputBlockedError,
     TerminalRecordCorruptError,
     _request_fingerprint,
+    _scoped_idempotency_key,
     create_terminal,
     delete_terminal,
     get_output,
@@ -1310,7 +1311,9 @@ class TestCreateTerminalIdempotencyKey:
         )
 
         assert result.id == "prior-terminal"
-        mock_lookup.assert_called_once_with("retry-key-1")
+        mock_lookup.assert_called_once_with(
+            _scoped_idempotency_key("retry-key-1", _record().request_fingerprint)
+        )
         mock_get_terminal.assert_called_once_with("prior-terminal")
         # The whole point: no tmux window, no provider process, no new DB row.
         mock_tmux.session_exists.assert_not_called()
@@ -1364,8 +1367,10 @@ class TestCreateTerminalIdempotencyKey:
         )
 
         assert result.id == "test1234"
-        mock_lookup.assert_called_once_with("fresh-key")
-        assert mock_db_create.call_args.kwargs["idempotency_key"] == "fresh-key"
+        # Looked up and stored under the fingerprint-scoped key (issue #944).
+        fresh_key = _scoped_idempotency_key("fresh-key", _record().request_fingerprint)
+        mock_lookup.assert_called_once_with(fresh_key)
+        assert mock_db_create.call_args.kwargs["idempotency_key"] == fresh_key
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
@@ -1454,13 +1459,17 @@ class TestCreateTerminalIdempotencyKey:
         ``isolated_memory_db`` fixture) to prove the fix against an actual
         PK collision, not a mock.
         """
+        # Stored under the key THIS request scopes to (issue #944), so the
+        # stale row is the one its own insert would collide with.
+        stale_storage_key = _scoped_idempotency_key("stale-key", _record().request_fingerprint)
         db_create_terminal(
             "long-gone-terminal",
             "cao-session",
             "window-0",
             "kiro_cli",
             "developer",
-            idempotency_key="stale-key",
+            idempotency_key=stale_storage_key,
+            request_fingerprint=_record().request_fingerprint,
         )
         # orphans the key row
         assert db_delete_terminal("long-gone-terminal", end_reason="deleted") is True
@@ -1484,7 +1493,7 @@ class TestCreateTerminalIdempotencyKey:
         # Not just "didn't crash" -- the replacement's OWN mapping actually
         # landed, so a future retry with this key finds test1234, not a
         # second-generation orphan.
-        assert get_idempotency_record("stale-key").terminal_id == "test1234"
+        assert get_idempotency_record(stale_storage_key).terminal_id == "test1234"
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_idempotency_key")
@@ -1941,21 +1950,23 @@ class TestIdempotentReplayWaitsForInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
-    async def test_lookup_only_with_another_requests_key_is_a_conflict(
+    async def test_lookup_only_with_another_requests_key_is_not_found(
         self, mock_lookup, mock_get_terminal
     ):
-        """lookup_only runs the same fingerprint check as any replay, so it
-        cannot be used to read the terminal id of a different request that
-        happens to share the key."""
-        mock_lookup.return_value = _record(
-            terminal_id="prior-terminal", agent_profile="someone-elses-profile"
-        )
+        """lookup_only cannot read the terminal id of a different request that
+        shares the key, nor learn that the key is in use (issue #944): the other
+        request's mapping lives under its own scoped key, so this lookup misses
+        and answers exactly as for an unused key."""
+        other = _record(terminal_id="prior-terminal", agent_profile="someone-elses-profile")
+        other_key = _scoped_idempotency_key("k", other.request_fingerprint)
+        mock_lookup.side_effect = lambda key: other if key == other_key else None
         mock_get_terminal.return_value = dict(_PRIOR_ROW)
 
-        with pytest.raises(terminal_service.IdempotencyKeyConflict):
+        with pytest.raises(IdempotencyKeyNotFound):
             await create_terminal(
                 "kiro_cli", "developer", new_session=True, idempotency_key="k", lookup_only=True
             )
+        mock_get_terminal.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -2169,7 +2180,7 @@ class TestIdempotencyKeyRequestFingerprint:
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_any_differing_field_conflicts(
+    async def test_any_differing_field_gets_its_own_slot(
         self,
         mock_tmux,
         mock_provider_manager,
@@ -2179,19 +2190,22 @@ class TestIdempotencyKeyRequestFingerprint:
         field,
         value,
     ):
-        """Each fingerprinted field, varied ALONE, must conflict.
+        """Each fingerprinted field, varied ALONE, must miss the baseline's slot.
 
         Parametrized rather than one test per field so that adding a field to
         the fingerprint without adding it here is visible as a gap. ``caller_id``
-        is the one that turns a cross-operator collision into a loud 409 instead
-        of a silent hand-off of someone else's worker.
+        is the one that keeps a cross-operator collision from silently handing
+        over someone else's worker. Since issue #944 a miss is indistinguishable
+        from an unused key: the lookup answers 404, not 409.
         """
-        # The STORED record was written for the baseline request; this call
-        # varies exactly one field, so the fingerprints must differ.
-        mock_lookup.return_value = _record()
+        # The STORED record was written for the baseline request under its
+        # scoped key; this call varies exactly one field, so it must look up a
+        # different key and find nothing.
+        baseline_key = _scoped_idempotency_key("job-1", _record().request_fingerprint)
+        mock_lookup.side_effect = lambda key: _record() if key == baseline_key else None
         mock_get_terminal.return_value = _valid_row()
 
-        kwargs = {"new_session": True, "idempotency_key": "job-1"}
+        kwargs = {"new_session": True, "idempotency_key": "job-1", "lookup_only": True}
         args = ["kiro_cli", "developer"]
         if field == "provider":
             args[0] = value
@@ -2200,12 +2214,12 @@ class TestIdempotencyKeyRequestFingerprint:
         else:
             kwargs[field] = value
 
-        with pytest.raises(IdempotencyKeyConflict) as exc:
+        with pytest.raises(IdempotencyKeyNotFound):
             await create_terminal(*args, **kwargs)
 
-        assert "different request" in str(exc.value)
-        # The conflict is raised BEFORE any terminal is created,
-        # so there is no orphan tmux window, provider, or row to clean up.
+        (looked_up,) = mock_lookup.call_args.args
+        assert looked_up != baseline_key
+        mock_get_terminal.assert_not_called()
         mock_tmux.create_session.assert_not_called()
         mock_provider_manager.create_provider.assert_not_called()
         mock_db_create.assert_not_called()
@@ -2217,7 +2231,7 @@ class TestIdempotencyKeyRequestFingerprint:
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_second_task_under_one_key_conflicts_instead_of_being_dropped(
+    async def test_second_task_under_one_key_is_not_resolved_to_the_first(
         self,
         mock_tmux,
         mock_provider_manager,
@@ -2232,25 +2246,26 @@ class TestIdempotencyKeyRequestFingerprint:
         for task A, then retry the otherwise identical request with task B. The
         old behaviour returned A's terminal while `_schedule_deferred_init` was
         never called, so B was discarded with no conflict, no delivery and no log
-        line -- the one failure mode a caller cannot detect. Both assertions
-        matter: raising is only correct if delivery also did not happen, and a
-        test that checked the raise alone would still pass if the conflict were
-        thrown AFTER B had already been sent somewhere.
+        line -- the one failure mode a caller cannot detect. Since issue #944
+        task B lives under its own scoped key, so it never resolves to A's
+        terminal; a lookup for it finds nothing, and nothing is delivered into A.
         """
-        mock_lookup.return_value = _record(initial_message="task A")
+        task_a = _record(initial_message="task A")
+        key_a = _scoped_idempotency_key("job-1", task_a.request_fingerprint)
+        mock_lookup.side_effect = lambda key: task_a if key == key_a else None
         mock_get_terminal.return_value = _valid_row()
 
-        with pytest.raises(IdempotencyKeyConflict):
+        with pytest.raises(IdempotencyKeyNotFound):
             await create_terminal(
                 "kiro_cli",
                 "developer",
                 new_session=True,
                 idempotency_key="job-1",
                 initial_message="task B",
+                lookup_only=True,
             )
 
-        # Task B was neither delivered into A's terminal nor silently dropped:
-        # the caller is told, and nothing was scheduled for either task.
+        mock_get_terminal.assert_not_called()
         mock_deferred_init.assert_not_called()
         mock_db_create.assert_not_called()
 
@@ -2340,13 +2355,11 @@ class TestIdempotencyKeyRequestFingerprint:
         mock_fifo_manager,
         mock_status_monitor,
     ):
-        """STALE beats CONFLICT -- the ordering that would bite.
+        """A stale mapping in this request's own slot falls through to a fresh create.
 
-        The fingerprint comparison deliberately runs AFTER the stale-terminal
-        branch. Reversed, an operator reusing a key from a job that already
-        finished would get a 409 -- breaking the exact case the feature was
-        built to serve. Here the key maps to a DELETED terminal AND the request
-        differs, and the correct outcome is a fresh create, not a conflict.
+        Here the scoped key maps to a DELETED terminal, and the correct outcome
+        is a fresh create. The stale row is cleared under the SCOPED key, the
+        one the replacement's insert would otherwise collide with (issue #944).
         """
         mock_lookup.return_value = _record(terminal_id="long-gone")
         mock_get_terminal.side_effect = ValueError("Terminal 'long-gone' not found")
@@ -2367,7 +2380,24 @@ class TestIdempotencyKeyRequestFingerprint:
         )
 
         assert result.id == "test1234"
-        mock_delete_key.assert_called_once_with("stale-key", "long-gone")
+        reviewer_fp = _request_fingerprint(
+            "kiro_cli",
+            "reviewer",
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        mock_delete_key.assert_called_once_with(
+            _scoped_idempotency_key("stale-key", reviewer_fp), "long-gone"
+        )
         # The replacement stores the fingerprint of the request that actually
         # created it, so a later retry of THAT request matches. Note
         # session_name is None, not the generated "cao-session": the
@@ -2389,6 +2419,121 @@ class TestIdempotencyKeyRequestFingerprint:
             None,
             None,
         )
+
+
+_REAL_CREATE_PATCHES = (
+    "cli_agent_orchestrator.services.terminal_service.status_monitor",
+    "cli_agent_orchestrator.services.terminal_service.fifo_manager",
+    "cli_agent_orchestrator.services.terminal_service.FIFO_DIR",
+    "cli_agent_orchestrator.services.terminal_service.provider_manager",
+    "cli_agent_orchestrator.backends.registry._backend",
+    "cli_agent_orchestrator.services.terminal_service.generate_window_name",
+    "cli_agent_orchestrator.services.terminal_service.generate_session_name",
+    "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
+    "cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile",
+)
+
+
+class TestKeyedRequestsDoNotRevealKeyUse:
+    """Issue #944: a keyed request must not reveal whether its key is in use.
+
+    These run against the REAL database (module-level ``isolated_memory_db``),
+    so the first request's mapping is stored however production stores it and
+    the assertions are about observable behaviour only. Before the fix the
+    second, different request under the same key raised
+    ``IdempotencyKeyConflict`` (HTTP 409), while an unused key answered 201 or
+    404, so any WRITE-scoped caller could probe for keys in use.
+    """
+
+    @pytest.fixture
+    def real_create(self):
+        patchers = [patch(target) for target in _REAL_CREATE_PATCHES]
+        mocks = dict(
+            zip(
+                (
+                    "status",
+                    "fifo",
+                    "fifo_dir",
+                    "providers",
+                    "tmux",
+                    "window",
+                    "session",
+                    "terminal_id",
+                    "profile",
+                ),
+                (p.start() for p in patchers),
+            )
+        )
+        mocks["window"].return_value = "worker-abcd"
+        mocks["status"].status_observation.return_value = MagicMock(
+            status=TerminalStatus.IDLE, output_generation=None
+        )
+        mocks["session"].side_effect = ["cao-first", "cao-second", "cao-third"]
+        mocks["terminal_id"].side_effect = ["aaaa1111", "bbbb2222", "cccc3333"]
+        mocks["tmux"].session_exists.return_value = False
+        mocks["profile"].side_effect = lambda name: AgentProfile(name=name, description=name)
+        provider = AsyncMock()
+        provider.identity_verified = True
+        provider.initialize.return_value = True
+        mocks["providers"].create_provider.return_value = provider
+        mocks["fifo_dir"].__truediv__ = MagicMock(return_value="fake.fifo")
+        yield mocks
+        for p in patchers:
+            p.stop()
+
+    @pytest.mark.asyncio
+    async def test_keyed_create_for_a_key_held_by_another_request_creates_fresh(self, real_create):
+        first = await create_terminal(
+            "kiro_cli", "developer", new_session=True, idempotency_key="job-1"
+        )
+        # A DIFFERENT request under the same key: its own terminal, not a 409.
+        second = await create_terminal(
+            "kiro_cli", "reviewer", new_session=True, idempotency_key="job-1"
+        )
+        assert (first.id, second.id) == ("aaaa1111", "bbbb2222")
+        assert real_create["providers"].create_provider.call_count == 2
+
+        # Each request stays idempotent for its own retries.
+        assert (
+            await create_terminal("kiro_cli", "reviewer", new_session=True, idempotency_key="job-1")
+        ).id == "bbbb2222"
+        assert (
+            await create_terminal(
+                "kiro_cli", "developer", new_session=True, idempotency_key="job-1"
+            )
+        ).id == "aaaa1111"
+        assert real_create["providers"].create_provider.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_lookup_only_answers_alike_for_unused_and_foreign_keys(self, real_create):
+        with pytest.raises(IdempotencyKeyNotFound) as unused:
+            await create_terminal(
+                "kiro_cli",
+                "reviewer",
+                new_session=True,
+                idempotency_key="job-1",
+                lookup_only=True,
+            )
+        await create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="job-1")
+
+        # Same status and same message as before the key was claimed: the
+        # caller cannot tell that another request now holds it.
+        with pytest.raises(IdempotencyKeyNotFound) as foreign:
+            await create_terminal(
+                "kiro_cli",
+                "reviewer",
+                new_session=True,
+                idempotency_key="job-1",
+                lookup_only=True,
+            )
+        assert str(foreign.value) == str(unused.value)
+        assert real_create["providers"].create_provider.call_count == 1
+
+        # The owner's own lookup still resolves.
+        found = await create_terminal(
+            "kiro_cli", "developer", new_session=True, idempotency_key="job-1", lookup_only=True
+        )
+        assert found.id == "aaaa1111"
 
 
 class TestCreateTerminalWorktree:
