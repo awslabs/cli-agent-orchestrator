@@ -159,6 +159,7 @@ from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
     approval_store,
+    delegation_callback_service,
     ephemeral_service,
     flow_service,
     manifest_freeze,
@@ -280,6 +281,10 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
             await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
         except Exception:
             logger.exception("Inbox reconciliation daemon error")
+        try:
+            await asyncio.to_thread(delegation_callback_service.sweep)
+        except Exception:
+            logger.exception("Delegation callback sweep error")
 
 
 async def ephemeral_sweep_daemon() -> None:
@@ -1736,6 +1741,7 @@ async def lifespan(app: FastAPI):
     status_monitor_task = asyncio.create_task(status_monitor.run())
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
+    delegation_callback_task = asyncio.create_task(delegation_callback_service.run())
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
     # Start ApprovalBridge when AG-UI surface is enabled
@@ -1820,6 +1826,7 @@ async def lifespan(app: FastAPI):
     status_monitor_task.cancel()
     log_writer_task.cancel()
     inbox_service_task.cancel()
+    delegation_callback_task.cancel()
     # Cancel approval bridge on shutdown
     if approval_bridge_task is not None:
         approval_bridge_task.cancel()
@@ -1835,6 +1842,7 @@ async def lifespan(app: FastAPI):
             status_monitor_task,
             log_writer_task,
             inbox_service_task,
+            delegation_callback_task,
             daemon_task,
             return_exceptions=True,
         )

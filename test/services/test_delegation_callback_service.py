@@ -181,3 +181,28 @@ class TestSweep:
         svc.sweep()
         assert env["sent"] == []
         assert "delegation cycle" in caplog.text
+
+
+class TestConsumer:
+    def test_idle_event_evaluates_and_error_event_ends(self):
+        events = [
+            {"topic": "terminal.w1.status", "data": {"status": "idle"}},
+            {"topic": "terminal.w2.status", "data": {"status": "error"}},
+        ]
+
+        class FakeQueue:
+            async def get(self):
+                if events:
+                    return events.pop(0)
+                raise asyncio.CancelledError
+
+        with (
+            patch(f"{MOD}.bus") as bus,
+            patch(f"{MOD}.evaluate_completion") as ev,
+            patch(f"{MOD}.handle_worker_ended") as ended,
+        ):
+            bus.subscribe.return_value = FakeQueue()
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(svc.run())
+        ev.assert_called_once_with("w1")
+        ended.assert_called_once_with("w2", "reached ERROR")

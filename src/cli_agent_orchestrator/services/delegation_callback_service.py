@@ -7,6 +7,7 @@ ending. Evaluation runs on terminal status events and on a periodic sweep, so
 it still applies on backends that do not publish status events.
 """
 
+import asyncio
 import logging
 from typing import List, Optional
 
@@ -25,9 +26,11 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.delegation import EdgeReason, EdgeSource, EdgeState
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
@@ -189,3 +192,20 @@ def sweep() -> None:
         except Exception as exc:  # noqa: BLE001 - one worker must not stop the sweep
             logger.debug("delegation sweep failed for %s: %s", worker_id, exc)
     _log_cycles(list_armed_worker_ids())
+
+
+async def run() -> None:
+    """Consume terminal.*.status: evaluate on IDLE/COMPLETED, end edges on ERROR."""
+    queue = bus.subscribe("terminal.*.status")
+    logger.info("DelegationCallbackService started")
+    while True:
+        event = await queue.get()
+        try:
+            status_value = event["data"]["status"]
+            terminal_id = terminal_id_from_topic(event["topic"])
+            if status_value in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
+                await asyncio.to_thread(evaluate_completion, terminal_id)
+            elif status_value == TerminalStatus.ERROR.value:
+                await asyncio.to_thread(handle_worker_ended, terminal_id, "reached ERROR")
+        except Exception as exc:  # noqa: BLE001 - one bad event must not stop the consumer
+            logger.error("DelegationCallbackService error: %s", exc)
