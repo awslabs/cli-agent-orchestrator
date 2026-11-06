@@ -1,5 +1,6 @@
 """Tests for delegation_callback_service."""
 
+import asyncio
 from unittest.mock import patch
 
 import pytest
@@ -11,8 +12,10 @@ from cli_agent_orchestrator.clients.database import (
     create_delegation_edge,
     find_open_edge,
     list_open_edges_into,
+    mark_assign_edges_delivered,
 )
 from cli_agent_orchestrator.models.delegation import EdgeReason, EdgeSource
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import delegation_callback_service as svc
 
 MOD = "cli_agent_orchestrator.services.delegation_callback_service"
@@ -74,3 +77,107 @@ class TestSendMessageRules:
     def test_unrelated_terminal_with_expect_reply(self, _meta, db):
         svc.on_send_message(sender_id="w1", receiver_id="w3", message_id=9, expect_reply=True)
         assert find_open_edge("w1", "w3") is not None
+
+
+def _armed(caller, worker):
+    create_delegation_edge(caller, worker, EdgeSource.ASSIGN)
+    mark_assign_edges_delivered(worker)
+
+
+@pytest.fixture
+def env():
+    """Patch the I/O the evaluator touches; return the inbox capture list."""
+    sent = []
+    with (
+        patch(f"{MOD}.status_monitor") as sm,
+        patch(f"{MOD}.terminal_service") as ts,
+        patch(f"{MOD}.get_pending_messages", return_value=[]) as pending,
+        patch(f"{MOD}.get_terminal_metadata", return_value={"agent_profile": "developer"}),
+        patch(
+            f"{MOD}.create_inbox_message",
+            side_effect=lambda sender_id, receiver_id, message: sent.append(
+                (sender_id, receiver_id, message)
+            ),
+        ),
+        patch(f"{MOD}.inbox_service"),
+    ):
+        sm.get_status.return_value = TerminalStatus.IDLE
+        ts.get_output.return_value = "final answer"
+        yield {"sent": sent, "status": sm, "pending": pending, "ts": ts}
+
+
+class TestEvaluateCompletion:
+    def test_forwards_idle_worker(self, db, env):
+        _armed("sup", "w1")
+        assert svc.evaluate_completion("w1") == 1
+        sender, receiver, text = env["sent"][0]
+        assert (sender, receiver) == ("w1", "sup")
+        assert text.endswith("final answer")
+        assert list_open_edges_into("w1") == []
+
+    def test_unarmed_edge_not_forwarded(self, db, env):
+        create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+        assert svc.evaluate_completion("w1") == 0
+
+    def test_waiting_on_sub_worker_not_forwarded(self, db, env):
+        _armed("sup", "w1")
+        create_delegation_edge("w1", "w2", EdgeSource.ASSIGN)
+        assert svc.evaluate_completion("w1") == 0
+        assert env["sent"] == []
+
+    def test_forwarded_after_sub_worker_replies(self, db, env):
+        _armed("sup", "w1")
+        create_delegation_edge("w1", "w2", EdgeSource.ASSIGN)
+        svc.on_send_message(sender_id="w2", receiver_id="w1", message_id=3, expect_reply=False)
+        assert svc.evaluate_completion("w1") == 1
+
+    def test_pending_inbox_blocks(self, db, env):
+        _armed("sup", "w1")
+        env["pending"].return_value = [object()]
+        assert svc.evaluate_completion("w1") == 0
+
+    def test_processing_blocks(self, db, env):
+        _armed("sup", "w1")
+        env["status"].get_status.return_value = TerminalStatus.PROCESSING
+        assert svc.evaluate_completion("w1") == 0
+
+    def test_second_evaluation_does_not_double_forward(self, db, env):
+        _armed("sup", "w1")
+        svc.evaluate_completion("w1")
+        assert svc.evaluate_completion("w1") == 0
+        assert len(env["sent"]) == 1
+
+    def test_unreadable_output_still_forwards(self, db, env):
+        _armed("sup", "w1")
+        env["ts"].get_output.side_effect = RuntimeError("pane gone")
+        assert svc.evaluate_completion("w1") == 1
+        assert "(last response could not be read)" in env["sent"][0][2]
+
+
+class TestWorkerEnded:
+    def test_deleted_worker_notifies_caller(self, db, env):
+        _armed("sup", "w1")
+        svc.handle_worker_ended("w1", "was deleted")
+        sender, receiver, text = env["sent"][0]
+        assert (sender, receiver) == ("w1", "sup")
+        assert text.startswith("[CAO worker ended] Worker w1")
+        assert list_open_edges_into("w1") == []
+
+    def test_outbound_edges_closed_silently(self, db, env):
+        create_delegation_edge("w1", "w2", EdgeSource.ASSIGN)
+        svc.handle_worker_ended("w1", "reached ERROR")
+        assert env["sent"] == []
+
+
+class TestSweep:
+    def test_sweep_forwards_missed_worker(self, db, env):
+        _armed("sup", "w1")
+        svc.sweep()
+        assert len(env["sent"]) == 1
+
+    def test_cycle_logged_not_forwarded(self, db, env, caplog):
+        _armed("w1", "w2")
+        _armed("w2", "w1")
+        svc.sweep()
+        assert env["sent"] == []
+        assert "delegation cycle" in caplog.text
