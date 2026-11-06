@@ -36,8 +36,9 @@ import build_agent_plugin as builder  # noqa: E402
 OPERATOR_DIR = PACKAGES_DIR / "cao"
 CONTRIBUTOR_DIR = PACKAGES_DIR / "cao-contributor"
 LIFECYCLE_DIR = PACKAGES_DIR / "cao-agent-plugin-lifecycle"
-ALL_PACKAGE_DIRS = [OPERATOR_DIR, CONTRIBUTOR_DIR, LIFECYCLE_DIR]
-ALL_CONFIGS = [builder.OPERATOR, builder.CONTRIBUTOR, builder.LIFECYCLE]
+AG_UI_BUILDER_DIR = PACKAGES_DIR / "cao-ag-ui-builder"
+ALL_PACKAGE_DIRS = [OPERATOR_DIR, CONTRIBUTOR_DIR, LIFECYCLE_DIR, AG_UI_BUILDER_DIR]
+ALL_CONFIGS = [builder.OPERATOR, builder.CONTRIBUTOR, builder.LIFECYCLE, builder.AG_UI_BUILDER]
 AUDIT_SCRIPT = (
     REPO_ROOT / "skills" / "cao-agent-plugin-audit" / "scripts" / "validate_agent_plugin.py"
 )
@@ -302,6 +303,43 @@ class TestLifecyclePackage:
             assert (bundled / name).read_bytes() == (vendored / name).read_bytes(), name
 
 
+class TestAgUiBuilderPackage:
+    """The fourth package: emit-side AG-UI vocabulary for client builders (#1116).
+
+    The name is provisional; a rename is one ``PackageConfig.name`` edit.
+    """
+
+    def test_name_matches_the_config(self):
+        assert manifest_of(AG_UI_BUILDER_DIR)["name"] == builder.AG_UI_BUILDER.name
+        assert AG_UI_BUILDER_DIR.name == builder.AG_UI_BUILDER.name
+
+    def test_it_ships_exactly_the_agui_author_skill(self):
+        report = validate_plugin(AG_UI_BUILDER_DIR)
+        assert set(report.skill_names) == {"agui-author"}
+        assert report.loadable
+        assert report.findings == ()
+
+    def test_it_never_ships_an_mcp_json(self):
+        """The skill teaches emit-side vocabulary; it needs no CAO MCP server."""
+        assert builder.AG_UI_BUILDER.ships_mcp is False
+        assert not (AG_UI_BUILDER_DIR / "mcp.json").exists()
+        assert not (AG_UI_BUILDER_DIR / ".mcp.json").exists()
+
+    def test_the_operator_package_still_leaves_agui_author_to_it(self):
+        """The operator package excluded it for "adjacent features with their own consumers"."""
+        assert "agui-author" not in builder.OPERATOR.skills
+        assert "agui-author" in builder.OPERATOR.excluded_note
+
+    def test_its_description_says_it_describes_main(self):
+        description = manifest_of(AG_UI_BUILDER_DIR)["description"]
+        assert "cao.generative_ui" in description
+        assert "main" in description
+
+    def test_it_is_pinned_with_its_siblings(self):
+        versions = {manifest_of(d)["version"] for d in ALL_PACKAGE_DIRS}
+        assert len(versions) == 1, versions
+
+
 class TestAllowlistsAreEnforcedIndependently:
     """Requirement 3.5 — one package's failure must not mask the other's."""
 
@@ -311,6 +349,7 @@ class TestAllowlistsAreEnforcedIndependently:
             (builder.OPERATOR, OPERATOR_DIR),
             (builder.CONTRIBUTOR, CONTRIBUTOR_DIR),
             (builder.LIFECYCLE, LIFECYCLE_DIR),
+            (builder.AG_UI_BUILDER, AG_UI_BUILDER_DIR),
         ],
     )
     def test_discovered_skills_equal_the_allowlist(self, config, package_dir):
@@ -339,6 +378,7 @@ class TestAllowlistsAreEnforcedIndependently:
         assert "cao:" in error
         assert "cao-contributor:" in error
         assert "cao-agent-plugin-lifecycle:" in error
+        assert "cao-ag-ui-builder:" in error
 
     def test_check_reports_the_second_package_when_only_it_drifts(
         self, tmp_path, monkeypatch, capsys
@@ -444,6 +484,7 @@ class TestPackagesInstallThroughTheRealPipeline:
             "cao",
             "cao-contributor",
             "cao-agent-plugin-lifecycle",
+            "cao-ag-ui-builder",
         }
         collisions = [
             f for record in store.list_installed() for f in record.findings if "collision" in f.code

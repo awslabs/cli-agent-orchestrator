@@ -1,0 +1,605 @@
+{
+ "meta": {
+  "keys": [
+   "ag_ui_protocol",
+   "cao_version",
+   "captures",
+   "protocol_version",
+   "schema"
+  ],
+  "values": {
+   "captures": [
+    "none",
+    "approve",
+    "reject"
+   ],
+   "protocol_version": "1.0",
+   "schema": "cao-dojo-trace/1"
+  }
+ },
+ "records": [
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "plane",
+    "request.resume",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "none",
+    "dir": "request",
+    "plane": "run",
+    "run": "none-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.protocolVersion",
+    "frame.runId",
+    "frame.threadId",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "none",
+    "dir": "out",
+    "frame.protocolVersion": "1.0",
+    "frame.runId": "none-run-1",
+    "frame.threadId": "cao-dojo-trace",
+    "frame.type": "RUN_STARTED",
+    "plane": "run",
+    "run": "none-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.snapshot.counts.sessions",
+    "frame.snapshot.counts.terminals",
+    "frame.snapshot.scopes[0]",
+    "frame.snapshot.scopes[1]",
+    "frame.snapshot.scopes[2]",
+    "frame.snapshot.sessions",
+    "frame.snapshot.terminals",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "none",
+    "dir": "out",
+    "frame.type": "STATE_SNAPSHOT",
+    "plane": "run",
+    "run": "none-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.outcome.type",
+    "frame.runId",
+    "frame.threadId",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "none",
+    "dir": "out",
+    "frame.outcome.type": "success",
+    "frame.runId": "none-run-1",
+    "frame.threadId": "cao-dojo-trace",
+    "frame.type": "RUN_FINISHED",
+    "plane": "run",
+    "run": "none-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.metadata.cao.eventId",
+    "frame.metadata.cao.terminalId",
+    "frame.name",
+    "frame.subagentRunId",
+    "frame.timestamp",
+    "frame.type",
+    "frame.value.component",
+    "frame.value.event_id",
+    "frame.value.props.interrupt_id",
+    "frame.value.props.message",
+    "frame.value.props.options[0]",
+    "frame.value.props.options[1]",
+    "frame.value.props.provider",
+    "frame.value.props.reason",
+    "frame.value.props.terminal_id",
+    "frame.value.session_name",
+    "frame.value.terminal_id",
+    "frame.value.timestamp",
+    "frame.value.traceparent",
+    "plane",
+    "seq"
+   ],
+   "values": {
+    "capture": "approve",
+    "dir": "out",
+    "frame.name": "cao.generative_ui",
+    "frame.type": "CUSTOM",
+    "frame.value.component": "approval_card",
+    "frame.value.props.options[0]": "approve",
+    "frame.value.props.options[1]": "deny",
+    "plane": "stream"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "plane",
+    "request.resume",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "approve",
+    "dir": "request",
+    "plane": "run",
+    "run": "approve-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.protocolVersion",
+    "frame.runId",
+    "frame.threadId",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "approve",
+    "dir": "out",
+    "frame.protocolVersion": "1.0",
+    "frame.runId": "approve-run-1",
+    "frame.threadId": "cao-dojo-trace",
+    "frame.type": "RUN_STARTED",
+    "plane": "run",
+    "run": "approve-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.snapshot.counts.sessions",
+    "frame.snapshot.counts.terminals",
+    "frame.snapshot.scopes[0]",
+    "frame.snapshot.scopes[1]",
+    "frame.snapshot.scopes[2]",
+    "frame.snapshot.sessions[0].id",
+    "frame.snapshot.sessions[0].name",
+    "frame.snapshot.sessions[0].status",
+    "frame.snapshot.terminals[0].agent_profile",
+    "frame.snapshot.terminals[0].id",
+    "frame.snapshot.terminals[0].last_active",
+    "frame.snapshot.terminals[0].provider",
+    "frame.snapshot.terminals[0].session_name",
+    "frame.snapshot.terminals[0].status",
+    "frame.snapshot.terminals[0].window",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "approve",
+    "dir": "out",
+    "frame.type": "STATE_SNAPSHOT",
+    "plane": "run",
+    "run": "approve-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.outcome.interrupts[0].id",
+    "frame.outcome.interrupts[0].message",
+    "frame.outcome.interrupts[0].metadata.options[0]",
+    "frame.outcome.interrupts[0].metadata.options[1]",
+    "frame.outcome.interrupts[0].metadata.provider",
+    "frame.outcome.interrupts[0].metadata.sessionName",
+    "frame.outcome.interrupts[0].metadata.terminalId",
+    "frame.outcome.interrupts[0].reason",
+    "frame.outcome.interrupts[0].responseSchema.properties.approved.description",
+    "frame.outcome.interrupts[0].responseSchema.properties.approved.type",
+    "frame.outcome.interrupts[0].responseSchema.required[0]",
+    "frame.outcome.interrupts[0].responseSchema.type",
+    "frame.outcome.interrupts[0].subagentRunId",
+    "frame.outcome.type",
+    "frame.runId",
+    "frame.threadId",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "approve",
+    "dir": "out",
+    "frame.outcome.interrupts[0].metadata.options[0]": "approve",
+    "frame.outcome.interrupts[0].metadata.options[1]": "deny",
+    "frame.outcome.interrupts[0].responseSchema.properties.approved.description": "true=approve, false=deny",
+    "frame.outcome.interrupts[0].responseSchema.properties.approved.type": "boolean",
+    "frame.outcome.interrupts[0].responseSchema.required[0]": "approved",
+    "frame.outcome.interrupts[0].responseSchema.type": "object",
+    "frame.outcome.type": "interrupt",
+    "frame.runId": "approve-run-1",
+    "frame.threadId": "cao-dojo-trace",
+    "frame.type": "RUN_FINISHED",
+    "plane": "run",
+    "run": "approve-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "plane",
+    "request.resume[0].interruptId",
+    "request.resume[0].payload.approved",
+    "request.resume[0].status",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "approve",
+    "dir": "request",
+    "plane": "run",
+    "request.resume[0].payload.approved": true,
+    "request.resume[0].status": "resolved",
+    "run": "approve-run-2"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.protocolVersion",
+    "frame.runId",
+    "frame.threadId",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "approve",
+    "dir": "out",
+    "frame.protocolVersion": "1.0",
+    "frame.runId": "approve-run-2",
+    "frame.threadId": "cao-dojo-trace",
+    "frame.type": "RUN_STARTED",
+    "plane": "run",
+    "run": "approve-run-2"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.snapshot.counts.sessions",
+    "frame.snapshot.counts.terminals",
+    "frame.snapshot.scopes[0]",
+    "frame.snapshot.scopes[1]",
+    "frame.snapshot.scopes[2]",
+    "frame.snapshot.sessions[0].id",
+    "frame.snapshot.sessions[0].name",
+    "frame.snapshot.sessions[0].status",
+    "frame.snapshot.terminals[0].agent_profile",
+    "frame.snapshot.terminals[0].id",
+    "frame.snapshot.terminals[0].last_active",
+    "frame.snapshot.terminals[0].provider",
+    "frame.snapshot.terminals[0].session_name",
+    "frame.snapshot.terminals[0].status",
+    "frame.snapshot.terminals[0].window",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "approve",
+    "dir": "out",
+    "frame.type": "STATE_SNAPSHOT",
+    "plane": "run",
+    "run": "approve-run-2"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.outcome.type",
+    "frame.runId",
+    "frame.threadId",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "approve",
+    "dir": "out",
+    "frame.outcome.type": "success",
+    "frame.runId": "approve-run-2",
+    "frame.threadId": "cao-dojo-trace",
+    "frame.type": "RUN_FINISHED",
+    "plane": "run",
+    "run": "approve-run-2"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.metadata.cao.eventId",
+    "frame.metadata.cao.terminalId",
+    "frame.name",
+    "frame.subagentRunId",
+    "frame.timestamp",
+    "frame.type",
+    "frame.value.component",
+    "frame.value.event_id",
+    "frame.value.props.interrupt_id",
+    "frame.value.props.message",
+    "frame.value.props.options[0]",
+    "frame.value.props.options[1]",
+    "frame.value.props.provider",
+    "frame.value.props.reason",
+    "frame.value.props.terminal_id",
+    "frame.value.session_name",
+    "frame.value.terminal_id",
+    "frame.value.timestamp",
+    "frame.value.traceparent",
+    "plane",
+    "seq"
+   ],
+   "values": {
+    "capture": "reject",
+    "dir": "out",
+    "frame.name": "cao.generative_ui",
+    "frame.type": "CUSTOM",
+    "frame.value.component": "approval_card",
+    "frame.value.props.options[0]": "approve",
+    "frame.value.props.options[1]": "deny",
+    "plane": "stream"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "plane",
+    "request.resume",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "reject",
+    "dir": "request",
+    "plane": "run",
+    "run": "reject-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.protocolVersion",
+    "frame.runId",
+    "frame.threadId",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "reject",
+    "dir": "out",
+    "frame.protocolVersion": "1.0",
+    "frame.runId": "reject-run-1",
+    "frame.threadId": "cao-dojo-trace",
+    "frame.type": "RUN_STARTED",
+    "plane": "run",
+    "run": "reject-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.snapshot.counts.sessions",
+    "frame.snapshot.counts.terminals",
+    "frame.snapshot.scopes[0]",
+    "frame.snapshot.scopes[1]",
+    "frame.snapshot.scopes[2]",
+    "frame.snapshot.sessions[0].id",
+    "frame.snapshot.sessions[0].name",
+    "frame.snapshot.sessions[0].status",
+    "frame.snapshot.terminals[0].agent_profile",
+    "frame.snapshot.terminals[0].id",
+    "frame.snapshot.terminals[0].last_active",
+    "frame.snapshot.terminals[0].provider",
+    "frame.snapshot.terminals[0].session_name",
+    "frame.snapshot.terminals[0].status",
+    "frame.snapshot.terminals[0].window",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "reject",
+    "dir": "out",
+    "frame.type": "STATE_SNAPSHOT",
+    "plane": "run",
+    "run": "reject-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.outcome.interrupts[0].id",
+    "frame.outcome.interrupts[0].message",
+    "frame.outcome.interrupts[0].metadata.options[0]",
+    "frame.outcome.interrupts[0].metadata.options[1]",
+    "frame.outcome.interrupts[0].metadata.provider",
+    "frame.outcome.interrupts[0].metadata.sessionName",
+    "frame.outcome.interrupts[0].metadata.terminalId",
+    "frame.outcome.interrupts[0].reason",
+    "frame.outcome.interrupts[0].responseSchema.properties.approved.description",
+    "frame.outcome.interrupts[0].responseSchema.properties.approved.type",
+    "frame.outcome.interrupts[0].responseSchema.required[0]",
+    "frame.outcome.interrupts[0].responseSchema.type",
+    "frame.outcome.interrupts[0].subagentRunId",
+    "frame.outcome.type",
+    "frame.runId",
+    "frame.threadId",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "reject",
+    "dir": "out",
+    "frame.outcome.interrupts[0].metadata.options[0]": "approve",
+    "frame.outcome.interrupts[0].metadata.options[1]": "deny",
+    "frame.outcome.interrupts[0].responseSchema.properties.approved.description": "true=approve, false=deny",
+    "frame.outcome.interrupts[0].responseSchema.properties.approved.type": "boolean",
+    "frame.outcome.interrupts[0].responseSchema.required[0]": "approved",
+    "frame.outcome.interrupts[0].responseSchema.type": "object",
+    "frame.outcome.type": "interrupt",
+    "frame.runId": "reject-run-1",
+    "frame.threadId": "cao-dojo-trace",
+    "frame.type": "RUN_FINISHED",
+    "plane": "run",
+    "run": "reject-run-1"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "plane",
+    "request.resume[0].interruptId",
+    "request.resume[0].payload.approved",
+    "request.resume[0].status",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "reject",
+    "dir": "request",
+    "plane": "run",
+    "request.resume[0].payload.approved": false,
+    "request.resume[0].status": "resolved",
+    "run": "reject-run-2"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.protocolVersion",
+    "frame.runId",
+    "frame.threadId",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "reject",
+    "dir": "out",
+    "frame.protocolVersion": "1.0",
+    "frame.runId": "reject-run-2",
+    "frame.threadId": "cao-dojo-trace",
+    "frame.type": "RUN_STARTED",
+    "plane": "run",
+    "run": "reject-run-2"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.snapshot.counts.sessions",
+    "frame.snapshot.counts.terminals",
+    "frame.snapshot.scopes[0]",
+    "frame.snapshot.scopes[1]",
+    "frame.snapshot.scopes[2]",
+    "frame.snapshot.sessions[0].id",
+    "frame.snapshot.sessions[0].name",
+    "frame.snapshot.sessions[0].status",
+    "frame.snapshot.terminals[0].agent_profile",
+    "frame.snapshot.terminals[0].id",
+    "frame.snapshot.terminals[0].last_active",
+    "frame.snapshot.terminals[0].provider",
+    "frame.snapshot.terminals[0].session_name",
+    "frame.snapshot.terminals[0].status",
+    "frame.snapshot.terminals[0].window",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "reject",
+    "dir": "out",
+    "frame.type": "STATE_SNAPSHOT",
+    "plane": "run",
+    "run": "reject-run-2"
+   }
+  },
+  {
+   "paths": [
+    "capture",
+    "dir",
+    "frame.outcome.type",
+    "frame.runId",
+    "frame.threadId",
+    "frame.type",
+    "plane",
+    "run",
+    "seq"
+   ],
+   "values": {
+    "capture": "reject",
+    "dir": "out",
+    "frame.outcome.type": "success",
+    "frame.runId": "reject-run-2",
+    "frame.threadId": "cao-dojo-trace",
+    "frame.type": "RUN_FINISHED",
+    "plane": "run",
+    "run": "reject-run-2"
+   }
+  }
+ ],
+ "schema": "cao-dojo-trace-shape/1"
+}
