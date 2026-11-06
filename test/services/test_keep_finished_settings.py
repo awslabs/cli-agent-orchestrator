@@ -97,7 +97,8 @@ def test_range_ends_are_accepted(key, value):
     assert getattr(parse_keep_finished_block({key: value}), key) == value
 
 
-def test_an_invalid_block_reads_as_off_for_keep_decisions(settings_file, caplog):
+def test_an_invalid_block_reads_as_off_for_keep_decisions(settings_file, caplog, monkeypatch):
+    monkeypatch.setattr(keep_service, "_last_invalid_setting", None)
     _write(settings_file, {"enabled": True, "max_per_session": 0})
     with caplog.at_level("WARNING"):
         settings = keep_service.current_settings()

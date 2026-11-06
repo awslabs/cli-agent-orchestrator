@@ -77,13 +77,28 @@ class KeepOutcome:
 NOT_APPLICABLE = KeepOutcome(kept=False)
 
 
+# The last invalid-block message logged, so a typo warns once, not once a minute.
+_last_invalid_setting: Optional[str] = None
+
+
 def current_settings() -> KeepFinishedSettings:
-    """The keep setting, or OFF when it is invalid (a typo can only give today's behaviour)."""
+    """The keep setting, or OFF when it is invalid (a typo can only give today's behaviour).
+
+    An invalid block is logged once per distinct error, then at debug level, so the
+    reaper's once-a-minute read does not repeat the same warning all day.
+    """
+    global _last_invalid_setting
     try:
-        return get_keep_finished_settings()
+        settings = get_keep_finished_settings()
     except KeepFinishedSettingsError as exc:
-        logger.warning("%s; keeping finished agents is OFF until it is fixed", exc)
+        if str(exc) != _last_invalid_setting:
+            _last_invalid_setting = str(exc)
+            logger.warning("%s; keeping finished agents is OFF until it is fixed", exc)
+        else:
+            logger.debug("%s; keeping finished agents is still OFF", exc)
         return KEEP_OFF
+    _last_invalid_setting = None
+    return settings
 
 
 def log_startup_posture() -> None:
@@ -170,6 +185,14 @@ def keep_finished(
     Never tears down ``terminal_id`` itself: when it is not kept the CALLER does
     its usual teardown, so the not-kept path is the pre-#1225 path. Evicted children
     are torn down here, after the decision, outside the lock.
+
+    An agent's delete of a child that is working is a cancellation, whether or not
+    the child is already kept: its mark, if any, is dropped and the delete runs. A
+    mark whose window has already ended is dropped the same way, so no caller is
+    ever told "kept until" a time in the past. The existing-mark check, the cap count
+    and the mark itself all happen under one lock, and the child never counts toward
+    its own cap, so two racing deletes of one child can neither evict it nor evict
+    someone else for it.
     """
     settings = current_settings()
     if not settings.enabled:
@@ -177,18 +200,30 @@ def keep_finished(
     metadata = terminal_service.get_terminal_metadata(terminal_id)
     if not metadata or not metadata.get("caller_id") or not _runtime_is_live(metadata):
         return NOT_APPLICABLE
-    existing = database.get_kept_terminal(terminal_id)
-    if existing is not None:
-        return KeepOutcome(kept=True, kept_until=existing["kept_until"], note=KEPT_NOTE)
     if reason == "delete_terminal" and not _is_idle(terminal_id):
         # An agent deleting a child that is still working is cancelling it. Keeping
-        # it would leave it running and spending tokens, so it is deleted as before.
+        # it would leave it running and spending tokens, so it is deleted as before --
+        # also when it was kept earlier and has started working again (review 396).
+        with _keep_lock:
+            database.unmark_terminal_kept(terminal_id)
         return KeepOutcome(kept=False, note="Not kept: it was still working.")
 
     session_name = str(metadata["tmux_session"])
     cap = settings.max_per_session
     with _keep_lock:
-        kept = database.list_kept_terminals(session_name)
+        existing = database.get_kept_terminal(terminal_id)
+        if existing is not None:
+            if existing["kept_until"] > database._utcnow():
+                return KeepOutcome(kept=True, kept_until=existing["kept_until"], note=KEPT_NOTE)
+            # Its window has ended and the reaper simply hasn't run yet: drop the
+            # mark and let the caller tear it down, rather than report a past time.
+            database.unmark_terminal_kept(terminal_id)
+            return KeepOutcome(kept=False, note="Not kept: its keep window had ended.")
+        kept = [
+            row
+            for row in database.list_kept_terminals(session_name)
+            if row["terminal_id"] != terminal_id
+        ]
         evict: List[str] = []
         if len(kept) >= cap:
             if settings.on_cap == "dont_keep":
@@ -206,15 +241,20 @@ def keep_finished(
                 )
             evict = idle[:needed]
         kept_until = database._utcnow() + timedelta(minutes=settings.idle_window_minutes)
-        if not database.mark_terminal_kept(
+        mark = database.mark_terminal_kept(
             terminal_id, session_name, kept_until=kept_until, reason=reason, evict=evict
-        ):
+        )
+        if mark is None:
             return NOT_APPLICABLE
+        if not mark.written:
+            # Marked by someone else after the check above: report that mark, evict nothing.
+            return KeepOutcome(kept=True, kept_until=mark.kept_until, note=KEPT_NOTE)
 
+    # Only the marks the database really removed are torn down.
     note = KEPT_NOTE
-    for victim in evict:
+    for victim in mark.evicted:
         note += " " + _eviction_sentence(victim, _evict(victim, registry), cap)
-    return KeepOutcome(kept=True, kept_until=kept_until, note=note, evicted=tuple(evict))
+    return KeepOutcome(kept=True, kept_until=kept_until, note=note, evicted=mark.evicted)
 
 
 # The rest of a kept child's report; callers put "kept until <time>" in front of it.
@@ -307,6 +347,9 @@ def reap(registry: Optional[PluginRegistry] = None) -> Dict[str, int]:
     """
     counts: Counter[str] = Counter()
     try:
+        # Nothing kept (always the case while the setting is off): one read, no write.
+        if not database.list_kept_terminals():
+            return {}
         counts["orphans"] += database.delete_orphan_kept_rows()
         settings = current_settings()
         window = timedelta(minutes=settings.idle_window_minutes)
@@ -354,7 +397,9 @@ def _trim_to_cap(cap: int, registry: Optional[PluginRegistry], counts: Counter[s
             if not _is_idle(terminal_id):
                 continue
             with _keep_lock:
-                database.unmark_terminal_kept(terminal_id)
+                removed = database.unmark_terminal_kept(terminal_id)
+            if not removed:
+                continue  # someone else removed it first; nothing to tear down here
             excess -= 1
             _evict(terminal_id, registry)
             counts["evicted"] += 1

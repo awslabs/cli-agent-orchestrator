@@ -343,6 +343,19 @@ class KeptTerminalModel(Base):
 KEEP_REASONS = ("handoff", "delete_terminal")
 
 
+class KeptMark(NamedTuple):
+    """What ``mark_terminal_kept`` did (#1225).
+
+    ``written`` is False when the terminal was already marked, in which case nothing
+    was evicted and ``kept_until`` is the existing mark's. ``evicted`` names only the
+    marks this call really removed.
+    """
+
+    written: bool
+    kept_until: datetime
+    evicted: Tuple[str, ...]
+
+
 def _with_kept_until(terminal_query: Any) -> List[Tuple[Any, Optional[datetime]]]:
     """Run a terminal selection with each row's ``kept_until`` (#1225), in the SAME query.
 
@@ -3613,36 +3626,44 @@ def mark_terminal_kept(
     kept_until: datetime,
     reason: str,
     evict: Sequence[str] = (),
-) -> bool:
+) -> Optional[KeptMark]:
     """Record ``terminal_id`` as kept until ``kept_until`` (#1225).
 
     ``evict`` names kept terminals whose marks are removed in the SAME
     transaction, so a session at its cap never shows one keep more than allowed,
-    not even between two commits.
+    not even between two commits. Only marks that exist are removed, and only those
+    are reported in ``KeptMark.evicted``; ``terminal_id`` itself is never evicted.
 
-    Returns False, writing nothing (and evicting nothing), when the terminal row no
+    Returns None, writing nothing (and evicting nothing), when the terminal row no
     longer exists: a child deleted between its keep decision and this write must
     not leave a mark behind or cost another child its keep. An existing mark is
-    left as it is (the first keep wins).
+    left as it is (the first keep wins) and nothing is evicted.
     """
     if reason not in KEEP_REASONS:
         raise ValueError(f"unknown keep reason {reason!r}")
     with SessionLocal() as db:
         if not db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first():
-            return False
-        if db.get(KeptTerminalModel, terminal_id) is None:
-            _delete_kept_rows(db, [tid for tid in evict if tid != terminal_id])
-            db.add(
-                KeptTerminalModel(
-                    terminal_id=terminal_id,
-                    session_name=session_name,
-                    kept_at=_utcnow(),
-                    kept_until=kept_until,
-                    reason=reason,
-                )
+            return None
+        existing = db.get(KeptTerminalModel, terminal_id)
+        if existing is not None:
+            return KeptMark(False, cast(datetime, as_utc(existing.kept_until)), ())
+        removed = tuple(
+            tid
+            for tid in dict.fromkeys(evict)
+            if tid != terminal_id and db.get(KeptTerminalModel, tid) is not None
+        )
+        _delete_kept_rows(db, list(removed))
+        db.add(
+            KeptTerminalModel(
+                terminal_id=terminal_id,
+                session_name=session_name,
+                kept_at=_utcnow(),
+                kept_until=kept_until,
+                reason=reason,
             )
-            db.commit()
-        return True
+        )
+        db.commit()
+        return KeptMark(True, kept_until, removed)
 
 
 def unmark_terminal_kept(terminal_id: str) -> bool:

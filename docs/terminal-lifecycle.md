@@ -202,15 +202,20 @@ cao session status <session> --workers
 
 ```
 ID           AGENT                PROVIDER        MODEL                HONORED  STATUS          KEPT UNTIL
----------------------------------------------------------------------------------------------------------------------
-3f9a1c2e     developer            claude_code     default              -        idle            2026-11-06 14:05 UTC
+--------------------------------------------------------------------------------------------------------------------
+10000000     developer            kiro_cli        unknown              unknown  idle            -
+20000000     developer            kiro_cli        unknown              unknown  idle            2026-11-06 14:05 UTC
 ```
 
-The `KEPT UNTIL` column only appears when something is kept. Over the API,
-`GET /terminals/{id}` returns `"kept": true` and `"kept_until"`, and each row of
-`GET /sessions/{name}/terminals` carries `"kept_until"` (null when not kept).
-`cao agent status <id>` adds `kept_until` for a kept agent. The web UI does not show
-a badge yet.
+The `KEPT UNTIL` column only appears when something is kept; with nothing kept the
+table is exactly as before. `cao agent status <id>` adds `kept_until` for a kept
+agent. The web UI does not show a badge yet.
+
+Over the API, the terminal body (`GET /terminals/{id}`, and the body returned when a
+terminal is created) now always has two more fields, `"kept"` and `"kept_until"`, and
+each row of `GET /sessions/{name}/terminals` has `"kept_until"`. They are `false` and
+`null` unless the terminal is kept, including while the setting is off. They are
+additive: a client that ignores unknown fields sees no change.
 
 ### The reaper: how kept agents go away
 
@@ -218,7 +223,9 @@ Once a minute, CAO looks at every kept agent:
 
 - **Working** (busy, or waiting on a prompt you have to answer): it is never torn
   down, and its window starts again from now. So asking a kept agent a follow-up
-  question keeps it around.
+  question keeps it around. **A kept agent stuck busy, for example on a prompt nobody
+  answers, stays until you delete it**: there is no upper limit yet. Busy agents are
+  never evicted for the cap either.
 - **Idle past its window**: it is torn down the normal way. CAO saves its scrollback
   and `snapshot.json` **first**, while the pane still shows everything, then sends the
   exit command, closes the window, and records the end in its launch record
@@ -227,13 +234,19 @@ Once a minute, CAO looks at every kept agent:
 
 When a session is full, `teardown_oldest` tears down the oldest idle kept agent the
 same way (`kept_evicted`), and the result says which one. If every kept agent in the
-session is still working, the new one is not kept.
+session is still working, the new one is not kept. If the agent chosen for eviction
+starts working at that very moment, CAO leaves it running rather than kill live work;
+it is then **no longer kept, and stays until you delete it**, and the result says so.
 
 **After a server restart**, kept agents and their windows are remembered and the
-reaper carries on. One limit: after a restart CAO may not see that a kept agent is
-working until new output reaches it, so it may be torn down when its stored window
-ends even if someone is typing in its pane. If the server was down when a window
-ended, the agent is torn down when the server starts.
+reaper carries on. If the server was down when a window ended, the agent is torn down
+when the server starts. One limit, on the **tmux** backend: after a restart CAO does
+not re-attach to existing panes' output, so it cannot see that a kept agent is
+working. Its status reads `unknown`, and CAO treats `unknown` as idle: the agent is
+torn down when its stored window ends even if someone is typing in its pane, it can be
+evicted for the cap, and an agent's `delete_terminal` on it is a keep, not a
+cancellation. The same applies whenever a status read comes back `unknown`. On herdr,
+CAO reads the status from herdr itself, so this restart limit doesn't apply.
 
 ### Operator deletes still delete immediately
 
@@ -242,14 +255,19 @@ You stay in control. These always delete at once, kept or not:
 - `cao agent cancel --delete <id>`
 - `cao shutdown --session <name>` and `cao shutdown --all`
 - the web UI's close button
-- `DELETE /terminals/{id}` and `DELETE /sessions/{name}`, and any other direct CLI or
-  API call
+- `DELETE /terminals/{id}` and `DELETE /sessions/{name}`, and any other API call
+  without the flag below
 
-Only the agent-side `delete_terminal` tool asks for a keep. It does that with a flag
-on its request (`DELETE /terminals/{id}?keep_if_enabled=true`). That flag is a
-convenience, not a security boundary: an agent with a shell can still delete a worker
-with `cao agent cancel --delete`. The flag can only turn a delete into a keep, never
-stop one.
+Only the agent side asks for a keep:
+
+- the `delete_terminal` tool, and `cao agent handoff`'s own delete after a successful
+  handoff, send a flag on their request: `DELETE /terminals/{id}?keep_if_enabled=true`;
+- the `handoff` tool asks through the shape of its own run-step request.
+
+The flag is sent whether or not keeping is on; with it off, the server ignores it and
+deletes as before. The flag is a convenience, not a security boundary: an agent with a
+shell can still delete a worker with `cao agent cancel --delete`. It can only turn a
+delete into a keep, never stop one.
 
 ### Limits, RAM and tokens
 
@@ -272,6 +290,7 @@ stop one.
 | The result says "Not kept: this session already keeps 5" | The session is full and `on_cap` is `dont_keep`, or every kept agent is busy | Raise `max_per_session`, or delete kept agents you're done with |
 | A kept agent vanished before its time | It was the oldest idle one when the session was full, or the window ended while the server was down | Raise `max_per_session` or `idle_window_minutes` |
 | A worker deleted by an agent wasn't kept | It was still working, so the delete was a cancellation | Expected |
+| A kept agent never goes away | It is stuck busy (for example on a prompt), or it started working as it was evicted | Delete it: `cao agent cancel --delete <id>` |
 
 ### FAQ
 

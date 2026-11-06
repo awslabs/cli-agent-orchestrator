@@ -20,12 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while it is working. `max_per_session` (default 5) caps how many a session keeps; `on_cap`
   chooses between tearing down the oldest idle one (`teardown_oldest`, the default;
   `kept_evicted`) and not keeping the new one (`dont_keep`). Operator deletes
-  (`cao agent cancel --delete`, `cao shutdown`, the web UI, the API) still delete at once;
-  only the agent-side `delete_terminal` tool sends the new `DELETE /terminals/{id}`
-  query flag `keep_if_enabled`. Workflows, flows, remote workers and the timeout/error paths
-  are unchanged. Kept terminals show `kept` and `kept_until` in `GET /terminals/{id}`,
-  `kept_until` in session terminal lists, and a `KEPT UNTIL` column in
-  `cao session status --workers`. With the setting off every path behaves as before. See
+  (`cao agent cancel --delete`, `cao shutdown`, the web UI, the API) still delete at once.
+  Only the agent side asks for a keep: the `delete_terminal` tool and `cao agent handoff`'s
+  own post-success delete send the new `DELETE /terminals/{id}` query flag `keep_if_enabled`
+  (always; the server ignores it while the setting is off), and the `handoff` tool asks
+  through its run-step request. Workflows, flows, remote workers and the timeout/error paths
+  are unchanged. Terminal bodies gain two additive fields, `kept` and `kept_until`, and session
+  terminal rows gain `kept_until`; they are `false`/`null` unless a terminal is kept, also while
+  the setting is off. `cao session status --workers` shows a `KEPT UNTIL` column only when
+  something is kept. With the setting off, every path behaves as before, and only those
+  additive fields and the ignored flag differ on the wire. See
   `docs/terminal-lifecycle.md`, which also now says retention is 14 days (it said 7), lists
   flow recycling (no snapshot), and gives the real snapshot directory.
 

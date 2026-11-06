@@ -502,8 +502,156 @@ def test_mark_refuses_a_missing_terminal_and_evicts_nothing(keep):
         database.mark_terminal_kept(
             "deadbeef", SESSION, kept_until=NOW, reason="handoff", evict=["a0000001"]
         )
-        is False
+        is None
     )
     assert _kept_ids() == ["a0000001"]
     with pytest.raises(ValueError, match="unknown keep reason"):
         database.mark_terminal_kept("a0000001", SESSION, kept_until=NOW, reason="whim")
+
+
+# --- Review 396 ----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_agent_delete_of_a_kept_child_that_is_working_again_deletes_it(keep):
+    """P2-1: kept after its handoff, given a follow-up, now working: the supervisor's
+    delete_terminal is a cancellation, so the mark is dropped and the delete runs."""
+    await launch_runtime(release_runtime_of(keep))
+    keep.setting()
+    assert keep_service.keep_finished(CHILD, reason="handoff").kept is True
+    keep.statuses[CHILD] = TerminalStatus.PROCESSING
+    outcome = keep_service.keep_finished(CHILD, reason="delete_terminal")
+    assert outcome.kept is False and outcome.kept_until is None
+    assert outcome.note == "Not kept: it was still working."
+    assert database.get_kept_terminal(CHILD) is None
+
+
+@pytest.mark.asyncio
+async def test_the_route_deletes_a_kept_child_that_is_working_again(keep, monkeypatch):
+    """P2-1 end to end: DELETE ?keep_if_enabled=true on a kept, busy child deletes it."""
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api import main
+    from cli_agent_orchestrator.plugins.registry import PluginRegistry
+
+    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    await launch_runtime(release_runtime_of(keep))
+    keep.setting()
+    keep_service.keep_finished(CHILD, reason="handoff")
+    keep.statuses[CHILD] = TerminalStatus.PROCESSING
+    response = TestClient(main.app, base_url="http://localhost").delete(
+        "/terminals/" + CHILD, params={"keep_if_enabled": "true"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"success": True, "keep_note": "Not kept: it was still working."}
+    assert database.get_terminal_metadata(CHILD) is None
+    assert database.get_launch_record(CHILD)["end_reason"] == "deleted"
+
+
+def test_a_mark_whose_window_has_ended_is_never_reported(keep):
+    """No stale kept_until: an expired, not-yet-reaped mark is dropped and the delete runs."""
+    keep.setting(idle_window_minutes=10)
+    _child("a0000001")
+    keep_service.keep_finished("a0000001", reason="handoff")
+    keep.clock[0] = NOW + timedelta(minutes=10)
+    outcome = keep_service.keep_finished("a0000001", reason="delete_terminal")
+    assert outcome.kept is False and outcome.kept_until is None
+    assert outcome.note == "Not kept: its keep window had ended."
+    assert database.get_kept_terminal("a0000001") is None
+
+
+def test_a_mark_still_in_its_window_reports_that_window(keep):
+    keep.setting(idle_window_minutes=10)
+    _child("a0000001")
+    first = keep_service.keep_finished("a0000001", reason="handoff")
+    keep.clock[0] = NOW + timedelta(minutes=9)
+    again = keep_service.keep_finished("a0000001", reason="delete_terminal")
+    assert again.kept is True and again.kept_until == first.kept_until > keep.clock[0]
+
+
+def test_trimming_a_lowered_cap_skips_a_busy_oldest_child(keep):
+    """P3-1 (probe B): cap 3 -> 1 with the oldest kept child busy. The busy one keeps
+    its mark (it would otherwise be left running, unmarked, and never reaped); the two
+    idle ones go."""
+    keep.setting(max_per_session=3)
+    _fill(keep, ["a0000001", "a0000002", "a0000003"])
+    keep.statuses["a0000001"] = TerminalStatus.PROCESSING
+    keep.setting(max_per_session=1)
+    assert keep_service.reap() == {"busy": 1, "evicted": 2}
+    assert _kept_ids() == ["a0000001"]
+    assert database.get_terminal_metadata("a0000001") is not None
+    assert database.get_terminal_metadata("a0000002") is None
+    assert database.get_terminal_metadata("a0000003") is None
+
+
+@pytest.mark.parametrize("cap", [1, 2])
+def test_a_duplicate_delete_racing_a_keep_evicts_nothing(keep, monkeypatch, cap):
+    """P3-2: a retried delete_terminal(T) whose existence check ran before the first
+    call's mark landed must neither evict T itself (cap 1) nor an unrelated older
+    child (cap 2), and must report T's real mark."""
+    keep.setting(max_per_session=cap)
+    _fill(keep, ["a0000001"])  # older, unrelated
+    _child("a0000002")
+    keep.clock[0] = NOW + timedelta(minutes=5)
+    if cap == 1:
+        database.unmark_terminal_kept("a0000001")
+    first = keep_service.keep_finished("a0000002", reason="delete_terminal")
+    assert first.kept is True
+    before = _kept_ids()
+    # The second call's existence read is stale: it saw no mark.
+    real = database.get_kept_terminal
+    reads = []
+
+    def stale_once(tid):
+        reads.append(tid)
+        return None if len(reads) == 1 else real(tid)
+
+    monkeypatch.setattr(database, "get_kept_terminal", stale_once)
+    keep.calls.clear()
+    second = keep_service.keep_finished("a0000002", reason="delete_terminal")
+    assert second.kept is True and second.kept_until == first.kept_until
+    assert second.evicted == ()
+    assert keep.calls == []
+    assert _kept_ids() == before
+    assert database.get_terminal_metadata("a0000002") is not None
+    assert database.get_terminal_metadata("a0000001") is not None
+
+
+def test_mark_reports_only_the_marks_it_removed(keep):
+    keep.setting()
+    _fill(keep, ["a0000001"])
+    _child("a0000002")
+    mark = database.mark_terminal_kept(
+        "a0000002",
+        SESSION,
+        kept_until=NOW,
+        reason="handoff",
+        evict=["a0000001", "deadbeef", "a0000002"],
+    )
+    assert mark.written is True and mark.evicted == ("a0000001",)
+    again = database.mark_terminal_kept(
+        "a0000002", SESSION, kept_until=NOW + timedelta(hours=1), reason="handoff", evict=["x"]
+    )
+    assert again.written is False and again.kept_until == NOW and again.evicted == ()
+
+
+def test_an_off_pass_only_reads(keep, monkeypatch):
+    """P3-5: nothing kept -> no purge write, no settings read."""
+    monkeypatch.setattr(
+        database, "delete_orphan_kept_rows", lambda: pytest.fail("purged an empty table")
+    )
+    monkeypatch.setattr(keep_service, "current_settings", lambda: pytest.fail("read settings"))
+    assert keep_service.reap() == {}
+
+
+def test_an_invalid_block_warns_once_per_distinct_error(keep, caplog, monkeypatch):
+    monkeypatch.setattr(keep_service, "_last_invalid_setting", None)
+    keep.config["terminal"] = {"keep_finished": {"enabled": True, "on_cap": "nope"}}
+    with caplog.at_level("DEBUG"):
+        for _ in range(3):
+            keep_service.current_settings()
+        keep.config["terminal"] = {"keep_finished": {"enabled": True, "max_per_session": 0}}
+        keep_service.current_settings()
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2
+    assert "on_cap" in warnings[0] and "max_per_session" in warnings[1]
