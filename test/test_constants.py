@@ -590,11 +590,26 @@ class TestCaoHomeDir:
     """Tests for CAO home directory constants."""
 
     def test_cao_home_dir_is_under_aws_cli_agent_orchestrator(self):
-        """Test that CAO_HOME_DIR is under ~/.aws/cli-agent-orchestrator."""
-        from cli_agent_orchestrator.constants import CAO_HOME_DIR
+        """With CAO_HOME_DIR unset, CAO_HOME_DIR is ~/.aws/cli-agent-orchestrator.
 
-        expected = Path.home() / ".aws" / "cli-agent-orchestrator"
-        assert CAO_HOME_DIR == expected
+        The constant is read at import, so a CAO_HOME_DIR in the runner's
+        environment (``CAO_HOME_DIR=$(mktemp -d) pytest ...``) replaces the
+        default. Reload with it unset to check the default, then reload under
+        the original environment so later tests see the session's value.
+        """
+        import importlib
+        import os
+
+        import cli_agent_orchestrator.constants as constants_module
+
+        env = {k: v for k, v in os.environ.items() if k != "CAO_HOME_DIR"}
+        try:
+            with patch.dict("os.environ", env, clear=True):
+                importlib.reload(constants_module)
+                expected = Path.home() / ".aws" / "cli-agent-orchestrator"
+                assert constants_module.CAO_HOME_DIR == expected
+        finally:
+            importlib.reload(constants_module)
 
     def test_cao_home_dir_is_pathlib_path(self):
         """Test that CAO_HOME_DIR is a Path object."""

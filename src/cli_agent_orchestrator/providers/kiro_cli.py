@@ -24,7 +24,7 @@ import re
 import shlex
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -34,11 +34,15 @@ from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.kiro_attest import (
     KiroAttestationError,
     McpServerRow,
+    ToolsPage,
+    ToolsPanel,
     check_mcp_panel,
+    check_tools_page,
     check_tools_panel,
+    join_tools_pages,
     palette_shows_only,
     parse_mcp_panel,
-    parse_tools_panel,
+    parse_tools_page,
 )
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroV3LaunchError,
@@ -422,7 +426,8 @@ def kiro_v3_startup_selector(output: str) -> bool:
 
 # Reads of the pane during the v3 attestation (#1167), about 2.5 s each time
 # (6 reads, 5 intervals): for the typed palette, for a panel's frame after
-# Enter, and for the prompt after Escape closes ``/mcp``. Provisional.
+# Enter or after a Down scrolls ``/tools``, and for the prompt after Escape
+# closes ``/mcp``. Provisional.
 V3_ATTEST_READS = 6
 V3_ATTEST_READ_INTERVAL_S = 0.5
 # v3's ``/mcp`` panel is a snapshot of Kiro's server list, taken as it opens: an
@@ -433,6 +438,28 @@ V3_ATTEST_READ_INTERVAL_S = 0.5
 # the first open: up to one open's waits (about 7.5 s) after the timeout.
 V3_MCP_REOPEN_DELAY_S = 1.0
 V3_MCP_REOPEN_DELAY_MAX_S = 3.0
+#: One screen's render wait: ``V3_ATTEST_READS`` reads, ``V3_ATTEST_READ_INTERVAL_S`` apart.
+V3_ATTEST_RENDER_WAIT_S = (V3_ATTEST_READS - 1) * V3_ATTEST_READ_INTERVAL_S
+# How far back each ``/tools`` read looks. Kiro v3 sizes a scrolling ``/tools``
+# list to the pane (``max(rows - 9, 5)`` rows) but draws it inside the input
+# frame, with three reserved rows below it, so the panel is always taller than
+# the pane and its title is pushed above the pane's top row. Each ``/tools``
+# read is therefore the pane plus its recent scrollback: on tmux the visible
+# pane and this many lines above it, on herdr the last this many lines. By
+# default (``chat.preserveScrollback`` on) Kiro repaints only the pane, so
+# rows above it keep the text they had when they left it: on a pane of 12
+# rows or more those are only the chrome, the title, its divider and the
+# search row, which don't change as the list scrolls; below 12 rows the read
+# is old rows under the one title, and the one-row check refuses it after
+# one Down. Provisional; on herdr a scrolling panel in a pane over about 97
+# rows refuses.
+V3_TOOLS_READ_LINES = 100
+_V3_TOOLS_DIALOG = "a dialog appeared on /tools; it was not answered and nothing more was typed"
+
+
+def _shows_v3_dialog(screen: str) -> bool:
+    """Whether a v3 dialog or startup selector is on ``screen`` (never answered)."""
+    return kiro_v3_dialog(screen) is not None or kiro_v3_startup_selector(screen)
 
 
 @dataclass(frozen=True)
@@ -1054,12 +1081,15 @@ class KiroCliProvider(BaseProvider):
             )
             raise
 
-    async def _open_v3_panel(self, command: str) -> str:
+    async def _open_v3_panel(
+        self, command: str, read_panel: Optional[Callable[[], Awaitable[str]]] = None
+    ) -> str:
         """Type a slash command, confirm its palette, press Enter, and return the screen.
 
         Typed key by key, never as a paste, and never followed by Tab: on
         2.35.1 Tab after ``/tools`` selects ``trust-all``. Enter is pressed only
-        once the palette shows the plain completion for ``command``.
+        once the palette shows the plain completion for ``command``. The screen
+        after Enter is read with ``read_panel`` (default: the visible pane).
         """
         backend = get_backend()
         for key in command:
@@ -1076,7 +1106,7 @@ class KiroCliProvider(BaseProvider):
                 code, f"the {command} palette did not appear; nothing was selected"
             )
         backend.send_special_key(self.session_name, self.window_name, "Enter")
-        return await self._read_screen()
+        return await (read_panel or self._read_screen)()
 
     async def _wait_v3_mcp_running(self, servers: List[str]) -> Dict[str, McpServerRow]:
         """Open ``/mcp`` until no server is still loading; return its rows (#1167).
@@ -1180,6 +1210,149 @@ class KiroCliProvider(BaseProvider):
                 return
         raise KiroAttestationError("kiro_v3_mcp_not_ready", "the prompt did not return after /mcp")
 
+    async def _read_v3_tools_screen(self) -> str:
+        """The pane plus its recent scrollback, for ``/tools`` (see ``V3_TOOLS_READ_LINES``)."""
+        screen = await asyncio.to_thread(
+            get_backend().get_history,
+            self.session_name,
+            self.window_name,
+            tail_lines=V3_TOOLS_READ_LINES,
+            strip_escapes=True,
+        )
+        return screen if isinstance(screen, str) else ""
+
+    async def _read_v3_tools_panel(self, start: float) -> ToolsPanel:
+        """Open ``/tools``, read every screen of it, close it, and join the screens (#1167).
+
+        A list longer than the pane scrolls: Kiro shows the rows that fit, with
+        ``↓ more`` below them, and its Down key moves the list by one row. So
+        while the screen just read is the open panel with ``↓ more`` on it, and
+        no dialog, CAO presses Down once and reads again; the new screen must
+        be the last one moved down by exactly one row. Down is the only key
+        sent into the panel, never Enter or Tab. Kiro draws a scrolling panel
+        taller than the pane, so each read includes the pane's recent
+        scrollback (``_read_v3_tools_screen``); the parser still requires one
+        title and nothing but blank rows below the footer.
+
+        Escape closes the panel, on a pass and on every refusal; it is not
+        pressed if a dialog is on screen by then, and a pass then refuses. On a
+        pass the empty prompt must then be back on screen. The joined rows
+        must hold every row the title declares, each once
+        (``join_tools_pages``), before ``check_tools_panel`` sees them.
+
+        Bounded by the declared count (a screen still showing ``↓ more`` once
+        that many rows have been read refuses) and by ``provider_init_timeout``
+        from ``start``, checked before each Down: so a refusal on time comes at
+        most one screen's render wait (about 2.5 s) after it, and a pass ends
+        at most that wait plus the prompt's (about 5 s) after it.
+        """
+        backend = get_backend()
+        timeout = float(get_server_settings()["provider_init_timeout"])
+        screen = await self._open_v3_panel("/tools", self._read_v3_tools_screen)
+        try:
+            page, screen = await self._read_v3_tools_page(screen, None)
+            pages = [page]
+            while page.more_below:
+                read = len(pages[0].rows) + len(pages) - 1
+                if read >= page.declared:
+                    raise KiroAttestationError(
+                        "kiro_v3_tools_mismatch",
+                        f"the /tools panel shows more rows than the {page.declared} it declares",
+                    )
+                elapsed = time.monotonic() - start
+                if elapsed >= timeout:
+                    raise KiroAttestationError(
+                        "kiro_v3_tools_mismatch",
+                        f"the /tools panel was still scrolling after {elapsed:.0f} s "
+                        f"({read} of {page.declared} tags read)",
+                    )
+                if _shows_v3_dialog(screen):
+                    raise KiroAttestationError("kiro_v3_tools_mismatch", _V3_TOOLS_DIALOG)
+                backend.send_special_key(self.session_name, self.window_name, "Down")
+                page, screen = await self._read_v3_tools_page(
+                    await self._read_v3_tools_screen(), page
+                )
+                pages.append(page)
+            panel = join_tools_pages(pages)
+        except KiroAttestationError:
+            await self._close_v3_tools_panel()
+            raise
+        if not await self._close_v3_tools_panel():
+            raise KiroAttestationError("kiro_v3_tools_mismatch", _V3_TOOLS_DIALOG)
+        await self._wait_v3_prompt_after_tools()
+        # Counts only; no screen text is logged.
+        logger.debug(
+            "kiro_cli: terminal %s /tools read: %d tags, %d on screen at a time, %d Down",
+            self.terminal_id,
+            len(panel.tags) + len(panel.mcp_tools),
+            len(pages[0].rows),
+            len(pages) - 1,
+        )
+        return panel
+
+    async def _read_v3_tools_page(
+        self, screen: str, previous: Optional[ToolsPage]
+    ) -> Tuple[ToolsPage, str]:
+        """Parse one ``/tools`` screen, reading again while its frame trails (#1167).
+
+        With no ``previous`` the panel has just opened: it must start at its
+        first row, and a panel that fits on one screen must already be whole.
+        Otherwise the screen was read after one Down on ``previous`` and must
+        be ``previous`` moved down by one row (``check_tools_page``). Up to
+        ``V3_ATTEST_READS`` reads, ``V3_ATTEST_READ_INTERVAL_S`` apart; then
+        the last read's reason refuses. Returns the page and its screen.
+        """
+        reads = 1
+        while True:
+            try:
+                page = parse_tools_page(screen)
+                check_tools_page(page, previous)
+                if previous is None and not page.more_below:
+                    join_tools_pages([page])
+                return page, screen
+            except KiroAttestationError:
+                if reads >= V3_ATTEST_READS:
+                    raise
+            reads += 1
+            await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+            screen = await self._read_v3_tools_screen()
+
+    async def _close_v3_tools_panel(self) -> bool:
+        """Press Escape on ``/tools`` unless the pane now shows a dialog; say whether it did.
+
+        The pane and its recent scrollback are read first, as for the panel: a
+        dialog is never answered, not even with Escape, and nothing more is
+        typed into it.
+        """
+        if _shows_v3_dialog(await self._read_v3_tools_screen()):
+            return False
+        get_backend().send_special_key(self.session_name, self.window_name, "Escape")
+        return True
+
+    async def _wait_v3_prompt_after_tools(self) -> None:
+        """Return once the empty prompt is back after Escape closed ``/tools`` (#1167).
+
+        Read from the pane, as after ``/mcp``, and not only through the status
+        monitor, which may still hold the idle status from before ``/tools``
+        opened. A dialog refuses at once and is not answered; so does a prompt
+        that is not back within the render wait. No key is sent here.
+        """
+        for attempt in range(V3_ATTEST_READS):
+            if attempt:
+                await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
+            screen = await self._read_screen()
+            if _shows_v3_dialog(screen):
+                raise KiroAttestationError(
+                    "kiro_v3_tools_mismatch",
+                    "a dialog appeared after /tools closed; it was not answered and "
+                    "nothing more was typed",
+                )
+            if re.search(NEW_TUI_IDLE_PATTERN, screen):
+                return
+        raise KiroAttestationError(
+            "kiro_v3_tools_mismatch", "the prompt did not return after /tools"
+        )
+
     async def _attestation_grant(self) -> tuple[list[str], list[str], list[str]]:
         """The grant and servers the panels are held to, and the launch's own allowlist.
 
@@ -1225,7 +1398,10 @@ class KiroCliProvider(BaseProvider):
         ``/mcp`` is opened first, and opened again until no server is still
         loading (see ``_wait_v3_mcp_running``), and only then ``/tools``: a
         loading server has no rows on ``/tools`` yet, so a per-tool grant read
-        before then would be checked against nothing.
+        before then would be checked against nothing. A ``/tools`` list longer
+        than the pane is read screen by screen (see ``_read_v3_tools_panel``),
+        and that read and the final prompt wait share one
+        ``provider_init_timeout``.
         """
         grant, servers, launch = await self._attestation_grant()
         exceeding = tools_exceeding(grant, launch)
@@ -1240,28 +1416,24 @@ class KiroCliProvider(BaseProvider):
                 "kiro_v3_mcp_not_ready",
                 f"the installed file configures ungranted servers {ungranted}",
             )
-        backend = get_backend()
         model = header_model(await self._read_screen(), self._agent_profile)
 
         rows = await self._wait_v3_mcp_running(servers)
 
-        screen = await self._open_v3_panel("/tools")
-        for attempt in range(V3_ATTEST_READS):
-            try:
-                panel = parse_tools_panel(screen)
-                break
-            except KiroAttestationError:
-                if attempt == V3_ATTEST_READS - 1:
-                    backend.send_special_key(self.session_name, self.window_name, "Escape")
-                    raise
-            await asyncio.sleep(V3_ATTEST_READ_INTERVAL_S)
-            screen = await self._read_screen()
-        backend.send_special_key(self.session_name, self.window_name, "Escape")
+        tools_start = time.monotonic()
+        panel = await self._read_v3_tools_panel(tools_start)
         check_tools_panel(panel, grant)
+        # The /tools read and this wait share one provider_init_timeout, counted
+        # from the first /tools key, with one render wait as a floor: a long
+        # scroll takes from this wait rather than adding a fifth T to init
+        # (see utils/init_allowance.py).
+        remaining = float(get_server_settings()["provider_init_timeout"]) - (
+            time.monotonic() - tools_start
+        )
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=float(get_server_settings()["provider_init_timeout"]),
+            timeout=max(V3_ATTEST_RENDER_WAIT_S, remaining),
         ):
             raise KiroAttestationError("kiro_v3_mcp_not_ready", "the prompt did not return")
         return KiroAttestation(

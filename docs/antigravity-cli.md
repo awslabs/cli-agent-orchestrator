@@ -56,6 +56,8 @@ The provider classifies `agy` states from the tmux output buffer (footer-anchore
 
 The TUI footer is identical for IDLE and COMPLETED, so the two are split on an internal turn counter (`mark_input_received`), exactly as the Cursor CLI provider does. This preserves the "wait for IDLE before delivering the task" contract right after initialization.
 
+With `CAO_PYTE_STATUS` on (the default), these patterns run against the pyte-rendered screen, not the raw stream. `agy` redraws its footer in place, so the raw stream keeps a stale `esc to cancel` after the turn ends; only the rendered screen shows which footer is live. `agy` 1.5.0 positions that footer with a scroll region that it resets with `CSI ; r`. CAO's pyte screen treats that reset as a full-screen reset, as xterm and tmux do; pyte 0.8.2 alone keeps the old region, which drew the ready footer four rows too high and stalled initialization at `processing` or `waiting_user_answer`.
+
 ### TUI Structure
 
 ```

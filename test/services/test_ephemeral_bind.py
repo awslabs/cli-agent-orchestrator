@@ -19,6 +19,17 @@ from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.utils.tool_mapping import get_launch_disallowed_tools
+
+EPHEMERAL_HELPER_CUT = (
+    "Agent",
+    "Task",
+    "Monitor",
+    "Skill",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
 
 CHILD = "eeeeeeee"
 
@@ -63,6 +74,66 @@ async def test_owner_launch_is_bound_and_marked_ephemeral(runtime_store, with_cl
     assert audit(name)["events"][-1]["terminal_id"] == CHILD
     assert audit(name)["events"][-1]["effective_tools"] == terminal.allowed_tools
     assert factory.call_args.args[5] == terminal.allowed_tools
+    # The bind is what marks the launch a helper's, and its bound
+    # event records the deny list the launch command will carry.
+    assert factory.call_args.kwargs["ephemeral"] is True
+    recorded = audit(name)["events"][-1]["disallowed_tools"]
+    assert recorded == get_launch_disallowed_tools(
+        "claude_code", terminal.allowed_tools, ephemeral=True
+    )
+    for tool in EPHEMERAL_HELPER_CUT + ("SendMessage", "ListAgents", "Workflow"):
+        assert recorded.count(tool) == 1, tool
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowed_tools", [None, ["fs_read", "@cao-mcp-server"]])
+async def test_an_installed_profile_that_reads_like_a_helper_is_not_a_helper(
+    runtime_store, allowed_tools
+):
+    """The flag comes from the bind, never from the profile text."""
+    from cli_agent_orchestrator.services.ephemeral_service import FENCE_SENTENCE
+
+    env, name, backend, factory = runtime_store
+    tools_line = "allowedTools:\n  - fs_read\n  - '@cao-mcp-server'\n" if allowed_tools else ""
+    # Shaped like a helper's generated profile: no skills, only the CAO MCP server, a
+    # reserved-looking description and the helper fence. It is still an installed profile.
+    (env[3] / "ordinary.md").write_text(
+        "---\nname: ordinary\ndescription: Ramones-log_triage-3f9a ephemeral helper\n"
+        "provider: claude_code\nskills: []\n"
+        "mcpServers:\n  cao-mcp-server:\n    command: cao-mcp-server\n    args: []\n"
+        + tools_line
+        + "---\n"
+        + FENCE_SENTENCE
+        + "\nTask.\n"
+    )
+    terminal = await terminal_service.create_terminal(
+        "claude_code", "ordinary", session_name="cao-session"
+    )
+    assert terminal.ephemeral is False
+    assert "ephemeral" not in factory.call_args.kwargs
+    assert database.get_ephemeral_agent(name)["state"] != "launched"
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_helper_launch_still_gets_the_flag(runtime_store, monkeypatch):
+    """assign launches helpers with defer_init=True: the flag must not depend on that path."""
+    env, name, backend, factory = runtime_store
+    token = claim(env, name)["claim_id"]
+    schedule = Mock(return_value=None)
+    monkeypatch.setattr(terminal_service, "_schedule_deferred_init", schedule)
+    terminal = await terminal_service.create_terminal(
+        "claude_code",
+        name,
+        session_name="cao-session",
+        caller_id=CALLER,
+        claim_id=token,
+        initial_message="inspect",
+        defer_init=True,
+    )
+    assert terminal.ephemeral is True
+    assert factory.call_args.kwargs["ephemeral"] is True
+    schedule.assert_called_once()
+    assert schedule.call_args.args[0] is factory.return_value
 
 
 @pytest.mark.parametrize(

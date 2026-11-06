@@ -1511,7 +1511,10 @@ class TestMcpKeyValidation:
         assert tomllib.loads(f"x = {match.group(1)}")["x"] == {"": "value"}
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
-    def test_accepts_normal_names_and_env_keys(self, mock_load):
+    def test_accepts_normal_names_and_env_keys(self, mock_load, monkeypatch):
+        # A set CAO_HOME_DIR is forwarded into the bundled server's env and
+        # would add a second key to the exact table asserted below.
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
         mock_load.return_value = self._profile_with(
             {"cao-mcp-server": {"command": "cmd", "args": [], "env": {"API_KEY": "v"}}}
         )

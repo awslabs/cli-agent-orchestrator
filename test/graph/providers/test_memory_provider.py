@@ -187,6 +187,10 @@ class TestMemoryProviderHappyPath:
         # The fixture already seeded the ACTIVE relates_to a→b store edge
         # (origin=compiler). No contradiction is stored here, so none projects —
         # a separate test covers store-sourced contradictions.
+        # Without this, projection's lint pass ran the contradiction check
+        # through whichever coding-agent CLI was on PATH (`claude -p`), with the
+        # developer's own login when HOME was the real one.
+        _disable_llm(monkeypatch)
         provider = MemoryGraphProvider(memory_service=populated_scope)
 
         view = await provider.project(scope="global")

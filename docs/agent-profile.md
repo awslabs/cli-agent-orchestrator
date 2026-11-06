@@ -65,7 +65,9 @@ portable and make profile listings useful.
   key out of the committed profile, see
   [examples/serply-research](../examples/serply-research/README.md); for a
   keyless one, see
-  [examples/deed-page-publisher](../examples/deed-page-publisher/README.md).
+  [examples/deed-page-publisher](../examples/deed-page-publisher/README.md); for
+  a worker that provisions resources and reports back to a supervisor, see
+  [examples/cohesivity-backend](../examples/cohesivity-backend/README.md).
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
   provider tool configuration. `tools` is the provider's own tool catalog and
   is passed through to it; it is not the CAO allowlist and does not restrict

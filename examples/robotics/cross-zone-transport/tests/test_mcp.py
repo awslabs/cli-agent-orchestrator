@@ -351,6 +351,22 @@ def test_a_rebound_host_name_cannot_reach_the_controller(controller, path):
             assert client.get(base + "/state", headers={"Host": host}).status_code == 200
 
 
+def test_the_live_view_is_never_cached(controller):
+    # A CDN in front of a port forward caches a response without cache headers,
+    # and a cached /state freezes the page on the first floor it saw.
+    url, _, world, _ = controller
+    base = url[: -len("/mcp")]
+    with httpx2.Client(trust_env=False) as client:
+        page = client.get(base + "/")
+        assert page.headers["cache-control"] == "no-store, max-age=0"
+        # Each poll carries a changing query, so it is a new cache key every time.
+        assert 'fetch("state?t=" + Date.now()' in page.text and 'fetch("/state' not in page.text
+        state = client.get(base + "/state?t=1")
+        assert state.status_code == 200
+        assert state.headers["cache-control"] == "no-store, max-age=0"
+        assert state.json()["run_id"] == world.run_id
+
+
 def test_a_cross_site_page_cannot_read_the_live_view(controller):
     url, _, _, _ = controller
     base = url[: -len("/mcp")]
