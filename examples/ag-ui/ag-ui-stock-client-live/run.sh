@@ -5,7 +5,9 @@
 # Boots cao-server with CAO_AGUI_ENABLED=1 and mock_cli on PATH, then runs the
 # pinned upstream stock client (@ag-ui/client HttpAgent, zero CAO wire code)
 # against /agui/v1/run and verifies at least one frame is received from
-# post-connect activity (AC3 / spec Requirement 13.4).
+# post-connect activity (AC3 / spec Requirement 13.4). It then verifies the
+# ambient stream (GET/POST /agui/v1/stream) with the same SDK's verifyEvents:
+# the conformance tests' captured streams and one live HttpAgent run.
 #
 # This proves the run plane works with the official AG-UI SDK speaking the
 # stock protocol (no CopilotKit page, no CAO-specific adapter).
@@ -23,11 +25,13 @@ export PATH="${REPO_ROOT}/test/providers/fixtures/bin:${PATH}"
 BASE="http://localhost:${CAO_API_PORT}"
 SERVER_PID=""
 SERVER_LOG="$(mktemp -t agui-stock-client.XXXXXX.log)"
+CAPTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agui-ambient-captures.XXXXXX")"
 
 cleanup() {
     local code=$?
     [ -n "${SERVER_PID}" ] && kill "${SERVER_PID}" >/dev/null 2>&1 || true
     rm -f "${SERVER_LOG}"
+    rm -rf "${CAPTURE_DIR}"
     exit "${code}"
 }
 trap cleanup EXIT INT TERM
@@ -65,5 +69,14 @@ if [ ! -d "${EXAMPLE_DIR}/node_modules" ]; then
 fi
 echo "[stock-client] Running stock @ag-ui/client against /agui/v1/run..." >&2
 node "${EXAMPLE_DIR}/client.mjs" "${BASE}"
+
+# The ambient stream (GET/POST /agui/v1/stream) through the same pinned SDK's
+# verifyEvents: every stream the conformance tests produce, then a live run
+# through the stock HttpAgent that must end RUN_FINISHED cancelled.
+echo "[stock-client] Capturing the ambient-stream conformance tests' streams..." >&2
+(cd "${REPO_ROOT}" && CAO_AGUI_CAPTURE_DIR="${CAPTURE_DIR}" uv run pytest \
+    test/api/test_agui_stream_conformance.py -q --no-cov -p no:cacheprovider)
+echo "[stock-client] Verifying the ambient stream with @ag-ui/client verifyEvents..." >&2
+node "${EXAMPLE_DIR}/verify-ambient.mjs" --captures "${CAPTURE_DIR}" --live "${BASE}"
 
 echo "[stock-client] Done." >&2

@@ -88,6 +88,7 @@
   .gcard[data-state="rejected"] { border-color: var(--err); }
   .gcard[data-state="settled"] { opacity: 0.6; }
   .gcard[data-state="skipped"] { opacity: 0.6; border-style: dashed; }
+  .gcard[data-state="held"] { border-style: dotted; }
   .fields { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; font-size: 13px; }
   .fields dt { color: var(--muted); }
   .fields dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
@@ -170,11 +171,6 @@
   // name and the component in `value` (services/agui_stream.py
   // CAO_GENERATIVE_UI_EVENT_NAME).
   var GENERATIVE_UI_NAME = "cao.generative_ui";
-  var STREAM_EVENTS = [
-    "STATE_SNAPSHOT", "STATE_DELTA", "CUSTOM",
-    "RUN_STARTED", "RUN_FINISHED", "STEP_STARTED", "STEP_FINISHED",
-    "TOOL_CALL_START", "TOOL_CALL_END", "TEXT_MESSAGE_CONTENT", "RUN_ERROR",
-  ];
   // How far back the stream replays on connect, so a card raised before the
   // page opened still shows. The server's ring buffer bounds what comes back.
   var REPLAY_WINDOW_MS = 10 * 60 * 1000;
@@ -182,6 +178,9 @@
   // follow deadline since #1107, and resume delivery has no hard timeout); this
   // is only a backstop so the page can never sit in a run forever.
   var RUN_TIMEOUT_MS = 150 * 1000;
+  // The AG-UI version this page speaks, declared on every RunAgentInput
+  // (AG-UI 1.0 basic/run-input: a consumer MUST declare it).
+  var PROTOCOL_VERSION = "1.0";
 
   var els = {
     endpoint: document.getElementById("endpoint"),
@@ -201,15 +200,21 @@
   var es = null;
   var fleetState = null;
   var seenIds = new Set();
-  // The previous frame's EventSource lastEventId. A frame sent without an `id:`
-  // line keeps the previous value, so only a changed value is the frame's own id.
-  var prevStreamId = "";
   var cards = new Map();          // interrupt_id -> card element
   // interrupt_id -> final state, kept across reconnects: the stream's replay
   // window resends an answered card's frame, which must not reopen it.
   var resolved = new Map();
   var runInFlight = false;
-  var threadId = "cao-dojo-" + randomId();
+  // The interrupt ids of the most recent run that ended with the interrupt
+  // outcome, and that run's threadId. AG-UI 1.0 interrupt-resume: "The resume
+  // list MUST cover every interrupt of the run being continued", so a resume is
+  // sent only once each of these has a decision, on that run's thread. A run
+  // that only collects starts a fresh thread, so it never continues past an
+  // interrupt it does not answer. Both are cleared when a run ends any other way.
+  var lastInterrupted = [];
+  var lastInterruptedThread = null;
+  // interrupt_id -> {card, approved}: decisions made but not sent yet.
+  var decisions = new Map();
 
   function randomId() {
     if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
@@ -341,11 +346,12 @@
     rejected: "rejected",
     settled: "no longer pending",
     skipped: "answer not used",
+    held: "decided",
   };
   function setCardState(card, state, note) {
     card.setAttribute("data-state", state);
     var id = card.getAttribute("data-interrupt-id");
-    if (state === "pending" || state === "sending") resolved.delete(id);
+    if (state === "pending" || state === "sending" || state === "held") resolved.delete(id);
     else resolved.set(id, state);
     card._state.textContent = STATE_LABEL[state] + (note ? " — " + note : "");
     var live = state === "pending";
@@ -499,34 +505,32 @@
       else if (type === "STATE_SNAPSHOT") desc = "snapshot: " + ((data.snapshot && data.snapshot.sessions || []).length) + " session(s)";
       else if (type === "STATE_DELTA") desc = (data.delta || []).length + " patch op(s)";
       else if (type === "RUN_FINISHED") desc = "outcome: " + ((data.outcome && data.outcome.type) || "—");
-      else desc = data.message || data.runId || data.session_name || data.step_name || "";
+      else desc = data.message || data.runId || data.session_name || data.step_name || (data.metadata && data.metadata.cao && data.metadata.cao.sessionName) || data.name || "";
     } catch (e) { desc = ""; }
     line.appendChild(el("span", "ld", desc));
     els.log.insertBefore(line, els.log.firstChild);
     while (els.log.children.length > 300) els.log.removeChild(els.log.lastChild);
   }
 
-  // The live stream: EventSource on GET /agui/v1/stream (named events).
-  function handleStream(type, ev) {
+  // The live stream: EventSource on GET /agui/v1/stream, one AG-UI 1.0 run of
+  // unnamed SSE frames whose `type` is in the JSON data.
+  function handleStream(ev) {
     var data;
     try { data = JSON.parse(ev.data); } catch (e) { data = {}; }
-    // Dedupe record frames on their id (the SSE `id:` line or the payload's
-    // event_id), which absorbs the reconnect replay overlap. Never
-    // STATE_SNAPSHOT / STATE_DELTA: cao-server sends these per connection with
-    // no `id:` line and never replays them, so they cannot be duplicates.
-    // EventSource keeps lastEventId across events and reconnects, so deduping
-    // them on it would drop every snapshot after a reconnect and every delta
-    // that follows a record.
-    // Frames from the server's session-end close (TOOL_CALL_END) have no `id:`
-    // line either; reading lastEventId for them would drop them as duplicates.
-    var stateFrame = type === "STATE_SNAPSHOT" || type === "STATE_DELTA";
-    var sseId = ev.lastEventId || "";
-    var ownId = sseId && sseId !== prevStreamId ? sseId : "";
-    prevStreamId = sseId;
-    var id = stateFrame ? null : data.event_id || (data.value && data.value.event_id) || ownId;
-    if (id) {
-      if (seenIds.has(id)) return;
-      seenIds.add(id);
+    if (!data || typeof data !== "object") data = {};
+    var type = typeof data.type === "string" ? data.type : "message";
+    // Dedupe a CAO record seen twice (the ?since= replay when EventSource
+    // reconnects on its own) on the CAO event id in metadata.cao, plus what the
+    // frame is about, because one record can become several AG-UI events.
+    // Frames without a CAO event id (RUN_*, STATE_SNAPSHOT, STATE_DELTA, the
+    // closers) are per run and never repeat. ev.lastEventId is not used: it
+    // carries over from the previous frame when a frame has no `id:` line.
+    var cao = (data.metadata && data.metadata.cao) || {};
+    var eventId = cao.eventId || (data.value && data.value.event_id);
+    if (eventId) {
+      var key = [eventId, type, data.subagentRunId || data.toolCallId || data.name || ""].join("|");
+      if (seenIds.has(key)) return;
+      seenIds.add(key);
     }
     logEvent("stream", type, data);
     if (type === "STATE_SNAPSHOT") {
@@ -560,7 +564,6 @@
   function resetView() {
     fleetState = null;
     seenIds = new Set();
-    prevStreamId = "";
     cards = new Map();
     clear(els.fleet);
     els.fleet.appendChild(el("p", "empty", "Waiting for the first snapshot."));
@@ -600,9 +603,7 @@
         ? "no CAO server reachable at " + base + " (is CAO_AGUI_ENABLED set, and this page's origin in CAO_CORS_ORIGINS?)"
         : "disconnected after " + frames + " frame(s); retrying…");
     };
-    STREAM_EVENTS.forEach(function (type) {
-      es.addEventListener(type, function (ev) { frames++; handleStream(type, ev); });
-    });
+    es.onmessage = function (ev) { frames++; handleStream(ev); };
   }
   function disconnect() {
     if (es) { es.close(); es = null; }
@@ -642,7 +643,7 @@
     var ids = [];
     cards.forEach(function (card, id) {
       var state = card.getAttribute("data-state");
-      if (state === "pending" || state === "sending") ids.push(id);
+      if (state === "pending" || state === "sending" || state === "held") ids.push(id);
     });
     return ids;
   }
@@ -655,7 +656,10 @@
       var card = cards.get(id);
       if (!card) return;
       var state = card.getAttribute("data-state");
-      if ((state === "pending" || state === "sending") && openIds.indexOf(id) < 0) setCardState(card, "settled");
+      if ((state === "pending" || state === "sending" || state === "held") && openIds.indexOf(id) < 0) {
+        decisions.delete(id);
+        setCardState(card, "settled");
+      }
     });
   }
   // Ids of the resume entries CAO did not use, from RUN_FINISHED.result
@@ -667,7 +671,7 @@
       .filter(function (s) { return s && typeof s.interruptId === "string"; })
       .map(function (s) { return s.interruptId; });
   }
-  function onRunFinished(data, decided, openAtStart) {
+  function onRunFinished(data, decided, openAtStart, runThreadId) {
     var outcome = data.outcome && data.outcome.type;
     var skipped = skippedIds(data);
     // A skipped answer was not used, so the card is neither approved nor
@@ -676,24 +680,43 @@
       var card = cards.get(id);
       if (card) setCardState(card, "skipped", "this prompt was no longer pending");
     });
-    var decidedSkipped = decided && skipped.indexOf(decided.card.getAttribute("data-interrupt-id")) >= 0;
-    if (decided && !decidedSkipped) {
-      setCardState(decided.card, decided.approved ? "approved" : "rejected", "answer sent");
-    }
+    decided = decided || [];
+    var decidedSkipped = decided.length > 0 && decided.every(function (d) {
+      return skipped.indexOf(d.card.getAttribute("data-interrupt-id")) >= 0;
+    });
+    decided.forEach(function (d) {
+      var id = d.card.getAttribute("data-interrupt-id");
+      decisions.delete(id);
+      if (skipped.indexOf(id) < 0) setCardState(d.card, d.approved ? "approved" : "rejected", "answer sent");
+    });
     if (outcome === "interrupt") {
+      lastInterrupted = (data.outcome.interrupts || []).map(function (intr) { return String(intr.id); });
+      lastInterruptedThread = runThreadId || null;
+      // A decision for an interrupt this run no longer lists cannot be sent:
+      // drop it, and put a still-held card back to pending.
+      decisions.forEach(function (d, id) {
+        if (lastInterrupted.indexOf(id) >= 0) return;
+        decisions.delete(id);
+        if (d.card.getAttribute("data-state") === "held") setCardState(d.card, "pending");
+      });
       var open = (data.outcome.interrupts || []).map(function (intr) {
         var card = addApprovalCard(interruptToProps(intr));
-        if (card && card.getAttribute("data-state") !== "pending") setCardState(card, "pending");
+        var state = card && card.getAttribute("data-state");
+        if (card && state !== "pending" && state !== "held") setCardState(card, "pending");
         return String(intr.id);
       });
       reconcile(open, openAtStart);
       addRunResult("RUN_FINISHED", outcome, open.length + " approval(s) waiting" + skippedNote(skipped), skipped);
     } else {
+      lastInterrupted = [];
+      lastInterruptedThread = null;
       reconcile([], openAtStart);
       var detail = decidedSkipped
         ? "answer not used: this prompt was no longer pending"
-        : decided
-          ? (decided.approved ? "approval sent" : "rejection sent") + skippedNote(skipped)
+        : decided.length
+          ? (decided.length > 1
+            ? decided.length + " answers sent"
+            : (decided[0].approved ? "approval sent" : "rejection sent")) + skippedNote(skipped)
           : skipped.length
             ? skipped.length + " answer(s) not used: no longer pending"
             : "nothing is waiting for approval";
@@ -708,7 +731,8 @@
   function runAgentInput(extra) {
     var prompt = (els.prompt.value || "").trim();
     var body = {
-      threadId: threadId,
+      protocolVersion: PROTOCOL_VERSION,
+      threadId: "cao-dojo-" + randomId(),
       runId: randomId(),
       state: {},
       messages: prompt ? [{ id: randomId(), role: "user", content: prompt }] : [],
@@ -728,7 +752,7 @@
     var base = baseUrl();
     if (!base) {
       addRunResult("HTTP_ERROR", null, "enter a cao-server URL");
-      if (decided) setCardState(decided.card, "pending", "not sent: enter a cao-server URL");
+      undecide(decided, "not sent: enter a cao-server URL");
       return;
     }
     setRunInFlight(true);
@@ -747,7 +771,7 @@
         try { detail = (await res.json()).detail || ""; } catch (e) { detail = ""; }
         ended = "HTTP_ERROR";
         addRunResult("HTTP_ERROR", null, "HTTP " + res.status + (detail ? ": " + detail : ""));
-        if (decided) setCardState(decided.card, "pending", "not sent (HTTP " + res.status + ")");
+        undecide(decided, "not sent (HTTP " + res.status + ")");
         return;
       }
       var reader = res.body.getReader();
@@ -773,18 +797,18 @@
             renderFleet();
           } else if (type === "RUN_FINISHED") {
             ended = type;
-            onRunFinished(data, decided, openAtStart);
+            onRunFinished(data, decided, openAtStart, body.threadId);
           } else if (type === "RUN_ERROR") {
             ended = type;
             addRunResult("RUN_ERROR", null, data.message || "");
-            if (decided) setCardState(decided.card, "pending", "RUN_ERROR: " + (data.message || ""));
+            undecide(decided, "RUN_ERROR: " + (data.message || ""));
           }
         }
       }
       if (!ended) {
         ended = "NO_END";
         addRunResult("NO_END", null, "the stream closed without RUN_FINISHED or RUN_ERROR");
-        if (decided) setCardState(decided.card, "pending", "run ended without a result");
+        undecide(decided, "run ended without a result");
       }
     } catch (e) {
       if (!ended) {
@@ -792,25 +816,85 @@
         addRunResult("HTTP_ERROR", null, abort.signal.aborted
           ? "no RUN_FINISHED within " + RUN_TIMEOUT_MS / 1000 + " s"
           : "request failed: " + e.message + " (is this page's origin in CAO_CORS_ORIGINS?)");
-        if (decided) setCardState(decided.card, "pending", "not sent");
+        undecide(decided, "not sent");
       }
     } finally {
       clearTimeout(timer);
       setRunInFlight(false);
     }
+    // Held decisions may now cover every interrupt of the latest interrupted run.
+    if (decisions.size) sendIfCovered();
   }
+  // Put the cards of a resume that was not used back to pending, and forget
+  // their decisions, so the operator decides again.
+  function undecide(decided, note) {
+    (decided || []).forEach(function (d) {
+      decisions.delete(d.card.getAttribute("data-interrupt-id"));
+      setCardState(d.card, "pending", note);
+    });
+  }
+  // The page's buildResumeArray (as upstream @ag-ui/client's): one entry per
+  // interrupt, in order, refusing a missing answer or one for an id not listed.
+  // ag-ui's ResumeEntry requires status; without it the run stream breaks
+  // before RUN_STARTED instead of answering RUN_ERROR.
+  function buildResumeArray(ids, responses) {
+    var missing = ids.filter(function (id) { return !responses.has(id); });
+    if (missing.length) throw new Error("missing responses for open interrupts: " + missing.join(", "));
+    var unknown = [];
+    responses.forEach(function (_v, id) { if (ids.indexOf(id) < 0) unknown.push(id); });
+    if (unknown.length) throw new Error("responses reference unknown interrupt ids: " + unknown.join(", "));
+    return ids.map(function (id) {
+      return { interruptId: id, status: "resolved", payload: { approved: responses.get(id).approved } };
+    });
+  }
+  // A raw single-entry resume, for the test seam only: it deliberately skips the
+  // coverage rule so the e2e can send an id CAO never raised.
   function resume(interruptId, payload, decided) {
-    // ag-ui's ResumeEntry requires status; without it the run stream breaks
-    // before RUN_STARTED instead of answering RUN_ERROR.
     var entry = { interruptId: String(interruptId), status: "resolved", payload: payload };
-    return run(runAgentInput({ resume: [entry] }), decided);
+    var extra = { resume: [entry] };
+    if (lastInterruptedThread) extra.threadId = lastInterruptedThread;
+    return run(runAgentInput(extra), decided);
   }
+  // Record a decision. The resume goes out once every interrupt of the most
+  // recent interrupted run has one (AG-UI 1.0: the list MUST cover them all);
+  // until then the card is held. The page never abandons a prompt for the
+  // operator: on CAO an abandoned (cancelled) entry is a deny typed into the CLI.
+  // A card known only from the stream, with no interrupted run outstanding, is
+  // answered on its own.
   function decide(card, approved) {
     if (runInFlight || card.getAttribute("data-state") !== "pending") return;
-    setCardState(card, "sending");
-    card._approve.disabled = true;
-    card._reject.disabled = true;
-    resume(card.getAttribute("data-interrupt-id"), { approved: approved }, { card: card, approved: approved });
+    decisions.set(card.getAttribute("data-interrupt-id"), { card: card, approved: approved });
+    sendIfCovered();
+  }
+  // Send the held decisions as one resume once they cover every interrupt of the
+  // latest interrupted run, on that run's thread; otherwise show them held.
+  function sendIfCovered() {
+    if (runInFlight || !decisions.size) return;
+    var waiting = lastInterrupted.filter(function (i) { return !decisions.has(i); });
+    if (waiting.length) {
+      decisions.forEach(function (d) {
+        setCardState(d.card, "held", "waiting for your answer to " + waiting.length + " other prompt(s)");
+      });
+      return;
+    }
+    var ids = lastInterrupted.slice();
+    decisions.forEach(function (_d, i) { if (ids.indexOf(i) < 0) ids.push(i); });
+    var entries;
+    try {
+      entries = buildResumeArray(ids, decisions);
+    } catch (e) {
+      addRunResult("NOT_SENT", null, e.message);
+      return;
+    }
+    var decided = ids.map(function (i) { return decisions.get(i); });
+    decided.forEach(function (d) {
+      setCardState(d.card, "sending");
+      d.card._approve.disabled = true;
+      d.card._reject.disabled = true;
+    });
+    var extra = { resume: entries };
+    if (lastInterruptedThread) extra.threadId = lastInterruptedThread;
+    run(runAgentInput(extra), decided);
   }
 
   els.connect.addEventListener("click", connect);

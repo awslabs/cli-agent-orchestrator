@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 
+from cli_agent_orchestrator.clients import database as _db
 from cli_agent_orchestrator.plugins import (
     PostCreateSessionEvent,
     PostCreateTerminalEvent,
@@ -28,7 +29,9 @@ from cli_agent_orchestrator.plugins import (
     hook,
 )
 from cli_agent_orchestrator.plugins.base import CaoPlugin
+from cli_agent_orchestrator.services.agui.attribution import subagent_run_id_for_session
 from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled
+from cli_agent_orchestrator.services.agui_stream import SESSION_SUBAGENT_RUN_ID_KEY
 from cli_agent_orchestrator.services.event_log_service import get_event_log
 from cli_agent_orchestrator.services.event_primitives import normalize_kind
 from cli_agent_orchestrator.services.sse_bus import get_bus
@@ -67,6 +70,14 @@ class EventLogPublisher(CaoPlugin):
         # zero-cost and retains no fleet metadata unless an operator opts in.
         if not agui_surface_enabled():
             return
+
+        try:  # #1193: the session's AG-UI subagentRunId at log time (hashed; the raw id stays here)
+            if session_name and (inc := _db.get_session_incarnation(session_name)):
+                detail = {**detail, SESSION_SUBAGENT_RUN_ID_KEY: subagent_run_id_for_session(inc)}
+        except Exception:
+            logger.debug(
+                "event_log_publisher: no session subagentRunId for %s", session_name, exc_info=True
+            )
 
         kind = normalize_kind(event_type, detail)
         event = get_event_log().append(kind, terminal_id, session_name, detail)
