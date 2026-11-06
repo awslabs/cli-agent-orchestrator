@@ -203,7 +203,7 @@ def keep_finished(
     if reason == "delete_terminal" and not _is_idle(terminal_id):
         # An agent deleting a child that is still working is cancelling it. Keeping
         # it would leave it running and spending tokens, so it is deleted as before --
-        # also when it was kept earlier and has started working again (review 396).
+        # also when it was kept earlier and has started working again.
         with _keep_lock:
             database.unmark_terminal_kept(terminal_id)
         return KeepOutcome(kept=False, note="Not kept: it was still working.")
