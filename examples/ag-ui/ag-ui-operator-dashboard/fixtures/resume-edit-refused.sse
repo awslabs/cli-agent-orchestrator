@@ -1,0 +1,4 @@
+data: {"type":"RUN_STARTED","threadId":"od-cap","runId":"edit","protocolVersion":"1.0"}
+
+data: {"type":"RUN_ERROR","message":"Resume failed for interrupt cf055aea-ae97-4543-a82c-e902455e5f20: Decision 'edit' not supported for this interrupt. Allowed: ['approve', 'deny']"}
+
