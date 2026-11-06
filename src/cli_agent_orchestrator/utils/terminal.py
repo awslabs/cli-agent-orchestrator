@@ -174,18 +174,20 @@ async def wait_for_shell(
 
     logger.info(f"Waiting for shell to be ready for terminal {terminal_id}...")
 
-    deadline = time.time() + timeout
+    # Monotonic clock: a wall-clock step (NTP, VM resume) must not cut the wait short or
+    # stretch it, since a timeout here gates whether the identity check runs in time.
+    deadline = time.monotonic() + timeout
     previous_buffer = ""
-    last_change = time.time()
+    last_change = time.monotonic()
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         buf = read_buffer()
 
         if buf != previous_buffer:
             previous_buffer = buf
-            last_change = time.time()
+            last_change = time.monotonic()
 
-        stable_elapsed = time.time() - last_change
+        stable_elapsed = time.monotonic() - last_change
 
         if buf.strip() and stable_elapsed >= stable_duration:
             logger.info(f"Shell ready for {terminal_id} (buffer stable, {len(buf)} bytes)")
@@ -233,8 +235,8 @@ async def wait_until_status(
     logger.info(
         f"wait_until_status [{terminal_id}]: waiting for {{{target_str}}}, timeout={timeout}s"
     )
-    start = time.time()
-    while time.time() - start < timeout:
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
         current = await asyncio.to_thread(status_monitor.get_status, terminal_id)
         if on_poll is not None:
             await on_poll()

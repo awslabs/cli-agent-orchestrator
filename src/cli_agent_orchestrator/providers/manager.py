@@ -76,6 +76,7 @@ class ProviderManager:
         provider_variant: Optional[str] = None,
         session_id: Optional[str] = None,
         kiro_launch: Optional[KiroLaunch] = None,
+        ephemeral: bool = False,
     ) -> BaseProvider:
         """Create and store provider instance.
 
@@ -85,6 +86,12 @@ class ProviderManager:
 
         ``kiro_launch`` is an ephemeral Kiro helper's per-launch home and
         kiro-cli (#1167 Phase 2); only ``kiro_cli`` accepts it.
+
+        ``ephemeral`` marks an ephemeral Claude Code helper's launch: the caller
+        sets it from the launch's ephemeral binding, the fact that marks the
+        terminal ephemeral, never from the profile text. Only
+        ``claude_code`` accepts it; Kiro helpers are told apart by ``kiro_launch``
+        and Codex helpers launch as before.
         """
         try:
             provider: BaseProvider
@@ -100,6 +107,8 @@ class ProviderManager:
                 )
             if kiro_launch is not None and provider_type != ProviderType.KIRO_CLI.value:
                 raise ValueError("a per-launch Kiro home is only for the kiro_cli provider")
+            if ephemeral and provider_type != ProviderType.CLAUDE_CODE.value:
+                raise ValueError("the ephemeral helper cut is only for the claude_code provider")
             if provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
@@ -126,6 +135,7 @@ class ProviderManager:
                     effort=effort,
                     resume_session_id=resume_session_id,
                     session_id=session_id,
+                    ephemeral=ephemeral,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(

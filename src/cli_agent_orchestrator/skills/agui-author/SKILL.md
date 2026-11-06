@@ -10,7 +10,7 @@ description: Author live dashboard UI from an agent via the `emit_ui` MCP tool. 
 
 # Authoring generative UI over AG-UI
 
-CAO exposes an **AG-UI** stream (`GET /agui/v1/stream`) that any AG-UI client —
+CAO exposes an **AG-UI** 1.0 stream (`GET`/`POST /agui/v1/stream`) that any AG-UI client —
 CopilotKit, the AG-UI Dojo, or a plain `EventSource` — can consume. Your UI
 intents ride on it as AG-UI `CUSTOM` events named `cao.generative_ui`, so a
 dashboard renders them only if it handles that name (the CAO examples under
@@ -159,9 +159,9 @@ curl -sX POST http://localhost:9889/agui/v1/emit_ui \
   -d '{"component":"progress","props":{"label":"demo","value":0.5}}'
 ```
 
-An `event: CUSTOM` frame with `"name": "cao.generative_ui"` appears on the
-stream, carrying your component and props in `value`; an off-list component is
-refused with HTTP 400.
+A `data:` frame with `"type":"CUSTOM"` and `"name":"cao.generative_ui"` appears
+on the stream, carrying your component and props in `value`; an off-list
+component is refused with HTTP 400.
 
 ## See also
 

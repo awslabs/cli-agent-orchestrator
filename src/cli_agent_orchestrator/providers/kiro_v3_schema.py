@@ -248,6 +248,35 @@ SUPPORTED_KIRO_CLI_VERSIONS: Mapping[str, KiroCliVersionEntry] = MappingProxyTyp
                 "so it cannot widen the render, tags or rules; pending operator verification"
             ),
         ),
+        # PENDING OPERATOR VERIFICATION. Derived statically, never run, as for
+        # 2.37.0. This release ships the same engine, @kiro/agent 0.66.70: the
+        # 17-file @kiro/agent package, acp-server.js included, is byte-identical
+        # to 2.35.1's and 2.37.0's. That package is a subset of the engine's
+        # whole installed tree, and unlike 2.36.0's and 2.37.0's tree (693
+        # files, identical to 2.35.1's), 3.0.0's tree has 694 files: the semver
+        # bump (7.8.5 -> 7.8.6) added one new file and changed three others, and
+        # the tslib bump (2.8.1 -> 2.9.1) changed five files with none added or
+        # removed, so 693 + 1 = 694. Neither bundled library is loaded by
+        # acp-server.js (semver is reached only through global-agent's
+        # install-time script; tslib only through async-mutex inside
+        # z3-solver, used for code-constraint analysis, not permissions).
+        # `chat --help` and the root --help are identical to 2.37.0's, and
+        # Kiro's legacy copies read the same in its TUI and its binary. It
+        # reuses KAS_0_66_70 unchanged, so it cannot widen anything: the
+        # render, the tags and the rules are 2.35.1's. It only lets the v3
+        # probe accept 3.0.0; a launch on it needs the operator opt-in (#1167).
+        "3.0.0": KiroCliVersionEntry(
+            cli_version="3.0.0",
+            schema=KAS_0_66_70,
+            pending_operator_verification=True,
+            basis=(
+                "static: engine package byte-identical to 2.35.1's and 2.37.0's; the "
+                "engine tree differs from 2.37.0's only in two bundled helper libraries "
+                "(semver, tslib) that the engine doesn't load; reuses KAS_0_66_70 "
+                "unchanged, so it cannot widen the render, tags or rules; pending "
+                "operator verification"
+            ),
+        ),
     }
 )
 

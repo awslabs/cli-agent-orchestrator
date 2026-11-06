@@ -36,6 +36,9 @@ interface RunDetailProps {
 // follower that never stops polling a finished run.
 const TERMINAL_RUN_STATES = new Set(['completed', 'failed', 'cancelled'])
 
+/** How often the detail re-reads a live run's inspection (the list polls every 10s). */
+export const RUN_REFRESH_MS = 5000
+
 export function RunDetail({ run, allRuns }: RunDetailProps) {
   const events = useStore(s => s.wfEvents)
   const gaps = useStore(s => s.wfGaps)
@@ -47,6 +50,7 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
   const setFollowConnected = useStore(s => s.setFollowConnected)
   const cancelWorkflowRun = useStore(s => s.cancelWorkflowRun)
   const resumeWorkflowRun = useStore(s => s.resumeWorkflowRun)
+  const refreshSelectedRun = useStore(s => s.refreshSelectedRun)
   const showSnackbar = useStore(s => s.showSnackbar)
   // Guards the cancel/resume buttons against double-submit while the request is
   // in flight (both actions re-fetch + re-select the run when they settle).
@@ -99,7 +103,22 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
   // Reset the absent latch when the selection changes to a different run.
   useEffect(() => setAbsent(false), [run.run_id])
 
-  const cue = runCue(run.state)
+  // Keep the snapshot itself current, not just the follow decision: steps settle
+  // while the run is live (a script-tier run emits no events, so the follow
+  // stream never carries them), and Cancel / Resume move a run between states.
+  // Poll the inspection while the run is live, and re-read it once when the
+  // polled list reports a state the snapshot has not caught up with.
+  useEffect(() => {
+    if (isTerminal) return
+    const interval = setInterval(refreshSelectedRun, RUN_REFRESH_MS)
+    return () => clearInterval(interval)
+  }, [run.run_id, isTerminal, refreshSelectedRun])
+  const liveState = liveRow?.state
+  useEffect(() => {
+    if (liveState && liveState !== run.state) refreshSelectedRun()
+  }, [liveState, run.state, refreshSelectedRun])
+
+  const cue = runCue(effectiveState)
   const selectedEvent = events[selectedIndex] ?? null
 
   return (

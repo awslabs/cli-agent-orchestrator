@@ -1217,6 +1217,62 @@ class TestHandoffCreateTimeoutRecovery:
         assert all(not c.kwargs.get("lookup_only") for c in mock_create.call_args_list)
         mock_requests.post.assert_not_called()
 
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_failed_original_with_a_retained_terminal_reports_its_id(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """Issue #943: a 424 that names the failed original's retained terminal
+        (deferred provider cleanup) surfaces that id on the HandoffResult, so the
+        operator can delete it. Nothing is sent to it and nothing is retried."""
+        import requests
+
+        cause = "terminal 'abc12345' for idempotency_key 'k' failed to initialize: boom"
+        error = self._http_error(424, cause)
+        error.response._content = json.dumps({"detail": cause, "terminal_id": "abc12345"}).encode()
+        mock_create.side_effect = [requests.exceptions.ReadTimeout("read timed out"), error]
+        seen = []
+        result, mock_requests = self._run(mock_create, mock_provider, seen)
+
+        assert result.success is False
+        assert result.terminal_id == "abc12345"
+        assert "failed to initialize: boom" in result.message
+        assert mock_create.call_count == 2
+        assert all(not c.kwargs.get("lookup_only") for c in mock_create.call_args_list)
+        mock_requests.post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._claim_ephemeral")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_claim_424_with_a_retained_terminal_reports_its_id(
+        self, mock_create, mock_claim, mock_provider, _nudge
+    ):
+        """Issue #943, claim path: the 424 arrives as a ``_ClaimRefused`` that
+        carries the retained terminal, and the HandoffResult surfaces it."""
+        import requests
+
+        from cli_agent_orchestrator.utils.orchestration import EphemeralClaim, _ClaimRefused
+
+        mock_claim.return_value = EphemeralClaim("claude_code", [], "claim-1")
+        mock_create.side_effect = [
+            requests.exceptions.ReadTimeout("read timed out"),
+            _ClaimRefused(
+                "unexpected_failure",
+                "ephemeral launch failed (424)",
+                status_code=424,
+                terminal_id="abc12345",
+            ),
+        ]
+        result, mock_requests = self._run(mock_create, mock_provider)
+
+        assert result.success is False
+        assert result.rule == "unexpected_failure"
+        assert result.terminal_id == "abc12345"
+        assert mock_create.call_count == 2
+        mock_requests.post.assert_not_called()
+
     @pytest.mark.parametrize("status_code", [500, 400])
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
@@ -1326,7 +1382,10 @@ class TestHandoffCreateTimeoutRecovery:
         )
 
         failed = MagicMock(status_code=424)
-        failed.json.return_value = {"detail": "terminal 'dev-failed' failed to initialize"}
+        failed.json.return_value = {
+            "detail": "terminal 'dev-failed' failed to initialize",
+            "terminal_id": "dev-failed",
+        }
         calls = []
 
         def post(url, **kwargs):
@@ -1362,6 +1421,7 @@ class TestHandoffCreateTimeoutRecovery:
 
         assert exc_info.value.status_code == 424
         assert exc_info.value.rule == "unexpected_failure"
+        assert exc_info.value.terminal_id == "dev-failed"
         assert len(calls) == 2
         assert not any(params.get("lookup_only") for params in calls)
 

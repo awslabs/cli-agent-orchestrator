@@ -330,7 +330,9 @@ def test_wiki_compiler_kiro_argv_pins_agent_engine_v2():
     assert "--v3" not in argv
 
 
-def test_wiki_compiler_kiro_nonzero_exit_still_falls_back_as_llm_error(tmp_path, monkeypatch):
+def test_wiki_compiler_kiro_nonzero_exit_still_falls_back_as_llm_error(
+    tmp_path, monkeypatch, real_llm_client_selection
+):
     """A fake ``kiro-cli`` on PATH records its argv and exits 3; no real Kiro runs."""
     from cli_agent_orchestrator.services import wiki_compiler
 

@@ -299,7 +299,8 @@ def test_the_live_view_serves_only_the_page_and_the_measured_state(controller):
         assert page.status_code == 200
         assert page.headers["content-type"].startswith("text/html")
         # Page-relative, so the page also works behind the path prefix of a port forward.
-        assert 'fetch("state"' in page.text and 'fetch("/state"' not in page.text
+        assert 'fetch("state?t=" + Date.now()' in page.text and 'fetch("/state' not in page.text
+        assert page.headers["cache-control"] == "no-store, max-age=0"
         # The robot pictures are inlined: one for each team color, and a blocked one.
         assert "__ROBOT_SPRITES__" not in page.text
         assert page.text.count("data:image/png;base64,") == 5
@@ -307,6 +308,9 @@ def test_the_live_view_serves_only_the_page_and_the_measured_state(controller):
         assert set(re.findall(r"https?://[^\s\"')]+", page.text)) == {"http://www.w3.org/2000/svg"}
         state = client.get(base + "/state")
         assert state.status_code == 200
+        assert state.headers["cache-control"] == "no-store, max-age=0"
+        # A cache-busting query is the same state, so the poll URL of the page works.
+        assert client.get(base + "/state?t=1").json()["run_id"] == world.run_id
         data = state.json()
         assert data["run_id"] == world.run_id
         assert data["commands"][0]["command_id"] == "form-1"
