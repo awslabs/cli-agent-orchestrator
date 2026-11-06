@@ -102,6 +102,7 @@ CAO ships with built-in skills including:
 | `cao-worker-protocols` | Worker-side callback and completion rules for assigned and handed-off tasks |
 | `cao-agent-plugin-creator` | Authors a new Agent Plugins 1.0.0 package from an empty directory: the `plugin.json` manifest, `skills/`, and an optional `mcp.json` |
 | `cao-agent-plugin-audit` | Audits an existing Agent Plugins 1.0.0 package against the vendored schemas and the Agent Skills limits that `cao plugin validate` only warns about, using a bundled validator that needs no CAO install |
+| `cao-ephemeral-decider-setup` | Walks an agent through setting up ephemeral agents and an installed decider for a user, end to end: preflight, installing the decider into `cao-server`'s own environment, the tier table, a safe settings edit, handing consent to the human, the server/MCP restart, shadow vs on, a smoke test, provider caveats and undo |
 
 ## Extra Skill Directories
 

@@ -7,11 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- add `cao-ephemeral-decider-setup`, a bundled skill walking an agent through setting up
-  ephemeral agents and an installed decider (worked example Jev) for a user: preflight,
-  installing the decider into `cao-server`'s own environment, the per-provider tier table,
-  a safe edit of the `ephemeral` settings block, handing consent to the human, the
-  server/MCP restart, shadow vs on, a smoke test, provider caveats and undo (#1239)
+- **Add `cao-ephemeral-decider-setup`, a bundled skill walking an agent through setting up
+  ephemeral agents and an installed decider for a user (#1239).** Covers preflight, installing
+  the decider into `cao-server`'s own environment, the per-provider tier table, a safe edit of
+  the `ephemeral` settings block, handing consent to the human, the server/MCP restart, shadow
+  vs on, a smoke test, provider caveats and undo.
 
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different

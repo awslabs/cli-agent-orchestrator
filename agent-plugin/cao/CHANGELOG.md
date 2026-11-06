@@ -22,4 +22,4 @@ Skills:
 - `cao-supervisor-protocols`
 - `cao-worker-protocols`
 
-Excluded: `cao-provider` and the event-plugin authoring skill (both moved to cao-contributor, where they serve the contributor story); `cao-memory`, `cao-learning`, `cao-workflow` (useful, but they expand the surface before the delivery path is proven); `skills/vendor/ext-apps/*` (Apache-2.0 vendored content with its own NOTICE attribution obligations, which redistributing in a second package would multiply for no benefit); `agui-author`, `cao-mcp-apps`, `mcp-apps-builder` (adjacent features with their own consumers).
+Excluded: `cao-provider` and the event-plugin authoring skill (both moved to cao-contributor, where they serve the contributor story); `cao-memory`, `cao-learning`, `cao-workflow`, `cao-ephemeral-decider-setup` (useful, but they expand the surface before the delivery path is proven); `skills/vendor/ext-apps/*` (Apache-2.0 vendored content with its own NOTICE attribution obligations, which redistributing in a second package would multiply for no benefit); `agui-author`, `cao-mcp-apps`, `mcp-apps-builder` (adjacent features with their own consumers).
