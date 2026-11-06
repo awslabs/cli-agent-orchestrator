@@ -7,6 +7,11 @@ Keep `ephemeral.enabled` false outside testing. It defaults to false, and stays 
 the rest of the lifecycle cleanup work (#1079) ships and creating an ephemeral agent from
 inside a workflow step is refused (#1080). The cleanup described below is not enough on its own.
 
+For an agent setting this feature up for a user, end to end — including installing a
+decider such as Jev into `cao-server`'s own environment, the tier table, a safe edit of
+the block below, and handing consent to the human — see the bundled
+[`cao-ephemeral-decider-setup`](../skills/cao-ephemeral-decider-setup/SKILL.md) skill.
+
 ## Operator settings
 
 The operator-only `ephemeral` block in `settings.json` has these defaults:

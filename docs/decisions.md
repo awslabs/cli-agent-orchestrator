@@ -168,6 +168,10 @@ shutdown and crash recovery mark unfinished decisions interrupted.
 
 ## Operator controls
 
+For an agent walking a user through installing a decider, building the tier
+table below, and turning a point on for the first time, see the bundled
+[`cao-ephemeral-decider-setup`](../skills/cao-ephemeral-decider-setup/SKILL.md) skill.
+
 ```bash
 cao decisions status
 cao decisions off
