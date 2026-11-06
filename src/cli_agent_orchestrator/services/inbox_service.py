@@ -19,6 +19,7 @@ from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
+    mark_message_edges_delivered,
     update_message_status,
 )
 from cli_agent_orchestrator.constants import (
@@ -294,6 +295,12 @@ class InboxService:
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+                # Arming is bookkeeping. A failure here must not reach the handler
+                # below, which would mark a batch that was delivered as FAILED.
+                try:
+                    mark_message_edges_delivered([m.id for m in batch])
+                except Exception as arm_exc:  # noqa: BLE001
+                    logger.warning(f"Could not arm delegation edges for {terminal_id}: {arm_exc}")
                 # The paste is in the pane: the immediate-delivery caller may
                 # answer now. Everything below is confirmation and recovery.
                 after_dispatch()
