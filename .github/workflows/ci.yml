@@ -593,6 +593,70 @@ jobs:
         # Non-zero exit fails the job; the script cleans up the server on exit.
         run: ./examples/ag-ui/ag-ui-stock-client-live/run.sh
 
+  ag-ui-operator-dashboard:
+    name: AG-UI operator dashboard
+    runs-on: ubuntu-latest
+    # Bounds a hung e2e: the job normally takes a few minutes.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: examples/ag-ui/ag-ui-operator-dashboard
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The keyless e2e drives real mock_cli terminals, which need tmux.
+      # Explicit, so the job does not depend on the runner image shipping tmux (ubuntu-latest, now ubuntu-26.04, does).
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (cao-server + agui run plane)
+        working-directory: .
+        run: uv sync --locked --all-extras --dev
+
+      # Node 22: the e2e runs e2e/e2e.ts with --experimental-strip-types.
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: examples/ag-ui/ag-ui-operator-dashboard/package-lock.json
+
+      - name: Install app dependencies (exact pins, install scripts off)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Dependency checks
+        run: npm run test:dependencies
+
+      - name: Type check
+        run: npm run typecheck
+
+      # Codecov ingests only the Python coverage.xml, so it never sees this
+      # TypeScript. vite.config.ts holds core/ to 100% lines, branches,
+      # functions and statements; a drop fails this step.
+      - name: Unit tests with coverage floor
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+      # A private cao-server (temp HOME, own tmux server, port 9896) with mock_cli
+      # terminals. SIMULATED: an agent showing a prompt. The harness types the
+      # marker "APPROVAL_REQUIRED: <text>" into a pane without Enter, standing in
+      # for a CLI that prints a permission prompt and waits. COVERED FOR REAL: the
+      # approval bridge, classification, the run plane, resume and key delivery.
+      # See examples/ag-ui/ag-ui-operator-dashboard/e2e/README.md.
+      - name: Keyless e2e (cao-server + mock_cli terminals)
+        run: ./e2e/run.sh
   # =======================================================================================
   # RUST TUI (issue #321, unit `rust-ci`). THE FIRST JOB IN ci.yml THAT INSPECTS THE RUST
   # CRATE AT ALL — measured before this change: `cargo` appeared in only
