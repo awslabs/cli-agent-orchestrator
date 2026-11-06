@@ -140,6 +140,33 @@ async def test_overlong_target_stays_inside_the_step_id_length_bound(
     assert len(set(step_ids)) == len(step_ids)
 
 
+@pytest.mark.parametrize("concurrency", [0, 1])
+@pytest.mark.asyncio
+async def test_concurrency_clamps_up_to_at_least_one_worker(
+    api_base_url, fake_run_step_server, concurrency
+):
+    """The DOWNWARD half of the clamp, which the upward cases never reach.
+
+    ``concurrency`` is declared as a bare int with no minimum, so 0 and
+    negatives clear ``_validate_inputs`` (asserted below, since that premise is
+    the whole reason the floor has to live in the script). Without the
+    ``max(1, ...)`` floor, 0 resolves to ``max_workers=0`` and
+    ``ThreadPoolExecutor`` raises ``ValueError: max_workers must be greater
+    than 0`` mid-run — after the sequential plan step has already executed.
+    """
+    inputs = _resolved_inputs({"target": "myapp", "concurrency": concurrency})
+    assert inputs["concurrency"] == concurrency  # the gate really does let this through
+    spec = _RealSpec(_WORKFLOW_PATH, "workflow-example")
+
+    result = await run_script_workflow(spec, inputs, f"test-concurrency-{concurrency}")
+
+    assert result.state == RunState.COMPLETED
+    assert result.output["max_workers"] == 1
+    # The fan-out still runs every check — a floored worker count serialises
+    # the units, it does not drop any.
+    assert set(result.output["checks"].keys()) == {"style", "security", "performance"}
+
+
 def test_slug_truncation_is_collision_safe_and_stable():
     """Bare truncation would collapse targets sharing a prefix onto one step_id.
 
