@@ -1500,8 +1500,7 @@ def _helper_v3_refusal(error: KiroV3Refusal) -> KiroV3Refusal:
 def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
     """The probe's version or missing-flag refusal with the helper's remedy, same kind.
 
-    It stays a capability error (a 400 with a plain-string detail); any other
-    probe failure, which suggests no engine, is returned as it is.
+    Any other probe failure, which suggests no engine, is returned as it is.
     """
     if error.kind == KiroV3UnsupportedVersionError.code:
         message = str(KiroV3UnsupportedVersionError(error.version, remedy=_HELPER_SUPPORTED_CLI))
@@ -1521,14 +1520,19 @@ def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
     )
 
 
-def _helper_probe(probe: Callable[..., KiroCapabilities]) -> Callable[..., KiroCapabilities]:
-    """``probe``, whose refusals carry the helper's remedy."""
+def _helper_probe(
+    probe: Callable[..., KiroCapabilities], agent_profile: str, caller_id: Optional[str]
+) -> Callable[..., KiroCapabilities]:
+    """``probe``, whose helper refusals are structured and counted in the archive."""
 
     def run(*args: Any, **kwargs: Any) -> KiroCapabilities:
         try:
             return probe(*args, **kwargs)
         except KiroCapabilityError as exc:
-            raise _helper_capability_error(exc) from exc
+            error = _helper_capability_error(exc)
+            raise _ephemeral_kiro_refusal(
+                agent_profile, caller_id, KiroLaunchRefusal(error.kind, str(error))
+            ) from None
 
     return run
 
@@ -2365,7 +2369,9 @@ async def _create_terminal_unguarded(
                         probe,
                         executable=resolved_cli.path,
                         env=kiro_launch_home.kiro_env(kiro_probe_home),
-                    )
+                    ),
+                    agent_profile,
+                    caller_id,
                 )
             try:
                 capabilities = await asyncio.to_thread(probe, resolved_engine, requested)

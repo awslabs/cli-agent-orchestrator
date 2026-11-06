@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Ephemeral assign and handoff relay Kiro launch refusal rules and remedies.** Helper
+  probe refusals are structured and counted in the refusal archive; installed-profile
+  launches keep their existing errors. Older-server and unknown launch failures retain
+  bounded, control-free server text with `unexpected_failure`.
+
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different
   request already claimed gets its own slot. On `POST /sessions` and

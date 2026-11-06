@@ -518,7 +518,9 @@ async def test_bind_refusal_relays_rule_without_launch_parameters(launch_http, m
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
 @pytest.mark.parametrize("body", [{"detail": "private launch URL and parameters"}, [], None])
-async def test_nonpolicy_bind_error_after_claim_is_generic(launch_http, monkeypatch, path, body):
+async def test_nonpolicy_bind_error_after_claim_keeps_server_text(
+    launch_http, monkeypatch, path, body
+):
     runtime, _, _, _, _ = launch_http
     post = orchestration.requests.post
 
@@ -537,7 +539,11 @@ async def test_nonpolicy_bind_error_after_claim_is_generic(launch_http, monkeypa
     result = await invoke(path, runtime[1])
     assert not result["success"]
     assert result["rule"] == "unexpected_failure"
-    assert result["message"] == "ephemeral launch failed (500)"
+    assert result["message"] == (
+        "private launch URL and parameters"
+        if isinstance(body, dict)
+        else "ephemeral launch failed (500)"
+    )
     for forbidden in [
         "http://",
         "https://",
@@ -546,7 +552,6 @@ async def test_nonpolicy_bind_error_after_claim_is_generic(launch_http, monkeypa
         "working_directory",
         "allowed_tools",
         "/workspace",
-        "private",
     ]:
         assert forbidden not in str(result)
     assert database.get_terminal_metadata(CHILD) is None
@@ -1051,3 +1056,67 @@ async def test_A_M1_claim_rule_relay(launch_http, path, fault, rule):
     assert result["message"].startswith("ephemeral policy: " + rule)
     backend.create_window.assert_not_called()
     factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+@pytest.mark.parametrize(
+    "status, body, expected",
+    [
+        (
+            400,
+            {"detail": "kiro_v3_unsupported_version: use a supported version"},
+            "kiro_v3_unsupported_version: use a supported version",
+        ),
+        (400, "upstream refused", "upstream refused"),
+        (400, {"detail": "refused\x00\x1b\n\r\t\x7f\x85\u202e safely"}, "refused safely"),
+        (400, {"detail": "x" * 100000}, "x" * 4096),
+        (503, "y" * 100000, "y" * 4096),
+    ],
+    ids=["legacy-json", "non-json", "controls", "oversized-json", "oversized-text"],
+)
+async def test_claimed_launch_error_text_is_bounded_and_control_free(
+    launch_http, monkeypatch, path, status, body, expected
+):
+    import requests
+
+    original = orchestration.requests.post
+
+    def reject_launch(url, **kwargs):
+        if url.endswith("/claim"):
+            return original(url, **kwargs)
+        response = requests.Response()
+        response.status_code = status
+        response._content = (json.dumps(body) if isinstance(body, dict) else body).encode()
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", reject_launch)
+    result = await invoke(path, launch_http[0][1])
+    assert result["success"] is False
+    assert result["rule"] == "unexpected_failure"
+    assert result["message"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+async def test_existing_policy_refusal_output_is_unchanged(launch_http, monkeypatch, path):
+    import requests
+
+    original = orchestration.requests.post
+    message = "ephemeral policy: claim_expired renew the claim"
+
+    def reject_launch(url, **kwargs):
+        if url.endswith("/claim"):
+            return original(url, **kwargs)
+        response = requests.Response()
+        response.status_code = 400
+        response._content = json.dumps(
+            {"detail": {"kind": "ephemeral_policy", "rule": "claim_expired", "message": message}}
+        ).encode()
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", reject_launch)
+    result = await invoke(path, launch_http[0][1])
+    assert result["success"] is False
+    assert result["rule"] == "claim_expired"
+    assert result["message"] == message

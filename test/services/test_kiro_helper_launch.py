@@ -284,10 +284,11 @@ async def test_v2_refuses_a_helper_before_bind_and_returns_the_claim(kiro, engin
 @pytest.mark.asyncio
 async def test_a_kiro_cli_version_off_the_allow_list_refuses_before_bind(kiro):
     (kiro.fake / "version").write_text("9.9.9")
-    with pytest.raises(KiroCapabilityError) as err:
+    with pytest.raises(kiro.service.EphemeralPolicyError) as err:
         await launch(kiro)
-    assert err.value.kind == "kiro_v3_unsupported_version"
-    assert err.value.capability == "--version" and err.value.version == "9.9.9"
+    assert err.value.rule == "kiro_v3_unsupported_version"
+    assert "9.9.9" in err.value.detail
+    assert audit(kiro.name)["refusals"][err.value.rule]["count"] == 1
     # A helper runs only on v3, so the remedy is a supported kiro-cli, never v2.
     assert "v2" not in str(err.value)
     assert str(err.value).endswith(terminal_service._HELPER_SUPPORTED_CLI)
@@ -861,9 +862,10 @@ async def test_a_wrapper_without_effort_refuses_an_effort_launch_before_bind(kir
             repr(str(kiro.fake / "chat-help.txt")),
         )
     )
-    with pytest.raises(KiroCapabilityError) as err:
+    with pytest.raises(kiro.service.EphemeralPolicyError) as err:
         await launch(kiro)
-    assert err.value.kind == "unsupported_capability" and err.value.capability == "--effort"
+    assert err.value.rule == "unsupported_capability" and "--effort" in err.value.detail
+    assert audit(kiro.name)["refusals"][err.value.rule]["count"] == 1
     assert "v2" not in str(err.value)
     assert str(err.value).endswith(terminal_service._HELPER_SUPPORTED_CLI)
     assert_refused_before_bind(kiro)

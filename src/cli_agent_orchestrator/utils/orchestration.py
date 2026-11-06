@@ -1158,7 +1158,7 @@ def _create_terminal(
                 raise _ClaimRefused(rule or "unexpected_failure", message)
             raise _ClaimRefused(
                 "unexpected_failure",
-                f"ephemeral launch failed ({response.status_code})",
+                _claim_launch_error_message(response),
                 status_code=response.status_code,
                 terminal_id=(
                     _retained_terminal_id(response) if response.status_code == 424 else None
@@ -1448,6 +1448,27 @@ def _parse_run_step_error(
         return None, detail, _terminal_id_from_detail(detail), None
     fallback = f"status {response.status_code}"
     return None, fallback, None, None
+
+
+def _claim_launch_error_message(response: requests.Response) -> str:
+    """Keep older/unknown servers' launch error text without trusting it as a rule.
+
+    Policy details use their existing contract. This fallback bounds the relayed
+    text and strips control characters before it reaches the creator.
+    """
+    fallback = f"ephemeral launch failed ({response.status_code})"
+    message: object
+    try:
+        payload = response.json()
+    except ValueError:
+        message = response.text
+    else:
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        message = detail.get("message") if isinstance(detail, dict) else detail
+    if not isinstance(message, str):
+        return fallback
+    cleaned = "".join(ch for ch in message[:4096] if ch.isprintable()).strip()
+    return cleaned or fallback
 
 
 def _receiver_provider(receiver_id: str) -> Optional[str]:
@@ -1757,7 +1778,7 @@ async def _run_step_and_build_result(
             and response.status_code not in (502, 504)
             and tid is None
         ):
-            msg = f"ephemeral launch failed ({response.status_code})"
+            msg = _claim_launch_error_message(response)
             rule = "unexpected_failure"
         elif kind == "error" or (kind is None and response.status_code == 502):
             msg = f"Handoff failed: worker errored ({structured_detail})"

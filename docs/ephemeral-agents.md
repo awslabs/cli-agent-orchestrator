@@ -489,10 +489,11 @@ CAO opens `/mcp list` again until it runs, or until `provider_init_timeout` (60 
 default) has passed; see [How long CAO waits for MCP servers](kiro-cli.md#how-long-cao-waits-for-mcp-servers).
 Every refusal and its fix is in the
 [Kiro helper symptom table](kiro-cli.md#when-a-helper-is-refused). CAO's own refusals
-before the window are `ephemeral_policy` errors. The probe's refusals before the window
-(an unsupported kiro-cli version, or a missing wrapper flag) keep their capability-error
-shape: a 400 whose detail is a plain string. The later ones are 400s with a message, and
-a deferred failure records the `rule`.
+before the window, including probe refusals for an unsupported kiro-cli version or a
+missing wrapper flag, are structured `ephemeral_policy` errors. Their rule, message and
+helper remedy reach the creator through assign and handoff, and the refusal is counted
+in the name's archive. Installed-profile probe refusals keep their plain-string 400
+detail. The later ones are 400s with a message, and a deferred failure records the `rule`.
 
 On release, after the window is killed, CAO stops every process whose `KIRO_HOME` is the
 home (SIGTERM, then SIGKILL). A process whose `CAO_TERMINAL_ID` names another terminal is
