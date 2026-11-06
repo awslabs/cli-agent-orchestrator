@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Keep finished child agents open, for workshops and debugging** (#1225 phase 1). A new
+  machine-wide setting, `terminal.keep_finished`, off by default
+  (`cao config set terminal.keep_finished.enabled true`). While it is on, a successful
+  `handoff` leaves its worker open instead of sending the exit command and deleting it (the
+  result says "kept until …" where it would say "was torn down", with `torn_down: false`), and
+  an agent's `delete_terminal` on an idle worker whose pane is live keeps it and says so. A
+  failed create's retained record (a 424 replay) is never kept. Anyone can then open the
+  pane and see what the child did and which tools it called. A reaper tears each kept child
+  down the normal way (scrollback and snapshot first, then exit and delete; launch-record end
+  reason `kept_expired`) once it has been idle for `idle_window_minutes` (default 60), and never
+  while it is working. `max_per_session` (default 5) caps how many a session keeps; `on_cap`
+  chooses between tearing down the oldest idle one (`teardown_oldest`, the default;
+  `kept_evicted`) and not keeping the new one (`dont_keep`). Operator deletes
+  (`cao agent cancel --delete`, `cao shutdown`, the web UI, the API) still delete at once;
+  only the agent-side `delete_terminal` tool sends the new `DELETE /terminals/{id}`
+  query flag `keep_if_enabled`. Workflows, flows, remote workers and the timeout/error paths
+  are unchanged. Kept terminals show `kept` and `kept_until` in `GET /terminals/{id}`,
+  `kept_until` in session terminal lists, and a `KEPT UNTIL` column in
+  `cao session status --workers`. With the setting off every path behaves as before. See
+  `docs/terminal-lifecycle.md`, which also now says retention is 14 days (it said 7), lists
+  flow recycling (no snapshot), and gives the real snapshot directory.
+
 - **The ambient AG-UI stream sends generative UI as `CUSTOM` `cao.generative_ui`, not
   `GENERATIVE_UI`.** AG-UI 1.0 has no `GENERATIVE_UI` event type, and its processing rules say a
   producer "MUST NOT emit an event type the protocol does not describe" (`CUSTOM` and `RAW` exist

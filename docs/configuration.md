@@ -67,7 +67,13 @@ Every derived path resolves from this value, so one override moves everything â€
   },
   "terminal": {
     "backend": "tmux",
-    "herdr_session": "cao"
+    "herdr_session": "cao",
+    "keep_finished": {
+      "enabled": false,
+      "idle_window_minutes": 60,
+      "max_per_session": 5,
+      "on_cap": "teardown_oldest"
+    }
   },
   "apps": {
     "enabled": false,
@@ -287,6 +293,14 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 - `pane_layout`: how that window is re-arranged after each spawn â€” `"tiled"`
   (default), `"even-vertical"`, `"even-horizontal"`, or `"none"`. See
   [Choosing a layout](#choosing-a-layout).
+- `keep_finished`: keep finished child agents open so you can see what they did,
+  for workshops and debugging. Off by default; turn it on with
+  `cao config set terminal.keep_finished.enabled true`. Its four keys (`enabled`,
+  `idle_window_minutes`, `max_per_session`, `on_cap`), the reaper that cleans kept
+  agents up, and what stays unchanged are in
+  [Keep finished agents](terminal-lifecycle.md#keep-finished-agents-for-workshops-and-debugging).
+  A bad value is refused by `cao config set`, and logged and treated as off when it
+  is already in the file. It has no environment variable.
 
 Select a backend for a single run without touching `settings.json`:
 
