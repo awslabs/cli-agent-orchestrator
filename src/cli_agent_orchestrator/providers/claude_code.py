@@ -561,11 +561,16 @@ class ClaudeCodeProvider(BaseProvider):
         effort: Optional[str] = None,
         resume_session_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        ephemeral: bool = False,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # An ephemeral helper's launch. Set by the provider manager from the
+        # launch's ephemeral binding, never from the profile: the launch also
+        # cuts tool_mapping.EPHEMERAL_ALWAYS_DISALLOWED.
+        self._ephemeral = ephemeral is True
         # When set, the launched claude process resumes this Claude Code
         # session id (--resume <sid>) instead of starting a fresh
         # conversation. Used to re-open a supervisor conversation inside a
@@ -829,13 +834,16 @@ class ClaudeCodeProvider(BaseProvider):
         # check used to skip the flags entirely for allowed_tools=[].
         # The list also carries Claude Code's own agent-messaging and
         # agent-spawning built-ins (tool_mapping.ALWAYS_DISALLOWED), which every
-        # restricted grant loses, the developer default included.
-        if self._allowed_tools is not None and "*" not in self._allowed_tools:
-            from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+        # restricted grant loses, the developer default included. An ephemeral
+        # helper also loses tool_mapping.EPHEMERAL_ALWAYS_DISALLOWED, whatever
+        # its grant; an installed launch's list is unchanged.
+        from cli_agent_orchestrator.utils.tool_mapping import get_launch_disallowed_tools
 
-            disallowed = get_disallowed_tools("claude_code", self._allowed_tools)
-            for tool in disallowed:
-                command_parts.extend(["--disallowedTools", tool])
+        disallowed = get_launch_disallowed_tools(
+            "claude_code", self._allowed_tools, ephemeral=self._ephemeral
+        )
+        for tool in disallowed:
+            command_parts.extend(["--disallowedTools", tool])
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters
