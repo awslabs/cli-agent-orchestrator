@@ -337,6 +337,7 @@ _COMPOSER_FRAME_CHARS = "─╭╮╰╯│| \t"
 # User input echo. Kimi Code renders the submitted user message bold + colour
 # 222 with a leading sparkle; the legacy TUI uses the same sparkle inline.
 USER_INPUT_SPARKLE_RE = re.compile(r"[✨💫][^\S\n]+\S")
+USER_INPUT_CODE_PROMPT_RE = re.compile(r"^\s*❯[^\S\n]+\S")
 USER_INPUT_STYLE_RE = re.compile(r"\x1b\[1m\x1b\[38;5;222m|\x1b\[38;5;222m")
 
 #: The measured foreground index Kimi Code draws submitted user input in. A
@@ -471,6 +472,11 @@ TRUST_HINT_RE = re.compile(r"↑↓\s*navigate\s*·\s*Enter\s*select\s*·\s*Esc\
 TRUST_OPTION_TRUST = "Trust this folder"
 TRUST_OPTION_REJECT = "Don't trust"
 TRUST_OPTIONS: Tuple[str, ...] = (TRUST_OPTION_TRUST, TRUST_OPTION_REJECT)
+# Kimi Code 2.3 renamed the choices without changing the trust dialog.
+TRUST_OPTION_ALIASES = {
+    "Trust and continue": TRUST_OPTION_TRUST,
+    "Exit": TRUST_OPTION_REJECT,
+}
 # The trust dialog's selection marker is U+276F. Deliberately distinct from the
 # approval dialog's U+25B6 so one dialog's navigation can never be applied to
 # the other.
@@ -497,8 +503,8 @@ def _trust_option_body(stripped: str) -> str:
     """The option label on a row, with any selection marker removed."""
 
     if stripped.startswith(TRUST_SELECT_MARKER):
-        return stripped[len(TRUST_SELECT_MARKER) :].strip()
-    return stripped
+        stripped = stripped[len(TRUST_SELECT_MARKER) :].strip()
+    return TRUST_OPTION_ALIASES.get(stripped, stripped)
 
 
 def is_trust_option_row(clean_line: str) -> bool:
@@ -1621,6 +1627,14 @@ def is_user_input_start(
     ):
         return False
 
+    # Kimi Code 2.3 renders submitted messages with ❯ instead of a sparkle.
+    # A trust dialog uses the same glyph, so keep its option rows distinct and
+    # require the submission's foreground colour whenever SGR is available.
+    if semantics is SpinnerSemantics.CODE and USER_INPUT_CODE_PROMPT_RE.match(clean):
+        if is_trust_option_row(clean) and not _SGR_RE.search(raw):
+            return False
+        return not _SGR_RE.search(raw) or is_drawn_in_foreground(raw, USER_INPUT_COLOR_INDEX)
+
     return bool(
         USER_INPUT_SPARKLE_RE.search(clean)
         and (USER_INPUT_STYLE_RE.search(raw) or clean.lstrip().startswith(("✨", "💫")))
@@ -1686,7 +1700,10 @@ def classify_line(
     # --- dialogs first: their rows would otherwise be read as content ---
     if TRUST_TITLE_RE.match(clean) or TRUST_HINT_RE.search(clean):
         return KimiLineKind.TRUST_DIALOG
-    if is_trust_option_row(clean):
+    # The 2.3 reject label is the ordinary word "Exit". A bare alias in an
+    # answer is content; the complete dialog is already identified by its
+    # title/hint, and detect_trust_dialog normalizes both option rows itself.
+    if is_trust_option_row(clean) and stripped not in TRUST_OPTION_ALIASES:
         return KimiLineKind.TRUST_DIALOG
     if stripped.startswith(TRUST_MCP_TARGETS_PREFIX):
         return KimiLineKind.TRUST_DIALOG

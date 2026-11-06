@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotent for its own retries) instead of answering 409, and with `lookup_only=true` it answers
   404, the same as an unused key. Stored key values change, so a keyed retry that spans the
   upgrade creates a new terminal once instead of replaying.
+
+- **Kimi Code 2.3 and Cursor 2026.10.22 replies** (#1149): recognise the new
+  submission/trust and coloured-panel layouts, and recover Kimi execution evidence
+  after long prompt redraws. Kimi turns that finish without a final text answer
+  complete after a short, stable ready interval; fetching their answer still reports
+  an extraction error. **Behaviour change:** synchronous `cao session send` exits 1
+  when fetching the answer fails, instead of silently exiting 0. Ctrl-C still exits 130.
+
 - **Breaking: `GET /agui/v1/stream` is now an AG-UI 1.0 conformant run by default, and
   `POST /agui/v1/stream` is added** (#1193). Each connection is one run: `RUN_STARTED` first,
   `data:`-only frames with `type` in the JSON (no `event:` lines), schema field names, integer

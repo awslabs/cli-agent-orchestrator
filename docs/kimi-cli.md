@@ -22,9 +22,13 @@ supports both from one provider:
 
 Dialect selection is capability-based: CAO never infers a dialect from a
 version number. The CODE path was validated end-to-end against Kimi Code
-**0.43.1**. (A later local install, Kimi Code 2.0.0, still exposes the same
-capability flags in `--help`; that is a limited observation, not full
-2.0.0 TUI/E2E support.)
+**0.43.1**. Compatibility handling also covers Kimi Code **2.3**'s `❯`
+submission marker and renamed workspace-trust choices. The original local
+compatibility checks against **2.3.3** exercised workspace trust and multi-turn
+requests with text and tool output; synthetic regression fixtures cover
+completion and extraction edge cases. These checks do not establish full 2.3
+provider E2E coverage. A Kimi Code 2.0.0 install was only checked for the same
+capability flags in `--help`, not full 2.0.0 TUI/E2E support.
 
 ## Prerequisites
 
@@ -136,6 +140,38 @@ Rules that matter:
 
 ## Kimi Code Path
 
+### Completion and Message Extraction
+
+For the measured 2.3 submission layout (`❯`), CAO checks the current visible
+pane before confirming a ready-looking turn. The pane must show the ready
+status/footer and boxed composer, with no live spinner or active trust or
+permission dialog. Finishing a tool call or displaying answer text does not
+override a visible spinner, active dialog or non-ready pane. These checks use
+observable terminal output, not an independent signal of the model's internal
+state.
+
+When those readiness checks pass and a publishable final answer is available
+for this turn (after its latest tool call, if any), the turn can become
+**COMPLETED** without an extra delay. A turn can also finish with only tool output
+or reasoning, and no final text. In that case, CAO waits for the visible ready
+pane and the current generation's recorded output to remain unchanged for
+**2 seconds** before reporting **COMPLETED**. New output, a changed pane or a new generation
+restarts the wait; a live spinner, active dialog or non-ready pane cannot age
+into completion. A build that continuously animates its idle pane can therefore
+remain **PROCESSING**. The interval is a readiness check, not a task timeout.
+
+Completion and answer availability are separate: `get_output` with `mode=last`
+still reports an extraction error when there is no publishable final answer or
+no reliable answer boundary. It does not substitute reasoning, tool-only output,
+an earlier answer or the echoed prompt. Synchronous `cao session send` reports
+an answer-fetch failure and exits **1**; Ctrl-C while waiting still exits **130**.
+
+This additional settle check is selected by the recorded `❯` submission
+grammar, not by a version-number comparison. Older CODE submissions using `✨`
+retain their existing completion behavior, including when the answer has
+scrolled out of the visible pane; they do not acquire the 2-second wait. The
+[legacy TUI status rules](#status-detection) are unchanged.
+
 ### Working Directory
 
 The terminal's own working directory *is* Kimi's cwd. The provider deliberately
@@ -223,12 +259,18 @@ symlinked home rather than following it.
 
 ### Workspace Trust — inherit one, or opt in to all
 
-Kimi Code refuses to run in an untrusted folder. Measured against 0.43.1:
+Kimi Code refuses to run in an untrusted folder. CAO recognizes both measured
+sets of trust-dialog labels:
 
-| Selection | Result |
-|---|---|
-| **Don't trust** | **the process exits immediately** (exit 0). No TUI, no turn. |
-| **Trust this folder** | full function; trust recorded for that folder |
+| Choice | 0.43.1 label | 2.3 label |
+|---|---|---|
+| Grant workspace trust | **Trust this folder** | **Trust and continue** |
+| Decline workspace trust | **Don't trust** | **Exit** |
+
+On 0.43.1, choosing **Don't trust** was measured to exit the process immediately
+with exit code 0: no TUI and no turn. Choosing the trust option allows Kimi to
+run and records trust for that folder. The renamed 2.3 labels do not change
+CAO's explicit opt-in policy below.
 
 Because the dialog fires for **any** untrusted cwd — even a repository with no
 project MCP files — and because CAO builds a fresh `KIMI_CODE_HOME` per
@@ -251,10 +293,10 @@ There are two supported ways to resolve it, and they are not equivalent.
 #### Option A — pre-trust one workspace (preferred)
 
 Run normal `kimi` once in that repository, using your usual `KIMI_CODE_HOME`,
-and choose **Trust this folder**:
+and choose **Trust this folder** (0.43.1) or **Trust and continue** (2.3):
 
 ```bash
-cd /path/to/repo && kimi      # then choose "Trust this folder"
+cd /path/to/repo && kimi      # then choose the workspace-trust option
 ```
 
 Kimi records the decision in `$KIMI_CODE_HOME/workspace-trust/`. Every later CAO
@@ -299,9 +341,10 @@ as opaque.
 When opted in, the handler is still **positive-identification only**: the exact
 dialog must be present (title + navigation hint + a recognised option set), the
 workspace the dialog names must equal the pane's actual working directory, and
-the selection must be readable. If the selection is already *Trust this folder*
-it is accepted; otherwise CAO navigates deterministically, re-reads the pane,
-verifies the marker moved, and only then sends Enter. Any other outcome —
+the selection must be readable. CAO normalizes *Trust and continue* to
+*Trust this folder* and *Exit* to *Don't trust*. If the trust option is already
+selected it is accepted; otherwise CAO navigates deterministically, re-reads
+the pane, verifies the marker moved, and only then sends Enter. Any other outcome —
 unknown layout, unreadable selection, mismatched workspace — fails closed
 without sending a key. A blind Enter is never sent.
 
