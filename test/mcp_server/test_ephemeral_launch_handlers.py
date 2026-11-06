@@ -518,9 +518,7 @@ async def test_bind_refusal_relays_rule_without_launch_parameters(launch_http, m
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
 @pytest.mark.parametrize("body", [{"detail": "private launch URL and parameters"}, [], None])
-async def test_nonpolicy_bind_error_after_claim_keeps_server_text(
-    launch_http, monkeypatch, path, body
-):
+async def test_nonpolicy_bind_error_after_claim_is_generic(launch_http, monkeypatch, path, body):
     runtime, _, _, _, _ = launch_http
     post = orchestration.requests.post
 
@@ -539,12 +537,9 @@ async def test_nonpolicy_bind_error_after_claim_keeps_server_text(
     result = await invoke(path, runtime[1])
     assert not result["success"]
     assert result["rule"] == "unexpected_failure"
-    assert result["message"] == (
-        "private launch URL and parameters"
-        if isinstance(body, dict)
-        else "ephemeral launch failed (500)"
-    )
+    assert result["message"] == "ephemeral launch failed (500)"
     for forbidden in [
+        "private",
         "http://",
         "https://",
         "claim_id",
@@ -1068,12 +1063,32 @@ async def test_A_M1_claim_rule_relay(launch_http, path, fault, rule):
             {"detail": "kiro_v3_unsupported_version: use a supported version"},
             "kiro_v3_unsupported_version: use a supported version",
         ),
-        (400, "upstream refused", "upstream refused"),
+        (400, "upstream refused", "ephemeral launch failed (400)"),
         (400, {"detail": "refused\x00\x1b\n\r\t\x7f\x85\u202e safely"}, "refused safely"),
         (400, {"detail": "x" * 100000}, "x" * 4096),
-        (503, "y" * 100000, "y" * 4096),
+        (503, "y" * 100000, "ephemeral launch failed (503)"),
+        (424, {"detail": "private replay failure"}, "ephemeral launch failed (424)"),
+        (500, {"detail": "private exception"}, "ephemeral launch failed (500)"),
+        (499, {"detail": "refused"}, "refused"),
+        (400, {"detail": {"message": "private dict failure"}}, "ephemeral launch failed (400)"),
+        (400, {"detail": "\x00" * 5000 + "secret"}, "ephemeral launch failed (400)"),
+        (400, {"detail": ""}, "ephemeral launch failed (400)"),
+        (400, {"detail": "  "}, "ephemeral launch failed (400)"),
     ],
-    ids=["legacy-json", "non-json", "controls", "oversized-json", "oversized-text"],
+    ids=[
+        "legacy-json",
+        "non-json",
+        "controls",
+        "oversized-json",
+        "oversized-text",
+        "replay",
+        "boundary-500",
+        "boundary-499",
+        "dict-detail",
+        "bound-before-filter",
+        "empty",
+        "whitespace",
+    ],
 )
 async def test_claimed_launch_error_text_is_bounded_and_control_free(
     launch_http, monkeypatch, path, status, body, expected
@@ -1120,3 +1135,41 @@ async def test_existing_policy_refusal_output_is_unchanged(launch_http, monkeypa
     assert result["success"] is False
     assert result["rule"] == "claim_expired"
     assert result["message"] == message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        (
+            "ephemeral policy: timeout refused\x00\x1b\u202e safely",
+            "ephemeral policy: timeout refused safely",
+        ),
+        ("x" * 100000, "x" * 4096),
+        ("\x00" * 5000 + "secret", "ephemeral launch failed (400)"),
+    ],
+    ids=["controls", "oversized", "bound-before-filter"],
+)
+async def test_policy_refusal_message_is_bounded_and_control_free(
+    launch_http, monkeypatch, path, message, expected
+):
+    import requests
+
+    original = orchestration.requests.post
+
+    def reject_launch(url, **kwargs):
+        if url.endswith("/claim"):
+            return original(url, **kwargs)
+        response = requests.Response()
+        response.status_code = 400
+        response._content = json.dumps(
+            {"detail": {"kind": "ephemeral_policy", "rule": "timeout", "message": message}}
+        ).encode()
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", reject_launch)
+    result = await invoke(path, launch_http[0][1])
+    assert result["success"] is False
+    assert result["rule"] == "timeout"
+    assert result["message"] == expected

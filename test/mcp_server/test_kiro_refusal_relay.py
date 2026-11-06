@@ -88,6 +88,13 @@ async def test_helper_probe_refusal_reaches_creator_and_archive(
     assert result["success"] is False
     assert result["rule"] == rule, (result, helper.seen["responses"])
     assert clue in result["message"]
+    if refusal == "version":
+        assert result["message"] == (
+            "ephemeral policy: kiro_v3_unsupported_version "
+            "Kiro engine 'v3' is not supported on kiro-cli 3.1.0. "
+            "CAO supports v3 only on kiro-cli 2.35.1, 2.36.0, 2.37.0, 3.0.0, "
+            "each with a pinned engine schema. Use a supported kiro-cli version: a Kiro helper runs only on engine 'v3'."
+        )
     if refusal != "field":
         assert "Use a supported kiro-cli version" in result["message"]
         assert "v2" not in result["message"]

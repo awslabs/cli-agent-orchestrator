@@ -1155,7 +1155,12 @@ def _create_terminal(
         if claim is not None and response.status_code >= 400:
             kind, message, _, rule = _parse_run_step_error(response)
             if kind == "ephemeral_policy":
-                raise _ClaimRefused(rule or "unexpected_failure", message)
+                raise _ClaimRefused(
+                    rule or "unexpected_failure",
+                    _bounded_launch_message(
+                        message, f"ephemeral launch failed ({response.status_code})"
+                    ),
+                )
             raise _ClaimRefused(
                 "unexpected_failure",
                 _claim_launch_error_message(response),
@@ -1450,25 +1455,29 @@ def _parse_run_step_error(
     return None, fallback, None, None
 
 
-def _claim_launch_error_message(response: requests.Response) -> str:
-    """Keep older/unknown servers' launch error text without trusting it as a rule.
-
-    Policy details use their existing contract. This fallback bounds the relayed
-    text and strips control characters before it reaches the creator.
-    """
-    fallback = f"ephemeral launch failed ({response.status_code})"
-    message: object
-    try:
-        payload = response.json()
-    except ValueError:
-        message = response.text
-    else:
-        detail = payload.get("detail") if isinstance(payload, dict) else None
-        message = detail.get("message") if isinstance(detail, dict) else detail
+def _bounded_launch_message(message: object, fallback: str) -> str:
+    """Bound decoded launch text before scanning and remove non-printable characters."""
     if not isinstance(message, str):
         return fallback
     cleaned = "".join(ch for ch in message[:4096] if ch.isprintable()).strip()
     return cleaned or fallback
+
+
+def _claim_launch_error_message(response: requests.Response) -> str:
+    """Relay only plain-string 4xx details, excluding private 424 replay failures.
+
+    Non-policy dict details, non-JSON bodies and 5xx errors keep the generic
+    message so internal exception text never reaches the creator.
+    """
+    fallback = f"ephemeral launch failed ({response.status_code})"
+    if not 400 <= response.status_code < 500 or response.status_code == 424:
+        return fallback
+    try:
+        payload = response.json()
+    except ValueError:
+        return fallback
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    return _bounded_launch_message(detail, fallback)
 
 
 def _receiver_provider(receiver_id: str) -> Optional[str]:
@@ -1769,7 +1778,9 @@ async def _run_step_and_build_result(
         # server-side or has no worker, so this branch makes no claim about it.
         worker_outcome = False
         if kind == "ephemeral_policy":
-            msg = structured_detail
+            msg = _bounded_launch_message(
+                structured_detail, f"ephemeral launch failed ({response.status_code})"
+            )
         # Generic text is only for failures before any worker is known; a launched
         # worker's timeout, error or extraction failure keeps its handoff result.
         elif (

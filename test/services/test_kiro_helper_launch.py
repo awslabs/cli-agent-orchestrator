@@ -1301,6 +1301,44 @@ def test_every_helper_refusal_code_is_in_the_kiro_docs():
         if f"`{code}`" not in rows and f"`:{code.split(':', 1)[-1]}`" not in rows
     )
     assert not missing, f"no symptom-table row for {missing}"
-    assert "`Kiro engine 'v3' requires wrapper flag`" in rows
+    for rule in ("unsupported_capability", "missing_executable", "timeout", "malformed_output"):
+        assert f"`{rule}`" in rows
     fixes = [line.rstrip(" |").rsplit("|", 1)[-1] for line in rows.splitlines()]
     assert not [fix for fix in fixes if "v2" in fix], "a helper fix suggests engine v2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_failure", [False, True])
+async def test_helper_decided_model_probe_falls_back_before_reporting(
+    kiro, monkeypatch, final_failure
+):
+    from cli_agent_orchestrator.decisions import engine
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
+    bound = {}
+    monkeypatch.setattr(engine, "bind_launch", lambda plan, **values: bound.update(values))
+    script = kiro.script.read_text()
+    kiro.script.write_text(
+        script.replace(
+            'encoding="utf-8").read())',
+            'encoding="utf-8").read().replace("--model", "--absent"))',
+        )
+    )
+    if final_failure:
+        (kiro.fake / "version").write_text("3.1.0")
+        assert (
+            await policy_rule(kiro, launch_plan=LaunchPlan(model="decided-model"))
+            == "kiro_v3_unsupported_version"
+        )
+        assert audit(kiro.name)["refusals"]["kiro_v3_unsupported_version"]["count"] == 1
+        assert "unsupported_capability" not in audit(kiro.name)["refusals"]
+        assert_refused_before_bind(kiro)
+    else:
+        terminal = await launch(kiro, launch_plan=LaunchPlan(model="decided-model"))
+        assert terminal.id == CHILD
+        assert bound["not_honored"] is True
+        assert kiro.factory.call_args.kwargs["kiro_launch"].model is None
+        assert not audit(kiro.name).get("refusals", {})
+    assert kiro.probe.call_count == 2
+    assert "model" in kiro.probe.call_args_list[0].args[1]
+    assert "model" not in kiro.probe.call_args_list[1].args[1]
