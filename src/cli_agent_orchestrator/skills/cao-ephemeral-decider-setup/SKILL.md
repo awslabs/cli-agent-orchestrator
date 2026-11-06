@@ -20,13 +20,11 @@ refuses every provider's launches; a stale MCP connection fails with no hint tha
 fix it. This skill walks an agent through every step in order, up to the one step that is
 human-only: granting consent.
 
-**Decider-generic.** Everything below works for any installed decider package. `cao-decider-jev`
-(entry-point name `jev`) is the worked example; a self-hosted decider follows the same steps, since
-consent, installation and the tier table are decider-package concerns, not CAO-specific to any one
-name. CAO bundles and endorses no decider. A published, generally-installable `jev` release is
-tracked in #1182 — until then, "install the decider package" means installing from whatever source
-the user already has (a git checkout, a wheel, a private index), never a source this skill invents
-for you. **Never resolve a decider by a bare, guessed name from PyPI** — see step 3.
+**Decider-generic.** Everything below works for any installed decider package; `cao-decider-jev`
+(entry-point name `jev`) is the worked example. CAO bundles and endorses no decider. A published
+`cao-decider-jev` release is tracked in #1182 — until then, install from whatever source the user
+already has (a git checkout, a wheel, a private index), never one this skill invents. **Never
+resolve a decider by a bare, guessed name from PyPI** — see step 3.
 
 **Scope.** This skill is setup mechanics only. Whether to delegate to an ephemeral agent at all is
 `cao-agent-routing`'s job. Authoring a decider package is out of scope entirely.
@@ -47,8 +45,8 @@ for you. **Never resolve a decider by a bare, guessed name from PyPI** — see s
 12. [Safety](#12-safety)
 
 Stop and report back to the user at the first failed check in any step — don't guess past a
-refusal. Get the user's explicit OK before **any** step that writes `settings.json` (steps 4 and 5)
-or restarts the shared server (step 7) — see [Safety](#12-safety).
+refusal. Get the user's explicit OK before **any** step that writes `settings.json` or restarts the
+shared server (steps 4, 5, 7, 8 and 11) — see [Safety](#12-safety).
 
 ## 1. Back up `settings.json`
 
@@ -56,11 +54,12 @@ Before touching anything, so every later step has a real restore point:
 
 ```bash
 SETTINGS="$(cao config path)"
-cp "$SETTINGS" "$SETTINGS.bak.$(date +%s)"
+if [ -f "$SETTINGS" ]; then cp "$SETTINGS" "$SETTINGS.bak.$(date +%s)"; else echo "no settings.json yet: nothing to back up"; fi
 ```
 
-Keep this path; you'll need it in [Undo](#11-undo). Remove old `settings.json.bak.*` files yourself
-once the user confirms the setup is done — they're plaintext copies of an operator-only file.
+Keep this path for [Undo](#11-undo). On a fresh install there is no file yet, so "restore the
+backup" later means removing the `settings.json` this setup created. Remove the `.bak.*` copies once
+the user confirms the setup is done — they're plaintext copies of an operator-only file.
 
 ## 2. Preflight
 
@@ -70,7 +69,32 @@ decisions.** A git install of `main` and a published PyPI release can report the
 predate the decision platform entirely (at the time of writing, the latest PyPI release, 2.5.4, has
 none of the commands probed below). Checking `--version` alone is the mistake to avoid.
 
-Instead, probe for every command and field this skill goes on to use, and stop at the first one
+**First, find the interpreter the running `cao-server` really uses** — every later check runs in
+it, never in a guessed path or the agent's own `uv run` venv. Take it from the process listening on
+the CAO port (`CAO_API_PORT` if this install sets it, else `9889`). Read only the process's command
+line, never its environment:
+
+```bash
+PORT="${CAO_API_PORT:-9889}"
+PID="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -n 1)"
+if [ -n "$PID" ]; then
+  ps -o args= -p "$PID"   # e.g. /path/to/venv/bin/python3 /path/to/cao-server
+  CAO_PY="$(ps -o args= -p "$PID" | awk '{print $1}')"
+else
+  echo "no cao-server on port $PORT: using the uv tool path, unconfirmed"
+  CAO_PY="$(uv tool dir)/cli-agent-orchestrator/bin/python3"
+fi
+"$CAO_PY" -c 'import sys, cli_agent_orchestrator as c; print(sys.prefix); print(c.__file__)'
+readlink -f "$(command -v cao)"; readlink -f "$(dirname "$CAO_PY")/cao"
+```
+
+The import must succeed, and the last line must print one path twice (the `cao` on `PATH` is that
+server's own CLI). Otherwise — or if the path has spaces and `awk` cut it — stop and ask the user.
+If no server was running, tell the user the fallback is a guess until step 7 confirms it. If your
+shell drops variables between commands, start each later one with `CAO_PY=<that path>`. These are
+POSIX-shell commands; on Windows, stop and ask.
+
+Then probe for every command and field this skill goes on to use, and stop at the first one
 that fails — passing some but not all of these still means later steps fail confusingly instead of
 clearly:
 
@@ -83,15 +107,13 @@ cao decisions status            # exit 0, JSON with an "installed_deciders" key
 ```
 
 If any of these exits non-zero, prints "No such command", or the `status` JSON has no
-`installed_deciders` key, this build does not have the full decision platform this skill relies on.
-Report that plainly and stop — do not proceed to later steps. A build with `cao decisions status`
-but without `enable`/`off`/`installed_deciders` is the "passes preflight, fails later" trap the
-probes above exist to catch. Once #1182 ships, re-check whether the PyPI release has caught up
-before relying on it here.
+`installed_deciders` key, this build lacks the decision platform this skill relies on: report that
+and stop. A build with `status` but without `enable`/`off`/`installed_deciders` is the "passes
+preflight, fails later" trap these probes catch.
 
-Then confirm how `cao-server` is actually running (a foreground terminal, a background process,
-`launchd`, a container): you'll need to restart it in step 7, and CAO itself does not start a
-server for you. Ask the user if it isn't obvious from the shell, tmux, or process list.
+Then confirm how `cao-server` is started (a foreground terminal, a background process, `launchd`, a
+container; the `ps` line helps): step 7 restarts it, and CAO does not start a server for you. Ask
+the user if it isn't obvious.
 
 ## 3. Install the decider into cao-server's environment
 
@@ -103,69 +125,75 @@ package's own docs — for the worked example that is **`cao-decider-jev`** (imp
 decider isn't published anywhere reachable yet, say so plainly and point to #1182 — don't invent a
 source.
 
-The decider package must load inside the **same Python environment `cao-server` runs from** — not
-whatever environment the agent's own shell happens to have active. Find that environment first:
+The decider package must load inside the **same Python environment `cao-server` runs from** —
+`"$CAO_PY"` from step 2, not whatever environment the agent's own shell has active. Patterns A and B
+below only apply when that environment is CAO's `uv tool` venv (the common case):
 
 ```bash
-cao config path          # prints the active settings.json path
-cao -V                   # confirms a cao binary is on PATH at all
-command -v cao-server    # the cao-server executable's path
-cat "$(uv tool dir)/cli-agent-orchestrator/uv-receipt.toml"   # if CAO is a uv tool
+[ "$("$CAO_PY" -c 'import sys; print(sys.prefix)')" = "$(uv tool dir)/cli-agent-orchestrator" ] \
+  && echo "uv tool venv: patterns A/B apply" || echo "NOT the uv tool venv: stop and ask the user"
+cat "$(uv tool dir)/cli-agent-orchestrator/uv-receipt.toml"
 ```
 
-When CAO is installed as a `uv tool` (the common case; `uv tool dir` prints the tools root), its
-environment is `$(uv tool dir)/cli-agent-orchestrator/`. There are two ways to add a decider
-package to it. Read the receipt's own `requirements` entry for `cli-agent-orchestrator` first — a
-`git = "..."` or `path = "..."` source means pattern A must reinstall from that *same* source, not
-from PyPI, or it silently moves the user onto a published release instead:
+If it isn't the uv tool venv (a source checkout's `.venv` under `uv run`, pipx, a plain venv), stop
+and ask the user how that environment is managed; install the decider only the way they say.
 
 | Pattern | Command | Survives `cao update` / `uv tool upgrade`? | Also touches CAO itself? |
 | --- | --- | --- | --- |
-| A: re-run the tool install with `--with`, from the receipt's own source | `uv tool install "<source from the receipt, e.g. git+https://...>" --with "<decider-dist>" --reinstall` | **Only for an unpinned PyPI install.** `uv` records every `--with` package in the tool's own receipt, and a plain `uv tool upgrade` (or `cao update` on an unpinned registry install) reinstalls it too. **For a git or version-pinned install, `cao update` rebuilds the receipt without `--with` at all** (a current CAO gap — see below) | Yes — this reinstalls CAO itself, which may upgrade it unintentionally |
-| B: `uv pip install` straight into the tool's venv | `uv pip install --python "$(uv tool dir)/cli-agent-orchestrator/bin/python3" "<decider-dist>"` | **No.** The receipt never records it, so the next `uv tool upgrade` (or any `cao update`) rebuilds the venv from the receipt alone and silently drops the decider | No — leaves CAO's own version untouched |
+| A: re-run the tool install with the receipt's own source and every `--with` | `uv tool install <CAO source> <each existing extra> --with "<decider-dist>" --reinstall`, mapped from the receipt as below | **Only for an unpinned PyPI install.** `uv` records every `--with` package in the receipt, and a plain `uv tool upgrade` (or `cao update` on an unpinned registry install) reinstalls it too. **For a git or version-pinned install, `cao update` rebuilds the receipt without `--with` at all**; for a local install it refuses and prints a reinstall hint that has no `--with` either (a current CAO gap — see below) | Yes — this reinstalls CAO itself, which may upgrade it unintentionally |
+| B: `uv pip install` straight into the tool's venv | `uv pip install --python "$CAO_PY" "<decider-dist>"` | **No.** The receipt never records it, so the next `uv tool upgrade` (or any `cao update`) rebuilds the venv from the receipt alone and silently drops the decider | No — leaves CAO's own version untouched |
 
-**Known CAO gap, not just a skill caveat:** for a git install, `cao update` runs `uv tool install
-<git-source> --upgrade --reinstall`; for a pinned registry install it runs `uv tool install
-cli-agent-orchestrator@latest --upgrade`. Neither passes `--with` (`cli/commands/update.py`,
-`_build_command`); only an unpinned PyPI install's plain `uv tool upgrade` carries `--with`
-forward. So after **any** `cao update`, re-run the entry-point check below, whichever pattern was
-used. Tell the user this is a CAO limitation (`cao update` should carry a receipt's extra
-requirements forward), and suggest filing or finding a tracking issue if one doesn't already cover
-it.
+**Pattern A must keep the install's source and its extras.** Read the receipt's `requirements`
+list. The `cli-agent-orchestrator` entry gives `<CAO source>`:
 
-Pick A when the user accepts CAO being upgraded at the same time, and the "only survives an
-unpinned-PyPI upgrade" caveat. Pick B to leave CAO's own version untouched — but warn the user that
-**any** future CAO upgrade needs the decider reinstalled, since nothing records it.
+| Receipt entry for `cli-agent-orchestrator` | `<CAO source>` |
+| --- | --- |
+| `git = "<url>"`, maybe with `rev`/`tag`/`branch` | `"git+<url>"`, or `"git+<url>@<rev>"` |
+| `editable = "<path>"` | `--editable "<path>"` — without `--editable`, uv turns it into a static copy and later edits to the checkout silently stop reaching CAO |
+| `directory = "<path>"` or `path = "<path>"` | `"<path>"` |
+| `specifier = "<spec>"` | `"cli-agent-orchestrator<spec>"` |
+| only `name` | `cli-agent-orchestrator` |
+| any other field (extras, a marker, …) | none: stop and ask the user |
+
+`--with` *replaces* the receipt's extra requirements, it doesn't add to them. So repeat every other
+entry in the list in its own form — `--with "<name><spec>"`, `--with "git+<url>"`, `--with
+"<path>"`, or `--with-editable "<path>"` for an `editable` one — then add the new decider. After
+the reinstall, re-read the receipt: the CAO entry must keep the same field (`editable` stays
+`editable`), and every earlier entry must still be there.
+
+**Known CAO gap, not just a skill caveat:** `cao update` runs `uv tool install <git-source>
+--upgrade --reinstall` for a git install and `uv tool install cli-agent-orchestrator@latest
+--upgrade` for a pinned one; neither passes `--with` (`cli/commands/update.py`, `_build_command`).
+For a local install (`editable`/`directory`/`path`) it changes nothing and prints a `uv tool install
+… --reinstall` hint, which drops every `--with` if run as printed. So after **any** CAO upgrade or
+reinstall, re-run the entry-point check below. Tell the user this is a CAO limitation, and suggest
+filing or finding a tracking issue.
+
+Pick A when the user accepts CAO being reinstalled (maybe upgraded) too. Pick B to leave CAO's
+version untouched — but warn that **any** CAO upgrade then needs the decider reinstalled.
 
 **Verify the install really landed where `cao-server` loads from — by entry point, never by
 guessing an import name:**
 
 ```bash
-"$(uv tool dir)/cli-agent-orchestrator/bin/python3" -c "
+"$CAO_PY" -c "
 from importlib.metadata import entry_points
 print([e.name for e in entry_points(group='cao.deciders')])
 "
 ```
 
-The worked example's name, `jev`, must appear in that list. An empty list, or an import error,
-means the decider went into the wrong interpreter — most often the agent's own `uv run` venv rather
-than `cao-server`'s. The same check, run once `cao-server` is back up, is `cao decisions status`'s
-`installed_deciders` field (step 7 confirms the *running server*, not just this interpreter, sees
-it).
+`jev` must appear in that list. An empty list, or an import error, means the decider went into the
+wrong interpreter. The running server only picks it up after the restart in step 7.
 
-If pattern B was used, periodically re-check the exact distribution is still recorded in the
-receipt (pattern A only ever records anything there), or re-run the `uv pip install` after any CAO
-upgrade — match the exact distribution name, not a loose substring (`grep -q jev` also matches an
-unrelated package such as `cao-decider-jevk5`):
+After pattern A, this confirms the receipt recorded the decider — by the exact quoted name, since
+`grep -q jev` would also match an unrelated `cao-decider-jev-extra`. Pattern B is never recorded,
+so it prints "NOT recorded": reinstall after every CAO upgrade. Either way, re-run the entry-point
+check after any `cao update`:
 
 ```bash
 grep -q '"<decider-dist>"' "$(uv tool dir)/cli-agent-orchestrator/uv-receipt.toml" \
-  && echo "recorded" || echo "NOT recorded — will not survive an upgrade"
+  && echo "recorded" || echo "NOT recorded"
 ```
-
-A decider installed any other way (editable source checkout, a local repository on `PYTHONPATH`)
-must still end up importable from that same interpreter; apply the same entry-point check before
-moving on.
 
 ## 4. Build the complete tier table
 
@@ -210,11 +238,12 @@ whenever `min_tier`/`max_tier`/`default_tier` are set, not only after decisions 
 **There is no validated CLI for most of this block.** `cao config set ephemeral.<key> <value>`
 writes a scalar key straight into `settings.json` (verified: creates `{"ephemeral": {"enabled":
 true}}`, read back by `cao config get`) — prefer it over a hand edit for one scalar key such as
-`enabled`. But it does **not** validate the value against CAO's own policy rules, and doesn't show
-up in `cao config list`, so a typo'd key name writes successfully and silently does nothing. For a
-list value (`allowed_providers`) or several keys at once, hand-edit the file. Get the user's
-explicit OK before touching this file either way — the backup you need is already in place from
-step 1.
+`enabled`. It also writes a JSON list as a real list (`cao config set ephemeral.allowed_providers
+'["claude_code","codex"]'`). But it does **not** validate the value against CAO's own policy rules,
+and doesn't show up in `cao config list`, so a typo'd key name writes successfully and silently
+does nothing — the check below names it. Prefer `cao config set` for every key; hand-edit the file
+only when you can't use it. Get the user's explicit OK before touching this file either way — the
+backup you need is already in place from step 1.
 
 1. Edit only the `ephemeral` object. Keep every other top-level key as-is — `model_tiers`,
    `decisions`, and anything else in the file must survive untouched. At minimum you are likely
@@ -233,24 +262,25 @@ step 1.
    merged into (not replacing) the existing `ephemeral` object and the rest of the file. See
    [Operator settings](../../docs/ephemeral-agents.md#operator-settings) for the full key list and
    defaults.
-2. Verify the result with CAO's own loader, run in `cao-server`'s own interpreter (found in step 3)
-   — not the agent's own `uv run` venv, which either isn't `cao-server`'s code at all, or is a
-   different checkout of it:
+2. Verify the result with CAO's own loader, run in `cao-server`'s own interpreter (`"$CAO_PY"`
+   from step 2), never the agent's own `uv run` venv:
    ```bash
-   "$(uv tool dir)/cli-agent-orchestrator/bin/python3" -c "
+   "$CAO_PY" -c "
    from cli_agent_orchestrator.services.ephemeral_service import read_settings, validate_block, EphemeralPolicyError
    try:
-       validate_block(read_settings())
+       block = read_settings()
+       validate_block(block)
        print('OK')
+       print('unknown keys (ignored):', block['_unknown_keys'])
    except EphemeralPolicyError as e:
        print('rule:', e.rule, '| detail:', e.detail)
    "
    ```
-   Print only `OK`, or the `rule`/`detail` pair — never the whole settings dict. A
-   `policy_config_error:<key>` means fix the named key and re-run this check before restarting the
-   server — a broken block refuses every ephemeral create and claim at runtime. This same check
-   also covers whether step 4's tier table is complete, since `validate_block` calls the same tier
-   validation.
+   Print only `OK` and the unknown key *names*, or the `rule`/`detail` pair — never the whole
+   settings dict. A non-empty unknown-keys list is a typo'd or unsupported key: CAO ignores it
+   (the server only logs a warning on create), so fix its name. A `policy_config_error:<key>`
+   means fix the named key and re-run this check before restarting the server — a broken block
+   refuses every ephemeral create and claim. It also re-checks step 4's tier table.
 3. If the check fails and you can't make it pass, restore the backup from step 1 rather than
    leaving the file broken.
 
@@ -275,7 +305,7 @@ its status/consent/revoke surface (`cao decisions show <name> -- --help`, forwar
 package's `status` subcommand — see [Decider packages](../../docs/decisions.md#decider-packages)):
 
 ```bash
-"$(uv tool dir)/cli-agent-orchestrator/bin/cao-decider-jev" --help
+"$(dirname "$CAO_PY")/cao-decider-jev" --help
 ```
 
 You may check **whether** a key is present without ever seeing or printing its value — using the
@@ -285,7 +315,7 @@ any one decider). For the worked example, that is the package's own shape-only c
 length, never the value):
 
 ```bash
-"$(uv tool dir)/cli-agent-orchestrator/bin/cao-decider-jev" key check
+"$(dirname "$CAO_PY")/cao-decider-jev" key check
 ```
 
 Use the equivalent for whatever decider is actually installed — check its own `--help` or docs for
@@ -293,32 +323,40 @@ the exact subcommand; don't invent an environment-variable name for it. Never ec
 key-bearing file through `cat`, or print the environment with a bare `env`/`printenv` (see
 [Safety](#12-safety)).
 
-`cao decisions enable <name>` only sets `model.route`'s decider to `shadow`-ready; it does not
-itself turn routing on, and `effort.route` stays off. Turning routing on is step 8, which the agent
-*can* run without the user's OK as a consent action — it still needs the user's OK as a
-settings-writing action, like every other write in this skill.
+Consent itself doesn't turn routing on, but a decider's consent command may also set a point: Jev's
+sets `model.route` to `shadow`, and leaves `effort.route` off. Moving points is step 8. It is not a
+consent action, so the agent may run it — but only with the user's OK, like every other
+settings write in this skill.
 
 ## 7. Restart the server, reconnect MCP
 
 A newly installed decider is discovered at `cao-server` startup, not live. Get the user's OK, then
 restart it the way it's actually running (found in step 2: foreground gets Ctrl-C then relaunched,
-background gets killed and relaunched, `launchd` gets `launchctl kickstart`). Find the exact
-process by the port it's actually listening on, not by matching process arguments — an unrelated
-process (including this agent's own shell) can share the same command-line text. The port is
-`CAO_API_PORT` if set, else `9889` (`constants.py::SERVER_PORT`) — read it from how this install
-actually starts its server, don't assume the default:
+background gets killed and relaunched, `launchd` gets `launchctl kickstart`). Find the process by
+the port it listens on (step 2's `PORT`), never by matching process arguments — an unrelated
+process, including this agent's own shell, can share the same command-line text:
 
 ```bash
 PORT="${CAO_API_PORT:-9889}"
 curl -sf "http://127.0.0.1:${PORT}/health"        # exit 0: something is listening
-lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN              # the PID actually bound to that port
-ps -o pid,lstart,etime -p <pid-from-above>          # start time newer than your restart
+PID="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -n 1)"
+ps -o pid,lstart,etime -p "$PID"                   # start time newer than your restart
+ps -o args= -p "$PID" | awk '{print $1}'           # must still equal "$CAO_PY"
 ```
 
-Then confirm the *server* actually discovered the decider, not just this CLI process (`cao
-decisions status`'s `installed_deciders` field runs in whatever process calls it, which may not be
-the server). The running server logs its effective settings, including discovered deciders, at
-startup and on every settings change — check that log for the restart you just did.
+Then confirm what the restarted server sees. It lists the `cao.deciders` entry points of its own
+environment once, at startup, so with the same interpreter and a start time after the install, it
+sees what that interpreter's own `cao` reports:
+
+```bash
+"$(dirname "$CAO_PY")/cao" decisions status | "$CAO_PY" -c "import json,sys; print([d['name'] for d in json.load(sys.stdin)['installed_deciders']])"
+```
+
+`jev` must be in the list. If step 2 fell back to the uv tool path, re-run step 2's interpreter
+check now that a server is up. Don't use the server log as proof: its `Decision settings: …
+points=model.route=shadow:jev` line shows the *binding*, which reads the same whether or not the
+package is installed. The final proof is in step 8: after a real launch in shadow, no record has
+`reason: decider_unavailable`.
 
 **Your own MCP connection does not auto-refresh.** The CAO MCP server process this agent's own
 terminal is talking to registers `create_ephemeral_agent` once, at its own startup, and only if
@@ -338,12 +376,8 @@ decider's answer is applied, within `[min_tier, max_tier]`, if confident). Get t
 this step too — it's a settings write like step 5, even though running it isn't itself a consent
 action.
 
-Always land in `shadow` first. Setting a point to `shadow` or `on` here is *CAO's* own mechanism; a
-decider package may also do its own version of this as part of its consent command (the worked
-example's `cao decisions enable jev` has Jev itself call `set_point("model.route", "shadow",
-"jev")`) — that is Jev's own consent behavior, not something `cao decisions enable` does
-generically, and it doesn't need step 6's human-only gate, since step 8 isn't granting or revoking
-consent:
+Always land in `shadow` first (Jev's consent may already have put `model.route` there — see step
+6; the command is safe to repeat):
 
 ```bash
 cao decisions set model.route shadow --decider jev
@@ -358,9 +392,11 @@ record's `outcome` reads `shadow`, never `applied`/`fallback`:
 cao decisions list --point model.route --limit 10
 ```
 
-Check that `outcome` is `shadow` with no failure `reason` present. A `timeout`, `error`,
-`invalid_answer`, `no_answer`, or `decider_unavailable` reason, repeated across more than one task,
-is worth investigating before flipping to `on` — an all-`shadow`, no-note result is the expected
+Check that `outcome` is `shadow` with no failure `reason` present. This is the server-side proof
+step 7 promised: these records are written by the running server. Even one `decider_unavailable`
+means that server could not load the decider (cached until its next restart) — go back to steps 3
+and 7. A `timeout`, `error`, `invalid_answer`, or `no_answer` reason, repeated across more than one
+task, is worth investigating before flipping to `on` — an all-`shadow`, no-note result is the expected
 shape of a working shadow phase, not a sign nothing is happening.
 
 Once the user agrees to flip to `on`:
@@ -424,6 +460,8 @@ time.
 
 ## 11. Undo
 
+Every command here writes `settings.json` or restarts the server, so get the user's OK first:
+
 ```bash
 cao decisions set model.route off
 cao decisions set effort.route off
@@ -431,16 +469,14 @@ cao decisions set effort.route off
 cao decisions off
 ```
 
-Then, with the user's OK: set `ephemeral.enabled` back to `false` in `settings.json` (step 1's
-backup is your restore point) and restart the server (step 7's checks again, to confirm it's back
-and the log shows the change); remove the tier mappings this setup added (`cao decisions tier
-<provider> <tier> --unset` for each), unless the user wants to keep them; leave the decider
-**binding** (`--decider <name>` on the point) as is — `off` state already stops it from being
-asked; tell every other already-connected agent session that `create_ephemeral_agent` keeps being
-advertised until each one reconnects its MCP connection, since this agent can't fix that remotely;
-leave consent revocation and uninstalling the decider package to the user (`cao decisions disable
-<name>`, like enable, needs the same human-only interactive step); and remove the
-`settings.json.bak.*` files this setup created, once the user confirms they no longer need them.
+Then set `ephemeral.enabled` back to `false` (step 1's backup is your restore point; if there was
+none, remove the file this setup created) and restart the server (step 7's checks again); remove
+the tier mappings this setup added (`cao decisions tier <provider> <tier> --unset` for each),
+unless the user wants to keep them; leave the decider **binding** (`--decider <name>` on the
+point) as is — `off` already stops it being asked; tell every other connected agent session that
+`create_ephemeral_agent` stays advertised until it reconnects MCP; leave consent revocation (`cao
+decisions disable <name>`) and uninstalling the decider package to the user, by policy; and remove
+the `settings.json.bak.*` files once the user confirms they no longer need them.
 
 ## 12. Safety
 
@@ -460,12 +496,12 @@ leave consent revocation and uninstalling the decider package to the user (`cao 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `cao decisions --help` says "No such command", or `enable`/`off` are missing | This build predates the decision platform, or (on the current PyPI release) hasn't caught up to it yet | Stop; tell the user to install a build with it, e.g. a git install of `main` |
-| Decider answers worked yesterday, now every launch falls back | A CAO upgrade reinstalled the tool venv and dropped a decider installed with plain `uv pip install` (pattern B), or dropped a pattern-A `--with` package on a git/pinned install (a current CAO gap) | Re-check the entry-point list (step 3); reinstall with the correct pattern for this install's source |
+| Decider answers worked yesterday, now every launch falls back | A CAO upgrade reinstalled the tool venv and dropped a decider installed with plain `uv pip install` (pattern B), or dropped a pattern-A `--with` package on a git/pinned install or a local reinstall from `cao update`'s hint (a current CAO gap) | Re-check the entry-point list (step 3); reinstall with the correct pattern for this install's source |
 | Every create refuses with `policy_config_error:model_tiers` | A tier is missing for one of the allowed providers (the detail names which `provider.tier`) | Re-run step 4's completeness check; fill the gap |
 | `create_ephemeral_agent` is missing from this agent's own tool list after enabling it | This agent's MCP connection started before `ephemeral.enabled` became true | Reconnect MCP (`/mcp` in Claude Code) or restart this agent's own terminal |
 | A Kiro ephemeral helper refuses with `unexpected_failure (400)` | The running `kiro-cli` isn't allow-listed for v3 | Check the server log for `kiro_v3_unsupported_version` / `kiro_v3_unverified_version`; pin to a listed version, or ask the operator about their `v3_allow_unverified_versions` opt-in |
 | A medium-complexity task's model.route record shows `fallback` / `low_confidence` | Confidence came in below `confidence_threshold` (default `0.7`) | Expected behavior, not a bug — only investigate if it recurs on tasks that shouldn't be borderline |
-| Editing `ephemeral.*` seems to do nothing | A hand edit used the wrong key name, or `cao config set` wrote a key CAO's own validator (step 5) then rejects | Re-run step 5's loader check; it names the exact rejected key |
+| Editing `ephemeral.*` seems to do nothing | A typo'd key name: CAO ignores unknown keys (nothing rejects them; the server only logs `ephemeral settings: unknown keys are ignored` on create) | Re-run step 5's loader check; its unknown-keys list names the typo. Compare with the [Operator settings](../../docs/ephemeral-agents.md#operator-settings) list |
 
 ## Related skills
 
