@@ -86,7 +86,7 @@ CAO_VALIDATE_TIMEOUT_SECONDS = 120
 # Severity order. Only ADVISORY leaves the exit status at 0.
 FATAL = "FATAL"  # the package is not loadable by CAO
 SKIPPED = "SKIPPED"  # CAO drops one skill, or MCP, and loads the rest
-LIMIT = "LIMIT"  # breaks an Agent Skills limit; CAO's loader does not check it
+LIMIT = "LIMIT"  # breaks an Agent Skills limit; CAO loads it and only warns
 WARNING = "WARNING"  # CAO reports it (or a finding CAO returned) and the package still loads
 ADVISORY = "ADVISORY"  # input for a human judgement; never changes the exit status
 

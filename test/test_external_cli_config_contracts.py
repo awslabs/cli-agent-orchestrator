@@ -50,6 +50,9 @@ _TEXT_SUFFIXES = frozenset({".md", ".mdx", ".py", ".ts", ".tsx", ".txt"})
 _PRUNED_DIRS = frozenset(
     {
         ".git",
+        # Git worktrees live under .claude/worktrees/ (gitignored); walking them
+        # from the main clone would scan every other branch's checkout too.
+        ".claude",
         ".sweep",
         ".venv",
         ".mypy_cache",
