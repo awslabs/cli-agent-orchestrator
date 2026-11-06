@@ -14,10 +14,10 @@ An off-list component is still refused as ``RAW`` with ``rejected_component``.
 from __future__ import annotations
 
 import json
+from test._support.agui_stream_harness import LegacyFramingClient
 from typing import Any, Dict, List, Tuple
 
 import pytest
-from fastapi.testclient import TestClient
 
 import cli_agent_orchestrator.api.main as main
 from cli_agent_orchestrator.api.main import app
@@ -27,7 +27,9 @@ ag_ui_core = pytest.importorskip("ag_ui.core")
 EventType = ag_ui_core.EventType
 CustomEvent = ag_ui_core.CustomEvent
 
-client = TestClient(app, base_url="http://localhost")
+# These tests pin the deprecated legacy wire (?framing=cao-legacy); the conformant
+# AG-UI 1.0 stream is covered by test_agui_stream_conformance.py.
+client = LegacyFramingClient(app, base_url="http://localhost")
 
 _UI_EVENT = {
     "id": "evt-ui",

@@ -86,12 +86,12 @@ emit iframe '{"src":"https://evil.example"}' 400
 sleep 1
 echo
 echo "[showcase] AG-UI frames captured from ${STREAM}:"
-grep -aE '^event:|rejected_component' "${FRAMES}" | head -40 || true
+grep -a '^data: ' "${FRAMES}" | grep -aoE '"type": *"[A-Z_]+"|"name": *"cao\.[a-z_]+"|rejected_component' | head -40 || true
 
 # The frames are part of the gate, not just display: the six accepted intents
 # must actually traverse the live SSE stream as CUSTOM cao.generative_ui frames.
 # (AG-UI 1.0 has no generative-UI event type; CAO carries it on CUSTOM.)
-FRAME_COUNT=$(grep -a '^data: ' "${FRAMES}" | grep -c '"name": "cao.generative_ui"' || true)
+FRAME_COUNT=$(grep -a '^data: ' "${FRAMES}" | grep -cE '"name": *"cao\.generative_ui"' || true)
 
 echo
 if [ "${fail}" -eq 0 ] && [ "${FRAME_COUNT}" -ge 6 ]; then

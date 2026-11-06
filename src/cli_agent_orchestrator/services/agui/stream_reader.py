@@ -91,6 +91,9 @@ class AguiStreamReader:
         params: Dict[str, str] = {}
         if self._since:
             params["since"] = self._since
+        # This reader parses the named-event legacy wire (``event:`` + snake_case
+        # data), which is no longer the stream's default; ask for it explicitly.
+        params["framing"] = "cao-legacy"
         return params
 
     def _build_headers(self) -> Dict[str, str]:
