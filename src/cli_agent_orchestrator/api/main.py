@@ -2343,6 +2343,7 @@ def _agui_ambient_response(
     from ag_ui.encoder import EventEncoder
     from fastapi.responses import StreamingResponse
 
+    from cli_agent_orchestrator.clients import database as _db
     from cli_agent_orchestrator.clients.database import get_session_incarnation
     from cli_agent_orchestrator.services.agui import run_plane
     from cli_agent_orchestrator.services.agui.ambient_run import AmbientRun, ambient_stream
@@ -2394,6 +2395,7 @@ def _agui_ambient_response(
             incarnation_of=get_session_incarnation,
             state_baseline_known=state_baseline_known,
             since=since,
+            terminal_known=lambda terminal_id: _db.terminal_exists(terminal_id),
         )
         try:
             async for frame in ambient_stream(
