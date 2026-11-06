@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -563,6 +564,40 @@ class TestReferencedSkillsExist:
 
 
 class TestQuotedCommandsAreReal:
+    def test_the_unit_tests_row_quotes_every_selection_and_coverage_flag(self):
+        """The row's command must select and measure what CI does (#1154).
+
+        Every token of CI's command is compared except those that only shape CI's
+        output (``--cov-report=xml`` feeds the Codecov upload, ``-v`` is
+        verbosity). A missing path means a local run skips tests CI runs; a
+        missing ``--cov-branch`` or ``--cov-fail-under`` means a local pass on a
+        coverage figure CI does not use.
+        """
+        output_only = {"--cov-report=xml", "-v"}
+        command = _unit_tests_pytest_command()
+        start = command.index("uv run pytest")
+        joined = command[start:].replace("\\\n", " ")  # shell line continuations
+        ci_tokens = [t for t in shlex.split(joined) if t not in output_only]
+        rows = [runs for first, runs, _ in _gate_map_rows() if first.startswith("**Unit Tests**")]
+        assert len(rows) == 1, f"expected one Unit Tests row, found {len(rows)}"
+        quoted = re.search(r"`([^`]+)`", rows[0])
+        assert quoted, "the Unit Tests row no longer quotes a command"
+        row_tokens = shlex.split(quoted.group(1))
+        missing = [t for t in ci_tokens if t not in row_tokens]
+        assert not missing, f"The Unit Tests job runs {missing}, which the skill's row omits."
+
+    def test_the_dev_loop_install_matches_ci(self):
+        """The dev loop says its ``uv sync`` mirrors CI; it must quote CI's flags."""
+        steps = _ci_spec()["jobs"]["test"]["steps"]
+        installs = [str(s["run"]).strip() for s in steps if "uv sync" in str(s.get("run", ""))]
+        assert installs, "the Unit Tests job no longer runs uv sync; update this test"
+        dev_loop = re.search(r"## Local dev loop\s+```bash\n(.*?)```", _skill_text(), re.S)
+        assert dev_loop, "the skill has no Local dev loop code block"
+        message = f"CI installs with `{installs[0]}`; the skill's dev loop must quote it verbatim."
+        assert installs[0] in dev_loop.group(1), message
+        unlocked = [line.strip() for line in _skill_text().splitlines() if "uv sync --all" in line]
+        assert not unlocked, f"`uv sync` without CI's --locked: {unlocked}"
+
     def test_the_coverage_target_matches_ci(self):
         match = re.search(r"--cov=(\S+)", _unit_tests_pytest_command())
         assert match, "The Unit Tests job no longer passes --cov; update this test."

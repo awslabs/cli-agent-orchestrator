@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
+  now stored scoped by the request fingerprint, so a request that reuses a key another, different
+  request already claimed gets its own slot. On `POST /sessions` and
+  `POST /sessions/{session_name}/terminals` such a request now creates a fresh terminal (201,
+  idempotent for its own retries) instead of answering 409, and with `lookup_only=true` it answers
+  404, the same as an unused key. Stored key values change, so a keyed retry that spans the
+  upgrade creates a new terminal once instead of replaying.
+
 - **Kimi Code 2.3 and Cursor 2026.10.22 replies** (#1149): recognise the new
   submission/trust and coloured-panel layouts, and recover Kimi execution evidence
   after long prompt redraws. Kimi turns that finish without a final text answer

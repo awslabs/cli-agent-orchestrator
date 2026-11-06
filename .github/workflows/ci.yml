@@ -541,7 +541,8 @@ jobs:
       - name: Record dog-food demo (asserts the plugin pipeline; gates on drift)
         # Runs run.sh OFFLINE (no provider binary, network, or secrets) — CAO
         # installing its own `cao` plugin through its own pipeline — and asserts
-        # validate/add/install(Kiro+OpenCode)/remove, exporting
+        # validate/add/install(Kiro+OpenCode)/remove, then validate/add/remove for
+        # every other package in build_agent_plugin.py's PACKAGES, exporting
         # docs/media/agent-plugins-dogfood-demo.gif. A non-zero exit or a missing
         # PASS marker (the pipeline regressed) fails this job — the shift-left
         # gate. The live OpenCode observational step (CAO_DOGFOOD_LIVE=1, needs

@@ -20,6 +20,7 @@ import pytest
 from cli_agent_orchestrator.agent_plugins.installer import install
 from cli_agent_orchestrator.agent_plugins.models import PluginSource, Severity
 from cli_agent_orchestrator.agent_plugins.validation import validate_plugin
+from cli_agent_orchestrator.utils.skills import AGENT_SKILLS_LIMIT_CODES
 
 from .conftest import PLUGIN_SCHEMA_ID
 
@@ -62,6 +63,13 @@ class TestEveryPackageIsConformant:
 
         fatals = [f for f in report.findings if f.severity is Severity.FATAL]
         assert fatals == [], fatals
+
+    @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
+    def test_package_skills_are_within_the_agent_skills_limits(self, package_dir):
+        """A CAO package another Agent Skills client would reject is a regression (#1154)."""
+        report = validate_plugin(package_dir)
+        limits = [f for f in report.findings if f.code in AGENT_SKILLS_LIMIT_CODES]
+        assert limits == [], [f"{f.code}: {f.message}" for f in limits]
         assert report.loadable
 
     @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
