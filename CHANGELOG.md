@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the statically reviewed `KAS_0_66_91`; 2.37.1 reuses `KAS_0_66_70`. Every agent and
   helper render stays byte-identical. Both remain refused at launch unless the operator
   enables `kiro.v3_allow_unverified_versions`, until live checks OC1–OC19 pass.
+  3.1.0 has captured-help probe coverage; 2.37.1 has schema and launch coverage
+  only because no help capture is available.
 
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different

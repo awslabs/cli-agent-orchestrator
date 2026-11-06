@@ -285,6 +285,9 @@ the panel is refused too.
 2.37.1 and 3.1.0 remain pending until the operator's live checks OC1–OC19 pass.
 Until then, they are admitted only with `kiro.v3_allow_unverified_versions`.
 3.1.0 pins `KAS_0_66_91`; every agent and helper render remains byte-identical.
+The 3.1.0 probe is tested against captured help. No 2.37.1 help capture is
+available, so its coverage is schema lookup, pending refusal, opt-in admission
+and launch tests; it has no captured-help probe cases.
 
 Any other version refuses v3; v2 is not affected. A new kiro-cli release needs a
 CAO update before v3 runs on it.
