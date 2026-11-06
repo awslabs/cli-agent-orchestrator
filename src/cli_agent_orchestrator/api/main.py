@@ -201,7 +201,6 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
-    IdempotencyKeyConflict,
     IdempotencyKeyNotFound,
     IdempotentCreateFailed,
     OutputMode,
@@ -4410,11 +4409,14 @@ async def create_session(
     ``terminal_service.create_terminal``'s docstring for the mechanics.
     Omitted (default): today's behavior, no retry protection.
 
-    The key is matched together with a fingerprint of the request, not on its
-    own, so presenting a key that a DIFFERENT request already claimed returns
-    **409 CONFLICT** rather than that other request's terminal. A key whose
-    terminal has since been torn down is stale, not conflicting, and simply
-    creates fresh.
+    The key is scoped by a fingerprint of the request, not matched on its own
+    (issue #944), so presenting a key that a DIFFERENT request already claimed
+    creates a fresh terminal for this request (idempotent for its own retries)
+    rather than returning that other request's terminal. It is not refused:
+    answering differently for a key in use than for an unused one would tell
+    the caller whether someone else holds the key. With ``lookup_only`` both
+    cases answer **404**. A key whose terminal has since been torn down is
+    stale and simply creates fresh.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -4537,8 +4539,7 @@ async def create_session(
             #
             # Sidecar args are all derived from the primary request or its
             # result, so a genuine retry fingerprints identically and hits;
-            # anything else 409s inside the task and is logged below like any
-            # other sidecar failure, without failing the primary.
+            # anything else gets its own fingerprint-scoped slot (issue #944).
             sidecar_idempotency_key = (
                 f"{idempotency_key}:memory-manager-sidecar" if idempotency_key else None
             )
@@ -4599,14 +4600,6 @@ async def create_session(
         # A distinct status, so the caller reports that cause and does not
         # mistake it for a retryable server error.
         return _idempotent_create_failed_response(e)
-    except IdempotencyKeyConflict as e:
-        # The key was already used for a DIFFERENT request (review on PR #634,
-        # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
-        # rather than silently serving the first call's terminal to a caller
-        # who asked for something else. IdempotencyKeyConflict subclasses
-        # Exception and NOT ValueError precisely so this arm cannot be
-        # shadowed by the 400 arm below -- which, note, sits FIRST here.
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
@@ -4790,11 +4783,14 @@ async def create_terminal_in_session(
     ``terminal_service.create_terminal``'s docstring for the mechanics.
     Omitted (default): today's behavior, no retry protection.
 
-    The key is matched together with a fingerprint of the request, not on its
-    own, so presenting a key that a DIFFERENT request already claimed returns
-    **409 CONFLICT** rather than that other request's terminal. A key whose
-    terminal has since been torn down is stale, not conflicting, and simply
-    creates fresh.
+    The key is scoped by a fingerprint of the request, not matched on its own
+    (issue #944), so presenting a key that a DIFFERENT request already claimed
+    creates a fresh terminal for this request (idempotent for its own retries)
+    rather than returning that other request's terminal. It is not refused:
+    answering differently for a key in use than for an unused one would tell
+    the caller whether someone else holds the key. With ``lookup_only`` both
+    cases answer **404**. A key whose terminal has since been torn down is
+    stale and simply creates fresh.
     """
     launch_plan: LaunchPlan | None = None
     try:
@@ -4924,13 +4920,6 @@ async def create_terminal_in_session(
         # A distinct status, so the caller reports that cause and does not
         # mistake it for a retryable server error.
         return _idempotent_create_failed_response(e)
-    except IdempotencyKeyConflict as e:
-        # The key was already used for a DIFFERENT request (review on PR #634,
-        # issue #616) — 409, not the 404 the generic ValueError arm below would
-        # give it. Unlike the Kiro arm, this one does not depend on preceding
-        # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
-        # of the ValueError family can shadow it.
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
         KiroV3Refusal,
         KiroCapabilityError,
@@ -5066,8 +5055,6 @@ async def create_terminal_in_session_as_operator(
         # A keyed replay of a failed original, as on the other create routes
         # (review on PR #773).
         return _idempotent_create_failed_response(e)
-    except IdempotencyKeyConflict as e:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
         KiroV3Refusal,
         KiroCapabilityError,

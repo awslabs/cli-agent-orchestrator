@@ -1212,6 +1212,11 @@ class IdempotencyKeyModel(Base):
     BEFORE doing any real work (tmux window, provider process) and returns
     the terminal that key already produced instead of creating a second one.
 
+    Since issue #944 ``key`` stores the caller's key SCOPED by the request
+    fingerprint (``terminal_service._scoped_idempotency_key``), not the bare
+    key, so a different request reusing a key gets its own row rather than a
+    409 that would reveal the key is in use.
+
     ``key`` is the primary key (not just unique) specifically so a second
     ``INSERT`` for an already-claimed key raises ``IntegrityError`` at
     ``commit()`` time rather than silently overwriting the first mapping --
@@ -2626,9 +2631,8 @@ def terminal_id_in_use(terminal_id: str) -> bool:
 
     - ``idempotency_keys.terminal_id``: a retry resolves its key to this id and
       then looks the row up. If a new terminal reused it, ``get_terminal``
-      succeeds against the wrong terminal -- a fingerprint mismatch raises a
-      spurious conflict, and a coincidentally equal one hands the caller
-      somebody else's running worker.
+      succeeds against the wrong terminal and hands the caller somebody else's
+      running worker.
     - ``inbox.receiver_id``: reconciliation joins a PENDING message's receiver
       id to ``terminals``, so a reused id types the deleted receiver's stale
       message into the new terminal's live session.
@@ -2810,10 +2814,9 @@ def get_idempotency_record(key: str) -> Optional[IdempotencyRecord]:
     (``terminal_service.create_terminal``) uses this to decide whether to do
     any real work at all, before generating a terminal id or touching tmux.
 
-    Returns the fingerprint together with the terminal id in ONE read, so the
-    caller can tell a genuine retry (same key, same request) from a key
-    COLLISION (same key, different request) rather than returning a terminal
-    that answers a question this caller never asked. This deliberately
+    Returns the fingerprint together with the terminal id in ONE read. Since
+    issue #944 the caller passes the fingerprint-scoped key, so a row found here
+    was written for the same request. This deliberately
     REPLACES an earlier ``get_terminal_id_by_idempotency_key`` that returned
     the id alone (review on PR #634): keeping a fingerprint-BLIND public
     lookup beside this one would invite a future caller to reintroduce exactly

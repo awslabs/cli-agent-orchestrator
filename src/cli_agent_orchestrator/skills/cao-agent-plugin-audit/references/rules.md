@@ -3,10 +3,12 @@
 Every check `scripts/validate_agent_plugin.py` performs, with its finding code and
 severity. Severities, in order: `FATAL` (the package does not load), `SKIPPED`
 (one skill or MCP is dropped, the rest loads), `LIMIT` (an Agent Skills limit CAO
-does not check), `WARNING` (CAO reports it and loads the package), `ADVISORY`
+does not enforce), `WARNING` (CAO reports it and loads the package), `ADVISORY`
 (input for a human; never changes the exit status).
 
 The "CAO" column says whether CAO's own validator reports the same condition.
+"warns" means `cao plugin validate` reports it as a `WARNING` with the same code
+and still loads the skill.
 
 ## Schema bytes
 
@@ -80,10 +82,10 @@ printed as `ignored:`. So is a `plugin.json` at the top of the directory.
 | `skill.unparseable` | SKIPPED | yes | no `---` frontmatter, unclosed frontmatter, invalid YAML, or frontmatter that is not a mapping |
 | `skill.blank_field` | SKIPPED | yes | `name` or `description` missing or blank |
 | `skill.folder_name` | SKIPPED | yes | folder name differs from frontmatter `name` |
-| `skill.name_pattern` | LIMIT | **no** | `name` does not match the Agent Skills pattern below |
-| `skill.name_length` | LIMIT | **no** | `name` is longer than 64 characters |
-| `skill.description_length` | LIMIT | **no** | `description` is longer than 1024 characters |
-| `skill.body_length` | LIMIT | **no** | the body, after the closing `---` and stripped, is longer than 500 lines |
+| `skill.name_pattern` | LIMIT | warns | `name` does not match the Agent Skills pattern below |
+| `skill.name_length` | LIMIT | warns | `name` is longer than 64 characters |
+| `skill.description_length` | LIMIT | warns | `description` is longer than 1024 characters |
+| `skill.body_length` | LIMIT | warns | the body, after the closing `---` and stripped, is longer than 500 lines |
 
 The Agent Skills name pattern:
 
@@ -100,7 +102,7 @@ Runs only when `CAO_AGENT_PLUGINS_ENABLED` is already set to `1`, `true` or
 
 | Code | Severity | Condition |
 |---|---|---|
-| `cao.<code>` | WARNING | one per finding in CAO's JSON, whatever CAO's own severity; the message names that severity |
+| `cao.<code>` | WARNING | one per finding in CAO's JSON, whatever CAO's own severity; the message names that severity. A `LIMIT` finding reappears here as `cao.skill.<limit>` |
 | `cao.not_loadable` | FATAL | `cao plugin validate --json` printed JSON whose `loadable` is not `true` |
 
 The command runs with the package root resolved to an absolute path and a timeout

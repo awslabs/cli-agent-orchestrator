@@ -1183,17 +1183,19 @@ def _create_terminal(
         # match (review on PR #634, issue #616). The server fingerprints
         # session_name, and this branch mints a new one per invocation, so two
         # keyed retries from outside a CAO terminal produced different
-        # fingerprints for the same logical request: the retry 409'd against its
-        # own first attempt instead of reattaching to it. Deriving the name makes
+        # fingerprints for the same logical request: the retry missed its own
+        # first attempt instead of reattaching to it. Deriving the name makes
         # the request byte-identical across attempts, which is the precondition
         # the fingerprint check has always assumed.
         #
         # sha256 of the key, truncated to the same 8 hex chars
         # `generate_session_name` uses, so the result is indistinguishable in
         # shape from a generated name and satisfies the same tmux-name rules.
-        # Two DIFFERENT requests sharing a key collide on this name, which is
-        # correct: that is the conflict case, and it surfaces as the 409 the key
-        # is supposed to produce rather than as two sessions.
+        # Two DIFFERENT requests sharing a key collide on this name. Since issue
+        # #944 the server scopes the key by request fingerprint, so the second
+        # request is no longer refused with 409; it attempts its own create of
+        # the SAME session name and fails there, because that session exists.
+        # Use distinct keys for distinct requests.
         session_name = (
             generate_session_name_for_key(idempotency_key)
             if idempotency_key
