@@ -636,6 +636,11 @@ Returns:
 _assign_description = _build_assign_description(
     ENABLE_SENDER_ID_INJECTION, ENABLE_WORKING_DIRECTORY
 )
+_expect_callback_field_desc = (
+    "If true (default), the server guarantees you hear back: if the worker goes idle "
+    "without calling send_message, its last response is forwarded to you, and if it ends "
+    "you are told. Set false for fire-and-forget workers."
+)
 _assign_message_field_desc = (
     "The task message to send to the worker agent."
     if ENABLE_SENDER_ID_INJECTION
@@ -676,6 +681,10 @@ if ENABLE_WORKING_DIRECTORY:
                 description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
             ),
         ] = None,
+        expect_callback: bool = Field(
+            default=True,
+            description=_expect_callback_field_desc,
+        ),
     ) -> Dict[str, Any]:
         denied = _tool_denied_reason("assign")
         if denied:
@@ -689,6 +698,7 @@ if ENABLE_WORKING_DIRECTORY:
             use_worktree=use_worktree,
             target_host=target_host,
             description=description,
+            expect_callback=expect_callback,
         )
 
 else:
@@ -722,6 +732,10 @@ else:
                 description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
             ),
         ] = None,
+        expect_callback: bool = Field(
+            default=True,
+            description=_expect_callback_field_desc,
+        ),
     ) -> Dict[str, Any]:
         denied = _tool_denied_reason("assign")
         if denied:
@@ -735,6 +749,7 @@ else:
             use_worktree=use_worktree,
             target_host=target_host,
             description=description,
+            expect_callback=expect_callback,
         )
 
 
@@ -943,6 +958,14 @@ async def send_message(
             "this one via handoff/assign (the recorded caller)."
         ),
     ),
+    expect_reply: bool = Field(
+        default=False,
+        description=(
+            "Set true when messaging a terminal you did not assign and you are waiting for "
+            "its reply; the server then forwards its last response if it goes idle without "
+            "replying. Follow-ups to your own workers are tracked automatically."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Send a message to another terminal's inbox.
 
@@ -965,7 +988,7 @@ async def send_message(
     Returns:
         Dict with success status and message details
     """
-    return _send_message_impl(receiver_id, message)
+    return _send_message_impl(receiver_id, message, expect_reply=expect_reply)
 
 
 @mcp.tool()
