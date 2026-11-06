@@ -2791,6 +2791,21 @@ def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
         return deleted > 0
 
 
+def terminal_exists(terminal_id: str) -> bool:
+    """Whether ``terminal_id`` names a terminal CAO currently has a row for.
+
+    A plain, quiet existence check (``get_terminal_metadata`` logs a warning on a
+    miss). The AG-UI ambient stream uses it so that a sender label such as
+    ``"operator"`` is never announced as a subagent.
+    """
+    if not terminal_id:
+        return False
+    with SessionLocal() as db:
+        return (
+            db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first() is not None
+        )
+
+
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Get terminal metadata by ID."""
     import json as _json
