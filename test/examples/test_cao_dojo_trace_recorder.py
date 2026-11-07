@@ -763,6 +763,25 @@ def test_a_server_capture_outside_a_git_checkout_names_no_build(monkeypatch):
     assert meta["cao_build"] is None and meta["cao_build_dirty"] is None
 
 
+def test_out_outside_a_git_checkout_is_refused_before_any_capture(monkeypatch, tmp_path, capsys):
+    """`--out` must name the build it records (`_meta.cao_build`), so it refuses a non-checkout.
+
+    The refusal comes before the capture: nothing is launched and no file is written.
+    """
+
+    def no_capture(*args: Any) -> None:
+        raise AssertionError("capture_server ran although --out was refused")
+
+    monkeypatch.setattr(record_trace, "require_editable_checkout", lambda: None)
+    monkeypatch.setattr(record_trace, "_in_git_work_tree", lambda: False)
+    monkeypatch.setattr(record_trace, "capture_server", no_capture)
+    out = tmp_path / "t.ndjson"
+
+    assert record_trace.main(["--live", "--out", str(out)]) == 1
+    assert "run it in a git checkout" in capsys.readouterr().err
+    assert not out.exists()
+
+
 def test_offline_write_shape_writes_the_projection_to_the_given_path(tmp_path):
     shape = tmp_path / "shape.json"
     assert record_trace.main(["--offline", "--write-shape", "--shape", str(shape)]) == 0
