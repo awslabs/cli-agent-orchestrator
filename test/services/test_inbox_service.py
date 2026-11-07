@@ -2189,3 +2189,65 @@ class TestDialogGuardCoversSubmitRecovery:
 
         assert pastes == ["paste"]
         assert enters, "a non-blocking provider must still get its swallowed Enter re-sent"
+
+
+class TestDelegationEdgeArming:
+    """A successful delivery arms the send_message edges its messages opened."""
+
+    @pytest.fixture(autouse=True)
+    def _no_submit_confirmation(self):
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False
+        ):
+            yield
+
+    @patch("cli_agent_orchestrator.services.inbox_service.mark_message_edges_delivered")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_successful_delivery_arms_message_edges(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update, mock_arm
+    ):
+        mock_get.return_value = [_make_message(id=5), _make_message(id=6)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        InboxService().deliver_pending("term-1", num_messages=0)
+
+        mock_arm.assert_called_once_with([5, 6])
+
+    @patch("cli_agent_orchestrator.services.inbox_service.mark_message_edges_delivered")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_failed_delivery_does_not_arm_edges(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update, mock_arm
+    ):
+        mock_get.return_value = [_make_message(id=5)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.dispatch_input.side_effect = RuntimeError("tmux error")
+
+        InboxService().deliver_pending("term-1")
+
+        mock_arm.assert_not_called()
+
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.mark_message_edges_delivered",
+        side_effect=RuntimeError("database unavailable"),
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_arming_failure_leaves_delivered_batch_delivered(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update, _mock_arm
+    ):
+        mock_get.return_value = [_make_message(id=5)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        InboxService().deliver_pending("term-1")
+
+        mock_term_svc.dispatch_input.assert_called_once()
+        statuses = [c.args[1] for c in mock_update.call_args_list]
+        assert MessageStatus.FAILED not in statuses

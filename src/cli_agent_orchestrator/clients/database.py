@@ -50,6 +50,12 @@ else:
     from sqlalchemy import Column
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
+from cli_agent_orchestrator.models.delegation import (
+    DelegationEdge,
+    EdgeReason,
+    EdgeSource,
+    EdgeState,
+)
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.kiro_engine import canonical_kiro_engine
@@ -314,6 +320,23 @@ class InboxModel(Base):
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(UTCDateTime, default=_utcnow)
+
+
+class DelegationEdgeModel(Base):
+    """A caller -> worker delegation that expects a callback (assign-callback-guarantee)."""
+
+    __tablename__ = "delegation_edges"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    caller_id = Column(String, nullable=False, index=True)
+    worker_id = Column(String, nullable=False, index=True)
+    source = Column(String, nullable=False)  # EdgeSource value
+    state = Column(String, nullable=False, index=True)  # EdgeState value
+    reason = Column(String, nullable=False)  # EdgeReason value
+    message_id = Column(Integer, nullable=True)  # inbox id that opened a send_message edge
+    created_at = Column(UTCDateTime, default=_utcnow)
+    delivered_at = Column(UTCDateTime, nullable=True)
+    closed_at = Column(UTCDateTime, nullable=True)
 
 
 class DecisionRecordModel(Base):
@@ -3870,6 +3893,180 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
             db.commit()
             return True
         return False
+
+
+# Delegation edge functions (assign-callback-guarantee)
+
+
+def _edge_from_row(row: DelegationEdgeModel) -> DelegationEdge:
+    return DelegationEdge(
+        id=row.id,
+        caller_id=row.caller_id,
+        worker_id=row.worker_id,
+        source=EdgeSource(row.source),
+        state=EdgeState(row.state),
+        reason=EdgeReason(row.reason),
+        message_id=row.message_id,
+        created_at=row.created_at,
+        delivered_at=row.delivered_at,
+        closed_at=row.closed_at,
+    )
+
+
+def create_delegation_edge(
+    caller_id: str,
+    worker_id: str,
+    source: EdgeSource,
+    reason: EdgeReason = EdgeReason.NO_CALLBACK,
+    message_id: Optional[int] = None,
+) -> DelegationEdge:
+    """Insert an OPEN, unarmed edge caller -> worker."""
+    with SessionLocal() as db:
+        row = DelegationEdgeModel(
+            caller_id=caller_id,
+            worker_id=worker_id,
+            source=source.value,
+            state=EdgeState.OPEN.value,
+            reason=reason.value,
+            message_id=message_id,
+        )
+        db.add(row)
+        # Read the edge back from the flushed row, before commit expires it. A
+        # reload after commit raised ObjectDeletedError in test runs and would
+        # turn a stored edge into a failed create.
+        db.flush()
+        edge = _edge_from_row(row)
+        db.commit()
+        return edge
+
+
+def mark_assign_edges_delivered(worker_id: str) -> int:
+    """Arm open, unarmed assign edges into ``worker_id`` (initial task delivered)."""
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.worker_id == worker_id,
+                DelegationEdgeModel.source == EdgeSource.ASSIGN.value,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+                DelegationEdgeModel.delivered_at.is_(None),
+            )
+            .update({DelegationEdgeModel.delivered_at: _utcnow()}, synchronize_session=False)
+        )
+        db.commit()
+        return count
+
+
+def mark_message_edges_delivered(message_ids: List[int]) -> int:
+    """Arm open send_message edges opened by any of ``message_ids``."""
+    if not message_ids:
+        return 0
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.message_id.in_(message_ids),
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+                DelegationEdgeModel.delivered_at.is_(None),
+            )
+            .update({DelegationEdgeModel.delivered_at: _utcnow()}, synchronize_session=False)
+        )
+        db.commit()
+        return count
+
+
+def close_delegation_edge(edge_id: int, state: EdgeState) -> bool:
+    """Close an edge only if it is still OPEN. True when this call closed it.
+
+    The conditional UPDATE is the claim: the status-event consumer and the
+    sweep can evaluate the same terminal concurrently, and only the caller that
+    wins the claim may forward, so a result is never forwarded twice.
+    """
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.id == edge_id,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .update(
+                {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return count > 0
+
+
+def list_open_edges_into(worker_id: str, armed_only: bool = False) -> List[DelegationEdge]:
+    """Open edges where ``worker_id`` is the worker someone is waiting on."""
+    with SessionLocal() as db:
+        query = db.query(DelegationEdgeModel).filter(
+            DelegationEdgeModel.worker_id == worker_id,
+            DelegationEdgeModel.state == EdgeState.OPEN.value,
+        )
+        if armed_only:
+            query = query.filter(DelegationEdgeModel.delivered_at.isnot(None))
+        return [_edge_from_row(r) for r in query.order_by(DelegationEdgeModel.id).all()]
+
+
+def list_open_edges_out_of(caller_id: str) -> List[DelegationEdge]:
+    """Open edges where ``caller_id`` is itself waiting on other terminals."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.caller_id == caller_id,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .order_by(DelegationEdgeModel.id)
+            .all()
+        )
+        return [_edge_from_row(r) for r in rows]
+
+
+def find_open_edge(caller_id: str, worker_id: str) -> Optional[DelegationEdge]:
+    with SessionLocal() as db:
+        row = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.caller_id == caller_id,
+                DelegationEdgeModel.worker_id == worker_id,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .order_by(DelegationEdgeModel.id)
+            .first()
+        )
+        return _edge_from_row(row) if row else None
+
+
+def list_armed_worker_ids() -> List[str]:
+    """Distinct workers with at least one armed OPEN edge into them (sweep input)."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(DelegationEdgeModel.worker_id)
+            .filter(
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+                DelegationEdgeModel.delivered_at.isnot(None),
+            )
+            .distinct()
+            .all()
+        )
+        return sorted(r[0] for r in rows)
+
+
+def close_open_edges_for_terminal(terminal_id: str, state: EdgeState) -> List[DelegationEdge]:
+    """Close every OPEN edge touching ``terminal_id``; return the inbound ones closed.
+
+    Inbound edges (someone waits on this terminal) need a notice; outbound
+    edges (this terminal waited on others) are closed silently because their
+    replies have no live receiver.
+    """
+    inbound = list_open_edges_into(terminal_id)
+    closed = [e for e in inbound if close_delegation_edge(e.id, state)]
+    for edge in list_open_edges_out_of(terminal_id):
+        close_delegation_edge(edge.id, state)
+    return closed
 
 
 # Flow database functions
