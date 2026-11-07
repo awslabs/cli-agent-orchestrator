@@ -130,14 +130,28 @@ common case:
 ```bash
 [ "$("$CAO_PY" -c 'import sys; print(sys.prefix)')" = "$(uv tool dir)/cli-agent-orchestrator" ] \
   && echo "uv tool venv: patterns A/B apply" || echo "NOT the uv tool venv: stop and ask the user"
-cat "$(uv tool dir)/cli-agent-orchestrator/uv-receipt.toml"
+"$CAO_PY" - "$(uv tool dir)/cli-agent-orchestrator/uv-receipt.toml" <<'EOF'
+import re, sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    requirements = tomllib.load(f)["tool"]["requirements"]
+for entry in requirements:  # print only the requirements, with any user:password@ in a URL hidden
+    print({k: re.sub(r"//[^/@]*@", "//<redacted>@", v) if isinstance(v, str) else v
+           for k, v in entry.items()})
+EOF
 ```
+
+This prints one line per requirement in uv's install receipt, such as
+`{'name': 'cli-agent-orchestrator', 'git': 'https://github.com/awslabs/cli-agent-orchestrator.git'}`.
+Don't `cat` the receipt: a source URL can carry a credential. If any line shows `<redacted>`,
+stop: the user must run the pattern A reinstall themselves, because you can't copy that source.
 
 If it's another environment (a source checkout's `.venv`, pipx, a plain venv), ask the user how
 it's managed, and install only the way they say.
 
 **Always name the package together with its source**, as `"cao-decider-jev @ <source>"`. uv then
-refuses the install if the source turns out to be a different package. Examples:
+refuses the install if the source turns out to be a different package (`Package metadata name …
+does not match given name …`, or for a wheel, `Requested package name … does not match … in the
+distribution filename`). Examples:
 `"cao-decider-jev @ git+https://<host>/<repo>.git"` or `"cao-decider-jev @ /path/to/checkout"`.
 Once the package is on PyPI, plain `"cao-decider-jev"` works.
 
@@ -146,7 +160,7 @@ Pick a pattern with the user:
 | Pattern | Command | Survives a CAO upgrade? | Touches CAO itself? |
 | --- | --- | --- | --- |
 | A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | Only for a plain PyPI install upgraded with `uv tool upgrade`. For a git install, `cao update` drops it (see below). | Yes: CAO is reinstalled and may move to a newer version |
-| B: add it to the tool's environment | `uv pip install --python "$CAO_PY" "cao-decider-jev @ <source>"` | **No.** The receipt never records it, so any CAO upgrade silently drops it | No |
+| B: add it to the tool's environment | `uv pip install --python "$CAO_PY" "cao-decider-jev @ <source>"` | **No.** The receipt never records it, so any CAO upgrade silently drops it | Not CAO's own package, but it can change dependencies CAO shares (such as `httpx`). Run it with `--dry-run` first and show the user the changes |
 
 **For pattern A, copy the source and the extras from the receipt.** The `cli-agent-orchestrator`
 entry in `requirements` gives `<CAO source>`:
@@ -162,7 +176,7 @@ entry in `requirements` gives `<CAO source>`:
 
 `--with` *replaces* the receipt's extra packages; it doesn't add to them. Repeat every other entry
 in its own form (`--with "<name><spec>"`, `--with "git+<url>"`, `--with "<path>"`, or
-`--with-editable "<path>"`), then add the decider. Afterwards, re-read the receipt. The CAO
+`--with-editable "<path>"`), then add the decider. Afterwards, re-run the receipt block above. The CAO
 entry must keep the same field (`editable` stays `editable`), and every earlier entry must still
 be there.
 
@@ -181,11 +195,19 @@ What you should see: `['fixed_table', 'jev']`. `fixed_table` is CAO's built-in d
 `recorded` after pattern A, or `NOT recorded` after pattern B. If `jev` is missing, the package
 went into the wrong environment.
 
-**Tell the user about upgrades.** `cao update` on a git install runs `uv tool install <git source>
---upgrade --reinstall` without any `--with`, so it removes the decider even after pattern A. On a
-local install it changes nothing and prints a reinstall command that has no `--with` either.
-After **any** CAO upgrade or reinstall, re-run the check above and reinstall the decider if
-needed. This is a current CAO limitation.
+**Tell the user about upgrades.** The check above shows that the decider loads *now*, and
+whether the receipt records it. It can't promise the decider survives the next upgrade, and
+often it won't:
+
+- `cao update` on a git install runs `uv tool install <git source> --upgrade --reinstall` without
+  any `--with`, so it removes the decider even after pattern A;
+- on a local install, `cao update` changes nothing and prints a reinstall command that has no
+  `--with` either;
+- after pattern B, any upgrade removes it.
+
+So the user (or you, with their OK) must re-run the check above after **any** CAO upgrade or
+reinstall, reinstall the decider if `jev` is missing, and restart the server. This is a current
+CAO limitation.
 
 ## 4. Turn on helpers and fill the tier table
 
@@ -220,8 +242,9 @@ cao decisions tier codex large  <large-model-id>
 
 Ask the user for the model ids. They depend on the login this CAO uses, so never copy them from
 another account or from an example. Codex logins sometimes need a qualified id such as
-`global.openai.<name>`. `tier` refuses an unknown provider or tier with "invalid provider, tier
-or model". A wrong id that looks valid only fails later, when a helper launches. To remove a
+`global.openai.<name>`. `tier` refuses an unknown provider or a malformed model id with "invalid
+provider, tier or model", and an unknown tier with a usage error (`Invalid value`). A wrong id
+that looks valid only fails later, when a helper launches. To remove a
 mapping, use `cao decisions tier <provider> <tier> --unset`.
 
 **The trap.** Every tier from `min_tier` to `max_tier`, plus `default_tier`, must be mapped for
@@ -270,8 +293,10 @@ path: `"$(dirname "$CAO_PY")/cao-decider-jev"`. `enable` ends with:
 
 ```text
 Consent granted; effective states:
-{"effort.route": "off", "model.route": "shadow"}
+{"effort.route": "off", "model.route": "shadow", "provider.route": "off"}
 ```
+
+The exact list of points can grow with CAO versions; what matters is `"model.route": "shadow"`.
 
 **What you may check yourself.** These two commands read state without showing the key:
 
@@ -291,7 +316,8 @@ step 2 found it running:
 
 - a foreground terminal: Ctrl-C, then start it again;
 - a background process: stop it, then start it again;
-- `launchd`: `launchctl kickstart`.
+- `launchd`: `launchctl kickstart -k gui/$(id -u)/<label>`, with the job label from the user
+  (`-k` stops the running instance first; without it, kickstart leaves a running job alone).
 
 Find the process by its port, never by matching command-line text: your own shell can match that
 text too. Then check the restart:
@@ -301,11 +327,14 @@ PORT="${CAO_API_PORT:-9889}"
 curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null && echo "server answers"
 PID="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -n 1)"
 ps -o pid,lstart,etime -p "$PID"                   # the start time must be after your install
-ps -o args= -p "$PID" | awk '{print $1}'           # must still equal "$CAO_PY"
+ps -o args= -p "$PID"                              # must match the ps line you saw in step 2
 "$(dirname "$CAO_PY")/cao" decisions status | "$CAO_PY" -c "import json,sys; print([d['name'] for d in json.load(sys.stdin)['installed_deciders']])"
 ```
 
-`jev` must be in the last list. The server log line `points=model.route=shadow:jev` isn't proof:
+The `ps` line must be the same command as in step 2, so the server still runs the Python you
+installed into. Compare it with step 2's `ps` line, not with `"$CAO_PY"`: when step 2 used the
+shebang fallback, the two differ even after a correct restart. `jev` must be in the last list.
+The server log line `points=model.route=shadow:jev` isn't proof:
 it shows the binding, which reads the same whether or not the package loads. The real proof
 comes in step 7.
 
@@ -316,7 +345,8 @@ terminal. Confirm `create_ephemeral_agent` is in your tool list before you go on
 
 ## 7. Watch in shadow
 
-In **shadow**, the decider answers every helper launch and CAO records the answer, but helpers
+In **shadow**, the decider answers every helper launch that asks for `auto`, and CAO records
+the answer, but helpers
 still run on `default_tier`. Jev's consent already put `model.route` there. Bind effort routing
 too, if the user wants it (it's a settings write, so get their OK):
 
@@ -325,7 +355,8 @@ cao decisions set model.route shadow --decider jev
 cao decisions set effort.route shadow --decider jev
 ```
 
-Let the user's work create a few helpers with `model_tier: "auto"`, then read the records:
+Let the user's work create a few helpers with `model_tier: "auto"` **and assign or hand off a
+task to each** (creating alone writes no record), then read the records:
 
 ```bash
 cao decisions list --point model.route --limit 10
@@ -379,17 +410,25 @@ every time.
 
 ## 9. Undo
 
-Each of these writes settings or restarts the server, so get the user's OK:
+Each of these writes settings or restarts the server, so get the user's OK.
 
-```bash
-cao decisions off                      # stops every point at once and waits for in-flight calls
-cao config set ephemeral.enabled false
-cao decisions tier <provider> <tier> --unset   # for each mapping this setup added, unless the user keeps them
-```
-
-`cao decisions off` stays in force until a point is set again. Then restart the server (step 6's
-checks), and tell other connected agents that they keep seeing `create_ephemeral_agent` until
-they reconnect MCP.
+1. Stop every point at once. This waits for in-flight decider calls:
+   ```bash
+   cao decisions off
+   ```
+   It stays in force until a point is set again.
+2. Put `settings.json` back the way it was. With the server stopped, restore the step 1 backup;
+   if step 1 found no file, delete the `settings.json` this setup created:
+   ```bash
+   SETTINGS="$(cao config path)"
+   ls "$SETTINGS".bak.*                           # pick the one step 1 made
+   cp "$SETTINGS.bak.<timestamp>" "$SETTINGS"     # or, if there was no backup: rm "$SETTINGS"
+   ```
+   If the user wants to keep later, unrelated settings changes, undo only this setup's keys
+   instead: `cao config set ephemeral.enabled false`, then
+   `cao decisions tier <provider> <tier> --unset` for each mapping this setup added.
+3. Start the server again (step 6's checks), and tell other connected agents that they keep
+   seeing `create_ephemeral_agent` until they reconnect MCP.
 
 These are **the user's** steps:
 
@@ -405,7 +444,7 @@ Delete the `settings.json.bak.*` files once the user no longer needs them.
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `cao decisions` says "No such command", or `enable`/`off` are missing | The build predates the decision platform | Stop. The user installs a build that has it, such as a git install of `main` |
-| uv says `Package metadata name … does not match given name` | The source isn't the package you named | Stop and ask the user for the right source |
+| uv says `Package metadata name … does not match given name`, or `Requested package name … does not match … in the distribution filename` | The source isn't the package you named | Stop and ask the user for the right source |
 | `jev` is missing from the entry-point list | It was installed into a different Python | Re-run step 2, then reinstall with `--python "$CAO_PY"` |
 | It worked yesterday; now every launch falls back with `decider_unavailable` | A CAO upgrade rebuilt the tool and dropped the decider | Re-run step 3's check and reinstall, then restart |
 | Every create fails with `policy_config_error:model_tiers` | One allowed provider is missing a tier (the detail names it) | Map that tier, and re-run step 4's loader check |
@@ -428,5 +467,16 @@ Swap in its package name, decider name and its own key and consent commands.
 `model_tier: "auto"`, even though its answer isn't applied. That's the price of seeing its
 picks first.
 
-**What does Jev receive?** `cao decisions show jev` prints the full disclosure. In short: the
-delegated task text after CAO's secret redaction, and the helper's purpose and description.
+**What does Jev receive?** `cao decisions show jev` prints the full disclosure, which is what
+the user agrees to. For each delegation, one request per point that is in shadow or on goes to
+TypeSafe (`api.typesafe.ai`, US-hosted). It carries:
+
+- the delegated task message, after CAO's secret redaction;
+- for a helper, its purpose and creator-written description (redacted); for a normal
+  delegation, the target profile's name and its description (redacted);
+- fixed question wording and the model alias;
+- the user's API key, their IP address, and a User-Agent naming the package.
+
+It doesn't send the helper's brief, the profile's role, the provider, working directories, file
+contents, terminal, session or request ids, or decision records. Redaction is a list of patterns,
+not a guarantee, and TypeSafe keeps the data unless the user has a zero-retention agreement.
