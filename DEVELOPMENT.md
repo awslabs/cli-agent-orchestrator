@@ -94,6 +94,25 @@ it, as on a fresh CI runner. Exactly two things are kept:
   `~/.cargo` so `test_no_ffi_guard` can run `cargo metadata`. cargo may update its
   own `~/.cargo/.global-cache` while it does.
 
+**The suite never reaches your tmux server either.** CAO's agents run inside tmux,
+so pytest is often started from a tmux pane, where `TMUX` names that pane's
+server. `test/conftest.py` removes `TMUX` and `TMUX_PANE` and points `TMUX_TMPDIR`
+at a fresh directory under `/tmp` (short, because macOS caps a socket path at
+about 104 bytes), and stops any server a test left there when the session ends.
+Each `pytest -n` worker gets its own directory. Sessions that keep the real
+`HOME` (below) keep the real tmux environment too.
+
+**Rule for any code or test that runs tmux:** either clear `TMUX` and `TMUX_PANE`
+from the environment it runs with (`env -u TMUX -u TMUX_PANE`, or pop them from
+the `env` dict) *and* set a private `TMUX_TMPDIR`, or address the server
+explicitly with `-S <socket>` or `-L <name>`. Neither half of the first option
+works alone. `TMUX_TMPDIR` on its own is not isolation inside tmux: tmux gives
+`TMUX` priority, so `dict(os.environ, TMUX_TMPDIR=tmp)` still reaches the server
+you are working in, and a `kill-server` there ends every session on it. Clearing
+`TMUX` without a private `TMUX_TMPDIR` reaches the default socket, which is
+usually the same server. Never run a bare `tmux kill-server` outside the test
+harness. `test/test_tmux_isolation.py` checks the harness side of this.
+
 The suite also never runs a coding-agent CLI for memory compilation or lint: the
 LLM client is stubbed to "none" unless a test installs its own.
 
