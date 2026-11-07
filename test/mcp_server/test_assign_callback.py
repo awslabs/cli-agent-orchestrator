@@ -1,5 +1,6 @@
 """assign and send_message callback flags."""
 
+import asyncio
 import os
 from unittest.mock import MagicMock, patch
 
@@ -134,3 +135,39 @@ class TestSendMessageFlag:
         # the flag are asserted exactly.
         assert send.call_args.args[0] == "bbbb2222"
         assert send.call_args.kwargs == {"expect_reply": True}
+
+
+class TestToolsCalledDirectly:
+    """Called without FastMCP, unset Field defaults arrive as FieldInfo objects.
+
+    FieldInfo is truthy, so a tool that forwarded it would ask for a reply (or a
+    callback) the caller never requested. The tools must pass plain booleans.
+    """
+
+    def test_send_message_without_flag_uses_two_argument_form(self):
+        from cli_agent_orchestrator.mcp_server import server
+
+        with patch.object(server, "_send_message_impl", return_value={"success": True}) as impl:
+            asyncio.run(server.send_message("done", receiver_id="1234abcd"))
+        impl.assert_called_once_with("1234abcd", "done")
+
+    def test_send_message_with_flag_passes_true(self):
+        from cli_agent_orchestrator.mcp_server import server
+
+        with patch.object(server, "_send_message_impl", return_value={"success": True}) as impl:
+            asyncio.run(server.send_message("done", receiver_id="1234abcd", expect_reply=True))
+        impl.assert_called_once_with("1234abcd", "done", expect_reply=True)
+
+    @pytest.mark.parametrize(
+        ("given", "expected"), [({}, True), ({"expect_callback": False}, False)]
+    )
+    def test_assign_passes_a_plain_boolean(self, given, expected):
+        from cli_agent_orchestrator.mcp_server import server
+
+        with (
+            patch.object(server, "_tool_denied_reason", return_value=None),
+            patch.object(server, "_assign_impl", return_value={"success": True}) as impl,
+        ):
+            asyncio.run(server.assign("developer", "do it", **given))
+        value = impl.call_args.kwargs["expect_callback"]
+        assert type(value) is bool and value is expected

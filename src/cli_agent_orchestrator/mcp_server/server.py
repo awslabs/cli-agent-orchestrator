@@ -698,7 +698,8 @@ if ENABLE_WORKING_DIRECTORY:
             use_worktree=use_worktree,
             target_host=target_host,
             description=description,
-            expect_callback=expect_callback,
+            # A direct call passes the FieldInfo default; only an explicit False opts out.
+            expect_callback=expect_callback is not False,
         )
 
 else:
@@ -749,7 +750,8 @@ else:
             use_worktree=use_worktree,
             target_host=target_host,
             description=description,
-            expect_callback=expect_callback,
+            # A direct call passes the FieldInfo default; only an explicit False opts out.
+            expect_callback=expect_callback is not False,
         )
 
 
@@ -988,7 +990,11 @@ async def send_message(
     Returns:
         Dict with success status and message details
     """
-    return _send_message_impl(receiver_id, message, expect_reply=expect_reply)
+    # Called directly (not through FastMCP), the unset default is the FieldInfo
+    # object, which is truthy. Only an explicit True asks for a reply.
+    if expect_reply is True:
+        return _send_message_impl(receiver_id, message, expect_reply=True)
+    return _send_message_impl(receiver_id, message)
 
 
 @mcp.tool()
