@@ -232,13 +232,17 @@ Once a minute, CAO looks at every kept agent:
   exit command, closes the window, and records the end in its launch record
   (`kept_expired`). An ephemeral helper's name is released, and a Kiro helper's
   private home (with its transcripts) is removed only now, at this final teardown.
-- **Status read raises**: CAO retries until one minute after the stored window ends,
-  then tears the child down as it does for readable `unknown`. This bounds a broken
-  status reader even across restarts; it can end work whose status CAO cannot read.
+- **Status read raises**: CAO leaves the child alone until one minute after the
+  stored `kept_until`, then tears it down as it does for readable `unknown`. There
+  may be no retry if that time has already passed, for example after server downtime
+  or a forward jump of the wall clock. This bounds a broken status reader even
+  across restarts; it can end work whose status CAO cannot read.
 
 When a session is full, `teardown_oldest` tears down the oldest idle kept agent the
 same way (`kept_evicted`), and the result says which one. If every kept agent in the
-session is still working, the new one is not kept. If the agent chosen for eviction
+session is still working, the new one is not kept. If the kept rows keep changing
+during status probes, CAO stops after three probe rounds, evicts nothing, and reports
+that the new agent was not kept. If the agent chosen for eviction
 starts working at that very moment, CAO leaves it running rather than kill live work;
 it is then **no longer kept, and stays until you delete it**, and the result says so.
 If eviction teardown fails or is deferred, the child is also no longer kept so the cap

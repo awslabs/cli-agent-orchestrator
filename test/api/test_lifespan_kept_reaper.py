@@ -31,6 +31,8 @@ async def test_kept_reaper_runs_before_sleep_and_survives_a_failed_pass(monkeypa
         assert delay == 60
         events.append(("sleep", clock()))
         elapsed[0] += delay
+        if len(events) > 6:
+            pytest.fail("daemon swallowed cancellation")
         if len(events) >= 4:
             raise asyncio.CancelledError
 
@@ -38,7 +40,7 @@ async def test_kept_reaper_runs_before_sleep_and_survives_a_failed_pass(monkeypa
     monkeypatch.setattr(main.asyncio, "sleep", sleep)
     with patch.object(main.logger, "exception") as error:
         with pytest.raises(asyncio.CancelledError):
-            await main.kept_terminal_reaper_daemon(registry)
+            await asyncio.wait_for(main.kept_terminal_reaper_daemon(registry), timeout=1)
     assert [kind for kind, _ in events] == ["pass", "sleep", "pass", "sleep"]
     assert events[2][1] - events[0][1] == 60.5
     error.assert_called_once_with("Kept-terminal reaper error")

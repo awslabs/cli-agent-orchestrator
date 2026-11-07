@@ -783,6 +783,7 @@ def test_failed_eviction_is_logged_for_operator_cleanup(keep, monkeypatch, caplo
     monkeypatch.setattr(terminal_service, "dismantle_terminal_runtime", lambda *a, **k: False)
     outcome = keep_service.keep_finished("a0000002", reason="handoff")
     assert outcome.kept
+    assert "an operator delete is required" in outcome.note
     assert "a0000001 is no longer kept; operator delete is required" in caplog.text
 
 
@@ -804,3 +805,44 @@ def test_readable_unknown_is_reaped_at_expiry(keep):
     keep.clock[0] = NOW + timedelta(minutes=1)
     assert keep_service.reap() == {"expired": 1}
     assert database.get_terminal_metadata("a0000001") is None
+
+
+def test_at_cap_stops_probing_when_every_snapshot_changes(keep, monkeypatch):
+    keep.setting(max_per_session=1)
+    _fill(keep, ["a0000001"])
+    _child("a0000002")
+    reads = []
+
+    def probe(tid):
+        reads.append(tid)
+        if len(reads) > 3:
+            pytest.fail("at-cap probes exceeded three rounds")
+        database.extend_kept_until(tid, NOW + timedelta(hours=len(reads) + 1))
+        return TerminalStatus.IDLE
+
+    monkeypatch.setattr(keep_service.status_monitor, "get_status", probe)
+    outcome = keep_service.keep_finished("a0000002", reason="handoff")
+    assert not outcome.kept
+    assert "Not kept:" in outcome.note and "changed" in outcome.note
+    assert reads == ["a0000001"] * 3
+    assert _kept_ids() == ["a0000001"]
+    assert keep.calls == []
+
+
+def test_eviction_of_an_already_gone_victim_needs_no_operator_delete(keep, monkeypatch, caplog):
+    keep.setting(max_per_session=1)
+    _fill(keep, ["a0000001"])
+    _child("a0000002")
+
+    def vanished(tid):
+        database.delete_terminal(tid, end_reason="deleted")
+        return None
+
+    monkeypatch.setattr(terminal_service, "capture_terminal_snapshot", vanished)
+    outcome = keep_service.keep_finished("a0000002", reason="handoff")
+    assert outcome.kept and outcome.evicted == ("a0000001",)
+    assert "a0000001 is no longer kept and was already gone." in outcome.note
+    assert "operator delete is required" not in outcome.note
+    assert "operator delete is required" not in caplog.text
+    assert database.get_terminal_metadata("a0000001") is None
+    assert _kept_ids() == ["a0000002"]

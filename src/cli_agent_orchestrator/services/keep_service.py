@@ -53,6 +53,9 @@ REAPER_INTERVAL_SECONDS = 60
 # Bound unreadable status without process-local retry state (also survives restart).
 UNREADABLE_GRACE_SECONDS = 60
 
+# Bound repeated snapshot invalidation by concurrent keeps or reaper extensions.
+MAX_CAP_PROBE_ROUNDS = 3
+
 # A child in either state is working, or waiting on a person, and is never reaped
 # or evicted. Read raw from status_monitor, like flow_service._is_terminal_busy.
 BUSY_STATUSES = frozenset({TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER})
@@ -217,6 +220,7 @@ def keep_finished(
     cap = settings.max_per_session
     candidates: Optional[List[Dict[str, Any]]] = None
     idle: List[str] = []
+    probe_rounds = 0
     while True:
         with _keep_lock:
             existing = database.get_kept_terminal(terminal_id)
@@ -236,6 +240,13 @@ def keep_finished(
                 if settings.on_cap == "dont_keep":
                     return KeepOutcome(kept=False, note=_cap_note(len(kept), cap, "dont_keep"))
                 if candidates != kept:
+                    if probe_rounds >= MAX_CAP_PROBE_ROUNDS:
+                        return KeepOutcome(
+                            kept=False,
+                            note=_cap_note(len(kept), cap, settings.on_cap)
+                            + " The kept agents changed during status probes; no agent was evicted.",
+                        )
+                    probe_rounds += 1
                     # Snapshot membership AND windows. A removed/re-marked or extended
                     # victim invalidates the probes, as does a concurrent new keep.
                     candidates = kept
@@ -294,6 +305,8 @@ def _eviction_sentence(terminal_id: str, outcome: str, cap: int) -> str:
     )
     if outcome == "torn_down":
         return f"{lead} and was torn down."
+    if outcome == "gone":
+        return f"{lead} and was already gone."
     if outcome == "working":
         return f"{lead}; it started working again, so it was left running."
     return (
@@ -303,7 +316,7 @@ def _eviction_sentence(terminal_id: str, outcome: str, cap: int) -> str:
 
 
 def _evict(terminal_id: str, registry: Optional[PluginRegistry]) -> str:
-    """Tear down a child whose keep was given up. ``torn_down``, ``working`` or ``not_torn_down``.
+    """Tear down an evicted child: ``torn_down``, ``gone``, ``working`` or ``not_torn_down``.
 
     Never raises. Its keep mark is already gone, so the cap holds whatever happens here.
     """
@@ -320,6 +333,8 @@ def _evict(terminal_id: str, registry: Optional[PluginRegistry]) -> str:
             return "torn_down"
     except Exception as exc:  # noqa: BLE001 — an eviction must not fail the new keep
         logger.warning("keep: failed to tear down evicted terminal %s: %s", terminal_id, exc)
+    if database.get_terminal_metadata(terminal_id) is None:
+        return "gone"
     logger.warning("keep: terminal %s is no longer kept; operator delete is required", terminal_id)
     return "not_torn_down"
 
@@ -337,7 +352,9 @@ def teardown_kept(
 
     ``terminal_service.delete_terminal`` is NOT used: it would take a second
     snapshot after the exit command and overwrite the first. A deferred runtime
-    cleanup (Grok) keeps both rows, so the next reaper pass retries.
+    cleanup (Grok) leaves the terminal row and any existing keep mark, so the reaper
+    retries marked children. Eviction has already removed the mark; an operator
+    delete is required if the terminal row remains.
     """
     metadata = terminal_service.capture_terminal_snapshot(terminal_id)
     if metadata is None:
