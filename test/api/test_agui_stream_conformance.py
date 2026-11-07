@@ -794,35 +794,59 @@ def test_a_finished_terminal_owns_no_later_event(monkeypatch: pytest.MonkeyPatch
     assert call["metadata"]["cao"]["sender"] == "aaaa1111"
 
 
-def test_a_session_owned_call_closes_before_its_session_finishes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A call kept on a session (its sender is not a terminal) whose receiver is in
-    # another session must still close before the owning session's
-    # SUBAGENT_FINISHED, so it is never tagged with a finished invocation.
-    _known_terminals(monkeypatch, "ef015678")
+def _call_to_an_unannounced_receiver(monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, Any]]:
+    """``operator`` assigns into a terminal of the same session that the run never
+    announced (it started before the replay window), then the session ends.
+
+    The receiver is in the record's session, as CAO's one producer of these records
+    writes it. Because the run never opened the receiver, closing the session's
+    open terminals does not reach the call; only the session's own close loop does.
+    """
+    _known_terminals(monkeypatch, "abcd1234", "ef015678")
     install(
         monkeypatch,
         live=[
             _session_launch("x-1", "cao-a", "2026-11-04T10:00:00.000000+00:00"),
-            _session_launch("x-2", "cao-b", "2026-11-04T10:00:01.000000+00:00"),
-            _terminal_launch("x-3", "cao-b", "ef015678", "rev", "2026-11-04T10:00:02.000000+00:00"),
-            _assign("x-4", "cao-a", "operator", "ef015678", "2026-11-04T10:00:03.000000+00:00"),
-            _session_kill("x-5", "cao-a", "2026-11-04T10:00:04.000000+00:00"),
-            dict(R.TERMINAL_B_KILL, id="x-6", session_name="cao-b", terminal_id="ef015678"),
+            _terminal_launch("x-2", "cao-a", "abcd1234", "dev", "2026-11-04T10:00:01.000000+00:00"),
+            _assign("x-3", "cao-a", "operator", "ef015678", "2026-11-04T10:00:02.000000+00:00"),
+            _session_kill("x-4", "cao-a", "2026-11-04T10:00:03.000000+00:00"),
         ],
     )
     _, body = _get()
-    events = _conformant("review-P3-1-cross-session-call", body)
+    events = _conformant("review-note1-unannounced-receiver", body)
     _no_tag_outside_its_invocation(events)
-    types = [(e["type"], e.get("toolCallId") or e.get("subagentRunId")) for e in events]
-    end = types.index(("TOOL_CALL_END", "x-4"))
+    return events
+
+
+def test_a_session_owned_call_closes_before_its_session_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A call kept on a session (its sender is not a terminal) must close before
+    # the session's SUBAGENT_FINISHED, so it is never tagged with a finished
+    # invocation, even when the run never announced its receiver.
+    events = _call_to_an_unannounced_receiver(monkeypatch)
     session_a = next(
         e["subagentRunId"]
         for e in events
         if e["type"] == "SUBAGENT_STARTED" and e["name"] == "cao-a"
     )
-    assert end < types.index(("SUBAGENT_FINISHED", session_a))
+    assert "terminal:ef015678" not in {
+        e["subagentRunId"] for e in events if e["type"] == "SUBAGENT_STARTED"
+    }
+    (start,) = [e for e in events if e["type"] == "TOOL_CALL_START"]
+    assert start["toolCallId"] == "x-3" and start["subagentRunId"] == session_a
+    types = [(e["type"], e.get("toolCallId") or e.get("subagentRunId")) for e in events]
+    assert types.index(("TOOL_CALL_END", "x-3")) < types.index(("SUBAGENT_FINISHED", session_a))
+
+
+def test_a_call_the_session_close_ends_is_closed_by_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The session's close loop ends the call as a completion, not as a stream that
+    # closed: the stream is still open, and the run goes on.
+    events = _call_to_an_unannounced_receiver(monkeypatch)
+    (end,) = [e for e in events if e["type"] == "TOOL_CALL_END" and e["toolCallId"] == "x-3"]
+    assert end["metadata"]["cao"]["closedBy"] == "completion"
 
 
 def test_a_failing_terminal_lookup_keeps_the_event_on_the_session(

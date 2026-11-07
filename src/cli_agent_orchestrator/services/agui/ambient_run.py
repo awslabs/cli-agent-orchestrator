@@ -621,8 +621,10 @@ class AmbientRun:
                 out.extend(self._close_terminal(terminal_id, session, reason, {}, ts))
         sid = self._sessions.pop(session)
         # Calls the session itself owns (a sender that is not a terminal is kept on
-        # the receiver's session) close before the session finishes, even when the
-        # receiver lives in another session and is still running.
+        # the receiver's session) close before the session finishes. The loop above
+        # ends a call only through a terminal the run has open, so this one is for a
+        # receiver the run never announced, such as a terminal that started before
+        # the replay window.
         for cid in [c for c, call in self._calls.items() if call["owner"] == sid]:
             out.append(self._end_call(cid, ts, "completion"))
         self._finished.add(sid)
