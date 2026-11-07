@@ -103,8 +103,7 @@ async def test_helper_probe_refusal_reaches_creator_and_archive(
     assert_refused_before_bind(helper)
 
 
-@pytest.mark.asyncio
-async def test_installed_probe_refusal_keeps_plain_string_400(helper_http, monkeypatch):
+def test_installed_probe_refusal_keeps_plain_string_400(helper_http, monkeypatch):
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
     message = "kiro_v3_unsupported_version: original installed remedy; retry with engine 'v2'."

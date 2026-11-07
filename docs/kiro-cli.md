@@ -318,7 +318,7 @@ is not checked.
 
 The message never names a path on the server (it may be a shared server); the server log does.
 
-| Message starts with | What it means | Fix |
+| Refusal rule | What it means | Fix |
 |---|---|---|
 | `kiro_v3_unsupported_version` | kiro-cli is a version CAO has no schema for | use a supported version, or `--engine v2` |
 | `kiro_v3_unverified_version` | the version is listed but not yet operator-verified | `--engine v2` until it is verified (operators running the checklist: see *Pending versions*) |
@@ -416,7 +416,7 @@ replace those.
 | `kiro_v3_workspace_config:home` | the launch directory is your home folder, or is inside a home folder that is a git repository | launch from a repository folder, or use a worktree |
 | `kiro_v3_unverified_version` | the kiro-cli version is listed but not yet operator-verified | use a verified kiro-cli version; operators running the checklist can opt in (see [Pending versions](#pending-versions-operator-only)) |
 | `kiro_v3_unsupported_version` | kiro-cli is a version CAO has no schema for | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
-| `unsupported_capability` | the kiro-cli on the server's `PATH` doesn't list a flag the helper needs (`--trust-workspace`, or `--model` or `--effort` when asked for) | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
+| `unsupported_capability` | the kiro-cli on the server's `PATH` doesn't list a flag the helper needs (`--trust-workspace`, or `--model` or `--effort` when asked for), or doesn't advertise `v3` as an accepted `--agent-engine` value | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
 | `missing_executable` | the resolved kiro-cli could not be executed by the probe | check that kiro-cli is installed and executable for the server's user |
 | `timeout` | the kiro-cli capability probe timed out before a worker was launched; this is separate from a handoff worker timeout | check that `kiro-cli --help`, `chat --help` and `--version` finish promptly |
 | `malformed_output` | kiro-cli returned output the capability probe could not recognise | use a [supported kiro-cli version](#supported-kiro-cli-versions), or report the probe failure |

@@ -1279,6 +1279,7 @@ def test_every_helper_refusal_code_is_in_the_kiro_docs():
 
     root = Path(__file__).parents[2]
     sources = [
+        root / "src/cli_agent_orchestrator/providers/kiro_capabilities.py",
         root / "src/cli_agent_orchestrator/providers/kiro_launch_home.py",
         root / "src/cli_agent_orchestrator/providers/kiro_workspace.py",
         root / "src/cli_agent_orchestrator/services/terminal_service.py",
@@ -1287,6 +1288,7 @@ def test_every_helper_refusal_code_is_in_the_kiro_docs():
     for source in sources:
         text = source.read_text(encoding="utf-8")
         codes |= set(re.findall(r'KiroLaunchRefusal\(\s*"([a-z0-9_:]+)"', text))
+        codes |= set(re.findall(r'KiroCapabilityError\(\s*"([a-z0-9_:]+)"', text))
         codes |= set(re.findall(r'self\.code = "(kiro_[a-z0-9_:]+)"', text))
     assert {"kiro_v3_global_home:secrets", "kiro_ephemeral_engine:v2"} <= codes
     # The version refusals carry the helper's own remedy, so they get helper rows too.
@@ -1301,8 +1303,6 @@ def test_every_helper_refusal_code_is_in_the_kiro_docs():
         if f"`{code}`" not in rows and f"`:{code.split(':', 1)[-1]}`" not in rows
     )
     assert not missing, f"no symptom-table row for {missing}"
-    for rule in ("unsupported_capability", "missing_executable", "timeout", "malformed_output"):
-        assert f"`{rule}`" in rows
     fixes = [line.rstrip(" |").rsplit("|", 1)[-1] for line in rows.splitlines()]
     assert not [fix for fix in fixes if "v2" in fix], "a helper fix suggests engine v2"
 
@@ -1342,3 +1342,17 @@ async def test_helper_decided_model_probe_falls_back_before_reporting(
     assert kiro.probe.call_count == 2
     assert "model" in kiro.probe.call_args_list[0].args[1]
     assert "model" not in kiro.probe.call_args_list[1].args[1]
+
+
+def test_kiro_docs_guard_rejects_new_undocumented_capability_kind(monkeypatch):
+    read_text = Path.read_text
+
+    def undocumented_kind(path, *args, **kwargs):
+        text = read_text(path, *args, **kwargs)
+        if path.name == "kiro_capabilities.py":
+            text += '\nraise KiroCapabilityError("new_undocumented_kind", engine, "refused")\n'
+        return text
+
+    monkeypatch.setattr(Path, "read_text", undocumented_kind)
+    with pytest.raises(AssertionError, match="new_undocumented_kind"):
+        test_every_helper_refusal_code_is_in_the_kiro_docs()

@@ -539,7 +539,6 @@ async def test_nonpolicy_bind_error_after_claim_is_generic(launch_http, monkeypa
     assert result["rule"] == "unexpected_failure"
     assert result["message"] == "ephemeral launch failed (500)"
     for forbidden in [
-        "private",
         "http://",
         "https://",
         "claim_id",
@@ -547,6 +546,7 @@ async def test_nonpolicy_bind_error_after_claim_is_generic(launch_http, monkeypa
         "working_directory",
         "allowed_tools",
         "/workspace",
+        "private",
     ]:
         assert forbidden not in str(result)
     assert database.get_terminal_metadata(CHILD) is None
@@ -1061,15 +1061,19 @@ async def test_A_M1_claim_rule_relay(launch_http, path, fault, rule):
         (
             400,
             {"detail": "kiro_v3_unsupported_version: use a supported version"},
-            "kiro_v3_unsupported_version: use a supported version",
+            "ephemeral launch failed (400)",
         ),
         (400, "upstream refused", "ephemeral launch failed (400)"),
-        (400, {"detail": "refused\x00\x1b\n\r\t\x7f\x85\u202e safely"}, "refused safely"),
-        (400, {"detail": "x" * 100000}, "x" * 4096),
+        (
+            400,
+            {"detail": "refused\x00\x1b\n\r\t\x7f\x85\u202e safely"},
+            "ephemeral launch failed (400)",
+        ),
+        (400, {"detail": "x" * 100000}, "ephemeral launch failed (400)"),
         (503, "y" * 100000, "ephemeral launch failed (503)"),
         (424, {"detail": "private replay failure"}, "ephemeral launch failed (424)"),
         (500, {"detail": "private exception"}, "ephemeral launch failed (500)"),
-        (499, {"detail": "refused"}, "refused"),
+        (499, {"detail": "refused"}, "ephemeral launch failed (499)"),
         (400, {"detail": {"message": "private dict failure"}}, "ephemeral launch failed (400)"),
         (400, {"detail": "\x00" * 5000 + "secret"}, "ephemeral launch failed (400)"),
         (400, {"detail": ""}, "ephemeral launch failed (400)"),
@@ -1090,7 +1094,7 @@ async def test_A_M1_claim_rule_relay(launch_http, path, fault, rule):
         "whitespace",
     ],
 )
-async def test_claimed_launch_error_text_is_bounded_and_control_free(
+async def test_nonpolicy_claimed_launch_error_text_is_generic(
     launch_http, monkeypatch, path, status, body, expected
 ):
     import requests
@@ -1148,8 +1152,9 @@ async def test_existing_policy_refusal_output_is_unchanged(launch_http, monkeypa
         ),
         ("x" * 100000, "x" * 4096),
         ("\x00" * 5000 + "secret", "ephemeral launch failed (400)"),
+        ("line one\n\r\t  line two", "line one line two"),
     ],
-    ids=["controls", "oversized", "bound-before-filter"],
+    ids=["controls", "oversized", "bound-before-filter", "whitespace-runs"],
 )
 async def test_policy_refusal_message_is_bounded_and_control_free(
     launch_http, monkeypatch, path, message, expected
@@ -1173,3 +1178,33 @@ async def test_policy_refusal_message_is_bounded_and_control_free(
     assert result["success"] is False
     assert result["rule"] == "timeout"
     assert result["message"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+@pytest.mark.parametrize("stage", ["repo-root", "worktree-add"])
+async def test_worktree_error_after_claim_hides_path_and_git_stderr(
+    launch_http, monkeypatch, path, stage
+):
+    import subprocess
+
+    from cli_agent_orchestrator.services import worktree_service
+
+    stderr = "fatal: detected dubious ownership in repository at '/private/fake-repo'"
+
+    def git_result(args, **kwargs):
+        if stage == "worktree-add" and args[0] == "rev-parse":
+            return subprocess.CompletedProcess(args, 0, stdout="/private/fake-repo", stderr="")
+        return subprocess.CompletedProcess(args, 128, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(worktree_service, "_run_git", git_result)
+    result = await invoke(path, launch_http[0][1], use_worktree=True)
+    assert result["success"] is False
+    assert result["rule"] == "unexpected_failure"
+    assert result["message"] == "ephemeral launch failed (400)"
+    assert result["terminal_id"] is None
+    for private in ["/workspace", "/private/fake-repo", "dubious ownership", "git rev-parse"]:
+        assert private not in str(result)
+    assert database.get_terminal_metadata(CHILD) is None
+    launch_http[0][2].create_window.assert_not_called()
+    launch_http[0][3].assert_not_called()

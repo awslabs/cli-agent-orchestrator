@@ -1456,28 +1456,20 @@ def _parse_run_step_error(
 
 
 def _bounded_launch_message(message: object, fallback: str) -> str:
-    """Bound decoded launch text before scanning and remove non-printable characters."""
+    """Bound decoded launch text before relaying and normalise whitespace."""
     if not isinstance(message, str):
         return fallback
-    cleaned = "".join(ch for ch in message[:4096] if ch.isprintable()).strip()
+    cleaned = " ".join(
+        "".join(
+            " " if ch.isspace() else ch for ch in message[:4096] if ch.isspace() or ch.isprintable()
+        ).split()
+    )
     return cleaned or fallback
 
 
 def _claim_launch_error_message(response: requests.Response) -> str:
-    """Relay only plain-string 4xx details, excluding private 424 replay failures.
-
-    Non-policy dict details, non-JSON bodies and 5xx errors keep the generic
-    message so internal exception text never reaches the creator.
-    """
-    fallback = f"ephemeral launch failed ({response.status_code})"
-    if not 400 <= response.status_code < 500 or response.status_code == 424:
-        return fallback
-    try:
-        payload = response.json()
-    except ValueError:
-        return fallback
-    detail = payload.get("detail") if isinstance(payload, dict) else None
-    return _bounded_launch_message(detail, fallback)
+    """Hide non-policy launch errors after a claim, including paths and git stderr."""
+    return f"ephemeral launch failed ({response.status_code})"
 
 
 def _receiver_provider(receiver_id: str) -> Optional[str]:
@@ -1787,10 +1779,14 @@ async def _run_step_and_build_result(
             payload.get("claim_id") is not None
             and kind not in ("error", "timeout")
             and response.status_code not in (502, 504)
-            and tid is None
+            and (tid is None or 400 <= response.status_code < 500)
         ):
             msg = _claim_launch_error_message(response)
             rule = "unexpected_failure"
+            # A 4xx launch detail can mention an unallocated terminal (e.g.
+            # git worktree add). Only a structured 424 identifies a retained one.
+            if 400 <= response.status_code < 500:
+                tid = _retained_terminal_id(response) if response.status_code == 424 else None
         elif kind == "error" or (kind is None and response.status_code == 502):
             msg = f"Handoff failed: worker errored ({structured_detail})"
             worker_outcome = True
