@@ -1325,7 +1325,7 @@ async def test_helper_decided_model_probe_falls_back_before_reporting(
         )
     )
     if final_failure:
-        (kiro.fake / "version").write_text("3.1.0")
+        (kiro.fake / "version").write_text("3.2.0")
         assert (
             await policy_rule(kiro, launch_plan=LaunchPlan(model="decided-model"))
             == "kiro_v3_unsupported_version"

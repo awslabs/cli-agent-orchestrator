@@ -54,8 +54,8 @@ async def test_helper_probe_refusal_reaches_creator_and_archive(
 ):
     helper = helper_http
     if refusal == "version":
-        (helper.fake / "version").write_text("3.1.0")
-        rule, clue = "kiro_v3_unsupported_version", "3.1.0"
+        (helper.fake / "version").write_text("3.2.0")
+        rule, clue = "kiro_v3_unsupported_version", "3.2.0"
     elif refusal == "flag":
         script = helper.script.read_text()
         helper.script.write_text(
@@ -91,7 +91,7 @@ async def test_helper_probe_refusal_reaches_creator_and_archive(
     if refusal == "version":
         assert result["message"] == (
             "ephemeral policy: kiro_v3_unsupported_version "
-            "Kiro engine 'v3' is not supported on kiro-cli 3.1.0. "
+            "Kiro engine 'v3' is not supported on kiro-cli 3.2.0. "
             "CAO supports v3 only on kiro-cli 2.35.1, 2.36.0, 2.37.0, 3.0.0, "
             "each with a pinned engine schema. Use a supported kiro-cli version: a Kiro helper runs only on engine 'v3'."
         )
@@ -115,7 +115,7 @@ def test_installed_probe_refusal_keeps_plain_string_400(helper_http, monkeypatch
 
     def reject(*args, **kwargs):
         raise KiroCapabilityError(
-            "kiro_v3_unsupported_version", KiroEngine.V3, message, version="3.1.0"
+            "kiro_v3_unsupported_version", KiroEngine.V3, message, version="3.2.0"
         )
 
     monkeypatch.setattr(terminal_service, "probe_kiro_capabilities", reject)
