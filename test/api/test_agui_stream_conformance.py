@@ -482,6 +482,26 @@ def test_the_lifespan_startup_installs_the_signal_stop_hook(
         assert calls == ["hook"]
 
 
+@pytest.mark.parametrize("thread_id", ["bad id!", "x" * 129, ""])
+def test_post_refuses_a_thread_id_the_get_refuses(
+    monkeypatch: pytest.MonkeyPatch, thread_id: str
+) -> None:
+    # Review note 6: one threadId rule for both methods, with the same 400.
+    install(monkeypatch, history=[R.SESSION_LAUNCH])
+    get_code, get_body = _get({"threadId": thread_id})
+    post_code, post_body = _post(_run_input(threadId=thread_id))
+    assert get_code == 400
+    assert post_code == 400, f"POST served threadId {thread_id!r} with {post_code}"
+    assert json.loads(post_body) == json.loads(get_body)
+
+
+def test_post_accepts_a_128_character_thread_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    install(monkeypatch, history=[R.SESSION_LAUNCH])
+    code, body = _post(_run_input(threadId="t" * 128))
+    assert code == 200
+    assert _conformant("review-note6-post-128", body)[0]["threadId"] == "t" * 128
+
+
 def test_max_seconds_ends_run_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     _blocking_bus(monkeypatch, [R.SESSION_LAUNCH])
     code, body = _get({"maxSeconds": 1})

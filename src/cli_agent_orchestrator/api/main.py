@@ -2325,6 +2325,7 @@ _AGUI_LEGACY_DEPRECATION_LINK = (
 )
 _AGUI_SUB_FRAME_ID_RE = re.compile(r"^([^.]+)\.(\d+)$")
 _AGUI_THREAD_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_AGUI_THREAD_ID_ERROR = "Invalid threadId: 1-128 characters of A-Z a-z 0-9 . _ : -"
 
 
 def _agui_legacy_framing_headers() -> Dict[str, str]:
@@ -2552,10 +2553,7 @@ async def agui_stream(
             detail=f"Unknown framing {framing!r}; supported: {sorted(AGUI_STREAM_FRAMINGS)}",
         )
     if thread_id is not None and not _AGUI_THREAD_ID_RE.fullmatch(thread_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid threadId: 1-128 characters of A-Z a-z 0-9 . _ : -",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_AGUI_THREAD_ID_ERROR)
 
     from fastapi.responses import StreamingResponse
 
@@ -2827,6 +2825,9 @@ async def agui_stream_post(
         raise RequestValidationError(
             [{**err, "loc": ("body", *err["loc"])} for err in e.errors(include_url=False)]
         )
+    # The same threadId rule and 400 as GET (review note 6).
+    if not _AGUI_THREAD_ID_RE.fullmatch(run_input.thread_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_AGUI_THREAD_ID_ERROR)
 
     raw_version = body.get("protocolVersion") if isinstance(body, dict) else None
     if raw_version is not None:
