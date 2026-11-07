@@ -124,10 +124,11 @@ def _report(problems: list[str]) -> None:
 
 @contextmanager
 def problems_printed_by_caller() -> Iterator[None]:
-    """Loads inside log no problems, and don't count as reported.
+    """Loads inside this block log nothing and do not count as reported.
 
     For `cao decisions match show` and `check`, which print every problem themselves: the
     load's log line would repeat each one.
+    Mutates process-global state; CLI process only, not concurrency-safe.
     """
     global _last_problems
     previous = _last_problems

@@ -196,8 +196,12 @@ def test_show_and_check_print_each_catalog_problem_once(home, caplog, monkeypatc
 
 def test_the_quick_start_settings_cover_long_context_at_large(home):
     doc = (Path(__file__).resolve().parents[2] / "docs" / "decisions.md").read_text()
+    assert "### Quick start" in doc, "quick-start heading moved or missing"
+    assert "### An example with Claude Code" in doc, "Claude Code example heading moved or missing"
     section = doc[doc.index("### Quick start") : doc.index("### An example with Claude Code")]
-    (block,) = re.findall(r"```json\n(.*?)```", section, re.S)
+    blocks = re.findall(r"```json\n(.*?)```", section, re.S)
+    assert len(blocks) == 1, "quick-start section must contain exactly one fenced JSON block"
+    (block,) = blocks
     settings_service._save(json.loads(block))
     args = ["explain", "--needs", "long_context", "--size", "medium", "--options", "claude_code"]
     result = run(*args, "--tier-auto")
