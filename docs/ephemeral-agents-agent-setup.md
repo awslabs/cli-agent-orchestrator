@@ -167,7 +167,9 @@ entry in `requirements` gives `<CAO source>`:
 
 | Receipt entry for `cli-agent-orchestrator` | `<CAO source>` |
 | --- | --- |
-| `git = "<url>"`, maybe with `rev`, `tag` or `branch` | `"git+<url>"` or `"git+<url>@<rev>"` |
+| `git = "<url>"` | `"git+<url>"` |
+| `git = "<url>?rev=<ref>"` (uv records a pinned commit, tag or branch this way) | `"git+<url>@<ref>"`. **Don't pass `?rev=` back to uv:** it silently ignores it, installs the latest commit and drops the pin |
+| `git = "<url>?<anything else>"` | stop and ask the user |
 | `editable = "<path>"` | `--editable "<path>"`. Without `--editable`, uv makes a static copy, and later edits to the checkout stop reaching CAO |
 | `directory = "<path>"` or `path = "<path>"` | `"<path>"` |
 | `specifier = "<spec>"` | `"cli-agent-orchestrator<spec>"` |
