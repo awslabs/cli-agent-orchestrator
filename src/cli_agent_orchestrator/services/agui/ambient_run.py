@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import signal
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -141,6 +142,62 @@ def install_uvicorn_exit_hook() -> None:
 
     setattr(handle_exit, _HOOK_MARKER, True)
     uvicorn.Server.handle_exit = handle_exit  # type: ignore[method-assign]
+
+
+def install_signal_stop_hook() -> None:
+    """Make the installed SIGINT/SIGTERM handlers ask the ambient streams to close first.
+
+    For a launch that never runs ``cao-server``'s ``main()``, such as
+    ``uvicorn cli_agent_orchestrator.api.main:app``. Called from the lifespan
+    startup, which uvicorn runs after it installs its own handlers, so it wraps
+    them in place; uvicorn 0.29+ puts its originals back when it stops. A handler that
+    already stops the streams (``install_uvicorn_exit_hook``'s) is left alone.
+    Main thread only, where signal handlers live, and idempotent.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        current = signal.getsignal(sig)
+        if not callable(current) or getattr(current, _HOOK_MARKER, False):
+            continue
+
+        def handler(signum: int, frame: Any, _next: Callable[..., Any] = current) -> None:
+            request_stop()
+            _next(signum, frame)
+
+        setattr(handler, _HOOK_MARKER, True)
+        signal.signal(sig, handler)
+
+
+async def until_stop(source: Any) -> AsyncIterator[Any]:
+    """Yield from ``source`` until the server-stop signal, then end as if it had ended.
+
+    The legacy ``framing=cao-legacy`` stream reads its bus through this, so a stop
+    ends it the way its source ending does, instead of holding uvicorn's shutdown.
+    """
+    waiter = _register_stop_waiter()
+    _, stop_event = waiter
+    it = source.__aiter__()
+    pending: Optional["asyncio.Future[Any]"] = None
+    stop_wait: Optional["asyncio.Future[Any]"] = None
+    try:
+        while True:
+            pending = asyncio.ensure_future(it.__anext__())
+            if stop_wait is None:
+                stop_wait = asyncio.ensure_future(stop_event.wait())
+            done, _ = await asyncio.wait({pending, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if stop_wait in done:
+                return
+            try:
+                item = pending.result()
+            except StopAsyncIteration:
+                return
+            yield item
+    finally:
+        for fut in (pending, stop_wait):
+            if fut is not None and not fut.done():
+                fut.cancel()
+        _unregister_stop_waiter(waiter)
 
 
 # ---------------------------------------------------------------------------
