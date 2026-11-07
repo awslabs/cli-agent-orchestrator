@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Accept kiro-cli 3.1.0 and 2.37.1 as pending v3 versions (#1167).** 3.1.0 maps to
+  the statically reviewed `KAS_0_66_91`; 2.37.1 reuses `KAS_0_66_70`. Every agent and
+  helper render stays byte-identical. Both remain refused at launch unless the operator
+  enables `kiro.v3_allow_unverified_versions`, until the operator checklist
+  (OC1–OC19, #1167) passes.
+  3.1.0 has captured-help probe coverage; 2.37.1 has schema and launch coverage
+  only because no help capture is available.
+
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different
   request already claimed gets its own slot. On `POST /sessions` and
@@ -129,8 +137,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.kiro/agents`, and the workspace's `.kiro/` holds no configuration; after the header, CAO
   reads `/mcp` until no server is loading, then `/tools`, before any task. **Not yet a
   supported configuration:** v3 support is claimed only once the live operator checklist has passed.
-  A kiro-cli version still pending operator verification (2.36.0, 2.37.0, 3.0.0; each ships the
-  same v3 engine, `@kiro/agent` 0.66.70, as 2.35.1) refuses unless the operator sets
+  A kiro-cli version still pending operator verification (2.36.0, 2.37.0, 2.37.1, 3.0.0 on
+  `@kiro/agent` 0.66.70; 3.1.0 on 0.66.91) refuses unless the operator sets
   `kiro.v3_allow_unverified_versions: true` (provisional, for running the checklist on it); such a
   launch logs a warning and its response carries `launch_notes`.
   Also: `cao launch` now shows the server's refusal reason instead of "Failed to connect", and the
