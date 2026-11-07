@@ -69,7 +69,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `interrupts`. `approveWithEdits` is omitted, because each interrupt's `responseSchema` says whether
   edit is accepted, and `transport.resumable` is never declared. The route sits behind
   `CAO_AGUI_ENABLED` at the `cao:read` floor, like `POST /agui/v1/run`.
->>>>>>> upstream/main
 - **The ambient AG-UI stream sends generative UI as `CUSTOM` `cao.generative_ui`, not
   `GENERATIVE_UI`.** AG-UI 1.0 has no `GENERATIVE_UI` event type, and its processing rules say a
   producer "MUST NOT emit an event type the protocol does not describe" (`CUSTOM` and `RAW` exist

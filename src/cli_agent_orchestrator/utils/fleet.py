@@ -253,7 +253,7 @@ class FleetClient:
         """Issue an HTTP request to the broker.
 
         A ``None`` read element in ``timeout`` (e.g. ``(_CONNECT_TIMEOUT, None)``) is
-        reserved for streaming reads such as log tailing.
+        reserved for future streaming callers.
         """
         try:
             response = requests.request(
