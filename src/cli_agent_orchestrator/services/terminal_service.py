@@ -62,6 +62,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.database import (
     get_idempotency_record,
+    get_kept_terminal,
     get_session_incarnation,
     get_terminal_metadata,
     list_pending_deferred_init_external_owner_terminal_ids,
@@ -5651,6 +5652,14 @@ def get_terminal(terminal_id: str) -> Dict:
             else:
                 status = reported_status(terminal_id, observed_status).value
 
+        # #1225: a kept child (terminal.keep_finished) shows when its window ends.
+        # Best-effort: an unreadable keep mark must not fail a status read.
+        try:
+            kept = get_kept_terminal(terminal_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("get_terminal: keep mark of %s unreadable: %s", terminal_id, exc)
+            kept = None
+
         return {
             "id": metadata["id"],
             "name": metadata["tmux_window"],
@@ -5674,6 +5683,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "status": status,
             "status_generation": status_generation,
             "output_generation": output_generation,
+            "kept": kept is not None,
+            "kept_until": kept["kept_until"] if kept is not None else None,
             "last_active": metadata["last_active"],
         }
 

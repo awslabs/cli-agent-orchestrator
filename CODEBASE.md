@@ -95,6 +95,8 @@ contract supplies the operation.
 messages, and related state. Paths and defaults are centralized in
 `constants.py`; unified runtime configuration is resolved by
 `services/config_service.py` and `services/settings_service.py`.
+`services/keep_service.py` manages `kept_terminals` marks and the once-a-minute
+reaper for finished children.
 
 Terminal output and status changes flow through services such as
 `fifo_reader.py`, `status_monitor.py`, `event_bus.py`, `sse_bus.py`, and
