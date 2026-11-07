@@ -280,16 +280,96 @@ def _adopt_controller_isolation() -> None:
     _PINNED_ROOT_ENV.update(state["pinned"])
 
 
+# --------------------------------------------------------------------------- #
+# tmux isolation
+# --------------------------------------------------------------------------- #
+#
+# The suite must never reach a tmux server it did not start. CAO's own agents run
+# inside tmux, so a contributor's pytest is often started from a tmux pane, and
+# then ``TMUX`` names that pane's server. tmux gives ``TMUX`` priority over
+# ``TMUX_TMPDIR``, so a test that only sets ``TMUX_TMPDIR`` still talks to the
+# real server, and one bare ``tmux kill-server`` ends every session on it. Clearing
+# ``TMUX`` alone is not enough either: the command then reaches the default socket
+# under the real ``TMUX_TMPDIR``, which is usually the same server.
+#
+# So, with HOME isolation and decided by the same rule, this conftest removes
+# ``TMUX`` and ``TMUX_PANE`` at import and points ``TMUX_TMPDIR`` at a fresh
+# directory. Every default-socket and ``-L`` server a test starts lives there, and
+# the directory, plus any server a test left running in it, is removed at exit.
+# The directory is short and under /tmp on purpose: macOS caps a unix socket path
+# at about 104 bytes, and pytest's ``tmp_path`` is often longer than that.
+#
+# One directory per process. Each pytest-xdist worker makes its own, so workers
+# never share a default server. Re-pinned before and after every test
+# (``_isolated_tmux``), so a ``TMUX`` that a test sets without monkeypatch is gone
+# before the next test and before any session fixture's teardown sees it. A test
+# may still set ``TMUX_TMPDIR`` itself after fixture setup.
+#
+# A session that keeps the real HOME (E2E and the Kiro integration test, see
+# above) keeps the real tmux environment too, because those tests read the panes
+# of a ``cao-server`` you started yourself.
+
+#: Variables that name the tmux server a client talks to. ``TMUX_TMPDIR`` is
+#: replaced rather than removed.
+TMUX_SERVER_ENV_VARS = ("TMUX", "TMUX_PANE")
+
+_ISOLATED_TMUX: Dict[str, str] = {}
+
+
+def _isolate_tmux() -> None:
+    import atexit
+    import tempfile
+
+    for name in TMUX_SERVER_ENV_VARS:
+        os.environ.pop(name, None)
+    tmpdir = tempfile.mkdtemp(prefix="cao-tmux-", dir="/tmp" if os.path.isdir("/tmp") else None)
+    _ISOLATED_TMUX["tmpdir"] = tmpdir
+    os.environ["TMUX_TMPDIR"] = tmpdir
+    atexit.register(_remove_tmux_dir, tmpdir)
+
+
+def _remove_tmux_dir(tmpdir: str) -> None:
+    """Stop any server a test left in the private dir, by explicit socket, then delete it."""
+    import shutil
+    import stat
+    import subprocess
+
+    try:
+        env = {k: v for k, v in os.environ.items() if k not in TMUX_SERVER_ENV_VARS}
+        for root, _dirs, files in os.walk(tmpdir):
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    if not stat.S_ISSOCK(os.lstat(path).st_mode):
+                        continue
+                    subprocess.run(
+                        ["tmux", "-S", path, "kill-server"],
+                        env=env,
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                except Exception:
+                    # Best effort at interpreter exit, where even starting a
+                    # subprocess can fail; the directory is removed regardless.
+                    pass
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _decide_at_import() -> None:
     import sys
 
     if os.environ.get("PYTEST_XDIST_WORKER"):
         _adopt_controller_isolation()
+        if "path" in _ISOLATED_HOME:
+            _isolate_tmux()
         return
     os.environ.pop(_ISOLATION_HANDOFF_VAR, None)
     args, markexpr = _argv_selection(sys.argv[1:])
     if not _needs_real_home(args, markexpr):
         _isolate_home()
+        _isolate_tmux()
 
 
 _decide_at_import()
@@ -342,6 +422,29 @@ def _isolated_home(request, monkeypatch):
         else:
             monkeypatch.delenv(name, raising=False)
     yield pathlib.Path(_ISOLATED_HOME["path"])
+
+
+@pytest.fixture(autouse=True)
+def _isolated_tmux():
+    """Keep ``TMUX`` and ``TMUX_PANE`` unset and ``TMUX_TMPDIR`` on the private dir.
+
+    Applied before and after each test with plain ``os.environ`` writes, not
+    monkeypatch: monkeypatch would restore a value that leaked in before setup,
+    so it would linger until the next test. See "tmux isolation" above.
+    ``real_home`` does not opt a test out of this.
+    """
+    if "tmpdir" not in _ISOLATED_TMUX:
+        yield None
+        return
+    _pin_tmux_env()
+    yield pathlib.Path(_ISOLATED_TMUX["tmpdir"])
+    _pin_tmux_env()
+
+
+def _pin_tmux_env() -> None:
+    for name in TMUX_SERVER_ENV_VARS:
+        os.environ.pop(name, None)
+    os.environ["TMUX_TMPDIR"] = _ISOLATED_TMUX["tmpdir"]
 
 
 _DECISION_HOME_UNSTATABLE = object()
