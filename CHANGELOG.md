@@ -53,6 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal whose invocation already finished no longer becomes a subagent or reuses a finished
   `subagentRunId`; the event stays on the record's session invocation, or is untagged, and keeps
   the sender in `metadata.cao.sender`. `clients.database.terminal_exists` is added for the check.
+- **Direct SQLite connections are now closed when their block ends.** `with sqlite3.connect(...) as conn:`
+  only commits or rolls back; it does not close, and the connection is in a reference cycle with its
+  statement cache, so each such block held a file descriptor on the database until a full garbage
+  collection ran. That covered the workflow journal and its event log, the spec index, the approval
+  store and the SQLite migrators: 47 descriptors per three-step workflow run with the GC disabled. A
+  new `utils.sqlite_connection.closing_transaction` keeps the commit-or-rollback behaviour and then
+  closes the connection; every such block in `src/` uses it. Isolation levels, pragmas and timeouts
+  are unchanged.
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different
   request already claimed gets its own slot. On `POST /sessions` and
