@@ -549,7 +549,15 @@ def _ambient_card(event: Dict[str, Any]) -> Dict[str, Any]:
     from cli_agent_orchestrator.services.agui.ambient_run import AmbientRun
 
     encoder = EventEncoder(accept="text/event-stream")
-    run = AmbientRun(THREAD_ID, "offline-ambient", incarnation_of=lambda _session: None)
+    run = AmbientRun(
+        THREAD_ID,
+        "offline-ambient",
+        incarnation_of=lambda _session: None,
+        # Offline there is no database to ask. A live server finds this terminal,
+        # so the lookup #1243 added says yes here too and the card keeps its
+        # subagentRunId.
+        terminal_known=lambda _terminal_id: True,
+    )
     frames = parse_sse_data("".join(encoder.encode(e) for _, e in run.feed(event)))
     cards = [f for f in frames if f.get("type") == "CUSTOM" and f.get("name") == CAO_GENERATIVE_UI]
     if len(cards) != 1:
