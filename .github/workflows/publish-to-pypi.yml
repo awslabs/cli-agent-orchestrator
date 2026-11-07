@@ -86,6 +86,14 @@ jobs:
           python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME" \
             --index https://test.pypi.org --index https://pypi.org
 
+      # The published CAO Dojo AG-UI trace must be current with its committed shape file
+      # (#1116). PRs only warn about this, because re-recording needs a logged-in Claude
+      # Code; a release is where it blocks. Reads two committed files: no server, no
+      # network, stdlib only. Fix: `make record-agui-trace`.
+      - name: Refuse a release whose CAO Dojo trace is missing or stale
+        if: github.event_name == 'release' || inputs.environment == 'release'
+        run: make check-agui-trace-release AGUI_PY=python
+
       # A manual dispatch uploads to exactly one index, chosen by `inputs.environment`, so
       # only THAT index is asked: a testpypi dispatch must not be refused on pypi.org state,
       # and a pypi dispatch must not be passed on test.pypi.org state. The index is selected

@@ -134,6 +134,13 @@ jobs:
           python scripts/assert_release_version.py --tag "v$VERSION"
           --index https://test.pypi.org --index https://pypi.org
 
+      # The CAO Dojo trace gate publish-to-pypi.yml's verify-release-version runs on the
+      # release chain (#1116), run here before anything is tagged, for the same reason as
+      # the step above. Stdlib only; reads two committed files. Fix: `make
+      # record-agui-trace` on main (docs/RELEASING.md).
+      - name: Refuse a release whose CAO Dojo trace is missing or stale
+        run: make check-agui-trace-release AGUI_PY=python
+
       # One atomic push of the release commit to main AND its tag (review on #652, N2):
       # `git push && git push --tags` could land the bump untagged, and the next schedule
       # would then bump past the version that never got its tag. The script also refuses

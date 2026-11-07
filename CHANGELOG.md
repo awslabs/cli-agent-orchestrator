@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **The CAO Dojo has a recorded, scrubbed AG-UI trace with leak and drift guards** (#1116).
+  `examples/ag-ui/cao-dojo/trace/cao-dojo-trace.ndjson` holds three captures (`none`, `approve`,
+  `reject`) from a real Claude Code permission prompt, recorded by
+  `examples/ag-ui/cao-dojo/tools/record_trace.py` against an isolated `cao-server`. A typed leak
+  rule (L1-L14, each mutation-tested) runs at pre-commit; an offline replay (tier 1: the pinned SDK
+  models plus upstream `enforceEvents`/`verifyEvents`) runs at pre-push (Python) and in CI (Python
+  and node); a keyless `mock_cli` approve/reject/none e2e checks a live recording against the
+  committed shape file in the `AG-UI stock-client live (AC3)` job (tier 2). The release path refuses a missing or stale
+  trace. `mock_cli`'s scripted mode gains `__mock_approval__`, which holds a prompt until it is
+  answered. New `make` targets: `record-agui-trace`, `check-agui-trace`,
+  `check-agui-trace-release`.
+- **A fourth agent-plugin package, `cao-ag-ui-builder`** (#1116; the name is provisional). It
+  ships the `agui-author` skill and no `mcp.json`.
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different
   request already claimed gets its own slot. On `POST /sessions` and
