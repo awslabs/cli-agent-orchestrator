@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Remote worker status polling no longer overruns `--timeout` by up to 60s.** (#1059)
+  `FleetClient.terminal_status` now defaults its read timeout to 5.0s (matching the local
+  terminal poll ceiling in `wait_until_terminal_status`) instead of inheriting the module-wide
+  60s read timeout, keeping stalled broker responses bounded within the caller's poll budget.
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different
   request already claimed gets its own slot. On `POST /sessions` and

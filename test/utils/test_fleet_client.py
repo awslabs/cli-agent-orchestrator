@@ -18,6 +18,8 @@ operator time rather than merely returning the wrong value:
 - **`follow_logs` sets no read timeout**, because a quiet log is not a stalled
   one -- and a 60s read timeout on a followed log looks exactly like a worker
   that died.
+- **`terminal_status` fails fast with a 5s read timeout**, matching the local
+  status poll budget so stalled broker reads do not overrun `--timeout`.
 
 There is no live broker anywhere in this file, and no `kubernetes` import. That
 is the module's design claim -- four HTTP routes and one token -- so stubbing
@@ -36,7 +38,7 @@ from cli_agent_orchestrator.constants import (
     ELASTIC_BROKER_TOKEN_HEADER,
     ELASTIC_BROKER_URL_ENV,
 )
-from cli_agent_orchestrator.utils.fleet import FleetClient
+from cli_agent_orchestrator.utils.fleet import BrokerRequestError, FleetClient
 
 
 @pytest.fixture(autouse=True)
@@ -328,8 +330,29 @@ class TestProxiedRoutes:
         with patch(
             "cli_agent_orchestrator.utils.fleet.requests.request",
             return_value=_response(payload={"id": "t1", "status": "completed"}),
-        ):
+        ) as mock_request:
             assert client.terminal_status("w1", "t1") == "completed"
+            # Status polling caps the read at 5.0s to stay within the caller poll budget
+            assert mock_request.call_args.kwargs["timeout"] == (5.0, 5.0)
+
+    def test_terminal_status_allows_custom_read_timeout(self, client):
+        with patch(
+            "cli_agent_orchestrator.utils.fleet.requests.request",
+            return_value=_response(payload={"id": "t1", "status": "idle"}),
+        ) as mock_request:
+            assert client.terminal_status("w1", "t1", read_timeout=2.5) == "idle"
+            # Disambiguate connect (5.0s) vs custom read timeout (2.5s)
+            assert mock_request.call_args.kwargs["timeout"] == (5.0, 2.5)
+
+    def test_terminal_status_read_timeout_surfaces_as_broker_request_error(self, client):
+        with patch(
+            "cli_agent_orchestrator.utils.fleet.requests.request",
+            side_effect=requests.ReadTimeout("read timed out"),
+        ):
+            with pytest.raises(BrokerRequestError) as exc:
+                client.terminal_status("w1", "t1")
+            assert exc.value.status_code is None
+            assert "read timed out" in exc.value.format_message()
 
 
 class TestSoleTerminal:
