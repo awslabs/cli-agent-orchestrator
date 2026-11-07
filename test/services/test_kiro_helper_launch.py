@@ -284,10 +284,11 @@ async def test_v2_refuses_a_helper_before_bind_and_returns_the_claim(kiro, engin
 @pytest.mark.asyncio
 async def test_a_kiro_cli_version_off_the_allow_list_refuses_before_bind(kiro):
     (kiro.fake / "version").write_text("9.9.9")
-    with pytest.raises(KiroCapabilityError) as err:
+    with pytest.raises(kiro.service.EphemeralPolicyError) as err:
         await launch(kiro)
-    assert err.value.kind == "kiro_v3_unsupported_version"
-    assert err.value.capability == "--version" and err.value.version == "9.9.9"
+    assert err.value.rule == "kiro_v3_unsupported_version"
+    assert "9.9.9" in err.value.detail
+    assert audit(kiro.name)["refusals"][err.value.rule]["count"] == 1
     # A helper runs only on v3, so the remedy is a supported kiro-cli, never v2.
     assert "v2" not in str(err.value)
     assert str(err.value).endswith(terminal_service._HELPER_SUPPORTED_CLI)
@@ -861,9 +862,10 @@ async def test_a_wrapper_without_effort_refuses_an_effort_launch_before_bind(kir
             repr(str(kiro.fake / "chat-help.txt")),
         )
     )
-    with pytest.raises(KiroCapabilityError) as err:
+    with pytest.raises(kiro.service.EphemeralPolicyError) as err:
         await launch(kiro)
-    assert err.value.kind == "unsupported_capability" and err.value.capability == "--effort"
+    assert err.value.rule == "unsupported_capability" and "--effort" in err.value.detail
+    assert audit(kiro.name)["refusals"][err.value.rule]["count"] == 1
     assert "v2" not in str(err.value)
     assert str(err.value).endswith(terminal_service._HELPER_SUPPORTED_CLI)
     assert_refused_before_bind(kiro)
@@ -1277,6 +1279,7 @@ def test_every_helper_refusal_code_is_in_the_kiro_docs():
 
     root = Path(__file__).parents[2]
     sources = [
+        root / "src/cli_agent_orchestrator/providers/kiro_capabilities.py",
         root / "src/cli_agent_orchestrator/providers/kiro_launch_home.py",
         root / "src/cli_agent_orchestrator/providers/kiro_workspace.py",
         root / "src/cli_agent_orchestrator/services/terminal_service.py",
@@ -1285,6 +1288,7 @@ def test_every_helper_refusal_code_is_in_the_kiro_docs():
     for source in sources:
         text = source.read_text(encoding="utf-8")
         codes |= set(re.findall(r'KiroLaunchRefusal\(\s*"([a-z0-9_:]+)"', text))
+        codes |= set(re.findall(r'KiroCapabilityError\(\s*"([a-z0-9_:]+)"', text))
         codes |= set(re.findall(r'self\.code = "(kiro_[a-z0-9_:]+)"', text))
     assert {"kiro_v3_global_home:secrets", "kiro_ephemeral_engine:v2"} <= codes
     # The version refusals carry the helper's own remedy, so they get helper rows too.
@@ -1299,6 +1303,56 @@ def test_every_helper_refusal_code_is_in_the_kiro_docs():
         if f"`{code}`" not in rows and f"`:{code.split(':', 1)[-1]}`" not in rows
     )
     assert not missing, f"no symptom-table row for {missing}"
-    assert "`Kiro engine 'v3' requires wrapper flag`" in rows
     fixes = [line.rstrip(" |").rsplit("|", 1)[-1] for line in rows.splitlines()]
     assert not [fix for fix in fixes if "v2" in fix], "a helper fix suggests engine v2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_failure", [False, True])
+async def test_helper_decided_model_probe_falls_back_before_reporting(
+    kiro, monkeypatch, final_failure
+):
+    from cli_agent_orchestrator.decisions import engine
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
+    bound = {}
+    monkeypatch.setattr(engine, "bind_launch", lambda plan, **values: bound.update(values))
+    script = kiro.script.read_text()
+    kiro.script.write_text(
+        script.replace(
+            'encoding="utf-8").read())',
+            'encoding="utf-8").read().replace("--model", "--absent"))',
+        )
+    )
+    if final_failure:
+        (kiro.fake / "version").write_text("3.1.0")
+        assert (
+            await policy_rule(kiro, launch_plan=LaunchPlan(model="decided-model"))
+            == "kiro_v3_unsupported_version"
+        )
+        assert audit(kiro.name)["refusals"]["kiro_v3_unsupported_version"]["count"] == 1
+        assert "unsupported_capability" not in audit(kiro.name)["refusals"]
+        assert_refused_before_bind(kiro)
+    else:
+        terminal = await launch(kiro, launch_plan=LaunchPlan(model="decided-model"))
+        assert terminal.id == CHILD
+        assert bound["not_honored"] is True
+        assert kiro.factory.call_args.kwargs["kiro_launch"].model is None
+        assert not audit(kiro.name).get("refusals", {})
+    assert kiro.probe.call_count == 2
+    assert "model" in kiro.probe.call_args_list[0].args[1]
+    assert "model" not in kiro.probe.call_args_list[1].args[1]
+
+
+def test_kiro_docs_guard_rejects_new_undocumented_capability_kind(monkeypatch):
+    read_text = Path.read_text
+
+    def undocumented_kind(path, *args, **kwargs):
+        text = read_text(path, *args, **kwargs)
+        if path.name == "kiro_capabilities.py":
+            text += '\nraise KiroCapabilityError("new_undocumented_kind", engine, "refused")\n'
+        return text
+
+    monkeypatch.setattr(Path, "read_text", undocumented_kind)
+    with pytest.raises(AssertionError, match="new_undocumented_kind"):
+        test_every_helper_refusal_code_is_in_the_kiro_docs()
