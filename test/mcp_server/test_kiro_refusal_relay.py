@@ -16,6 +16,7 @@ from cli_agent_orchestrator.api import main
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.plugins.registry import PluginRegistry
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilityError
+from cli_agent_orchestrator.providers.kiro_v3_schema import SUPPORTED_KIRO_CLI_VERSIONS
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.utils import orchestration
 
@@ -89,10 +90,11 @@ async def test_helper_probe_refusal_reaches_creator_and_archive(
     assert result["rule"] == rule, (result, helper.seen["responses"])
     assert clue in result["message"]
     if refusal == "version":
+        supported = ", ".join(sorted(SUPPORTED_KIRO_CLI_VERSIONS))
         assert result["message"] == (
             "ephemeral policy: kiro_v3_unsupported_version "
             "Kiro engine 'v3' is not supported on kiro-cli 3.2.0. "
-            "CAO supports v3 only on kiro-cli 2.35.1, 2.36.0, 2.37.0, 3.0.0, "
+            f"CAO supports v3 only on kiro-cli {supported}, "
             "each with a pinned engine schema. Use a supported kiro-cli version: a Kiro helper runs only on engine 'v3'."
         )
     if refusal != "field":
