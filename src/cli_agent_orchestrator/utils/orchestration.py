@@ -1428,6 +1428,8 @@ def _terminal_id_from_detail(detail: str) -> Optional[str]:
 
 def _parse_run_step_error(
     response: requests.Response,
+    *,
+    scrape_terminal_id: bool = True,
 ) -> tuple[Optional[str], str, Optional[str], Optional[str]]:
     """Parse a run-step error into ``(kind, message, terminal_id, policy_rule)``.
 
@@ -1435,7 +1437,8 @@ def _parse_run_step_error(
     ``{"message", "kind", "terminal_id"}`` so callers read the failure kind and
     the live terminal as fields. Falls back to the legacy plain-string detail
     (+ regex terminal-id scrape) when the structured shape is absent, so a
-    newer client still works against an older server.
+    newer client still works against an older server. Callers can disable the
+    scrape for untrusted launch text without discarding structured worker ids.
     """
     try:
         payload = response.json()
@@ -1450,7 +1453,8 @@ def _parse_run_step_error(
         rule = detail.get("rule", "unexpected_failure") if kind == "ephemeral_policy" else None
         return kind, message, detail.get("terminal_id"), rule
     if isinstance(detail, str) and detail:
-        return None, detail, _terminal_id_from_detail(detail), None
+        tid = _terminal_id_from_detail(detail) if scrape_terminal_id else None
+        return None, detail, tid, None
     fallback = f"status {response.status_code}"
     return None, fallback, None, None
 
@@ -1759,7 +1763,12 @@ async def _run_step_and_build_result(
         # run-step endpoint returns a STRUCTURED detail object
         # ({message, kind, terminal_id}) so we read terminal_id and the
         # failure kind as fields rather than scraping the message.
-        kind, structured_detail, tid, rule = _parse_run_step_error(response)
+        kind, structured_detail, tid, rule = _parse_run_step_error(
+            response,
+            scrape_terminal_id=not (
+                payload.get("claim_id") is not None and 400 <= response.status_code < 500
+            ),
+        )
         # worker RAN LONG (timeout) vs CRASHED (terminal reached ERROR) must
         # be reported distinctly so a 5s crash is not mislabeled as an
         # N-second timeout. The structured `kind` is authoritative; the
@@ -1783,10 +1792,11 @@ async def _run_step_and_build_result(
         ):
             msg = _claim_launch_error_message(response)
             rule = "unexpected_failure"
-            # A 4xx launch detail can mention an unallocated terminal (e.g.
-            # git worktree add). Only a structured 424 identifies a retained one.
-            if 400 <= response.status_code < 500:
-                tid = _retained_terminal_id(response) if response.status_code == 424 else None
+            # Structured worker ids survive on every status; only scraped 4xx
+            # ids (e.g. an unallocated git worktree terminal) are dropped above.
+            # A retained 424 can also name its worker at the top level.
+            if response.status_code == 424:
+                tid = tid or _retained_terminal_id(response)
         elif kind == "error" or (kind is None and response.status_code == 502):
             msg = f"Handoff failed: worker errored ({structured_detail})"
             worker_outcome = True

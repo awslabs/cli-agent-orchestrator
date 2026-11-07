@@ -1012,6 +1012,52 @@ async def test_claimed_provider_error_preserves_handoff_and_releases(launch_http
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 409, 424, 499])
+async def test_claimed_run_step_4xx_keeps_structured_worker_for_cleanup(
+    launch_http, monkeypatch, status
+):
+    import requests
+
+    env, name, _, _ = launch_http[0]
+    original = orchestration.requests.post
+
+    def retained_worker_response(url, **kwargs):
+        if not url.endswith("/run-step"):
+            return original(url, **kwargs)
+        # Launch and bind a real worker, then model a future server's structured
+        # 4xx response while that worker remains alive and needs cleanup.
+        kwargs["json"] = {**kwargs["json"], "teardown": False}
+        launched = original(url, **kwargs)
+        assert launched.status_code == 200
+        assert launched.json()["terminal_id"] == CHILD
+        response = requests.Response()
+        response.status_code = status
+        response._content = json.dumps(
+            {
+                "detail": {
+                    "kind": "identity_pending",
+                    "message": "/private/worker identity check pending",
+                    "terminal_id": CHILD,
+                }
+            }
+        ).encode()
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", retained_worker_response)
+    result = await invoke("default", name)
+    assert result["success"] is False
+    assert result["message"] == f"ephemeral launch failed ({status})"
+    assert result["rule"] == "unexpected_failure"
+    assert result["terminal_id"] == CHILD
+    assert database.get_terminal_metadata(CHILD) is not None
+    assert database.get_ephemeral_agent(name)["state"] == "launched"
+    assert orchestration._delete_terminal_impl(result["terminal_id"])["success"]
+    assert database.get_terminal_metadata(CHILD) is None
+    assert_released(env, name, "terminal_deleted")
+    assert database.get_ephemeral_agent(name)["state"] == "gc"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "e2_variant", ["omitted", "explicit", "default", "effort_explicit", "effort_default"]
 )
@@ -1075,6 +1121,11 @@ async def test_A_M1_claim_rule_relay(launch_http, path, fault, rule):
         (500, {"detail": "private exception"}, "ephemeral launch failed (500)"),
         (499, {"detail": "refused"}, "ephemeral launch failed (499)"),
         (400, {"detail": {"message": "private dict failure"}}, "ephemeral launch failed (400)"),
+        (
+            409,
+            {"detail": {"kind": "diverged", "message": "/private/x"}},
+            "ephemeral launch failed (409)",
+        ),
         (400, {"detail": "\x00" * 5000 + "secret"}, "ephemeral launch failed (400)"),
         (400, {"detail": ""}, "ephemeral launch failed (400)"),
         (400, {"detail": "  "}, "ephemeral launch failed (400)"),
@@ -1089,6 +1140,7 @@ async def test_A_M1_claim_rule_relay(launch_http, path, fault, rule):
         "boundary-500",
         "boundary-499",
         "dict-detail",
+        "nonpolicy-kind",
         "bound-before-filter",
         "empty",
         "whitespace",
