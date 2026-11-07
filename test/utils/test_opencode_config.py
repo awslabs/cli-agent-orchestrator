@@ -863,3 +863,20 @@ class TestMcpEntryRecord:
             record_mcp_entry("demo-tools", self.ENTRY)
         assert sidecar.read_text(encoding="utf-8") == "{not json"
         assert any("not recording mcp.demo-tools" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "content",
+        ['["not", "a", "record"]', '{"version": 1, "agents": ["developer"]}'],
+        ids=["not-an-object", "agents-not-an-object"],
+    )
+    def test_a_wrongly_shaped_sidecar_is_left_intact_not_rewritten(
+        self, tmp_config: Path, caplog, content: str
+    ):
+        """Valid JSON that is not a grant record is refused the same way as invalid JSON."""
+        tmp_config.parent.mkdir(parents=True)
+        sidecar = tmp_config.with_name("cao-grants.json")
+        sidecar.write_text(content, encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            record_mcp_entry("demo-tools", self.ENTRY)
+        assert sidecar.read_text(encoding="utf-8") == content
+        assert any("unexpected shape" in r.getMessage() for r in caplog.records)
