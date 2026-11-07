@@ -324,16 +324,13 @@ class TestTheTraceGate:
         assert runs == (environment in (None, "release")), scenario
 
     def test_release_yml_runs_the_same_trace_gate_before_it_tags(self):
-        steps = RELEASE_FOR_TRACE["jobs"]["release"]["steps"]
+        steps = RELEASE["jobs"]["release"]["steps"]
         (step,) = _trace_steps(steps)
         assert step["run"].strip() == TRACE_GATE
         assert "if" not in step, "the pre-tag gate must run on every release run"
         names = [s.get("name", "") for s in steps]
         tag = next(i for i, n in enumerate(names) if n.startswith("Commit, tag and push"))
         assert steps.index(step) < tag
-
-
-RELEASE_FOR_TRACE = _load("release.yml")
 
 
 # --------------------------------------------------------------------------------------

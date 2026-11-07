@@ -206,8 +206,8 @@ def test_every_known_gap_is_still_observed():
         for where, keys in gap.items():
             for key in keys:
                 assert (where, key) in seen, (
-                    f"KNOWN_GAPS {gap_id} no longer observed ({where}.{key}): remove it from "
-                    f"{KNOWN_GAPS_FILE.name}"
+                    f"KNOWN_GAPS {gap_id} not observed in any trace ({where}.{key}): remove "
+                    f"it from {KNOWN_GAPS_FILE.name}"
                 )
 
 

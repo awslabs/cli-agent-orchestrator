@@ -9,7 +9,9 @@
 //
 // For each trace: every run-plane run must pass verifyEvents with no error, and
 // every enforcement warning must start with one listed in cao-dojo/tools/known_gaps.json
-// (shared with the Python lane). Each stream card goes through enforceEvents
+// (shared with the Python lane; CAO_DOJO_KNOWN_GAPS overrides the path, for tests).
+// After all traces, every known gap must be observed in at least one of them,
+// the same union the Python lane takes (known-gaps.mjs). Each stream card goes through enforceEvents
 // alone, since a lone CUSTOM is not a run. Before any trace, the three vendored
 // upstream conformance streams must each produce their declared outcome, which
 // proves this lane can fail.
@@ -22,9 +24,12 @@ import { fileURLToPath } from "node:url";
 import { enforceEvents, verifyEvents } from "@ag-ui/client";
 import { from, lastValueFrom, toArray } from "rxjs";
 
+import { GapLedger, allowedWarnings } from "./known-gaps.mjs";
+
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "../../..");
-const knownGapsPath = join(repo, "examples/ag-ui/cao-dojo/tools/known_gaps.json");
+const knownGapsPath =
+  process.env.CAO_DOJO_KNOWN_GAPS || join(repo, "examples/ag-ui/cao-dojo/tools/known_gaps.json");
 const fixturesDir = join(repo, "test/examples/fixtures/ag-ui-conformance");
 const CONTROLS = [
   "first-event-not-run-started-fatal",
@@ -49,20 +54,6 @@ async function pipe(events, stages) {
   } catch (err) {
     return { outcome: "failed", error: err?.message ?? String(err), warnings: [...warnings] };
   }
-}
-
-function allowedWarnings() {
-  const gaps = JSON.parse(readFileSync(knownGapsPath, "utf8"));
-  const allowed = new Map();
-  for (const [gapId, gap] of Object.entries(gaps)) {
-    for (const [type, keys] of Object.entries(gap)) {
-      for (const key of keys) {
-        const text = `[ag-ui][enforce] Removed unrecognised material at '/${key}' on ${type}.`;
-        allowed.set(text, gapId);
-      }
-    }
-  }
-  return allowed;
 }
 
 function parseTrace(path) {
@@ -102,7 +93,7 @@ for (const name of CONTROLS) {
 }
 
 // 2. The traces.
-const allowed = allowedWarnings();
+const ledger = new GapLedger(allowedWarnings(JSON.parse(readFileSync(knownGapsPath, "utf8"))));
 const paths = process.argv.slice(2);
 if (paths.length === 0) fail("no trace given: node verify-trace.mjs <trace.ndjson>...");
 for (const path of paths) {
@@ -114,7 +105,6 @@ for (const path of paths) {
     fail(`${path}: ${err.message}`);
     continue;
   }
-  const seen = new Set();
   if (parsed.runs.size === 0) fail(`${path}: no run-plane runs`);
   for (const [runId, frames] of parsed.runs) {
     const got = await pipe(frames, [enforceEvents(), verifyEvents()]);
@@ -122,9 +112,7 @@ for (const path of paths) {
       fail(`${runId}: verifyEvents: ${got.error}`);
       continue;
     }
-    const gapOf = (w) => [...allowed.keys()].find((prefix) => w.startsWith(prefix));
-    const unlisted = got.warnings.filter((w) => gapOf(w) === undefined);
-    got.warnings.forEach((w) => gapOf(w) !== undefined && seen.add(gapOf(w)));
+    const unlisted = ledger.record(got.warnings);
     if (unlisted.length) unlisted.forEach((w) => fail(`${runId}: ${w}`));
     else console.log(`  ok   ${runId}: ${frames.map((f) => f.type).join(" > ")}`);
   }
@@ -135,9 +123,13 @@ for (const path of paths) {
     else if (got.warnings.length) got.warnings.forEach((w) => fail(`${label}: ${w}`));
     else console.log(`  ok   ${label}`);
   }
-  for (const [text, gapId] of allowed) {
-    if (!seen.has(text)) fail(`${path}: KNOWN_GAPS ${gapId} no longer observed (${text}): remove it from known_gaps.json`);
-  }
+}
+
+// 3. Every known gap is observed in at least one trace. Checked once, across all
+// of them, so a stale published trace and a fresh recording that differ on a
+// gap still pass while either carries it.
+for (const [text, gapId] of ledger.unobserved()) {
+  fail(`KNOWN_GAPS ${gapId} not observed in any trace (${text}): remove it from known_gaps.json`);
 }
 
 console.warn = realWarn;
