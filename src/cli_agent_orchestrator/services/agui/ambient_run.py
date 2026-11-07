@@ -255,6 +255,7 @@ class AmbientRun:
         state_baseline_known: bool = True,
         since: Optional[str] = None,
         terminal_known: Optional[Callable[[str], bool]] = None,
+        terminal_label: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
     ) -> None:
         self.thread_id = thread_id
         self.run_id = run_id
@@ -263,6 +264,9 @@ class AmbientRun:
         # terminal_id that is neither open on the run nor known to CAO (a label
         # such as "operator" or "supervisor") never becomes a subagent.
         self._terminal_known = terminal_known
+        # The ``agent_profile`` and ``provider`` of a known terminal, to name one
+        # first met mid-replay, before the snapshot that has the names.
+        self._terminal_label = terminal_label
         self._state_baseline_known = state_baseline_known
         self._since = since
         self._snapshot_sent = False
@@ -577,9 +581,15 @@ class AmbientRun:
                 return self._terminals[terminal_id][0]
             sid = subagent_run_id_for_terminal(terminal_id)
             if sid not in self._finished and self._is_known_terminal(terminal_id):
+                label = self._label_of(terminal_id)
                 out.extend(
                     self._open_terminal(
-                        terminal_id, session, name="terminal", provider=None, envelope={}, ts=None
+                        terminal_id,
+                        session,
+                        name=label.get("agent_profile") or label.get("provider") or "terminal",
+                        provider=label.get("provider"),
+                        envelope={},
+                        ts=None,
                     )
                 )
                 return sid
@@ -593,6 +603,15 @@ class AmbientRun:
         except Exception:  # a DB hiccup must not break the stream; attribute conservatively
             logger.debug("ambient_run: terminal lookup failed for %s", terminal_id, exc_info=True)
             return False
+
+    def _label_of(self, terminal_id: str) -> Dict[str, Any]:
+        if self._terminal_label is None:
+            return {}
+        try:
+            return self._terminal_label(terminal_id) or {}
+        except Exception:  # a DB hiccup must not break the stream; keep the generic name
+            logger.debug("ambient_run: label lookup failed for %s", terminal_id, exc_info=True)
+            return {}
 
     def _close_calls_for_terminal(self, terminal_id: str, ts: Optional[int]) -> List[Any]:
         sid = self._terminals.get(terminal_id, (None, ""))[0]

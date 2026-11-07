@@ -2402,6 +2402,7 @@ def _agui_ambient_response(
             state_baseline_known=state_baseline_known,
             since=since,
             terminal_known=lambda terminal_id: _db.terminal_exists(terminal_id),
+            terminal_label=lambda terminal_id: _db.get_terminal_label(terminal_id),
         )
         try:
             async for frame in ambient_stream(

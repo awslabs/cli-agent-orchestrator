@@ -811,10 +811,17 @@ def test_request_stop_is_reentrant_on_the_lock_holding_thread() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _known_terminals(monkeypatch: pytest.MonkeyPatch, *known: str) -> None:
+def _known_terminals(
+    monkeypatch: pytest.MonkeyPatch, *known: str, labels: Optional[Dict[str, Dict[str, str]]] = None
+) -> None:
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.terminal_exists",
         lambda terminal_id: terminal_id in known,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_label",
+        lambda terminal_id: (labels or {}).get(terminal_id) if terminal_id in known else None,
         raising=False,
     )
 
@@ -921,6 +928,45 @@ def test_a_known_terminal_sender_owns_its_call_before_its_launch_is_seen(
     assert "terminal:cccc3333" in {
         e["subagentRunId"] for e in events if e["type"] == "SUBAGENT_STARTED"
     }
+
+
+def test_a_replay_that_starts_after_a_launch_names_the_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review note 3, replay half: the replay window starts after both terminals'
+    # launch records, and the replay runs before the snapshot that has their
+    # names, so each was first announced with the generic name "terminal".
+    _known_terminals(
+        monkeypatch,
+        "aaaa1111",
+        "bbbb2222",
+        labels={
+            "aaaa1111": {"agent_profile": "supervisor", "provider": "kiro_cli"},
+            "bbbb2222": {"agent_profile": None, "provider": "claude_code"},
+        },
+    )
+    ui_from_b = dict(R.GENERATIVE_UI, id="n3-1", terminal_id="bbbb2222")
+    install(monkeypatch, history=[R.SESSION_LAUNCH, R.HANDOFF, ui_from_b])
+    _, body = _get({"since": SINCE})
+    events = _conformant("review-note3-replay-names", body)
+    started = {e["subagentRunId"]: e for e in events if e["type"] == "SUBAGENT_STARTED"}
+    assert started["terminal:aaaa1111"]["name"] == "supervisor"
+    assert started["terminal:aaaa1111"]["metadata"]["cao"]["provider"] == "kiro_cli"
+    assert started["terminal:bbbb2222"]["name"] == "claude_code"  # no profile: the provider
+
+
+def test_a_label_lookup_failure_keeps_the_generic_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    _known_terminals(monkeypatch, "aaaa1111", "bbbb2222")
+
+    def broken(terminal_id: str) -> Dict[str, str]:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_label", broken)
+    install(monkeypatch, history=[R.SESSION_LAUNCH, R.HANDOFF])
+    _, body = _get({"since": SINCE})
+    events = _conformant("review-note3-label-failure", body)
+    started = {e["subagentRunId"]: e for e in events if e["type"] == "SUBAGENT_STARTED"}
+    assert started["terminal:aaaa1111"]["name"] == "terminal"
 
 
 def test_a_finished_terminal_owns_no_later_event(monkeypatch: pytest.MonkeyPatch) -> None:

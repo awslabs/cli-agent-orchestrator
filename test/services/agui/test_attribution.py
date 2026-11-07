@@ -123,6 +123,21 @@ def test_stamped_session_id_on_the_record_wins() -> None:
     assert next(e for e in events if e["type"] == "SUBAGENT_STARTED")["subagentRunId"] == stamped
 
 
+def test_without_a_label_lookup_a_known_terminal_keeps_the_generic_name() -> None:
+    """``terminal_known`` but no ``terminal_label`` (an embedder such as a trace
+    recorder): the terminal is still announced, under the generic name."""
+    run = ambient_run.AmbientRun(
+        thread_id="t",
+        run_id="r",
+        incarnation_of=lambda name: "inc-1",
+        terminal_known=lambda terminal_id: True,
+    )
+    ui = dict(R.GENERATIVE_UI, id="u-1", terminal_id="deadbeef")
+    events = _events(run, [R.SESSION_LAUNCH, ui])
+    started = {e["subagentRunId"]: e for e in events if e["type"] == "SUBAGENT_STARTED"}
+    assert started["terminal:deadbeef"]["name"] == "terminal"
+
+
 def test_without_a_terminal_lookup_an_unseen_terminal_stays_on_its_session() -> None:
     """No ``terminal_known`` callback: a terminal the run has not seen is never announced.
 
