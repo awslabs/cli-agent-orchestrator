@@ -41,7 +41,11 @@ _REASON_TEXT = {
     ),
 }
 _UNREADABLE = "(last response could not be read)"
-_DONE_STATES = (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+_DONE_STATES = (  # subset-ok: only IDLE/COMPLETED end a turn; ERROR is handled apart
+    TerminalStatus.IDLE,
+    TerminalStatus.COMPLETED,
+)
+_DONE_STATE_VALUES = frozenset(s.value for s in _DONE_STATES)
 
 
 def build_auto_forward_message(
@@ -203,7 +207,7 @@ async def run() -> None:
         try:
             status_value = event["data"]["status"]
             terminal_id = terminal_id_from_topic(event["topic"])
-            if status_value in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
+            if status_value in _DONE_STATE_VALUES:
                 await asyncio.to_thread(evaluate_completion, terminal_id)
             elif status_value == TerminalStatus.ERROR.value:
                 await asyncio.to_thread(handle_worker_ended, terminal_id, "reached ERROR")
