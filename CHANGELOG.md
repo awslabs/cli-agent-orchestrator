@@ -26,8 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (always; the server ignores it while the setting is off), and the `handoff` tool asks
   through its run-step request. Workflows, flows, remote workers and the timeout/error paths
   are unchanged. Terminal bodies gain two additive fields, `kept` and `kept_until`, and session
-  terminal rows gain `kept_until`; they are `false`/`null` unless a terminal is kept, also while
-  the setting is off. `cao session status --workers` shows a `KEPT UNTIL` column only when
+  terminal rows gain `kept_until`; handoff and agent-delete responses can include `keep_note`
+  explaining the keep or eviction outcome. The kept fields are `false`/`null` unless a terminal
+  is kept, also while the setting is off. `cao session status --workers` shows a `KEPT UNTIL` column only when
   something is kept. With the setting off, every path behaves as before, and only those
   additive fields and the ignored flag differ on the wire. See
   `docs/terminal-lifecycle.md`, which also now says retention is 14 days (it said 7), lists

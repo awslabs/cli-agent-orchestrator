@@ -215,7 +215,8 @@ Over the API, the terminal body (`GET /terminals/{id}`, and the body returned wh
 terminal is created) now always has two more fields, `"kept"` and `"kept_until"`, and
 each row of `GET /sessions/{name}/terminals` has `"kept_until"`. They are `false` and
 `null` unless the terminal is kept, including while the setting is off. They are
-additive: a client that ignores unknown fields sees no change.
+additive: a client that ignores unknown fields sees no change. Handoff and agent-delete
+responses can also include `keep_note`, explaining the keep or eviction outcome.
 
 ### The reaper: how kept agents go away
 
@@ -231,12 +232,18 @@ Once a minute, CAO looks at every kept agent:
   exit command, closes the window, and records the end in its launch record
   (`kept_expired`). An ephemeral helper's name is released, and a Kiro helper's
   private home (with its transcripts) is removed only now, at this final teardown.
+- **Status read raises**: CAO retries until one minute after the stored window ends,
+  then tears the child down as it does for readable `unknown`. This bounds a broken
+  status reader even across restarts; it can end work whose status CAO cannot read.
 
 When a session is full, `teardown_oldest` tears down the oldest idle kept agent the
 same way (`kept_evicted`), and the result says which one. If every kept agent in the
 session is still working, the new one is not kept. If the agent chosen for eviction
 starts working at that very moment, CAO leaves it running rather than kill live work;
 it is then **no longer kept, and stays until you delete it**, and the result says so.
+If eviction teardown fails or is deferred, the child is also no longer kept so the cap
+can hold. CAO warns with its terminal ID, and `keep_note` says an operator delete is
+required (`cao agent cancel --delete <id>`); the reaper cannot retry an unmarked child.
 
 **After a server restart**, kept agents and their windows are remembered and the
 reaper carries on. If the server was down when a window ended, the agent is torn down

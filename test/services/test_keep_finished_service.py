@@ -392,7 +392,7 @@ async def test_reaper_leaves_a_child_whose_status_it_cannot_read(keep, monkeypat
         raise RuntimeError("status backend down")
 
     monkeypatch.setattr(keep_service.status_monitor, "get_status", boom)
-    keep.clock[0] = NOW + timedelta(hours=1)
+    keep.clock[0] = NOW + timedelta(minutes=1, seconds=59)
     assert keep_service.reap() == {"unknown": 1}
     assert database.get_terminal_metadata(CHILD) is not None
 
@@ -709,3 +709,98 @@ def test_the_same_invalid_block_warns_again_after_it_was_fixed(keep, caplog, mon
         keep_service.current_settings()
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 2 and all("on_cap" in w for w in warnings)
+
+
+def test_at_cap_probes_never_hold_the_keep_lock(keep, monkeypatch):
+    keep.setting(max_per_session=1)
+    _fill(keep, ["a0000001"])
+    _child("a0000002")
+    held = []
+
+    def probe(tid):
+        held.append(keep_service._keep_lock.locked())
+        return TerminalStatus.IDLE
+
+    monkeypatch.setattr(keep_service.status_monitor, "get_status", probe)
+    outcome = keep_service.keep_finished("a0000002", reason="handoff")
+    assert outcome.kept and outcome.evicted == ("a0000001",)
+    assert held and not any(held)
+
+
+def test_at_cap_rechecks_a_candidate_changed_during_probe(keep, monkeypatch):
+    keep.setting(max_per_session=1)
+    _fill(keep, ["a0000001"])
+    _child("a0000002")
+    original = database.get_kept_terminal("a0000001")
+    reads = []
+
+    def probe(tid):
+        reads.append(tid)
+        if len(reads) == 1:
+            database.extend_kept_until(tid, NOW + timedelta(hours=2))
+            return TerminalStatus.IDLE
+        return TerminalStatus.PROCESSING
+
+    monkeypatch.setattr(keep_service.status_monitor, "get_status", probe)
+    outcome = keep_service.keep_finished("a0000002", reason="handoff")
+    assert not outcome.kept
+    assert database.get_kept_terminal("a0000001")["kept_until"] > original["kept_until"]
+    assert keep.calls == []
+
+
+@pytest.mark.parametrize("offset,expected", [(59, {"unknown": 1}), (60, {"expired": 1})])
+def test_unreadable_status_has_one_minute_expiry_grace(keep, monkeypatch, offset, expected):
+    keep.setting(idle_window_minutes=1)
+    _fill(keep, ["a0000001"])
+
+    def unreadable(tid):
+        raise RuntimeError("unreadable")
+
+    monkeypatch.setattr(keep_service.status_monitor, "get_status", unreadable)
+    keep.clock[0] = NOW + timedelta(minutes=1, seconds=offset)
+    assert keep_service.reap() == expected
+    assert (database.get_terminal_metadata("a0000001") is None) == (offset == 60)
+
+
+def test_reaper_counts_a_row_that_disappears_during_snapshot_as_gone(keep, monkeypatch):
+    keep.setting(idle_window_minutes=1)
+    _fill(keep, ["a0000001"])
+    keep.clock[0] = NOW + timedelta(minutes=2)
+
+    def vanished(tid):
+        database.delete_terminal(tid, end_reason="deleted")
+        return None
+
+    monkeypatch.setattr(terminal_service, "capture_terminal_snapshot", vanished)
+    assert keep_service.reap() == {"gone": 1}
+    assert database.get_kept_terminal("a0000001") is None
+
+
+def test_failed_eviction_is_logged_for_operator_cleanup(keep, monkeypatch, caplog):
+    keep.setting(max_per_session=1)
+    _fill(keep, ["a0000001"])
+    _child("a0000002")
+    monkeypatch.setattr(terminal_service, "dismantle_terminal_runtime", lambda *a, **k: False)
+    outcome = keep_service.keep_finished("a0000002", reason="handoff")
+    assert outcome.kept
+    assert "a0000001 is no longer kept; operator delete is required" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "flag", ["deferred_init_external_owner", "deferred_init_runtime_reclaimed"]
+)
+def test_each_deferred_runtime_tombstone_prevents_keep(keep, flag):
+    _child("a0000001")
+    metadata = dict(database.get_terminal_metadata("a0000001"))
+    metadata[flag] = True
+    assert not keep_service._runtime_is_live(metadata)
+    keep.backend.cleanup_terminal_exact.assert_not_called()
+
+
+def test_readable_unknown_is_reaped_at_expiry(keep):
+    keep.setting(idle_window_minutes=1)
+    _fill(keep, ["a0000001"])
+    keep.statuses["a0000001"] = TerminalStatus.UNKNOWN
+    keep.clock[0] = NOW + timedelta(minutes=1)
+    assert keep_service.reap() == {"expired": 1}
+    assert database.get_terminal_metadata("a0000001") is None

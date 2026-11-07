@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 # minute's granularity is the same order as the setting itself.
 REAPER_INTERVAL_SECONDS = 60
 
+# Bound unreadable status without process-local retry state (also survives restart).
+UNREADABLE_GRACE_SECONDS = 60
+
 # A child in either state is working, or waiting on a person, and is never reaped
 # or evicted. Read raw from status_monitor, like flow_service._is_terminal_busy.
 BUSY_STATUSES = frozenset({TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER})
@@ -78,6 +81,8 @@ NOT_APPLICABLE = KeepOutcome(kept=False)
 
 
 # The last invalid-block message logged, so a typo warns once, not once a minute.
+# Best-effort diagnostic deduplication across request/reaper threads: a race may
+# duplicate or suppress a warning, but never affects settings validation or keeping.
 _last_invalid_setting: Optional[str] = None
 
 
@@ -210,45 +215,55 @@ def keep_finished(
 
     session_name = str(metadata["tmux_session"])
     cap = settings.max_per_session
-    with _keep_lock:
-        existing = database.get_kept_terminal(terminal_id)
-        if existing is not None:
-            if existing["kept_until"] > database._utcnow():
-                return KeepOutcome(kept=True, kept_until=existing["kept_until"], note=KEPT_NOTE)
-            # Its window has ended and the reaper simply hasn't run yet: drop the
-            # mark and let the caller tear it down, rather than report a past time.
-            database.unmark_terminal_kept(terminal_id)
-            return KeepOutcome(kept=False, note="Not kept: its keep window had ended.")
-        kept = [
-            row
-            for row in database.list_kept_terminals(session_name)
-            if row["terminal_id"] != terminal_id
-        ]
-        evict: List[str] = []
-        if len(kept) >= cap:
-            if settings.on_cap == "dont_keep":
-                return KeepOutcome(kept=False, note=_cap_note(len(kept), cap, "dont_keep"))
-            needed = len(kept) - cap + 1
-            idle = [row["terminal_id"] for row in kept if _is_idle(row["terminal_id"])]
-            if len(idle) < needed:
-                return KeepOutcome(
-                    kept=False,
-                    note=(
-                        f"Not kept: this session already keeps {len(kept)} finished agents "
-                        f"({KEEP_FINISHED_SETTING}.max_per_session={cap}) and none of them "
-                        "is idle."
-                    ),
+    candidates: Optional[List[Dict[str, Any]]] = None
+    idle: List[str] = []
+    while True:
+        with _keep_lock:
+            existing = database.get_kept_terminal(terminal_id)
+            if existing is not None:
+                if existing["kept_until"] > database._utcnow():
+                    return KeepOutcome(kept=True, kept_until=existing["kept_until"], note=KEPT_NOTE)
+                database.unmark_terminal_kept(terminal_id)
+                return KeepOutcome(kept=False, note="Not kept: its keep window had ended.")
+            kept = [
+                row
+                for row in database.list_kept_terminals(session_name)
+                if row["terminal_id"] != terminal_id
+            ]
+            evict: List[str] = []
+            needs_probe = False
+            if len(kept) >= cap:
+                if settings.on_cap == "dont_keep":
+                    return KeepOutcome(kept=False, note=_cap_note(len(kept), cap, "dont_keep"))
+                if candidates != kept:
+                    # Snapshot membership AND windows. A removed/re-marked or extended
+                    # victim invalidates the probes, as does a concurrent new keep.
+                    candidates = kept
+                    needs_probe = True
+                else:
+                    needed = len(kept) - cap + 1
+                    if len(idle) < needed:
+                        return KeepOutcome(
+                            kept=False,
+                            note=(
+                                f"Not kept: this session already keeps {len(kept)} finished agents "
+                                f"({KEEP_FINISHED_SETTING}.max_per_session={cap}) and none of them "
+                                "is idle."
+                            ),
+                        )
+                    evict = idle[:needed]
+            if not needs_probe:
+                kept_until = database._utcnow() + timedelta(minutes=settings.idle_window_minutes)
+                mark = database.mark_terminal_kept(
+                    terminal_id, session_name, kept_until=kept_until, reason=reason, evict=evict
                 )
-            evict = idle[:needed]
-        kept_until = database._utcnow() + timedelta(minutes=settings.idle_window_minutes)
-        mark = database.mark_terminal_kept(
-            terminal_id, session_name, kept_until=kept_until, reason=reason, evict=evict
-        )
-        if mark is None:
-            return NOT_APPLICABLE
-        if not mark.written:
-            # Marked by someone else after the check above: report that mark, evict nothing.
-            return KeepOutcome(kept=True, kept_until=mark.kept_until, note=KEPT_NOTE)
+                if mark is None:
+                    return NOT_APPLICABLE
+                if not mark.written:
+                    return KeepOutcome(kept=True, kept_until=mark.kept_until, note=KEPT_NOTE)
+                break
+        # Status reads can fork tmux; never hold the process-global decision lock.
+        idle = [row["terminal_id"] for row in kept if _is_idle(row["terminal_id"])]
 
     # Only the marks the database really removed are torn down.
     note = KEPT_NOTE
@@ -281,7 +296,10 @@ def _eviction_sentence(terminal_id: str, outcome: str, cap: int) -> str:
         return f"{lead} and was torn down."
     if outcome == "working":
         return f"{lead}; it started working again, so it was left running."
-    return f"{lead}, but its teardown did not complete, so it was not torn down."
+    return (
+        f"{lead}, but its teardown did not complete, so it was not torn down; "
+        "an operator delete is required."
+    )
 
 
 def _evict(terminal_id: str, registry: Optional[PluginRegistry]) -> str:
@@ -302,6 +320,7 @@ def _evict(terminal_id: str, registry: Optional[PluginRegistry]) -> str:
             return "torn_down"
     except Exception as exc:  # noqa: BLE001 — an eviction must not fail the new keep
         logger.warning("keep: failed to tear down evicted terminal %s: %s", terminal_id, exc)
+    logger.warning("keep: terminal %s is no longer kept; operator delete is required", terminal_id)
     return "not_torn_down"
 
 
@@ -329,7 +348,7 @@ def teardown_kept(
     except Exception as exc:  # noqa: BLE001 — graceful exit is best-effort, as in handoff
         logger.warning("keep: failed to send the exit command to %s: %s", terminal_id, exc)
     if not terminal_service.dismantle_terminal_runtime(terminal_id, metadata):
-        logger.warning("keep: teardown of %s deferred; retrying on the next pass", terminal_id)
+        logger.warning("keep: teardown of %s deferred", terminal_id)
         return False
     return terminal_service.delete_terminal_row(
         terminal_id, metadata, registry=registry, end_reason=end_reason
@@ -342,7 +361,8 @@ def reap(registry: Optional[PluginRegistry] = None) -> Dict[str, int]:
     Runs whatever the setting says now, so turning it off never strands a kept child:
     those still expire on schedule. Per child: busy -> its window starts again from
     now; idle and past its window -> torn down (``kept_expired``); status unreadable
-    -> left for the next pass. Then, while the setting is on, a session holding more
+    -> retried until one minute past expiry, then torn down like readable UNKNOWN.
+    Then, while the setting is on, a session holding more
     than ``max_per_session`` (the operator lowered it) loses its oldest idle ones.
     """
     counts: Counter[str] = Counter()
@@ -358,7 +378,9 @@ def reap(registry: Optional[PluginRegistry] = None) -> Dict[str, int]:
             terminal_id = row["terminal_id"]
             try:
                 status = _status(terminal_id)
-                if status is None:
+                if status is None and now < row["kept_until"] + timedelta(
+                    seconds=UNREADABLE_GRACE_SECONDS
+                ):
                     counts["unknown"] += 1
                 elif status in BUSY_STATUSES:
                     database.extend_kept_until(terminal_id, now + window)
@@ -366,6 +388,8 @@ def reap(registry: Optional[PluginRegistry] = None) -> Dict[str, int]:
                 elif row["kept_until"] <= now:
                     if teardown_kept(terminal_id, end_reason="kept_expired", registry=registry):
                         counts["expired"] += 1
+                    elif database.get_terminal_metadata(terminal_id) is None:
+                        counts["gone"] += 1
                     else:
                         counts["deferred"] += 1
             except Exception as exc:  # noqa: BLE001 — one child must not stop the pass
