@@ -314,7 +314,11 @@ def test_meta(source):
         )
     else:
         assert recorded == installed
-    assert len(meta["cao_build"]) == 40
+    if source == "offline":
+        # An offline capture names no build, so tier 1 needs no git checkout.
+        assert meta["cao_build"] is None and meta["cao_build_dirty"] is None
+    else:
+        assert len(meta["cao_build"]) == 40
     if source == "published":
         assert meta["mode"] == "live" and meta["provider"] == "claude_code"
         assert "shape_sha256" in meta

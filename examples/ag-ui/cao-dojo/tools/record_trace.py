@@ -343,12 +343,25 @@ def _git(*args: str) -> str:
     ).stdout.strip()
 
 
+def _in_git_work_tree() -> bool:
+    """Whether REPO_ROOT is a git checkout (not, say, a `git archive` export)."""
+    try:
+        return _git("rev-parse", "--is-inside-work-tree") == "true"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def build_meta(mode: str, provider: str, provider_version: str) -> Dict[str, Any]:
+    # An offline capture comes from CAO's producers in-process, not from a recorded
+    # build, so it names none and runs no git: tier 1 then works in a tree that is
+    # not a git checkout. A server capture names the build when it can. The shape
+    # file and the debt check never read these two keys (META_SHAPE_EXCLUDED).
+    named = mode != "offline" and _in_git_work_tree()
     return {
         "schema": SCHEMA,
         "cao_version": importlib.metadata.version("cli-agent-orchestrator"),
-        "cao_build": _git("rev-parse", "HEAD"),
-        "cao_build_dirty": bool(_git("status", "--porcelain")),
+        "cao_build": _git("rev-parse", "HEAD") if named else None,
+        "cao_build_dirty": bool(_git("status", "--porcelain")) if named else None,
         "ag_ui_protocol": importlib.metadata.version("ag-ui-protocol"),
         "protocol_version": "1.0",
         "mode": mode,
@@ -987,6 +1000,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if mode != "offline":
             require_editable_checkout()
+        if args.out and not _in_git_work_tree():
+            raise RecorderError(
+                "--out writes the published trace, which must name the build it was "
+                "recorded from (`_meta.cao_build`); run it in a git checkout"
+            )
         if args.out and not args.allow_dirty and _git("status", "--porcelain"):
             raise RecorderError(
                 "the checkout is dirty; commit first, or pass --allow-dirty to record "

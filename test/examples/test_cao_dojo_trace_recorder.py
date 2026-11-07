@@ -743,6 +743,26 @@ def test_offline_check_reports_drift_against_a_changed_shape(tmp_path, capsys):
     assert "--mock --write-shape" in err and "make record-agui-trace" in err
 
 
+def test_an_offline_capture_runs_no_git(monkeypatch):
+    """Tier 1 must work in a tree that is not a git checkout (a `git archive` export)."""
+
+    def no_git(*args: str) -> str:
+        raise AssertionError(f"git {' '.join(args)} was run for an offline capture")
+
+    monkeypatch.setattr(record_trace, "_git", no_git)
+    meta = record_trace.build_meta("offline", "mock_cli", "offline")
+    assert meta["cao_build"] is None and meta["cao_build_dirty"] is None
+
+
+def test_a_server_capture_outside_a_git_checkout_names_no_build(monkeypatch):
+    def not_a_checkout(*args: str) -> str:
+        raise subprocess.CalledProcessError(128, ["git", *args])
+
+    monkeypatch.setattr(record_trace, "_git", not_a_checkout)
+    meta = record_trace.build_meta("mock", "mock_cli", "mock")
+    assert meta["cao_build"] is None and meta["cao_build_dirty"] is None
+
+
 def test_offline_write_shape_writes_the_projection_to_the_given_path(tmp_path):
     shape = tmp_path / "shape.json"
     assert record_trace.main(["--offline", "--write-shape", "--shape", str(shape)]) == 0
