@@ -78,6 +78,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |
 | **AG-UI construct demos (shift-left recordings)** | same pattern for the L2 construct library | **Yes** |
 | **AG-UI stock-client live (AC3)** | drives a real third-party AG-UI client against the surface | **Yes** |
+| **AG-UI operator dashboard** | `examples/ag-ui/ag-ui-operator-dashboard`: installs tmux, then `npm ci`, `test:dependencies`, `tsc`, vitest with a 100% coverage floor on `core/`, `vite build`, and a keyless e2e against a private cao-server with `mock_cli` terminals | **Yes** |
 | **Agent Plugins dog-food (shift-left recording)** | records the plugin pipeline from `examples/agent-plugins/agent-plugins-dogfood/tools` and gates on drift | **Yes** |
 | **CAO MCP Apps** | MCP Apps build + backend coverage ratchet floor | **Yes** |
 | **CAO MCP Apps E2E (Playwright)** | browser E2E over the `ui://cao/*` views | **Yes** |
