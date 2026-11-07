@@ -12,10 +12,11 @@ produce a green recording. See the ["Verified by
 dog-fooding"](../../../docs/agent-plugins.md#verified-by-dog-fooding) section of
 the Agent Plugins guide for the embedded GIF.
 
-> `cao plugin` is **hidden** from `cao --help` pending maintainer decision M1
-> (Requirement 16.5) — it is reachable and fully usable, just deliberately
-> unadvertised. The recording narrates this so a hidden command does not look
-> broken. It does **not** open any ship gate.
+> `cao plugin` is hidden from `cao --help` and refuses to run unless
+> `CAO_AGENT_PLUGINS_ENABLED` is set, pending graduation (#1244); the verb is
+> decision M1, recorded by the issue author in #573. `run.sh` sets the variable
+> for its own scratch environment only, and the recording narrates this so a
+> hidden command does not look broken. It does **not** change the default.
 
 ## What each step asserts
 
