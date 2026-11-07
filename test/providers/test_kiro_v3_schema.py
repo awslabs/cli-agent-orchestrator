@@ -2,9 +2,10 @@
 
 Each allow-listed kiro-cli version maps to one pinned engine schema, CAO's
 reading of that engine's agent-file keys, rules, capabilities and tool tags.
-Any other version refuses v3. The 0.66.70 entry is frozen here as the Phase 1
-design records it; 2.36.0, 2.37.0 and 3.0.0 ship the same engine and are pending
-operator verification. Provisional (#1167).
+Any other version refuses v3. The six allow-list rows span two engines:
+2.35.1, 2.36.0, 2.37.0, 2.37.1 and 3.0.0 ship 0.66.70; 3.1.0 ships 0.66.91.
+Only 2.35.1 is operator-verified; the other five rows are pending operator
+verification. Provisional (#1167).
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from cli_agent_orchestrator.providers.kiro_v3_schema import (
 )
 
 
-def test_the_allow_list_pins_2_35_1_and_marks_every_other_row_pending():
+def test_the_allow_list_pins_six_versions_and_marks_0_66_70_updates_pending():
     assert set(SUPPORTED_KIRO_CLI_VERSIONS) == {
         "2.35.1",
         "2.36.0",
@@ -40,7 +41,7 @@ def test_the_allow_list_pins_2_35_1_and_marks_every_other_row_pending():
         assert "cannot widen" in entry.basis
         # The same object, unchanged: a pending entry can't widen the render.
         assert entry.schema is KAS_0_66_70
-    for version in ("2.35.1", "2.36.0", "2.37.0", "3.0.0"):
+    for version in ("2.35.1", "2.36.0", "2.37.0", "2.37.1", "3.0.0"):
         assert kiro_v3_schema_for_cli_version(version) is KAS_0_66_70
     assert tuple(s.engine for s in pinned_kiro_v3_schemas()) == ("kas-0.66.70", "kas-0.66.91")
     for version in (None, "", "2.35", "2.35.1 ", "v2.35.1", "3.0", "3", "v3.0.0", "3.0.0 "):

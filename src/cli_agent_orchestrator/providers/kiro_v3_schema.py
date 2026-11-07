@@ -203,12 +203,9 @@ KAS_0_66_70 = KiroV3EngineSchema(
 # PENDING OPERATOR VERIFICATION. Derived statically, never run (#1167).
 # A static comparison of the 0.66.70 and 0.66.91 engines found equal CAO tags
 # and render-facing fields. This inventory is not read by CAO's select().
-# On both engines, the shell tag still carries control_bash_process,
-# list_processes and get_process_output whenever execute_bash is granted.
+# See unmodelled_tools below for the process-tool tags and capabilities.
 # The 0.66.70 inventory is not recorded here.
-# Non-data changes: ris rejects unrecorded session consent; switchMode changes
-# skill bookkeeping; memory-sync org refresh adds an MCP reconcile trigger
-# (default off). c2s_render_architecture and subagent_response were removed;
+# c2s_render_architecture and subagent_response were removed;
 # the XDG_CACHE_HOME c2s store is unchanged.
 # Windows execute_pwsh/control_pwsh_process remain shell-capability variants.
 # MCP disclosure tool_load/tool_call/load_resource retain read, @builtin and
