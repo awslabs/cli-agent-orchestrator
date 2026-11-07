@@ -10,9 +10,12 @@ Two layers:
 
 * The accounting itself (``known-gaps.mjs``) needs only ``node``.
 * The end-to-end cases run ``verify-trace.mjs`` on real trace files, which needs
-  the pinned ``@ag-ui/client`` (``npm ci`` in ``ag-ui-stock-client-live``); they
-  skip without it, except where ``CAO_DOJO_REQUIRE_NODE_LANE=1`` (CI's AC3 job)
-  turns a missing dependency into a failure rather than a silent skip.
+  the pinned ``@ag-ui/client`` (``npm ci`` in ``ag-ui-stock-client-live``) and the
+  published trace; they skip without them.
+
+Every test here is ``must_run("agui-node")``: in CI's AC3 job, which sets
+``CAO_MUST_RUN: agui-node``, any of those skips fails the session instead of
+passing silently (``test/_must_run.py``).
 """
 
 from __future__ import annotations
@@ -33,26 +36,19 @@ KNOWN_GAPS_MJS = NODE_DIR / "known-gaps.mjs"
 VERIFY_TRACE = NODE_DIR / "verify-trace.mjs"
 NODE = shutil.which("node")
 
-REQUIRED = os.environ.get("CAO_DOJO_REQUIRE_NODE_LANE") == "1"
 HAS_AG_UI_CLIENT = (NODE_DIR / "node_modules" / "@ag-ui" / "client").is_dir()
 
-needs_node = pytest.mark.skipif(NODE is None and not REQUIRED, reason="needs node")
+pytestmark = pytest.mark.must_run("agui-node")
+
+needs_node = pytest.mark.skipif(NODE is None, reason="needs node")
 needs_ag_ui_client = pytest.mark.skipif(
-    (NODE is None or not HAS_AG_UI_CLIENT) and not REQUIRED,
+    NODE is None or not HAS_AG_UI_CLIENT,
     reason="needs node and `npm ci` in examples/ag-ui/ag-ui-stock-client-live",
 )
 
-
-def test_the_node_lane_dependencies_are_present_where_required():
-    """In AC3 a missing node or @ag-ui/client fails here instead of skipping the lane."""
-    if not REQUIRED:
-        pytest.skip("CAO_DOJO_REQUIRE_NODE_LANE is not set")
-    assert NODE is not None, "node is not on PATH"
-    assert HAS_AG_UI_CLIENT, "run `npm ci` in examples/ag-ui/ag-ui-stock-client-live first"
-
-
 PROBE_GAP = {"G-probe": {"RUN_FINISHED": ["caoProbe"]}}
 PROBE_WARNING = "[ag-ui][enforce] Removed unrecognised material at '/caoProbe' on RUN_FINISHED."
+OTHER_WARNING = "[ag-ui][enforce] Removed unrecognised material at '/caoOther' on RUN_FINISHED."
 
 
 # --- The accounting (node only) ------------------------------------------------
@@ -95,6 +91,13 @@ def test_an_unlisted_warning_is_returned_for_its_own_trace():
     assert out == {"unlisted": [[], [PROBE_WARNING]], "unobserved": []}
 
 
+@needs_node
+def test_an_unlisted_warning_is_returned_next_to_an_observed_listed_gap():
+    """Observing a listed gap must not hide an unlisted warning, in that trace or another."""
+    out = _ledger(PROBE_GAP, [[PROBE_WARNING, OTHER_WARNING], [OTHER_WARNING]])
+    assert out == {"unlisted": [[OTHER_WARNING], [OTHER_WARNING]], "unobserved": []}
+
+
 # --- verify-trace.mjs end to end (node and @ag-ui/client) ------------------------
 
 
@@ -120,7 +123,9 @@ def _verify(tmp_path: Path, gaps: Dict[str, Any], *traces: Path) -> subprocess.C
     gaps_file.write_text(json.dumps(gaps), encoding="utf-8")
     return subprocess.run(
         [str(NODE), str(VERIFY_TRACE), *map(str, traces)],
-        env={"PATH": str(Path(str(NODE)).parent), "CAO_DOJO_KNOWN_GAPS": str(gaps_file)},
+        # The caller's environment, so a script-shim `node` (nodenv, asdf) still finds
+        # its interpreter; the suite's conftest already isolates HOME.
+        env={**os.environ, "CAO_DOJO_KNOWN_GAPS": str(gaps_file)},
         capture_output=True,
         text=True,
         timeout=120,
@@ -146,25 +151,25 @@ def _ordered(gap_file: Path, other: Path, gap_file_first: bool) -> List[Path]:
     return [gap_file, other] if gap_file_first else [other, gap_file]
 
 
-@needs_ag_ui_client
-@BOTH_ORDERS
-def test_a_gap_in_the_fresh_recording_only_passes(tmp_path, published, gap_file_first):
-    """A keyless change adds a listed key; the stale published trace lacks it."""
-    fresh = _with_probe(published, tmp_path / "fresh.ndjson")
-    result = _verify(tmp_path, PROBE_GAP, *_ordered(fresh, published, gap_file_first))
-    assert result.returncode == 0, result.stdout
-    assert "[verify-trace] PASS" in result.stdout
+def _why(result: subprocess.CompletedProcess) -> str:
+    return f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
 
 @needs_ag_ui_client
 @BOTH_ORDERS
-def test_a_gap_in_the_stale_published_trace_only_passes_while_its_entry_is_kept(
-    tmp_path, published, gap_file_first
-):
-    """The reverse: a keyless change removes the key, the published trace still has it."""
-    stale = _with_probe(published, tmp_path / "stale-published.ndjson")
-    result = _verify(tmp_path, PROBE_GAP, *_ordered(stale, published, gap_file_first))
-    assert result.returncode == 0, result.stdout
+def test_a_gap_in_only_one_of_two_traces_passes(tmp_path, published, gap_file_first):
+    """A listed gap that one trace carries and the other lacks passes, in either order.
+
+    This is both scenarios the union exists for: a keyless change adds a listed key,
+    so the fresh recording has it and the stale published trace does not; or a
+    keyless change removes one, so only the stale published trace still has it.
+    ``verify-trace.mjs`` does not know which file is which, so at this level the
+    two are the same input, and the file order is what varies.
+    """
+    with_gap = _with_probe(published, tmp_path / "with-gap.ndjson")
+    result = _verify(tmp_path, PROBE_GAP, *_ordered(with_gap, published, gap_file_first))
+    assert result.returncode == 0, _why(result)
+    assert "[verify-trace] PASS" in result.stdout, _why(result)
 
 
 @needs_ag_ui_client
@@ -172,13 +177,13 @@ def test_dropping_the_entry_before_the_re_record_fails_on_the_published_trace(tm
     """Why the entry stays until the re-record: the stale trace still carries the key."""
     stale = _with_probe(published, tmp_path / "stale-published.ndjson")
     result = _verify(tmp_path, {}, published, stale)
-    assert result.returncode == 1
-    assert PROBE_WARNING in result.stdout
+    assert result.returncode == 1, _why(result)
+    assert PROBE_WARNING in result.stdout, _why(result)
 
 
 @needs_ag_ui_client
 def test_a_gap_observed_in_no_trace_fails(tmp_path, published):
     fresh = Path(shutil.copy(published, tmp_path / "fresh.ndjson"))
     result = _verify(tmp_path, PROBE_GAP, fresh, published)
-    assert result.returncode == 1
-    assert "KNOWN_GAPS G-probe not observed in any trace" in result.stdout
+    assert result.returncode == 1, _why(result)
+    assert "KNOWN_GAPS G-probe not observed in any trace" in result.stdout, _why(result)
