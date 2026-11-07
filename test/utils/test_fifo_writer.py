@@ -137,6 +137,84 @@ class TestCopy:
             os.close(dst_fd)
 
 
+class TestWaitingForAReader:
+    """The writer waits for a reader without blocking in ``open()``, and its pane ends the wait.
+
+    A blocking ``open()`` of a FIFO with no reader never returns and never reads
+    stdin, so a writer started while its reader was not attached outlived its
+    pane and its tmux server as an orphan.
+    """
+
+    def test_stdin_closing_before_any_reader_ends_the_writer(self, tmp_path):
+        import time
+
+        fifo = tmp_path / "t.fifo"
+        os.mkfifo(fifo, 0o600)
+        src_r, src_w = os.pipe()
+        os.write(src_w, b"output nobody will read")
+        os.close(src_w)  # the pane is gone
+        try:
+            start = time.monotonic()
+            assert fifo_writer.run(str(fifo), src_fd=src_r) == 0
+            assert time.monotonic() - start < 2.0
+        finally:
+            os.close(src_r)
+        assert stat.S_ISFIFO(os.stat(fifo).st_mode)
+
+    def test_a_late_reader_still_gets_output_written_before_it_attached(self, tmp_path):
+        fifo = tmp_path / "t.fifo"
+        os.mkfifo(fifo, 0o600)
+        src_r, src_w = os.pipe()
+        os.write(src_w, b"early ")
+        got = []
+        writer = threading.Thread(
+            target=lambda: got.append(fifo_writer.run(str(fifo), src_fd=src_r)), daemon=True
+        )
+        writer.start()
+        try:
+            writer.join(timeout=0.3)
+            assert writer.is_alive(), "the writer gave up before a reader attached"
+            read_fd = _reader(fifo)
+            try:
+                os.write(src_w, b"late")
+                os.close(src_w)
+                out = _drain(read_fd, len(b"early late"))
+                writer.join(timeout=5.0)
+            finally:
+                os.close(read_fd)
+        finally:
+            os.close(src_r)
+        assert got == [0]
+        assert out == b"early late"
+
+    def test_the_opened_fd_is_blocking(self, tmp_path):
+        fifo = tmp_path / "t.fifo"
+        os.mkfifo(fifo, 0o600)
+        read_fd = _reader(fifo)
+        try:
+            dst_fd = fifo_writer.open_fifo_for_writing(str(fifo))
+            try:
+                assert os.get_blocking(dst_fd)
+            finally:
+                os.close(dst_fd)
+        finally:
+            os.close(read_fd)
+
+    def test_without_src_fd_the_open_waits_for_a_late_reader(self, tmp_path):
+        fifo = tmp_path / "t.fifo"
+        os.mkfifo(fifo, 0o600)
+        read_fds = []
+        late = threading.Timer(0.2, lambda: read_fds.append(_reader(fifo)))
+        late.start()
+        try:
+            dst_fd = fifo_writer.open_fifo_for_writing(str(fifo))
+            os.close(dst_fd)
+        finally:
+            late.join()
+            for fd in read_fds:
+                os.close(fd)
+
+
 class TestAsPipePaneRunsIt:
     """The exact invocation ``TmuxClient._pipe_pane_command`` builds."""
 
@@ -164,6 +242,51 @@ class TestAsPipePaneRunsIt:
         assert proc.returncode == 0, err
         assert out == b"hello from the pane\n"
 
+    def test_subprocess_with_no_reader_exits_when_its_pane_closes_stdin(self, tmp_path):
+        """The orphan this guards against: a writer stuck in open() after its pane is gone."""
+        fifo = tmp_path / "t.fifo"
+        os.mkfifo(fifo, 0o600)
+        proc = self._spawn(fifo)
+        try:
+            _, err = proc.communicate(b"pane output with no reader\n", timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        assert proc.returncode == 0, err
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+    def test_subprocess_waiting_with_unread_stdin_does_not_spin(self, tmp_path):
+        """Pane output waiting in stdin, stdin still open, no reader: the wait must sleep.
+
+        Readable data could make a hang-up poll return at once on a platform that
+        reports readable data to it, so a wait built on that poll alone would retry
+        the open in a busy loop for as long as the pane lives.
+        """
+        import resource
+        import time
+
+        fifo = tmp_path / "t.fifo"
+        os.mkfifo(fifo, 0o600)
+        proc = self._spawn(fifo)
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        try:
+            proc.stdin.write(b"pane output nobody is reading yet\n")
+            proc.stdin.flush()
+            time.sleep(2.0)
+            assert proc.poll() is None, "the writer must keep waiting while stdin is open"
+            proc.stdin.close()
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+        print(f"writer CPU over a 2 s wait with unread stdin: {cpu:.3f} s")
+        assert proc.returncode == 0
+        assert cpu < 0.2, f"the writer used {cpu:.3f} s of CPU in a 2 s wait"
+
     def test_subprocess_refuses_a_swapped_symlink(self, tmp_path):
         victim = tmp_path / "victim.log"
         victim.write_bytes(b"")
@@ -174,6 +297,27 @@ class TestAsPipePaneRunsIt:
         assert proc.returncode == 1
         assert b"fifo_writer" in err
         assert victim.read_bytes() == b""
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="AF_UNIX sockets")
+    def test_subprocess_refuses_a_socket_at_the_path(self):
+        """A socket is refused, never waited on as if it were a FIFO with no reader."""
+        import shutil
+        import socket
+        import tempfile
+
+        # Short directory: tmp_path can exceed the 104-byte AF_UNIX path limit on macOS.
+        short_dir = tempfile.mkdtemp(prefix="cao-fw-", dir="/tmp")
+        path = os.path.join(short_dir, "t.fifo")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(path)
+            proc = self._spawn(path)
+            _, err = proc.communicate(b"output for a socket\n", timeout=10)
+        finally:
+            sock.close()
+            shutil.rmtree(short_dir, ignore_errors=True)
+        assert proc.returncode == 1, err
+        assert b"fifo_writer" in err
 
     def test_module_has_no_project_imports(self):
         """Started by file path on every pipe re-arm: it must not pull the package in."""

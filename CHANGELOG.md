@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3.1.0 has captured-help probe coverage; 2.37.1 has schema and launch coverage
   only because no help capture is available.
 
+- **A pipe-pane writer no longer outlives its pane when no reader is attached.**
+  `utils/fifo_writer.py` opened the FIFO with a blocking `open()`, which never returns while
+  nothing has the read end open and never reads stdin meanwhile. A writer started while its
+  reader thread had not opened yet, or had exited on an error, therefore survived its pane and
+  its tmux server as an orphan. The open is now non-blocking and retried, and while it waits the
+  writer exits as soon as tmux closes its stdin. Output written before a late reader attaches is
+  still delivered.
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different
   request already claimed gets its own slot. On `POST /sessions` and
