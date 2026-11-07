@@ -9,10 +9,11 @@ No file locking is applied; concurrent ``cao install --provider opencode_cli``
 invocations are not a supported scenario.
 """
 
+import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Set
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
@@ -37,6 +38,13 @@ _SCHEMA = "https://opencode.ai/config.json"
 #: server the *profile* declares — ``cao-mcp-server*`` above all — whose ``mcp``
 #: entry never resolves inside the store and so can never be proven CAO's from
 #: the config bytes alone.
+#:
+#: The same sidecar records ``mcp`` entry ownership (#1154), under a top-level
+#: ``"mcp"`` map of ``{"<server>": "sha256:<hex>"}``: one fingerprint of each
+#: plugin-derived entry CAO wrote. A grant key is a bare name, so the name is the
+#: record; an ``mcp`` entry has content, so the record is a digest of the content,
+#: which also notices a user rewriting an entry CAO once wrote. The key is
+#: additive, so a ``version`` 1 reader that knows only ``agents`` keeps it intact.
 GRANT_RECORD_FILENAME = "cao-grants.json"
 
 _EMPTY_GRANT_RECORD: Dict[str, Any] = {"version": 1, "agents": {}}
@@ -314,6 +322,91 @@ def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
     _write_grant_record(record)
 
 
+def mcp_entry_fingerprint(config: Mapping[str, Any]) -> str:
+    """A stable digest of an OpenCode ``mcp`` entry, ignoring ``enabled``.
+
+    ``enabled`` is left out because CAO itself flips it on removal
+    (:func:`disable_mcp_server`) and back on reinstall; an entry CAO disabled is
+    still the entry CAO wrote. Everything else, ``command``, ``environment`` and
+    ``cwd`` included, is part of the digest, so any other edit breaks the match.
+    """
+    material = {key: value for key, value in config.items() if key != "enabled"}
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _recorded_mcp_entries() -> Dict[str, str]:
+    """The ``mcp`` fingerprints the sidecar holds, ignoring malformed rows."""
+    recorded = read_grant_record().get("mcp")
+    if not isinstance(recorded, dict):
+        return {}
+    return {
+        name: digest
+        for name, digest in recorded.items()
+        if isinstance(name, str) and isinstance(digest, str)
+    }
+
+
+class GrantRecordUnreadableError(ValueError):
+    """The grant sidecar exists but cannot be parsed as a grant record."""
+
+
+def _load_grant_record_or_raise() -> Dict[str, Any]:
+    """Load the sidecar for a write: absent is empty, unreadable raises (GH #737).
+
+    :func:`read_grant_record` degrades a corrupt sidecar to an empty record,
+    which is right for a reader. A writer must not do that, because publishing
+    the empty default would drop every row the damaged file still holds.
+    """
+    path = _grant_record_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return dict(_EMPTY_GRANT_RECORD, agents={})
+    try:
+        loaded = json.loads(raw)
+    except ValueError as exc:
+        raise GrantRecordUnreadableError(f"{path}: {exc}") from exc
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("agents"), dict):
+        raise GrantRecordUnreadableError(f"{path}: unexpected shape")
+    return loaded
+
+
+def record_mcp_entry(name: str, config: Mapping[str, Any]) -> None:
+    """Record that CAO wrote *config* as ``mcp.<name>``, writing only on change.
+
+    Called for plugin-derived servers only. Those are delivered to every
+    CAO-managed agent, which is what lets a recorded entry that has dropped out
+    of an agent's desired set be disabled as withdrawn. A profile-declared
+    server is one agent's, so recording it would let a second agent's install
+    disable a server the first still uses.
+
+    Fails closed: a sidecar that is present but unreadable is left as it is and
+    this entry goes unrecorded, so CAO falls back to the containment proof for
+    it. An install is never failed for this.
+    """
+    digest = mcp_entry_fingerprint(config)
+    try:
+        record = _load_grant_record_or_raise()
+        entries = record.get("mcp")
+        if not isinstance(entries, dict):
+            entries = {}
+        if entries.get(name) == digest:
+            return
+        entries[name] = digest
+        record["mcp"] = entries
+        record["version"] = 1
+        _write_grant_record(record)
+    except GrantRecordUnreadableError as exc:
+        logger.warning("opencode grant record is unreadable (%s); not recording mcp.%s", exc, name)
+
+
+def is_recorded_mcp_entry(name: str, config: Mapping[str, Any]) -> bool:
+    """Whether the sidecar records CAO writing exactly *config* as ``mcp.<name>``."""
+    digest = _recorded_mcp_entries().get(name)
+    return digest is not None and digest == mcp_entry_fingerprint(config)
+
+
 def _reconcile_agent_grants(
     agent_name: str,
     mcp_names: Iterable[str],
@@ -448,14 +541,20 @@ def _agent_entry_absent(data: Mapping[str, Any], agent_name: str) -> bool:
 #     user's config. ``is_cao_owned_mcp_entry`` decides whether an existing entry
 #     is safe to overwrite.
 #
-# PROVENANCE IS A HEURISTIC, NOT A FACT. ``opencode.json`` records no owner, so
-# the only signal available without persisted state (install-record / marker
-# key — design.md §10a options 1 and 2, deliberately out of scope here) is that
-# a CAO-delivered plugin server's ``command``/``environment`` were expanded from
-# ``${PLUGIN_ROOT}``/``${PLUGIN_DATA}`` and therefore point INSIDE the plugin
-# store. A *stale* CAO entry written under a different ``CAO_HOME_DIR`` points at
-# the OLD store and is thus indistinguishable from a user's entry; it is treated
-# conservatively (reported as a collision, never overwritten).
+# OWNERSHIP IS RECORDED FIRST, INFERRED SECOND. ``opencode.json`` itself records
+# no owner, so CAO keeps its own record in the ``cao-grants.json`` sidecar: a
+# fingerprint of every plugin-derived entry it writes (#1154), the counterpart of
+# the grant record. An entry whose current bytes match its recorded fingerprint
+# is CAO's, wherever its paths point. That covers the case containment cannot: an
+# entry CAO wrote under a different ``CAO_HOME_DIR`` names the OLD store and used
+# to be indistinguishable from a user's entry.
+#
+# Containment remains as the second proof, for entries written before the record
+# existed or after the sidecar was lost: a CAO-delivered plugin server's
+# ``command``/``environment`` were expanded from ``${PLUGIN_ROOT}``/
+# ``${PLUGIN_DATA}`` and therefore point INSIDE the plugin store. An entry that
+# neither proof covers is treated as the user's (reported on collision, never
+# overwritten, never disabled).
 
 
 def _entry_path_strings(config: Mapping[str, Any]) -> List[str]:
@@ -509,11 +608,18 @@ def is_cao_owned_mcp_entry(
     candidate: Mapping[str, Any],
     *,
     plugin_store_roots: Iterable[Path],
+    name: Optional[str] = None,
 ) -> bool:
     """Whether CAO may overwrite ``existing`` with ``candidate`` without data loss.
 
-    Three ways an existing entry is provably CAO's, and therefore safe to replace:
+    Four ways an existing entry is provably CAO's, and therefore safe to replace:
 
+    0. ``name`` is given and the sidecar records CAO writing exactly
+       ``existing`` under it (:func:`is_recorded_mcp_entry`, #1154). This is the
+       recorded proof, and the only one that holds for an entry CAO wrote under
+       a different ``CAO_HOME_DIR``, whose paths name a store that is no longer
+       the current one. It is a digest of the content rather than of the name,
+       so a user who rewrote an entry CAO once wrote gets it back as their own.
     1. It is byte-for-byte what CAO would write now (idempotent replay — a
        reinstall/refresh re-writes CAO's own entry every time, and that must not
        be misreported as a user collision or the server could never be delivered
@@ -543,6 +649,8 @@ def is_cao_owned_mcp_entry(
     definition do not point into CAO's plugin store.
     """
     if dict(existing) == dict(candidate):
+        return True
+    if name is not None and is_recorded_mcp_entry(name, existing):
         return True
     if entry_within_roots(existing, plugin_store_roots):
         return True

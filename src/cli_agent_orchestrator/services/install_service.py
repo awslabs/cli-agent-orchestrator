@@ -60,7 +60,9 @@ from cli_agent_orchestrator.utils.opencode_config import (
     ensure_skills_symlink,
     entry_within_roots,
     is_cao_owned_mcp_entry,
+    is_recorded_mcp_entry,
     read_config,
+    record_mcp_entry,
     remove_agent_tools,
     to_opencode_agent_id,
     translate_mcp_server_config,
@@ -1740,8 +1742,9 @@ def _materialize_opencode_mcp(
     * **Disable, don't orphan, a withdrawn server (Finding 1).** Removal deletes a
       plugin's ``PLUGIN_ROOT`` but there is no ``opencode.json`` delete, so a
       server no longer in the desired set is set ``enabled: false`` — only when it
-      is provably CAO's (its command resolves inside the plugin store), so a
-      user's own server and CAO's ``cao-mcp-server`` are never touched.
+      is provably CAO's (recorded in the sidecar, or its command resolves inside
+      the plugin store), so a user's own server and CAO's ``cao-mcp-server`` are
+      never touched.
 
     The same "only touch what CAO can prove it owns" rule governs the per-agent
     grant: ``upsert_agent_tools``/``remove_agent_tools`` merge into
@@ -1764,9 +1767,10 @@ def _materialize_opencode_mcp(
     pattern can only ever select from what was delivered, and a human still had
     to write that pattern into the profile.
 
-    Ownership is a heuristic without persisted provenance; see
-    ``opencode_config.is_cao_owned_mcp_entry`` and design.md §10a options 1/2 for
-    the exact-cleanup follow-up. Keeping the top-level ``tools`` default-deny
+    ``mcp`` entry ownership is recorded the way grant ownership is (#1154): each
+    plugin-derived entry written here gets a fingerprint in the same sidecar, and
+    plugin-store containment is the fallback proof for entries that predate it.
+    See ``opencode_config.is_cao_owned_mcp_entry``. Keeping the top-level ``tools`` default-deny
     matches the prior in-place behaviour.
     """
     store = InstalledPluginStore()
@@ -1794,7 +1798,10 @@ def _materialize_opencode_mcp(
                 mcp_name in plugin_derived
                 and isinstance(existing, dict)
                 and not is_cao_owned_mcp_entry(
-                    existing, opencode_mcp_cfg, plugin_store_roots=plugin_store_roots
+                    existing,
+                    opencode_mcp_cfg,
+                    plugin_store_roots=plugin_store_roots,
+                    name=mcp_name,
                 )
             ):
                 collisions.append(
@@ -1805,6 +1812,8 @@ def _materialize_opencode_mcp(
                 )
                 continue
             upsert_mcp_server(mcp_name, opencode_mcp_cfg)
+            if mcp_name in plugin_derived:
+                record_mcp_entry(mcp_name, opencode_mcp_cfg)
             if mcp_name in grantable:
                 granted.append(mcp_name)
         # Grant only the servers actually written for this agent AND present in
@@ -1819,15 +1828,17 @@ def _materialize_opencode_mcp(
     # Finding 1 reconcile: disable any CAO-plugin server no longer desired.
     # Plugin servers are delivered to every agent uniformly, so a server absent
     # from this agent's merged set means its plugin was uninstalled. The
-    # plugin-store containment check is what keeps this from touching a user's
-    # own server or CAO's ``cao-mcp-server`` (neither resolves inside the store).
+    # Only a provably-CAO plugin entry is disabled: one the sidecar records CAO
+    # writing (#1154), or one that resolves inside the plugin store. A user's own
+    # server and CAO's ``cao-mcp-server`` match neither, because only
+    # plugin-derived entries are recorded and neither resolves inside the store.
     desired = set(merged_servers or {})
     current = read_config().get("mcp", {})
     if isinstance(current, dict):
         for name, cfg in current.items():
             if name in desired or not isinstance(cfg, dict) or cfg.get("enabled") is False:
                 continue
-            if entry_within_roots(cfg, plugin_store_roots):
+            if is_recorded_mcp_entry(name, cfg) or entry_within_roots(cfg, plugin_store_roots):
                 disable_mcp_server(name)
 
     if collisions:

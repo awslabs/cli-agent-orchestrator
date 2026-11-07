@@ -700,6 +700,129 @@ class TestOpencodeRemovalIsDisableNotDelete:
         assert "demo-tools" not in copilot_md
 
 
+def _move_plugin_store(workspace, monkeypatch) -> InstalledPluginStore:
+    """Point the plugin store at a fresh tree, as a changed ``CAO_HOME_DIR`` would.
+
+    ``opencode.json`` and its sidecar live under ``~/.aws/opencode`` and do not
+    follow ``CAO_HOME_DIR``, so after a home move the entries CAO wrote earlier
+    still name the OLD store. That is the state plugin-store containment cannot
+    explain and a recorded ownership row can.
+    """
+    moved = InstalledPluginStore(
+        plugins_dir=workspace["tmp_path"] / "home2" / "agent-plugins",
+        data_dir=workspace["tmp_path"] / "home2" / "agent-plugin-data",
+    )
+    for target, value in (
+        ("cli_agent_orchestrator.agent_plugins.store.AGENT_PLUGINS_DIR", moved.plugins_dir),
+        ("cli_agent_orchestrator.agent_plugins.store.AGENT_PLUGIN_DATA_DIR", moved.data_dir),
+        ("cli_agent_orchestrator.agent_plugins.validation.AGENT_PLUGIN_DATA_DIR", moved.data_dir),
+    ):
+        monkeypatch.setattr(target, value, raising=False)
+    workspace["store"] = moved
+    return moved
+
+
+class TestOpencodeMcpEntryOwnershipIsRecorded:
+    """#1154 — ``mcp`` entry ownership is recorded, the way grant ownership is.
+
+    Before this, ownership of an ``mcp`` entry was inferred only from plugin-store
+    containment (design.md §10a, "Residual limitation"), so an entry CAO wrote
+    under a different ``CAO_HOME_DIR`` was indistinguishable from a user's: it was
+    reported as a collision, never updated, and never disabled. The sidecar now
+    records a fingerprint of every plugin-derived entry CAO writes.
+    """
+
+    def test_the_sidecar_records_a_fingerprint_of_each_delivered_entry(self, opencode_workspace):
+        from cli_agent_orchestrator.services import install_service
+
+        install_plugin(
+            opencode_workspace,
+            "demo",
+            mcp=mcp_doc(**{"demo-tools": stdio(env={"DEMO_HOME": "${PLUGIN_DATA}"})}),
+        )
+        opencode_workspace["write_profile"]("worker")
+        assert install_service.install_agent("worker", "opencode_cli").success
+
+        sidecar = opencode_workspace["opencode_config"].with_name("cao-grants.json")
+        record = json.loads(sidecar.read_text(encoding="utf-8"))
+        fingerprint = record["mcp"]["demo-tools"]
+        assert fingerprint.startswith("sha256:")
+        # A fingerprint, not a copy: the entry's values are not duplicated into
+        # the sidecar (an `environment` value may be something the user would not
+        # want written twice).
+        assert "DEMO_HOME" not in sidecar.read_text(encoding="utf-8")
+
+    def test_a_cao_entry_left_by_a_moved_store_is_updated_not_reported(
+        self, opencode_workspace, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import install_service
+
+        server = {"demo-tools": stdio(args=["--root", "${PLUGIN_ROOT}"])}
+        install_plugin(opencode_workspace, "demo", mcp=mcp_doc(**server))
+        opencode_workspace["write_profile"]("worker", frontmatter=NAMES_DEMO_TOOLS)
+        assert install_service.install_agent("worker", "opencode_cli").success
+        old_root = str(opencode_workspace["store"].plugin_root("demo"))
+        assert old_root in opencode_json(opencode_workspace)["mcp"]["demo-tools"]["command"]
+
+        moved = _move_plugin_store(opencode_workspace, monkeypatch)
+        install_plugin(opencode_workspace, "demo", mcp=mcp_doc(**server))
+        captured = _finding_spy(monkeypatch)
+        assert install_service.install_agent("worker", "opencode_cli").success
+
+        data = opencode_json(opencode_workspace)
+        assert str(moved.plugin_root("demo")) in data["mcp"]["demo-tools"]["command"]
+        assert old_root not in data["mcp"]["demo-tools"]["command"]
+        assert data["agent"]["worker"]["tools"]["demo-tools*"] is True
+        assert not any(f.code == "mcp_delivery.opencode_config_collision" for f in captured), [
+            f.code for f in captured
+        ]
+
+    def test_a_cao_entry_left_by_a_moved_store_is_disabled_once_withdrawn(
+        self, opencode_workspace, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import install_service
+
+        install_plugin(
+            opencode_workspace,
+            "demo",
+            mcp=mcp_doc(**{"demo-tools": stdio(args=["--root", "${PLUGIN_ROOT}"])}),
+        )
+        opencode_workspace["write_profile"]("worker")
+        assert install_service.install_agent("worker", "opencode_cli").success
+        assert opencode_json(opencode_workspace)["mcp"]["demo-tools"]["enabled"] is True
+
+        # The new home has no plugin, so nothing delivers `demo-tools` any more.
+        _move_plugin_store(opencode_workspace, monkeypatch)
+        assert install_service.install_agent("worker", "opencode_cli").success
+
+        entry = opencode_json(opencode_workspace)["mcp"]["demo-tools"]
+        assert entry["enabled"] is False
+
+    def test_a_recorded_entry_the_user_rewrote_is_not_overwritten(
+        self, opencode_workspace, monkeypatch
+    ):
+        """The record proves what CAO wrote, not that CAO owns the name forever."""
+        from cli_agent_orchestrator.services import install_service
+
+        server = {"demo-tools": stdio(args=["--root", "${PLUGIN_ROOT}"])}
+        install_plugin(opencode_workspace, "demo", mcp=mcp_doc(**server))
+        opencode_workspace["write_profile"]("worker")
+        assert install_service.install_agent("worker", "opencode_cli").success
+
+        data = opencode_json(opencode_workspace)
+        user_entry = {"type": "local", "command": ["/usr/local/bin/user-thing"], "enabled": True}
+        data["mcp"]["demo-tools"] = user_entry
+        opencode_workspace["opencode_config"].write_text(json.dumps(data), encoding="utf-8")
+
+        _move_plugin_store(opencode_workspace, monkeypatch)
+        install_plugin(opencode_workspace, "demo", mcp=mcp_doc(**server))
+        captured = _finding_spy(monkeypatch)
+        assert install_service.install_agent("worker", "opencode_cli").success
+
+        assert opencode_json(opencode_workspace)["mcp"]["demo-tools"] == user_entry
+        assert any(f.code == "mcp_delivery.opencode_config_collision" for f in captured)
+
+
 class TestOpencodeCwdIsEmitted:
     """Reproduced by review 3 on #584 — the mapped ``cwd`` never reached OpenCode.
 

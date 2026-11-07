@@ -14,7 +14,10 @@ from cli_agent_orchestrator.utils.opencode_config import (
     ensure_skills_symlink,
     entry_within_roots,
     is_cao_owned_mcp_entry,
+    is_recorded_mcp_entry,
+    mcp_entry_fingerprint,
     read_config,
+    record_mcp_entry,
     remove_agent_tools,
     to_opencode_agent_id,
     translate_mcp_server_config,
@@ -799,3 +802,64 @@ class TestIsCaoOwnedMcpEntry:
         existing = {"type": "local", "command": ["/home/someone/bin/their-server"], "enabled": True}
         candidate = {"type": "local", "command": [str(root / "demo" / "server")], "enabled": True}
         assert is_cao_owned_mcp_entry(existing, candidate, plugin_store_roots=[root]) is False
+
+
+class TestMcpEntryRecord:
+    """#1154: ``mcp`` entry ownership is recorded beside the grant record."""
+
+    ENTRY = {"type": "local", "command": ["/old-home/agent-plugins/demo/server"], "enabled": True}
+
+    def test_the_fingerprint_ignores_enabled_and_nothing_else(self):
+        disabled = {**self.ENTRY, "enabled": False}
+        assert mcp_entry_fingerprint(disabled) == mcp_entry_fingerprint(self.ENTRY)
+        for edit in ({"command": ["/other"]}, {"cwd": "/w"}, {"environment": {"A": "1"}}):
+            assert mcp_entry_fingerprint({**self.ENTRY, **edit}) != mcp_entry_fingerprint(
+                self.ENTRY
+            )
+
+    def test_a_recorded_entry_is_owned_wherever_its_paths_point(self, tmp_config: Path):
+        record_mcp_entry("demo-tools", self.ENTRY)
+        candidate = {"type": "local", "command": ["/new-home/demo/server"], "enabled": True}
+        roots = [tmp_config.parent / "agent-plugins"]
+        assert is_cao_owned_mcp_entry(self.ENTRY, candidate, plugin_store_roots=roots) is False
+        assert (
+            is_cao_owned_mcp_entry(
+                self.ENTRY, candidate, plugin_store_roots=roots, name="demo-tools"
+            )
+            is True
+        )
+        # A CAO-disabled copy of the recorded entry is still CAO's.
+        assert is_recorded_mcp_entry("demo-tools", {**self.ENTRY, "enabled": False})
+
+    def test_the_record_is_per_name_and_per_content(self, tmp_config: Path):
+        record_mcp_entry("demo-tools", self.ENTRY)
+        assert not is_recorded_mcp_entry("other-tools", self.ENTRY)
+        assert not is_recorded_mcp_entry("demo-tools", {**self.ENTRY, "command": ["/user"]})
+
+    def test_mcp_and_grant_rows_share_the_sidecar_without_clobbering(self, tmp_config: Path):
+        record_mcp_entry("demo-tools", self.ENTRY)
+        upsert_agent_tools("developer", ["demo-tools"])
+        record_mcp_entry("more-tools", {**self.ENTRY, "command": ["/x"]})
+        record = json.loads(tmp_config.with_name("cao-grants.json").read_text())
+        assert record["version"] == 1
+        assert record["agents"] == {"developer": ["demo-tools*"]}
+        assert set(record["mcp"]) == {"demo-tools", "more-tools"}
+
+    def test_a_malformed_mcp_row_is_ignored_not_raised(self, tmp_config: Path):
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.with_name("cao-grants.json").write_text(
+            json.dumps({"version": 1, "agents": {}, "mcp": ["demo-tools"]}), encoding="utf-8"
+        )
+        assert not is_recorded_mcp_entry("demo-tools", self.ENTRY)
+        record_mcp_entry("demo-tools", self.ENTRY)
+        assert is_recorded_mcp_entry("demo-tools", self.ENTRY)
+
+    def test_a_corrupt_sidecar_is_left_intact_not_rewritten(self, tmp_config: Path, caplog):
+        """Fail closed (GH #737): recording must not replace an unreadable sidecar."""
+        tmp_config.parent.mkdir(parents=True)
+        sidecar = tmp_config.with_name("cao-grants.json")
+        sidecar.write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            record_mcp_entry("demo-tools", self.ENTRY)
+        assert sidecar.read_text(encoding="utf-8") == "{not json"
+        assert any("not recording mcp.demo-tools" in r.getMessage() for r in caplog.records)
