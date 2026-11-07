@@ -395,8 +395,9 @@ difference is deliberate rather than an inconsistency:
   **disabled** (`"enabled": false`), not deleted: OpenCode will not spawn it, and
   re-installing the plugin re-enables it. The trade is that the disabled entry —
   with its now-dangling command — stays visible in `opencode mcp list` until you
-  remove it by hand. Pruning it outright needs provenance CAO does not yet record
-  and is tracked as a follow-up.
+  remove it by hand. CAO now records a fingerprint of each plugin server it writes
+  (see [`opencode-cli.md`](opencode-cli.md)), but still disables rather than
+  prunes withdrawn entries; pruning on that record is tracked as a follow-up.
 
 Server names collide the way skill names do, and are resolved by the same kind of
 rule rather than by timing. **A server your profile already declares always
