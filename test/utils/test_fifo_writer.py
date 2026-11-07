@@ -215,6 +215,72 @@ class TestWaitingForAReader:
                 os.close(fd)
 
 
+class TestWaitBranchesInProcess:
+    """The same branches the subprocess tests reach, driven in this process.
+
+    Coverage does not follow the ``-I -S`` subprocess, so these keep the wait loop's
+    refusal and hang-up checks measured.
+    """
+
+    def test_enxio_on_a_socket_path_is_refused_not_waited_on(self, monkeypatch):
+        """Linux answers a non-blocking open of a socket with ENXIO, like a FIFO with no reader."""
+        import errno as errno_mod
+        import shutil
+        import socket
+        import tempfile
+
+        # Short directory: tmp_path can exceed the 104-byte AF_UNIX path limit on macOS.
+        short_dir = tempfile.mkdtemp(prefix="cao-fw-", dir="/tmp")
+        path = os.path.join(short_dir, "t.fifo")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(path)
+
+            calls = []
+
+            def enxio(*_args, **_kwargs):
+                calls.append(1)
+                if len(calls) > 1:
+                    # A regressed refusal would retry for ever; fail instead of hanging.
+                    raise AssertionError("retried after a non-FIFO")
+                raise OSError(errno_mod.ENXIO, "No such device or address")
+
+            # Scoped, so the cleanup below gets the real os.open back.
+            with monkeypatch.context() as patch:
+                patch.setattr(fifo_writer.os, "open", enxio)
+                with pytest.raises(OSError) as info:
+                    fifo_writer.open_fifo_for_writing(path, src_fd=None)
+        finally:
+            sock.close()
+            shutil.rmtree(short_dir, ignore_errors=True)
+        assert info.value.errno == errno_mod.EEXIST
+        assert len(calls) == 1
+
+    def test_stdin_closed_is_false_for_events_other_than_a_hang_up(self, monkeypatch):
+        class _Poller:
+            def register(self, fd, mask):
+                pass
+
+            def poll(self, timeout):
+                assert timeout == 0
+                return [(0, fifo_writer.select.POLLIN)]
+
+        monkeypatch.setattr(fifo_writer.select, "poll", _Poller)
+        assert fifo_writer._stdin_closed(0) is False
+
+    def test_stdin_closed_is_true_on_a_hang_up_and_false_while_open(self):
+        r, w = os.pipe()
+        try:
+            assert fifo_writer._stdin_closed(r) is False
+            os.close(w)
+            w = None
+            assert fifo_writer._stdin_closed(r) is True
+        finally:
+            os.close(r)
+            if w is not None:
+                os.close(w)
+
+
 class TestAsPipePaneRunsIt:
     """The exact invocation ``TmuxClient._pipe_pane_command`` builds."""
 
