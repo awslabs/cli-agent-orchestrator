@@ -155,6 +155,8 @@ provider override while keeping the same sequence.
 ### Configure and integrate
 
 - [Ephemeral agents](docs/ephemeral-agents.md): opt-in create-only profiles and their limits.
+- [Ephemeral agents setup runbook](docs/ephemeral-agents-agent-setup.md): step-by-step setup of
+  ephemeral agents and a decider, written for an agent to follow.
 - [Agent profiles](docs/agent-profile.md): profile schema, discovery, provider
   selection, and overrides.
 - [HTTP API and PTY WebSocket](docs/api.md): route-family overview and terminal
