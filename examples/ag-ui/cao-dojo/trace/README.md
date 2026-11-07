@@ -25,7 +25,13 @@ regenerates the shape file after a deliberate frame change:
 - the tier-1 checks that compare the published trace with CAO's own producers
   (the snapshot interior and the card mapper) skip the published trace while it
   is stale, and keep running on the offline capture, where they only compare
-  CAO's producers with themselves.
+  CAO's producers with themselves;
+- a `known_gaps.json` entry passes while at least one trace still observes its
+  gap. Both lanes take the union across traces: the Python tier 1 over the
+  offline capture and the published trace, the node lane over the mock
+  recording and the published trace. So if a keyless change removes a listed
+  key, **keep its entry until the re-record**: the stale published trace still
+  carries the key, and both lanes fail on an unlisted key.
 
 An `ag-ui-protocol` minor bump also needs a re-record before the next release:
 `_meta.ag_ui_protocol` names the SDK the trace was recorded with, and tier 1

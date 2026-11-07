@@ -625,6 +625,13 @@ jobs:
           uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --mock --check
           --emit "$RUNNER_TEMP/cao-dojo-mock-trace.ndjson"
 
+      - name: CAO Dojo node lane's known-gap rule (a union across traces, like the Python lane)
+        # The end-to-end cases need the pinned @ag-ui/client installed above, so they
+        # run here; Unit Tests runs the same file and skips them without it.
+        run: uv run pytest test/examples/test_cao_dojo_verify_trace_node.py -q --no-cov -rs
+        env:
+          CAO_DOJO_REQUIRE_NODE_LANE: "1"
+
       - name: CAO Dojo trace through upstream enforceEvents and verifyEvents (tier 1, node)
         run: |
           published=examples/ag-ui/cao-dojo/trace/cao-dojo-trace.ndjson
