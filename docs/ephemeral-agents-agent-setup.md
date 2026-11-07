@@ -21,6 +21,11 @@ For what ephemeral agents and decisions are, see [Ephemeral agents](ephemeral-ag
 
 ## Before you start
 
+- **Ephemeral agents are experimental.** [Ephemeral agents](ephemeral-agents.md) warns:
+  "Keep `ephemeral.enabled` false outside testing. It defaults to false, and stays false until
+  the rest of the lifecycle cleanup work (#1079) ships and creating an ephemeral agent from
+  inside a workflow step is refused (#1080)." Tell the user this warning and get their explicit
+  OK before step 4.
 - **The worked example is Jev**, a hosted decider from TypeSafe. Its package is
   `cao-decider-jev`, and it registers the decider name `jev`. CAO doesn't bundle or endorse any
   decider; any other decider package works the same way, with its own name, key and consent
@@ -29,9 +34,11 @@ For what ephemeral agents and decisions are, see [Ephemeral agents](ephemeral-ag
   user must give you the source they already have: a git URL, a local checkout or a wheel. If
   they have none, stop. Never guess a source, and never install a bare `jev` from PyPI: that
   name belongs to an unrelated project.
-- **You need a CAO build that has the decision platform.** A git install of `main` has it. The
-  PyPI release 2.5.4 doesn't, even though a git install can print the same version number.
-  Step 2 checks this.
+- **You need a CAO build with the decision commands this runbook uses.** A git install of
+  `main` has them. PyPI 2.5.4 has an early decision platform with `status`, `set`, `tier`,
+  `table`, `exclude`, `tune`, `list` and `purge`, but lacks `enable`, `disable`, `show`, `off`
+  and the `installed_deciders` status key. Step 2's probes stop that build, even though a git
+  install can print the same version number.
 - **macOS or Linux.** On Windows, stop and ask.
 
 ### Rules for the agent
@@ -290,8 +297,10 @@ cao-decider-jev key check --auth # should end with {"status": 200, "alias_listed
 cao decisions enable jev         # shows what Jev sends and where; type api.typesafe.ai to agree
 ```
 
-If `cao-decider-jev` isn't on their `PATH` (it usually isn't after pattern B), give them the full
-path: `"$(dirname "$CAO_PY")/cao-decider-jev"`. `enable` ends with:
+For **both patterns A and B**, give the user the full path
+`"$(dirname "$CAO_PY")/cao-decider-jev"` in place of each bare `cao-decider-jev` in the block
+above. uv links only the main package's executables, so neither pattern puts the decider
+executable on `PATH`. `enable` ends with:
 
 ```text
 Consent granted; effective states:
@@ -347,10 +356,13 @@ terminal. Confirm `create_ephemeral_agent` is in your tool list before you go on
 
 ## 7. Watch in shadow
 
-In **shadow**, the decider answers every helper launch that asks for `auto`, and CAO records
-the answer, but helpers
-still run on `default_tier`. Jev's consent already put `model.route` there. Bind effort routing
-too, if the user wants it (it's a settings write, so get their OK):
+In **shadow**, `model.route` asks the decider for every helper launched with `auto`, and every
+normal delegation to an installed profile that omits a model. Both send the redacted task
+message to the decider. CAO records the answer, but helpers still run on `default_tier` and
+installed profiles keep their existing model. Jev's consent already put `model.route` there.
+Use `cao decisions exclude --add <profile>` to keep an installed profile on its own model and
+skip its `model.route` calls and records. This writes settings, so get the user's OK first.
+Bind effort routing too, if the user wants it (also a settings write):
 
 ```bash
 cao decisions set model.route shadow --decider jev
@@ -376,6 +388,12 @@ assign and handoff results carry no note; that's normal.
   Ignore it here.
 
 ## 8. Switch on and run a smoke test
+
+In **on** mode, `model.route` covers every helper launched with `auto`, and every normal
+delegation to an installed profile that omits a model. Those delegations may run on a
+different model: the installed profile's model is a fallback and may be overridden. Tell the
+user this before switching on. Use `cao decisions exclude --add <profile>` to keep a profile
+on its own model (a settings write, so get the user's OK).
 
 When the user agrees, switch on:
 
@@ -445,7 +463,7 @@ Delete the `settings.json.bak.*` files once the user no longer needs them.
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| `cao decisions` says "No such command", or `enable`/`off` are missing | The build predates the decision platform | Stop. The user installs a build that has it, such as a git install of `main` |
+| `cao decisions` says "No such command", or `enable`/`off` are missing | The build lacks the commands this runbook needs; PyPI 2.5.4 has an early version without consent and stop commands | Stop. The user installs a build with these commands, such as a git install of `main` |
 | uv says `Package metadata name … does not match given name`, or `Requested package name … does not match … in the distribution filename` | The source isn't the package you named | Stop and ask the user for the right source |
 | `jev` is missing from the entry-point list | It was installed into a different Python | Re-run step 2, then reinstall with `--python "$CAO_PY"` |
 | It worked yesterday; now every launch falls back with `decider_unavailable` | A CAO upgrade rebuilt the tool and dropped the decider | Re-run step 3's check and reinstall, then restart |
@@ -465,9 +483,11 @@ user does in their own terminal, and the OKs before installs, settings writes an
 **Do I have to use Jev?** No. Any package that registers a `cao.deciders` entry point works.
 Swap in its package name, decider name and its own key and consent commands.
 
-**Does shadow cost anything?** Yes: the decider is asked on every helper launch with
-`model_tier: "auto"`, even though its answer isn't applied. That's the price of seeing its
-picks first.
+**Does shadow cost anything?** Yes: `model.route` asks the decider for every helper launched
+with `auto`, and every normal delegation to an installed profile that omits a model. Both
+send the redacted task message, even though the answer isn't applied. That's the price of
+seeing its picks first. Use `cao decisions exclude --add <profile>` to keep an installed
+profile on its own model and skip those calls (a settings write, so get the user's OK).
 
 **What does Jev receive?** `cao decisions show jev` prints the full disclosure, which is what
 the user agrees to. For each delegation, one request per point that is in shadow or on goes to
