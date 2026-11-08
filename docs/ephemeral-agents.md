@@ -7,6 +7,9 @@ Keep `ephemeral.enabled` false outside testing. It defaults to false, and stays 
 the rest of the lifecycle cleanup work (#1079) ships and creating an ephemeral agent from
 inside a workflow step is refused (#1080). The cleanup described below is not enough on its own.
 
+To have an agent set up ephemeral agents and a decider for you, point it at
+[the setup runbook](ephemeral-agents-agent-setup.md).
+
 ## Operator settings
 
 The operator-only `ephemeral` block in `settings.json` has these defaults:

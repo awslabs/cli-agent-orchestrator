@@ -152,7 +152,10 @@ class TestDatabaseListAllTerminals:
         mock_terminal.last_active = None
 
         mock_db = MagicMock()
-        mock_db.query.return_value.all.return_value = [mock_terminal]
+        # The listing outer-joins the #1225 keep table and reads (row, kept_until) pairs.
+        mock_db.query.return_value.outerjoin.return_value.add_columns.return_value.all.return_value = [
+            (mock_terminal, None)
+        ]
         mock_session_class.return_value.__enter__ = MagicMock(return_value=mock_db)
         mock_session_class.return_value.__exit__ = MagicMock(return_value=False)
 
