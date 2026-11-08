@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/terminal-lifecycle.md`, which also now says retention is 14 days (it said 7), lists
   flow recycling (no snapshot), and gives the real snapshot directory.
 
+- **Ephemeral assign and handoff relay Kiro launch refusal rules and remedies (#1240).**
+  Helper probe refusals are structured and counted in the refusal archive.
+  Structured policy messages are bounded and stripped of control characters.
+  Other launch failures after a claim return a generic message. Installed-profile
+  launches keep their existing errors.
+
 - **Accept kiro-cli 3.1.0 and 2.37.1 as pending v3 versions (#1167).** 3.1.0 maps to
   the statically reviewed `KAS_0_66_91`; 2.37.1 reuses `KAS_0_66_70`. Every agent and
   helper render stays byte-identical. Both remain refused at launch unless the operator

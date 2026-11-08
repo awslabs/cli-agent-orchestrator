@@ -1501,8 +1501,8 @@ def _helper_v3_refusal(error: KiroV3Refusal) -> KiroV3Refusal:
 def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
     """The probe's version or missing-flag refusal with the helper's remedy, same kind.
 
-    It stays a capability error (a 400 with a plain-string detail); any other
-    probe failure, which suggests no engine, is returned as it is.
+    Other probe messages stay intact here. The launch path wraps only the final
+    helper failure as a structured, archived policy refusal after model fallback.
     """
     if error.kind == KiroV3UnsupportedVersionError.code:
         message = str(KiroV3UnsupportedVersionError(error.version, remedy=_HELPER_SUPPORTED_CLI))
@@ -1520,18 +1520,6 @@ def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
     return KiroCapabilityError(
         error.kind, error.engine, message, capability=error.capability, version=error.version
     )
-
-
-def _helper_probe(probe: Callable[..., KiroCapabilities]) -> Callable[..., KiroCapabilities]:
-    """``probe``, whose refusals carry the helper's remedy."""
-
-    def run(*args: Any, **kwargs: Any) -> KiroCapabilities:
-        try:
-            return probe(*args, **kwargs)
-        except KiroCapabilityError as exc:
-            raise _helper_capability_error(exc) from exc
-
-    return run
 
 
 def _helper_engine(
@@ -2361,34 +2349,43 @@ async def _create_terminal_unguarded(
                     _helper_stage_a, agent_profile, caller_id, env_vars
                 )
                 kiro_helper = (resolved_cli, global_home)
-                probe = _helper_probe(
-                    functools.partial(
-                        probe,
-                        executable=resolved_cli.path,
-                        env=kiro_launch_home.kiro_env(kiro_probe_home),
-                    )
+                probe = functools.partial(
+                    probe,
+                    executable=resolved_cli.path,
+                    env=kiro_launch_home.kiro_env(kiro_probe_home),
                 )
             try:
-                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
-            except KiroCapabilityError:
-                # A routed launch is refused, never relaunched on the profile's model, which
-                # is the fallback provider's (#1099).
-                if (
-                    model
-                    or launch_plan is None
-                    or launch_plan.model is None
-                    or launch_plan.provider is not None
-                ):
+                try:
+                    capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
+                except KiroCapabilityError:
+                    # A routed launch is refused, never relaunched on the profile's model, which
+                    # is the fallback provider's (#1099).
+                    if (
+                        model
+                        or launch_plan is None
+                        or launch_plan.model is None
+                        or launch_plan.provider is not None
+                    ):
+                        raise
+                    launch_model = resolve_launch_model(model, profile)
+                    requested = requested_kiro_capabilities(
+                        resolved_engine, model=launch_model, yolo=True, effort=launch_effort
+                    )
+                    capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
+                    decision_not_honored = True
+                    model_honored = ProviderManager.provider_class(provider).honors_model(
+                        agent_profile=agent_profile, profile=profile, requested_model=launch_model
+                    )
+            except KiroCapabilityError as exc:
+                if not helper:
                     raise
-                launch_model = resolve_launch_model(model, profile)
-                requested = requested_kiro_capabilities(
-                    resolved_engine, model=launch_model, yolo=True, effort=launch_effort
-                )
-                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
-                decision_not_honored = True
-                model_honored = ProviderManager.provider_class(provider).honors_model(
-                    agent_profile=agent_profile, profile=profile, requested_model=launch_model
-                )
+                error = _helper_capability_error(exc)
+                # Convert once, after #1099's decided-model fallback. Keep the
+                # rule in its field and remove its duplicate from the detail.
+                detail = str(error).removeprefix(f"{error.kind}: ")
+                raise _ephemeral_kiro_refusal(
+                    agent_profile, caller_id, KiroLaunchRefusal(error.kind, detail)
+                ) from None
             if resolved_engine == KiroEngine.V3:
                 # #1167: the probed version must be allow-listed and verified
                 # (or pending, with the operator's opt-in), and the policy
