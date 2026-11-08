@@ -10,6 +10,15 @@
  * stream. A dropped stream is "reconnecting" and is retried. A stream the
  * server refuses (an HTTP error, or an EventSource the browser gives up on) is
  * "refused" and is not retried. `close()` ends it as "closed".
+ *
+ * Reconnects replay what the server's event log still holds. The browser's
+ * `EventSource` sends `Last-Event-ID` and the GET route replays after it. The
+ * token stream has no such header, so each reconnect sends
+ * `forwardedProps.cao.since`: the `timestamp` of the last frame seen, or,
+ * before any frame carried one, the time the first stream opened less
+ * {@link SINCE_MARGIN_MS}. The replay may overlap what was already seen; the
+ * panel dedupes by event id. On both paths, a stream that opens again after a
+ * drop calls `onReopen`, so the caller can list interrupts again.
  */
 
 import { readFrames } from "./sse.ts";
@@ -18,6 +27,12 @@ import type { Frame } from "./types.ts";
 
 /** `EventSource.CLOSED`: the browser will not reconnect. */
 const EVENTSOURCE_CLOSED = 2;
+
+/**
+ * How far before the first open a reconnect replays from when no frame has
+ * carried a `timestamp` yet: room for a client clock ahead of the server's.
+ */
+export const SINCE_MARGIN_MS = 5000;
 
 export interface EventSourceLike {
   readyState: number;
@@ -35,6 +50,11 @@ export interface AmbientOptions {
   token?: string;
   onFrame: (frame: Frame) => void;
   onStatus?: (status: AmbientStatus, detail?: string) => void;
+  /**
+   * Called when a stream is accepted again after an accepted stream dropped. Not
+   * on the first open, even when earlier attempts failed before it.
+   */
+  onReopen?: () => void;
   fetchImpl?: typeof fetch;
   eventSourceImpl?: new (url: string) => EventSourceLike;
   /** Delay before reconnecting the token stream, in ms (default 2000). */
@@ -68,7 +88,14 @@ function openEventSource(opts: AmbientOptions, status: NonNullable<AmbientOption
   const Impl = opts.eventSourceImpl ?? (globalThis as { EventSource?: AmbientOptions["eventSourceImpl"] }).EventSource;
   if (!Impl) throw new Error("EventSource is not available; pass a token to use the POST stream");
   const source = new Impl(urlFor(opts.base, "stream", { threadId: opts.threadId }));
-  source.onopen = () => status("open");
+  let dropped = false;
+  let everOpened = false;
+  source.onopen = () => {
+    status("open");
+    if (dropped && everOpened) opts.onReopen?.();
+    dropped = false;
+    everOpened = true;
+  };
   source.onmessage = (event) => {
     const frame = parseData(event.data);
     if (frame) opts.onFrame(frame);
@@ -77,6 +104,7 @@ function openEventSource(opts: AmbientOptions, status: NonNullable<AmbientOption
     if (source.readyState === EVENTSOURCE_CLOSED) {
       status("refused", "the server refused the stream (or this origin is not allowed)");
     } else {
+      dropped = true;
       status("reconnecting");
     }
   };
@@ -94,6 +122,10 @@ function openPost(opts: AmbientOptions, token: string, status: NonNullable<Ambie
   const fetchImpl = opts.fetchImpl ?? fetch;
   const retryMs = opts.retryMs ?? 2000;
   let attempt = 0;
+  // The replay cursor for the next reconnect, as epoch ms (see the header).
+  let sinceMs: number | undefined;
+  // Set once a stream has been accepted, so a later accept counts as a reopen.
+  let opened = false;
   // Wait between reconnects, ending early on close(). The abort listener is
   // removed when the timer fires, so listeners do not pile up across retries.
   const wait = (ms: number) =>
@@ -125,6 +157,7 @@ function openPost(opts: AmbientOptions, token: string, status: NonNullable<Ambie
             runId: `ambient-${Date.now()}-${attempt}`,
             messages: [],
             protocolVersion: "1.0",
+            ...(sinceMs === undefined ? {} : { forwardedProps: { cao: { since: new Date(sinceMs).toISOString() } } }),
           }),
           signal: controller.signal,
         });
@@ -133,7 +166,11 @@ function openPost(opts: AmbientOptions, token: string, status: NonNullable<Ambie
           return;
         }
         status("open");
+        if (opened) opts.onReopen?.();
+        opened = true;
+        if (sinceMs === undefined) sinceMs = Date.now() - SINCE_MARGIN_MS;
         for await (const frame of readFrames(response.body)) {
+          if (typeof frame.timestamp === "number") sinceMs = frame.timestamp;
           opts.onFrame(frame);
           if (controller.signal.aborted) break;
         }

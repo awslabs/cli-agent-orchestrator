@@ -24,6 +24,16 @@ const ALLOWED: ReadonlySet<string> = new Set(ALLOWED_COMPONENTS);
 
 export const GENERATIVE_UI_EVENT = "cao.generative_ui";
 
+/** The panel keeps the newest this many entries; older ones are dropped. */
+export const MAX_PANEL_ENTRIES = 200;
+
+/**
+ * The newest this many event ids are remembered for dedupe. It is larger than
+ * {@link MAX_PANEL_ENTRIES}, so a replay after a reconnect does not bring back
+ * an entry that was dropped from the panel a little earlier.
+ */
+export const MAX_SEEN_EVENT_IDS = 1000;
+
 /** Who an entry belongs to: a subagent when the stream names one, else the raw sender label. */
 export interface Owner {
   subagentRunId?: string;
@@ -91,14 +101,25 @@ export function entryFor(frame: Frame): Entry | null {
   return null;
 }
 
-/** Add one frame. A repeated event id (a `<rid>.<i>` cursor replays a whole record) is dropped. */
+/**
+ * Add one frame. A repeated event id (a `<rid>.<i>` cursor replays a whole
+ * record) is dropped. The panel and its dedupe memory are both bounded:
+ * {@link MAX_PANEL_ENTRIES} and {@link MAX_SEEN_EVENT_IDS}, newest kept.
+ */
 export function reduceFrame(panel: Panel, frame: Frame): Panel {
   const entry = entryFor(frame);
   if (!entry) return panel;
   if (entry.eventId && panel.seen.has(entry.eventId)) return panel;
   const seen = new Set(panel.seen);
-  if (entry.eventId) seen.add(entry.eventId);
-  return { entries: [...panel.entries, entry], seen };
+  if (entry.eventId) {
+    seen.add(entry.eventId);
+    // A Set iterates in insertion order, so the first id is the oldest.
+    for (const old of seen) {
+      if (seen.size <= MAX_SEEN_EVENT_IDS) break;
+      seen.delete(old);
+    }
+  }
+  return { entries: [...panel.entries, entry].slice(-MAX_PANEL_ENTRIES), seen };
 }
 
 /** The props of an ambient `approval_card` that names an interrupt, for a hint only. */

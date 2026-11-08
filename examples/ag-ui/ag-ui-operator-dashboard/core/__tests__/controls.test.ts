@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { controlsFor, EDIT_MAX_CHARS, isBlankForServer, payloadFor } from "../controls.ts";
+import { codePoints, controlsFor, EDIT_MAX_CHARS, isBlankForServer, payloadFor } from "../controls.ts";
 import { interruptsOf } from "./helpers.ts";
 
 const approveDeny = interruptsOf("one-interrupt.sse")[0].responseSchema;
@@ -67,13 +67,27 @@ describe("payloadFor", () => {
     });
   });
 
-  it("refuses multi-line or over-long text instead of letting the server cut it", () => {
+  it("refuses multi-line text, which the server would cut without notice", () => {
     expect(payloadFor("i", { kind: "edit", text: "a\nb" }, editOffered)).toMatchObject({ ok: false });
     expect(payloadFor("i", { kind: "edit", text: "a\rb" }, editOffered)).toMatchObject({ ok: false });
+  });
+
+  it("refuses over-long text, which the server refuses with RUN_ERROR and so stops the batch", () => {
     expect(payloadFor("i", { kind: "edit", text: "x".repeat(EDIT_MAX_CHARS + 1) }, editOffered)).toMatchObject({
       ok: false,
       reason: `edited text is longer than ${EDIT_MAX_CHARS} characters`,
     });
     expect(payloadFor("i", { kind: "edit", text: "x".repeat(EDIT_MAX_CHARS) }, editOffered)).toMatchObject({ ok: true });
+  });
+
+  it("counts code points, as Python's len() does, not UTF-16 units", () => {
+    const emoji = "\u{1F600}"; // one code point, two UTF-16 units
+    expect(emoji.length).toBe(2);
+    expect(codePoints(emoji)).toBe(1);
+    expect(payloadFor("i", { kind: "edit", text: emoji.repeat(EDIT_MAX_CHARS) }, editOffered)).toMatchObject({ ok: true });
+    expect(payloadFor("i", { kind: "edit", text: emoji.repeat(EDIT_MAX_CHARS + 1) }, editOffered)).toMatchObject({
+      ok: false,
+      reason: `edited text is longer than ${EDIT_MAX_CHARS} characters`,
+    });
   });
 });

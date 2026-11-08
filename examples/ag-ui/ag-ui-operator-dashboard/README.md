@@ -54,7 +54,11 @@ token, the run plane answers 403 and the card says so.
 **Stream status.** The header shows the ambient stream's state:
 - `connecting`;
 - `open`, once the server has accepted the stream;
-- `reconnecting` after a drop (the token stream retries every 2 s);
+- `reconnecting` after a drop. The token stream retries every 2 s and replays
+  from the last frame it saw (`forwardedProps.cao.since`); the browser's
+  `EventSource` replays through `Last-Event-ID`. When the stream opens again,
+  the dashboard lists interrupts again, so a prompt that started during the
+  drop is shown;
 - `refused` when the server rejects the stream or the browser gives up on it,
   which is not retried;
 - `closed`.
@@ -77,8 +81,10 @@ token, the run plane answers 403 and the card says so.
   `editedArgs`.** Today that is Kiro `permission_request` and Codex
   `approval_request`. Claude Code's permission dialog offers approve and deny
   only.
-- An Edit is one line of at most 4000 characters, typed into the agent's prompt
-  in place of yes or no. **Blank or whitespace-only text is refused here and
+- An Edit is one line of at most 4000 characters (code points, as the server's
+  `len()` counts them), typed into the agent's prompt in place of yes or no. The
+  dashboard refuses a line break, which the server would cut without notice, and
+  longer text, which the server refuses with `RUN_ERROR`, stopping the batch. **Blank or whitespace-only text is refused here and
   nothing is sent**, because the server would apply it as an approve. Edit always
   sends `approved: true`.
 - **Decisions are held until every open interrupt has one**, then sent as one
@@ -104,11 +110,12 @@ token, the run plane answers 403 and the card says so.
 `dangerouslySetInnerHTML` and no `eval`. A `RAW` frame with
 `event.rejected_component`, or a `CUSTOM` frame naming a component outside the
 six, shows as a refusal with the component name and sender and without props.
-The panel has no controls, not even on an `approval_card`.
+The panel has no controls, not even on an `approval_card`. It keeps the newest
+200 entries (`MAX_PANEL_ENTRIES` in `core/genui.ts`), so a long session does not
+grow without limit.
 
-**Routes.** The app requests `/agui/v1/run`, `/agui/v1/stream` and
-`/agui/v1/capabilities` and nothing else; `core/routes.ts` refuses any other
-path. It never calls `emit_ui` and never reads terminal output.
+**Routes.** The app requests `/agui/v1/run` and `/agui/v1/stream` and
+nothing else; `core/routes.ts` refuses any other path. It never calls `emit_ui` and never reads terminal output.
 
 ## What the run plane cannot tell you
 
@@ -161,5 +168,19 @@ HTTP 400. The components are read on both stream transports at once:
 `EventSource`, and the token `POST`.
 
 CI runs all of these in the **AG-UI operator dashboard** job, which installs
-tmux. Codecov reads only the Python suite's `coverage.xml`, so it does not see
+tmux.
+
+**Live check, opt-in and manual (not in CI).** `e2e/live-claude-code.sh`
+approves and denies one real Claude Code permission prompt through `core/`
+and prints the run-plane evidence (#1156). It needs a logged-in Claude Code
+and spends two model turns on your account, so only a person runs it, by hand:
+
+```bash
+./e2e/live-claude-code.sh --dry-run    # say what it would do; start nothing
+./e2e/live-claude-code.sh              # run it (CAO_LIVE_PORT, default 9897)
+```
+
+Read its header first: it says what it touches, including your real Claude
+Code login and `~/.claude`. It refuses port 9889 and any argument it does not
+know. It drives `core/` headless, not the browser view. Codecov reads only the Python suite's `coverage.xml`, so it does not see
 this TypeScript; the job's coverage floor is this app's coverage gate.

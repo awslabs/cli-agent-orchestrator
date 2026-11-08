@@ -42,6 +42,10 @@ The harness also calls `POST /agui/v1/emit_ui`, acting as an agent.
   `POST` path).
 - An off-list `emit_ui` call: HTTP 400, and nothing reaches either stream within
   a 2 s settle window.
+- A token stream that drops loses nothing: the first request asks the server to
+  end it after 2 s (`forwardedProps.cao.maxSeconds`), a component is emitted
+  while the client waits to reconnect, and it must arrive after the reconnect,
+  which carries `forwardedProps.cao.since`. The reopen is reported once.
 - The app requests no route outside `core/routes.ts`.
 
 ## Isolation
@@ -71,3 +75,11 @@ and `TMUX_TMPDIR` set to the private directory, so its default socket is the
 private one.
 The server is stopped with `-S <socket> kill-server`, and the scratch directory
 is removed.
+
+## The live check (opt-in, not in CI)
+
+`live-claude-code.sh` is a separate, manual script: it approves and denies one
+real Claude Code permission prompt through `core/` (#1156). It is never run by
+`npm run e2e` or by CI, because it needs a logged-in Claude Code and spends two
+model turns. Its header says what it touches; run `./e2e/live-claude-code.sh
+--dry-run` to see what it would do. The app's README has its usage.
