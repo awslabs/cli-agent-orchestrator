@@ -208,9 +208,12 @@ KAS_0_66_70 = KiroV3EngineSchema(
 # Removed in 0.66.91: c2s_query, c2s_describe_function, c2s_describe_module,
 # c2s_list_functions, c2s_list_modules, c2s_list_packages,
 # c2s_traverse_functions and c2s_traverse_modules (spec/@builtin-only),
-# c2s_render_architecture and subagent_response. None is selectable by CAO
-# helpers, so renders do not change. The c2s_show_component_diagram and
-# c2s_show_system_overview tools remain.
+# c2s_render_architecture and subagent_response. Renders do not change,
+# because CAO renders from its own tables. Of these tools, only
+# c2s_render_architecture had a tag that CAO renders: write and shell in
+# 0.66.70, when the c2s feature and KIRO_ARCHIFY_CLI_PATH enable it.
+# _TAGS_0_66_70 does not list it.
+# The c2s_show_component_diagram and c2s_show_system_overview tools remain.
 # update_pbt_status also lost its fs_write capability (spec/@builtin-only);
 # it likewise does not affect renders. The XDG_CACHE_HOME c2s store is unchanged.
 # Windows execute_pwsh/control_pwsh_process remain shell-capability variants.
