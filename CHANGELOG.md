@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Keep finished child agents open, for workshops and debugging** (#1225 phase 1). A new
+  machine-wide setting, `terminal.keep_finished`, off by default
+  (`cao config set terminal.keep_finished.enabled true`). While it is on, a successful
+  `handoff` leaves its worker open instead of sending the exit command and deleting it (the
+  result says "kept until …" where it would say "was torn down", with `torn_down: false`), and
+  an agent's `delete_terminal` on an idle worker whose pane is live keeps it and says so. A
+  failed create's retained record (a 424 replay) is never kept. Anyone can then open the
+  pane and see what the child did and which tools it called. A reaper tears each kept child
+  down the normal way (scrollback and snapshot first, then exit and delete; launch-record end
+  reason `kept_expired`) once it has been idle for `idle_window_minutes` (default 60), and never
+  while it is working. `max_per_session` (default 5) caps how many a session keeps; `on_cap`
+  chooses between tearing down the oldest idle one (`teardown_oldest`, the default;
+  `kept_evicted`) and not keeping the new one (`dont_keep`). Operator deletes
+  (`cao agent cancel --delete`, `cao shutdown`, the web UI, the API) still delete at once.
+  Only the agent side asks for a keep: the `delete_terminal` tool and `cao agent handoff`'s
+  own post-success delete send the new `DELETE /terminals/{id}` query flag `keep_if_enabled`
+  (always; the server ignores it while the setting is off), and the `handoff` tool asks
+  through its run-step request. Workflows, flows, remote workers and the timeout/error paths
+  are unchanged. Terminal bodies gain two additive fields, `kept` and `kept_until`, and session
+  terminal rows gain `kept_until`; handoff and agent-delete responses can include `keep_note`
+  explaining the keep or eviction outcome. The kept fields are `false`/`null` unless a terminal
+  is kept, also while the setting is off. `cao session status --workers` shows a `KEPT UNTIL` column only when
+  something is kept. With the setting off, every path behaves as before, and only those
+  additive fields and the ignored flag differ on the wire. See
+  `docs/terminal-lifecycle.md`, which also now says retention is 14 days (it said 7), lists
+  flow recycling (no snapshot), and gives the real snapshot directory.
+
 - **Ephemeral assign and handoff relay Kiro launch refusal rules and remedies (#1240).**
   Helper probe refusals are structured and counted in the refusal archive.
   Structured policy messages are bounded and stripped of control characters.
