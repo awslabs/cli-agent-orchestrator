@@ -88,6 +88,16 @@ class TestTerminalOperations:
 
             assert count_runtime_allocated_terminals() == 1
 
+    def test_terminal_exists_is_true_only_for_a_terminal_row(self, test_db):
+        # The AG-UI ambient stream asks this before announcing a sender as a
+        # subagent; labels such as "operator" and "supervisor" are not terminals.
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli")
+            assert db_mod.terminal_exists("live0001") is True
+            assert db_mod.terminal_exists("operator") is False
+            assert db_mod.terminal_exists("supervisor") is False
+            assert db_mod.terminal_exists("") is False
+
     def test_session_incarnation_backfill_is_atomic_when_any_row_is_missing(self, test_db):
         with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
             create_terminal("live0001", "cao-live", "w-live", "kimi_cli")

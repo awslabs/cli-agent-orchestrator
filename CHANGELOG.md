@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3.1.0 has captured-help probe coverage; 2.37.1 has schema and launch coverage
   only because no help capture is available.
 
+- **The ambient stream attributes events only to real terminals** (#1232 review). A sender that
+  is not a terminal (`operator`, `supervisor`), an `emit_ui` `terminal_id` CAO does not know, or a
+  terminal whose invocation already finished no longer becomes a subagent or reuses a finished
+  `subagentRunId`; the event stays on the record's session invocation, or is untagged, and keeps
+  the sender in `metadata.cao.sender`. `clients.database.terminal_exists` is added for the check.
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different
   request already claimed gets its own slot. On `POST /sessions` and
