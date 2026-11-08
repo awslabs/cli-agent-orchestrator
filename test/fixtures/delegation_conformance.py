@@ -64,7 +64,9 @@ class DelegationAdapter(EngineAdapter):
         )
         patch.setattr(o, "_send_direct_input_handoff", Mock())
         patch.setattr(
-            o, "_delete_terminal_impl", lambda tid, *, check_binding=True: {"success": True}
+            o,
+            "_delete_terminal_impl",
+            lambda tid, *, check_binding=True, keep_if_enabled=False: {"success": True},
         )
         patch.setattr(o.time, "time", lambda: 1000.0)
         patch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker.example")

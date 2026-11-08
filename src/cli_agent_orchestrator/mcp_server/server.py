@@ -389,7 +389,9 @@ if ENABLE_WORKING_DIRECTORY:
         5. Return the agent's response
         6. Report the teardown outcome. On success the result states whether the
            worker terminal was torn down. On a timeout or worker error it names the
-           terminal and job and states the terminal was not torn down.
+           terminal and job and states the terminal was not torn down. When the
+           operator has turned on keeping finished agents, a successful worker is
+           kept instead, and the result says until when; CAO tears it down later.
 
         ## Working Directory
 
@@ -507,7 +509,9 @@ else:
         4. Return the agent's response
         5. Report the teardown outcome. On success the result states whether the
            worker terminal was torn down. On a timeout or worker error it names the
-           terminal and job and states the terminal was not torn down.
+           terminal and job and states the terminal was not torn down. When the
+           operator has turned on keeping finished agents, a successful worker is
+           kept instead, and the result says until when; CAO tears it down later.
 
         ## Model
 
@@ -1118,12 +1122,17 @@ def delete_terminal(
     worker, so the node must run a cao-server that reports it (this release
     or later) and must not have restarted since the worker was created.
 
+    When the operator has turned on keeping finished agents for this machine,
+    an idle worker you created is kept instead of deleted, so people can look at
+    what it did afterwards. The result then says ``kept`` and until when; CAO
+    tears it down itself later, so there is nothing more for you to do.
+
     Args:
         terminal_id: The terminal ID to delete
         target_host: Remote CAO node hosting the terminal; omit for local
 
     Returns:
-        Dict with success status and message
+        Dict with success status and message (plus ``kept``/``kept_until`` when kept)
     """
     # Direct (non-MCP) invocation — e.g. existing unit tests calling the
     # function positionally — receives the pydantic FieldInfo object as the
@@ -1137,7 +1146,12 @@ def delete_terminal(
     # a real Optional[str] that needs no laundering.
     if not isinstance(target_host, str) or not target_host.strip():
         target_host = None
-    return _delete_terminal_impl(terminal_id, target_host=target_host)
+    # keep_if_enabled marks this as an AGENT's delete (#1225 phase 1): only this
+    # tool sends it, so every operator delete stays immediate. Remote workers are
+    # out of phase 1, so a target_host delete never asks for a keep.
+    return _delete_terminal_impl(
+        terminal_id, target_host=target_host, keep_if_enabled=target_host is None
+    )
 
 
 @mcp.tool()
