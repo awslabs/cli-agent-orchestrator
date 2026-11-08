@@ -1155,10 +1155,15 @@ def _create_terminal(
         if claim is not None and response.status_code >= 400:
             kind, message, _, rule = _parse_run_step_error(response)
             if kind == "ephemeral_policy":
-                raise _ClaimRefused(rule or "unexpected_failure", message)
+                raise _ClaimRefused(
+                    rule or "unexpected_failure",
+                    _bounded_launch_message(
+                        message, f"ephemeral launch failed ({response.status_code})"
+                    ),
+                )
             raise _ClaimRefused(
                 "unexpected_failure",
-                f"ephemeral launch failed ({response.status_code})",
+                _claim_launch_error_message(response),
                 status_code=response.status_code,
                 terminal_id=(
                     _retained_terminal_id(response) if response.status_code == 424 else None
@@ -1423,6 +1428,8 @@ def _terminal_id_from_detail(detail: str) -> Optional[str]:
 
 def _parse_run_step_error(
     response: requests.Response,
+    *,
+    scrape_terminal_id: bool = True,
 ) -> tuple[Optional[str], str, Optional[str], Optional[str]]:
     """Parse a run-step error into ``(kind, message, terminal_id, policy_rule)``.
 
@@ -1430,7 +1437,8 @@ def _parse_run_step_error(
     ``{"message", "kind", "terminal_id"}`` so callers read the failure kind and
     the live terminal as fields. Falls back to the legacy plain-string detail
     (+ regex terminal-id scrape) when the structured shape is absent, so a
-    newer client still works against an older server.
+    newer client still works against an older server. Callers can disable the
+    scrape for untrusted launch text without discarding structured worker ids.
     """
     try:
         payload = response.json()
@@ -1445,9 +1453,27 @@ def _parse_run_step_error(
         rule = detail.get("rule", "unexpected_failure") if kind == "ephemeral_policy" else None
         return kind, message, detail.get("terminal_id"), rule
     if isinstance(detail, str) and detail:
-        return None, detail, _terminal_id_from_detail(detail), None
+        tid = _terminal_id_from_detail(detail) if scrape_terminal_id else None
+        return None, detail, tid, None
     fallback = f"status {response.status_code}"
     return None, fallback, None, None
+
+
+def _bounded_launch_message(message: object, fallback: str) -> str:
+    """Bound decoded launch text before relaying and normalise whitespace."""
+    if not isinstance(message, str):
+        return fallback
+    cleaned = " ".join(
+        "".join(
+            " " if ch.isspace() else ch for ch in message[:4096] if ch.isspace() or ch.isprintable()
+        ).split()
+    )
+    return cleaned or fallback
+
+
+def _claim_launch_error_message(response: requests.Response) -> str:
+    """Hide non-policy launch errors after a claim, including paths and git stderr."""
+    return f"ephemeral launch failed ({response.status_code})"
 
 
 def _receiver_provider(receiver_id: str) -> Optional[str]:
@@ -1737,7 +1763,12 @@ async def _run_step_and_build_result(
         # run-step endpoint returns a STRUCTURED detail object
         # ({message, kind, terminal_id}) so we read terminal_id and the
         # failure kind as fields rather than scraping the message.
-        kind, structured_detail, tid, rule = _parse_run_step_error(response)
+        kind, structured_detail, tid, rule = _parse_run_step_error(
+            response,
+            scrape_terminal_id=not (
+                payload.get("claim_id") is not None and 400 <= response.status_code < 500
+            ),
+        )
         # worker RAN LONG (timeout) vs CRASHED (terminal reached ERROR) must
         # be reported distinctly so a 5s crash is not mislabeled as an
         # N-second timeout. The structured `kind` is authoritative; the
@@ -1748,17 +1779,24 @@ async def _run_step_and_build_result(
         # server-side or has no worker, so this branch makes no claim about it.
         worker_outcome = False
         if kind == "ephemeral_policy":
-            msg = structured_detail
+            msg = _bounded_launch_message(
+                structured_detail, f"ephemeral launch failed ({response.status_code})"
+            )
         # Generic text is only for failures before any worker is known; a launched
         # worker's timeout, error or extraction failure keeps its handoff result.
         elif (
             payload.get("claim_id") is not None
             and kind not in ("error", "timeout")
             and response.status_code not in (502, 504)
-            and tid is None
+            and (tid is None or 400 <= response.status_code < 500)
         ):
-            msg = f"ephemeral launch failed ({response.status_code})"
+            msg = _claim_launch_error_message(response)
             rule = "unexpected_failure"
+            # Structured worker ids survive on every status; only scraped 4xx
+            # ids (e.g. an unallocated git worktree terminal) are dropped above.
+            # A retained 424 can also name its worker at the top level.
+            if response.status_code == 424:
+                tid = tid or _retained_terminal_id(response)
         elif kind == "error" or (kind is None and response.status_code == 502):
             msg = f"Handoff failed: worker errored ({structured_detail})"
             worker_outcome = True
