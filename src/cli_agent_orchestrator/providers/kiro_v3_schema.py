@@ -205,8 +205,14 @@ KAS_0_66_70 = KiroV3EngineSchema(
 # and render-facing fields. This inventory is not read by CAO's select().
 # See unmodelled_tools below for the process-tool tags and capabilities.
 # The 0.66.70 inventory is not recorded here.
-# c2s_render_architecture and subagent_response were removed;
-# the XDG_CACHE_HOME c2s store is unchanged.
+# Removed in 0.66.91: c2s_query, c2s_describe_function, c2s_describe_module,
+# c2s_list_functions, c2s_list_modules, c2s_list_packages,
+# c2s_traverse_functions and c2s_traverse_modules (spec/@builtin-only),
+# c2s_render_architecture and subagent_response. None is selectable by CAO
+# helpers, so renders do not change. The c2s_show_component_diagram and
+# c2s_show_system_overview tools remain.
+# update_pbt_status also lost its fs_write capability (spec/@builtin-only);
+# it likewise does not affect renders. The XDG_CACHE_HOME c2s store is unchanged.
 # Windows execute_pwsh/control_pwsh_process remain shell-capability variants.
 # MCP disclosure tool_load/tool_call/load_resource retain read, @builtin and
 # @mcp-disclosure tags with no capability. They stay outside CAO's read map.
