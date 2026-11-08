@@ -261,7 +261,11 @@ class TestTerminalOperations:
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
-        mock_query.filter.return_value.order_by.return_value.all.return_value = [mock_terminal]
+        # The listing outer-joins the #1225 keep table and reads (row, kept_until) pairs.
+        selection = mock_query.filter.return_value.order_by.return_value
+        selection.outerjoin.return_value.add_columns.return_value.all.return_value = [
+            (mock_terminal, None)
+        ]
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
@@ -2712,6 +2716,8 @@ class TestListTerminalsInSessions:
             "deferred_init_external_owner",
             "deferred_init_runtime_reclaimed",
             "session_incarnation_id",
+            # #1225: end of a kept child's window, None when not kept.
+            "kept_until",
             "last_active",
         }
 

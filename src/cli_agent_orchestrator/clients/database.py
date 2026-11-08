@@ -5,7 +5,18 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+    cast,
+)
 
 from sqlalchemy import (
     Boolean,
@@ -303,6 +314,65 @@ class TerminalModel(Base):
     # terminal's spawn parent; it is not worth its price as a sort key.
 
 
+class KeptTerminalModel(Base):
+    """A finished child terminal CAO is keeping instead of tearing down (#1225).
+
+    Only written while ``terminal.keep_finished.enabled`` is on, so with the setting
+    off this table stays empty and no ``terminals`` row changes. Content-free on
+    purpose: ids, the session, two times and a reason label. A separate table rather
+    than columns on ``terminals`` so the migration is additive (``create_all`` makes
+    it) and the terminal rows themselves stay byte-identical.
+
+    The row is deleted in the same transaction as its terminal row by every
+    database teardown function below, so a reused terminal id can never inherit a
+    stale keep. ``kept_until`` is the end of the keep window; the reaper moves it
+    forward while the child is busy.
+    """
+
+    __tablename__ = "kept_terminals"
+
+    terminal_id = Column(String, primary_key=True)
+    session_name = Column(String, nullable=False)
+    kept_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    kept_until = Column(UTCDateTime, nullable=False)
+    reason = Column(String, nullable=False)  # one of KEEP_REASONS
+    __table_args__ = (Index("ix_kept_terminals_session_name", "session_name"),)
+
+
+# What made CAO keep a terminal (#1225 phase 1).
+KEEP_REASONS = ("handoff", "delete_terminal")
+
+
+class KeptMark(NamedTuple):
+    """What ``mark_terminal_kept`` did (#1225).
+
+    ``written`` is False when the terminal was already marked, in which case nothing
+    was evicted and ``kept_until`` is the existing mark's. ``evicted`` names only the
+    marks this call really removed.
+    """
+
+    written: bool
+    kept_until: datetime
+    evicted: Tuple[str, ...]
+
+
+def _with_kept_until(terminal_query: Any) -> List[Tuple[Any, Optional[datetime]]]:
+    """Run a terminal selection with each row's ``kept_until`` (#1225), in the SAME query.
+
+    An outer join on the keep table's primary key adds no rows and keeps the
+    selection's own ORDER BY, so the listing readers stay at one terminal SELECT
+    (plus the ephemeral membership one) however many terminals they return.
+    """
+    rows = (
+        terminal_query.outerjoin(
+            KeptTerminalModel, KeptTerminalModel.terminal_id == TerminalModel.id
+        )
+        .add_columns(KeptTerminalModel.kept_until)
+        .all()
+    )
+    return [(row[0], as_utc(row[1])) for row in rows]
+
+
 class InboxModel(Base):
     """SQLAlchemy model for inbox messages."""
 
@@ -385,12 +455,17 @@ LAUNCH_TARGET_KINDS = ("installed", "ephemeral", "workflow")
 # ``session_teardown`` (session delete or flow recycle). Every teardown
 # function that finalizes takes one as a required keyword, so a new call site
 # has to choose.
+# ``kept_expired`` and ``kept_evicted`` (#1225) are a kept child torn down by the
+# keep reaper after its idle window, and a kept child torn down to make room under
+# ``terminal.keep_finished.max_per_session``.
 LAUNCH_END_REASONS = (
     "launch_failed",
     "deleted",
     "pane_closed",
     "stale_cleanup",
     "session_teardown",
+    "kept_expired",
+    "kept_evicted",
 )
 
 
@@ -3264,7 +3339,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
             .filter(TerminalModel.tmux_session == tmux_session)
             .order_by(literal_column("terminals.rowid"))
         )
-        terminals = terminal_query.all()
+        terminals_kept = _with_kept_until(terminal_query)
         ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
@@ -3288,9 +3363,11 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # #1225: end of the keep window for a kept child, else None.
+                "kept_until": kept_until,
                 "last_active": t.last_active,
             }
-            for t in terminals
+            for t, kept_until in terminals_kept
         ]
 
 
@@ -3370,7 +3447,7 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
             .filter(TerminalModel.tmux_session.in_(tmux_sessions))
             .order_by(literal_column("terminals.rowid"))
         )
-        terminals = terminal_query.all()
+        terminals_kept = _with_kept_until(terminal_query)
         ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
@@ -3394,9 +3471,11 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # #1225: end of the keep window for a kept child, else None.
+                "kept_until": kept_until,
                 "last_active": t.last_active,
             }
-            for t in terminals
+            for t, kept_until in terminals_kept
         ]
 
 
@@ -3404,7 +3483,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
     """List all terminals."""
     with SessionLocal() as db:
         terminal_query = db.query(TerminalModel)
-        terminals = terminal_query.all()
+        terminals_kept = _with_kept_until(terminal_query)
         ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
@@ -3428,9 +3507,11 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # #1225: end of the keep window for a kept child, else None.
+                "kept_until": kept_until,
                 "last_active": t.last_active,
             }
-            for t in terminals
+            for t, kept_until in terminals_kept
         ]
 
 
@@ -3533,6 +3614,124 @@ def _finalize_launch_records_best_effort(terminal_ids: List[str], end_reason: st
         logger.warning(f"Launch record finalize failed for {terminal_ids}: {e}")
 
 
+def _delete_kept_rows(db: Any, terminal_ids: List[str]) -> None:
+    """Drop the keep marks of terminals deleted in the caller's transaction (#1225)."""
+    if terminal_ids:
+        db.query(KeptTerminalModel).filter(
+            KeptTerminalModel.terminal_id.in_(list(terminal_ids))
+        ).delete(synchronize_session=False)
+
+
+def mark_terminal_kept(
+    terminal_id: str,
+    session_name: str,
+    *,
+    kept_until: datetime,
+    reason: str,
+    evict: Sequence[str] = (),
+) -> Optional[KeptMark]:
+    """Record ``terminal_id`` as kept until ``kept_until`` (#1225).
+
+    ``evict`` names kept terminals whose marks are removed in the SAME
+    transaction, so a session at its cap never shows one keep more than allowed,
+    not even between two commits. Only marks that exist are removed, and only those
+    are reported in ``KeptMark.evicted``; ``terminal_id`` itself is never evicted.
+
+    Returns None, writing nothing (and evicting nothing), when the terminal row no
+    longer exists: a child deleted between its keep decision and this write must
+    not leave a mark behind or cost another child its keep. An existing mark is
+    left as it is (the first keep wins) and nothing is evicted.
+    """
+    if reason not in KEEP_REASONS:
+        raise ValueError(f"unknown keep reason {reason!r}")
+    with SessionLocal() as db:
+        if not db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first():
+            return None
+        existing = db.get(KeptTerminalModel, terminal_id)
+        if existing is not None:
+            return KeptMark(False, cast(datetime, as_utc(existing.kept_until)), ())
+        removed = tuple(
+            tid
+            for tid in dict.fromkeys(evict)
+            if tid != terminal_id and db.get(KeptTerminalModel, tid) is not None
+        )
+        _delete_kept_rows(db, list(removed))
+        db.add(
+            KeptTerminalModel(
+                terminal_id=terminal_id,
+                session_name=session_name,
+                kept_at=_utcnow(),
+                kept_until=kept_until,
+                reason=reason,
+            )
+        )
+        db.commit()
+        return KeptMark(True, kept_until, removed)
+
+
+def unmark_terminal_kept(terminal_id: str) -> bool:
+    """Remove a keep mark without touching the terminal. True when one was removed."""
+    with SessionLocal() as db:
+        removed = (
+            db.query(KeptTerminalModel)
+            .filter(KeptTerminalModel.terminal_id == terminal_id)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+    return removed > 0
+
+
+def get_kept_terminal(terminal_id: str) -> Optional[Dict[str, Any]]:
+    """The keep mark of one terminal, or None."""
+    with SessionLocal() as db:
+        row = db.get(KeptTerminalModel, terminal_id)
+        return _kept_row_dict(row) if row is not None else None
+
+
+def list_kept_terminals(session_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Keep marks, oldest keep first, optionally for one session."""
+    with SessionLocal() as db:
+        query = db.query(KeptTerminalModel)
+        if session_name is not None:
+            query = query.filter(KeptTerminalModel.session_name == session_name)
+        rows = query.order_by(KeptTerminalModel.kept_at, KeptTerminalModel.terminal_id).all()
+        return [_kept_row_dict(row) for row in rows]
+
+
+def extend_kept_until(terminal_id: str, kept_until: datetime) -> bool:
+    """Move a kept terminal's window end to ``kept_until``. False when not kept."""
+    with SessionLocal() as db:
+        row = db.get(KeptTerminalModel, terminal_id)
+        if row is None:
+            return False
+        row.kept_until = kept_until
+        db.commit()
+        return True
+
+
+def delete_orphan_kept_rows() -> int:
+    """Drop keep marks whose terminal row is gone. Returns how many."""
+    with SessionLocal() as db:
+        live = db.query(TerminalModel.id)
+        removed = (
+            db.query(KeptTerminalModel)
+            .filter(~KeptTerminalModel.terminal_id.in_(live))
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+    return removed
+
+
+def _kept_row_dict(row: Any) -> Dict[str, Any]:
+    return {
+        "terminal_id": row.terminal_id,
+        "session_name": row.session_name,
+        "kept_at": as_utc(row.kept_at),
+        "kept_until": as_utc(row.kept_until),
+        "reason": row.reason,
+    }
+
+
 def delete_terminal(terminal_id: str, *, end_reason: str) -> bool:
     """Delete terminal metadata.
 
@@ -3543,6 +3742,7 @@ def delete_terminal(terminal_id: str, *, end_reason: str) -> bool:
     """
     with SessionLocal() as db:
         deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
+        _delete_kept_rows(db, [terminal_id])
         db.commit()
     if deleted:
         _finalize_launch_records_best_effort([terminal_id], end_reason)
@@ -3568,6 +3768,7 @@ def delete_terminals_by_session(tmux_session: str, *, end_reason: str) -> int:
         deleted = (
             db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
         )
+        _delete_kept_rows(db, ids)
         db.commit()
     if ids:
         _finalize_launch_records_best_effort(ids, end_reason)
@@ -3598,6 +3799,7 @@ def delete_terminals_by_ids(terminal_ids: List[str], *, end_reason: str) -> int:
             for terminal_id in dict.fromkeys(terminal_ids)
             if db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
         ]
+        _delete_kept_rows(db, deleted_ids)
         db.commit()
     if deleted_ids:
         _finalize_launch_records_best_effort(deleted_ids, end_reason)
