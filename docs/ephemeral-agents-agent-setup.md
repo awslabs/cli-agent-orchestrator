@@ -422,11 +422,12 @@ every time.
 
 - **Codex** model ids depend on the login. Tool lists are advisory for Codex helpers (they run
   with a shell), while Claude Code and Kiro v3 enforce them.
-- **Kiro v3** refuses a `kiro-cli` version that isn't on CAO's list, with
-  `kiro_v3_unsupported_version` or `kiro_v3_unverified_version`. The reply can be a bare
-  `unexpected_failure`, with the real reason only in the server log. If the version is newer
-  than the listed ones, pin `kiro-cli` back or wait for CAO support; upgrading usually doesn't
-  help. The `kiro.v3_allow_unverified_versions` opt-in is the user's alone to set.
+- **Kiro v3** refuses unsupported `kiro-cli` versions with `kiro_v3_unsupported_version` and
+  pending, unverified versions with `kiro_v3_unverified_version`; the creating agent receives
+  the specific rule and its remedy. Use a supported version for an unsupported refusal, or a
+  verified version for an unverified refusal. `kiro-cli` 3.1.0 is pending: it is refused by
+  default and only the operator can admit it with `kiro.v3_allow_unverified_versions`. Older
+  CAO builds returned a bare `unexpected_failure`, with the real reason only in the server log.
 
 ## 9. Undo
 
@@ -472,7 +473,7 @@ Delete the `settings.json.bak.*` files once the user no longer needs them.
 | `create_ephemeral_agent` is missing from your tools | Your MCP connection is older than `ephemeral.enabled: true` | `/mcp` → reconnect in Claude Code, or restart your terminal |
 | `cao decisions enable jev` says it needs an interactive terminal | An agent ran it | Correct: hand the command to the user (step 5) |
 | Shadow records show `no_answer` | No consent or no key yet | `cao decisions show jev` names which; the user fixes it (step 5) |
-| A Kiro helper fails with a bare `unexpected_failure` | `kiro-cli` isn't on CAO's v3 list | Read the server log for `kiro_v3_…`; see the step 8 caveats |
+| A Kiro helper launch is refused with `kiro_v3_unsupported_version` or `kiro_v3_unverified_version` | Its version is unsupported or pending operator verification | Follow the refusal's remedy; for pending versions, use a verified version or ask the operator to opt in (step 8) |
 | A medium task falls back with `low_confidence` | Confidence was below 0.7 | Normal. Investigate only if it keeps happening on clear-cut tasks |
 
 ## FAQ
