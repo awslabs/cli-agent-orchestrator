@@ -38,4 +38,43 @@ describe("Root", () => {
     expect(document.body.textContent).toContain("Ambient stream: refused (EventSource is not available");
     expect(document.body.textContent).toContain("; token not sent");
   });
+
+  it("P3-2: when the ambient stream opens again after a drop, interrupts are listed again", async () => {
+    const runCalls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        runCalls.push(new URL(url).pathname);
+        return new Response('data: {"type":"RUN_FINISHED","outcome":{"type":"success"}}\n\n');
+      }),
+    );
+    let source: { onopen: ((e: unknown) => void) | null; onerror: ((e: unknown) => void) | null; readyState: number } | undefined;
+    vi.stubGlobal(
+      "EventSource",
+      class {
+        readyState = 1;
+        onopen: ((e: unknown) => void) | null = null;
+        onmessage: ((e: { data: string }) => void) | null = null;
+        onerror: ((e: unknown) => void) | null = null;
+        constructor() {
+          source = this;
+        }
+        close() {}
+      },
+    );
+    await act(async () => {
+      render(<Root choice={{ ok: true, server: "http://127.0.0.1:9889", note: "" }} threadId="t" />);
+    });
+    await act(async () => {
+      source!.onopen!({});
+    });
+    const atMount = runCalls.filter((p) => p === "/agui/v1/run").length;
+    expect(atMount).toBe(1);
+    await act(async () => {
+      source!.readyState = 0;
+      source!.onerror!({});
+      source!.onopen!({});
+    });
+    expect(runCalls.filter((p) => p === "/agui/v1/run").length).toBe(atMount + 1);
+  });
 });

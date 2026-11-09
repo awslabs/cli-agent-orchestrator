@@ -98,6 +98,18 @@ class TestTerminalOperations:
             assert db_mod.terminal_exists("supervisor") is False
             assert db_mod.terminal_exists("") is False
 
+    def test_get_terminal_label_names_only_a_terminal_row(self, test_db):
+        # The AG-UI ambient stream names a terminal it first meets mid-replay
+        # from this, instead of the generic "terminal".
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli", agent_profile="developer")
+            assert db_mod.get_terminal_label("live0001") == {
+                "agent_profile": "developer",
+                "provider": "kimi_cli",
+            }
+            assert db_mod.get_terminal_label("operator") is None
+            assert db_mod.get_terminal_label("") is None
+
     def test_session_incarnation_backfill_is_atomic_when_any_row_is_missing(self, test_db):
         with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
             create_terminal("live0001", "cao-live", "w-live", "kimi_cli")

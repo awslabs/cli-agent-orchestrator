@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import signal
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -143,6 +144,62 @@ def install_uvicorn_exit_hook() -> None:
     uvicorn.Server.handle_exit = handle_exit  # type: ignore[method-assign]
 
 
+def install_signal_stop_hook() -> None:
+    """Make the installed SIGINT/SIGTERM handlers ask the ambient streams to close first.
+
+    For a launch that never runs ``cao-server``'s ``main()``, such as
+    ``uvicorn cli_agent_orchestrator.api.main:app``. Called from the lifespan
+    startup, which uvicorn runs after it installs its own handlers, so it wraps
+    them in place; uvicorn 0.29+ puts its originals back when it stops. A handler that
+    already stops the streams (``install_uvicorn_exit_hook``'s) is left alone.
+    Main thread only, where signal handlers live, and idempotent.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        current = signal.getsignal(sig)
+        if not callable(current) or getattr(current, _HOOK_MARKER, False):
+            continue
+
+        def handler(signum: int, frame: Any, _next: Callable[..., Any] = current) -> None:
+            request_stop()
+            _next(signum, frame)
+
+        setattr(handler, _HOOK_MARKER, True)
+        signal.signal(sig, handler)
+
+
+async def until_stop(source: Any) -> AsyncIterator[Any]:
+    """Yield from ``source`` until the server-stop signal, then end as if it had ended.
+
+    The legacy ``framing=cao-legacy`` stream reads its bus through this, so a stop
+    ends it the way its source ending does, instead of holding uvicorn's shutdown.
+    """
+    waiter = _register_stop_waiter()
+    _, stop_event = waiter
+    it = source.__aiter__()
+    pending: Optional["asyncio.Future[Any]"] = None
+    stop_wait: Optional["asyncio.Future[Any]"] = None
+    try:
+        while True:
+            pending = asyncio.ensure_future(it.__anext__())
+            if stop_wait is None:
+                stop_wait = asyncio.ensure_future(stop_event.wait())
+            done, _ = await asyncio.wait({pending, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if stop_wait in done:
+                return
+            try:
+                item = pending.result()
+            except StopAsyncIteration:
+                return
+            yield item
+    finally:
+        for fut in (pending, stop_wait):
+            if fut is not None and not fut.done():
+                fut.cancel()
+        _unregister_stop_waiter(waiter)
+
+
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
@@ -198,6 +255,7 @@ class AmbientRun:
         state_baseline_known: bool = True,
         since: Optional[str] = None,
         terminal_known: Optional[Callable[[str], bool]] = None,
+        terminal_label: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
     ) -> None:
         self.thread_id = thread_id
         self.run_id = run_id
@@ -206,6 +264,9 @@ class AmbientRun:
         # terminal_id that is neither open on the run nor known to CAO (a label
         # such as "operator" or "supervisor") never becomes a subagent.
         self._terminal_known = terminal_known
+        # The ``agent_profile`` and ``provider`` of a known terminal, to name one
+        # first met mid-replay, before the snapshot that has the names.
+        self._terminal_label = terminal_label
         self._state_baseline_known = state_baseline_known
         self._since = since
         self._snapshot_sent = False
@@ -520,9 +581,15 @@ class AmbientRun:
                 return self._terminals[terminal_id][0]
             sid = subagent_run_id_for_terminal(terminal_id)
             if sid not in self._finished and self._is_known_terminal(terminal_id):
+                label = self._label_of(terminal_id)
                 out.extend(
                     self._open_terminal(
-                        terminal_id, session, name="terminal", provider=None, envelope={}, ts=None
+                        terminal_id,
+                        session,
+                        name=label.get("agent_profile") or label.get("provider") or "terminal",
+                        provider=label.get("provider"),
+                        envelope={},
+                        ts=None,
                     )
                 )
                 return sid
@@ -536,6 +603,15 @@ class AmbientRun:
         except Exception:  # a DB hiccup must not break the stream; attribute conservatively
             logger.debug("ambient_run: terminal lookup failed for %s", terminal_id, exc_info=True)
             return False
+
+    def _label_of(self, terminal_id: str) -> Dict[str, Any]:
+        if self._terminal_label is None:
+            return {}
+        try:
+            return self._terminal_label(terminal_id) or {}
+        except Exception:  # a DB hiccup must not break the stream; keep the generic name
+            logger.debug("ambient_run: label lookup failed for %s", terminal_id, exc_info=True)
+            return {}
 
     def _close_calls_for_terminal(self, terminal_id: str, ts: Optional[int]) -> List[Any]:
         sid = self._terminals.get(terminal_id, (None, ""))[0]

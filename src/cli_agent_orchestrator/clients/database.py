@@ -2883,6 +2883,23 @@ def terminal_exists(terminal_id: str) -> bool:
         )
 
 
+def get_terminal_label(terminal_id: str) -> Optional[Dict[str, Optional[str]]]:
+    """The ``agent_profile`` and ``provider`` of a terminal CAO has a row for, or ``None``.
+
+    Quiet, like ``terminal_exists``. The AG-UI ambient stream names a terminal it
+    first meets mid-replay from this, instead of the generic name "terminal".
+    """
+    if not terminal_id:
+        return None
+    with SessionLocal() as db:
+        row = (
+            db.query(TerminalModel.agent_profile, TerminalModel.provider)
+            .filter(TerminalModel.id == terminal_id)
+            .first()
+        )
+        return None if row is None else {"agent_profile": row[0], "provider": row[1]}
+
+
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Get terminal metadata by ID."""
     import json as _json

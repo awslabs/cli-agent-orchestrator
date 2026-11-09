@@ -334,6 +334,174 @@ def test_server_stop_ends_run_cancelled(monkeypatch: pytest.MonkeyPatch) -> None
     assert "TOOL_CALL_END" in _types(events)  # the open call was closed first
 
 
+def _held_bus(monkeypatch: pytest.MonkeyPatch, live: List[Dict[str, Any]]) -> threading.Event:
+    """A bus that holds its stream open after ``live`` until the returned event is set.
+
+    The test sets it from a safety timer, so a stream that ignores the stop signal
+    still ends, and the test fails on time instead of hanging.
+    """
+    install(monkeypatch)
+    released = threading.Event()
+
+    class _Held:
+        def register(self, overflow_close: bool = False) -> Any:
+            return object()
+
+        def unregister(self, sub: Any) -> None:
+            pass
+
+        async def drain(self, sub: Any):
+            for event in live:
+                yield event
+            while not released.is_set():
+                await asyncio.sleep(0.05)
+
+    monkeypatch.setattr("cli_agent_orchestrator.services.sse_bus.get_bus", lambda: _Held())
+    return released
+
+
+def _get_timed(handler: Any, params: Dict[str, Any], released: threading.Event) -> tuple:
+    """GET the stream, deliver ``handler(SIGTERM)`` after 0.5 s, release the bus at 5 s."""
+    import time
+
+    stop = threading.Timer(0.5, handler, args=(signal.SIGTERM, None))
+    safety = threading.Timer(5.0, released.set)
+    stop.start()
+    safety.start()
+    start = time.monotonic()
+    try:
+        code, body = _get(params)
+    finally:
+        stop.cancel()
+        safety.cancel()
+        released.set()
+    return code, body, time.monotonic() - start
+
+
+def test_server_stop_ends_a_legacy_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review note 2: the exit hook closed only the conformant streams, so an open
+    # framing=cao-legacy stream held uvicorn's shutdown until a second signal.
+    import uvicorn
+
+    released = _held_bus(monkeypatch, [R.SESSION_LAUNCH])
+    monkeypatch.setattr(uvicorn.Server, "handle_exit", uvicorn.Server.handle_exit)
+    ambient_run.install_uvicorn_exit_hook()
+    server = uvicorn.Server(uvicorn.Config(app))
+    code, body, elapsed = _get_timed(server.handle_exit, {"framing": "cao-legacy"}, released)
+    assert code == 200
+    assert elapsed < 4.0, f"the legacy stream ignored the stop signal ({elapsed:.1f} s)"
+    assert server.should_exit
+    assert re.search(r"(?m)^event: ", body)  # it is still the legacy wire
+
+
+def test_the_lifespan_hook_stops_streams_under_a_plain_uvicorn_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review note 2: `uvicorn cli_agent_orchestrator.api.main:app` never runs
+    # main(), so install_uvicorn_exit_hook() never runs either. uvicorn installs
+    # its own signal handler and then runs the lifespan, which wraps it.
+    import uvicorn
+
+    released = _held_bus(monkeypatch, [R.SESSION_LAUNCH])
+    server = uvicorn.Server(uvicorn.Config(app))
+    sigs = (signal.SIGINT, signal.SIGTERM)
+    saved = {sig: signal.getsignal(sig) for sig in sigs}
+    try:
+        for sig in sigs:
+            signal.signal(sig, server.handle_exit)  # what uvicorn's capture_signals does
+        ambient_run.install_signal_stop_hook()
+        handler = signal.getsignal(signal.SIGTERM)
+        code, body, elapsed = _get_timed(handler, {}, released)
+    finally:
+        for sig, previous in saved.items():
+            signal.signal(sig, previous)
+    assert elapsed < 4.0, f"the stream ignored the stop signal ({elapsed:.1f} s)"
+    assert server.should_exit  # uvicorn's own handler still ran
+    events = _conformant("review-note2-plain-uvicorn", body)
+    assert events[-1]["metadata"]["cao"]["endReason"] == "server_stop"
+
+
+def test_the_signal_stop_hook_wraps_once_and_only_a_callable_main_thread_handler() -> None:
+    calls: List[int] = []
+
+    def uvicorns(sig: int, frame: Any) -> None:
+        calls.append(sig)
+
+    saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        signal.signal(signal.SIGTERM, uvicorns)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)  # not a callable: left alone
+
+        worker = threading.Thread(target=ambient_run.install_signal_stop_hook)
+        worker.start()
+        worker.join()
+        assert signal.getsignal(signal.SIGTERM) is uvicorns  # off the main thread: a no-op
+
+        ambient_run.install_signal_stop_hook()
+        wrapped = signal.getsignal(signal.SIGTERM)
+        assert wrapped is not uvicorns
+        assert signal.getsignal(signal.SIGINT) is signal.SIG_DFL
+        ambient_run.install_signal_stop_hook()
+        assert signal.getsignal(signal.SIGTERM) is wrapped  # not wrapped twice
+
+        wrapped(signal.SIGTERM, None)
+        assert calls == [signal.SIGTERM]
+    finally:
+        for sig, previous in saved.items():
+            signal.signal(sig, previous)
+        ambient_run.reset_stop()
+
+
+def test_the_signal_stop_hook_leaves_the_patched_uvicorn_handler_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # cao-server's main() patches uvicorn.Server.handle_exit, so the handler
+    # uvicorn installs is a bound method of the patched function. The marker is
+    # found through the bound method, so the lifespan does not wrap it again.
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn.Server, "handle_exit", uvicorn.Server.handle_exit)
+    ambient_run.install_uvicorn_exit_hook()
+    server = uvicorn.Server(uvicorn.Config(app))
+    saved = signal.getsignal(signal.SIGTERM)
+    try:
+        signal.signal(signal.SIGTERM, server.handle_exit)
+        before = signal.getsignal(signal.SIGTERM)
+        ambient_run.install_signal_stop_hook()
+        assert signal.getsignal(signal.SIGTERM) == before
+    finally:
+        signal.signal(signal.SIGTERM, saved)
+
+
+def test_the_lifespan_startup_installs_the_signal_stop_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: List[str] = []
+    monkeypatch.setattr(ambient_run, "install_signal_stop_hook", lambda: calls.append("hook"))
+    with TestClient(app, base_url="http://localhost"):
+        assert calls == ["hook"]
+
+
+@pytest.mark.parametrize("thread_id", ["bad id!", "x" * 129, ""])
+def test_post_refuses_a_thread_id_the_get_refuses(
+    monkeypatch: pytest.MonkeyPatch, thread_id: str
+) -> None:
+    # Review note 6: one threadId rule for both methods, with the same 400.
+    install(monkeypatch, history=[R.SESSION_LAUNCH])
+    get_code, get_body = _get({"threadId": thread_id})
+    post_code, post_body = _post(_run_input(threadId=thread_id))
+    assert get_code == 400
+    assert post_code == 400, f"POST served threadId {thread_id!r} with {post_code}"
+    assert json.loads(post_body) == json.loads(get_body)
+
+
+def test_post_accepts_a_128_character_thread_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    install(monkeypatch, history=[R.SESSION_LAUNCH])
+    code, body = _post(_run_input(threadId="t" * 128))
+    assert code == 200
+    assert _conformant("review-note6-post-128", body)[0]["threadId"] == "t" * 128
+
+
 def test_max_seconds_ends_run_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     _blocking_bus(monkeypatch, [R.SESSION_LAUNCH])
     code, body = _get({"maxSeconds": 1})
@@ -663,10 +831,17 @@ def test_request_stop_is_reentrant_on_the_lock_holding_thread() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _known_terminals(monkeypatch: pytest.MonkeyPatch, *known: str) -> None:
+def _known_terminals(
+    monkeypatch: pytest.MonkeyPatch, *known: str, labels: Optional[Dict[str, Dict[str, str]]] = None
+) -> None:
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.terminal_exists",
         lambda terminal_id: terminal_id in known,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_label",
+        lambda terminal_id: (labels or {}).get(terminal_id) if terminal_id in known else None,
         raising=False,
     )
 
@@ -773,6 +948,45 @@ def test_a_known_terminal_sender_owns_its_call_before_its_launch_is_seen(
     assert "terminal:cccc3333" in {
         e["subagentRunId"] for e in events if e["type"] == "SUBAGENT_STARTED"
     }
+
+
+def test_a_replay_that_starts_after_a_launch_names_the_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review note 3, replay half: the replay window starts after both terminals'
+    # launch records, and the replay runs before the snapshot that has their
+    # names, so each was first announced with the generic name "terminal".
+    _known_terminals(
+        monkeypatch,
+        "aaaa1111",
+        "bbbb2222",
+        labels={
+            "aaaa1111": {"agent_profile": "supervisor", "provider": "kiro_cli"},
+            "bbbb2222": {"agent_profile": None, "provider": "claude_code"},
+        },
+    )
+    ui_from_b = dict(R.GENERATIVE_UI, id="n3-1", terminal_id="bbbb2222")
+    install(monkeypatch, history=[R.SESSION_LAUNCH, R.HANDOFF, ui_from_b])
+    _, body = _get({"since": SINCE})
+    events = _conformant("review-note3-replay-names", body)
+    started = {e["subagentRunId"]: e for e in events if e["type"] == "SUBAGENT_STARTED"}
+    assert started["terminal:aaaa1111"]["name"] == "supervisor"
+    assert started["terminal:aaaa1111"]["metadata"]["cao"]["provider"] == "kiro_cli"
+    assert started["terminal:bbbb2222"]["name"] == "claude_code"  # no profile: the provider
+
+
+def test_a_label_lookup_failure_keeps_the_generic_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    _known_terminals(monkeypatch, "aaaa1111", "bbbb2222")
+
+    def broken(terminal_id: str) -> Dict[str, str]:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_label", broken)
+    install(monkeypatch, history=[R.SESSION_LAUNCH, R.HANDOFF])
+    _, body = _get({"since": SINCE})
+    events = _conformant("review-note3-label-failure", body)
+    started = {e["subagentRunId"]: e for e in events if e["type"] == "SUBAGENT_STARTED"}
+    assert started["terminal:aaaa1111"]["name"] == "terminal"
 
 
 def test_a_finished_terminal_owns_no_later_event(monkeypatch: pytest.MonkeyPatch) -> None:

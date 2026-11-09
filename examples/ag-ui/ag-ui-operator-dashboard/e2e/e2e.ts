@@ -243,6 +243,50 @@ async function main() {
   log(`PASS the same six on the token POST stream (${tokenFrames} frames; status ${tokenStatus.join(" → ")})`);
   log('PASS off-list emit_ui: HTTP 400 "Unknown UI component \'iframe_embed\'", and nothing on either stream after a 2s settle');
 
+  // 6b. A token stream that drops replays what it missed (#1248 review, P3-2). The first request
+  //     asks the server to end the stream after 2 s (forwardedProps.cao.maxSeconds); the client
+  //     then waits 4 s before reconnecting. A component emitted in that gap must still arrive,
+  //     through forwardedProps.cao.since on the reconnect, and the reopen must be reported.
+  const replayBodies: Array<Record<string, unknown>> = [];
+  const droppingFetch: typeof fetch = (input, init) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    if (replayBodies.length === 0) body.forwardedProps = { cao: { maxSeconds: 2 } };
+    replayBodies.push(body);
+    return appFetch(input, { ...init, body: JSON.stringify(body) });
+  };
+  let replayPanel = emptyPanel();
+  let reopened = 0;
+  const replayStatus: string[] = [];
+  const ambientReplay = openAmbient({
+    base: BASE,
+    threadId: "operator-dashboard-e2e-ambient-replay",
+    token: "e2e-token",
+    fetchImpl: droppingFetch,
+    retryMs: 4000,
+    onFrame: (f) => {
+      replayPanel = reduceFrame(replayPanel, f);
+    },
+    onReopen: () => {
+      reopened += 1;
+    },
+    onStatus: (st) => replayStatus.push(st),
+  });
+  await until(() => replayStatus.includes("open"), "the replay stream to open");
+  // A frame with a timestamp before the drop, so the reconnect has a cursor to send.
+  assert.equal((await emitUi("progress", A.id, { label: "e2e before the drop" })).status, 200);
+  await until(() => replayStatus.includes("reconnecting"), "the server to end the first stream", 10_000);
+  assert.equal((await emitUi("metric", A.id, { label: "e2e during the drop" })).status, 200);
+  // Structural: the component was emitted while no stream was open, so it can only arrive by replay.
+  assert.equal(replayBodies.length, 1, "the reconnect had already started when the component was emitted");
+  const missed = () => replayPanel.entries.some((e) => e.kind === "component" && e.props.label === "e2e during the drop");
+  await until(missed, "the component emitted during the drop to arrive after the reconnect", 15_000);
+  ambientReplay.close();
+  await ambientReplay.done;
+  const since = (replayBodies[1]?.forwardedProps as { cao?: { since?: string } } | undefined)?.cao?.since;
+  assert.ok(since && !Number.isNaN(Date.parse(since)), `the reconnect body carried no forwardedProps.cao.since: ${JSON.stringify(replayBodies[1])}`);
+  assert.equal(reopened, 1);
+  log(`PASS the token stream replays across a drop: the reconnect sent forwardedProps.cao.since=${since}, the component emitted during the drop arrived, and the reopen was reported once`);
+
   // 7. Routes.
   const allowed = new Set<string>(Object.values(ROUTES));
   const outside = appRequests.filter((p) => !allowed.has(p));

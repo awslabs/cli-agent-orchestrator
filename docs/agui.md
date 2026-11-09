@@ -61,7 +61,9 @@ There are two ways in:
 - **`POST /agui/v1/stream`** (the AG-UI binding). The body is a `RunAgentInput`;
   `RUN_STARTED` and `RUN_FINISHED` echo its `threadId` and `runId`. CAO options
   ride in `forwardedProps.cao`: `since` (ISO-8601) and `maxSeconds` (1 to 3600).
-  A body that is not a valid `RunAgentInput` gets `422`. A `protocolVersion`
+  A body that is not a valid `RunAgentInput` gets `422`. A `threadId` outside
+  the GET rule below (letters, digits and `._:-`, up to 128 characters) gets
+  `400`, as on GET. A `protocolVersion`
   with a different major version gets `400`; a newer minor version, or a value
   CAO cannot parse, is served with a server-side warning. Only the published
   `MAJOR.MINOR` form is parsed, so `"2"`, `"2.0.0"` and `"draft"` are served

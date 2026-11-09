@@ -1633,6 +1633,12 @@ async def lifespan(app: FastAPI):
     # only in ``main()`` — so the imported-app deployment path
     # (``uvicorn cli_agent_orchestrator.api.main:app``) is covered too. Idempotent.
     install_access_log_redaction()
+    # The same deployment path never runs main()'s uvicorn exit hook, so wrap the
+    # signal handlers uvicorn has installed by now: a stop then reaches the open
+    # AG-UI streams before uvicorn waits for their connections.
+    from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run_hook
+
+    _ambient_run_hook.install_signal_stop_hook()
     # issues #406 / #709: exactly one cao-server per CAO_HOME_DIR. Taken before
     # the database, the recovery sweeps, the terminal registry, the status
     # monitor and uvicorn's port bind (uvicorn binds after lifespan startup), so
@@ -2319,6 +2325,7 @@ _AGUI_LEGACY_DEPRECATION_LINK = (
 )
 _AGUI_SUB_FRAME_ID_RE = re.compile(r"^([^.]+)\.(\d+)$")
 _AGUI_THREAD_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_AGUI_THREAD_ID_ERROR = "Invalid threadId: 1-128 characters of A-Z a-z 0-9 . _ : -"
 
 
 def _agui_legacy_framing_headers() -> Dict[str, str]:
@@ -2396,6 +2403,7 @@ def _agui_ambient_response(
             state_baseline_known=state_baseline_known,
             since=since,
             terminal_known=lambda terminal_id: _db.terminal_exists(terminal_id),
+            terminal_label=lambda terminal_id: _db.get_terminal_label(terminal_id),
         )
         try:
             async for frame in ambient_stream(
@@ -2545,10 +2553,7 @@ async def agui_stream(
             detail=f"Unknown framing {framing!r}; supported: {sorted(AGUI_STREAM_FRAMINGS)}",
         )
     if thread_id is not None and not _AGUI_THREAD_ID_RE.fullmatch(thread_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid threadId: 1-128 characters of A-Z a-z 0-9 . _ : -",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_AGUI_THREAD_ID_ERROR)
 
     from fastapi.responses import StreamingResponse
 
@@ -2694,9 +2699,12 @@ async def agui_stream(
             # keep-alive on the same interval; otherwise a proxy with a read
             # timeout (CloudFront defaults to 30s) closes the stream.
             from cli_agent_orchestrator.services.agui import run_plane
+            from cli_agent_orchestrator.services.agui.ambient_run import until_stop
 
+            # A server stop ends the drain as if its source had ended, so this
+            # stream does not hold uvicorn's shutdown (review note 2).
             async for event in _with_keepalive(
-                bus.drain(sub), run_plane.RUN_PLANE_HEARTBEAT_SECONDS
+                until_stop(bus.drain(sub)), run_plane.RUN_PLANE_HEARTBEAT_SECONDS
             ):
                 if event is None:
                     yield ":keep-alive\n\n"
@@ -2817,6 +2825,9 @@ async def agui_stream_post(
         raise RequestValidationError(
             [{**err, "loc": ("body", *err["loc"])} for err in e.errors(include_url=False)]
         )
+    # The same threadId rule and 400 as GET (review note 6).
+    if not _AGUI_THREAD_ID_RE.fullmatch(run_input.thread_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_AGUI_THREAD_ID_ERROR)
 
     raw_version = body.get("protocolVersion") if isinstance(body, dict) else None
     if raw_version is not None:

@@ -31,6 +31,8 @@ function Connected({ server, token, note, threadId }: { server: string; token?: 
         token,
         onFrame: (frame) => void store.controller.ambient(frame),
         onStatus: (status, detail) => setAmbientStatus(detail ? `${status} (${detail})` : status),
+        // Anything that started while the stream was down is listed again.
+        onReopen: () => void store.controller.refresh(),
       });
     } catch (error) {
       setAmbientStatus(`refused (${error instanceof Error ? error.message : String(error)})`);
