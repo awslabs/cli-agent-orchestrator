@@ -46,7 +46,7 @@ An agent followed it end to end, the way an agent would for a user. It used a sa
 - the restart check can run before the server is up, so an agent would read a slow start as a failed restart and stop to ask;
 - the page calls a key check safe, but Jev's key is stored once per OS user. On a test install next to the real one, the decider's key commands would act on my real key.
 
-The conductor asked me once, then filed the issue. A docs-only fix was written and tested in bash and zsh. Opening its pull request and posting the status comment both need my OK.
+The conductor asked me once, then filed the issue. A docs-only fix was written and tested in bash and zsh, and its pull request went up as soon as I said yes.
 
 ## The agents behind the conductor
 
