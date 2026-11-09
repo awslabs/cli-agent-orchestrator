@@ -13,11 +13,17 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients.database import (
     Base,
     create_delegation_edge,
+    create_terminal,
+    get_inbox_messages,
+    list_armed_worker_ids,
     list_open_edges_into,
+    list_open_edges_out_of,
+    mark_assign_edges_delivered,
 )
 from cli_agent_orchestrator.models.delegation import EdgeSource
 from cli_agent_orchestrator.services import terminal_service
 
+SVC = "cli_agent_orchestrator.services.delegation_callback_service"
 WORKER = "1e293d67"
 CALLER = "a1b2c3d4"
 TASK = "do the thing"
@@ -132,3 +138,58 @@ class TestDeleteNotifiesWaitingCaller:
             terminal_service.delete_terminal(WORKER, end_reason="deleted")
 
         dismantle.assert_called_once()
+
+
+class TestRowDeletionClosesEdges:
+    """Session teardown, retention cleanup and the stale-row purge delete rows
+    without ``delete_terminal``; the row deletion itself closes the edges."""
+
+    @pytest.fixture
+    def row_deletion(self, edge_db):
+        with (
+            patch.object(terminal_service, "db_delete_terminal", return_value=True),
+            patch.object(terminal_service, "_delete_deferred_failure_fallback"),
+            patch.object(terminal_service, "_delete_deferred_init_complete_fallback"),
+            patch.object(terminal_service, "ephemeral_service"),
+            patch.object(terminal_service, "create_inbox_message") as create_msg,
+        ):
+            yield create_msg
+
+    def test_row_deletion_closes_every_open_edge_without_a_notice(self, row_deletion):
+        create_delegation_edge(CALLER, WORKER, EdgeSource.ASSIGN)
+        mark_assign_edges_delivered(WORKER)
+        create_delegation_edge(WORKER, "c0ffee00", EdgeSource.ASSIGN)
+        assert list_armed_worker_ids() == [WORKER]
+
+        terminal_service.delete_terminal_row(WORKER, None, end_reason="session_teardown")
+
+        assert list_open_edges_into(WORKER) == []
+        assert list_open_edges_out_of(WORKER) == []
+        assert list_armed_worker_ids() == []
+        row_deletion.assert_not_called()
+        assert get_inbox_messages(CALLER) == []
+
+    def test_edge_failure_does_not_block_row_deletion(self, row_deletion):
+        with patch.object(
+            terminal_service,
+            "close_open_edges_for_terminal",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            assert terminal_service.delete_terminal_row(WORKER, None, end_reason="deleted")
+
+    def test_delete_terminal_still_notifies_before_the_row_goes(self, row_deletion):
+        create_terminal(CALLER, "cao-s", "sup", "claude_code")
+        create_delegation_edge(CALLER, WORKER, EdgeSource.ASSIGN)
+        with (
+            patch(f"{SVC}.terminal_service") as worker_pane,
+            patch(f"{SVC}.inbox_service"),
+            patch.object(terminal_service, "capture_terminal_snapshot", return_value={}),
+            patch.object(terminal_service, "dismantle_terminal_runtime", return_value=True),
+        ):
+            worker_pane.get_output.return_value = "half done"
+            terminal_service.delete_terminal(WORKER, end_reason="deleted")
+
+        (notice,) = get_inbox_messages(CALLER)
+        assert notice.message.startswith(f"[CAO worker ended] Worker {WORKER}")
+        assert notice.message.endswith("---\nhalf done")
+        assert list_open_edges_into(WORKER) == []

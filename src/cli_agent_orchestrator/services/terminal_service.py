@@ -6884,6 +6884,15 @@ def delete_terminal_row(
         # DB row was already deleted by another lifecycle owner.
         _delete_deferred_failure_fallback(terminal_id)
         _delete_deferred_init_complete_fallback(terminal_id)
+    # Close every delegation edge still open on this terminal, without a
+    # notice. ``delete_terminal`` has already told waiting callers; session
+    # teardown, retention cleanup and the stale-row purge come straight here,
+    # and an edge they left open would stay armed with no terminal behind it,
+    # re-evaluated by every sweep. Runs even when another owner deleted the row.
+    try:
+        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+    except Exception as exc:  # noqa: BLE001 - best-effort; the row is already gone
+        logger.warning("Could not close delegation edges of %s: %s", terminal_id, exc)
     if deleted:
         ephemeral_service.release(terminal_id, "terminal_gone")
     logger.info(f"Deleted terminal: {terminal_id}")
