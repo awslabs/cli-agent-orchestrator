@@ -268,11 +268,20 @@ class TestProvisionalPendingDecisions:
     qualifies. These assert that structure.
     """
 
-    def test_the_command_verb_is_marked_provisional(self) -> None:
+    def test_the_command_verb_records_the_m1_decision(self) -> None:
+        """M1 was decided (Option A, 2026-09-18), so the verb note says so.
+
+        This asserted ``**provisional**`` until the note was brought in line with
+        design.md, which records the decision. The surface stays gated, and the
+        gate is what ``test_the_unshipped_surfaces_are_named_with_their_gate``
+        pins, so "decided" here cannot be read as "shipped".
+        """
         text = _text(AGENT_PLUGINS_DOC)
 
-        assert "**provisional**" in text
+        assert "The command verb below is **decided**" in text
+        assert "Option A" in text
         assert "M1" in text
+        assert "The command verb below is **provisional**" not in text
 
     def test_the_verb_note_explains_what_the_conflict_is(self) -> None:
         """A bare "provisional" tells a reader nothing about what might change."""
@@ -303,4 +312,6 @@ class TestProvisionalPendingDecisions:
         text = _text(EVENT_PLUGINS_DOC)
 
         assert "M1" in text
-        assert "unsettled" in text.lower() or "open maintainer decision" in text.lower()
+        assert "the verb is decided" in text.lower()
+        assert "unsettled" not in text.lower()
+        assert "cao event-plugin" in text
