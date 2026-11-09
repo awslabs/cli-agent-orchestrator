@@ -4,8 +4,6 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import and_
-
 from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -96,19 +94,10 @@ def cleanup_old_data():
         # historical FIFO/status/Grok cleanup posture, but row deletion now
         # flows through terminal_service.delete_terminal_row so lifecycle
         # sidecars are removed atomically with the registry record instead of
-        # being orphaned by a bulk SQL DELETE. Local rows only: a remote
-        # terminal's row (#745) is the only handle on an agent in its
-        # runtime, which this sweep cannot stop.
+        # being orphaned by a bulk SQL DELETE.
         with SessionLocal() as db:
             old_terminals = list(
-                db.query(TerminalModel)
-                .filter(
-                    and_(
-                        TerminalModel.last_active < cutoff_date,
-                        TerminalModel.runtime_id.is_(None),
-                    )
-                )
-                .all()
+                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
             )
 
         from cli_agent_orchestrator.services import terminal_service

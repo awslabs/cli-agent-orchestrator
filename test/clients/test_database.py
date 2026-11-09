@@ -481,8 +481,7 @@ class TestTerminalOperations:
         mock_session.__exit__ = MagicMock(return_value=False)
 
         mock_query = MagicMock()
-        # Session name, then local rows only: a remote row is never swept (#745).
-        mock_query.filter.return_value.filter.return_value.delete.return_value = 2
+        mock_query.filter.return_value.delete.return_value = 2
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
@@ -1034,9 +1033,7 @@ class TestListSiblingsByGroupPrefix:
         assert by_id["sib-1"]["group"] == ["tenant_1", "project_5", "folder_1"]
         assert by_id["sib-1"]["metadata"] == {"task": "reviewing"}
         assert by_id["sib-2"]["metadata"] is None
-        # runtime_id is internal: list_siblings reads status through it and
-        # drops it from the reported shape (#745).
-        assert all(set(sibling) == {"id", "group", "metadata", "runtime_id"} for sibling in result)
+        assert all(set(sibling) == {"id", "group", "metadata"} for sibling in result)
 
     def test_caller_excluded_from_its_own_results(self, test_db):
         self._seed(
@@ -1804,10 +1801,8 @@ class TestFlowOperations:
         mock_session.__exit__ = MagicMock(return_value=False)
         mock_session_class.return_value = mock_session
 
-        # Receiver terminal exists, and runs on this server (no runtime_id)
-        mock_session.query.return_value.filter.return_value.first.return_value = MagicMock(
-            runtime_id=None
-        )
+        # Receiver terminal exists
+        mock_session.query.return_value.filter.return_value.first.return_value = MagicMock()
 
         # Setup mock to update message attributes on refresh
         def mock_refresh(msg):
@@ -2228,6 +2223,63 @@ class TestTerminalsSchemaMigration:
             ).fetchone()[0]
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
         assert "decision_records" in tables and indexes == 3
+
+    def test_a_beta_database_with_the_removed_runtime_id_column_still_works(
+        self, tmp_path, monkeypatch
+    ):
+        """A database written by 3.0-beta1 keeps ``terminals.runtime_id`` (#745).
+
+        The execution runtimes that added the column are removed, and nothing
+        reads it any more: a row the beta placed in a runtime (``runtime_id``
+        set) is an ordinary row again, and the server opens, migrates and uses
+        the database as before.
+        """
+        db_file = tmp_path / "beta.db"
+        new_engine = create_engine(
+            f"sqlite:///{db_file}", connect_args={"check_same_thread": False}
+        )
+        monkeypatch.setattr(db_mod, "engine", new_engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=new_engine))
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        db_mod.init_db()
+        db_mod.create_terminal("beef0001", "cao-remote", "developer-1", "mock_cli", "developer")
+        db_mod.create_terminal("beef0002", "cao-local", "developer-2", "mock_cli", "developer")
+        # What the beta's migration added, and what it wrote for a runtime's row.
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute("ALTER TABLE terminals ADD COLUMN runtime_id TEXT")
+            conn.execute("CREATE INDEX idx_terminals_runtime_id ON terminals (runtime_id)")
+            conn.execute(
+                "CREATE INDEX idx_terminals_session_runtime ON terminals (tmux_session, runtime_id)"
+            )
+            conn.execute("UPDATE terminals SET runtime_id = 'cao-runtime-0' WHERE id = 'beef0001'")
+            conn.commit()
+        conn.close()
+
+        db_mod.init_db()
+        db_mod.init_db()  # a restart: still idempotent
+
+        # Kept as the beta left it: neither dropped nor cleared, and not added twice.
+        with sqlite3.connect(str(db_file)) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
+            placed = conn.execute(
+                "SELECT id, runtime_id FROM terminals WHERE runtime_id IS NOT NULL"
+            ).fetchall()
+        conn.close()
+        assert columns.count("runtime_id") == 1
+        assert placed == [("beef0001", "cao-runtime-0")]
+
+        remote = db_mod.get_terminal_metadata("beef0001")
+        assert remote is not None and remote["tmux_session"] == "cao-remote"
+        assert "runtime_id" not in remote
+        assert [t["id"] for t in db_mod.list_terminals_by_session("cao-remote")] == ["beef0001"]
+        # The beta refused inbox messages to a runtime's terminal; nothing does now.
+        db_mod.create_inbox_message("beef0002", "beef0001", "hello")
+        db_mod.create_terminal("beef0003", "cao-new", "developer-3", "mock_cli", "developer")
+        assert db_mod.get_terminal_metadata("beef0003") is not None
+        assert db_mod.delete_terminal("beef0001", end_reason="deleted") is True
+        assert db_mod.get_terminal_metadata("beef0001") is None
 
 
 class TestTerminalMetadataRoundTrip:

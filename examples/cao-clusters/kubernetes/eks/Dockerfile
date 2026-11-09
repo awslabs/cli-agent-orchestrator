@@ -92,11 +92,11 @@ RUN set -eux; \
       apk upgrade --no-cache; \
       apk add --no-cache \
         bash ca-certificates-bundle coreutils curl diffutils findutils gawk git \
-        gnutar grep gzip procps py3.12-pip python-3.12 sed shadow tini tmux; \
+        gnutar grep gzip procps py3.12-pip python-3.12 sed shadow tmux; \
     elif command -v apt-get >/dev/null 2>&1; then \
       apt-get update; \
       apt-get install -y --no-install-recommends \
-        tmux git curl ca-certificates procps tini; \
+        tmux git curl ca-certificates procps; \
       rm -rf /var/lib/apt/lists/*; \
     else \
       echo "BASE_PROVIDER_IMAGE has neither apk nor apt-get" >&2; \
@@ -325,7 +325,4 @@ EXPOSE 9889
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${CAO_API_PORT:-9889}/health" || exit 1
 
-# tini is installed, not the entrypoint: the eks/ pods' teardown relies on
-# cao-server being PID 1. A pod whose PID 1 would be cao-bridge, which reaps no
-# children, runs tini first (see remote-runtime/runtime.yaml).
 ENTRYPOINT ["cao-entrypoint"]
