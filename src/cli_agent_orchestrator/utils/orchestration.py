@@ -27,6 +27,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
 
 import requests
@@ -1872,11 +1873,55 @@ async def _run_step_and_build_result(
         message=f"Successfully handed off to {agent_profile}"
         + (f" ({provider})" if provider else "")
         + f"{placement} in {execution_time:.2f}s"
-        + _teardown_sentence(terminal_id, torn_down)
+        + _teardown_or_keep_sentence(terminal_id, data, torn_down)
         + nudge,
         output=output,
         terminal_id=terminal_id,
     )
+
+
+def _format_kept_until(value: Any) -> str:
+    """A keep-window end from the API (ISO 8601) as ``YYYY-MM-DD HH:MM UTC``."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _kept_sentence(terminal_id: Optional[str], kept_until: Any, note: Any) -> str:
+    """The sentence a KEPT worker gets in place of the #1203 teardown sentence (#1225)."""
+    sentence = f". Worker terminal {terminal_id} was kept until {_format_kept_until(kept_until)}."
+    if isinstance(note, str) and note:
+        sentence += f" {note}"
+    return sentence + (
+        f" Read its last answer with `cao agent result {terminal_id}`, "
+        "or open its pane to see what it did."
+    )
+
+
+def _teardown_or_keep_sentence(
+    terminal_id: Optional[str], data: Dict[str, Any], torn_down: bool
+) -> str:
+    """What happened to a handoff's worker: torn down, not torn down, or kept (#1225).
+
+    The #1203 teardown sentence, unchanged, on every path but one: a worker the
+    server KEPT (``kept_until`` set) says "kept until ..." in its place. A keep can
+    never hide a delete that happened -- ``torn_down`` wins if both were ever set.
+    A worker the setting did not keep (the cap, a busy session) gets the teardown
+    sentence and then the server's reason. With the setting off the server sends no
+    keep fields, so this is exactly the #1203 sentence.
+    """
+    note = data.get("keep_note")
+    note = note if isinstance(note, str) and note else ""
+    if data.get("kept_until") and not torn_down:
+        return _kept_sentence(terminal_id, data["kept_until"], note)
+    sentence = _teardown_sentence(terminal_id, torn_down)
+    if note:
+        sentence += f" {note}" if sentence else f". {note}"
+    return sentence
 
 
 # Implementation functions
@@ -2477,19 +2522,33 @@ async def _handoff_impl(
             # errored, or timed-out wait leaves the terminal alive on purpose,
             # so the operator can inspect/recover it via status/result/cancel,
             # which is the entire point of surfacing terminal_id early.
-            cleanup = _delete_terminal_impl(terminal_id, check_binding=False)
-            torn_down = bool(cleanup.get("success"))
-            if not torn_down:
+            # keep_if_enabled: under terminal.keep_finished (#1225) the server keeps
+            # a child worker (one started from inside an agent's pane) instead of
+            # deleting it; a worker started from an operator shell has no caller and
+            # is deleted as before. A kept answer is a success that deleted nothing,
+            # so it never counts as torn down.
+            cleanup = _delete_terminal_impl(terminal_id, check_binding=False, keep_if_enabled=True)
+            kept = cleanup.get("kept") is True
+            torn_down = bool(cleanup.get("success")) and not kept
+            if not cleanup.get("success"):
                 logger.warning(
                     "handoff: post-success teardown of terminal %s failed: %s",
                     terminal_id,
                     cleanup.get("message"),
                 )
             # The step result said "not torn down" because the server was told
-            # teardown=False. Replace that with what this delete actually did.
+            # teardown=False. Replace that with what this delete actually did: a
+            # teardown, a keep (#1225, "kept until ..."), or neither.
+            if kept:
+                replacement = _kept_sentence(
+                    terminal_id, cleanup.get("kept_until"), cleanup.get("keep_note")
+                )
+            else:
+                replacement = _teardown_sentence(terminal_id, torn_down=torn_down)
+                if cleanup.get("keep_note"):
+                    replacement += f" {cleanup['keep_note']}"
             message = result.message.replace(
-                _teardown_sentence(terminal_id, torn_down=False),
-                _teardown_sentence(terminal_id, torn_down=torn_down),
+                _teardown_sentence(terminal_id, torn_down=False), replacement
             )
             if not torn_down:
                 # The terminal is still there, so the cleanup nudge still applies.
@@ -3027,7 +3086,11 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
 
 
 def _delete_terminal_impl(
-    terminal_id: str, target_host: Optional[str] = None, *, check_binding: bool = True
+    terminal_id: str,
+    target_host: Optional[str] = None,
+    *,
+    check_binding: bool = True,
+    keep_if_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Implementation of delete_terminal logic.
 
@@ -3044,6 +3107,15 @@ def _delete_terminal_impl(
     (see ``_target_binding_denial``). Internal callers that are tearing down a
     terminal they created in the same call pass ``False``; the tool and CLI
     paths keep the default.
+
+    ``keep_if_enabled`` (issue #1225 phase 1): sent ONLY by the agent-side callers,
+    the ``delete_terminal`` MCP tool and ``cao agent handoff``'s own post-success
+    teardown. While ``terminal.keep_finished`` is on, cao-server then keeps an idle
+    child instead of deleting it, and the result says ``kept`` and until when.
+    ``cao agent cancel --delete`` and every other operator path leave it False, so
+    they always delete at once. The flag is a convenience, not a security
+    boundary: it can only turn a delete into a keep, never the reverse. False sends
+    exactly the request this function sent before.
     """
     # Hoisted above the try because the HTTPError arm below interpolates it: if
     # it were assigned inside, a raise before that line would turn a reportable
@@ -3055,6 +3127,9 @@ def _delete_terminal_impl(
             denial = _target_binding_denial(terminal_id, base_url=base_url)
             if denial:
                 return {"success": False, "message": denial}
+        delete_kwargs: Dict[str, Any] = (
+            {"params": {"keep_if_enabled": "true"}} if keep_if_enabled else {}
+        )
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
             headers=_auth_headers_for(base_url) or None,
@@ -3062,6 +3137,7 @@ def _delete_terminal_impl(
             # hang for the full read timeout; a local delete keeps its single
             # scalar timeout so default-path behavior is unchanged.
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if target_host else _mcp_timeout(),
+            **delete_kwargs,
         )
         if response.status_code == 409:
             return {
@@ -3081,10 +3157,27 @@ def _delete_terminal_impl(
                     "delete_terminal after the Grok process exits."
                 ),
             }
-        return {
-            "success": True,
-            "message": f"Terminal {terminal_id}{location} deleted successfully",
-        }
+        keep_note = payload.get("keep_note")
+        keep_note = keep_note if isinstance(keep_note, str) and keep_note else None
+        if payload.get("kept") is True:
+            # Nothing was deleted: say so, and until when CAO keeps it (#1225).
+            kept_until = payload.get("kept_until")
+            message = (
+                f"Terminal {terminal_id}{location} was kept until "
+                f"{_format_kept_until(kept_until)}, not deleted."
+            )
+            return {
+                "success": True,
+                "kept": True,
+                "kept_until": kept_until,
+                "keep_note": keep_note,
+                "message": f"{message} {keep_note}" if keep_note else message,
+            }
+        message = f"Terminal {terminal_id}{location} deleted successfully"
+        if keep_note:
+            # Said only while keeping is on: why this one was deleted anyway.
+            return {"success": True, "message": f"{message}. {keep_note}", "keep_note": keep_note}
+        return {"success": True, "message": message}
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return {"success": False, "message": f"Terminal {terminal_id}{location} not found"}
@@ -3124,7 +3217,7 @@ def _status_impl(terminal_id: str) -> Dict[str, Any]:
             }
         response.raise_for_status()
         terminal = response.json()
-        return {
+        result = {
             "success": True,
             "terminal_id": terminal.get("id", terminal_id),
             "status": terminal.get("status"),
@@ -3132,6 +3225,10 @@ def _status_impl(terminal_id: str) -> Dict[str, Any]:
             "provider": terminal.get("provider"),
             "session_name": terminal.get("session_name"),
         }
+        if terminal.get("kept_until"):
+            # #1225: only for a kept child, so the output is unchanged otherwise.
+            result["kept_until"] = terminal["kept_until"]
+        return result
     except requests.HTTPError as exc:
         detail = (
             _extract_error_detail(exc.response, str(exc)) if exc.response is not None else str(exc)

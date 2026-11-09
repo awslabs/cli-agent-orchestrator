@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@ag-ui/client": "1.0.3",
-    "rxjs": "7.8.1"
+    "rxjs": "7.8.2"
   },
   "overrides": {
     "zod": "^4.6.6"

@@ -334,6 +334,29 @@ class TestDeleteWorkflow:
         with pytest.raises(KeyError):
             svc.delete_workflow("twice", scan_dir=str(spec_dir))
 
+    def test_a_file_gone_before_the_remove_drops_the_stale_row(
+        self, isolated_db, spec_dir, monkeypatch
+    ):
+        """The spec file vanishes between the index lookup and ``os.remove`` (a race).
+
+        ``delete_workflow`` must drop the stale index row and raise ``KeyError``.
+        """
+        _write_spec(spec_dir, "raced")
+        svc.list_workflows(scan_dir=str(spec_dir))
+
+        def gone(path):
+            raise FileNotFoundError(path)
+
+        monkeypatch.setattr(svc.os, "remove", gone)
+        with pytest.raises(KeyError):
+            svc.delete_workflow("raced", scan_dir=str(spec_dir))
+        conn = sqlite3.connect(isolated_db)
+        try:
+            row = conn.execute("SELECT 1 FROM workflow_index WHERE name = 'raced'").fetchone()
+        finally:
+            conn.close()
+        assert row is None
+
 
 def _write_script(spec_dir: Path, name: str, body: str = "def main():\n    pass\n") -> Path:
     path = spec_dir / f"{name}.py"

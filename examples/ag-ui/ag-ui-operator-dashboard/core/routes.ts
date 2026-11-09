@@ -7,7 +7,6 @@
 export const ROUTES = {
   stream: "/agui/v1/stream",
   run: "/agui/v1/run",
-  capabilities: "/agui/v1/capabilities",
 } as const;
 
 export type RouteName = keyof typeof ROUTES;

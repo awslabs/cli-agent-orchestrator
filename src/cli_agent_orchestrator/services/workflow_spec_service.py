@@ -64,6 +64,7 @@ from cli_agent_orchestrator.utils.atomic_file import (
     LockUnavailableError,
     strict_identity_lock,
 )
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -663,6 +664,7 @@ def _connect():
         WORKFLOW_SPEC_INDEX_BUSY_TIMEOUT_MS,
     )
 
+    # The caller owns the connection and closes it (closing_transaction).
     conn = sqlite3.connect(str(DATABASE_FILE))
     try:
         conn.execute(f"PRAGMA busy_timeout = {WORKFLOW_SPEC_INDEX_BUSY_TIMEOUT_MS}")
@@ -711,7 +713,7 @@ def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: str) -> Non
         description=description,
         indexed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute(
             "INSERT INTO workflow_index "
             "(name, source_path, mode, step_count, description, indexed_at) "
@@ -750,7 +752,7 @@ def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
         glob.glob(os.path.join(safe_dir, "*.yaml")) + glob.glob(os.path.join(safe_dir, "*.yml"))
     )
     py_paths = sorted(glob.glob(os.path.join(safe_dir, "*.py")))
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute("DELETE FROM workflow_index")
         conn.commit()
     rows = 0
@@ -805,7 +807,7 @@ def list_workflows(scan_dir: Optional[str] = None) -> List[WorkflowIndexRow]:
     O(n²) reads. Resolve the spec once and pass it down instead.
     """
     rebuild_index_from_files(scan_dir)
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         cursor = conn.execute(
             "SELECT name, source_path, mode, step_count, description, indexed_at "
             "FROM workflow_index ORDER BY name"
@@ -836,7 +838,7 @@ def _resolve_source_path(name: str, scan_dir: Optional[str] = None) -> str:
     """
     _validate_name(name)
     rebuild_index_from_files(scan_dir)
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         row = conn.execute(
             "SELECT source_path FROM workflow_index WHERE name = ?", (name,)
         ).fetchone()
@@ -1391,10 +1393,10 @@ def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:
         except FileNotFoundError:
             # The index row pointed at a now-missing file. Drop the stale row and
             # surface the unknown name rather than masking it as success.
-            with _connect() as conn:
+            with closing_transaction(_connect()) as conn:
                 conn.execute("DELETE FROM workflow_index WHERE name = ?", (name,))
                 conn.commit()
             raise KeyError(name)
-        with _connect() as conn:
+        with closing_transaction(_connect()) as conn:
             conn.execute("DELETE FROM workflow_index WHERE name = ?", (name,))
             conn.commit()

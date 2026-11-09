@@ -44,15 +44,21 @@ describe("readFrames", () => {
 });
 
 describe("routes", () => {
-  it("builds the three allowed URLs with or without a trailing slash", () => {
+  it("builds the two allowed URLs with or without a trailing slash", () => {
     expect(urlFor("http://127.0.0.1:9889", "run")).toBe("http://127.0.0.1:9889/agui/v1/run");
-    expect(urlFor("http://127.0.0.1:9889/", "capabilities")).toBe("http://127.0.0.1:9889/agui/v1/capabilities");
+    expect(urlFor("http://127.0.0.1:9889/", "run")).toBe("http://127.0.0.1:9889/agui/v1/run");
     expect(urlFor("http://h:1", "stream", { threadId: "t 1" })).toBe("http://h:1/agui/v1/stream?threadId=t+1");
   });
 
   it("allows only the listed paths", () => {
-    expect(Object.values(ROUTES).sort()).toEqual(["/agui/v1/capabilities", "/agui/v1/run", "/agui/v1/stream"]);
-    for (const path of ["/agui/v1/interrupts/x/resume", "/agui/v1/emit_ui", "/terminals/abc/output", "/sessions"]) {
+    expect(Object.values(ROUTES).sort()).toEqual(["/agui/v1/run", "/agui/v1/stream"]);
+    for (const path of [
+      "/agui/v1/capabilities",
+      "/agui/v1/interrupts/x/resume",
+      "/agui/v1/emit_ui",
+      "/terminals/abc/output",
+      "/sessions",
+    ]) {
       expect(() => assertAllowed(`http://h${path}`)).toThrow(/route not allowed/);
     }
     expect(() => assertAllowed("http://h/agui/v1/run?x=1")).not.toThrow();

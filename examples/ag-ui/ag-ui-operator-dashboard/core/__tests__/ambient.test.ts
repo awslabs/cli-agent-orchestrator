@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { openAmbient, parseData, type EventSourceLike } from "../ambient.ts";
+import { openAmbient, parseData, SINCE_MARGIN_MS, type EventSourceLike } from "../ambient.ts";
 import type { Frame } from "../types.ts";
 import { fakeFetch, fixtureText, sse } from "./helpers.ts";
 
@@ -56,6 +56,44 @@ describe("openAmbient without a token: EventSource on GET", () => {
     expect(frames).toEqual([{ type: "RUN_STARTED" }]);
     expect(status).toEqual(["connecting", "open", "reconnecting", "closed"]);
     expect(es.closed).toBe(true);
+  });
+
+  it("P3-2: an EventSource opened again after an accepted stream dropped calls onReopen; the first open does not", () => {
+    let reopened = 0;
+    const handle = openAmbient({
+      base: BASE,
+      threadId: "dash",
+      onFrame: () => {},
+      onReopen: () => (reopened += 1),
+      eventSourceImpl: FakeEventSource,
+    });
+    const es = FakeEventSource.last;
+    es.onopen!({});
+    expect(reopened).toBe(0);
+    es.readyState = 0;
+    es.onerror!({});
+    es.onopen!({});
+    expect(reopened).toBe(1);
+    es.onopen!({}); // a second open without a drop in between is not a reopen
+    expect(reopened).toBe(1);
+    handle.close();
+  });
+
+  it("P3-2: an EventSource that fails while connecting and then opens for the first time is not a reopen", () => {
+    let reopened = 0;
+    const handle = openAmbient({
+      base: BASE,
+      threadId: "dash",
+      onFrame: () => {},
+      onReopen: () => (reopened += 1),
+      eventSourceImpl: FakeEventSource,
+    });
+    const es = FakeEventSource.last;
+    es.readyState = 0; // still CONNECTING: the browser retries on its own
+    es.onerror!({});
+    es.onopen!({});
+    expect(reopened).toBe(0);
+    handle.close();
   });
 
   it("a stream the browser gives up on is 'refused', not endless reconnecting", () => {
@@ -134,6 +172,52 @@ describe("openAmbient with a token: fetch on POST", () => {
     ]);
     const runIds = calls.map((c) => (c.body as { runId: string }).runId);
     expect(new Set(runIds).size).toBe(4);
+  });
+
+  it("P3-2: each reconnect replays from the last frame seen, and a reopen lists interrupts again", async () => {
+    const { fetch, calls } = fakeFetch([
+      { sse: sse({ type: "RUN_STARTED" }, { type: "CUSTOM", name: "x", timestamp: 1_793_994_274_723 }) },
+      { throws: new TypeError("Failed to fetch") },
+      { sse: sse({ type: "RUN_STARTED" }, { type: "CUSTOM", name: "y", timestamp: 1_793_994_280_001 }) },
+      { hang: true },
+    ]);
+    let reopened = 0;
+    const handle = openAmbient({
+      base: BASE,
+      threadId: "t",
+      token: "k",
+      onFrame: () => {},
+      onReopen: () => (reopened += 1),
+      fetchImpl: fetch,
+      retryMs: 1,
+    });
+    while (calls.length < 4) await new Promise((r) => setTimeout(r, 2));
+    handle.close();
+    await handle.done;
+    const since = calls.map((c) => (c.body as { forwardedProps?: { cao?: { since?: string } } }).forwardedProps?.cao?.since);
+    expect(since).toEqual([
+      undefined, // the first stream asks for live frames only
+      "2026-11-06T19:44:34.723Z", // the last frame seen, after the stream ended
+      "2026-11-06T19:44:34.723Z", // unchanged across a failed attempt
+      "2026-11-06T19:44:40.001Z",
+    ]);
+    // The first open is not a reopen; the second accepted stream is.
+    expect(reopened).toBe(1);
+  });
+
+  it("P3-2: before any frame carries a timestamp, a reconnect replays from just before the first open", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_793_994_300_000);
+    try {
+      const { fetch, calls } = fakeFetch([{ sse: sse({ type: "RUN_STARTED" }) }, { hang: true }]);
+      const handle = openAmbient({ base: BASE, threadId: "t", token: "k", onFrame: () => {}, fetchImpl: fetch, retryMs: 1 });
+      while (calls.length < 2) await new Promise((r) => setTimeout(r, 2));
+      handle.close();
+      await handle.done;
+      const body = calls[1].body as { forwardedProps: { cao: { since: string } } };
+      expect(body.forwardedProps.cao.since).toBe(new Date(1_793_994_300_000 - SINCE_MARGIN_MS).toISOString());
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   it("an HTTP refusal is 'refused' and is not retried; a non-Error throw is reported as text", async () => {

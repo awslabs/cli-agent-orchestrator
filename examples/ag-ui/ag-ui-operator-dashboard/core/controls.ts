@@ -12,8 +12,17 @@ export type Decision =
   | { kind: "deny" }
   | { kind: "edit"; text: string };
 
-/** CAO types at most this many characters of edited text (handoff_approval.py). */
+/**
+ * The longest edited text CAO accepts, counted as Python's `len()` counts it:
+ * in code points. Longer text is not cut: `handoff_approval.py` refuses it, and
+ * the run plane answers that entry with `RUN_ERROR`, which stops the batch there.
+ */
 export const EDIT_MAX_CHARS = 4000;
+
+/** Length in code points, as Python's `len()` counts a `str` (an emoji is 1, not 2). */
+export function codePoints(text: string): number {
+  return [...text].length;
+}
 
 /**
  * Text the server would treat as blank. It tests `editedArgs.strip()`, and
@@ -41,8 +50,11 @@ export type PayloadResult = { ok: true; entry: ResumeEntry } | { ok: false; reas
  * - Edit is refused when the interrupt does not offer it.
  * - Blank or whitespace-only edit text is refused: the server would apply it
  *   as an approve.
- * - Edit text must be one line and at most {@link EDIT_MAX_CHARS} characters,
- *   because the server would otherwise cut it silently.
+ * - Edit text must be one line: the server would cut it without notice,
+ *   dropping carriage returns and everything after the first line feed.
+ * - Edit text must be at most {@link EDIT_MAX_CHARS} code points: the server
+ *   refuses longer text with `RUN_ERROR`, and that stops the whole batch at
+ *   that entry.
  * - Edit always sends `approved: true`; `approved: false` with text is a deny.
  */
 export function payloadFor(
@@ -66,7 +78,7 @@ export function payloadFor(
   if (/[\r\n]/.test(text)) {
     return { ok: false, reason: "edited text must be a single line" };
   }
-  if (text.length > EDIT_MAX_CHARS) {
+  if (codePoints(text) > EDIT_MAX_CHARS) {
     return { ok: false, reason: `edited text is longer than ${EDIT_MAX_CHARS} characters` };
   }
   return {

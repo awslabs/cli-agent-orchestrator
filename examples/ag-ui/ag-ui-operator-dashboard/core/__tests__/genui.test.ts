@@ -6,6 +6,8 @@ import {
   approvalHintProps,
   emptyPanel,
   entryFor,
+  MAX_PANEL_ENTRIES,
+  MAX_SEEN_EVENT_IDS,
   ownerText,
   propRows,
   reduceFrame,
@@ -121,5 +123,33 @@ describe("edge shapes", () => {
       ["u", "und…"],
       ["s", "abc…"],
     ]);
+  });
+});
+
+describe("bounded panel (Note 3)", () => {
+  const metric = (n: number): Frame => ({
+    type: "CUSTOM",
+    name: "cao.generative_ui",
+    value: { component: "metric", props: { n } },
+    metadata: { cao: { eventId: `e${n}` } },
+  });
+
+  it(`keeps only the newest ${MAX_PANEL_ENTRIES} entries`, () => {
+    let panel = emptyPanel();
+    for (let n = 1; n <= MAX_PANEL_ENTRIES + 5; n += 1) panel = reduceFrame(panel, metric(n));
+    expect(panel.entries).toHaveLength(MAX_PANEL_ENTRIES);
+    expect(panel.entries[0].eventId).toBe("e6");
+    expect(panel.entries.at(-1)!.eventId).toBe(`e${MAX_PANEL_ENTRIES + 5}`);
+  });
+
+  it(`remembers the newest ${MAX_SEEN_EVENT_IDS} event ids, so a replay of a dropped entry stays dropped`, () => {
+    let panel = emptyPanel();
+    for (let n = 1; n <= MAX_SEEN_EVENT_IDS + 1; n += 1) panel = reduceFrame(panel, metric(n));
+    expect(panel.seen.size).toBe(MAX_SEEN_EVENT_IDS);
+    expect(panel.seen.has("e1")).toBe(false);
+    expect(panel.seen.has("e2")).toBe(true);
+    // e300 left the panel long ago but is still remembered: a replay is not re-added.
+    expect(panel.entries.some((e) => e.eventId === "e300")).toBe(false);
+    expect(reduceFrame(panel, metric(300))).toBe(panel);
   });
 });

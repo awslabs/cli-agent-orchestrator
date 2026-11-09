@@ -1,6 +1,7 @@
 """Helper probe refusals cross the real API and reach their creator unchanged."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from test.providers.kiro_helper_support import operator_home  # noqa: F401
 from test.services.test_ephemeral_service import CALLER, create_store  # noqa: F401
 from test.services.test_kiro_helper_launch import (  # noqa: F401
@@ -11,14 +12,21 @@ from test.services.test_kiro_helper_launch import (  # noqa: F401
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
 from cli_agent_orchestrator.api import main
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.plugins.registry import PluginRegistry
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilityError
 from cli_agent_orchestrator.providers.kiro_v3_schema import SUPPORTED_KIRO_CLI_VERSIONS
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.utils import orchestration
+
+# TestClient's lifespan and HTTP workers need independent connections.
+# StaticPool's single in-memory connection lets a background session's
+# rollback undo the claim transaction, producing spurious 409 refusals.
+pytestmark = pytest.mark.parametrize("create_store", ["file"], indirect=True)
 
 
 @pytest.fixture
@@ -132,3 +140,34 @@ def test_installed_probe_refusal_keeps_plain_string_400(helper_http, monkeypatch
     )
     assert response.status_code == 400, response.text
     assert response.content == json.dumps({"detail": message}, separators=(",", ":")).encode()
+
+
+def test_claim_survives_background_reader(helper_http):
+    """A lifespan reader must not roll back the HTTP claim's transaction."""
+    engine = helper_http.env[1].kw["bind"]
+    reads = []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+
+        def read_during_claim(conn, cursor, statement, parameters, context, executemany):
+            if statement.startswith("UPDATE ephemeral_agents SET state=") and (
+                "claim_expires_at=" in statement
+            ):
+                # flow_daemon reads immediately at startup. Force its session to
+                # close between the claim UPDATE and commit, without a timer.
+                reads.append(pool.submit(database.get_flows_to_run).result(timeout=5))
+
+        event.listen(engine, "after_cursor_execute", read_during_claim)
+        try:
+            response = orchestration.requests.post(
+                f"{orchestration.API_BASE_URL}/ephemeral-agents/{helper_http.name}/claim",
+                params={"caller_id": CALLER},
+                json={},
+            )
+        finally:
+            event.remove(engine, "after_cursor_execute", read_during_claim)
+
+    assert reads == [[]]
+    assert response.status_code == 200, response.text
+    row = database.get_ephemeral_agent(helper_http.name)
+    assert row["state"] == "claimed"
+    assert row["claim_id"] == response.json()["claim_id"]

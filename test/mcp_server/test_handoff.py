@@ -692,7 +692,9 @@ class TestHandoffEarlyTerminalId:
             )
 
         assert result.success is True
-        mock_delete.assert_called_once_with("dev-t1", check_binding=False)
+        # keep_if_enabled (#1225): the server keeps a child worker only while
+        # terminal.keep_finished is on; with it off this is the same delete.
+        mock_delete.assert_called_once_with("dev-t1", check_binding=False, keep_if_enabled=True)
 
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
@@ -749,7 +751,9 @@ class TestHandoffEarlyTerminalId:
             )
 
         assert result.success is True
-        mock_delete.assert_called_once_with("dev-t1", check_binding=False)
+        # keep_if_enabled (#1225): the server keeps a child worker only while
+        # terminal.keep_finished is on; with it off this is the same delete.
+        mock_delete.assert_called_once_with("dev-t1", check_binding=False, keep_if_enabled=True)
 
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
