@@ -7,6 +7,9 @@ Keep `ephemeral.enabled` false outside testing. It defaults to false, and stays 
 the rest of the lifecycle cleanup work (#1079) ships and creating an ephemeral agent from
 inside a workflow step is refused (#1080). The cleanup described below is not enough on its own.
 
+To have an agent set up ephemeral agents and a decider for you, point it at
+[the setup runbook](ephemeral-agents-agent-setup.md).
+
 ## Operator settings
 
 The operator-only `ephemeral` block in `settings.json` has these defaults:
@@ -489,10 +492,21 @@ CAO opens `/mcp list` again until it runs, or until `provider_init_timeout` (60 
 default) has passed; see [How long CAO waits for MCP servers](kiro-cli.md#how-long-cao-waits-for-mcp-servers).
 Every refusal and its fix is in the
 [Kiro helper symptom table](kiro-cli.md#when-a-helper-is-refused). CAO's own refusals
-before the window are `ephemeral_policy` errors. The probe's refusals before the window
-(an unsupported kiro-cli version, or a missing wrapper flag) keep their capability-error
-shape: a 400 whose detail is a plain string. The later ones are 400s with a message, and
-a deferred failure records the `rule`.
+before the window, including probe refusals for an unsupported kiro-cli version or a
+missing wrapper flag, are structured `ephemeral_policy` errors. Other final probe
+failures use `missing_executable`, `timeout` (the probe timed out), or `malformed_output`;
+these are also structured and counted. Their rule and message reach the creator through
+assign and handoff, and the refusal is counted in the name's archive. Version and missing
+flag refusals carry a remedy suitable for a helper, which runs only on v3.
+
+Installed-profile probe refusals keep their plain-string 400 detail. After an ephemeral
+claim, only structured `ephemeral_policy` launch refusals are relayed. Other launch
+failures, including plain-string details, non-JSON bodies and 424 replays, keep the generic
+`ephemeral launch failed (<status>)` message with `unexpected_failure`.
+
+Relayed policy launch messages are bounded to 4096 decoded characters before whitespace
+runs are replaced with a single space and other non-printable characters are removed.
+The later refusals are 400s with a message, and a deferred failure records the `rule`.
 
 On release, after the window is killed, CAO stops every process whose `KIRO_HOME` is the
 home (SIGTERM, then SIGKILL). A process whose `CAO_TERMINAL_ID` names another terminal is

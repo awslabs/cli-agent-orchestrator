@@ -9,6 +9,7 @@ the result from outside. Each does nothing unless that test sets
 import json
 import os
 import subprocess
+from test import conftest
 
 import pytest
 
@@ -36,7 +37,22 @@ def _tmux_env() -> dict:
 
 def test_bare_kill_server():
     _require("kill-server")
+    # Fail closed, like the in-suite test: run a bare kill-server only when this
+    # session's conftest isolated tmux, so it can reach nothing but the private dir.
+    tmpdir = conftest._ISOLATED_TMUX.get("tmpdir")
+    tmux, tmux_tmpdir = os.environ.get("TMUX"), os.environ.get("TMUX_TMPDIR")
+    if not tmpdir or tmux is not None or tmux_tmpdir != tmpdir:
+        pytest.fail(
+            "the session environment is not isolated; not running a bare kill-server",
+            pytrace=False,
+        )
     subprocess.run(["tmux", "kill-server"], capture_output=True, timeout=10, check=False)
+
+
+def test_report_tmux_env():
+    """Report what conftest isolated and the tmux variables as this session sees them."""
+    _require("report-env")
+    _report({"isolated_tmux": dict(conftest._ISOLATED_TMUX), "env": _tmux_env()})
 
 
 def test_leave_a_server_running():

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
     List,
     Literal,
@@ -106,7 +107,7 @@ from cli_agent_orchestrator.decisions.engine import (
     launch_note,
     prepare_launch,
 )
-from cli_agent_orchestrator.decisions.owner import WORKFLOW_STEP, launch_owner
+from cli_agent_orchestrator.decisions.owner import DELEGATION, WORKFLOW_STEP, launch_owner
 from cli_agent_orchestrator.decisions.policy import DecisionInputError
 from cli_agent_orchestrator.decisions.targets import TargetKind, profile_source
 from cli_agent_orchestrator.decisions.types import LaunchPlan
@@ -161,6 +162,7 @@ from cli_agent_orchestrator.services import (
     approval_store,
     ephemeral_service,
     flow_service,
+    keep_service,
     manifest_freeze,
     secret_gate,
     session_service,
@@ -302,6 +304,24 @@ async def ephemeral_sweep_daemon() -> None:
             await asyncio.to_thread(ephemeral_service.sweep, False)
         except Exception:
             logger.exception("Ephemeral sweep daemon error")
+
+
+async def kept_terminal_reaper_daemon(registry: PluginRegistry) -> None:
+    """Background task that tears down kept children past their idle window (#1225).
+
+    The same shape as ``ephemeral_sweep_daemon``: the work runs in a worker thread
+    and every error is logged and swallowed, so this task cannot die and break the
+    lifespan shutdown. The first pass runs at startup, so a window that ended while
+    the server was down is honoured at once. With nothing kept a pass is one
+    SELECT on an empty table.
+    """
+    logger.info("Kept-terminal reaper started")
+    while True:
+        try:
+            await asyncio.to_thread(keep_service.reap, registry)
+        except Exception:
+            logger.exception("Kept-terminal reaper error")
+        await asyncio.sleep(keep_service.REAPER_INTERVAL_SECONDS)
 
 
 # Response Models
@@ -844,6 +864,22 @@ class RunStepResponse(BaseModel):
             "ORIGINAL terminal_id, which names a terminal that no longer "
             "exists, and this flag is the only thing that stops a consumer "
             "reading, writing to, or waiting on a dead id."
+        ),
+    )
+    kept_until: Optional[datetime] = Field(
+        default=None,
+        description=(
+            "Set only when a handoff's worker was KEPT instead of torn down "
+            "(terminal.keep_finished, issue #1225): the end of its keep window. "
+            "Absent from the body otherwise."
+        ),
+    )
+    keep_note: Optional[str] = Field(
+        default=None,
+        description=(
+            "Set only while keeping finished agents is on and it applied to this "
+            "worker: one sentence saying whether it was kept and why, including any "
+            "kept agent torn down to stay within the per-session cap. Absent otherwise."
         ),
     )
 
@@ -1597,6 +1633,12 @@ async def lifespan(app: FastAPI):
     # only in ``main()`` — so the imported-app deployment path
     # (``uvicorn cli_agent_orchestrator.api.main:app``) is covered too. Idempotent.
     install_access_log_redaction()
+    # The same deployment path never runs main()'s uvicorn exit hook, so wrap the
+    # signal handlers uvicorn has installed by now: a stop then reaches the open
+    # AG-UI streams before uvicorn waits for their connections.
+    from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run_hook
+
+    _ambient_run_hook.install_signal_stop_hook()
     # issues #406 / #709: exactly one cao-server per CAO_HOME_DIR. Taken before
     # the database, the recovery sweeps, the terminal registry, the status
     # monitor and uvicorn's port bind (uvicorn binds after lifespan startup), so
@@ -1771,6 +1813,9 @@ async def lifespan(app: FastAPI):
     # the immediate and event-driven status paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
     ephemeral_sweep_task = asyncio.create_task(ephemeral_sweep_daemon())
+    # #1225: report an ON or invalid keep setting once, then reap kept children.
+    keep_service.log_startup_posture()
+    kept_reaper_task = asyncio.create_task(kept_terminal_reaper_daemon(registry))
 
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
@@ -1860,6 +1905,13 @@ async def lifespan(app: FastAPI):
     ephemeral_sweep_task.cancel()
     try:
         await ephemeral_sweep_task
+    except asyncio.CancelledError:
+        pass
+
+    # Same for the kept-terminal reaper (#1225).
+    kept_reaper_task.cancel()
+    try:
+        await kept_reaper_task
     except asyncio.CancelledError:
         pass
 
@@ -2273,6 +2325,7 @@ _AGUI_LEGACY_DEPRECATION_LINK = (
 )
 _AGUI_SUB_FRAME_ID_RE = re.compile(r"^([^.]+)\.(\d+)$")
 _AGUI_THREAD_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_AGUI_THREAD_ID_ERROR = "Invalid threadId: 1-128 characters of A-Z a-z 0-9 . _ : -"
 
 
 def _agui_legacy_framing_headers() -> Dict[str, str]:
@@ -2297,6 +2350,7 @@ def _agui_ambient_response(
     from ag_ui.encoder import EventEncoder
     from fastapi.responses import StreamingResponse
 
+    from cli_agent_orchestrator.clients import database as _db
     from cli_agent_orchestrator.clients.database import get_session_incarnation
     from cli_agent_orchestrator.services.agui import run_plane
     from cli_agent_orchestrator.services.agui.ambient_run import AmbientRun, ambient_stream
@@ -2348,6 +2402,8 @@ def _agui_ambient_response(
             incarnation_of=get_session_incarnation,
             state_baseline_known=state_baseline_known,
             since=since,
+            terminal_known=lambda terminal_id: _db.terminal_exists(terminal_id),
+            terminal_label=lambda terminal_id: _db.get_terminal_label(terminal_id),
         )
         try:
             async for frame in ambient_stream(
@@ -2497,10 +2553,7 @@ async def agui_stream(
             detail=f"Unknown framing {framing!r}; supported: {sorted(AGUI_STREAM_FRAMINGS)}",
         )
     if thread_id is not None and not _AGUI_THREAD_ID_RE.fullmatch(thread_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid threadId: 1-128 characters of A-Z a-z 0-9 . _ : -",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_AGUI_THREAD_ID_ERROR)
 
     from fastapi.responses import StreamingResponse
 
@@ -2646,9 +2699,12 @@ async def agui_stream(
             # keep-alive on the same interval; otherwise a proxy with a read
             # timeout (CloudFront defaults to 30s) closes the stream.
             from cli_agent_orchestrator.services.agui import run_plane
+            from cli_agent_orchestrator.services.agui.ambient_run import until_stop
 
+            # A server stop ends the drain as if its source had ended, so this
+            # stream does not hold uvicorn's shutdown (review note 2).
             async for event in _with_keepalive(
-                bus.drain(sub), run_plane.RUN_PLANE_HEARTBEAT_SECONDS
+                until_stop(bus.drain(sub)), run_plane.RUN_PLANE_HEARTBEAT_SECONDS
             ):
                 if event is None:
                     yield ":keep-alive\n\n"
@@ -2769,6 +2825,9 @@ async def agui_stream_post(
         raise RequestValidationError(
             [{**err, "loc": ("body", *err["loc"])} for err in e.errors(include_url=False)]
         )
+    # The same threadId rule and 400 as GET (review note 6).
+    if not _AGUI_THREAD_ID_RE.fullmatch(run_input.thread_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_AGUI_THREAD_ID_ERROR)
 
     raw_version = body.get("protocolVersion") if isinstance(body, dict) else None
     if raw_version is not None:
@@ -3922,9 +3981,9 @@ async def get_skill_content(
 # Agent Plugins (Agent Plugins 1.0.0) — NOT the event-plugin system
 # =============================================================================
 # Added inline next to the /skills and /settings/skill-dirs handlers because
-# api/main.py is flat (no routers package). Naming is unresolved maintainer
-# decision M1; per requirements.md 16.5 this surface must not ship to end users
-# before that is settled, so every route below is gated on
+# api/main.py is flat (no routers package). The naming is decision M1, recorded
+# by the issue author in #573; the surface does not ship to end users until it
+# graduates (#1244), so every route below is gated on
 # CAO_AGENT_PLUGINS_ENABLED (default off) and 404s without it — the routes are
 # constructed but not executable, mirroring the AG-UI gate above. The scope
 # dependencies are authorization, not the gate: they are a no-op when auth is
@@ -5544,6 +5603,9 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
 @app.post(
     TERMINALS_RUN_STEP_ROUTE,
     response_model=RunStepResponse,
+    # The two #1225 keep fields are the only Optional ones, so this keeps every
+    # response body without a keep byte-identical to the one before #1225.
+    response_model_exclude_none=True,
     summary="Run one agent step (shared substrate)",
     description=(
         "Failure contract: a non-2xx body is a structured object "
@@ -5905,7 +5967,35 @@ async def run_step(
                 body.claim_id,
                 body.caller_id,
             )
+        # #1225 phase 1: a handoff's worker may be kept instead of torn down. Only
+        # the shape the handoff MCP tool sends qualifies -- a fresh terminal, a
+        # handoff delegation with a recorded caller on THIS node, no workflow
+        # identity -- so workflow steps, reuse calls and remote handoffs (which
+        # carry no caller_id) keep their teardown. The hook runs at the success
+        # teardown only; whether to keep is decided there, by the setting.
+        keep_outcomes: List[keep_service.KeepOutcome] = []
+        keep_hook: Optional[Callable[[str], bool]] = None
+        if (
+            body.teardown
+            and body.reuse_terminal_id is None
+            and body.orchestration_type == "handoff"
+            and body.caller_id is not None
+            and not body.env_vars
+            and owner == DELEGATION
+        ):
+            keep_registry = get_plugin_registry(request)
+
+            def _keep_handoff_worker(terminal_id: str) -> bool:
+                outcome = keep_service.keep_finished(
+                    terminal_id, reason="handoff", registry=keep_registry
+                )
+                keep_outcomes.append(outcome)
+                return outcome.kept
+
+            keep_hook = _keep_handoff_worker
+
         result = await run_agent_step(
+            keep_on_success=keep_hook,
             provider=body.provider,
             agent=body.agent,
             prompt=body.prompt,
@@ -5946,10 +6036,12 @@ async def run_step(
             result.status.value if hasattr(result.status, "value") else str(result.status)
         )
         _settle_step(result.terminal_id, None, result.last_message, response_status)
+        keep_outcome = keep_outcomes[0] if keep_outcomes else keep_service.NOT_APPLICABLE
         _schedule_elastic_terminal_ended(
             background_tasks,
             result.terminal_id,
-            teardown=body.teardown,
+            # A kept worker has not ended.
+            teardown=body.teardown and not keep_outcome.kept,
             reuse_terminal_id=body.reuse_terminal_id,
         )
 
@@ -5963,7 +6055,10 @@ async def run_step(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
             status=response_status,
+            # False for a kept worker: it was not torn down (#1203 / #1225).
             torn_down=result.torn_down,
+            kept_until=keep_outcome.kept_until if keep_outcome.kept else None,
+            keep_note=keep_outcome.note,
         )
     except ReplayDivergenceError as e:
         # FR-3's surfacing (BR-6/BR-7, TD-3/TD-4). 409 rather than 502/504 because
@@ -9342,9 +9437,39 @@ async def get_handoff_result_endpoint(
 async def delete_terminal(
     request: Request,
     terminal_id: TerminalId,
+    keep_if_enabled: bool = Query(
+        default=False,
+        description=(
+            "Sent by the agent-side delete_terminal MCP tool (issue #1225). While "
+            "terminal.keep_finished is on, an idle child terminal is KEPT instead of "
+            "deleted and the response says until when. A convenience flag, not an "
+            "identity check: any request without it deletes immediately, which is "
+            "what every operator surface sends."
+        ),
+    ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     """Delete a terminal."""
+    keep_note: Optional[str] = None
+    if keep_if_enabled:
+        try:
+            outcome = await asyncio.to_thread(
+                keep_service.keep_finished,
+                terminal_id,
+                reason="delete_terminal",
+                registry=get_plugin_registry(request),
+            )
+        except Exception as exc:  # noqa: BLE001 — a keep failure falls back to the delete
+            logger.warning("delete_terminal: keep decision for %s failed: %s", terminal_id, exc)
+            outcome = keep_service.NOT_APPLICABLE
+        if outcome.kept:
+            return {
+                "success": True,
+                "kept": True,
+                "kept_until": outcome.kept_until.isoformat() if outcome.kept_until else None,
+                "keep_note": outcome.note,
+            }
+        keep_note = outcome.note
     try:
         # delete_terminal is fully synchronous: blocking tmux kills, a
         # full-history scrollback snapshot capture, and DB writes. Off the
@@ -9365,6 +9490,8 @@ async def delete_terminal(
                     "retry delete after residual Grok processes exit"
                 ),
             )
+        if keep_note:
+            return {"success": True, "keep_note": keep_note}
         return {"success": True}
     except HTTPException:
         raise

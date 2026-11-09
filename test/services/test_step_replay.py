@@ -62,6 +62,7 @@ from __future__ import annotations
 import ast
 import inspect
 import sqlite3
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Optional
 
@@ -77,6 +78,7 @@ from cli_agent_orchestrator.services import step_replay, workflow_journal
 from cli_agent_orchestrator.services.step_replay import ReplayDecision, ReplayVerdict, decide
 from cli_agent_orchestrator.services.step_result import parse_envelope, serialise_envelope
 from cli_agent_orchestrator.services.workflow_errors import HaltRule
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 RUN = "run-1"
 STEP = "call-1"
@@ -123,6 +125,10 @@ _POLICIES: list[Optional[RecoveryPolicy]] = [
 ]
 
 
+# Python 3.13 warns when it finalizes an unclosed sqlite3 connection.
+pytestmark = pytest.mark.filterwarnings("error::ResourceWarning")
+
+
 @pytest.fixture(autouse=True)
 def _patched_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Point the journal at a temp DB and create the tables (both #583 columns included)."""
@@ -133,10 +139,11 @@ def _patched_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yield db_path
 
 
-def _direct_connect() -> sqlite3.Connection:
+def _direct_connect() -> AbstractContextManager[sqlite3.Connection]:
+    """A direct connection for one block: committed (or rolled back), then closed."""
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
-    return sqlite3.connect(str(DATABASE_FILE))
+    return closing_transaction(sqlite3.connect(str(DATABASE_FILE)))
 
 
 def _seed_step(
