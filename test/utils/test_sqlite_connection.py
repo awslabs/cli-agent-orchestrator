@@ -115,6 +115,7 @@ def _exercise_db_paths(i: int, scan_dir: str) -> None:
     database._migrate_workflow_run()
     database._migrate_workflow_run_step()
     database._migrate_workflow_index()
+    database._migrate_decision_records_match()
     run_id = f"run-{i}"
     ts = "2026-01-01T00:00:00Z"
     workflow_journal.insert_run(run_id, "wf", "{}", "{}", "running", ts)

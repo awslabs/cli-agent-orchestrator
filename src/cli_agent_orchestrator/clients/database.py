@@ -1480,7 +1480,7 @@ def _migrate_decision_records_match() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(decision_records)")
             columns = {row[1] for row in cursor.fetchall()}
             if not columns:
