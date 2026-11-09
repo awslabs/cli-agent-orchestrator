@@ -9209,12 +9209,14 @@ _WEB_INPUT_ESCAPE_HOLD_FALLBACK_S = 0.55
 class _WebInputWindow:
     """The input state that browser terminals on one shared window share."""
 
-    __slots__ = ("lock", "hold_owner", "hold_until", "__weakref__")
+    __slots__ = ("lock", "hold_owner", "hold_until", "hold_released", "__weakref__")
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.hold_owner: object = None
         self.hold_until = 0.0
+        # Set when the current hold ends early, so its waiters wake at once.
+        self.hold_released = asyncio.Event()
 
     def _held_against(self, owner: object) -> float:
         """Seconds left on another terminal's Escape hold; 0 if none."""
@@ -9223,9 +9225,13 @@ class _WebInputWindow:
         return max(0.0, self.hold_until - time.monotonic())
 
     async def wait_for_hold(self, owner: object) -> None:
-        """Wait out an Escape hold left by another terminal."""
+        """Wait out an Escape hold left by another terminal, or until it ends."""
         while (remaining := self._held_against(owner)) > 0:
-            await asyncio.sleep(remaining)
+            released = self.hold_released
+            try:
+                await asyncio.wait_for(released.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass
 
     @asynccontextmanager
     async def turn(self, owner: object):
@@ -9249,12 +9255,15 @@ class _WebInputWindow:
     def after_write(self, owner: object, raw: bytes, escape_hold_s: float) -> None:
         """Record whether ``owner``'s frame left tmux holding a partial Escape."""
         if raw.endswith(b"\x1b"):
+            if self.hold_owner is None:
+                self.hold_released = asyncio.Event()
             self.hold_owner = owner
             self.hold_until = time.monotonic() + escape_hold_s
         elif self.hold_owner is owner:
             # tmux read the bytes after the Escape with this terminal's pane
             # active, which resolved the partial key there.
             self.hold_owner = None
+            self.hold_released.set()
 
 
 _WEB_INPUT_WINDOWS: "weakref.WeakValueDictionary[str, _WebInputWindow]" = (

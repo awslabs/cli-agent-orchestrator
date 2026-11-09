@@ -365,6 +365,31 @@ class TestWebInputWindow:
         window.after_write(a, b"x", 5.0)
         assert window.hold_owner is None
 
+    @pytest.mark.asyncio
+    async def test_a_waiter_wakes_as_soon_as_the_owner_releases_the_hold(self):
+        """Not at the end of the hold: the owner's next frame ends it early."""
+        window, a, b = main_module._WebInputWindow(), object(), object()
+        window.after_write(a, b"\x1b", 5.0)
+
+        started = time.monotonic()
+        waiter = asyncio.create_task(window.wait_for_hold(b))
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        window.after_write(a, b"x", 5.0)
+        await asyncio.wait_for(waiter, timeout=1.0)
+        assert time.monotonic() - started < 1.0
+
+    @pytest.mark.asyncio
+    async def test_a_new_hold_after_a_release_holds_again(self):
+        window, a, b = main_module._WebInputWindow(), object(), object()
+        window.after_write(a, b"\x1b", 5.0)
+        window.after_write(a, b"x", 5.0)  # released
+        window.after_write(a, b"\x1b", 0.2)  # a fresh hold, not the set event
+
+        started = time.monotonic()
+        await window.wait_for_hold(b)
+        assert time.monotonic() - started >= 0.2
+
 
 class TestTheAttachFailsClosed:
     @pytest.mark.asyncio
