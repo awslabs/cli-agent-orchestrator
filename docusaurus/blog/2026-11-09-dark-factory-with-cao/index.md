@@ -5,7 +5,7 @@ tags: [case-study, orchestration-patterns]
 description: One conductor I talk to, a shepherd for my PRs, a reviewer for everyone else's, and rules written as code. Here's what it took to let them run with the lights off.
 ---
 
-The reviewer's report opened with good news: every normal flow passed. Then it listed three ways the kit could still do something nobody had approved.
+The reviewer's report opened with good news: all four requested normal flows passed. Then it listed three ways the kit could still do something nobody had approved.
 
 The first was a push. The kit lets one of my agents push fix commits to my own pull requests, under a standing OK I wrote down. Before it pushes, it checks the remote. But that check asked git where `origin` *fetches* from, and `git push origin` goes wherever the *push* URL points. Git lets those two be different.
 
@@ -37,18 +37,18 @@ The way of working behind it is real. From 6 to 9 November, working this way, my
 
 ## One PR's day
 
-The everyday case is small. On 8 November, a maintainer approved #1263, a code-comment change, with one P3 nit about wording. An approval that lists a finding isn't a green light, so the PR was held.
+The everyday case is small. On 8 November, a maintainer approved #1263, a code-comment change, with one minor wording nit (P3). An approval that lists a finding isn't a green light, so the PR was held.
 
 A fixer changed the comment only, and a check confirmed the code's syntax tree was unchanged. It went out as a fast-forward push with a short reply. The push dismissed the approval, so the PR waited for a fresh one. The next day the maintainer merged it, with that fix as the head.
 
 To be honest about timing: that round ran under my earlier PR watcher, before this kit existed. The kit writes that routine down; it didn't invent it. But the maintainer's real review text became a test fixture, and every later review of the kit replayed it, from hold to ready-to-arm.
 
-![One PR's path: a new review wakes the shepherd, the P3 holds the PR, the resource gate says GO, a fixer works, the permission check runs right before the push, a fast-forward push and a reply go out, the approval is dismissed, and a maintainer merges; a dashed step shows where the kit would arm auto-merge after a clean re-approval](./pr-through-the-gates.svg)
-*#1263 through the gates. The live round ended in a maintainer's merge; the dashed step is what the kit does next time.*
+![How the kit would handle #1263's real P3 review: a wake and hold, a resource gate, a fixer, permission checks, a fast-forward push and reply, then a modelled clean re-approval and conductor clear before the auto-merge gate can say ARM](./pr-through-the-gates.svg)
+*How the kit would handle #1263's real review. The live round used the earlier watcher and ended in a maintainer's merge.*
 
 ## Rules written as code, not prompts
 
-An agent can talk itself past a rule in a prompt. It can't argue with an exit code. So every rule that matters is a small script, and every worker re-runs the permission check right before each push, post or arm, so a pause, a revoked OK or a moved PR head stops it.
+An agent can talk itself past a rule in a prompt. So the checks for permissions, resources and auto-merge are small scripts with explicit results. Every worker must re-run the permission check right before each push, post or arm, so a pause, a revoked OK or a moved PR head stops it.
 
 My standing OKs are data, not prose: eight records, each saying who holds it, what action it covers, and its scope (this repo, my pull requests, the main branch). A revoked OK stays in the file, marked revoked. Only the conductor edits that file, only on my words, and it bumps the policy version every time.
 
@@ -59,7 +59,7 @@ The auto-merge gate arms a PR only when all of these hold:
 - no review or comment since then lists findings;
 - every required check is present and green;
 - GitHub gave a clear answer about which checks are required;
-- the PR changes fewer than 1,500 lines.
+- the PR changes no more than 1,500 lines.
 
 Even then it only arms GitHub's own auto-merge; it never merges itself.
 
@@ -74,7 +74,7 @@ All of this runs on a 32 GB laptop, which made one rule non-negotiable. In my wo
 
 So an agent runs a resource gate first, before it creates a worker, approves a review plan or starts a full test suite. The gate reads memory pressure, free memory, swap, disk, load and the number of live agent terminals, then prints GO, THROTTLE or STOP:
 - **STOP:** nothing new starts. That happens at critical memory pressure, under 15% free memory, under 20 GiB of free disk, or at seven live terminals.
-- **THROTTLE:** one small worker at a time. That happens at warning pressure, above 16 GiB of swap, or at four terminals.
+- **THROTTLE:** one small worker at a time. If no STOP condition applies, warning pressure, under 30% free memory, above 16 GiB of swap, under 40 GiB of free disk, load above 1.2 per CPU, or four or more live terminals triggers it.
 
 A reading it can't trust counts as THROTTLE, never GO. That rule came from a review: the first version treated a memory-pressure reading of 0 or −1 as healthy and said GO.
 
@@ -84,10 +84,10 @@ Full test suites and review runs share one "heavy" slot, held with a secret toke
 
 I also wanted fewer pointless wake-ups. I asked it to "pick the feedback and CI status from the PR that I owned and the pr that we reviewed have an update." The old loop also woke for other people's PRs falling behind main, and for comments on issues.
 
-The new rules wake the shepherd for feedback, CI, review decisions, conflicts and state changes on my PRs, and for new commits or replies on PRs we reviewed. Everything else goes into a digest that rides along with the next real wake.
+The new rules wake the shepherd for feedback, CI that needs action, review decisions, conflicts and state changes on my PRs, and for new commits, replies and state changes on PRs we reviewed. A PR falling behind main wakes it only when approved or already armed. Other activity goes into a digest that rides with the next wake; if its oldest line waits more than 24 hours, the digest itself causes one wake.
 
 Replayed over 118 recorded polls, the old rules woke 25 times and the new ones 26:
-- **4 old wakes were dropped,** all noise: other PRs falling behind main, and issue comments.
+- **4 old wakes were dropped,** all noise: PRs falling behind main when no branch update was due, and issue comments.
 - **5 new wakes appeared:** new commits on a PR we had reviewed, which the old rules missed.
 - **188 lines** went to the digest instead of waking anyone.
 
@@ -114,11 +114,11 @@ Besides the wrong-repository push, a few catches stand out:
 - **Damaged records reviving a revoked permission.** Deleting one field from a revocation, or appending an exact copy of the original grant, turned DENY back into ALLOW.
 - **A finding on an older commit.** A review on an older commit saying "P2: fix this before merge" was missed, and the gate said ARM.
 
-The opposite failure mattered too: a gate so strict nothing clean gets through. The agent supervising the build caught that a clean approval ("0 P1, 0 P2, 0 P3 … Findings: None.") would hold a PR forever, and added clear-by-reading: one conductor GO bound to that exact text. The next review still found a deadlock: a re-approval saying "The previous P3 is fixed." stayed stuck.
+The opposite failure mattered too: a gate so strict nothing clean gets through. The agent supervising the build caught that a clean approval ("0 P1, 0 P2, 0 P3 … Findings: None.") would hold a PR forever, and added a way to clear it after the conductor reads the exact text and gives GO. The next review still found a deadlock: a re-approval saying "The previous P3 is fixed." stayed stuck.
 
 The tests grew with the reviews. 138 kit tests passed at the first review and 1,291 at the last, plus 100 for the PR watch. Mutation runs deliberately break each gate condition and check that a test notices. In one round, two of 243 broken versions slipped through at first; the tests were tightened, and then all 243 were caught. Survivors in other rounds got the same treatment: a tighter test, or dead code removed.
 
-None of this was quick: each round fixed the last findings, and a fresh reviewer found the next layer.
+None of this was quick: each round fixed the last findings, and independent re-checks found the next layer.
 
 ## What it still can't do
 

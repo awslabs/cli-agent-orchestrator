@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="430" viewBox="0 0 1000 430" role="img" aria-labelledby="title desc">
   <title id="title">One pull request through the gates</title>
-  <desc id="desc">Steps for PR 1263, left to right and then down. A new review wakes the shepherd. The review lists a P3, so the PR is held. The resource gate says GO. A fixer makes the change. Right before the push, the permission check asks: paused? policy changed? head moved? exact push URL? A fast-forward push and a short reply go out, and the reply goes through an outbox that cannot post twice. The push dismisses the approval. In the live round a maintainer then merged the PR. A dashed side step shows what the kit does next time: after a clean re-approval, the auto-merge gate says ARM, and it never merges directly.</desc>
+  <desc id="desc">How the kit would handle PR 1263's real P3 review, rather than a record of its live fix round. A new review wakes the shepherd. The P3 holds the PR. If the resource gate says GO, a fixer changes the comment. Before a push, every permission check must pass. A fast-forward push and a short reply follow; the kit's reply uses its outbox. The push dismisses the approval. A modelled clean re-approval is read and cleared by the conductor before the auto-merge gate can say ARM. The kit never merges directly. The actual live round used the earlier watcher and ended in a maintainer's merge.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
       <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
@@ -19,7 +19,7 @@
   </defs>
 
   <rect width="1000" height="430" fill="#ffffff"/>
-  <text class="eyebrow" x="40" y="36">#1263 THROUGH THE GATES</text>
+  <text class="eyebrow" x="40" y="36">HOW THE KIT WOULD HANDLE #1263'S REVIEW</text>
 
   <!-- Row 1 -->
   <rect x="40" y="64" width="200" height="72" rx="12" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
@@ -46,9 +46,9 @@
   <!-- Row 2: the last-moment check -->
   <rect x="520" y="180" width="440" height="110" rx="12" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
   <text class="gate" x="540" y="208">5. Permission check, right before the push</text>
-  <text class="copy" x="540" y="232">Paused? Standing OK revoked or policy changed?</text>
-  <text class="copy" x="540" y="252">PR head moved? Pushing exactly the approved commit</text>
-  <text class="copy" x="540" y="272">to exactly the approved URL? Any "no" stops it.</text>
+  <text class="copy" x="540" y="232">Not paused? Standing OK and policy still valid?</text>
+  <text class="copy" x="540" y="252">PR head unchanged? Pushing the approved commit</text>
+  <text class="copy" x="540" y="272">to the approved URL? Every check must pass.</text>
 
   <path d="M520 235H484" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
 
@@ -62,13 +62,13 @@
 
   <!-- Row 3 -->
   <rect x="40" y="334" width="440" height="72" rx="12" fill="#ecfdf5" stroke="#047857" stroke-width="2"/>
-  <text class="done" x="60" y="364">7. Merged by a maintainer</text>
-  <text class="copy" x="60" y="386">the live round; the merged head was the fix</text>
+  <text class="done" x="60" y="364">7. Clean re-approval</text>
+  <text class="copy" x="60" y="386">modelled: conductor reads and clears the clean review</text>
 
   <!-- Side step: what the kit does next time -->
   <path d="M480 370H576" fill="none" stroke="#64748b" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-grey)"/>
   <rect x="580" y="334" width="380" height="72" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
-  <text class="step" x="600" y="362">With the kit, after a clean re-approval</text>
+  <text class="step" x="600" y="362">8. Ready to arm auto-merge</text>
   <text class="copy" x="600" y="384">the auto-merge gate says ARM: green, required</text>
-  <text class="copy" x="600" y="400">checks present, under 1,500 lines. It never merges.</text>
+  <text class="copy" x="600" y="400">checks present, at most 1,500 lines. It never merges.</text>
 </svg>
