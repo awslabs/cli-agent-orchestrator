@@ -25,6 +25,7 @@ import pytest
 import cli_agent_orchestrator.backends as backends_pkg
 from cli_agent_orchestrator.backends.base import TerminalBackend
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+from cli_agent_orchestrator.backends.remote_backend import RemoteBackend
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.constants import HERDR_PANE_READ_MAX_LINES, TMUX_HISTORY_LIMIT
 
@@ -59,6 +60,8 @@ def _instantiate(cls: type[TerminalBackend]) -> TerminalBackend:
     if cls is HerdrBackend:
         with patch.object(HerdrBackend, "_ensure_session_running"):
             return HerdrBackend()
+    if cls is RemoteBackend:
+        return RemoteBackend()
     pytest.fail(
         f"{cls.__name__} is a new TerminalBackend: teach this test how to build one so its "
         "max_history_lines is checked like the others (#728)"
@@ -89,6 +92,11 @@ class TestEveryBackendDeclaresAReadCeiling:
 class TestShippedCeilings:
     def test_tmux_ceiling_is_the_floor_cao_raises_history_limit_to(self) -> None:
         assert _instantiate(TmuxBackend).max_history_lines == TMUX_HISTORY_LIMIT
+
+    def test_remote_ceiling_is_the_runners_tmux_floor(self) -> None:
+        # A runner drives tmux with CAO's own TmuxClient, so the depth it can
+        # serve is the same floor a local tmux pane has.
+        assert _instantiate(RemoteBackend).max_history_lines == TMUX_HISTORY_LIMIT
 
     def test_herdr_ceiling_is_herdrs_read_clamp(self) -> None:
         assert _instantiate(HerdrBackend).max_history_lines == HERDR_PANE_READ_MAX_LINES == 1000

@@ -64,6 +64,7 @@ from pydantic import (
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.backends.remote_backend import RemoteBackend
 from cli_agent_orchestrator.cli.commands.agent_plugin import UNTRUSTED_CONTENT_WARNING
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
@@ -150,6 +151,8 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
 )
 from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
 from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
+from cli_agent_orchestrator.runner.protocol import RunnerError
+from cli_agent_orchestrator.runner.token import runner_hub_ssl_context, runner_token
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -1698,6 +1701,10 @@ async def lifespan(app: FastAPI):
         logger.error("refusing to start: %s", exc.message().splitlines()[0])
         server_lock.refuse(exc)
     logger.info("Holding server lock %s (pid %d)", server_lock_handle.path, os.getpid())
+    # #745: the runner-channel token leaves this process's environment before
+    # anything it starts can inherit it (see runner.token).
+    if isinstance(get_backend(), RemoteBackend):
+        runner_token()
     # issue #583 Bolt 3 (``approval-enforcement-default``): report the approval gate's RESOLVED state
     # AND the mechanism that decided it. A malformed settings file fails closed, so the source tells
     # the operator why enforcement remains ON and how to recover. Logs only the boolean and a member
@@ -1880,6 +1887,33 @@ async def lifespan(app: FastAPI):
         herdr_inbox_task = asyncio.create_task(svc.start())
         logger.info("Herdr inbox service started")
 
+    # The remote backend's runner hub: a listener on its own thread and port
+    # that execution-only runners dial in to. Started only for that backend, so
+    # tmux/herdr servers open no extra socket.
+    runner_hub = None
+    if isinstance(backend, RemoteBackend):
+        from cli_agent_orchestrator.runner.hub import RunnerHub
+
+        runner_hub = RunnerHub(
+            token=runner_token() or "",
+            host=os.environ.get("CAO_RUNNER_BIND_HOST", "127.0.0.1"),
+            port=int(os.environ.get("CAO_RUNNER_PORT", "9891")),
+            call_timeout=float(os.environ.get("CAO_RUNNER_CALL_TIMEOUT", "30")),
+            placement_timeout=float(os.environ.get("CAO_RUNNER_PLACEMENT_TIMEOUT", "60")),
+            expiry=float(os.environ.get("CAO_RUNNER_EXPIRY", "600")),
+            reserved_sessions=[
+                name.strip()
+                for name in os.environ.get("CAO_RUNNER_RESERVED_SESSIONS", "").split(",")
+                if name.strip()
+            ],
+            state_path=CAO_HOME_DIR / "runner-hub.json",
+            ssl_context=runner_hub_ssl_context(),
+        )
+        # Routes are restored from the registry before the first runner can
+        # connect, so its report is reconciled against them, not raced.
+        backend.attach_hub(runner_hub)
+        runner_hub.start()
+
     yield
 
     # AG-UI ambient streams: backstop for launches whose shutdown reaches the
@@ -1887,6 +1921,9 @@ async def lifespan(app: FastAPI):
     from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run
 
     _ambient_run.request_stop(sticky=False)
+    if runner_hub is not None:
+        runner_hub.stop()
+        logger.info("Runner hub stopped")
 
     # Stop herdr inbox service on shutdown
     if herdr_inbox_task is not None:
@@ -2166,7 +2203,12 @@ async def health_check():
     from cli_agent_orchestrator.services.settings_service import get_server_settings
 
     backend = get_backend()
-    backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
+    if isinstance(backend, HerdrBackend):
+        backend_name = "herdr"
+    elif isinstance(backend, RemoteBackend):
+        backend_name = "remote"
+    else:
+        backend_name = "tmux"
 
     # The installed package version, so a client (the web UI's server card) can
     # show what it is talking to without a shell. Same source as `cao --version`.
@@ -3352,6 +3394,22 @@ async def claim_ephemeral_agent_endpoint(
         raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
 
 
+@app.get("/runners")
+async def list_runners_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """Connected cao-runners and what they host (remote terminal backend only).
+
+    Read-only operator view: an orchestrator or readiness check uses it to
+    wait for a runner that claims a session before creating that session.
+    Other backends have no runners and answer 404.
+    """
+    backend = get_backend()
+    if not isinstance(backend, RemoteBackend):
+        raise HTTPException(status_code=404, detail="terminal backend is not 'remote'")
+    return backend.hub.describe()
+
+
 @app.get("/agents/profiles")
 async def list_agent_profiles_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
@@ -4419,6 +4477,21 @@ def _set_launch_note(response: Response, plan: LaunchPlan | None) -> None:
             logger.warning("Decision response header could not be built", exc_info=True)
 
 
+def _raise_for_wrapped_runner_error(exc: BaseException) -> None:
+    """Answer with a runner's status when ``exc`` is, or was caused by, its failure (#745).
+
+    A service that wraps a backend error (``raise RuntimeError(...) from e``,
+    as session teardown does) would otherwise turn "runner unavailable" or
+    "outcome unknown" into a generic 500.
+    """
+    seen = 0
+    cause: Optional[BaseException] = exc
+    while cause is not None and seen < 8:
+        if isinstance(cause, RunnerError):
+            raise HTTPException(status_code=cause.status_code, detail=str(exc)) from exc
+        cause, seen = cause.__cause__, seen + 1
+
+
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     request: Request,
@@ -4695,7 +4768,10 @@ async def create_session(
         # repo, or the 'git worktree add' itself failed -- a client-input
         # problem, not a server crash. Mirrors POST /sessions/{name}/terminals.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create session: {str(e)}",
@@ -4739,7 +4815,10 @@ async def get_session(
         return await asyncio.to_thread(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get session: {str(e)}",
@@ -4791,7 +4870,10 @@ async def delete_session(
         raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete session: {str(e)}",
@@ -5044,7 +5126,10 @@ async def create_terminal_in_session(
         # or the 'git worktree add' itself failed -- a client-input problem,
         # not a server crash.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create terminal: {str(e)}",
@@ -5165,7 +5250,10 @@ async def create_terminal_in_session_as_operator(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create terminal: {str(e)}",
@@ -5225,7 +5313,10 @@ async def get_terminal(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except TerminalNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get terminal: {str(e)}",
@@ -5421,7 +5512,10 @@ async def get_terminal_working_directory(
         return WorkingDirectoryResponse(working_directory=working_directory)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get working directory: {str(e)}",
@@ -5479,7 +5573,10 @@ async def send_terminal_input(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to send input: {str(e)}",
@@ -5513,7 +5610,10 @@ async def send_terminal_key(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to send key: {str(e)}",
@@ -5541,7 +5641,10 @@ async def get_terminal_output(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get output: {str(e)}",
@@ -5584,7 +5687,10 @@ async def get_terminal_output_range(
     except ValueError as e:
         # Malformed id / negative offset — a caller error, not a missing log.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         # A genuine file I/O failure surfaced by read_output_range (BR-4): report
         # it rather than masking a real fault as empty output.
         raise HTTPException(
@@ -5611,7 +5717,10 @@ async def exit_terminal(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to exit terminal: {str(e)}",
@@ -6303,6 +6412,7 @@ async def run_step(
     except Exception as e:
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to run step: {str(e)}",
@@ -9683,7 +9793,10 @@ async def delete_terminal(
         raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete terminal: {str(e)}",
@@ -9708,7 +9821,10 @@ async def create_inbox_message_endpoint(
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create inbox message: {str(e)}",
@@ -11793,7 +11909,7 @@ def main():
     parser.add_argument(
         "--terminal",
         type=str,
-        choices=["tmux", "herdr"],
+        choices=["tmux", "herdr", "remote"],
         default=None,
         help="Terminal backend to use, overriding terminal_backend in config.json",
     )

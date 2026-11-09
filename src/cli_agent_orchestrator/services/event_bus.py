@@ -10,7 +10,7 @@ import logging
 import re
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 
@@ -42,6 +42,8 @@ class EventBus:
         self._wildcard: Dict[str, Tuple[re.Pattern, List[asyncio.Queue]]] = {}
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # id(queue) -> callback for an event that queue lost (see subscribe).
+        self._on_drop: Dict[int, Callable[[str], None]] = {}
         # Per-topic rate-limit state for queue-full drop reporting.
         # {topic: (dropped_since_last_log, last_log_monotonic)}
         self._drop_counts: Dict[str, int] = {}
@@ -68,11 +70,21 @@ class EventBus:
             # crashing the publisher thread.
             logger.debug(f"Event bus loop closed; dropping event: {topic}")
 
-    def subscribe(self, pattern: str) -> asyncio.Queue:
-        """Subscribe to a topic pattern (e.g., 'terminal.*.output'). Returns async queue."""
+    def subscribe(
+        self, pattern: str, on_drop: Optional[Callable[[str], None]] = None
+    ) -> asyncio.Queue:
+        """Subscribe to a topic pattern (e.g., 'terminal.*.output'). Returns async queue.
+
+        ``on_drop(topic)`` is called, on the loop thread, for each event this
+        subscription loses to a full queue, so a subscriber that must not miss
+        events (the status monitor) learns which topic it missed.
+        """
         queue: asyncio.Queue = asyncio.Queue(
             maxsize=get_server_settings()["event_bus_max_queue_size"]
         )
+        if on_drop is not None:
+            with self._lock:
+                self._on_drop[id(queue)] = on_drop
 
         with self._lock:
             if "*" in pattern:
@@ -90,6 +102,7 @@ class EventBus:
     def unsubscribe(self, pattern: str, queue: asyncio.Queue) -> None:
         """Remove a queue from a subscription pattern."""
         with self._lock:
+            self._on_drop.pop(id(queue), None)
             if "*" in pattern:
                 regex = pattern.replace(".", r"\.").replace("*", "[^.]+")
                 if regex in self._wildcard:
@@ -177,6 +190,7 @@ class EventBus:
         does not need its own lock.
         """
         event = {"topic": topic, "data": data}
+        lost: List[Callable[[str], None]] = []
         with self._lock:
             # O(1) exact match lookup
             for q in self._exact.get(topic, []):
@@ -184,6 +198,7 @@ class EventBus:
                     q.put_nowait(event)
                 except asyncio.QueueFull:
                     self._record_drop(topic)
+                    self._note_lost(q, lost)
 
             # Wildcard pattern matching
             for compiled, queues in self._wildcard.values():
@@ -193,6 +208,18 @@ class EventBus:
                             q.put_nowait(event)
                         except asyncio.QueueFull:
                             self._record_drop(topic)
+                            self._note_lost(q, lost)
+        # Outside the lock: a callback may publish.
+        for callback in lost:
+            try:
+                callback(topic)
+            except Exception:  # noqa: BLE001 - the drop is logged either way
+                logger.exception("event_bus drop callback failed for %s", topic)
+
+    def _note_lost(self, queue: asyncio.Queue, lost: List[Callable[[str], None]]) -> None:
+        callback = self._on_drop.get(id(queue))
+        if callback is not None:
+            lost.append(callback)
 
 
 bus = EventBus()
