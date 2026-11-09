@@ -2809,3 +2809,125 @@ class TestCopilotStaleWaitingCapture:
         assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
         sm._last_stale_capture_check["t1"] = None
         assert sm.get_status("t1") == TerminalStatus.IDLE
+
+
+class TestStartedOnLastInput:
+    """Whether a terminal has shown work on the last input sent to it (PR #1247, P2-1).
+
+    A ready status latched before an input stays cached after it, so the
+    delegation callback asks this before it forwards a terminal's last response.
+    """
+
+    @pytest.fixture
+    def tmux(self):
+        no_provider = MagicMock()
+        no_provider.get_provider.return_value = None
+        with (
+            patch(
+                "cli_agent_orchestrator.backends.registry.get_backend",
+                return_value=_backend(event_inbox=False),
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager", no_provider),
+            patch("cli_agent_orchestrator.services.status_monitor._queue_status_transition"),
+            patch("cli_agent_orchestrator.services.status_monitor.bus"),
+        ):
+            yield StatusMonitor()
+
+    @staticmethod
+    def _output(sm, status):
+        """One chunk of output landed and was detected as ``status``."""
+        with sm._lock:
+            sm._capture_generation["t1"] = sm._capture_generation.get("t1", 0) + 1
+            sm._output_generation["t1"] = sm._output_generation.get("t1", 0) + 1
+        sm._apply_detection("t1", status)
+
+    def _latched_idle(self, sm):
+        sm.notify_input_sent("t1")
+        self._output(sm, TerminalStatus.PROCESSING)
+        self._output(sm, TerminalStatus.IDLE)
+
+    def test_no_input_seen_counts_as_started(self, tmux):
+        assert tmux.started_on_last_input("t1") is True
+
+    def test_latched_idle_after_new_input_is_not_started(self, tmux):
+        self._latched_idle(tmux)
+        tmux.notify_input_sent("t1")
+
+        assert tmux.get_status("t1") == TerminalStatus.IDLE
+        assert tmux.started_on_last_input("t1") is False
+
+    def test_output_that_still_reads_idle_is_not_started(self, tmux):
+        self._latched_idle(tmux)
+        tmux.notify_input_sent("t1")
+        self._output(tmux, TerminalStatus.IDLE)
+
+        assert tmux.started_on_last_input("t1") is False
+
+    def test_processing_observed_after_input_stays_started_once_done(self, tmux):
+        self._latched_idle(tmux)
+        tmux.notify_input_sent("t1")
+        self._output(tmux, TerminalStatus.PROCESSING)
+        self._output(tmux, TerminalStatus.IDLE)
+
+        assert tmux.started_on_last_input("t1") is True
+
+    def test_waiting_observed_after_input_is_started(self, tmux):
+        self._latched_idle(tmux)
+        tmux.notify_input_sent("t1")
+        self._output(tmux, TerminalStatus.WAITING_USER_ANSWER)
+
+        assert tmux.started_on_last_input("t1") is True
+
+    def test_fast_turn_completed_after_input_is_started(self, tmux):
+        """A turn can reach COMPLETED with no PROCESSING detected in between."""
+        self._latched_idle(tmux)
+        tmux.notify_input_sent("t1")
+        self._output(tmux, TerminalStatus.COMPLETED)
+
+        assert tmux.started_on_last_input("t1") is True
+
+    def test_completed_latched_before_input_is_not_started(self, tmux):
+        tmux.notify_input_sent("t1")
+        self._output(tmux, TerminalStatus.PROCESSING)
+        self._output(tmux, TerminalStatus.COMPLETED)
+        tmux.notify_input_sent("t1")
+
+        assert tmux.get_status("t1") == TerminalStatus.COMPLETED
+        assert tmux.started_on_last_input("t1") is False
+
+    def test_optimistic_dispatch_latch_is_not_started(self, tmux):
+        self._latched_idle(tmux)
+        tmux.notify_input_sent("t1", assume_processing=True)
+
+        assert tmux.get_status("t1") == TerminalStatus.PROCESSING
+        assert tmux.started_on_last_input("t1") is False
+
+    def test_clear_terminal_forgets_the_input(self, tmux):
+        self._latched_idle(tmux)
+        tmux.notify_input_sent("t1")
+        tmux.clear_terminal("t1")
+
+        assert tmux.started_on_last_input("t1") is True
+        assert tmux.last_input_at("t1") is None
+
+    def test_last_input_at_is_the_latest_input(self, tmux):
+        tmux.notify_input_sent("t1")
+        first = tmux.last_input_at("t1")
+        tmux.notify_input_sent("t1")
+
+        assert first is not None and tmux.last_input_at("t1") >= first
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_herdr_counts_native_activity_after_the_input(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        sm = StatusMonitor()
+        assert sm.started_on_last_input("h1") is True
+
+        sm.notify_input_sent("h1")
+        assert sm.started_on_last_input("h1") is False
+
+        sm.note_native_activity("h1")
+        assert sm.started_on_last_input("h1") is True
+
+        sm.notify_input_sent("h1")
+        assert sm.started_on_last_input("h1") is False

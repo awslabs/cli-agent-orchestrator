@@ -9,9 +9,12 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients.database import (
     Base,
     close_delegation_edge,
+    close_delegation_edge_with_message,
     close_open_edges_for_terminal,
     create_delegation_edge,
+    create_terminal,
     find_open_edge,
+    get_inbox_messages,
     list_armed_worker_ids,
     list_open_edges_into,
     list_open_edges_out_of,
@@ -19,6 +22,7 @@ from cli_agent_orchestrator.clients.database import (
     mark_message_edges_delivered,
 )
 from cli_agent_orchestrator.models.delegation import EdgeReason, EdgeSource, EdgeState
+from cli_agent_orchestrator.models.inbox import MessageStatus
 
 
 @pytest.fixture
@@ -82,3 +86,44 @@ def test_close_open_edges_for_terminal_returns_inbound_only(db):
     assert [e.id for e in closed_inbound] == [inbound.id]
     assert list_open_edges_into("w1") == []
     assert list_open_edges_out_of("w1") == []
+
+
+class TestCloseWithMessage:
+    """The claim and the message it sends are one commit (PR #1247 review, P2-1 path 3)."""
+
+    def test_claim_queues_the_message_for_the_caller(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+
+        assert close_delegation_edge_with_message(
+            edge.id, EdgeState.AUTO_FORWARDED, "w1", "sup", "result"
+        )
+
+        assert list_open_edges_into("w1") == []
+        (message,) = get_inbox_messages("sup")
+        assert (message.sender_id, message.message, message.status) == (
+            "w1",
+            "result",
+            MessageStatus.PENDING,
+        )
+
+    def test_lost_claim_queues_nothing(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+        close_delegation_edge(edge.id, EdgeState.REPLIED)
+
+        assert not close_delegation_edge_with_message(
+            edge.id, EdgeState.AUTO_FORWARDED, "w1", "sup", "result"
+        )
+
+        assert get_inbox_messages("sup") == []
+
+    def test_gone_caller_still_closes_the_edge(self, db):
+        edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+
+        assert close_delegation_edge_with_message(
+            edge.id, EdgeState.WORKER_ENDED, "w1", "sup", "notice"
+        )
+
+        assert list_open_edges_into("w1") == []
+        assert get_inbox_messages("sup") == []

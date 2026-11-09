@@ -2251,3 +2251,76 @@ class TestDelegationEdgeArming:
         mock_term_svc.dispatch_input.assert_called_once()
         statuses = [c.args[1] for c in mock_update.call_args_list]
         assert MessageStatus.FAILED not in statuses
+
+
+class TestDelegationEdgeArmingAfterConfirmation:
+    """Edges are armed after the submit confirmation, whatever its outcome."""
+
+    @pytest.fixture
+    def delivery(self):
+        order = []
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", True),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.mark_message_edges_delivered",
+                side_effect=lambda ids: order.append(("arm", ids)),
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service"),
+            patch("cli_agent_orchestrator.services.inbox_service.get_backend") as backend,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message(id=5)],
+            ),
+        ):
+            backend.return_value.supports_event_inbox.return_value = False
+            monitor.get_status.return_value = TerminalStatus.IDLE
+            yield order
+
+    @pytest.mark.parametrize("confirmed", [True, False])
+    def test_armed_after_the_confirmation_returns(self, delivery, confirmed):
+        def confirm(*_args, **_kwargs):
+            delivery.append(("confirm", None))
+            return confirmed
+
+        with patch.object(InboxService, "_confirm_submitted", side_effect=confirm):
+            InboxService().deliver_pending("term-1")
+
+        assert delivery == [("confirm", None), ("arm", [5])]
+
+
+class TestHoldDeliveryIfIdle:
+    def test_held_when_no_delivery_runs(self):
+        service = InboxService()
+        with service.hold_delivery_if_idle("term-1") as held:
+            assert held is True
+            assert service._delivery_lock("term-1").locked() is True
+        assert service._delivery_lock("term-1").locked() is False
+
+    def test_not_held_while_a_delivery_runs(self):
+        service = InboxService()
+        seen = []
+
+        def dispatch(terminal_id, *_args, **_kwargs):
+            with service.hold_delivery_if_idle(terminal_id) as held:
+                seen.append(held)
+            return 0
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False),
+            patch("cli_agent_orchestrator.services.inbox_service.mark_message_edges_delivered"),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as ts,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message(id=5)],
+            ),
+        ):
+            monitor.get_status.return_value = TerminalStatus.IDLE
+            ts.dispatch_input.side_effect = dispatch
+            service.deliver_pending("term-1")
+
+        assert seen == [False]
+        assert service._delivery_lock("term-1").locked() is False

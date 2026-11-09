@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import (
     Base,
+    close_delegation_edge,
     create_delegation_edge,
     find_open_edge,
     list_open_edges_into,
@@ -86,24 +87,31 @@ def _armed(caller, worker):
 
 @pytest.fixture
 def env():
-    """Patch the I/O the evaluator touches; return the inbox capture list."""
+    """Patch the I/O the evaluator touches; return the inbox capture list.
+
+    The claim stays real (the database close); only the queued message is
+    captured instead of written.
+    """
     sent = []
+
+    def claim_and_record(edge_id, state, sender_id, receiver_id, message):
+        if not close_delegation_edge(edge_id, state):
+            return False
+        sent.append((sender_id, receiver_id, message))
+        return True
+
     with (
         patch(f"{MOD}.status_monitor") as sm,
         patch(f"{MOD}.terminal_service") as ts,
         patch(f"{MOD}.get_pending_messages", return_value=[]) as pending,
         patch(f"{MOD}.get_terminal_metadata", return_value={"agent_profile": "developer"}),
-        patch(
-            f"{MOD}.create_inbox_message",
-            side_effect=lambda sender_id, receiver_id, message: sent.append(
-                (sender_id, receiver_id, message)
-            ),
-        ),
-        patch(f"{MOD}.inbox_service"),
+        patch(f"{MOD}.close_delegation_edge_with_message", side_effect=claim_and_record),
+        patch(f"{MOD}.inbox_service") as inbox,
     ):
         sm.get_status.return_value = TerminalStatus.IDLE
+        sm.started_on_last_input.return_value = True
         ts.get_output.return_value = "final answer"
-        yield {"sent": sent, "status": sm, "pending": pending, "ts": ts}
+        yield {"sent": sent, "status": sm, "pending": pending, "ts": ts, "inbox": inbox}
 
 
 class TestEvaluateCompletion:
@@ -146,6 +154,37 @@ class TestEvaluateCompletion:
         svc.evaluate_completion("w1")
         assert svc.evaluate_completion("w1") == 0
         assert len(env["sent"]) == 1
+
+    def test_not_started_on_last_input_blocks(self, db, env):
+        _armed("sup", "w1")
+        env["status"].started_on_last_input.return_value = False
+        env["status"].last_input_at.return_value = svc._monotonic()
+        assert svc.evaluate_completion("w1") == 0
+        assert env["sent"] == []
+
+    def test_not_started_past_the_pickup_timeout_forwards_with_its_header(
+        self, db, env, monkeypatch
+    ):
+        _armed("sup", "w1")
+        env["status"].started_on_last_input.return_value = False
+        env["status"].last_input_at.return_value = 100.0
+        monkeypatch.setattr(
+            svc, "_monotonic", lambda: 100.0 + svc.DELEGATION_PICKUP_TIMEOUT_SECONDS
+        )
+        assert svc.evaluate_completion("w1") == 1
+        text = env["sent"][0][2]
+        assert text.startswith(
+            "[CAO auto-forward] Worker w1 (profile developer) has not started on the last "
+            "message delivered to it."
+        )
+        assert f"no sign of work {int(svc.DELEGATION_PICKUP_TIMEOUT_SECONDS)}s" in text
+        assert text.endswith("---\nfinal answer")
+
+    def test_delivery_in_flight_blocks(self, db, env):
+        _armed("sup", "w1")
+        env["inbox"].hold_delivery_if_idle.return_value.__enter__.return_value = False
+        assert svc.evaluate_completion("w1") == 0
+        env["status"].get_status.assert_not_called()
 
     def test_unreadable_output_still_forwards(self, db, env):
         _armed("sup", "w1")

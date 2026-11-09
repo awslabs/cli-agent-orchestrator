@@ -9,8 +9,9 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from itertools import groupby
-from typing import Callable, Dict, Iterable, Optional, Set
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -30,7 +31,7 @@ from cli_agent_orchestrator.constants import (
     INBOX_SUBMIT_MAX_RESUBMITS,
     INBOX_SWEEP_FANOUT,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     TerminalInputBlockedError,
@@ -295,15 +296,18 @@ class InboxService:
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
-                # Arming is bookkeeping. A failure here must not reach the handler
-                # below, which would mark a batch that was delivered as FAILED.
-                try:
-                    mark_message_edges_delivered([m.id for m in batch])
-                except Exception as arm_exc:  # noqa: BLE001
-                    logger.warning(f"Could not arm delegation edges for {terminal_id}: {arm_exc}")
                 # The paste is in the pane: the immediate-delivery caller may
                 # answer now. Everything below is confirmation and recovery.
                 after_dispatch()
+                # Delegation edges opened by this batch are armed only after the
+                # submit confirmation has run. An edge armed on the paste alone
+                # could be evaluated while the receiver's screen still holds
+                # the previous answer, before it shows the new turn. They are armed even
+                # when the confirmation gives up, because pickup can lag
+                # delivery by more than that wait. The evaluator's own check
+                # that the receiver started on its last input keeps an
+                # unpicked delivery from forwarding the previous answer, and
+                # its pickup timeout tells the caller if it never starts.
                 if INBOX_SUBMIT_CONFIRMATION and not eager:
                     if get_backend().supports_event_inbox():
                         # Event-inbox backends (herdr) push delivery synchronously
@@ -342,6 +346,7 @@ class InboxService:
                             registry=registry,
                             sender_id=sender_id,
                         )
+                self._arm_message_edges(terminal_id, batch)
             except TerminalNotFoundError as e:
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                 # for this window). Treat as transient: reset to PENDING so the
@@ -391,6 +396,41 @@ class InboxService:
                 for message in batch:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
+
+    @staticmethod
+    def _arm_message_edges(terminal_id: str, batch: List[InboxMessage]) -> None:
+        """Arm the send_message delegation edges opened by ``batch``.
+
+        Arming is bookkeeping. A failure here must not reach the delivery's
+        exception handlers, which would mark a delivered batch as FAILED.
+        """
+        try:
+            mark_message_edges_delivered([m.id for m in batch])
+        except Exception as arm_exc:  # noqa: BLE001
+            logger.warning(f"Could not arm delegation edges for {terminal_id}: {arm_exc}")
+
+    @contextmanager
+    def hold_delivery_if_idle(self, terminal_id: str) -> Iterator[bool]:
+        """Hold the terminal's delivery lock if no delivery holds it; yield whether held.
+
+        A delivery marks its messages DELIVERED before it types them, and the
+        receiver's status stays at its latched IDLE or COMPLETED until the new
+        turn shows. A reader that must not mistake that window for a finished
+        turn (the delegation callback) holds this while it decides. It never
+        waits: a delivery in flight yields False, and the caller retries on a
+        later status event or sweep.
+
+        Thread Safety:
+            Safe from any thread. Must not be held while delivering to the same
+            terminal: the lock is not reentrant.
+        """
+        lock = self._delivery_lock(terminal_id)
+        held = lock.acquire(blocking=False)
+        try:
+            yield held
+        finally:
+            if held:
+                lock.release()
 
     def _wait_for_pickup(
         self,

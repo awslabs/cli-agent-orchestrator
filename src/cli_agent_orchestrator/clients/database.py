@@ -4234,6 +4234,43 @@ def close_delegation_edge(edge_id: int, state: EdgeState) -> bool:
         return count > 0
 
 
+def close_delegation_edge_with_message(
+    edge_id: int, state: EdgeState, sender_id: str, receiver_id: str, message: str
+) -> bool:
+    """Close an OPEN edge and queue ``message`` for ``receiver_id`` in one commit.
+
+    True when this call closed the edge; only then is the message queued, as
+    PENDING. Doing both in one transaction leaves no moment where the edge is
+    closed and the message not yet queued. In that gap an evaluator of the
+    receiver would see no open edge out of it and no pending message, and
+    could forward the receiver's previous answer before it had read this one.
+    The message is skipped when the receiver row no longer exists.
+    """
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.id == edge_id,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .update(
+                {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},
+                synchronize_session=False,
+            )
+        )
+        if count and db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
+            db.add(
+                InboxModel(
+                    sender_id=sender_id,
+                    receiver_id=receiver_id,
+                    message=message,
+                    status=MessageStatus.PENDING.value,
+                )
+            )
+        db.commit()
+        return count > 0
+
+
 def list_open_edges_into(worker_id: str, armed_only: bool = False) -> List[DelegationEdge]:
     """Open edges where ``worker_id`` is the worker someone is waiting on."""
     with SessionLocal() as db:
