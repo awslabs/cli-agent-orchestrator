@@ -60,7 +60,7 @@ from cli_agent_orchestrator.utils.opencode_config import (
     ensure_skills_symlink,
     entry_within_roots,
     is_cao_owned_mcp_entry,
-    is_recorded_mcp_entry,
+    is_orphaned_recorded_mcp_entry,
     read_config,
     record_mcp_entry,
     remove_agent_tools,
@@ -1826,11 +1826,14 @@ def _materialize_opencode_mcp(
         remove_agent_tools(agent_id, plugin_store_roots=plugin_store_roots)
 
     # Finding 1 reconcile: disable any CAO-plugin server no longer desired.
-    # Plugin servers are delivered to every agent uniformly, so a server absent
-    # from this agent's merged set means its plugin was uninstalled. The
-    # Only a provably-CAO plugin entry is disabled: one the sidecar records CAO
-    # writing (#1154), or one that resolves inside the plugin store. A user's own
-    # server and CAO's ``cao-mcp-server`` match neither, because only
+    # Plugin servers are delivered to every agent of THIS home uniformly, so a
+    # server inside this home's plugin store and absent from this agent's merged
+    # set was uninstalled here. Another live CAO home shares ``opencode.json``
+    # (``~/.aws/opencode`` does not follow ``CAO_HOME_DIR``), so absence alone
+    # does not mean withdrawn for its entries. Only a provably-CAO plugin entry
+    # is disabled: one inside this home's plugin store, or one the sidecar
+    # records CAO writing whose plugin root is gone (#1154, #1253 review). A
+    # user's own server and CAO's ``cao-mcp-server`` match neither, because only
     # plugin-derived entries are recorded and neither resolves inside the store.
     desired = set(merged_servers or {})
     current = read_config().get("mcp", {})
@@ -1838,7 +1841,9 @@ def _materialize_opencode_mcp(
         for name, cfg in current.items():
             if name in desired or not isinstance(cfg, dict) or cfg.get("enabled") is False:
                 continue
-            if is_recorded_mcp_entry(name, cfg) or entry_within_roots(cfg, plugin_store_roots):
+            if is_orphaned_recorded_mcp_entry(name, cfg) or entry_within_roots(
+                cfg, plugin_store_roots
+            ):
                 disable_mcp_server(name)
 
     if collisions:

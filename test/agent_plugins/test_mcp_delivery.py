@@ -18,6 +18,8 @@ No hand-built dict, no re-implemented comprehension.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -700,14 +702,31 @@ class TestOpencodeRemovalIsDisableNotDelete:
         assert "demo-tools" not in copilot_md
 
 
-def _move_plugin_store(workspace, monkeypatch) -> InstalledPluginStore:
+def _remove_store(store: InstalledPluginStore) -> None:
+    """Delete a plugin store from disk, as removing an old CAO home would."""
+    for directory in (store.plugins_dir, store.data_dir):
+        shutil.rmtree(directory, ignore_errors=True)
+    assert not store.plugins_dir.exists()
+
+
+def _move_plugin_store(workspace, monkeypatch, *, keep_old: bool = False) -> InstalledPluginStore:
     """Point the plugin store at a fresh tree, as a changed ``CAO_HOME_DIR`` would.
 
     ``opencode.json`` and its sidecar live under ``~/.aws/opencode`` and do not
     follow ``CAO_HOME_DIR``, so after a home move the entries CAO wrote earlier
     still name the OLD store. That is the state plugin-store containment cannot
     explain and a recorded ownership row can.
+
+    A real move leaves no old store behind, so by default the old store is
+    renamed away. ``keep_old=True`` leaves it in place instead, which models a
+    SECOND LIVE home sharing ``~/.aws/opencode`` with the first (#1253 review).
     """
+    old = workspace["store"]
+    if not keep_old:
+        for directory in (old.plugins_dir, old.data_dir):
+            if directory.exists():
+                directory.rename(directory.with_name(directory.name + ".moved-away"))
+        assert not old.plugins_dir.exists()
     moved = InstalledPluginStore(
         plugins_dir=workspace["tmp_path"] / "home2" / "agent-plugins",
         data_dir=workspace["tmp_path"] / "home2" / "agent-plugin-data",
@@ -821,6 +840,106 @@ class TestOpencodeMcpEntryOwnershipIsRecorded:
 
         assert opencode_json(opencode_workspace)["mcp"]["demo-tools"] == user_entry
         assert any(f.code == "mcp_delivery.opencode_config_collision" for f in captured)
+
+
+class TestTwoLiveCaoHomesShareOpencodeJson:
+    """#1253 review, finding 1: a second LIVE home must not touch the first's entries.
+
+    ``~/.aws/opencode`` does not follow ``CAO_HOME_DIR``, so two homes running at
+    once share one ``opencode.json`` and one sidecar. While home A's store still
+    exists, the record does not prove home B owns A's entry.
+    """
+
+    SERVER = {"demo-tools": stdio(args=["--root", "${PLUGIN_ROOT}"])}
+
+    def _home_a(self, workspace) -> tuple[InstalledPluginStore, dict]:
+        from cli_agent_orchestrator.services import install_service
+
+        install_plugin(workspace, "demo", mcp=mcp_doc(**self.SERVER))
+        workspace["write_profile"]("worker", frontmatter=NAMES_DEMO_TOOLS)
+        assert install_service.install_agent("worker", "opencode_cli").success
+        entry = opencode_json(workspace)["mcp"]["demo-tools"]
+        assert entry["enabled"] is True
+        return workspace["store"], entry
+
+    def test_home_b_without_the_plugin_leaves_a_live_home_a_entry_alone(
+        self, opencode_workspace, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import install_service
+
+        store_a, entry_a = self._home_a(opencode_workspace)
+        _move_plugin_store(opencode_workspace, monkeypatch, keep_old=True)
+        assert store_a.plugin_root("demo").exists()
+
+        opencode_workspace["write_profile"]("beta")
+        assert install_service.install_agent("beta", "opencode_cli").success
+        assert opencode_json(opencode_workspace)["mcp"]["demo-tools"] == entry_a
+
+        # Home A goes away: nothing delivers its entry any more, so it is disabled.
+        _remove_store(store_a)
+        assert install_service.install_agent("beta", "opencode_cli").success
+        after = opencode_json(opencode_workspace)["mcp"]["demo-tools"]
+        assert after["enabled"] is False
+        assert {k: v for k, v in after.items() if k != "enabled"} == {
+            k: v for k, v in entry_a.items() if k != "enabled"
+        }
+
+    def test_home_b_with_the_plugin_reports_a_collision_until_home_a_is_gone(
+        self, opencode_workspace, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import install_service
+
+        store_a, entry_a = self._home_a(opencode_workspace)
+        store_b = _move_plugin_store(opencode_workspace, monkeypatch, keep_old=True)
+        install_plugin(opencode_workspace, "demo", mcp=mcp_doc(**self.SERVER))
+        captured = _finding_spy(monkeypatch)
+        assert install_service.install_agent("worker", "opencode_cli").success
+        assert opencode_json(opencode_workspace)["mcp"]["demo-tools"] == entry_a
+        assert any(f.code == "mcp_delivery.opencode_config_collision" for f in captured)
+
+        _remove_store(store_a)
+        captured.clear()
+        assert install_service.install_agent("worker", "opencode_cli").success
+        data = opencode_json(opencode_workspace)
+        assert str(store_b.plugin_root("demo")) in data["mcp"]["demo-tools"]["command"]
+        assert data["mcp"]["demo-tools"]["enabled"] is True
+        assert data["agent"]["worker"]["tools"]["demo-tools*"] is True
+        assert not any(f.code == "mcp_delivery.opencode_config_collision" for f in captured)
+
+
+class TestAnUnreadableSidecarDoesNotFailTheInstall:
+    """#1253 review, finding 2: an unreadable sidecar is refused, never raised."""
+
+    @pytest.mark.parametrize("damage", ["invalid-utf-8", "mode-000", "directory"])
+    def test_the_install_completes_and_grants_the_tool(self, opencode_workspace, damage):
+        from cli_agent_orchestrator.services import install_service
+
+        if damage == "mode-000" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("root reads a mode-000 file")
+        install_plugin(
+            opencode_workspace,
+            "demo",
+            mcp=mcp_doc(**{"demo-tools": stdio(args=["--root", "${PLUGIN_ROOT}"])}),
+        )
+        opencode_workspace["write_profile"]("worker", frontmatter=NAMES_DEMO_TOOLS)
+        sidecar = opencode_workspace["opencode_config"].with_name("cao-grants.json")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        if damage == "directory":
+            sidecar.mkdir()
+        else:
+            sidecar.write_bytes(b'{"version": 1, "agents": {"other": ["x*"]}, "n": "\xff"}')
+            if damage == "mode-000":
+                sidecar.write_text('{"version": 1, "agents": {}}', encoding="utf-8")
+                sidecar.chmod(0)
+        try:
+            result = install_service.install_agent("worker", "opencode_cli")
+        finally:
+            if not sidecar.is_dir():
+                sidecar.chmod(0o600)
+        assert result.success, result
+        data = opencode_json(opencode_workspace)
+        assert data["mcp"]["demo-tools"]["enabled"] is True
+        assert data["agent"]["worker"]["tools"]["demo-tools*"] is True
 
 
 class TestOpencodeCwdIsEmitted:
@@ -1107,6 +1226,35 @@ class TestOpencodeAgentEntryIsNeverClobbered:
         assert result["agent"]["worker"]["tools"]["user*"] is True
         # Not a plugin-store entry, so CAO neither deletes nor disables it.
         assert result["mcp"]["profile-srv"]["enabled"] is True
+
+    def test_a_profile_server_is_never_recorded_even_with_a_gone_plugin_root(
+        self, opencode_workspace
+    ):
+        """Only plugin-derived entries are recorded (#1154, #1253 review).
+
+        A profile server is one agent's. If it were recorded, one whose own env
+        names an absolute ``PLUGIN_ROOT`` that does not exist would read as an
+        orphaned CAO entry, and the next install that no longer declares it would
+        disable a server the user owns.
+        """
+        from cli_agent_orchestrator.services.install_service import install_agent
+
+        gone = opencode_workspace["tmp_path"] / "no-such-plugin-root"
+        opencode_workspace["write_profile"](
+            "worker",
+            frontmatter=(
+                'mcpServers:\n  profile-srv:\n    type: stdio\n    command: "srv"\n'
+                f'    env:\n      PLUGIN_ROOT: "{gone}"\n'
+            ),
+        )
+        assert install_agent("worker", "opencode_cli").success
+        sidecar = opencode_workspace["opencode_config"].with_name("cao-grants.json")
+        record = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
+        assert "profile-srv" not in record.get("mcp", {})
+
+        opencode_workspace["write_profile"]("worker")
+        assert install_agent("worker", "opencode_cli").success
+        assert opencode_json(opencode_workspace)["mcp"]["profile-srv"]["enabled"] is True
 
     def test_a_missing_sidecar_still_withdraws_provable_plugin_grants(self, opencode_workspace):
         """The upgrade path: an install predating the sidecar stays cleanable.

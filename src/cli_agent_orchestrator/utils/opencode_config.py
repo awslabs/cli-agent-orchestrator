@@ -12,6 +12,7 @@ invocations are not a supported scenario.
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
@@ -363,6 +364,10 @@ def _load_grant_record_or_raise() -> Dict[str, Any]:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return dict(_EMPTY_GRANT_RECORD, agents={})
+    except (OSError, UnicodeDecodeError) as exc:
+        # Not valid UTF-8, not readable, or a directory: unreadable like bad JSON,
+        # and refused the same way, naming the file (#1253 review).
+        raise GrantRecordUnreadableError(f"{path}: {exc}") from exc
     try:
         loaded = json.loads(raw)
     except ValueError as exc:
@@ -405,6 +410,36 @@ def is_recorded_mcp_entry(name: str, config: Mapping[str, Any]) -> bool:
     """Whether the sidecar records CAO writing exactly *config* as ``mcp.<name>``."""
     digest = _recorded_mcp_entries().get(name)
     return digest is not None and digest == mcp_entry_fingerprint(config)
+
+
+def _plugin_root_is_gone(config: Mapping[str, Any]) -> bool:
+    """Whether the plugin root an ``mcp`` entry names no longer exists on disk.
+
+    The mapper sets ``PLUGIN_ROOT`` in every plugin server's environment to that
+    plugin's root in the store it was delivered from. An entry without one, or
+    with a relative one, is never treated as gone. ``lexists`` keeps a dangling
+    symlink counting as present, so an unclear answer leaves the entry alone.
+    """
+    environment = config.get("environment")
+    root = environment.get("PLUGIN_ROOT") if isinstance(environment, dict) else None
+    if not isinstance(root, str) or not root or not os.path.isabs(root):
+        return False
+    return not os.path.lexists(root)
+
+
+def is_orphaned_recorded_mcp_entry(name: str, config: Mapping[str, Any]) -> bool:
+    """Whether the record alone proves CAO may update or disable ``mcp.<name>``.
+
+    Two conditions, both required: the sidecar records CAO writing exactly
+    *config*, AND the plugin root the entry names is gone. The second matters
+    because ``~/.aws/opencode`` does not follow ``CAO_HOME_DIR``: two live CAO
+    homes share one ``opencode.json`` and one sidecar, and the record does not say
+    which home wrote an entry. While the entry's plugin root still exists, another
+    live home may be using it, so this home must neither disable nor rewrite it
+    (#1253 review). An entry whose store is gone, as after a ``CAO_HOME_DIR``
+    move, has no other owner left.
+    """
+    return is_recorded_mcp_entry(name, config) and _plugin_root_is_gone(config)
 
 
 def _reconcile_agent_grants(
@@ -614,12 +649,15 @@ def is_cao_owned_mcp_entry(
 
     Four ways an existing entry is provably CAO's, and therefore safe to replace:
 
-    0. ``name`` is given and the sidecar records CAO writing exactly
-       ``existing`` under it (:func:`is_recorded_mcp_entry`, #1154). This is the
-       recorded proof, and the only one that holds for an entry CAO wrote under
-       a different ``CAO_HOME_DIR``, whose paths name a store that is no longer
-       the current one. It is a digest of the content rather than of the name,
-       so a user who rewrote an entry CAO once wrote gets it back as their own.
+    0. ``name`` is given, the sidecar records CAO writing exactly ``existing``
+       under it, and the plugin root ``existing`` names is gone
+       (:func:`is_orphaned_recorded_mcp_entry`, #1154). This is the recorded
+       proof, and the only one that holds for an entry CAO wrote under a
+       ``CAO_HOME_DIR`` that no longer exists. While that plugin root exists,
+       another live CAO home may own the entry, so it is not accepted here and
+       a plugin server of the same name is reported as a collision. It is a
+       digest of the content rather than of the name, so a user who rewrote an
+       entry CAO once wrote gets it back as their own.
     1. It is byte-for-byte what CAO would write now (idempotent replay — a
        reinstall/refresh re-writes CAO's own entry every time, and that must not
        be misreported as a user collision or the server could never be delivered
@@ -627,9 +665,9 @@ def is_cao_owned_mcp_entry(
     2. Its command resolves **inside the plugin store**, whatever its
        ``enabled`` state. The plugin store is a CAO-managed directory that only
        CAO ever writes into, so a command rooted there is CAO's own delivery by
-       construction — this is the recorded-ownership signal, derived from the
-       very bytes being compared rather than from a side table that can go stale
-       or be lost while ``opencode.json`` persists.
+       construction. This is the containment proof: it is derived from the very
+       bytes being compared, so unlike the record in item 0 it cannot be lost
+       while ``opencode.json`` persists, but it holds only for the current store.
     3. (Subsumed by 2, kept explicit for readers) a CAO-*disabled* entry inside
        the plugin store — a server CAO delivered and then disabled on a prior
        uninstall. Re-enabling it on reinstall is safe.
@@ -650,7 +688,7 @@ def is_cao_owned_mcp_entry(
     """
     if dict(existing) == dict(candidate):
         return True
-    if name is not None and is_recorded_mcp_entry(name, existing):
+    if name is not None and is_orphaned_recorded_mcp_entry(name, existing):
         return True
     if entry_within_roots(existing, plugin_store_roots):
         return True

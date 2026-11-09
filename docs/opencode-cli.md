@@ -245,11 +245,16 @@ only costs CAO the first of the two proofs.
 
 The same two proofs decide which `mcp` entries are CAO's. For every agent-plugin
 server it writes, CAO records a SHA-256 fingerprint of the entry in `cao-grants.json`
-(under `"mcp"`; the fingerprint ignores `enabled`). An entry still matching its
-fingerprint is CAO's even if its paths name an agent-plugin store CAO no longer uses,
-for example after `CAO_HOME_DIR` changed, so CAO updates it on install and sets
-`"enabled": false` when the plugin is gone. An entry you edited no longer matches,
-and is then CAO's only if its paths resolve inside the current agent-plugin store.
+(under `"mcp"`; the fingerprint ignores `enabled`). `~/.aws/opencode` does not follow
+`CAO_HOME_DIR`, so two CAO homes share `opencode.json` and the sidecar. An entry
+inside the current agent-plugin store is CAO's. An entry inside another store is CAO's
+only once that store's plugin directory is gone, for example after `CAO_HOME_DIR`
+moved: CAO then updates it on install and sets `"enabled": false` when no installed
+plugin delivers it. While the other store's plugin directory still exists, another
+live CAO home may be using the entry, so CAO leaves it enabled and unchanged, and
+reports a plugin server of the same name as a collision. An entry you edited no
+longer matches its fingerprint, and is then CAO's only if its paths resolve inside
+the current agent-plugin store.
 Anything else is yours: CAO reports a plugin server of the same name instead of
 overwriting your entry, and never disables it.
 
