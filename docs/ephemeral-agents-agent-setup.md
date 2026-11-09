@@ -320,6 +320,11 @@ For another decider, use that package's own key-check and status commands. Don't
 environment variable name, and don't use `cao env list`: it prints values. Jev's own README is
 the authority for its key, consent and revoke commands.
 
+A decider's key may be stored once per OS user, and so shared by every CAO install on the
+machine; Jev's current release does this. On a second or test install, leave the commands that
+change or use the key (`key set`, `key delete`, `key check --auth`) to the user, and check the
+decider's README for where it keeps its key.
+
 ## 6. Restart the server and reconnect your MCP
 
 `cao-server` only looks for deciders when it starts. Get the user's OK, then restart it the way
@@ -331,16 +336,28 @@ step 2 found it running:
   (`-k` stops the running instance first; without it, kickstart leaves a running job alone).
 
 Find the process by its port, never by matching command-line text: your own shell can match that
-text too. Then check the restart:
+text too. Then check the restart. The server can take a few seconds to answer, so the block
+first waits for it, trying once a second, up to 30 times:
 
 ```bash
 PORT="${CAO_API_PORT:-9889}"
-curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null && echo "server answers"
-PID="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -n 1)"
-ps -o pid,lstart,etime -p "$PID"                   # the start time must be after your install
-ps -o args= -p "$PID"                              # must match the ps line you saw in step 2
-"$(dirname "$CAO_PY")/cao" decisions status | "$CAO_PY" -c "import json,sys; print([d['name'] for d in json.load(sys.stdin)['installed_deciders']])"
+UP=""
+for i in $(seq 1 30); do
+  if curl -sf --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null; then UP=1; break; fi
+  sleep 1
+done
+if [ -n "$UP" ]; then
+  echo "server answers"
+  PID="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -n 1)"
+  ps -o pid,lstart,etime -p "$PID"                   # the start time must be after your install
+  ps -o args= -p "$PID"                              # must match the ps line you saw in step 2
+  "$(dirname "$CAO_PY")/cao" decisions status | "$CAO_PY" -c "import json,sys; print([d['name'] for d in json.load(sys.stdin)['installed_deciders']])"
+else
+  echo "no answer on port $PORT after 30 tries: stop and report"
+fi
 ```
+
+If it prints `no answer`, the restart failed: stop and report it to the user.
 
 The `ps` line must be the same command as in step 2, so the server still runs the Python you
 installed into. Compare it with step 2's `ps` line, not with `"$CAO_PY"`: when step 2 used the
