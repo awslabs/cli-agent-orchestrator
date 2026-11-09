@@ -31,6 +31,22 @@ class TestWorkerCanSendMessage:
         with patch(f"{ORCH}.load_agent_profile", return_value=_profile("claude_code", {})):
             assert _worker_can_send_message("dev") is False
 
+    def test_server_under_another_name_found_by_its_args(self):
+        from cli_agent_orchestrator.utils.orchestration import _worker_can_send_message
+
+        servers = {
+            "orchestrator": {
+                "command": "uvx",
+                "args": [
+                    "--from",
+                    "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                    "cao-mcp-server",
+                ],
+            }
+        }
+        with patch(f"{ORCH}.load_agent_profile", return_value=_profile("claude_code", servers)):
+            assert _worker_can_send_message("dev") is True
+
     def test_provider_that_injects_cao_server(self):
         from cli_agent_orchestrator.utils.orchestration import _worker_can_send_message
 
@@ -79,6 +95,28 @@ class TestAssignFlags:
         assert "cannot call send_message" in result["message"]
         assert "send results back" not in create.call_args.kwargs["initial_message"]
         assert create.call_args.kwargs["worker_can_reply"] is False
+
+    @patch(f"{ORCH}.load_agent_profile", return_value=_profile("claude_code", {}))
+    @patch(f"{ORCH}._create_terminal", return_value=("w1", "claude_code"))
+    def test_claimed_worker_is_not_judged_by_its_profile(self, create, _load):
+        """An ephemeral claim pins the provider, which the profile does not show.
+
+        The profile here names claude_code and no cao-mcp-server, so judging the
+        claimed worker by it would wrongly withhold the reply instruction.
+        """
+        from cli_agent_orchestrator.utils.orchestration import EphemeralClaim, _assign_impl
+
+        claim = EphemeralClaim(provider="claude_code", effective_tools=[], claim_id="claim-1")
+        with (
+            patch(f"{ORCH}._claim_ephemeral", return_value=claim),
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}),
+        ):
+            result = _assign_impl("developer", "do it")
+        assert result["success"] is True
+        assert create.call_args.kwargs["claim"] == claim
+        assert create.call_args.kwargs["worker_can_reply"] is True
+        assert "send results back" in create.call_args.kwargs["initial_message"]
+        assert "cannot call send_message" not in result["message"]
 
     @patch(f"{ORCH}._create_terminal", return_value=("w1", "claude_code"))
     def test_opt_out(self, create):
@@ -169,5 +207,44 @@ class TestToolsCalledDirectly:
             patch.object(server, "_assign_impl", return_value={"success": True}) as impl,
         ):
             asyncio.run(server.assign("developer", "do it", **given))
+        value = impl.call_args.kwargs["expect_callback"]
+        assert type(value) is bool and value is expected
+
+
+def _server_with_working_directory():
+    """A separate copy of the MCP server module, imported with the
+    ``working_directory`` variant of ``assign`` (CAO_ENABLE_WORKING_DIRECTORY=true).
+
+    The variant is chosen at import time, so the default import never defines
+    it. The copy has its own FastMCP instance and leaves the imported module
+    and ``sys.modules`` untouched.
+    """
+    import importlib.util
+
+    from cli_agent_orchestrator.mcp_server import server
+
+    spec = importlib.util.spec_from_file_location(
+        "_cao_server_with_working_directory", server.__file__
+    )
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(os.environ, {"CAO_ENABLE_WORKING_DIRECTORY": "true"}):
+        spec.loader.exec_module(module)
+    assert module.ENABLE_WORKING_DIRECTORY is True
+    return module
+
+
+class TestWorkingDirectoryAssignCalledDirectly:
+    @pytest.mark.parametrize(
+        ("given", "expected"), [({}, True), ({"expect_callback": False}, False)]
+    )
+    def test_assign_passes_a_plain_boolean(self, given, expected):
+        server = _server_with_working_directory()
+
+        with (
+            patch.object(server, "_tool_denied_reason", return_value=None),
+            patch.object(server, "_assign_impl", return_value={"success": True}) as impl,
+        ):
+            asyncio.run(server.assign("developer", "do it", working_directory="/repo", **given))
+        assert impl.call_args.args[2] == "/repo"
         value = impl.call_args.kwargs["expect_callback"]
         assert type(value) is bool and value is expected

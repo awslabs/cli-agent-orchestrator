@@ -186,6 +186,30 @@ class TestEvaluateCompletion:
         assert svc.evaluate_completion("w1") == 0
         env["status"].get_status.assert_not_called()
 
+    def test_claim_lost_after_listing_does_not_forward(self, db, env):
+        """Two evaluators list the same edge before either claims it: one forwards.
+
+        The first evaluator's listing is returned only after a second
+        evaluation of the same terminal has run to completion, so both hold the
+        edge when they reach the claim.
+        """
+        _armed("sup", "w1")
+        real_list = svc.list_open_edges_into
+        inner = {}
+
+        def list_then_let_another_evaluator_run(terminal_id, armed_only=False):
+            edges = real_list(terminal_id, armed_only=armed_only)
+            if "forwarded" not in inner:
+                inner["forwarded"] = None  # set first, so the nested call does not recurse
+                inner["forwarded"] = svc.evaluate_completion(terminal_id)
+            return edges
+
+        with patch(f"{MOD}.list_open_edges_into", side_effect=list_then_let_another_evaluator_run):
+            outer = svc.evaluate_completion("w1")
+
+        assert (inner["forwarded"], outer) == (1, 0)
+        assert len(env["sent"]) == 1
+
     def test_unreadable_output_still_forwards(self, db, env):
         _armed("sup", "w1")
         env["ts"].get_output.side_effect = RuntimeError("pane gone")
