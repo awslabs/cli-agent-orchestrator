@@ -62,6 +62,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.database import (
     get_idempotency_record,
+    get_kept_terminal,
     get_session_incarnation,
     get_terminal_metadata,
     list_pending_deferred_init_external_owner_terminal_ids,
@@ -1500,8 +1501,8 @@ def _helper_v3_refusal(error: KiroV3Refusal) -> KiroV3Refusal:
 def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
     """The probe's version or missing-flag refusal with the helper's remedy, same kind.
 
-    It stays a capability error (a 400 with a plain-string detail); any other
-    probe failure, which suggests no engine, is returned as it is.
+    Other probe messages stay intact here. The launch path wraps only the final
+    helper failure as a structured, archived policy refusal after model fallback.
     """
     if error.kind == KiroV3UnsupportedVersionError.code:
         message = str(KiroV3UnsupportedVersionError(error.version, remedy=_HELPER_SUPPORTED_CLI))
@@ -1519,18 +1520,6 @@ def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
     return KiroCapabilityError(
         error.kind, error.engine, message, capability=error.capability, version=error.version
     )
-
-
-def _helper_probe(probe: Callable[..., KiroCapabilities]) -> Callable[..., KiroCapabilities]:
-    """``probe``, whose refusals carry the helper's remedy."""
-
-    def run(*args: Any, **kwargs: Any) -> KiroCapabilities:
-        try:
-            return probe(*args, **kwargs)
-        except KiroCapabilityError as exc:
-            raise _helper_capability_error(exc) from exc
-
-    return run
 
 
 def _helper_engine(
@@ -2360,34 +2349,43 @@ async def _create_terminal_unguarded(
                     _helper_stage_a, agent_profile, caller_id, env_vars
                 )
                 kiro_helper = (resolved_cli, global_home)
-                probe = _helper_probe(
-                    functools.partial(
-                        probe,
-                        executable=resolved_cli.path,
-                        env=kiro_launch_home.kiro_env(kiro_probe_home),
-                    )
+                probe = functools.partial(
+                    probe,
+                    executable=resolved_cli.path,
+                    env=kiro_launch_home.kiro_env(kiro_probe_home),
                 )
             try:
-                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
-            except KiroCapabilityError:
-                # A routed launch is refused, never relaunched on the profile's model, which
-                # is the fallback provider's (#1099).
-                if (
-                    model
-                    or launch_plan is None
-                    or launch_plan.model is None
-                    or launch_plan.provider is not None
-                ):
+                try:
+                    capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
+                except KiroCapabilityError:
+                    # A routed launch is refused, never relaunched on the profile's model, which
+                    # is the fallback provider's (#1099).
+                    if (
+                        model
+                        or launch_plan is None
+                        or launch_plan.model is None
+                        or launch_plan.provider is not None
+                    ):
+                        raise
+                    launch_model = resolve_launch_model(model, profile)
+                    requested = requested_kiro_capabilities(
+                        resolved_engine, model=launch_model, yolo=True, effort=launch_effort
+                    )
+                    capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
+                    decision_not_honored = True
+                    model_honored = ProviderManager.provider_class(provider).honors_model(
+                        agent_profile=agent_profile, profile=profile, requested_model=launch_model
+                    )
+            except KiroCapabilityError as exc:
+                if not helper:
                     raise
-                launch_model = resolve_launch_model(model, profile)
-                requested = requested_kiro_capabilities(
-                    resolved_engine, model=launch_model, yolo=True, effort=launch_effort
-                )
-                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
-                decision_not_honored = True
-                model_honored = ProviderManager.provider_class(provider).honors_model(
-                    agent_profile=agent_profile, profile=profile, requested_model=launch_model
-                )
+                error = _helper_capability_error(exc)
+                # Convert once, after #1099's decided-model fallback. Keep the
+                # rule in its field and remove its duplicate from the detail.
+                detail = str(error).removeprefix(f"{error.kind}: ")
+                raise _ephemeral_kiro_refusal(
+                    agent_profile, caller_id, KiroLaunchRefusal(error.kind, detail)
+                ) from None
             if resolved_engine == KiroEngine.V3:
                 # #1167: the probed version must be allow-listed and verified
                 # (or pending, with the operator's opt-in), and the policy
@@ -5651,6 +5649,14 @@ def get_terminal(terminal_id: str) -> Dict:
             else:
                 status = reported_status(terminal_id, observed_status).value
 
+        # #1225: a kept child (terminal.keep_finished) shows when its window ends.
+        # Best-effort: an unreadable keep mark must not fail a status read.
+        try:
+            kept = get_kept_terminal(terminal_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("get_terminal: keep mark of %s unreadable: %s", terminal_id, exc)
+            kept = None
+
         return {
             "id": metadata["id"],
             "name": metadata["tmux_window"],
@@ -5674,6 +5680,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "status": status,
             "status_generation": status_generation,
             "output_generation": output_generation,
+            "kept": kept is not None,
+            "kept_until": kept["kept_until"] if kept is not None else None,
             "last_active": metadata["last_active"],
         }
 

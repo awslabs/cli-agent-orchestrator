@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -14,7 +15,11 @@ from cli_agent_orchestrator.utils.opencode_config import (
     ensure_skills_symlink,
     entry_within_roots,
     is_cao_owned_mcp_entry,
+    is_orphaned_recorded_mcp_entry,
+    is_recorded_mcp_entry,
+    mcp_entry_fingerprint,
     read_config,
+    record_mcp_entry,
     remove_agent_tools,
     to_opencode_agent_id,
     translate_mcp_server_config,
@@ -799,3 +804,167 @@ class TestIsCaoOwnedMcpEntry:
         existing = {"type": "local", "command": ["/home/someone/bin/their-server"], "enabled": True}
         candidate = {"type": "local", "command": [str(root / "demo" / "server")], "enabled": True}
         assert is_cao_owned_mcp_entry(existing, candidate, plugin_store_roots=[root]) is False
+
+
+class TestMcpEntryRecord:
+    """#1154: ``mcp`` entry ownership is recorded beside the grant record."""
+
+    ENTRY = {"type": "local", "command": ["/old-home/agent-plugins/demo/server"], "enabled": True}
+
+    def test_the_fingerprint_ignores_enabled_and_nothing_else(self):
+        disabled = {**self.ENTRY, "enabled": False}
+        assert mcp_entry_fingerprint(disabled) == mcp_entry_fingerprint(self.ENTRY)
+        for edit in ({"command": ["/other"]}, {"cwd": "/w"}, {"environment": {"A": "1"}}):
+            assert mcp_entry_fingerprint({**self.ENTRY, **edit}) != mcp_entry_fingerprint(
+                self.ENTRY
+            )
+
+    @staticmethod
+    def _entry_rooted_at(root: Path) -> dict:
+        return {
+            "type": "local",
+            "command": [str(root / "server"), "--root", str(root)],
+            "environment": {"PLUGIN_ROOT": str(root), "PLUGIN_DATA": str(root) + "-data"},
+            "cwd": str(root),
+            "enabled": True,
+        }
+
+    def test_a_recorded_entry_is_owned_only_once_its_plugin_root_is_gone(
+        self, tmp_config: Path, tmp_path: Path
+    ):
+        """#1253 review: while another home's plugin root exists, the record proves nothing."""
+        old_root = tmp_path / "home-a" / "agent-plugins" / "demo"
+        old_root.mkdir(parents=True)
+        entry = self._entry_rooted_at(old_root)
+        record_mcp_entry("demo-tools", entry)
+        candidate = self._entry_rooted_at(tmp_path / "home-b" / "agent-plugins" / "demo")
+        roots = [tmp_path / "home-b" / "agent-plugins"]
+
+        # Home A is live: its plugin root exists, so home B may not take the entry.
+        assert is_recorded_mcp_entry("demo-tools", entry)
+        assert not is_orphaned_recorded_mcp_entry("demo-tools", entry)
+        assert not is_cao_owned_mcp_entry(
+            entry, candidate, plugin_store_roots=roots, name="demo-tools"
+        )
+
+        # Home A is gone: now the record alone proves CAO wrote it.
+        shutil.rmtree(tmp_path / "home-a")
+        assert is_orphaned_recorded_mcp_entry("demo-tools", entry)
+        assert is_cao_owned_mcp_entry(entry, candidate, plugin_store_roots=roots, name="demo-tools")
+        # Without the name, the record is not consulted at all.
+        assert not is_cao_owned_mcp_entry(entry, candidate, plugin_store_roots=roots)
+        # A CAO-disabled copy of the recorded entry is still CAO's.
+        assert is_orphaned_recorded_mcp_entry("demo-tools", {**entry, "enabled": False})
+
+    def test_an_unrecorded_entry_is_never_orphaned_even_when_its_root_is_gone(
+        self, tmp_config: Path, tmp_path: Path
+    ):
+        entry = self._entry_rooted_at(tmp_path / "never-existed" / "demo")
+        assert not is_orphaned_recorded_mcp_entry("demo-tools", entry)
+
+    @pytest.mark.parametrize(
+        "environment",
+        [None, {}, {"PLUGIN_ROOT": ""}, {"PLUGIN_ROOT": "relative/demo"}, {"PLUGIN_ROOT": 7}],
+        ids=["no-environment", "no-plugin-root", "empty", "relative", "not-a-string"],
+    )
+    def test_an_entry_without_an_absolute_plugin_root_is_never_orphaned(
+        self, tmp_config: Path, environment
+    ):
+        entry = {"type": "local", "command": ["/gone/server"], "enabled": True}
+        if environment is not None:
+            entry["environment"] = environment
+        record_mcp_entry("demo-tools", entry)
+        assert is_recorded_mcp_entry("demo-tools", entry)
+        assert not is_orphaned_recorded_mcp_entry("demo-tools", entry)
+
+    def test_a_dangling_symlink_plugin_root_counts_as_present(
+        self, tmp_config: Path, tmp_path: Path
+    ):
+        root = tmp_path / "demo"
+        root.symlink_to(tmp_path / "nowhere")
+        entry = self._entry_rooted_at(root)
+        record_mcp_entry("demo-tools", entry)
+        assert not is_orphaned_recorded_mcp_entry("demo-tools", entry)
+
+    def test_the_record_is_per_name_and_per_content(self, tmp_config: Path):
+        record_mcp_entry("demo-tools", self.ENTRY)
+        assert not is_recorded_mcp_entry("other-tools", self.ENTRY)
+        assert not is_recorded_mcp_entry("demo-tools", {**self.ENTRY, "command": ["/user"]})
+
+    def test_mcp_and_grant_rows_share_the_sidecar_without_clobbering(self, tmp_config: Path):
+        record_mcp_entry("demo-tools", self.ENTRY)
+        upsert_agent_tools("developer", ["demo-tools"])
+        record_mcp_entry("more-tools", {**self.ENTRY, "command": ["/x"]})
+        record = json.loads(tmp_config.with_name("cao-grants.json").read_text())
+        assert record["version"] == 1
+        assert record["agents"] == {"developer": ["demo-tools*"]}
+        assert set(record["mcp"]) == {"demo-tools", "more-tools"}
+
+    def test_a_malformed_mcp_row_is_ignored_not_raised(self, tmp_config: Path):
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.with_name("cao-grants.json").write_text(
+            json.dumps({"version": 1, "agents": {}, "mcp": ["demo-tools"]}), encoding="utf-8"
+        )
+        assert not is_recorded_mcp_entry("demo-tools", self.ENTRY)
+        record_mcp_entry("demo-tools", self.ENTRY)
+        assert is_recorded_mcp_entry("demo-tools", self.ENTRY)
+
+    def test_a_corrupt_sidecar_is_left_intact_not_rewritten(self, tmp_config: Path, caplog):
+        """Fail closed (GH #737): recording must not replace an unreadable sidecar."""
+        tmp_config.parent.mkdir(parents=True)
+        sidecar = tmp_config.with_name("cao-grants.json")
+        sidecar.write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            record_mcp_entry("demo-tools", self.ENTRY)
+        assert sidecar.read_text(encoding="utf-8") == "{not json"
+        assert any("not recording mcp.demo-tools" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("damage", ["invalid-utf-8", "mode-000", "directory"])
+    def test_an_unreadable_sidecar_is_left_intact_not_raised(
+        self, tmp_config: Path, caplog, damage: str
+    ):
+        """#1253 review: not UTF-8, unreadable, or a directory is refused like bad JSON."""
+        if damage == "mode-000" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("root reads a mode-000 file")
+        tmp_config.parent.mkdir(parents=True)
+        sidecar = tmp_config.with_name("cao-grants.json")
+        content = b'{"version": 1, "agents": {"other": ["x*"]}, "n": "\xff"}'
+        if damage == "directory":
+            sidecar.mkdir()
+        else:
+            sidecar.write_bytes(content)
+            if damage == "mode-000":
+                sidecar.chmod(0)
+        try:
+            with caplog.at_level(logging.WARNING):
+                record_mcp_entry("demo-tools", self.ENTRY)
+        finally:
+            if not sidecar.is_dir():
+                sidecar.chmod(0o600)
+        if damage == "directory":
+            assert sidecar.is_dir() and not any(sidecar.iterdir())
+        else:
+            assert sidecar.read_bytes() == content
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if "not recording mcp.demo-tools" in r.getMessage()
+        ]
+        assert warnings and str(sidecar) in warnings[0], warnings
+
+    @pytest.mark.parametrize(
+        "content",
+        ['["not", "a", "record"]', '{"version": 1, "agents": ["developer"]}'],
+        ids=["not-an-object", "agents-not-an-object"],
+    )
+    def test_a_wrongly_shaped_sidecar_is_left_intact_not_rewritten(
+        self, tmp_config: Path, caplog, content: str
+    ):
+        """Valid JSON that is not a grant record is refused the same way as invalid JSON."""
+        tmp_config.parent.mkdir(parents=True)
+        sidecar = tmp_config.with_name("cao-grants.json")
+        sidecar.write_text(content, encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            record_mcp_entry("demo-tools", self.ENTRY)
+        assert sidecar.read_text(encoding="utf-8") == content
+        assert any("unexpected shape" in r.getMessage() for r in caplog.records)

@@ -1,0 +1,1 @@
+{"identity":{"name":"cli-agent-orchestrator","version":"2.5.4"},"transport":{"streaming":true},"tools":{"clientProvided":false},"state":{"snapshots":true},"humanInTheLoop":{"supported":true,"approvals":true,"interrupts":true}}

@@ -113,6 +113,21 @@ you are working in, and a `kill-server` there ends every session on it. Clearing
 usually the same server. Never run a bare `tmux kill-server` outside the test
 harness. `test/test_tmux_isolation.py` checks the harness side of this.
 
+**A session that keeps the real `HOME` keeps the real tmux environment, and the
+harness stops no tmux server for it.** That is any session with
+`CAO_TEST_REAL_HOME=1` (which overrides the rest; `=0` forces isolation), an `-m`
+expression that selects `e2e` (`-m e2e`, `-m "e2e or x"`), or a test path with a
+component named exactly `e2e` (`test/e2e/...`, even with `-m "not e2e"`;
+`test_e2e_x.py` does not count) or `test_kiro_cli_integration.py`. CAO starts
+every tmux server with `exit-empty off`, so a server a test starts there keeps
+running after pytest exits. To run such a session on a private tmux, give it a
+private `TMUX_TMPDIR` with `TMUX` and `TMUX_PANE` cleared
+(`env -u TMUX -u TMUX_PANE`); otherwise the tests reach your own server. Before
+removing that directory, stop its server, in the same `EXIT` trap, kill first
+and then `rm` (the directory is under `/tmp` because of the socket-path cap):
+`export TMUX_TMPDIR="$(mktemp -d /tmp/cao-tmux.XXXXXX)"`, then
+`trap 'env -u TMUX -u TMUX_PANE tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT`.
+
 The suite also never runs a coding-agent CLI for memory compilation or lint: the
 LLM client is stubbed to "none" unless a test installs its own.
 

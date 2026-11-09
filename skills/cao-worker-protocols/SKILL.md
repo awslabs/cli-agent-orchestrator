@@ -1,6 +1,6 @@
 ---
 name: cao-worker-protocols
-description: Worker-side callback and completion rules for assigned and handed-off tasks in CAO
+description: Worker-side callback and completion rules for assigned and handed-off tasks in CAO. Use when acting as a CAO worker agent and finishing a task, deciding whether to call send_message (assign) or simply return the result (handoff), choosing the callback receiver_id, or reporting files and other deliverables back to the supervisor. Not for supervisor-side dispatch (use cao-supervisor-protocols) or launching sessions.
 ---
 
 # CAO Worker Protocols

@@ -93,7 +93,7 @@ export default function App() {
   const navLocked = useStore(s => s.navLockCount > 0)
 
   // Two independent gates, both fail-closed. Memory is a runtime capability
-  // check; Plugins is the build-time M1 gate (Requirement 16.5) and mirrors
+  // check; Plugins is the build-time graduation gate (#1244) and mirrors
   // `hidden=True` on the Click group and `Policy::Hidden` on the TUI rows.
   const visibleTabs = TABS.filter(
     t => (t.key !== 'memory' || memoryEnabled) && (t.key !== 'plugins' || PLUGINS_TAB_ENABLED)

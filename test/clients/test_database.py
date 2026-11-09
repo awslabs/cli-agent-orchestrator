@@ -88,6 +88,28 @@ class TestTerminalOperations:
 
             assert count_runtime_allocated_terminals() == 1
 
+    def test_terminal_exists_is_true_only_for_a_terminal_row(self, test_db):
+        # The AG-UI ambient stream asks this before announcing a sender as a
+        # subagent; labels such as "operator" and "supervisor" are not terminals.
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli")
+            assert db_mod.terminal_exists("live0001") is True
+            assert db_mod.terminal_exists("operator") is False
+            assert db_mod.terminal_exists("supervisor") is False
+            assert db_mod.terminal_exists("") is False
+
+    def test_get_terminal_label_names_only_a_terminal_row(self, test_db):
+        # The AG-UI ambient stream names a terminal it first meets mid-replay
+        # from this, instead of the generic "terminal".
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli", agent_profile="developer")
+            assert db_mod.get_terminal_label("live0001") == {
+                "agent_profile": "developer",
+                "provider": "kimi_cli",
+            }
+            assert db_mod.get_terminal_label("operator") is None
+            assert db_mod.get_terminal_label("") is None
+
     def test_session_incarnation_backfill_is_atomic_when_any_row_is_missing(self, test_db):
         with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
             create_terminal("live0001", "cao-live", "w-live", "kimi_cli")
@@ -261,7 +283,11 @@ class TestTerminalOperations:
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
-        mock_query.filter.return_value.order_by.return_value.all.return_value = [mock_terminal]
+        # The listing outer-joins the #1225 keep table and reads (row, kept_until) pairs.
+        selection = mock_query.filter.return_value.order_by.return_value
+        selection.outerjoin.return_value.add_columns.return_value.all.return_value = [
+            (mock_terminal, None)
+        ]
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
@@ -2712,6 +2738,8 @@ class TestListTerminalsInSessions:
             "deferred_init_external_owner",
             "deferred_init_runtime_reclaimed",
             "session_incarnation_id",
+            # #1225: end of a kept child's window, None when not kept.
+            "kept_until",
             "last_active",
         }
 

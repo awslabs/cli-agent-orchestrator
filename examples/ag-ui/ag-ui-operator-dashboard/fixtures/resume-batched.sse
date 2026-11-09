@@ -1,0 +1,6 @@
+data: {"type":"RUN_STARTED","threadId":"od-cap","runId":"batched","protocolVersion":"1.0"}
+
+data: {"type":"STATE_SNAPSHOT","snapshot":{"sessions":[{"id":"cao-od-a","name":"cao-od-a","status":"detached"},{"id":"cao-od-b","name":"cao-od-b","status":"detached"}],"terminals":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:41.727252+00:00"},{"id":"ecbb7401","session_name":"cao-od-b","provider":"mock_cli","agent_profile":"developer","window":"developer-82a0","status":null,"last_active":"2026-11-06T19:44:42.787122+00:00"}],"counts":{"sessions":2,"terminals":2},"scopes":["cao:read","cao:write","cao:admin"]}}
+
+data: {"type":"RUN_FINISHED","threadId":"od-cap","runId":"batched","outcome":{"type":"success"}}
+

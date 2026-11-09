@@ -158,6 +158,39 @@ class TestCliGate:
         assert result.exit_code != 0
         assert ENV_VAR in result.output
 
+    def test_the_refusal_names_m1_as_recorded_not_as_a_maintainer_decision(self, gate_off):
+        """M1 is signed off by the issue author in #573; graduation is what is left."""
+        result = CliRunner().invoke(cli, ["plugin", "list"])
+
+        assert result.exit_code != 0
+        output = " ".join(result.output.split())
+        assert (
+            "not released yet (pending graduation, #1244; the verb is decision M1, "
+            "recorded by the issue author in #573)"
+        ) in output
+        assert "maintainer decision M1" not in output
+
+    @pytest.mark.parametrize("state", ["gate_off", "gate_on"])
+    def test_the_group_help_names_m1_as_recorded_not_as_a_maintainer_decision(self, request, state):
+        """``cao plugin --help`` prints the group docstring with or without the gate."""
+        request.getfixturevalue(state)
+        result = CliRunner().invoke(cli, ["plugin", "--help"])
+
+        assert result.exit_code == 0, result.output
+        output = " ".join(result.output.split())
+        assert "is set, pending graduation (#1244)" in output
+        assert "The verb is decision M1, recorded by the issue author in #573" in output
+        assert "maintainer decision M1" not in output
+
+    def test_the_gate_module_names_m1_as_recorded_not_as_a_maintainer_decision(self):
+        from cli_agent_orchestrator.agent_plugins import gate
+
+        doc = " ".join((gate.__doc__ or "").split())
+        assert "M1 is now recorded as Option A by the issue author in #573" in doc
+        assert "shipping waits on graduation (#1244)" in doc
+        assert "still unresolved" not in doc
+        assert "maintainer decision M1" not in doc
+
     def test_the_gate_precedes_the_work(self, gate_off, monkeypatch):
         def _explode(*args, **kwargs):  # pragma: no cover - must never be reached
             raise AssertionError("install ran behind a closed gate")

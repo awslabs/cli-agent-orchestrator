@@ -304,6 +304,9 @@ def test_end_reason_vocabulary():
         "pane_closed",
         "stale_cleanup",
         "session_teardown",
+        # #1225: a kept child reaped after its window, or evicted for the cap.
+        "kept_expired",
+        "kept_evicted",
     }
 
 

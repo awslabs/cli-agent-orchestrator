@@ -7,8 +7,15 @@ bare ``kill-server`` can reach is one of these.
 
 A failed assertion here never compares against ``os.environ`` directly, because
 pytest would then print the whole environment.
+
+Only the tests that start tmux servers need tmux (``needs_tmux``). They are also
+``must_run("unit")``: the Unit Tests (3.12) job enforces that gate, so a runner
+image without tmux fails that job instead of skipping them silently. The tests
+that only read the environment run everywhere.
 """
 
+import errno
+import itertools
 import json
 import os
 import shutil
@@ -21,13 +28,17 @@ from test import conftest
 
 import pytest
 
-pytestmark = [
-    pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed"),
-    pytest.mark.skipif(
-        "path" not in conftest._ISOLATED_HOME,
-        reason="this session keeps the real HOME and tmux environment on purpose",
-    ),
-]
+pytestmark = pytest.mark.skipif(
+    "path" not in conftest._ISOLATED_HOME,
+    reason="this session keeps the real HOME and tmux environment on purpose",
+)
+
+
+def needs_tmux(test):
+    """Skip without tmux, and make that skip a failure where the "unit" gate is enforced."""
+    test = pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")(test)
+    return pytest.mark.must_run("unit")(test)
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROBE = "test/_support/tmux_probe.py"
@@ -36,7 +47,7 @@ PANE_COMMAND = "exec sleep 600"
 
 
 def _suite_tmux_dir():
-    return getattr(conftest, "_ISOLATED_TMUX", {}).get("tmpdir")
+    return conftest._ISOLATED_TMUX.get("tmpdir")
 
 
 def _clean_env() -> dict:
@@ -81,13 +92,22 @@ def _still_answers(socket: str) -> bool:
 
 
 def _process_alive(pid: int) -> bool:
-    """True if ``pid`` is still running after giving a kill up to 2s to land."""
+    """True if ``pid`` is still our running process after giving a kill up to 2s to land.
+
+    ``ESRCH``: no such process. ``EPERM``: a process exists but belongs to another
+    user, so the pid was reused and ours is gone. Both mean "not ours, not alive".
+    Any other error is unexpected and raised. A sandbox that returns ``EPERM`` for
+    our own pid would read as gone, but the ``has-session`` assert before this
+    still catches a server that answers.
+    """
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         try:
             os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
+        except OSError as error:
+            if error.errno in (errno.ESRCH, errno.EPERM):
+                return False
+            raise
         time.sleep(0.1)
     return True
 
@@ -177,6 +197,7 @@ def test_suite_environment_names_only_the_private_tmux_dir():
     assert len(os.path.join(tmpdir, f"tmux-{os.getuid()}", "x" * 32)) < 100
 
 
+@needs_tmux
 def test_bare_kill_server_from_the_suite_cannot_reach_an_outside_server(outside_servers):
     tmpdir = _suite_tmux_dir()
     tmux, tmux_tmpdir = os.environ.get("TMUX"), os.environ.get("TMUX_TMPDIR")
@@ -188,6 +209,7 @@ def test_bare_kill_server_from_the_suite_cannot_reach_an_outside_server(outside_
     assert _still_answers(outside_servers["default"])
 
 
+@needs_tmux
 @pytest.mark.parametrize("started_in_tmux", [True, False], ids=["inside-tmux", "default-socket"])
 def test_a_suite_started_with_an_outside_tmux_env_cannot_kill_it(outside_servers, started_in_tmux):
     """A child pytest inherits an environment naming an outside server.
@@ -206,6 +228,7 @@ def test_a_suite_started_with_an_outside_tmux_env_cannot_kill_it(outside_servers
     assert _still_answers(outside_servers["default"])
 
 
+@needs_tmux
 def test_a_session_leaves_no_tmux_server_or_dir_behind(tmp_path):
     """A child pytest starts a server and never stops it; the session end must.
 
@@ -252,3 +275,75 @@ def test_a_leaked_tmux_env_is_gone_by_the_next_test_and_after_teardown(tmp_path)
     assert clean["TMUX_TMPDIR"] != fallback, "the child did not isolate tmux"
     assert report["next_test"] == clean
     assert report["after_teardown"] == clean
+
+
+@pytest.mark.real_home
+def test_a_real_home_marker_does_not_opt_a_test_out_of_tmux_isolation():
+    """The per-test ``real_home`` marker restores HOME only; tmux stays isolated."""
+    tmpdir = _suite_tmux_dir()
+    assert tmpdir, "test/conftest.py did not isolate tmux"
+    tmux, pane, tmux_tmpdir = (os.environ.get(n) for n in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR"))
+    assert tmux is None
+    assert pane is None
+    assert tmux_tmpdir == tmpdir
+
+
+def test_a_session_that_keeps_the_real_home_leaves_the_tmux_env_alone(tmp_path):
+    """``CAO_TEST_REAL_HOME=1`` opts the whole session out of tmux isolation too.
+
+    A child pytest runs with that flag and with ``TMUX``, ``TMUX_PANE`` and
+    ``TMUX_TMPDIR`` set. Its probe reports that ``_ISOLATED_TMUX`` is empty and
+    the three values are exactly as given. The values name no server, and the
+    probe starts no tmux. The child's "real" HOME and CAO home are throwaway dirs.
+    """
+    scratch = tmp_path / "real-home-session"
+    (scratch / "home").mkdir(parents=True)
+    report_path = tmp_path / "report.json"
+    given = {
+        "TMUX": "/nonexistent-outer-socket,1,0",
+        "TMUX_PANE": "%7",
+        "TMUX_TMPDIR": str(scratch / "outer-tmux"),
+    }
+    env = _child_env("report-env")
+    env.update(given)
+    env.update(
+        CAO_TEST_REAL_HOME="1",
+        HOME=str(scratch / "home"),
+        CAO_HOME_DIR=str(scratch / "cao-home"),
+        CAO_TEST_TMUX_PROBE_REPORT=str(report_path),
+    )
+    _run_probe(env, "test_report_tmux_env")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["isolated_tmux"] == {}
+    assert report["env"] == given
+
+
+@pytest.mark.parametrize(
+    "error, alive",
+    [
+        (ProcessLookupError(errno.ESRCH, "no such process"), False),
+        (PermissionError(errno.EPERM, "not permitted"), False),
+        (None, True),
+    ],
+    ids=["ESRCH", "EPERM", "running"],
+)
+def test_process_alive_reads_errno(monkeypatch, error, alive):
+    def fake_kill(pid, sig):
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    clock = itertools.chain([0.0, 0.0], itertools.repeat(3.0))
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+    assert _process_alive(12345) is alive
+
+
+def test_process_alive_raises_an_unexpected_error(monkeypatch):
+    def fake_kill(pid, sig):
+        raise OSError(errno.EINVAL, "invalid signal")
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    with pytest.raises(OSError) as raised:
+        _process_alive(12345)
+    assert raised.value.errno == errno.EINVAL
