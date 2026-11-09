@@ -324,9 +324,10 @@ environment variable name, and don't use `cao env list`: it prints values. Jev's
 the authority for its key, consent and revoke commands.
 
 A decider's key may be stored once per OS user, and so shared by every CAO install on the
-machine; Jev's current release does this. On a second or test install, leave the commands that
-change or use the key (`key set`, `key delete`, `key check --auth`) to the user, and check the
-decider's README for where it keeps its key.
+machine; Jev's current version does this. The agent never runs `key set`, `key delete` or
+`key check --auth` — those are always the user's steps. On a second install, run plain
+`cao-decider-jev key check` first; if it reports the key present, tell the user they can skip
+`key set`. Check the decider's README for where it keeps its key.
 
 ## 6. Restart the server and reconnect your MCP
 
@@ -339,8 +340,9 @@ step 2 found it running:
   (`-k` stops the running instance first; without it, kickstart leaves a running job alone).
 
 Find the process by its port, never by matching command-line text: your own shell can match that
-text too. Then check the restart. The server can take a few seconds to answer, so the block
-first waits for it, trying once a second, up to 30 times:
+text too. Then check the restart. The block waits for the server, trying once a second: about
+30 s if nothing listens, or up to about 90 s if a server accepts the connection but never
+answers.
 
 ```bash
 PORT="${CAO_API_PORT:-9889}"
@@ -476,7 +478,9 @@ Each of these writes settings or restarts the server, so get the user's OK.
 These are **the user's** steps:
 
 - revoke consent, with `cao decisions disable jev`;
-- delete the key, with `cao-decider-jev key delete`;
+- delete the key, with `cao-decider-jev key delete` — tell the user first that this removes
+  the key for every CAO install on the machine (the key is shared per OS user), not just this
+  one;
 - uninstall the package: run pattern A again without the decider's `--with`, or
   `uv pip uninstall --python "$CAO_PY" cao-decider-jev` for pattern B.
 
