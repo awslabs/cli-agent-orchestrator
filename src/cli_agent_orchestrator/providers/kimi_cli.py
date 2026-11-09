@@ -853,7 +853,7 @@ class KimiCliProvider(BaseProvider):
         self._swarm_generation = 0
         self._swarm_revision = 0
         self._swarm_final_floor = 0
-        self._code_23_submission_seen = False
+        self._code_23_submission: Optional[bool] = None
         self._code_completion_candidate: Optional[Tuple[int, int, str, float]] = None
         self._swarm_stream: Optional[tempfile.SpooledTemporaryFile[str]] = None
         self._swarm_stream_complete = False
@@ -970,29 +970,39 @@ class KimiCliProvider(BaseProvider):
         # Apply this extra final-answer check to the measured 2.3 submission
         # grammar. Older Code/legacy builds retain their existing readiness
         # contract, including frames whose answer has left the viewport.
+        proof: Optional[str] = None
         with self._swarm_stream_lock:
             generation = self._swarm_generation
             revision = self._swarm_revision
             if not self._swarm_stream_complete or self._swarm_stream is None:
                 return TerminalStatus.COMPLETED
-            # Submission ownership is immutable within a complete generation.
-            # Do not re-read and classify an ever-growing spool on every poll.
-            if not self._code_23_submission_seen:
+            code_23_submission = self._code_23_submission
+            if code_23_submission is None:
                 try:
                     self._swarm_stream.seek(0)
                     proof = self._swarm_stream.read()
                 except (OSError, ValueError):
                     return TerminalStatus.UNKNOWN
-                self._code_23_submission_seen = any(
-                    kind is kt.KimiLineKind.USER_INPUT and clean.lstrip().startswith("❯")
-                    for _, clean, kind in kt.classify_lines(
-                        kt.normalize_activity_rows(proof),
-                        kt.SpinnerSemantics.CODE,
-                        include_unclosed_fences=True,
-                    )
-                )
-                if not self._code_23_submission_seen:
-                    return TerminalStatus.COMPLETED
+        if proof is not None:
+            # Parse the snapshot outside the lock used by chunk ingestion.
+            # Cache only identified submissions; a missing echo may arrive later.
+            for _, clean, kind in kt.classify_lines(
+                kt.normalize_activity_rows(proof),
+                kt.SpinnerSemantics.CODE,
+                include_unclosed_fences=True,
+            ):
+                if kind is kt.KimiLineKind.USER_INPUT:
+                    if clean.lstrip().startswith("❯"):
+                        code_23_submission = True
+                        break
+                    if clean.lstrip().startswith(("✨", "💫")):
+                        code_23_submission = False
+            with self._swarm_stream_lock:
+                if generation != self._swarm_generation or revision != self._swarm_revision:
+                    return TerminalStatus.UNKNOWN
+                self._code_23_submission = code_23_submission
+        if not code_23_submission:
+            return TerminalStatus.COMPLETED
         try:
             pane = get_backend().get_history(
                 self.session_name, self.window_name, visible_only=True, strip_escapes=False
@@ -2479,7 +2489,7 @@ class KimiCliProvider(BaseProvider):
             self._swarm_generation += 1
             self._swarm_revision += 1
             self._swarm_final_floor = 0
-            self._code_23_submission_seen = False
+            self._code_23_submission = None
             self._code_completion_candidate = None
             stream = self._swarm_stream
             self._swarm_stream = None
@@ -3178,8 +3188,9 @@ class KimiCliProvider(BaseProvider):
         for i, line in enumerate(clean_lines):
             if not re.search(PROMPT_WITH_INPUT_PATTERN, line):
                 continue
-            if self._dialect is KimiDialect.CODE and not kt.is_user_input_start(
-                raw_lines[i], line, kt.SpinnerSemantics.CODE
+            if self._dialect is KimiDialect.CODE and (
+                row_kinds[i] is not kt.KimiLineKind.USER_INPUT
+                or not kt.is_user_input_start(raw_lines[i], line, kt.SpinnerSemantics.CODE)
             ):
                 continue
             prompt_input_idx = i

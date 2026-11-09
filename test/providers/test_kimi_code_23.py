@@ -6,6 +6,8 @@ and paths are synthetic; no account, workspace, or conversation is recorded.
 
 import io
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -225,6 +227,77 @@ def completion_probe(provider, monkeypatch):
 
 def ready_status(provider):
     return provider.get_status_from_screen(kt.strip_sgr(ECHO + TOOL + FOOTER).splitlines())
+
+
+@pytest.mark.parametrize("layout", ["legacy", "plain", "fenced"])
+def test_quoted_prompt_does_not_break_get_output(provider, monkeypatch, completion_probe, layout):
+    _, backend = completion_probe
+    if layout == "legacy":
+        fixture = Path(__file__).with_name("fixtures") / "kimi_code_0431_03_final_answer.txt"
+        capture = fixture.read_text(encoding="utf-8").replace("   STEP 3", "   ❯ STEP 3", 1)
+        expected = "❯ STEP 3"
+    else:
+        example = "   ❯ npm test\n   The command runs the tests.\n"
+        capture = ECHO + TOOL + ANSWER
+        capture += f"   ```text\n{example}   ```\n" if layout == "fenced" else example
+        capture += FOOTER
+        expected = "❯ npm test"
+    backend.get_history.return_value = capture
+    monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        terminal_service,
+        "get_terminal_metadata",
+        lambda _: {"tmux_session": "session", "tmux_window": "window"},
+    )
+    monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda _: provider)
+    monkeypatch.setattr(terminal_service.status_monitor, "get_buffer", lambda _: capture)
+    output = terminal_service.get_output(provider.terminal_id, terminal_service.OutputMode.LAST)
+    assert expected in output
+    if layout != "legacy":
+        assert "The command runs the tests." in output
+        assert ready_status(provider) is TerminalStatus.COMPLETED
+
+
+def test_legacy_completion_reuses_submission_check_until_next_turn(provider, monkeypatch):
+    begin(provider)
+    replay(provider, ECHO.replace("❯", "✨") + "⠋ Thinking…\n")
+    provider.record_status_chunk(ANSWER * 12000, 1)
+    read = Mock(wraps=provider._swarm_stream.read)
+    monkeypatch.setattr(provider._swarm_stream, "read", read)
+    backend = Mock()
+    backend.get_native_status.return_value = None
+    backend.get_history.return_value = FOOTER
+    monkeypatch.setattr(kimi_module, "get_backend", lambda: backend)
+
+    for _ in range(3):
+        assert provider.get_status(FOOTER) is TerminalStatus.COMPLETED
+    read.assert_called_once()
+
+    begin(provider)
+    replay(provider, ECHO + "⠋ Thinking…\n")
+    backend.get_history.return_value = ECHO + TOOL + FOOTER
+    assert ready_status(provider) is TerminalStatus.PROCESSING
+
+
+def test_submission_check_discards_snapshot_changed_during_parse(
+    provider, monkeypatch, completion_probe
+):
+    _, backend = completion_probe
+    provider._swarm_stream = io.StringIO(ECHO.replace("❯", "✨") + "⠋ Thinking…\n")
+    classify = kt.classify_lines
+
+    with ThreadPoolExecutor(max_workers=1) as writer:
+
+        def classify_after_new_bytes(*args, **kwargs):
+            writer.submit(provider.record_status_chunk, ECHO, 1).result(timeout=2)
+            return classify(*args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(kt, "classify_lines", classify_after_new_bytes)
+            assert ready_status(provider) is TerminalStatus.UNKNOWN
+
+    backend.get_history.return_value = ECHO + TOOL + FOOTER
+    assert ready_status(provider) is TerminalStatus.PROCESSING
 
 
 @pytest.mark.parametrize(

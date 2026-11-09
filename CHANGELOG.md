@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete after a short, stable ready interval; fetching their answer still reports
   an extraction error. **Behaviour change:** synchronous `cao session send` exits 1
   when fetching the answer fails, instead of silently exiting 0. Ctrl-C still exits 130.
+  Cursor reports an extraction error instead of returning the raw terminal transcript
+  when neither the panel nor the legacy separator layout identifies the answer.
 
 - **Breaking: `GET /agui/v1/stream` is now an AG-UI 1.0 conformant run by default, and
   `POST /agui/v1/stream` is added** (#1193). Each connection is one run: `RUN_STARTED` first,
