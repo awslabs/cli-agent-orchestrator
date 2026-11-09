@@ -51,7 +51,7 @@ def _pty_attach(plan):
     ``("drain", fd)`` in the order they happened, so a test can assert the pane
     was selected before its bytes and held until they were read.
     """
-    state = SimpleNamespace(events=[], masters={}, peers=[], first_write=asyncio.Event())
+    state = SimpleNamespace(events=[], stamps=[], masters={}, peers=[], first_write=asyncio.Event())
     real_openpty, real_write = os.openpty, os.write
 
     def _openpty():
@@ -65,6 +65,7 @@ def _pty_attach(plan):
     def _write(fd, data):
         if fd in state.masters:
             state.events.append(("write", fd, bytes(data)))
+            state.stamps.append(("write", fd, time.monotonic()))
             state.first_write.set()
         return real_write(fd, data)
 
@@ -80,7 +81,13 @@ def _pty_attach(plan):
 
     backend = MagicMock()
     backend.prepare_web_attach_input.side_effect = _prepare
-    backend.focus_web_input.side_effect = lambda pane: state.events.append(("focus", pane))
+
+    def _focus(pane):
+        state.events.append(("focus", pane))
+        state.stamps.append(("focus", pane, time.monotonic()))
+
+    backend.focus_web_input.side_effect = _focus
+    backend.web_input_escape_hold.return_value = 0.0
     state.backend = backend
     proc = MagicMock()
     proc.poll.return_value = None
@@ -168,7 +175,7 @@ class TestPaneTerminalsSelectTheirOwnPane:
             await _attach([_input("A-1")])
 
         gc.collect()
-        assert _SCOPE not in main_module._WEB_INPUT_LOCKS
+        assert _SCOPE not in main_module._WEB_INPUT_WINDOWS
 
 
 class TestTwoTerminalsOnOneWindow:
@@ -203,10 +210,160 @@ class TestTwoTerminalsOnOneWindow:
         assert a_writes[-1] < a_drain < b_focus_before_its_write < b_write
 
     def test_terminals_on_different_windows_get_different_locks(self):
-        lock_3, lock_4 = main_module._web_input_lock("@3"), main_module._web_input_lock("@4")
+        window_3 = main_module._web_input_window("@3")
+        window_4 = main_module._web_input_window("@4")
 
-        assert lock_3 is not lock_4
-        assert main_module._web_input_lock("@3") is lock_3
+        assert window_3.lock is not window_4.lock
+        assert main_module._web_input_window("@3") is window_3
+
+
+async def _until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition never became true"
+        await asyncio.sleep(0.005)
+
+
+def _stamp(state, kind, key, nth=0):
+    return [s[2] for s in state.stamps if s[0] == kind and s[1] == key][nth]
+
+
+class TestALoneEscapeHoldsTheWindow:
+    """haofeif's P2: tmux keeps a trailing Escape as a partial key until its
+    escape-time expires, then delivers it to whichever pane is active then."""
+
+    HOLD = 0.3
+    PANES = {"worker-abcd": _PANE, "worker-efgh": _PANE_B}
+
+    def _plan(self, window):
+        return _ARGV, (_SCOPE, self.PANES[window])
+
+    @pytest.mark.asyncio
+    async def test_another_terminal_waits_out_the_hold_before_selecting(self):
+        with _pty_attach(self._plan) as state:
+            state.backend.web_input_escape_hold.return_value = self.HOLD
+            a_connected = asyncio.Event()
+
+            async def b_types_right_after_a_escapes():
+                await state.first_write.wait()
+
+            await asyncio.gather(
+                _attach(
+                    [a_connected.set, _input("\x1b"), lambda: asyncio.sleep(self.HOLD * 2)], _TID
+                ),
+                _attach([a_connected.wait, b_types_right_after_a_escapes, _input("b")], _TID_B),
+            )
+
+        a_fd = next(e[1] for e in state.events if e[0] == "write" and e[2] == b"\x1b")
+        escape_at = _stamp(state, "write", a_fd)
+        b_select_at = max(s[2] for s in state.stamps if s[0] == "focus" and s[1] == _PANE_B)
+        assert b_select_at - escape_at >= self.HOLD
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_that_connects_during_the_hold_selects_after_it(self):
+        with _pty_attach(self._plan) as state:
+            state.backend.web_input_escape_hold.return_value = self.HOLD
+
+            async def b_connects_right_after_a_escapes():
+                await state.first_write.wait()
+                await _attach([], _TID_B)
+
+            await asyncio.gather(
+                # A stays connected; its view (and tmux's partial key) outlive the frame.
+                _attach([_input("\x1b"), lambda: asyncio.sleep(self.HOLD * 2)], _TID),
+                b_connects_right_after_a_escapes(),
+            )
+
+        a_fd = next(e[1] for e in state.events if e[0] == "write")
+        assert _stamp(state, "focus", _PANE_B) - _stamp(state, "write", a_fd) >= self.HOLD
+
+    @pytest.mark.asyncio
+    async def test_the_sender_does_not_wait_for_its_own_escape(self):
+        with _pty_attach(self._plan) as state:
+            state.backend.web_input_escape_hold.return_value = 5.0
+            started = time.monotonic()
+            await _attach([_input("\x1b"), _input("x")])
+
+        assert [e[2] for e in state.events if e[0] == "write"] == [b"\x1b", b"x"]
+        assert time.monotonic() - started < 2.0
+
+    @pytest.mark.asyncio
+    async def test_the_senders_next_frame_releases_the_hold(self):
+        with _pty_attach(self._plan) as state:
+            state.backend.web_input_escape_hold.return_value = 5.0
+
+            def a_wrote(n):
+                return lambda: len([e for e in state.events if e[0] == "write"]) >= n
+
+            async def b_types_after_a_moved_on():
+                await _until(a_wrote(2))
+
+            started = time.monotonic()
+            await asyncio.gather(
+                _attach([_input("\x1b"), _input("x")], _TID),
+                _attach([b_types_after_a_moved_on, _input("b")], _TID_B),
+            )
+
+        assert [e[2] for e in state.events if e[0] == "write"] == [b"\x1b", b"x", b"b"]
+        assert time.monotonic() - started < 2.0
+
+    @pytest.mark.parametrize(
+        "answer", [MagicMock(), -1, True, "0.1"], ids=["mock", "negative", "bool", "str"]
+    )
+    @pytest.mark.asyncio
+    async def test_an_unusable_answer_falls_back_to_a_safe_hold(self, answer):
+        seen = []
+        real_after_write = main_module._WebInputWindow.after_write
+
+        def spy(self, owner, raw, escape_hold_s):
+            seen.append(escape_hold_s)
+            return real_after_write(self, owner, raw, escape_hold_s)
+
+        with _pty_attach(self._plan) as state:
+            state.backend.web_input_escape_hold.return_value = answer
+            with patch.object(main_module._WebInputWindow, "after_write", spy):
+                await _attach([_input("\x1b")])
+
+        assert seen == [main_module._WEB_INPUT_ESCAPE_HOLD_FALLBACK_S]
+
+    @pytest.mark.asyncio
+    async def test_window_terminals_never_ask_for_the_hold(self):
+        with _pty_attach((_ARGV, None)) as state:
+            await _attach([_input("\x1b")])
+
+        state.backend.web_input_escape_hold.assert_not_called()
+
+
+class TestWebInputWindow:
+    @pytest.mark.asyncio
+    async def test_only_a_trailing_escape_leaves_a_hold(self):
+        window, a = main_module._WebInputWindow(), object()
+
+        window.after_write(a, b"\x1b[A", 5.0)  # a whole arrow-key sequence
+        assert window.hold_owner is None
+        window.after_write(a, b"abc\x1b", 5.0)
+        assert window.hold_owner is a
+
+    @pytest.mark.asyncio
+    async def test_only_the_owner_skips_the_hold(self):
+        window, a, b = main_module._WebInputWindow(), object(), object()
+        window.after_write(a, b"\x1b", 0.2)
+
+        started = time.monotonic()
+        await window.wait_for_hold(a)
+        assert time.monotonic() - started < 0.1
+        await window.wait_for_hold(b)
+        assert time.monotonic() - started >= 0.2
+
+    @pytest.mark.asyncio
+    async def test_another_terminals_frame_does_not_clear_the_owners_hold(self):
+        window, a, b = main_module._WebInputWindow(), object(), object()
+        window.after_write(a, b"\x1b", 5.0)
+
+        window.after_write(b, b"b", 5.0)
+        assert window.hold_owner is a
+        window.after_write(a, b"x", 5.0)
+        assert window.hold_owner is None
 
 
 class TestTheAttachFailsClosed:

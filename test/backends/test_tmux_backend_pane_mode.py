@@ -112,3 +112,18 @@ class TestWebAttach:
 
         with pytest.raises(TerminalBackendError):
             backend.prepare_web_attach_input("ses", "coder-3")
+
+
+class TestEscapeHold:
+    """How long a trailing Escape may sit in tmux as a partial key."""
+
+    @pytest.mark.parametrize(
+        "configured, expected",
+        [(10, 0.55), (0, 0.55), (500, 0.55), (2000, 2.05), (None, 0.55)],
+        ids=["3.6-default", "zero", "3.4-default", "long", "unreadable"],
+    )
+    def test_floors_at_500_ms_plus_a_margin(self, client, configured, expected):
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+        client.escape_time_ms.return_value = configured
+
+        assert backend.web_input_escape_hold() == pytest.approx(expected)

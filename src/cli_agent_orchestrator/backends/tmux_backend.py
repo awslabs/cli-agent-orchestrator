@@ -23,6 +23,10 @@ from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
 
 logger = logging.getLogger(__name__)
 
+# See TmuxBackend.web_input_escape_hold.
+_TMUX_ESCAPE_HOLD_FLOOR_MS = 500
+_TMUX_ESCAPE_HOLD_MARGIN_MS = 50
+
 # The window pane-mode terminals share. Named rather than "the current window"
 # so a spawn triggered from anywhere lands in one place; the first pane-mode
 # terminal in a session creates it.
@@ -257,6 +261,19 @@ class TmuxBackend(TerminalBackend):
             raise TerminalBackendError(
                 f"Could not locate terminal '{session_name}:{window_name}': {e}"
             ) from e
+
+    def web_input_escape_hold(self) -> float:
+        """tmux's ``escape-time``, floored at 500 ms, plus a margin.
+
+        tmux keeps a trailing Escape as a partial key for ``escape-time`` (10 ms
+        by default since 3.5, 500 ms before), and for at least 500 ms while it
+        still waits for the client's answers to its own terminal queries, which
+        is just after an attach. The floor covers both.
+        """
+        configured = self._client.escape_time_ms()
+        floor_ms = _TMUX_ESCAPE_HOLD_FLOOR_MS
+        ms = max(configured if configured is not None else floor_ms, floor_ms)
+        return (ms + _TMUX_ESCAPE_HOLD_MARGIN_MS) / 1000
 
     def focus_web_input(self, target: str) -> None:
         self._client.select_pane(target)

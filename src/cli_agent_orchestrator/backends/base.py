@@ -463,6 +463,16 @@ class TerminalBackend(ABC):
         """
         return self.prepare_web_attach(session_name, window_name), None
 
+    def web_input_escape_hold(self) -> float:
+        """Seconds a trailing Escape may wait inside the backend before delivery.
+
+        A terminal client that cannot tell a lone Escape from the start of an
+        escape sequence holds it until a timer expires, then delivers it to
+        whatever is focused then. Only consulted when ``prepare_web_attach_input``
+        returned a focus; 0 means input is delivered as it is read.
+        """
+        return 0.0
+
     def focus_web_input(self, target: str) -> None:
         """Focus ``target`` (from ``prepare_web_attach_input``) so input reaches it."""
         return None

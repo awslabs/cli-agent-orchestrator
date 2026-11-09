@@ -657,3 +657,30 @@ class TestPaneCaptions:
             tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
 
         assert BORDER_STATUS_OPTION in str(window.set_option.call_args_list)
+
+
+class TestEscapeTime:
+    def test_reads_the_server_option(self, tmux):
+        tmux.server.cmd.return_value = MagicMock(returncode=0, stdout=["500"], stderr=[])
+
+        assert tmux.escape_time_ms() == 500
+        tmux.server.cmd.assert_called_once_with("show-options", "-sv", "escape-time")
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            MagicMock(returncode=1, stdout=[], stderr=["no server running"]),
+            MagicMock(returncode=0, stdout=[], stderr=[]),
+            MagicMock(returncode=0, stdout=["ten"], stderr=[]),
+        ],
+        ids=["failed", "empty", "not-a-number"],
+    )
+    def test_an_unreadable_answer_is_none(self, tmux, result):
+        tmux.server.cmd.return_value = result
+
+        assert tmux.escape_time_ms() is None
+
+    def test_a_server_error_is_none(self, tmux):
+        tmux.server.cmd.side_effect = LibTmuxException("no server running")
+
+        assert tmux.escape_time_ms() is None

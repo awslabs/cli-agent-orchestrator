@@ -1156,6 +1156,18 @@ class TmuxClient:
             return web_view_attach_argv(session_name, f"{session_name}:{terminal_name}"), None
         return web_view_attach_argv(session_name, located[0]), located
 
+    def escape_time_ms(self) -> Optional[int]:
+        """The server's ``escape-time`` in milliseconds, or None if unreadable."""
+        try:
+            result = self.server.cmd("show-options", "-sv", "escape-time")
+        except Exception as e:  # noqa: BLE001 — the caller has a safe default
+            logger.warning(f"Could not read tmux escape-time: {e}")
+            return None
+        if result.returncode != 0 or not result.stdout:
+            return None
+        value = str(result.stdout[0]).strip()
+        return int(value) if value.isdigit() else None
+
     def select_pane(self, pane_id: str) -> None:
         """Make ``pane_id`` the active pane of its window.
 

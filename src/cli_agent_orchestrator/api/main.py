@@ -9188,21 +9188,86 @@ def _ws_input_refusal(
 # to whichever pane is active when tmux reads them. Input for such a window is
 # serialised: a terminal holds its window's lock from selecting its pane until
 # tmux has read every byte it wrote, so no other terminal can move the window's
-# active pane while those bytes are in flight. Locks live only while a
+# active pane while those bytes are in flight. Windows live only while a
 # connection on that window holds one.
-_WEB_INPUT_LOCKS: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+#
+# Reading is not always delivering. tmux cannot tell a lone Escape from the
+# start of an escape sequence, so it keeps a trailing ``\x1b`` as a partial key
+# until its ``escape-time`` timer expires, and only then sends it to the pane
+# that is active AT THAT TIME. So a frame that ends in Escape leaves an "Escape
+# hold" on its window: other terminals wait it out before they select a pane.
+# The terminal that sent it does not wait: its own next bytes resolve the
+# partial key while its own pane is still the active one.
 # How long a writer waits for tmux to read its input before it lets the window
 # go anyway (tmux stalled), and the poll step while it waits.
 _WEB_INPUT_DRAIN_TIMEOUT_S = 2.0
 _WEB_INPUT_DRAIN_POLL_S = 0.002
+# The Escape hold when the backend cannot say how long its key timer is.
+_WEB_INPUT_ESCAPE_HOLD_FALLBACK_S = 0.55
 
 
-def _web_input_lock(scope: str) -> asyncio.Lock:
-    lock = _WEB_INPUT_LOCKS.get(scope)
-    if lock is None:
-        lock = asyncio.Lock()
-        _WEB_INPUT_LOCKS[scope] = lock
-    return lock
+class _WebInputWindow:
+    """The input state that browser terminals on one shared window share."""
+
+    __slots__ = ("lock", "hold_owner", "hold_until", "__weakref__")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.hold_owner: object = None
+        self.hold_until = 0.0
+
+    def _held_against(self, owner: object) -> float:
+        """Seconds left on another terminal's Escape hold; 0 if none."""
+        if self.hold_owner is None or self.hold_owner is owner:
+            return 0.0
+        return max(0.0, self.hold_until - time.monotonic())
+
+    async def wait_for_hold(self, owner: object) -> None:
+        """Wait out an Escape hold left by another terminal."""
+        while (remaining := self._held_against(owner)) > 0:
+            await asyncio.sleep(remaining)
+
+    @asynccontextmanager
+    async def turn(self, owner: object):
+        """The window's lock, taken once no other terminal's Escape hold is on.
+
+        The hold is waited out WITHOUT the lock: the terminal that left it
+        must still be able to send its next frame, which resolves tmux's
+        partial key and releases the hold early.
+        """
+        while True:
+            await self.wait_for_hold(owner)
+            await self.lock.acquire()
+            if self._held_against(owner) == 0:
+                break
+            self.lock.release()  # a hold appeared while we queued; wait again
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+    def after_write(self, owner: object, raw: bytes, escape_hold_s: float) -> None:
+        """Record whether ``owner``'s frame left tmux holding a partial Escape."""
+        if raw.endswith(b"\x1b"):
+            self.hold_owner = owner
+            self.hold_until = time.monotonic() + escape_hold_s
+        elif self.hold_owner is owner:
+            # tmux read the bytes after the Escape with this terminal's pane
+            # active, which resolved the partial key there.
+            self.hold_owner = None
+
+
+_WEB_INPUT_WINDOWS: "weakref.WeakValueDictionary[str, _WebInputWindow]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _web_input_window(scope: str) -> _WebInputWindow:
+    window = _WEB_INPUT_WINDOWS.get(scope)
+    if window is None:
+        window = _WebInputWindow()
+        _WEB_INPUT_WINDOWS[scope] = window
+    return window
 
 
 def _pty_unread_bytes(slave_path: str) -> int:
@@ -9428,7 +9493,17 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4004, reason="Failed to attach terminal")
         return
 
-    focus_lock = _web_input_lock(input_focus[0]) if input_focus is not None else None
+    input_window = _web_input_window(input_focus[0]) if input_focus is not None else None
+    input_owner = object()
+    escape_hold_s = _WEB_INPUT_ESCAPE_HOLD_FALLBACK_S
+    if input_window is not None:
+        try:
+            answer = await asyncio.to_thread(get_backend().web_input_escape_hold)
+        except Exception as e:  # noqa: BLE001 — the fallback is long enough for tmux defaults
+            logger.warning(f"Could not read the escape delay for terminal {terminal_id}: {e}")
+        else:
+            if isinstance(answer, (int, float)) and not isinstance(answer, bool) and answer >= 0:
+                escape_hold_s = float(answer)
     focus_failure_logged = False
     drain_timeout_logged = False
 
@@ -9476,8 +9551,8 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     os.close(slave_fd)
     # Pane mode: the view shows the whole shared window; select this
     # terminal's pane so its cursor starts on the right agent.
-    if focus_lock is not None:
-        async with focus_lock:
+    if input_window is not None:
+        async with input_window.turn(input_owner):
             await _select_own_pane()
 
     # Make master_fd non-blocking for event-driven reads
@@ -9573,19 +9648,23 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                         # Dropped: zero bytes reach the PTY (#1074).
                         continue
                     raw = payload["data"].encode()
-                    if focus_lock is None:
+                    if input_window is None:
                         await _write_input(raw)
                         continue
                     # Pane mode: select this terminal's pane on every frame (an
                     # operator in a real terminal may have moved it), and hold
                     # the window until tmux has read the bytes, so a paste's
-                    # later chunks cannot follow another terminal's selection.
-                    async with focus_lock:
+                    # later chunks cannot follow another terminal's selection;
+                    # past that, for as long as tmux may still be holding a
+                    # trailing Escape as a partial key.
+                    async with input_window.turn(input_owner):
                         if not await _select_own_pane():
                             # Dropped: never deliver keys to another agent's pane.
                             continue
                         await _write_input(raw)
-                        if not await _wait_for_pty_drain(slave_path):
+                        drained = await _wait_for_pty_drain(slave_path)
+                        input_window.after_write(input_owner, raw, escape_hold_s)
+                        if not drained:
                             if not drain_timeout_logged:
                                 drain_timeout_logged = True
                                 logger.warning(

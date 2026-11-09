@@ -399,12 +399,26 @@ agent's pane selected. Two web terminals on agents of the same window therefore
 show the same tiled window, not one agent each; window mode gives each terminal
 its own window.
 
-Input still reaches only the agent the terminal belongs to. tmux keeps one
-active pane per window, not per client, so cao-server selects the terminal's
-pane before every input it forwards and holds that window until tmux has read
-the input, so a paste in one terminal and a key in another cannot interleave.
-Input whose pane cannot be selected is dropped rather than sent to whichever
-pane is active, and a terminal whose pane cannot be found is not attached.
+**Keys** reach only the agent the terminal belongs to. tmux keeps one active
+pane per window, not per client, so cao-server selects the terminal's pane
+before every input it forwards and holds that window until tmux has read the
+input, so a paste in one terminal and a key in another cannot interleave. A key
+that ends in Escape holds the window a little longer: tmux keeps a lone Escape
+until its `escape-time` runs out (10 ms by default since tmux 3.5, 500 ms
+before), in case more of an escape sequence follows, and only then delivers it
+to the pane that is active. So for at least half a second after Escape, other
+web terminals on the same window wait before their next key, and a terminal
+opened on that window in that time selects its pane only afterwards. The
+terminal that sent Escape does not wait. Input whose pane cannot be selected is
+dropped rather than sent to whichever pane is active, and a terminal whose pane
+cannot be found is not attached.
+
+**The mouse** works as it does in tmux: a click or the wheel acts on the pane
+under the pointer, even another agent's tile. A click makes that pane the
+active one; your next key goes to your own agent again. The wheel puts the pane
+under the pointer into copy mode, where it reads keys as copy-mode commands, so
+an agent scrolled that way does not see what is typed to it until copy mode
+ends: press `q` in that agent's terminal (or scroll back to the bottom).
 
 One case is outside cao-server's reach: selecting another pane by hand, from a
 real terminal attached to the same window, in the instant between cao-server's
