@@ -3981,9 +3981,9 @@ async def get_skill_content(
 # Agent Plugins (Agent Plugins 1.0.0) — NOT the event-plugin system
 # =============================================================================
 # Added inline next to the /skills and /settings/skill-dirs handlers because
-# api/main.py is flat (no routers package). Naming is unresolved maintainer
-# decision M1; per requirements.md 16.5 this surface must not ship to end users
-# before that is settled, so every route below is gated on
+# api/main.py is flat (no routers package). The naming is decision M1, recorded
+# by the issue author in #573; the surface does not ship to end users until it
+# graduates (#1244), so every route below is gated on
 # CAO_AGENT_PLUGINS_ENABLED (default off) and 404s without it — the routes are
 # constructed but not executable, mirroring the AG-UI gate above. The scope
 # dependencies are authorization, not the gate: they are a no-op when auth is
