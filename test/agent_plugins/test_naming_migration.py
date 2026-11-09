@@ -112,9 +112,6 @@ _UNSCOPED_DOCS = [
     # `chore(agent-plugin): repin packages to vX.Y.Z` commit, and the doc quotes that
     # subject so an operator can recognise it. CAO's own noun, inside a code span.
     "RELEASING.md",
-    # Gained an event-plugin note on #834 (#745): which hooks the server emits
-    # for a terminal in an execution runtime. CAO's own noun throughout.
-    "execution-runtimes.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare

@@ -61,19 +61,6 @@ def test_claude_codes_install_script_may_fetch_its_native_binary():
     assert "--allow-scripts=@anthropic-ai/claude-code" in step
 
 
-def test_tini_is_installed_on_either_base():
-    step = _run_step("apk upgrade --no-cache")
-    apk, apt = step.split("elif command -v apt-get", 1)
-    assert re.search(r"\btini\b", apk) and re.search(r"\btini\b", apt.split("else", 1)[0])
-
-
-def test_the_runtime_pod_runs_tini_as_pid_1():
-    # cao-bridge reaps no children: without an init, every finished agent CLI
-    # in the runtime pod stays a zombie.
-    runtime = DOCKERFILE.parents[1] / "remote-runtime/runtime.yaml"
-    assert 'command: ["/usr/bin/tini", "--", "cao-entrypoint"]' in runtime.read_text()
-
-
 def test_the_kiro_cli_archive_is_checked_before_its_installer_runs():
     step = _run_step("kirocli.zip")
     assert step.index("sha256sum -c") < step.index("install.sh")

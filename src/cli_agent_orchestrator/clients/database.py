@@ -71,7 +71,6 @@ from cli_agent_orchestrator.models.delegation import (
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.kiro_engine import canonical_kiro_engine
-from cli_agent_orchestrator.models.terminal import LocalExecutionDisabledError
 from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 logger = logging.getLogger(__name__)
@@ -267,14 +266,6 @@ class TerminalModel(Base):
     # row that predates the column. A kiro_cli terminal takes typed input only when
     # this is True (terminal_service.terminal_input_refusal).
     identity_verified = Column(Boolean, nullable=True)
-    # The execution runtime this terminal runs in (#745); NULL for a terminal on
-    # this host. Its own column rather than a ``metadata`` key, because an agent
-    # can rewrite its metadata but must not be able to move its own placement.
-    # Local sweeps (the retention sweep in cleanup_service, the stale-row
-    # cleanup in delete_terminals_by_session) skip rows that have one: they
-    # cannot stop the agent in its runtime, and the row is the only handle on
-    # it. Such a row goes only through delete_terminal, which routes there.
-    runtime_id = Column(String, nullable=True)
     last_active = Column(UTCDateTime, default=_utcnow)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
@@ -2747,19 +2738,6 @@ def _migrate_terminals_schema() -> None:
                 conn.execute("ALTER TABLE terminals ADD COLUMN identity_verified BOOLEAN")
                 conn.commit()
                 logger.info("Migration: added identity_verified column to terminals table")
-            if "runtime_id" not in columns:
-                conn.execute("ALTER TABLE terminals ADD COLUMN runtime_id TEXT")
-                conn.commit()
-                logger.info("Migration: added runtime_id column to terminals table")
-            # For a runtime's terminal list and session_is_remote (#745).
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_terminals_runtime_id ON terminals (runtime_id)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_terminals_session_runtime "
-                "ON terminals (tmux_session, runtime_id)"
-            )
-            conn.commit()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
@@ -2824,7 +2802,6 @@ def create_terminal(
     description: Optional[str] = None,
     delegate_tools: Optional[List[str]] = None,
     identity_verified: Optional[bool] = None,
-    runtime_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -2895,7 +2872,6 @@ def create_terminal(
             session_incarnation_id=session_incarnation_id,
             initial_delivery_json=_json.dumps(initial_delivery) if initial_delivery else None,
             identity_verified=identity_verified,
-            runtime_id=runtime_id,
         )
         db.add(terminal)
         if idempotency_key:
@@ -2943,7 +2919,6 @@ def create_terminal(
             "deferred_init_runtime_reclaimed": False,
             "session_incarnation_id": session_incarnation_id,
             "identity_verified": identity_verified,
-            "runtime_id": terminal.runtime_id,
         }
 
 
@@ -3103,7 +3078,6 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             # As stored, None included (#1074): None is a non-Kiro or legacy row,
             # which the Kiro input gate treats differently from False.
             "identity_verified": getattr(terminal, "identity_verified", None),
-            "runtime_id": terminal.runtime_id,
             "last_active": terminal.last_active,
         }
 
@@ -3338,14 +3312,12 @@ def list_pending_deferred_init_external_owner_terminal_ids() -> List[str]:
 
 
 def count_runtime_allocated_terminals() -> int:
-    """Count terminal rows that still represent live/allocated provider runtime
-    on this host. A terminal in an execution runtime (#745) uses none of it."""
+    """Count terminal rows that still represent live/allocated provider runtime."""
 
     with SessionLocal() as db:
         return int(
             db.query(TerminalModel)
             .filter(TerminalModel.deferred_init_runtime_reclaimed.is_(False))
-            .filter(TerminalModel.runtime_id.is_(None))
             .count()
         )
 
@@ -3466,9 +3438,6 @@ def list_siblings_by_group_prefix(
                         "id": row.id,
                         "group": sibling_group,
                         "metadata": metadata,
-                        # Where its status comes from (#745); list_siblings
-                        # drops it from the reported shape.
-                        "runtime_id": row.runtime_id,
                     }
                 )
         return siblings
@@ -3695,30 +3664,9 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 # #1225: end of the keep window for a kept child, else None.
                 "kept_until": kept_until,
                 "last_active": t.last_active,
-                # Set for a terminal that runs in an execution runtime (#745).
-                "runtime_id": t.runtime_id,
             }
             for t, kept_until in terminals_kept
         ]
-
-
-def list_terminal_ids_on_runtime(runtime_id: str) -> List[str]:
-    """Ids of the terminals whose central row places them on ``runtime_id``."""
-    with SessionLocal() as db:
-        rows = db.query(TerminalModel.id).filter(TerminalModel.runtime_id == runtime_id).all()
-        return [row[0] for row in rows]
-
-
-def session_is_remote(tmux_session: str) -> bool:
-    """True when a terminal of ``tmux_session`` runs in an execution runtime (#745)."""
-    with SessionLocal() as db:
-        row = (
-            db.query(TerminalModel.id)
-            .filter(TerminalModel.tmux_session == tmux_session)
-            .filter(TerminalModel.runtime_id.isnot(None))
-            .first()
-        )
-        return row is not None
 
 
 def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
@@ -3955,55 +3903,24 @@ def delete_terminal(terminal_id: str, *, end_reason: str) -> bool:
     return deleted > 0
 
 
-def delete_terminal_routed_by(
-    terminal_id: str, runtime_id: str, tmux_session: str, *, end_reason: str
-) -> bool:
-    """Delete the row of ``terminal_id`` only while it names ``runtime_id`` and ``tmux_session``.
-
-    A remote delete waits on its runtime (#745). Meanwhile another delete may
-    drop the row and a new launch reuse the 8-hex id; only the row the delete
-    was routed by may go, never its replacement. Finalizes the launch record
-    (issue #1082) the same way ``delete_terminal`` does.
-    """
-    with SessionLocal() as db:
-        deleted = (
-            db.query(TerminalModel)
-            .filter(TerminalModel.id == terminal_id)
-            .filter(TerminalModel.runtime_id == runtime_id)
-            .filter(TerminalModel.tmux_session == tmux_session)
-            .delete()
-        )
-        if deleted:
-            _delete_kept_rows(db, [terminal_id])
-        db.commit()
-    if deleted:
-        _finalize_launch_records_best_effort([terminal_id], end_reason)
-    return deleted > 0
-
-
 def delete_terminals_by_session(tmux_session: str, *, end_reason: str) -> int:
-    """Delete all local terminals in a session.
+    """Delete all terminals in a session.
 
     Finalizes each deleted terminal's launch record (issue #1082); see
     ``delete_terminal`` for why that runs after commit, in its own transaction.
-    Session teardown on this server uses ``delete_terminal_row`` and
-    ``delete_terminals_by_ids``; ``cao-bridge`` uses this to sweep rows a dead
-    local tmux session left behind. A row whose terminal runs in an execution
-    runtime (#745) is never such a row, so it is kept even when the names match.
+    A defensive path: nothing in ``src/`` calls it today (session teardown
+    uses ``delete_terminal_row`` and ``delete_terminals_by_ids``), but the
+    name is still exported for older integrations, so it keeps finalizing.
     """
     with SessionLocal() as db:
         ids = [
             row[0]
             for row in db.query(TerminalModel.id)
             .filter(TerminalModel.tmux_session == tmux_session)
-            .filter(TerminalModel.runtime_id.is_(None))
             .all()
         ]
         deleted = (
-            db.query(TerminalModel)
-            .filter(TerminalModel.tmux_session == tmux_session)
-            .filter(TerminalModel.runtime_id.is_(None))
-            .delete()
+            db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
         )
         _delete_kept_rows(db, ids)
         db.commit()
@@ -4065,19 +3982,10 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
 
     Raises:
         ValueError: If the receiver terminal does not exist.
-        LocalExecutionDisabledError: If the receiver runs in an execution
-            runtime (#745): inbox delivery watches this server's own panes, so
-            the message would stay pending for good.
     """
     with SessionLocal() as db:
-        receiver = db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first()
-        if not receiver:
+        if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
             raise ValueError(f"Terminal '{receiver_id}' not found")
-        if receiver.runtime_id is not None:
-            raise LocalExecutionDisabledError(
-                f"terminal {receiver_id} runs in an execution runtime; inbox messages "
-                "are delivered to terminals on this server only"
-            )
         inbox_msg = InboxModel(
             sender_id=sender_id,
             receiver_id=receiver_id,

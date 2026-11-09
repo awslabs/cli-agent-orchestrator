@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Breaking: execution runtimes from the first #745 slice (#834) are removed, before any
+  release shipped them.** `3.0-beta1` replaces them with the remote terminal backend, where
+  `cao-server` keeps providers, status detection and the inbox and execution-only runners drive
+  tmux. Removed: the `cao-bridge` console script, `WS /runtime/channel`, `GET /runtimes`,
+  `POST /runtimes/{runtime_id}/terminals`, the `CAO_RUNTIME_TOKEN`, `CAO_RUNTIME_TOKEN_FILE`,
+  `CAO_RUNTIME_LAUNCH_TIMEOUT`, `CAO_BRIDGE_*` and `CAO_LOCAL_EXECUTION` settings,
+  `CAO_NODE_MODE=bridge` in the EKS image's entrypoint, and the
+  `examples/cao-clusters/kubernetes/remote-runtime/` example. There is no migration path: stop
+  any `cao-bridge` runtimes and their terminals before upgrading. A database written by the
+  beta keeps its nullable `terminals.runtime_id` column; nothing reads it any more.
+
 - **A reconnect no longer loses a tool call's end, and `toolCallName` is `assign`, not
   `OrchestrationType.ASSIGN`** (#1292). On the ambient AG-UI stream, a client that held an `assign`
   or `handoff` call open, lost its stream (an overflow, or a dropped connection) and reconnected
@@ -720,43 +731,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kind without importing it. Ops MCP gains `decisions_off` and cannot grant
   consent. Core still bundles only `fixed_table` and makes no external call.
   See `docs/decisions.md` (#810)
-- execution runtimes, first slice: agents run in separate runtime processes or
-  pods behind one `cao-server` that runs none itself. A runtime runs the new
-  `cao-bridge` console script, which dials `WS /runtime/channel` with a shared
-  token (`CAO_RUNTIME_TOKEN_FILE` or `CAO_RUNTIME_TOKEN`). New routes:
-  `GET /runtimes` and `POST /runtimes/{runtime_id}/terminals`. The terminal
-  routes and `DELETE /sessions/{session_name}` pass a remote terminal's
-  operations to its runtime, answering `503`, `504` or `502` when the runtime
-  cannot. Terminal rows gain a nullable `runtime_id` column, added
-  idempotently. A runtime's hello lists the terminals it runs, and the server
-  drops the record of one it no longer runs (a replaced pod's, for instance).
-  Status events (`terminal.{id}.status`) report `unknown` for a runtime's
-  terminals when its channel goes, and for a record a hello drops or cannot
-  drop; an accepted hello publishes each status it restores. A remote
-  launch records the working directory its runtime resolved. A record
-  dropped before a newer connection of the same runtime id registers stays
-  dropped, and that connection's hello then deletes the terminal as
-  unrecorded: under a shared token a duplicate runtime id can tear down
-  another runtime's agents. A
-  `cao-bridge` that cannot remove its readiness file exits rather than stay
-  Ready while disconnected. Commands for a terminal name its session, so a
-  command that outlived its terminal never reaches a newer one reusing the id,
-  and a hello lists at most 1024 terminals. A launch that would take a
-  runtime past that many answers `429`, counting launches in flight. The
-  image installs `tini`, which the runtime pod runs as PID 1 to reap the
-  processes agents leave. `cao-bridge` logs at INFO to stderr, so
-  `kubectl logs` shows its connects and reconnects, and the warnings every
-  launch and delete used to log (a status for a terminal placed nowhere yet,
-  a row expected to be missing) are gone. `cao-bridge` reads again, every
-  3 s, the status of a terminal it last reported as processing, so a turn
-  that ends without the output the status monitor recognises (#558)
-  recovers on a runtime too, where nothing else polls it. The image checks the kiro-cli
-  archive's published sha256 before running its installer.
-  `CAO_LOCAL_EXECUTION=0` stops the server starting agents
-  itself, and `CAO_RUNTIME_LAUNCH_TIMEOUT` bounds a launch. An EKS example is
-  in `examples/cao-clusters/kubernetes/remote-runtime/`. See
-  [Execution runtimes](docs/execution-runtimes.md) for the limits of this
-  slice (#745)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
   `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own

@@ -2,14 +2,6 @@
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-from click.testing import CliRunner
-from sqlalchemy.orm import sessionmaker
-
-from cli_agent_orchestrator.clients import database
-from cli_agent_orchestrator.clients.database import MemoryMetadataModel
-from cli_agent_orchestrator.services import memory_relationship_service, settings_service
-
 from test.services.test_scoring import (  # isort: skip  (per-name noqa below; see the comment)
     _ctx,
     _row,
@@ -17,6 +9,14 @@ from test.services.test_scoring import (  # isort: skip  (per-name noqa below; s
     db_engine,  # noqa: F401  # pytest fixture, injected by name
     svc,  # noqa: F401  # pytest fixture, injected by name
 )
+
+import pytest
+from click.testing import CliRunner
+from sqlalchemy.orm import sessionmaker
+
+from cli_agent_orchestrator.clients import database
+from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+from cli_agent_orchestrator.services import memory_relationship_service, settings_service
 
 
 @pytest.fixture
