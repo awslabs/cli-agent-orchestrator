@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from cli_agent_orchestrator.services.workflow_errors import ReplayDivergenceError
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -327,8 +328,14 @@ def _connect() -> sqlite3.Connection:
     if needs_migration:
         _migrate_workflow_run()
         _migrate_workflow_run_step()
+    # The caller owns the connection and closes it (closing_transaction); until it is
+    # handed back, a failure here closes it.
     conn = sqlite3.connect(path)
-    conn.execute(f"PRAGMA busy_timeout = {WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS}")
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS}")
+    except BaseException:
+        conn.close()
+        raise
     if needs_migration:
         # BR-6, corrected: cache the path only once the schema is VERIFIED, never merely
         # because the two silently-failing migrators returned. Verified on the connection this
@@ -415,7 +422,7 @@ def insert_run(
     journaled with a transient ``tier='yaml'`` window that would break tier
     dispatch / resumability (code-generation-plan CONTRADICTION #4).
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
@@ -475,7 +482,7 @@ def insert_run_with_steps(
     blocking engines still call them (INV-1). This is a NEW additive sibling that
     composes the same two INSERTs into one transaction for the async path.
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
@@ -512,7 +519,7 @@ def compare_and_set_run_manifest(
     a normal lost race, distinct from a SQLite exception, which callers must
     surface as a failed persistence rather than overwrite the winner.
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         cursor = conn.execute(
             "UPDATE workflow_run SET manifest_json = ? " "WHERE run_id = ? AND manifest_json = ?",
             (manifest_json, run_id, expected_manifest_json),
@@ -526,7 +533,7 @@ def insert_steps(run_id: str, steps: Sequence[Tuple[str, str]], updated_at: str)
     Called once at ``start_run`` to seed every spec step (typically ``pending``).
     ``INSERT OR REPLACE`` so a re-seed is idempotent.
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.executemany(
             "INSERT OR REPLACE INTO workflow_run_step "
             "(run_id, step_id, state, attempts, output_json, error, updated_at) "
@@ -554,7 +561,7 @@ def update_step(
     default, taken by every non-failure and every pre-U2 caller) writes NULL,
     leaving the pre-U2 behavior byte-identical.
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute(
             "UPDATE workflow_run_step "
             "SET state = ?, attempts = ?, output_json = ?, error = ?, "
@@ -566,7 +573,7 @@ def update_step(
 
 def update_run_current_step(run_id: str, current_step_id: Optional[str]) -> None:
     """UPDATE ``workflow_run.current_step_id`` (FR-6.4 "which step is live")."""
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute(
             "UPDATE workflow_run SET current_step_id = ? WHERE run_id = ?",
             (current_step_id, run_id),
@@ -596,7 +603,7 @@ def update_run_state(
     running" guard would silently turn every resume into a no-op. A caller that
     needs the guarded write wants ``settle_run_state_if_running`` below.
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute(
             "UPDATE workflow_run SET state = ?, finished_at = ?, error = ?, "
             "kind = ? WHERE run_id = ?",
@@ -627,7 +634,7 @@ def settle_run_state_if_running(run_id: str, state: str, finished_at: Optional[s
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
 
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         cursor = conn.execute(
             "UPDATE workflow_run SET state = ?, finished_at = ? " "WHERE run_id = ? AND state = ?",
             (state, finished_at, run_id, RunState.RUNNING.value),
@@ -670,7 +677,8 @@ def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> Dict[str, str]
 
     1. read this run's existing step rows (:func:`get_steps`);
     2. validate EVERY entry — nothing is written yet;
-    3. one ``with _connect() as conn:`` block, N single-row UPDATEs of ``state``;
+    3. one ``with closing_transaction(_connect()) as conn:`` block, N single-row
+       UPDATEs of ``state``;
     4. AFTER the commit, one warning per decision.
 
     **Why validate-then-write rather than iterate-and-write** (SR-2, the one threat
@@ -684,11 +692,11 @@ def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> Dict[str, str]
     **Why one transaction as WELL as up-front validation** (SR-3/TD-4). The two guard
     different failures and neither is redundant: validation catches operator error at
     the boundary, the transaction catches a database failure part-way through the
-    writes. ``with _connect() as conn:`` commits on clean exit and rolls back on an
-    exception, which is sufficient — deliberately NOT the ``BEGIN IMMEDIATE`` unit
-    6's TD-2a considered, because this is a single-writer, human-initiated path and
-    not a two-process race (concurrent resumes of the SAME run are rejected upstream
-    with 409 before this function is reached, SC-3).
+    writes. ``with closing_transaction(_connect()) as conn:`` commits on clean exit and
+    rolls back on an exception, which is sufficient — deliberately NOT the
+    ``BEGIN IMMEDIATE`` unit 6's TD-2a considered, because this is a single-writer,
+    human-initiated path and not a two-process race (concurrent resumes of the SAME
+    run are rejected upstream with 409 before this function is reached, SC-3).
 
     **Only ``state`` moves** (BR-8/SR-9/RL-4). ``attempts``, ``result_json``,
     ``output_json``, ``error``, ``call_fingerprint`` and ``updated_at`` are untouched,
@@ -784,7 +792,7 @@ def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> Dict[str, str]
         resolved[step_id] = (decision.value, _DECISION_STATES[decision.value])
 
     # 3. ONE transaction. ``state`` and nothing else (BR-8).
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         for step_id, (_decision, state) in resolved.items():
             conn.execute(
                 "UPDATE workflow_run_step SET state = ? WHERE run_id = ? AND step_id = ?",
@@ -853,7 +861,7 @@ def revoke_unconsumed_decisions(run_id: str, prior_states: Mapping[str, str]) ->
 
     authorised = set(DECISION_STATES.values())
     revoked: List[str] = []
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         for step_id, prior in prior_states.items():
             if prior in authorised:
                 # Refuse to "restore" a row to an authorised state — that would re-grant the
@@ -899,7 +907,7 @@ def get_run(run_id: str) -> Optional[RunRow]:
     ``None`` on absent is load-bearing: the rebuild returns ``None`` so
     ``get_run_status`` raises ``KeyError`` -> 404 (F1, contract unchanged).
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         row = conn.execute(
             "SELECT run_id, workflow_name, spec_snapshot, inputs_json, state, "
             "current_step_id, started_at, finished_at, tier, generation, manifest_json, error, "
@@ -938,7 +946,7 @@ def get_steps(run_id: str) -> List[StepRow]:
     ``settle_step`` writes is readable. The column order is append-only because the
     construction below indexes positionally.
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         rows = conn.execute(
             "SELECT run_id, step_id, state, attempts, output_json, error, updated_at, "
             "call_fingerprint, terminal_id, reprompted, error_kind, result_json "
@@ -979,7 +987,7 @@ def get_step(run_id: str, step_id: str) -> Optional[StepRow]:
     (FR-4 guard 2, unit 7). The column order is append-only because the
     construction below indexes positionally.
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         row = conn.execute(
             "SELECT run_id, step_id, state, attempts, output_json, error, updated_at, "
             "call_fingerprint, terminal_id, reprompted, error_kind, result_json "
@@ -1048,7 +1056,7 @@ def list_runs(
     sql += " ORDER BY started_at DESC, run_id DESC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
 
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         rows = conn.execute(sql, tuple(params)).fetchall()
     return [
         RunSummaryRow(
@@ -1109,7 +1117,7 @@ def append_step(
       fingerprint is preserved, which is the same stability this function
       provides unconditionally.
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute(
             "INSERT INTO workflow_run_step "
             "(run_id, step_id, state, attempts, output_json, error, updated_at, "
@@ -1169,7 +1177,7 @@ def begin_step(run_id: str, step_id: str, updated_at: str, call_fingerprint: str
     best-effort posture belongs to the caller (``record_step_completion``), so a
     journal failure degrades resumability and never fails a running step (INV-4).
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute(
             "INSERT INTO workflow_run_step "
             "(run_id, step_id, state, attempts, output_json, error, updated_at, "
@@ -1277,7 +1285,7 @@ def settle_step(
 
     Raises ``sqlite3.Error`` on a DB failure and swallows nothing (BR-3).
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         existed = (
             conn.execute(
                 "SELECT 1 FROM workflow_run_step WHERE run_id = ? AND step_id = ?",
@@ -1418,6 +1426,7 @@ def _connect_event() -> sqlite3.Connection:
         _migrate_workflow_run_event()
         _migrate_workflow_run_seq()
         _event_migrated_paths.add(path)
+    # The caller owns the connection and closes it (closing_transaction).
     return sqlite3.connect(path)
 
 
@@ -1483,7 +1492,7 @@ def append_event(
         which_guard_fired,
     )
     placeholders = ", ".join("?" for _ in _EVENT_COLUMNS)
-    with _connect_event() as conn:
+    with closing_transaction(_connect_event()) as conn:
         conn.execute(
             f"INSERT INTO workflow_run_event ({', '.join(_EVENT_COLUMNS)}) "
             f"VALUES ({placeholders})",
@@ -1500,7 +1509,7 @@ def persist_high_water(run_id: str, seq: int) -> None:
     any allocated slot even if the append was later swallowed (BR-3).
     Parameterized SQL only (BR-9).
     """
-    with _connect_event() as conn:
+    with closing_transaction(_connect_event()) as conn:
         conn.execute(
             "INSERT INTO workflow_run_seq (run_id, high_water) VALUES (?, ?) "
             "ON CONFLICT(run_id) DO UPDATE SET "
@@ -1548,7 +1557,7 @@ def read_events(run_id: str, after_seq: Optional[int] = None) -> List[EventRow]:
     (FR-5.2), so a disconnected follower resumes without gaps or duplicates.
     """
     select = f"SELECT {', '.join(_EVENT_COLUMNS)} FROM workflow_run_event WHERE run_id = ?"
-    with _connect_event() as conn:
+    with closing_transaction(_connect_event()) as conn:
         if after_seq is None:
             rows = conn.execute(f"{select} ORDER BY seq", (run_id,)).fetchall()
         else:
@@ -1584,7 +1593,7 @@ def _is_terminal_run(run_id: str) -> bool:
     already.
     """
     try:
-        with _connect_event() as conn:
+        with closing_transaction(_connect_event()) as conn:
             row = conn.execute(
                 "SELECT state FROM workflow_run WHERE run_id = ?",
                 (run_id,),
@@ -1729,7 +1738,7 @@ def persisted_high_water(run_id: str) -> int:
     the rebuild path.
     """
     try:
-        with _connect_event() as conn:
+        with closing_transaction(_connect_event()) as conn:
             row = conn.execute(
                 "SELECT high_water FROM workflow_run_seq WHERE run_id = ?",
                 (run_id,),
@@ -1749,7 +1758,7 @@ def max_event_seq(run_id: str) -> int:
     seq is not clobbered (BR-3). Read failures degrade to ``0``.
     """
     try:
-        with _connect_event() as conn:
+        with closing_transaction(_connect_event()) as conn:
             row = conn.execute(
                 "SELECT COALESCE(MAX(seq), 0) FROM workflow_run_event WHERE run_id = ?",
                 (run_id,),
@@ -1776,7 +1785,7 @@ def list_run_ids_by_age() -> List[Tuple[str, str]]:
     share a ``started_at``. Uses the same self-connecting ``_connect`` as the other
     ``workflow_run`` reads (run-table only; no event-table migration needed).
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         rows = conn.execute(
             "SELECT run_id, started_at FROM workflow_run ORDER BY started_at DESC, run_id DESC"
         ).fetchall()
@@ -1802,7 +1811,7 @@ def delete_run_events(run_id: str, conn: Optional[sqlite3.Connection] = None) ->
     if conn is not None:
         conn.execute(_DELETE_EVENTS_SQL, (run_id,))
         return
-    with _connect_event() as own:
+    with closing_transaction(_connect_event()) as own:
         own.execute(_DELETE_EVENTS_SQL, (run_id,))
 
 
@@ -1829,7 +1838,7 @@ def delete_run(run_id: str) -> None:
 
     _migrate_workflow_run()
     _migrate_workflow_run_step()
-    with _connect_event() as conn:
+    with closing_transaction(_connect_event()) as conn:
         # The event delete goes through the shared helper (DRY, one definition of
         # "clear a run's events"); the connection is threaded in so all four
         # statements stay in ONE transaction.

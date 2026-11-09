@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
     List,
     Literal,
@@ -106,7 +107,7 @@ from cli_agent_orchestrator.decisions.engine import (
     launch_note,
     prepare_launch,
 )
-from cli_agent_orchestrator.decisions.owner import WORKFLOW_STEP, launch_owner
+from cli_agent_orchestrator.decisions.owner import DELEGATION, WORKFLOW_STEP, launch_owner
 from cli_agent_orchestrator.decisions.policy import DecisionInputError
 from cli_agent_orchestrator.decisions.targets import TargetKind, profile_source
 from cli_agent_orchestrator.decisions.types import LaunchPlan
@@ -161,6 +162,7 @@ from cli_agent_orchestrator.services import (
     approval_store,
     ephemeral_service,
     flow_service,
+    keep_service,
     manifest_freeze,
     secret_gate,
     session_service,
@@ -199,7 +201,6 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
-    IdempotencyKeyConflict,
     IdempotencyKeyNotFound,
     IdempotentCreateFailed,
     OutputMode,
@@ -303,6 +304,24 @@ async def ephemeral_sweep_daemon() -> None:
             await asyncio.to_thread(ephemeral_service.sweep, False)
         except Exception:
             logger.exception("Ephemeral sweep daemon error")
+
+
+async def kept_terminal_reaper_daemon(registry: PluginRegistry) -> None:
+    """Background task that tears down kept children past their idle window (#1225).
+
+    The same shape as ``ephemeral_sweep_daemon``: the work runs in a worker thread
+    and every error is logged and swallowed, so this task cannot die and break the
+    lifespan shutdown. The first pass runs at startup, so a window that ended while
+    the server was down is honoured at once. With nothing kept a pass is one
+    SELECT on an empty table.
+    """
+    logger.info("Kept-terminal reaper started")
+    while True:
+        try:
+            await asyncio.to_thread(keep_service.reap, registry)
+        except Exception:
+            logger.exception("Kept-terminal reaper error")
+        await asyncio.sleep(keep_service.REAPER_INTERVAL_SECONDS)
 
 
 # Response Models
@@ -845,6 +864,22 @@ class RunStepResponse(BaseModel):
             "ORIGINAL terminal_id, which names a terminal that no longer "
             "exists, and this flag is the only thing that stops a consumer "
             "reading, writing to, or waiting on a dead id."
+        ),
+    )
+    kept_until: Optional[datetime] = Field(
+        default=None,
+        description=(
+            "Set only when a handoff's worker was KEPT instead of torn down "
+            "(terminal.keep_finished, issue #1225): the end of its keep window. "
+            "Absent from the body otherwise."
+        ),
+    )
+    keep_note: Optional[str] = Field(
+        default=None,
+        description=(
+            "Set only while keeping finished agents is on and it applied to this "
+            "worker: one sentence saying whether it was kept and why, including any "
+            "kept agent torn down to stay within the per-session cap. Absent otherwise."
         ),
     )
 
@@ -1598,6 +1633,12 @@ async def lifespan(app: FastAPI):
     # only in ``main()`` — so the imported-app deployment path
     # (``uvicorn cli_agent_orchestrator.api.main:app``) is covered too. Idempotent.
     install_access_log_redaction()
+    # The same deployment path never runs main()'s uvicorn exit hook, so wrap the
+    # signal handlers uvicorn has installed by now: a stop then reaches the open
+    # AG-UI streams before uvicorn waits for their connections.
+    from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run_hook
+
+    _ambient_run_hook.install_signal_stop_hook()
     # issues #406 / #709: exactly one cao-server per CAO_HOME_DIR. Taken before
     # the database, the recovery sweeps, the terminal registry, the status
     # monitor and uvicorn's port bind (uvicorn binds after lifespan startup), so
@@ -1772,6 +1813,9 @@ async def lifespan(app: FastAPI):
     # the immediate and event-driven status paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
     ephemeral_sweep_task = asyncio.create_task(ephemeral_sweep_daemon())
+    # #1225: report an ON or invalid keep setting once, then reap kept children.
+    keep_service.log_startup_posture()
+    kept_reaper_task = asyncio.create_task(kept_terminal_reaper_daemon(registry))
 
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
@@ -1793,6 +1837,12 @@ async def lifespan(app: FastAPI):
         logger.info("Herdr inbox service started")
 
     yield
+
+    # AG-UI ambient streams: backstop for launches whose shutdown reaches the
+    # lifespan before the streams close (uvicorn waits for connections first).
+    from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run
+
+    _ambient_run.request_stop(sticky=False)
 
     # Stop herdr inbox service on shutdown
     if herdr_inbox_task is not None:
@@ -1855,6 +1905,13 @@ async def lifespan(app: FastAPI):
     ephemeral_sweep_task.cancel()
     try:
         await ephemeral_sweep_task
+    except asyncio.CancelledError:
+        pass
+
+    # Same for the kept-terminal reaper (#1225).
+    kept_reaper_task.cancel()
+    try:
+        await kept_reaper_task
     except asyncio.CancelledError:
         pass
 
@@ -2254,6 +2311,120 @@ async def _with_keepalive(events: Any, interval: float) -> Any:
             pending.cancel()
 
 
+# ``?framing=`` values the ambient stream accepts. ``cao-legacy`` is the pre-1.0
+# framing, deprecated and kept byte-identical (#1193 mode ``off``).
+AGUI_FRAMING_LEGACY = "cao-legacy"
+AGUI_STREAM_FRAMINGS = frozenset({AGUI_FRAMING_LEGACY})
+# RFC 9745 section 2.1: Deprecation is an Item Structured Header Field whose value
+# is a Date (RFC 9651 section 3.3.7, "@" + integer seconds since the epoch).
+# 1793750400 = 2026-11-04T00:00:00Z, when the legacy framing was deprecated.
+_AGUI_LEGACY_DEPRECATED_AT = 1793750400
+_AGUI_LEGACY_DEPRECATION_LINK = (
+    "<https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/agui.md#legacy-framing>"
+    '; rel="deprecation"; type="text/html"'
+)
+_AGUI_SUB_FRAME_ID_RE = re.compile(r"^([^.]+)\.(\d+)$")
+_AGUI_THREAD_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_AGUI_THREAD_ID_ERROR = "Invalid threadId: 1-128 characters of A-Z a-z 0-9 . _ : -"
+
+
+def _agui_legacy_framing_headers() -> Dict[str, str]:
+    return {
+        "Deprecation": f"@{_AGUI_LEGACY_DEPRECATED_AT}",
+        "Link": _AGUI_LEGACY_DEPRECATION_LINK,
+    }
+
+
+def _agui_ambient_response(
+    *,
+    thread_id: str,
+    run_id: str,
+    since: Optional[str],
+    last_event_id: Optional[str],
+    fleet_snapshot: Any,
+    accept: Optional[str],
+    max_seconds: Optional[float],
+    state_baseline_known: bool,
+) -> Any:
+    """The AG-UI 1.0 conformant ambient run, shared by GET and POST /agui/v1/stream."""
+    from ag_ui.encoder import EventEncoder
+    from fastapi.responses import StreamingResponse
+
+    from cli_agent_orchestrator.clients import database as _db
+    from cli_agent_orchestrator.clients.database import get_session_incarnation
+    from cli_agent_orchestrator.services.agui import run_plane
+    from cli_agent_orchestrator.services.agui.ambient_run import AmbientRun, ambient_stream
+    from cli_agent_orchestrator.services.event_log_service import get_event_log
+    from cli_agent_orchestrator.services.sse_bus import get_bus
+    from cli_agent_orchestrator.services.ui_state_service import diff_snapshot
+
+    encoder = EventEncoder(accept=accept or "text/event-stream")
+    content_type = encoder.get_content_type()
+    is_sse = content_type == "text/event-stream"
+
+    def encode(sse_id: Optional[str], event: Any) -> Any:
+        frame = encoder.encode(event)
+        if is_sse and sse_id is not None:
+            return f"id: {sse_id}\n{frame}"
+        return frame
+
+    def replay() -> List[Dict[str, Any]]:
+        # A CAO extension (docs/agui.md): choose which buffered records this NEW run
+        # narrates first. Failure-isolated, as on the legacy path.
+        try:
+            if since:
+                return list(get_event_log().history(since=since))
+            if last_event_id:
+                log = get_event_log()
+                # `<record id>.<n>` names a frame the conformant stream synthesized
+                # before that record's own frame (record ids are uuid4, never
+                # dotted). The client saw only part of the record, so the new run
+                # replays the record whole rather than everything or what follows.
+                sub = _AGUI_SUB_FRAME_ID_RE.match(last_event_id)
+                if sub:
+                    fresh = list(log.history())
+                    for i, record in enumerate(fresh):
+                        if str(record.get("id")) == sub.group(1):
+                            return fresh[i:]
+                return list(log.after_id(last_event_id))
+        except Exception:
+            logger.warning("agui_stream: history replay failed", exc_info=True)
+        return []
+
+    async def generator() -> Any:
+        bus = get_bus()
+        # Register before the replay and the snapshot, so nothing published in
+        # between is lost (the same seam the legacy path uses).
+        sub = bus.register(overflow_close=True)
+        run = AmbientRun(
+            thread_id,
+            run_id,
+            incarnation_of=get_session_incarnation,
+            state_baseline_known=state_baseline_known,
+            since=since,
+            terminal_known=lambda terminal_id: _db.terminal_exists(terminal_id),
+            terminal_label=lambda terminal_id: _db.get_terminal_label(terminal_id),
+        )
+        try:
+            async for frame in ambient_stream(
+                run=run,
+                encode=encode,
+                is_sse=is_sse,
+                replay=replay(),
+                fleet_snapshot=fleet_snapshot,
+                diff=diff_snapshot,
+                bus=bus,
+                sub=sub,
+                keepalive_seconds=run_plane.RUN_PLANE_HEARTBEAT_SECONDS,
+                max_seconds=max_seconds,
+            ):
+                yield frame
+        finally:
+            bus.unregister(sub)
+
+    return StreamingResponse(generator(), media_type=content_type)
+
+
 @app.get("/agui/v1/stream")
 async def agui_stream(
     since: Optional[str] = Query(
@@ -2262,6 +2433,28 @@ async def agui_stream(
             "ISO-8601 lower bound. When set, buffered events after this "
             "timestamp are replayed (as AG-UI frames) before the live stream; "
             "clients dedupe by event id."
+        ),
+    ),
+    framing: Optional[str] = Query(
+        default=None,
+        description=(
+            "Wire framing. ``cao-legacy`` selects the pre-1.0 framing (named SSE "
+            "events, snake_case fields), which is deprecated and kept byte-identical."
+        ),
+    ),
+    thread_id: Optional[str] = Query(
+        default=None,
+        alias="threadId",
+        description="The application's thread id for this connection's run (1-128 of A-Z a-z 0-9 . _ : -).",
+    ),
+    max_seconds: Optional[int] = Query(
+        default=None,
+        alias="maxSeconds",
+        ge=1,
+        le=3600,
+        description=(
+            "End the run after this many seconds with the cancelled outcome (a limit "
+            "the producer enforces). Ignored with framing=cao-legacy."
         ),
     ),
     access_token: Optional[str] = Query(
@@ -2282,19 +2475,24 @@ async def agui_stream(
         ),
     ),
 ):
-    """Stream fleet events as AG-UI typed events (Server-Sent Events).
+    """Stream the fleet as one AG-UI 1.0 run (Server-Sent Events).
 
-    This is the L2 standalone-dashboard surface (consumed by any AG-UI client). It
-    shares the exact same source as ``/events`` — the in-process ``SseBus`` fed
-    by the ``EventLogPublisher`` — but re-maps each normalized six-primitive
-    record onto AG-UI typed events via ``agui_stream.to_agui_event`` before it
-    hits the wire. Every frame is named by an AG-UI 1.0 event type; generative
-    UI rides on ``CUSTOM`` with ``name="cao.generative_ui"``, which a client
-    renders only if it knows that name.
+    The ``EventSource`` convenience for ``POST /agui/v1/stream`` (the AG-UI
+    binding). It shares the exact same source as ``/events``, the in-process
+    ``SseBus`` fed by the ``EventLogPublisher``, and narrates each normalized
+    record as conformant AG-UI events (``services/agui/ambient_run.py``):
+    ``RUN_STARTED`` first, sessions and terminals as ``SUBAGENT_*``
+    invocations, delegations as tool calls, generative UI as ``CUSTOM``
+    ``cao.generative_ui``, and a ``RUN_FINISHED`` cancelled or ``RUN_ERROR``
+    close. Frames are ``data:``-only with ``type`` in the JSON; record frames
+    carry an ``id:`` cursor. Message bodies are never carried (the ring buffer
+    stores metadata only and the mapping redacts by construction).
 
-    Each SSE frame is a *named* AG-UI event: ``event: <AGUI_TYPE>`` +
-    ``data: <json>``. Message bodies are never carried (the ring buffer stores
-    metadata only and the mapping redacts by construction).
+    ``?framing=cao-legacy`` serves the deprecated pre-1.0 wire byte-for-byte
+    (named ``event:`` frames via ``agui_stream.to_agui_event``), with
+    ``Deprecation`` and ``Link`` headers. ``since`` / ``Last-Event-ID`` replay is
+    a CAO extension that chooses which buffered records the new run narrates
+    first (``docs/agui.md#replay``).
 
     Default-off: returns 404 unless the AG-UI surface is enabled via
     ``CAO_AGUI_ENABLED`` (or the MCP Apps surface is on). When auth is enabled,
@@ -2348,6 +2546,15 @@ async def agui_stream(
                 detail=f"Invalid ISO-8601 timestamp for 'since': {since!r}",
             )
 
+    # Validate ?framing= and ?threadId= at the boundary, before any stream starts.
+    if framing is not None and framing not in AGUI_STREAM_FRAMINGS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown framing {framing!r}; supported: {sorted(AGUI_STREAM_FRAMINGS)}",
+        )
+    if thread_id is not None and not _AGUI_THREAD_ID_RE.fullmatch(thread_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_AGUI_THREAD_ID_ERROR)
+
     from fastapi.responses import StreamingResponse
 
     from cli_agent_orchestrator.services import session_service
@@ -2378,6 +2585,22 @@ async def agui_stream(
             except Exception:
                 logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
         return build_dashboard_snapshot(sessions, terminals, list(scopes))
+
+    if framing != AGUI_FRAMING_LEGACY:
+        import uuid
+
+        from cli_agent_orchestrator.services.agui.ambient_run import DEFAULT_THREAD_ID
+
+        return _agui_ambient_response(
+            thread_id=thread_id or DEFAULT_THREAD_ID,
+            run_id=str(uuid.uuid4()),
+            since=since,
+            last_event_id=last_event_id,
+            fleet_snapshot=_fleet_snapshot,
+            accept="text/event-stream",
+            max_seconds=max_seconds,
+            state_baseline_known=True,
+        )
 
     def _sse(event_id: Optional[str], agui_type: str, data: Dict) -> str:
         """Format one SSE frame, with an ``id:`` cursor when the event has one."""
@@ -2476,9 +2699,12 @@ async def agui_stream(
             # keep-alive on the same interval; otherwise a proxy with a read
             # timeout (CloudFront defaults to 30s) closes the stream.
             from cli_agent_orchestrator.services.agui import run_plane
+            from cli_agent_orchestrator.services.agui.ambient_run import until_stop
 
+            # A server stop ends the drain as if its source had ended, so this
+            # stream does not hold uvicorn's shutdown (review note 2).
             async for event in _with_keepalive(
-                bus.drain(sub), run_plane.RUN_PLANE_HEARTBEAT_SECONDS
+                until_stop(bus.drain(sub)), run_plane.RUN_PLANE_HEARTBEAT_SECONDS
             ):
                 if event is None:
                     yield ":keep-alive\n\n"
@@ -2514,7 +2740,174 @@ async def agui_stream(
         finally:
             bus.unregister(sub)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    headers: Dict[str, str] = {}
+    if framing == AGUI_FRAMING_LEGACY:
+        logger.warning(
+            "agui_stream: a client requested the deprecated ?framing=%s; see docs/agui.md#legacy-framing",
+            AGUI_FRAMING_LEGACY,
+        )
+        headers = _agui_legacy_framing_headers()
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
+
+
+def _agui_parse_protocol_version(value: Any) -> Optional[Tuple[int, int]]:
+    """``"MAJOR.MINOR"`` to a tuple, or ``None`` when it cannot be interpreted.
+
+    Only the published identifier form counts (versioning#version-negotiation):
+    ``"2"``, ``"2.0.0"`` and ``"draft"`` are uninterpretable, so the caller serves
+    them with a warning rather than refusing them. Each part is bounded to 9
+    digits, so an overlong number is uninterpretable too instead of reaching
+    ``int()``'s digit limit.
+    """
+    if not isinstance(value, str):
+        return None
+    m = re.fullmatch(r"([0-9]{1,9})\.([0-9]{1,9})", value)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+@app.post("/agui/v1/stream")
+async def agui_stream_post(
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """The ambient fleet run over AG-UI's HTTP+SSE binding (POST a ``RunAgentInput``).
+
+    The same conformant run as ``GET /agui/v1/stream``, but delivered the way the
+    binding contract requires: the request carries the ``RunAgentInput`` that opens
+    the exchange, so a stock ``HttpAgent`` can consume it.
+
+    - ``threadId`` and ``runId`` come from the input; ``RUN_STARTED`` echoes them.
+    - ``protocolVersion`` is read. A different major version is refused with 400
+      before the stream; a newer minor, or a value that cannot be interpreted, is
+      served with a warning (versioning#version-negotiation).
+    - A non-empty ``resume[]`` is refused with 400: the ambient run raises no
+      interrupts, so there is nothing to answer here. Answers go to
+      ``POST /agui/v1/run``.
+    - ``forwardedProps.cao`` takes CAO's options: ``since`` (ISO-8601 replay bound)
+      and ``maxSeconds`` (1-3600; the run then ends with the cancelled outcome).
+    - ``messages``, ``tools``, ``context`` and ``state`` are accepted and not used:
+      the ambient run observes the fleet.
+    """
+    _require_agui_enabled()
+
+    from cli_agent_orchestrator.services.agui.run_plane import AG_UI_AVAILABLE
+
+    if not AG_UI_AVAILABLE:
+        return JSONResponse(
+            status_code=501,
+            content={
+                "detail": (
+                    "ag-ui-protocol is not installed. "
+                    "Install with: pip install cli-agent-orchestrator[agui]"
+                )
+            },
+        )
+
+    try:
+        body = await request.json()
+    except ValueError as e:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "json_invalid",
+                    "loc": ("body",),
+                    "msg": "invalid JSON body",
+                    "ctx": {"error": str(e)},
+                }
+            ]
+        )
+
+    from cli_agent_orchestrator.services.agui.run_plane import RunAgentInput
+
+    try:
+        run_input = RunAgentInput.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            [{**err, "loc": ("body", *err["loc"])} for err in e.errors(include_url=False)]
+        )
+    # The same threadId rule and 400 as GET (review note 6).
+    if not _AGUI_THREAD_ID_RE.fullmatch(run_input.thread_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_AGUI_THREAD_ID_ERROR)
+
+    raw_version = body.get("protocolVersion") if isinstance(body, dict) else None
+    if raw_version is not None:
+        parsed = _agui_parse_protocol_version(raw_version)
+        if parsed is None:
+            logger.warning(
+                "agui_stream: protocolVersion %.80r cannot be interpreted; serving as 1.0",
+                raw_version,
+            )
+        elif parsed[0] != 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"protocolVersion {raw_version!r} is not supported; this server speaks 1.0",
+            )
+        elif parsed[1] > 0:
+            logger.warning(
+                "agui_stream: client declared protocolVersion %r, newer than 1.0; serving 1.0",
+                raw_version,
+            )
+
+    if run_input.resume:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "resume[] is not accepted on /agui/v1/stream: the ambient run raises no "
+                "interrupts. Send answers to POST /agui/v1/run."
+            ),
+        )
+
+    forwarded = body.get("forwardedProps") if isinstance(body, dict) else None
+    cao_opts = forwarded.get("cao") if isinstance(forwarded, dict) else None
+    cao_opts = cao_opts if isinstance(cao_opts, dict) else {}
+    since = cao_opts.get("since")
+    if since is not None:
+        try:
+            text = str(since)
+            datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid ISO-8601 timestamp for forwardedProps.cao.since: {since!r}",
+            )
+    max_seconds = cao_opts.get("maxSeconds")
+    if max_seconds is not None and (
+        not isinstance(max_seconds, int)
+        or isinstance(max_seconds, bool)
+        or not 1 <= max_seconds <= 3600
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="forwardedProps.cao.maxSeconds must be an integer from 1 to 3600",
+        )
+
+    from cli_agent_orchestrator.services import session_service
+    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
+
+    scopes = list(_scopes)
+
+    def _fleet_snapshot() -> Dict:
+        sessions = session_service.list_sessions()
+        terminals: List[Dict] = []
+        for sess in sessions:
+            try:
+                terminals.extend(
+                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
+                )
+            except Exception:
+                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
+        return build_dashboard_snapshot(sessions, terminals, scopes)
+
+    return _agui_ambient_response(
+        thread_id=run_input.thread_id,
+        run_id=run_input.run_id,
+        since=str(since) if since is not None else None,
+        last_event_id=None,
+        fleet_snapshot=_fleet_snapshot,
+        accept=request.headers.get("accept"),
+        max_seconds=max_seconds,
+        state_baseline_known=not run_input.state,
+    )
 
 
 class EmitUIRequest(BaseModel):
@@ -2802,6 +3195,33 @@ async def agui_run(
         ),
         media_type=content_type,
     )
+
+
+# ---------------------------------------------------------------------------
+# Run plane capabilities (AG-UI 1.0 AgentCapabilities, #1192)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/agui/v1/capabilities")
+async def agui_capabilities(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Return the run plane's AG-UI 1.0 capabilities (GET /agui/v1/capabilities).
+
+    The body is one ``AgentCapabilities`` object in the 1.0 schema shape. AG-UI
+    leaves retrieval to the implementation, so CAO serves it beside
+    ``POST /agui/v1/run``, at the same ``cao:read`` floor. The declaration is
+    informative; the run's own events stay authoritative. It omits
+    ``humanInTheLoop.approveWithEdits`` (each interrupt's ``responseSchema``
+    says whether edit is accepted) and never declares ``transport.resumable``.
+
+    Returns 404 when the AG-UI surface is disabled.
+    """
+    _require_agui_enabled()
+
+    from cli_agent_orchestrator.services.agui.capabilities import build_capabilities
+
+    return build_capabilities()
 
 
 # Topology widget static bundle at /widgets/topology/ — the vanilla SSE-driven
@@ -3561,9 +3981,9 @@ async def get_skill_content(
 # Agent Plugins (Agent Plugins 1.0.0) — NOT the event-plugin system
 # =============================================================================
 # Added inline next to the /skills and /settings/skill-dirs handlers because
-# api/main.py is flat (no routers package). Naming is unresolved maintainer
-# decision M1; per requirements.md 16.5 this surface must not ship to end users
-# before that is settled, so every route below is gated on
+# api/main.py is flat (no routers package). The naming is decision M1, recorded
+# by the issue author in #573; the surface does not ship to end users until it
+# graduates (#1244), so every route below is gated on
 # CAO_AGENT_PLUGINS_ENABLED (default off) and 404s without it — the routes are
 # constructed but not executable, mirroring the AG-UI gate above. The scope
 # dependencies are authorization, not the gate: they are a no-op when auth is
@@ -4002,11 +4422,14 @@ async def create_session(
     ``terminal_service.create_terminal``'s docstring for the mechanics.
     Omitted (default): today's behavior, no retry protection.
 
-    The key is matched together with a fingerprint of the request, not on its
-    own, so presenting a key that a DIFFERENT request already claimed returns
-    **409 CONFLICT** rather than that other request's terminal. A key whose
-    terminal has since been torn down is stale, not conflicting, and simply
-    creates fresh.
+    The key is scoped by a fingerprint of the request, not matched on its own
+    (issue #944), so presenting a key that a DIFFERENT request already claimed
+    creates a fresh terminal for this request (idempotent for its own retries)
+    rather than returning that other request's terminal. It is not refused:
+    answering differently for a key in use than for an unused one would tell
+    the caller whether someone else holds the key. With ``lookup_only`` both
+    cases answer **404**. A key whose terminal has since been torn down is
+    stale and simply creates fresh.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -4129,8 +4552,7 @@ async def create_session(
             #
             # Sidecar args are all derived from the primary request or its
             # result, so a genuine retry fingerprints identically and hits;
-            # anything else 409s inside the task and is logged below like any
-            # other sidecar failure, without failing the primary.
+            # anything else gets its own fingerprint-scoped slot (issue #944).
             sidecar_idempotency_key = (
                 f"{idempotency_key}:memory-manager-sidecar" if idempotency_key else None
             )
@@ -4191,14 +4613,6 @@ async def create_session(
         # A distinct status, so the caller reports that cause and does not
         # mistake it for a retryable server error.
         return _idempotent_create_failed_response(e)
-    except IdempotencyKeyConflict as e:
-        # The key was already used for a DIFFERENT request (review on PR #634,
-        # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
-        # rather than silently serving the first call's terminal to a caller
-        # who asked for something else. IdempotencyKeyConflict subclasses
-        # Exception and NOT ValueError precisely so this arm cannot be
-        # shadowed by the 400 arm below -- which, note, sits FIRST here.
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
@@ -4382,11 +4796,14 @@ async def create_terminal_in_session(
     ``terminal_service.create_terminal``'s docstring for the mechanics.
     Omitted (default): today's behavior, no retry protection.
 
-    The key is matched together with a fingerprint of the request, not on its
-    own, so presenting a key that a DIFFERENT request already claimed returns
-    **409 CONFLICT** rather than that other request's terminal. A key whose
-    terminal has since been torn down is stale, not conflicting, and simply
-    creates fresh.
+    The key is scoped by a fingerprint of the request, not matched on its own
+    (issue #944), so presenting a key that a DIFFERENT request already claimed
+    creates a fresh terminal for this request (idempotent for its own retries)
+    rather than returning that other request's terminal. It is not refused:
+    answering differently for a key in use than for an unused one would tell
+    the caller whether someone else holds the key. With ``lookup_only`` both
+    cases answer **404**. A key whose terminal has since been torn down is
+    stale and simply creates fresh.
     """
     launch_plan: LaunchPlan | None = None
     try:
@@ -4516,13 +4933,6 @@ async def create_terminal_in_session(
         # A distinct status, so the caller reports that cause and does not
         # mistake it for a retryable server error.
         return _idempotent_create_failed_response(e)
-    except IdempotencyKeyConflict as e:
-        # The key was already used for a DIFFERENT request (review on PR #634,
-        # issue #616) — 409, not the 404 the generic ValueError arm below would
-        # give it. Unlike the Kiro arm, this one does not depend on preceding
-        # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
-        # of the ValueError family can shadow it.
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
         KiroV3Refusal,
         KiroCapabilityError,
@@ -4658,8 +5068,6 @@ async def create_terminal_in_session_as_operator(
         # A keyed replay of a failed original, as on the other create routes
         # (review on PR #773).
         return _idempotent_create_failed_response(e)
-    except IdempotencyKeyConflict as e:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (
         KiroV3Refusal,
         KiroCapabilityError,
@@ -5195,6 +5603,9 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
 @app.post(
     TERMINALS_RUN_STEP_ROUTE,
     response_model=RunStepResponse,
+    # The two #1225 keep fields are the only Optional ones, so this keeps every
+    # response body without a keep byte-identical to the one before #1225.
+    response_model_exclude_none=True,
     summary="Run one agent step (shared substrate)",
     description=(
         "Failure contract: a non-2xx body is a structured object "
@@ -5556,7 +5967,35 @@ async def run_step(
                 body.claim_id,
                 body.caller_id,
             )
+        # #1225 phase 1: a handoff's worker may be kept instead of torn down. Only
+        # the shape the handoff MCP tool sends qualifies -- a fresh terminal, a
+        # handoff delegation with a recorded caller on THIS node, no workflow
+        # identity -- so workflow steps, reuse calls and remote handoffs (which
+        # carry no caller_id) keep their teardown. The hook runs at the success
+        # teardown only; whether to keep is decided there, by the setting.
+        keep_outcomes: List[keep_service.KeepOutcome] = []
+        keep_hook: Optional[Callable[[str], bool]] = None
+        if (
+            body.teardown
+            and body.reuse_terminal_id is None
+            and body.orchestration_type == "handoff"
+            and body.caller_id is not None
+            and not body.env_vars
+            and owner == DELEGATION
+        ):
+            keep_registry = get_plugin_registry(request)
+
+            def _keep_handoff_worker(terminal_id: str) -> bool:
+                outcome = keep_service.keep_finished(
+                    terminal_id, reason="handoff", registry=keep_registry
+                )
+                keep_outcomes.append(outcome)
+                return outcome.kept
+
+            keep_hook = _keep_handoff_worker
+
         result = await run_agent_step(
+            keep_on_success=keep_hook,
             provider=body.provider,
             agent=body.agent,
             prompt=body.prompt,
@@ -5597,10 +6036,12 @@ async def run_step(
             result.status.value if hasattr(result.status, "value") else str(result.status)
         )
         _settle_step(result.terminal_id, None, result.last_message, response_status)
+        keep_outcome = keep_outcomes[0] if keep_outcomes else keep_service.NOT_APPLICABLE
         _schedule_elastic_terminal_ended(
             background_tasks,
             result.terminal_id,
-            teardown=body.teardown,
+            # A kept worker has not ended.
+            teardown=body.teardown and not keep_outcome.kept,
             reuse_terminal_id=body.reuse_terminal_id,
         )
 
@@ -5614,7 +6055,10 @@ async def run_step(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
             status=response_status,
+            # False for a kept worker: it was not torn down (#1203 / #1225).
             torn_down=result.torn_down,
+            kept_until=keep_outcome.kept_until if keep_outcome.kept else None,
+            keep_note=keep_outcome.note,
         )
     except ReplayDivergenceError as e:
         # FR-3's surfacing (BR-6/BR-7, TD-3/TD-4). 409 rather than 502/504 because
@@ -8993,9 +9437,39 @@ async def get_handoff_result_endpoint(
 async def delete_terminal(
     request: Request,
     terminal_id: TerminalId,
+    keep_if_enabled: bool = Query(
+        default=False,
+        description=(
+            "Sent by the agent-side delete_terminal MCP tool (issue #1225). While "
+            "terminal.keep_finished is on, an idle child terminal is KEPT instead of "
+            "deleted and the response says until when. A convenience flag, not an "
+            "identity check: any request without it deletes immediately, which is "
+            "what every operator surface sends."
+        ),
+    ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     """Delete a terminal."""
+    keep_note: Optional[str] = None
+    if keep_if_enabled:
+        try:
+            outcome = await asyncio.to_thread(
+                keep_service.keep_finished,
+                terminal_id,
+                reason="delete_terminal",
+                registry=get_plugin_registry(request),
+            )
+        except Exception as exc:  # noqa: BLE001 — a keep failure falls back to the delete
+            logger.warning("delete_terminal: keep decision for %s failed: %s", terminal_id, exc)
+            outcome = keep_service.NOT_APPLICABLE
+        if outcome.kept:
+            return {
+                "success": True,
+                "kept": True,
+                "kept_until": outcome.kept_until.isoformat() if outcome.kept_until else None,
+                "keep_note": outcome.note,
+            }
+        keep_note = outcome.note
     try:
         # delete_terminal is fully synchronous: blocking tmux kills, a
         # full-history scrollback snapshot capture, and DB writes. Off the
@@ -9016,6 +9490,8 @@ async def delete_terminal(
                     "retry delete after residual Grok processes exit"
                 ),
             )
+        if keep_note:
+            return {"success": True, "keep_note": keep_note}
         return {"success": True}
     except HTTPException:
         raise
@@ -10980,6 +11456,9 @@ def main():
     # ``uvicorn.error`` for WebSocket handshakes -- by
     # ``install_access_log_redaction()``, installed in the app lifespan so both
     # ``cao-server`` and ``uvicorn ...:app`` are covered.
+    from cli_agent_orchestrator.services.agui.ambient_run import install_uvicorn_exit_hook
+
+    install_uvicorn_exit_hook()
     uvicorn.run(
         app,
         host=host,

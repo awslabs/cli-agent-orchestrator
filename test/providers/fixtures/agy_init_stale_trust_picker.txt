@@ -1,0 +1,105 @@
+[?1049h[?25l[?2027h[?5W[?2004h[>4;2m[>1u[?u[H[2J
+[6`[38;5;179m▄[38;5;208;48;5;208m▀[38;5;203;48;5;209m▀[49m▄[m
+[5`[38;5;149;48;5;113m▀[38;5;143;48;5;107m▀[38;5;173;48;5;173m▀[38;5;209;48;5;209m▀[38;5;203;48;5;167m▀▀[m
+[4`[38;5;107;48;5;113m▀[38;5;71;48;5;72m▀[38;5;72;48;5;68m▀[38;5;67;49m▀[38;5;103m▀[38;5;98;48;5;68m▀[38;5;97;48;5;62m▀[38;5;132;48;5;97m▀[m
+  [38;5;78m▄[48;5;74m▀[38;5;73m▀[m    [38;5;68;48;5;69m▀▀[49m▄[m
+ [38;5;75m▄[38;5;79;48;5;75m▀[38;5;75;49m▀[m [5b[38;5;69m▀[48;5;69m▀[49m▄[m
+
+ Welcome to the [38;5;69mAntigravity CLI[m. You are currently not signed in.
+
+ ⣷  Signing in...[H[38;5;179;1mAccessing workspace:[m
+[K
+[1m/xxxxxxx/xxx/xxxxx-x0/agy-xxxx[m
+[K
+Do you trust the contents of this project?
+[K
+[38;5;69mAntigravity CLI[m requires permission to read, edit, and execute files here.
+[K
+[38;5;111m> Yes, I trust this folder[m
+  [38;5;110mNo, exit[m[K
+
+  [38;5;111;1m↑/↓[38;5;110;22m Navigate · [38;5;111;1menter[38;5;110;22m Confirm[m[13;199H[38;5;110mGemini 0.0 Flash · low[m[?1002h[?1006h[0 qM[J[H[K
+[7`[38;5;179m▄[38;5;208;48;5;208m▀[38;5;203;48;5;209m▀[49m▄[m [7b[38;5;111;1mAntigravity CLI 0.0.0[m
+[5`[1K [38;5;149;48;5;113m▀[38;5;143;48;5;107m▀[38;5;173;48;5;173m▀[38;5;209;48;5;209m▀[38;5;203;48;5;167m▀▀[m [6b[38;5;110mxxxxxx000xxxxxx.xxx[m
+[5`[38;5;107;48;5;113m▀[38;5;71;48;5;72m▀[38;5;72;48;5;68m▀[38;5;67;49m▀[38;5;103m▀[38;5;98;48;5;68m▀[38;5;97;48;5;62m▀[38;5;132;48;5;97m▀[m [5b[38;5;110mGemini 0.0 Flash (Low)[m
+   [38;5;78m▄[48;5;74m▀[38;5;73m▀[m    [38;5;68;48;5;69m▀▀[49m▄[m [4b[38;5;110m/xxxxxxx/xxx/xxxxx-x0/agy-xxxx[m
+  [38;5;75m▄[38;5;79;48;5;75m▀[38;5;75;49m▀[m [5b[38;5;69m▀[48;5;69m▀[49m▄[m
+⣷  [38;5;110mxxxxxx[38;5;111mxxxx.[38;5;110m..[m[K
+[38;5;239m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[m
+[C[K
+[38;5;239m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[m
+[38;5;110mesc to cancel[m[185X[11;199H[38;5;110mGemini 0.0 Flash · low[m[9;3H[?25h[?25l[7d⣯  [38;5;110mGenerating.[38;5;111m..[m[9;3H[?25h[?25l[7d⣟  [38;5;110mGenerating...[m[9;3H[?25h[?25l[7d⡿  [38;5;111mxx[m
+
+[?25h[?25l[7d⢿  [38;5;110mxx[38;5;111mxxxxx[m[9;3H[?25h[?25l[7d⣻  [38;5;110mxxxxxxx[38;5;111mxxx..[m[9;3H[?25h[?25l[3;38H[38;5;110m (xxxxxx xx xxxxx)[m[7;11H[38;5;110min[38;5;111mx...[m[9;3H[?25h[?25l[7;13H[38;5;110mx.[38;5;111m.[m[9;3H[?25h[?25l[7;15H[38;5;110m.[38;5;111m.[m[9;3H[?25h[?25l[H[38;5;111;1m  xxxxxxxxx. Use xxxx the xxxx xxxx "xxxxxx xx xxxxx xxxxxx", "xxxxxxxx a xxxxxx.xxxx", "xxxxxxx xxxxx xxxxxx xx xx xxxxx xxxxxx", "xxxxx xxxx xxxx the xxxxxxxx xxxx", "xxx is xx xxxxxx.xxxx xxxxxxxx", xx "xxx xx[m
+[38;5;111;1m  xxx.xxxx to xx xxxxxxx". xxxxxx the xxxxxxxx xxxxxxxx xxxx the xxxxxx xxxxx xxx xxxxxxx and xxxx, and the xxxxx xxxxxx xxxxxx xxx'x xxxxxx xxxx not xxxxx. xxx for xxx xxxxx xxxxxxx, the xxxxxx xxxxxxxx that xxxxx to[m
+[38;5;111;1m  xxx-xxxxxx xxxxxxxxx xxxxxx (xxx xxx-xxxxxx). xxx for xxxxxxxxx xx xxxxxxxx xxxxxx-xxxxxxxx xxxxx xxxxxx to the xxxxxxxx xxxxxxxxx (xxx xxxxxxx-xxxxx-xxxxxx). xxx for xxxxxxxx xx xxxxxxxx xxxxx xxxxxx xxxxxxx xxxxxxx[m
+[38;5;111;1m  the xxxxxx (xxx xxx-xxxxx-xxxxxx-xxxxx).[m
+[38;5;111;1m  - **xxx-xxxxx-xxxxxxx**: xxxx and xxxxxx the xxxx xxxxxxxxx xxx xxxxx xxxxxxx for a task xxxxxx xxxxxxxxxx xxxx xxxxxx xx xxxxxxx. Use xxxx a xxxxxxxxxx xxxxx to xxxxx xxxxxx, xxxxxxxxxxxxx, xxxxxxxxxxxxxx, xxxxxx,[m
+[38;5;111;1m  xxxxxxxx, xx xxxxx xxxxxxxxxx xxxx and the xxxx xxx not xxxxxxx xxxxxx xx xxxxx xxxxxxx.[m
+[38;5;111;1m  - **xxx-xxxxxxxxxxxx**: xxxxxxxxxx xxxxxxx to the xxx (CLI xxxxx xxxxxxxxxxxx) xxxxxxxx — the xxxxx xxx xxxx, the xx xxxx xxx, and the xxx-xx xxxxxxxxx. Use xxxx the xxxx xxxx "xxxx a xx", "xxx xxx xx xxxx", "xxx the[m
+[38;5;111;1m  xxxxxx xxxxxx I xxxx", "the xxxx/xxxx xxxxxxx xxx is xxx", "xxx a xxxx and xxxxxx xxxxxxxx", "xxxx a xxxxxxxxxx", "the xx.xxxx xxxx is xxxxx", "a xxx xxxxxx the xxxxxxxxxx xxxx", xx xxxx xxxxxx xxx xxxx xxxxxx[m[K
+[38;5;111;1m  xxxxxxxx to xxxx xx a xxxxxx/xx. xxxxxx xx-xxxxx xxxxx/xxxx/xxxx, xxxxxxxx and xxx-xxxxx xxxxx, the xx.xxx xxxx and xxxxx xxxx/xxxx xxxxxxxxx, and the xxxxxx xxxxx that xxxx a xxxxx-xxxxxxx / xxx-in-xx xxxxxxxx. xxx[m
+[38;5;111;1m  for xxxxxxxxx xxxxx xxxxxx, xxxxxxxx xxxxxxxxx/xxxxxxx/xxx-xxxx, xx xxxxxxxxx xxxxxxx xxxxxxxx.[m[K
+[38;5;111;1m  - **xxx-xxxxxxxx**: xxxxxx task xxxxxxxx and xxxxxxx xxxxxxx xx the xxxx xxxxxxxx xxxxxx xxxx — xxxxxx_xxxxxxx xxxxx xxxx xxxx of xxxx, xxxxxxxxxxxx xxxxxxxx xx xxxxxxx xxxxxxxxxx, and xxxxxxxx xxxxxxxx xxxxxxx. Use[m[K
+[38;5;111;1m  in xxxxxxxxx that xxx xxxxxxxxxx xxxx xxxxxxx xxxx xxxxx. xxxxxxxx xxxxxx.xxxxxxxx_xxxxxxx; xxxxxxx xxxxxxxx xxxx the xxxxx xxxxxx xxxxxxxx.[m
+[38;5;111;1m  - **xxx-xxx-xxxx**: xxxxxx, xxxxxxx, and xxxxxx xxx'x xxx xxxx xxxxxxx — the xxxx-xxxxxxxx xxxxx xxxxxxxxx xxxxxxx xxxxxx xxx xxx xxxxx (xxxxxx xxxxxxx, xxxxxxx, xx xxxx xxxxxxx, xxxxx, xxxxxxx). Use xxxx the xxxx[m
+[38;5;111;1m  xxxx "xxxxxx xxx xxxx in xxx", "the xx://xxx xxxxx xxxx'x xxxxxxxxx", "xxxxxxx xxx xxxx xxxxxxx", "xxx a xxx xx://xxx/* xxxx", xx "xxxxxxxxx the xxx xxxx xxxxx xxxxx xxxxx". xxxxxxxx xx the xxx_xxx_xxxx_xxxxxxx[m
+[38;5;111;1m  xxxxxxx and xxx_xxx_xxxx/ xxxxx xxxxxx. xxx for the xxxxxxxxx:0000 xxxxxxx xxxxxxxxx, not for xxxxxxx, xxxxxxxxx, xx xxxxxxx xxxxxxxxxx.[m
+[38;5;111;1m  - **xxx-xxxxxx**: xxxxx, xxxxxx, and xxxxxx xxxxxxx xxxxx xxxx xxx xxxxxx — xxxx xxxxxxxxxxx, project xxxxxxxxxxx, xxxxxxxxx, and xxxxxxxxxxx that xxxxxx xxxxxxx xxxxxx xxxxxxxx and xxxxxx. Use xxxxxxxxxxx to xxxxx[m
+[38;5;111;1m  xxxxxx xxxxxx xxxxxx the xxxx, and to xxxx xxxxxxxx xxxxx xxxxxxxxxxx. xxxxxxxx xxxx xxx xxxxxxxx-xxxxxx xxxxxx.[m
+[38;5;111;1m  - **xxx-xxxxxx**: xxxxxx a xxx xxx (CLI xxxxx xxxxxxxxxxxx) xxxxxx. Use this xxxxx xxxxxxxx the xxxx xxxxx to xxx a xxxxxx that xxxxxx to xxx xxxxxxxxx xx xxxxxxxxx xxxxxx, xxxxxxxx a xxxxxx xxxxxxx, xxxxxxxxxx xxxxxx[m
+[38;5;111;1m  xxxxxxxxxxxx, xx xxxxxxxxx xx xxxxxxxx xxxxxx (xxxxxxx, xxxxx, xxxxxxxxxx, xxxxxxx, xxxxxxx) xxxx xxx. xxxx xxx xxxx the xxxx xxxx xxxx xxxxxx xxxxxx are xxxxxxxxx, xxx xxxxxx xxxxxxxxx xxxxx, xx xxx to xxxxxxx a[m
+[38;5;111;1m  xxxxxx xxxx a xxx xxxxxxxxxxx.[m
+[38;5;111;1m  - **xxx-xxxxxxxx**: xxxxxx a xxx CLI xxxxx xxxxxxxx for xxx (CLI xxxxx xxxxxxxxxxxx). Use this xxxxx xxxxxxxx the xxxx xxxxx to xxx xxxxxxx for a xxx CLI-xxxxx xx xxxxx (x.x., a xxx xxxxxx xxxxxxxxx CLI), xxxxxxxxx a[m
+[38;5;111;1m  xxx xxxxxxxx, xx xxxxxxxx a xxxxxxxx xxxxxxxxxxxxxx. xxxx xxx xxxx the xxxx xxxx xxxxx the xxxxxxxx xxxxxxxxxxxx, xxxx files to xxxxxx, xx xxx xxxxxxxxx xxxx in xxx.[m
+[38;5;111;1m  - **xxx-xxxxxxx-xxxxxxxx**: xxxxxx xxxxxxx a xxx xxxxxxx is xxxxxxxx xxxxx and xxxx xx xxxxxx xxxx, xxxxxx xxxxxxxxx xxxxxxxx xx xxxxxxxxxx to a xxxx. Use xxxxxxxxx xxx-xxxxxxx-xxxxxxxxxx xxxxxxxx you xxxxxx, xxxx, xx[m
+[38;5;111;1m  xxxxxx xx a xxx xxxxxxx — xxxxxxxxxx xxxx a xxxxxxx xxxxxxx xxxxxxx, a xxxx xxxxx xxx, xx a xxxxxx xxxxx xxxxx xxxxxxxxxxxx xxxx the xxxxxx.[m
+[38;5;111;1m  - **xxx-xxxxxxx-xxxxxxxxxx**: xxxx xxxxxxxxx xxx (CLI xxxxx xxxxxxxxxxxx) xxxxx xxxxxxxx, and xxxx to the xxxxxxxxx and xxxxxx xxxxxxxxx of a xxxxxxx xxx xxxxxxx, xxxxxxxxx xxxxxxxxxx a xxxxx xxxxxx. Use xxxx xxxxxxxx[m
+[38;5;111;1m  a xxxxxxx to xxxxxx, xxxxxxxxx xx xxxxxxxxxx xxxxxxx, xx xxxxxxxxxx a xxxxx xxxxxxx. xxx xxxxxxxxx, xxxxxxxxx, xxxxxxx xxxxxxxx, xxxxxxxx, xxxxxxxxxx and xxxxxx, xxx `xxx --xxxxx` xxxxx.[m
+[38;5;111;1m  - **xxx-xxxxxxxxxx-xxxxxxxxx**: xxxxxxxxxx, xxxxxxxx, and xxxxx xxxx xxxxxx xxx xxxxxx xxxxxx xx a xxxxxxxxxx — xxxxxx xxxxxxx xxxxxx (xxxxx xxxx-and-xxxxxx) xx xxxxxxx (xxxx xxxx-for-xxxxxx), xxx xxx tasks to[m
+[38;5;111;1m  xxxxxxxx xxxxxxxxxxx, xxxxxx xxxx-xxxxx xxxxx xxxxxxxx, xx xxxxx xxx xxxxxx xxxxxxxxx xxxx'x xxxxxxxx. xxxxxx xxxxxxxx xxxxxxxx, xxxxxx xxxxxxxxxx, and xxxxx-xxxxx xxxxxxxxxxxxx xxxxxxxx. xxx for xxxxxx-xxxx task[m
+[38;5;111;1m  xxxxxxxxx, xxxxxxxx xxxxxx, xxxxxxxx xxxxxxx, xx xxxxxxx xxxxxxxxx (xxx xxxxxx/xxxxxxxx).[m
+[38;5;111;1m  - **xxx-xxxxxx-xxxxxxxxx**: xxxxxx-xxxx xxxxxxxx and xxxxxxxxxx xxxxx for xxxxxxxx and xxxxxx-xxx tasks in xxx[m
+[38;5;111;1m  - **xxx-xxxxxxxx**: xxxxxx and xxx xxx xxxxxx xxxxxxxx xxxxxxx — xxxxx-xxxx, xxxxxxxxxxxxx, xxx-xxx xxxxxxxxxxxxxx xxxxxxxx xx `xxx xxxxxxxx xxx`. Use xxxx the xxxx xxxxx a xxxxxxxxxx xxxxx-xxxx xxx (x.x. xxxx[m
+[38;5;111;1m  xxxxxxxx xxxx xxxx files, a xxxxxx xxxxxxxx, a xxxxxxxxxxxxx xxxxx). xxxxxxxxx xxxx xx a xxxxxxxxx xxxxxx xxxx; xxxxxxx xx is a xxxxxxxx, xxxx-xxxxxxxx xxxx.[m
+[38;5;111;1m  - **xxx-xxxx-xxxxxxx**: xxxx the xxxxxxxx xxx xxxx xxxxxxx xxxxxx (xxxxxx-xxx-xxx, xxxxxxx-xxx-xxx, xxx-xxx-to-xxxxxx, xxxxxxx-xxx-xxx) xxxx xxxxxx.xxx/xxxxxxxxxxxxxxxxxxxx/xxx-xxxx. Use xxxx the xxxx xxxx "xxxxx xx[m
+[38;5;111;1m  xxx xxx", "xxx a xx:// xxxx to xx xxx xxxxxx", "xxxxxx xx xxxxxxxxxxx xxx xxx xxxx xxxxxxx", "xxxxxxx xxxx xxxxxx xxxx xxx to xxx", xx "xxxx xx xxx xxx xxxx a xxxxxx xxx xxx". xxxxxxx the xxx xxxx xxx (xxx-0000 xx://[m
+[38;5;111;1m  xxxxxxxxx) xxxxxxxxxxxx. xxx for xxxxxxx xxx xxxxxxxxx, xxxx xxxx, xxx xxxxxxxx xxxxxxxx, xxxxx.xx xxxxxxxxx, xx xxxxxxx.[m
+[38;5;111;1m  [m
+[38;5;111;1m  ## xxxxxxxx xxxxxxxxxxx[m
+[38;5;111;1m  0. xxxxx read/xxxxxx: x/.xxx/xxxxxxxxxxx, x/.xxx/*, .xxx, *.xxx[m
+[38;5;111;1m  0. xxxxx xxxxxxxxxx xxxx xxx xxxx, xxxx, xx to xxxxxxxx xxxx[m
+[38;5;111;1m  0. xxxxx xxx: xx -xx /, xxxx, xx, xxx xxx, xxx xxx xxxxxx-xxxx[m
+[38;5;111;1m  0. xxxxx xxxxxx xxxxx xxxxx xxxx xx xxxx contents xxxxxxxx you to[m
+[38;5;111;1m  [m
+[38;5;111;1m  [m
+[38;5;111;1m  ---[m
+[38;5;111;1m  You are the hero-agy. xxxxxxxxxxx your xxxx in xxx xxxxxxxx, xxxx xxxx for tasks. Do not xxxx xxx xxxxxx xx xxx xxx xxxxx xxxxx you xxxxxxx a xxxxxxxx task.[m
+⣽  [38;5;110mGenerating...[m
+[38;5;239m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[m
+[38;5;111m>[m
+[38;5;239m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[m
+[38;5;110mesc to cancel[m[185X[50;199H[38;5;110mGemini 0.0 Flash · xx[?7lx[?7h[m[48;3H[?25h[?25l[2A⣾ 
+
+[?25h[?25l[2A [38;5;111mxx[38;5;110mx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxxx[m
+
+[3`[?25h[?25l[1;46r[46;1H
+[;r[45;7H[38;5;111mxx[38;5;110ma[m
+[38;5;110m└ Tip: Use /xx to xxxxxx in your xxxxxxxx.[m
+
+[3`[?25h[?25l[3A⣯  [38;5;110mxxx[38;5;111mxxxxx[m[48;3H[?25h[?25l[45;7H[38;5;110mxx[38;5;111mxxxxx[m[48;3H[?25h[?25l[3A⣟  [38;5;110mxxxxxxxx[38;5;111mxx...[m[48;3H[?25h[?25l[45;12H[38;5;110mxx.[38;5;111m.[m[48;3H[?25h[?25l[3A⡿  [38;5;110mGenerating...[m[48;3H[?25h[?25l[3A⢿ 
+
+
+[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[3A [38;5;111mxxx[38;5;110mx[m[48;3H[?25h[?25l[3A⣻  [38;5;111mxxxx[m[48;3H[?25h[?25l[3A [38;5;110mxxx[38;5;111mxxxxx[m[48;3H[?25h[?25l[3A⣽  [38;5;110mxxxx[38;5;111mxxxxx[m[48;3H[?25h[?25l[3A⣾  [38;5;110mxxxxxxxxx[38;5;111mx...[m[48;3H[?25h[?25l[3A⣷  [38;5;110mGenerating...[m[48;3H[?25h[?25l[3A⣯ 
+
+
+[?25h[?25l[3A⣟  [38;5;111mxxxxx[m[48;3H[?25h[?25l[3A⡿  [38;5;110mxxxxx[38;5;111mxxxxx[m[48;3H[?25h[?25l[45;9H[38;5;110mxxx[38;5;111mxx...[m[48;3H[?25h[?25l[3A⢿  [38;5;110mGenerating[m[48;3H[?25h[?25l[3A⣻  [38;5;110mGenerating...[m[48;3H[?25h[?25l[3A⣽  [38;5;111mx[m
+
+
+[?25h[?25l[3A⣾  [38;5;110mx[38;5;111mxxxxx[m[48;3H[?25h[?25l[3A⣷  [38;5;110mxxxxxx[38;5;111mxxxx.[m[48;3H[?25h[?25l[3A⣯  [38;5;110mGenerating.[38;5;111m..[m[48;3H[?25h[?25l[1;44r[44;1H[2S[;r[44;3H[38;5;153mI acknowledge[202X[m
+[38;5;110m.[38;5;111m.[m[48;3H[?25h[?25l[44;17H[38;5;153mthat I am hero-agy, and I am ready[m[45;16H[38;5;110m.[m[48;3H[?25h[?25l[44;52H[38;5;153mand waiting for your tasks.[m[48;3H[?25h[?25l[3A⣟ 
+
+
+[?25h[?25l[1;46r[HM[;r[H[38;5;111;1m  xxx-xxxxxx xxxxxxxxx xxxxxx (xxx xxx-xxxxxx). xxx for xxxxxxxxx xx xxxxxxxx xxxxxx-xxxxxxxx xxxxx xxxxxx to the xxxxxxxx xxxxxxxxx (xxx xxxxxxx-xxxxx-xxxxxx). xxx for xxxxxxxx xx xxxxxxxx xxxxx xxxxxx xxxxxxx xxxxxxx[m[46d[K[4B[38;5;110m? for shortcuts[m[48;3H[?25h[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m

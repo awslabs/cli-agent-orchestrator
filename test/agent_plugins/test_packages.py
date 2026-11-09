@@ -12,14 +12,17 @@ from __future__ import annotations
 import ast
 import itertools
 import json
+import re
 import sys
 from pathlib import Path
 
+import frontmatter
 import pytest
 
 from cli_agent_orchestrator.agent_plugins.installer import install
 from cli_agent_orchestrator.agent_plugins.models import PluginSource, Severity
 from cli_agent_orchestrator.agent_plugins.validation import validate_plugin
+from cli_agent_orchestrator.utils.skills import AGENT_SKILLS_LIMIT_CODES
 
 from .conftest import PLUGIN_SCHEMA_ID
 
@@ -62,7 +65,33 @@ class TestEveryPackageIsConformant:
 
         fatals = [f for f in report.findings if f.severity is Severity.FATAL]
         assert fatals == [], fatals
+
+    @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
+    def test_package_skills_are_within_the_agent_skills_limits(self, package_dir):
+        """A CAO package another Agent Skills client would reject is a regression (#1154)."""
+        report = validate_plugin(package_dir)
+        limits = [f for f in report.findings if f.code in AGENT_SKILLS_LIMIT_CODES]
+        assert limits == [], [f"{f.code}: {f.message}" for f in limits]
         assert report.loadable
+
+    @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
+    def test_every_packaged_skill_description_has_a_use_when_trigger(self, package_dir):
+        """A packaged skill must say when to load it, not only what it is (#1154).
+
+        Checked on the PARSED description, so a clause on a YAML continuation line
+        counts. A check of the first physical ``description:`` line alone flags
+        folded descriptions that do carry the clause.
+        """
+        missing = [
+            skill.parent.name
+            for skill in sorted((package_dir / "skills").glob("*/SKILL.md"))
+            if not re.search(
+                r"\buse when\b",
+                str(frontmatter.loads(skill.read_text(encoding="utf-8")).get("description", "")),
+                re.IGNORECASE,
+            )
+        ]
+        assert missing == []
 
     @pytest.mark.parametrize("package_dir", ALL_PACKAGE_DIRS)
     def test_schema_is_pinned_to_the_vendored_version(self, package_dir):

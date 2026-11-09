@@ -34,8 +34,10 @@ see [Configuration](configuration.md) and [Security](../SECURITY.md).
 ### Events and AG-UI
 
 - `/events` and `/events/history` expose server events.
-- `/agui/v1/stream` and `/agui/v1/emit_ui` provide the AG-UI stream and
-  generative UI input.
+- `GET`/`POST /agui/v1/stream` serve the fleet as an AG-UI 1.0 run, and
+  `/agui/v1/emit_ui` takes generative UI input. `POST /agui/v1/run` is the run
+  plane for approval interrupts, and `GET /agui/v1/capabilities` returns its
+  AG-UI 1.0 `AgentCapabilities`.
 
 See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 

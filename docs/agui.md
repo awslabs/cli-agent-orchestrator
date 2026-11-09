@@ -1,11 +1,11 @@
 # AG-UI event stream
 
 CAO exposes its normalized fleet events as an
-[AG-UI](https://github.com/ag-ui-protocol/ag-ui) typed-event stream over
-Server-Sent Events at `GET /agui/v1/stream`. Any AG-UI-compatible client —
-CopilotKit apps, the [AG-UI Dojo](https://docs.ag-ui.com/quickstart/applications),
-or a plain `EventSource` — renders a live CAO fleet with no CAO-specific adapter
-code. A producer endpoint, `POST /agui/v1/emit_ui`, lets agents author
+[AG-UI](https://github.com/ag-ui-protocol/ag-ui) 1.0 run over Server-Sent
+Events at `POST` and `GET /agui/v1/stream`. Any AG-UI client (CopilotKit apps,
+the [AG-UI Dojo](https://docs.ag-ui.com/quickstart/applications), `@ag-ui/client`,
+or a plain `EventSource`) consumes it with no CAO-specific wire code; rendering
+CAO's own components needs only a handler for the `cao.*` `CUSTOM` names. A producer endpoint, `POST /agui/v1/emit_ui`, lets agents author
 allow-listed **generative UI** onto the same stream.
 
 The surface is **default-off** and metadata-only (message bodies are never on
@@ -27,37 +27,156 @@ to a build without the feature.
 
 ## The stream
 
-`GET /agui/v1/stream` maps CAO's six normalized event primitives onto AG-UI
-typed events:
+The ambient stream is one [AG-UI 1.0](https://docs.ag-ui.com/) run that
+narrates the **fleet**: the sessions and terminals one `cao-server` can see.
+(A remote CAO deployment is a *runtime*; each runtime has its own fleet and its
+own stream.) Every frame is a `data:` line whose JSON carries its `type`, as the
+AG-UI SSE binding requires; there are no `event:` lines. A stock client such as
+`@ag-ui/client`'s `HttpAgent` reads it with no CAO code, and the pinned
+upstream `verifyEvents` accepts it (see [Verification](#verification)).
 
-| CAO primitive | AG-UI event(s) | Notes |
-|---|---|---|
-| session / terminal launch | `RUN_STARTED` / `STEP_STARTED` | |
-| completion | `RUN_FINISHED` / `STEP_FINISHED` | Also triggers synthesized `TOOL_CALL_END` for open receivers |
-| handoff (`orchestration_type=handoff\|assign`) | `TOOL_CALL_START` | Agent-to-agent task delegation [1] |
-| handoff (`orchestration_type=send_message` or absent) | `TEXT_MESSAGE_CONTENT` (metadata only) | Simple message dispatch |
-| a2a_delegation | `TOOL_CALL_START` | Cross-agent A2A task; closer also synthesizes `TOOL_CALL_RESULT` |
-| file modification | `STATE_DELTA` (RFC 6902) against a fleet `STATE_SNAPSHOT` | |
-| error | `RUN_ERROR` | |
-| agent-authored UI | `CUSTOM` with `name: "cao.generative_ui"` | Off-list component: `RAW` with `rejected_component` |
+A short run, captured from the conformance tests (`metadata` trimmed):
 
-[1] **L1 Cleanup A (TOOL_CALL lifecycle):** Handoff records with
-`orchestration_type` of `handoff` or `assign` now map to `TOOL_CALL_START`
-(previously all handoffs mapped to `TEXT_MESSAGE_CONTENT`). The
-`ToolCallLifecycleTracker` correlates these opens with receiver terminal
-completions and synthesizes exactly one `TOOL_CALL_END` per open. For
-`a2a_delegation` opens, a `TOOL_CALL_RESULT` is also synthesized before the
-`TOOL_CALL_END`. This ensures AG-UI clients see a well-formed tool-call
-lifecycle (open/result/end) rather than orphaned starts.
+```text
+data: {"type":"RUN_STARTED","threadId":"cao-fleet-f1e2…","runId":"c790…","protocolVersion":"1.0",…}
 
-On connect the server emits a full `STATE_SNAPSHOT` so any client hydrates its
-projection, then keeps it current with minimal RFC 6902 `STATE_DELTA` patches
-after each fleet change.
+data: {"type":"STATE_SNAPSHOT","snapshot":{"sessions":[],"terminals":[],…}}
+
+id: evt-01
+data: {"type":"SUBAGENT_STARTED","timestamp":1793786400000,"subagentRunId":"session:b8522a5d4d3df4e1","name":"cao-fleet-demo",…}
+
+id: evt-02
+data: {"type":"SUBAGENT_STARTED","subagentRunId":"terminal:aaaa1111","name":"supervisor","parentSubagentRunId":"session:b8522a5d4d3df4e1",…}
+
+id: evt-04
+data: {"type":"TOOL_CALL_START","subagentRunId":"terminal:aaaa1111","toolCallId":"evt-04","toolCallName":"handoff",…}
+
+…
+
+data: {"type":"RUN_FINISHED","threadId":"cao-fleet-f1e2…","runId":"c790…","outcome":{"type":"cancelled"},…}
+```
+
+There are two ways in:
+
+- **`POST /agui/v1/stream`** (the AG-UI binding). The body is a `RunAgentInput`;
+  `RUN_STARTED` and `RUN_FINISHED` echo its `threadId` and `runId`. CAO options
+  ride in `forwardedProps.cao`: `since` (ISO-8601) and `maxSeconds` (1 to 3600).
+  A body that is not a valid `RunAgentInput` gets `422`. A `threadId` outside
+  the GET rule below (letters, digits and `._:-`, up to 128 characters) gets
+  `400`, as on GET. A `protocolVersion`
+  with a different major version gets `400`; a newer minor version, or a value
+  CAO cannot parse, is served with a server-side warning. Only the published
+  `MAJOR.MINOR` form is parsed, so `"2"`, `"2.0.0"` and `"draft"` are served
+  with a warning, not refused. A non-empty `resume`
+  gets `400`: the ambient run raises no interrupts, so there is nothing to
+  resume, and answers go to the run plane (`POST /agui/v1/run`, below), which
+  owns the interrupts. Input `state` is accepted; because the stream's
+  `STATE_DELTA` patches apply to CAO's fleet snapshot and not to the caller's
+  state, deltas that would precede the first `STATE_SNAPSHOT` are dropped.
+- **`GET /agui/v1/stream`** (a convenience for `EventSource`, which cannot POST).
+  Query parameters: `threadId` (letters, digits and `._:-`, up to 128
+  characters; default `cao-fleet-<uuid>`, fixed for the server process),
+  `since`, `maxSeconds`, and `access_token` (see Auth). Every connection is a
+  new run with a new `runId`.
+
+### Event mapping
+
+| CAO record | AG-UI event(s) |
+|---|---|
+| session launch | `SUBAGENT_STARTED` for the session |
+| terminal launch | `SUBAGENT_STARTED` for the terminal, `parentSubagentRunId` = its session |
+| handoff / assign / `a2a_delegation` | `TOOL_CALL_START` attributed to the sending terminal (see below); `TOOL_CALL_END` when the receiver finishes or the call is closed. No `TOOL_CALL_RESULT`: CAO never sees the result |
+| `send_message` (or no orchestration type) | `CUSTOM` `cao.message_dispatched` (sender, receiver; never the body) |
+| terminal killed | `TOOL_CALL_END` for that terminal's open calls, then `SUBAGENT_FINISHED` with `metadata.cao.endReason: "killed"` |
+| session killed | the row above for each of its terminals, then `SUBAGENT_FINISHED` for the session |
+| error with a terminal | `SUBAGENT_ERROR` for that terminal |
+| error without a terminal | `CUSTOM` `cao.error`; the run continues |
+| file modification | `STATE_DELTA` (RFC 6902) against the fleet `STATE_SNAPSHOT` |
+| agent-authored UI | `CUSTOM` `cao.generative_ui` (see [Generative UI](#generative-ui)) |
+| anything else | `RAW` with `source: "cao"` |
+
+A close for an invocation the run has not announced (its launch is older than
+the replay window) synthesizes the `SUBAGENT_STARTED` first, parent before
+child, so every `SUBAGENT_*` and tool-call event names an invocation the run
+has already opened. Fields use the schema names (`subagentRunId`, `toolCallId`,
+`threadId`), and `timestamp` is integer epoch milliseconds. The CAO record's
+own fields (`eventId`, `terminalId`, `sessionName`, `traceparent`) are under
+`metadata.cao`, the same nested object and key names the run plane uses.
+AG-UI merges `metadata` without recursing ("The merge MUST NOT recurse"), so a
+later event's `cao` object replaces an earlier one as a whole; a client that
+keeps one item's CAO fields should read each event's `metadata.cao` on its own.
+
+**Attribution ids.** A terminal's `subagentRunId` is `terminal:<terminal id>`,
+the same value a run-plane interrupt raised by that terminal carries. A
+session's is `session:` plus the first 16 hex characters of a SHA-256 of the
+session's incarnation id: the same incarnation gives the same id on every
+connection and replay, a relaunched session under the same name gets a new
+one, and the internal incarnation id is not exposed. The id is computed when a
+record is logged and kept with it, so a replayed record keeps the id of the
+incarnation it belongs to. The ids are opaque; clients must not parse them.
+
+**Who owns an event.** When an event names a terminal it has not seen, the
+stream checks whether CAO still has that terminal. The event is tagged with the
+terminal's `subagentRunId` only when the terminal is open on the run, or when
+CAO knows it and its invocation has not finished on this run (it is then
+announced first). A sender that is not a terminal, such as the `operator` the
+MCP Apps operator tools send or the `supervisor` that `cao-mcp-server` sends
+without `CAO_TERMINAL_ID`, an id CAO does not know (for example an `emit_ui`
+`terminal_id`), or a terminal that has already finished, never becomes a
+subagent and never reuses a finished id: the event is tagged with the record's
+open session invocation, or left untagged. The raw sender stays in
+`metadata.cao.sender`. A terminal's own kill or error record is the exception:
+CAO writes it about that terminal, so it still announces an unseen terminal
+before closing it or reporting its error (for a kill the check could not succeed
+anyway, because CAO has already removed the row). In a replay, a terminal that
+has since been deleted can't be told apart from a label, so its earlier events
+stay on the session, and its kill record still announces and closes it under the
+generic name.
+
+One case is not exact. A record logged while the incarnation lookup failed has
+no stored id, so the stream derives one from the session's *current*
+incarnation, or from the launch record's event id once that incarnation has
+finished on the run. Both are stable across reconnects. But if the session was
+relaunched after such a record was logged, a replay can attribute the old record
+to the new incarnation. (The buffer is in-process, so records from before an
+upgrade never reach a replay.)
+
+**A killed invocation reads as success to a stock client.** AG-UI 1.0 defines
+only success and suspended outcomes for a subagent, and an absent outcome means
+success. CAO sends a killed terminal or session as `SUBAGENT_FINISHED` with no
+outcome rather than `SUBAGENT_ERROR`, because a stop is not a failure.
+CAO-aware clients read `metadata.cao.endReason: "killed"`.
+
+### How the run ends
+
+The fleet has no natural end, so the run ends when the connection does:
+
+| Cause | Last events |
+|---|---|
+| `maxSeconds` reached | closers, then `RUN_FINISHED` `{type: "cancelled"}`, `metadata.cao.endReason: "max_seconds"` |
+| `cao-server` stopping (SIGINT/SIGTERM) | closers, then `RUN_FINISHED` cancelled, `endReason: "server_stop"` |
+| the event source ending | closers, then `RUN_FINISHED` cancelled, `endReason: "source_ended"` |
+| the subscriber queue overflowing | `RUN_ERROR` `code: "cao.stream_overflow"`; reconnect to replay |
+| an internal failure | `RUN_ERROR` `code: "cao.stream_error"` |
+| the client disconnecting | nothing more: the run is truncated |
+
+"Closers" are a `TOOL_CALL_END` for every open tool call and a
+`SUBAGENT_FINISHED` (with that `endReason`) for every open invocation, children
+before parents. An idle stream sends a `: keep-alive` comment every
+`CAO_AGUI_HEARTBEAT_SECONDS` (default 15).
 
 ## Consuming it
 
 ```sh
 curl -N http://localhost:9889/agui/v1/stream
+```
+
+```js
+const es = new EventSource("http://localhost:9889/agui/v1/stream");
+es.onmessage = (ev) => {
+  const event = JSON.parse(ev.data);
+  // event.type is RUN_STARTED, STATE_SNAPSHOT, SUBAGENT_STARTED, CUSTOM, ...
+};
 ```
 
 For a browser client on another origin, add that origin to CORS via
@@ -73,7 +192,9 @@ uv run cao-server
 
 If CAO runs with `AUTH0_DOMAIN` set, `/agui/v1/stream` requires a `cao:read`
 JWT. Native `EventSource` can't send an `Authorization:` header, so the token
-travels as the `?access_token=<JWT>` query parameter:
+travels as the `?access_token=<JWT>` query parameter. `POST /agui/v1/stream` has
+no such limit: it authenticates with an `Authorization: Bearer <JWT>` header
+holding any of `cao:read`, `cao:write` or `cao:admin` (`require_any_scope`):
 
 ```
 https://dashboard.example.com/?access_token=eyJhbGc...
@@ -87,87 +208,63 @@ intermediaries — so mint short-TTL tokens (minutes, not hours). A short-lived
 single-use ticket handshake (`POST /agui/v1/ticket` with header auth →
 `?ticket=`) is a follow-up.
 
-## Connection resilience
+## Replay
 
-A client that drops the connection resumes **without a gap** by one of two
-cursors:
+Replay is a **CAO extension**, not AG-UI resumption: each connection is a new
+run, and a cursor only chooses which buffered CAO records that new run narrates
+first, between `RUN_STARTED` and the `STATE_SNAPSHOT`. CAO does not declare the
+AG-UI `transport.resumable` capability.
 
-- **`Last-Event-ID` (automatic).** Every event frame carries an `id:` cursor, so
-  a native browser `EventSource` resends the last id it saw as the
-  `Last-Event-ID` request header on its automatic reconnect. The server replays
-  the buffered records **after that id** before the live stream — no client code
-  required.
-- **`?since=<last event timestamp>` (explicit).** A non-`EventSource` client (or
-  one resuming across a fresh connection) can pass an ISO-8601 lower bound to
-  replay buffered events after that time.
+### Cursors
 
-`?since=` takes precedence when both are supplied. Either way the server
-registers the live subscription **before** replaying history, then drains both
-with event-id deduplication, so events published during the reconnect handoff
-are neither lost nor double-delivered. Pair this with a capped exponential
-backoff on the client.
+1. **`since`** (`?since=` on GET, `forwardedProps.cao.since` on POST): an
+   ISO-8601 lower bound. A malformed value gets `400` before the stream starts.
+2. **`Last-Event-ID`**, which a browser `EventSource` resends on its own when it
+   reconnects. Frames for a CAO record carry an `id:` line: the record's id on
+   its last frame, and `<record id>.<n>` on frames synthesized before it. A
+   cursor that names a record replays the records after it; one that names a
+   synthesized frame replays that record whole; an unknown cursor (evicted or
+   aged out of the buffer) replays the whole buffer. Used only when `since` is
+   absent.
+3. **Neither**: no replay.
 
-**Overflow is a gap *signal*, not a silent drop.** Each subscriber has a bounded
-queue so one slow client can never back-pressure the orchestration core. If that
-queue fills, the AG-UI stream does **not** quietly drop events on an open
-connection — it marks the overflow and **closes the stream**. The browser then
-reconnects automatically and the dropped records are replayed exactly once via
-`Last-Event-ID` (above). The durable record behind the replay is the in-process
-ring buffer (`event_log_service`). (The MCP-Apps `/events` stream keeps its
-legacy drop-on-slow behaviour and backfills via `cao_fetch_history`.)
+The buffer is the in-process ring (`event_log_service`, 500 records).
 
-## Replay contract (full specification)
+### Ordering and deduplication
 
-The replay mechanism is deterministic and designed for safe, idempotent reconnects:
+The live subscription is registered **before** the replay is read, so a record
+published during the handoff is in both; it is narrated once, from the replay.
+The `STATE_SNAPSHOT` follows the replay, and every `STATE_DELTA` follows the
+snapshot. Because a reconnect is a new run, a client that keeps state across
+runs should dedupe records on `metadata.cao.eventId` combined with the event
+`type` and its `subagentRunId`/`toolCallId`/`name`, since one record can become
+several events.
 
-### Cursor precedence
+**Overflow is a gap signal, not a silent drop.** Each subscriber has a bounded
+queue, so a slow client never back-pressures the orchestration core. When the
+queue fills, the run ends with `RUN_ERROR` `cao.stream_overflow`; the client
+reconnects with its cursor and the missed records are replayed. (The MCP Apps
+`/events` stream keeps its drop-on-slow behaviour and backfills via
+`cao_fetch_history`.)
 
-1. **`?since=<ISO-8601>`** -- explicit timestamp lower bound. Must be a valid
-   ISO-8601 string; malformed values produce HTTP 400 before any streaming starts.
-2. **`Last-Event-ID` header** -- native EventSource automatic cursor. Used only
-   when `?since=` is absent.
-3. **Neither** -- no replay; only the live stream is emitted.
+## Legacy framing
 
-### Validation
+`?framing=cao-legacy` on `GET /agui/v1/stream` serves the pre-1.0 wire,
+byte-for-byte: named `event:` lines, snake_case data, `RUN_STARTED`/`STEP_*`
+per session and terminal, `TEXT_MESSAGE_CONTENT` for `send_message`, and no run
+lifecycle. It is **deprecated**: the response carries
+`Deprecation: @1793750400` (2026-11-04) and a `Link` header pointing here, and
+the server logs a warning once per connection. `AguiStreamReader`
+(`services/agui/stream_reader.py`) requests it, since it parses that wire. An
+unknown `framing` value gets `400`. New clients should use the default.
 
-The `?since=` parameter is validated as ISO-8601 using `datetime.fromisoformat()`
-**before** the streaming response begins. Invalid values return `400 Bad Request`
-with a descriptive error. This prevents malformed cursors from being silently
-swallowed inside the failure-isolated replay block.
+## Verification
 
-### Over-delivery and deduplication (Seen-Set Dedup)
-
-The live subscription is registered **before** history replay begins. This means
-events published during the replay-to-live handoff are buffered in the subscriber
-queue. The stream maintains a `replayed_ids` set to deduplicate the overlap:
-events that appear in both the replay batch and the live queue are emitted only
-once (from replay). This guarantees neither gaps nor duplicates.
-
-### Snapshot ordering
-
-On every connection (fresh or reconnect), the server emits a full
-`STATE_SNAPSHOT` after the replay batch and before the first live `STATE_DELTA`.
-A client must receive the snapshot to hydrate its projection before it can
-correctly apply RFC-6902 patches.
-
-### Tool-call lifecycle across reconnects
-
-The `ToolCallLifecycleTracker` is instantiated per-connection. On reconnect with
-replay, the tracker processes replayed records first (rebuilding its open-call
-map), then continues with live events. Because the tracker is deterministic
-(same inputs produce same outputs), a replay produces the same synthesized frames
-as the original stream -- no duplicate closers, no orphan frames.
-
-### CAO extension status
-
-| Feature | Status | Notes |
-|---|---|---|
-| `?since=` ISO-8601 validation | Shipped | 400 on malformed |
-| `Last-Event-ID` replay | Shipped | Native EventSource compatible |
-| Seen-Set dedup | Shipped | Zero duplicates on reconnect |
-| Overflow-as-gap signal | Shipped | Stream closes; client reconnects |
-| `TOOL_CALL_END` lifecycle synthesis | Shipped | Deterministic under replay |
-| Short-lived ticket handshake | Follow-up | `POST /agui/v1/ticket` TBD |
+[`examples/ag-ui/ag-ui-stock-client-live/verify-ambient.mjs`](../examples/ag-ui/ag-ui-stock-client-live/verify-ambient.mjs)
+runs the pinned `@ag-ui/client` `verifyEvents` over every stream the
+conformance tests (`test/api/test_agui_stream_conformance.py`) capture when
+`CAO_AGUI_CAPTURE_DIR` is set, and over a live `HttpAgent` run against
+`POST /agui/v1/stream`. The AC3 CI job runs both.
 
 ## Generative UI
 
@@ -191,12 +288,15 @@ and can ignore it; it renders nothing unless it handles `cao.generative_ui`.
 Both planes use the same name and value:
 
 ```text
-event: CUSTOM
 data: {"type": "CUSTOM", "name": "cao.generative_ui",
        "value": {"component": "progress", "props": {"label": "demo", "value": 0.5},
                  "event_id": "...", "terminal_id": "...", "session_name": "...",
-                 "timestamp": "...", "traceparent": null}}
+                 "timestamp": "...", "traceparent": null},
+       "metadata": {"cao": {"eventId": "...", "terminalId": "...", "sessionName": "..."}}}
 ```
+
+The `value` object is the same on the default stream, on the legacy framing and
+on the run plane.
 
 **Server-side validation** (`services/agui_stream.py`): the closed allow-list
 `GENERATIVE_UI_COMPONENTS = {approval_card, choice_prompt, diff_summary,
@@ -244,16 +344,17 @@ wire dialect, consumer shape, and intended use:
 
 ### Ambient dialect (GET /agui/v1/stream)
 
-The **ambient plane** is the `GET /agui/v1/stream` SSE endpoint. It speaks
-CAO's own AG-UI dialect: `event:` + `data:` frames with UPPER_SNAKE event types
-(`STATE_SNAPSHOT`, `STATE_DELTA`, `STEP_STARTED`, `CUSTOM`, etc.) and an
-`id:` cursor for replay. Any `EventSource`-compatible client (browser-native or
-library-based) connects, hydrates from the initial `STATE_SNAPSHOT`, then folds
-live frames into its projection.
+The **ambient plane** is `GET`/`POST /agui/v1/stream`: one conformant AG-UI
+1.0 run per connection that narrates the fleet as subagent invocations, tool
+calls and state patches (see [The stream](#the-stream)). Any
+`EventSource`-compatible client, or a stock `HttpAgent`, connects, hydrates from
+the `STATE_SNAPSHOT`, then folds live events into its projection.
 
-This plane is optimized for long-lived dashboard consumers and the L2 construct
-library. No request body is required; the client is a pure observer. Replay is
-`Last-Event-ID`-based (browser-automatic) or `?since=`-based (explicit).
+This plane is for long-lived dashboard consumers and the L2 construct library.
+The client is an observer and raises nothing. Replay is a CAO extension, by
+`Last-Event-ID` (browser-automatic) or `since` (explicit); see
+[Replay](#replay). The heading keeps its old name for existing links; the wire
+is no longer a CAO dialect unless `?framing=cao-legacy` is requested.
 
 ### Stock run plane (POST /agui/v1/run)
 
@@ -306,13 +407,76 @@ left pending, the outcome is `{type: "success"}`. That means every entry that
 named a pending interrupt was delivered; skipped entries are logged and listed
 in `result.skippedResume`. It does not mean the agent finished. If the agent prompts again, the
 next run returns the new interrupt. `messages[]` is not read. Live fleet
-activity (`STATE_DELTA`, `STEP_STARTED/FINISHED`, `TOOL_CALL_START/END`,
-`CUSTOM`) is on the ambient plane, `GET /agui/v1/stream`. Embedders that call
+activity (`STATE_DELTA`, `SUBAGENT_*`, `TOOL_CALL_START/END`, `CUSTOM`) is on
+the ambient plane, `GET /agui/v1/stream`. Embedders that call
 `run_plane_stream` directly can still inject an event source to project it
 inside a run.
 
+Only `RUN_STARTED` and `RUN_FINISHED` carry `threadId` and `runId`, as the AG-UI
+1.0 schema says. `STATE_SNAPSHOT`, `STATE_DELTA`, `STEP_*`, `TOOL_CALL_*`,
+`CUSTOM` and `RUN_ERROR` carry only their own fields. A `STEP_STARTED`/
+`STEP_FINISHED` that comes from a CAO terminal names it in `metadata`, as
+`{"cao": {"terminalId": "<id>"}}`, the same nested `cao` object the ambient
+stream uses, not in a `stepId` field (the schema defines none).
+
+An interrupt raised by a terminal carries `subagentRunId`, the same
+`terminal:<id>` the ambient stream gives that terminal's `SUBAGENT_STARTED`, so a
+client can tie the prompt to the invocation it already shows. It is absent (never
+null) when an interrupt has no terminal. The run plane itself emits no `SUBAGENT_*`
+events and puts no `subagentRunId` on `RUN_*`.
+
+The run plane passes `Interrupt.expiresAt` through when it is set: an ISO 8601
+time after which the interrupt can no longer be answered. Nothing in CAO sets it
+today. An interrupt expires when its terminal leaves the waiting state, with no
+deadline known in advance, so the field is absent on every current provider.
+
+**Answering several interrupts.** AG-UI 1.0 says the resume list MUST cover
+every interrupt of the run it continues. When a run ends with several
+interrupts, a client sends one `RunAgentInput` whose `resume` has one entry per
+interrupt. Each entry is answered (`status: "resolved"`) or abandoned
+(`status: "cancelled"`). On CAO, abandoning a prompt delivers a deny to the CLI,
+so an abandoned entry is not a no-op. The CAO Dojo page holds a decided card
+until every interrupt of the run has an answer, then sends them together on that
+run's `threadId`. A run that only collects starts a fresh thread, so it never
+continues past an interrupt it does not answer. It also declares
+`protocolVersion: "1.0"` on every `RunAgentInput`.
+
 The run plane requires the `[agui]` optional extra (`ag-ui-protocol` package).
 Without it the endpoint returns HTTP 501.
+
+### Capabilities
+
+`GET /agui/v1/capabilities` returns the run plane's AG-UI 1.0 capabilities: one
+`AgentCapabilities` object in the 1.0 schema shape. AG-UI leaves retrieval to the
+implementation, so CAO serves it beside `POST /agui/v1/run`. Like the other AG-UI
+routes it returns 404 unless `CAO_AGUI_ENABLED` is set, and it needs `cao:read`
+when auth is on.
+
+```json
+{
+  "identity": {"name": "cli-agent-orchestrator", "version": "<installed version>"},
+  "transport": {"streaming": true},
+  "tools": {"clientProvided": false},
+  "state": {"snapshots": true},
+  "humanInTheLoop": {"supported": true, "approvals": true, "interrupts": true}
+}
+```
+
+The declaration lists only what the run plane does. A field that is left out is
+undeclared, not unsupported:
+
+- `humanInTheLoop.approveWithEdits` is omitted. AG-UI defines it for tool-call
+  interrupts whose `editedArgs` replace tool arguments. CAO's interrupts are not
+  tool calls, its `editedArgs` is answer text, and edit is offered per provider.
+  Read each interrupt's `responseSchema`: edit is accepted only where it lists
+  `editedArgs`.
+- `transport.resumable` is never declared, because the HTTP + SSE binding has no
+  stream resumption. The ambient stream's `since` / `Last-Event-ID` replay is
+  CAO's own extension (see [Replay](#replay)).
+- `tools.clientProvided` is `false`, because the run plane does not read
+  `RunAgentInput.tools`.
+
+A declaration is informative. The run's own events stay authoritative.
 
 ### Choosing a plane
 
@@ -338,7 +502,7 @@ and derives a `projection()` view without I/O.
 |---|---|
 | `AguiConstruct` | Abstract base: `handle_frame`, `projection`, `emit` (validated) |
 | `UiEmitter` / `RecordingUiEmitter` / `InProcessUiEmitter` / `HttpUiEmitter` | Emitter family (protocol + implementations) |
-| `AguiStreamReader` | `requests`-based SSE reader yielding `(event_id, agui_type, data)` tuples |
+| `AguiStreamReader` | `requests`-based SSE reader yielding `(event_id, agui_type, data)` tuples; it requests the [legacy framing](#legacy-framing), whose frames the constructs below fold |
 | `ToolCallLifecycleTracker` | Correlates TOOL_CALL opens with terminal completions |
 | `apply_json_patch_strict` | Pure RFC-6902 subset (add/remove/replace), never mutates inputs |
 
@@ -488,8 +652,9 @@ raise an interrupt, resume exactly-once (idempotent), and expire on transition:
 ## Privacy boundary
 
 `/agui/v1/stream` redacts message bodies (same contract as the SSE bus and the
-in-host MCP Apps iframe). `TEXT_MESSAGE_CONTENT` events carry metadata (sender,
-receiver, orchestration_type) but never the message text.
+in-host MCP Apps iframe). A message dispatch is `CUSTOM` `cao.message_dispatched`
+(`TEXT_MESSAGE_CONTENT` on the legacy framing), carrying the sender, receiver and
+orchestration type but never the message text.
 
 ## Troubleshooting
 
@@ -502,4 +667,12 @@ via `CAO_CORS_ORIGINS` (exact scheme + host + port), then restart CAO.
 
 **Events stop after a proxy idle timeout** — reconnect with backoff. A native
 `EventSource` resumes automatically via `Last-Event-ID`; other clients resume
-via `?since=`. No state is lost.
+via `since`. The reconnect is a new run, and the missed records are replayed
+into it.
+
+**`verifyEvents` reports "First event must be 'RUN_STARTED'"** — the client is
+reading the legacy framing. Drop `?framing=cao-legacy`.
+
+**The run ends with `RUN_FINISHED` cancelled** — the connection reached its
+`maxSeconds`, or the server is stopping. `metadata.cao.endReason` says which.
+An `EventSource` reconnects on its own.

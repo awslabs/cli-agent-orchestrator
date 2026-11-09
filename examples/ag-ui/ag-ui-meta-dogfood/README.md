@@ -37,7 +37,7 @@ CAO_AGUI_ENABLED=1 uv run python examples/ag-ui/ag-ui-meta-dogfood/capture.py
 
 | File | Contents |
 |------|----------|
-| `frames.jsonl` | The real AG-UI wire frames observed on `/agui/v1/stream` for the session. |
+| `frames.jsonl` | The real AG-UI wire frames observed on `/agui/v1/stream` for the session, in the default AG-UI 1.0 form (one `data:` payload per line, each with its `type`). `test/examples/test_ag_ui_meta_dogfood.py` checks it. |
 | `timeline.json` | `MultiAgentSessionTimeline` projection — the delegation graph, metadata only. |
 | `dashboard.json` | `SupervisorDashboardStream` projection (lifecycle rollup / last activity). |
 

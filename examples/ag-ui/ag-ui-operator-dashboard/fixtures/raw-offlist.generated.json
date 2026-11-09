@@ -1,0 +1,22 @@
+{
+  "type": "RAW",
+  "timestamp": 1793786408000,
+  "metadata": {
+    "cao": {
+      "eventId": "evt-09",
+      "terminalId": "bbbb2222",
+      "sessionName": "cao-fleet-demo"
+    }
+  },
+  "subagentRunId": "terminal:bbbb2222",
+  "event": {
+    "event_id": "evt-09",
+    "terminal_id": "bbbb2222",
+    "session_name": "cao-fleet-demo",
+    "timestamp": "2026-11-04T10:00:08.000000+00:00",
+    "cao_kind": "generative_ui",
+    "rejected_component": "html_blob",
+    "kind": "other"
+  },
+  "source": "cao"
+}

@@ -156,7 +156,7 @@ async def test_idempotent_retry_keeps_operator_edit(description_db):
         "kiro_cli",
         "developer",
         description=initial,
-        idempotency_key="retry",
+        idempotency_key=terminal_service._scoped_idempotency_key("retry", fingerprint),
         request_fingerprint=fingerprint,
     )
     terminal_service.update_description("feed1234", "Operator edit")
@@ -179,13 +179,16 @@ async def test_idempotent_retry_keeps_operator_edit(description_db):
             description="  Initial\nresponsibility ",
         )
         assert retry.description == "Operator edit"
-        with pytest.raises(terminal_service.IdempotencyKeyConflict):
+        # A different description is a different request: it has its own
+        # (empty) slot under the key, so it does not resolve to feed1234 (#944).
+        with pytest.raises(terminal_service.IdempotencyKeyNotFound):
             await terminal_service.create_terminal(
                 "kiro_cli",
                 "developer",
                 session_name="cao-demo",
                 idempotency_key="retry",
                 description="Other",
+                lookup_only=True,
             )
 
 

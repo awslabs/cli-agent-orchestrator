@@ -1,0 +1,406 @@
+{
+  "legacy_envelope": [
+    "STEP_STARTED",
+    {
+      "provider": "kiro_cli",
+      "step_id": "cccc3333",
+      "step_name": "reviewer",
+      "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    }
+  ],
+  "per_record": [
+    {
+      "frame": [
+        "RUN_STARTED",
+        {
+          "event_id": "evt-01",
+          "run_id": "cao-fleet-demo",
+          "session_name": "cao-fleet-demo",
+          "terminal_id": null,
+          "thread_id": "cao-fleet-demo",
+          "timestamp": "2026-11-04T10:00:00.000000+00:00",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-01"
+    },
+    {
+      "frame": [
+        "STEP_STARTED",
+        {
+          "event_id": "evt-02",
+          "provider": "kiro_cli",
+          "session_name": "cao-fleet-demo",
+          "step_id": "aaaa1111",
+          "step_name": "supervisor",
+          "terminal_id": "aaaa1111",
+          "timestamp": "2026-11-04T10:00:01.000000+00:00",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-02"
+    },
+    {
+      "frame": [
+        "STEP_STARTED",
+        {
+          "event_id": "evt-03",
+          "provider": "kiro_cli",
+          "session_name": "cao-fleet-demo",
+          "step_id": "bbbb2222",
+          "step_name": "developer",
+          "terminal_id": "bbbb2222",
+          "timestamp": "2026-11-04T10:00:02.000000+00:00",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-03"
+    },
+    {
+      "frame": [
+        "TOOL_CALL_START",
+        {
+          "event_id": "evt-04",
+          "metadata": {
+            "orchestration_type": "handoff",
+            "receiver": "bbbb2222",
+            "sender": "aaaa1111"
+          },
+          "session_name": "cao-fleet-demo",
+          "terminal_id": "aaaa1111",
+          "timestamp": "2026-11-04T10:00:03.000000+00:00",
+          "tool_call_id": "evt-04",
+          "tool_call_name": "handoff",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-04"
+    },
+    {
+      "frame": [
+        "TEXT_MESSAGE_CONTENT",
+        {
+          "delta": "",
+          "event_id": "evt-05",
+          "message_id": "bbbb2222",
+          "metadata": {
+            "orchestration_type": "send_message",
+            "receiver": "bbbb2222",
+            "sender": "aaaa1111"
+          },
+          "role": "assistant",
+          "session_name": "cao-fleet-demo",
+          "terminal_id": "aaaa1111",
+          "timestamp": "2026-11-04T10:00:04.000000+00:00",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-05"
+    },
+    {
+      "frame": [
+        "TOOL_CALL_START",
+        {
+          "event_id": "evt-06",
+          "metadata": {
+            "orchestration_type": "a2a",
+            "receiver": "bbbb2222",
+            "sender": "aaaa1111"
+          },
+          "session_name": "cao-fleet-demo",
+          "terminal_id": "aaaa1111",
+          "timestamp": "2026-11-04T10:00:05.000000+00:00",
+          "tool_call_id": "evt-06",
+          "tool_call_name": "a2a_delegation",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-06"
+    },
+    {
+      "frame": [
+        "STATE_DELTA",
+        {
+          "delta": [
+            {
+              "op": "add",
+              "path": "/last_file_mod",
+              "value": {
+                "path": "src/app.py",
+                "session_name": "cao-fleet-demo",
+                "terminal_id": "bbbb2222",
+                "timestamp": "2026-11-04T10:00:06.000000+00:00"
+              }
+            }
+          ],
+          "event_id": "evt-07",
+          "metadata": {
+            "event_type": "file_modified",
+            "path": "src/app.py"
+          },
+          "session_name": "cao-fleet-demo",
+          "terminal_id": "bbbb2222",
+          "timestamp": "2026-11-04T10:00:06.000000+00:00",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-07"
+    },
+    {
+      "frame": [
+        "CUSTOM",
+        {
+          "name": "cao.generative_ui",
+          "type": "CUSTOM",
+          "value": {
+            "component": "metric",
+            "event_id": "evt-08",
+            "props": {
+              "label": "tests",
+              "value": 3
+            },
+            "session_name": "cao-fleet-demo",
+            "terminal_id": "bbbb2222",
+            "timestamp": "2026-11-04T10:00:07.000000+00:00",
+            "traceparent": null
+          }
+        }
+      ],
+      "id": "evt-08"
+    },
+    {
+      "frame": [
+        "RAW",
+        {
+          "cao_kind": "generative_ui",
+          "event_id": "evt-09",
+          "rejected_component": "html_blob",
+          "session_name": "cao-fleet-demo",
+          "terminal_id": "bbbb2222",
+          "timestamp": "2026-11-04T10:00:08.000000+00:00",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-09"
+    },
+    {
+      "frame": [
+        "RUN_ERROR",
+        {
+          "event_id": "evt-10",
+          "message": "provider_error",
+          "metadata": {
+            "event_type": "provider_error"
+          },
+          "session_name": "cao-fleet-demo",
+          "terminal_id": "bbbb2222",
+          "timestamp": "2026-11-04T10:00:09.000000+00:00",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-10"
+    },
+    {
+      "frame": [
+        "RAW",
+        {
+          "cao_kind": "other",
+          "cao_type": "flow_tick",
+          "detail": {
+            "event_type": "flow_tick"
+          },
+          "event_id": "evt-11",
+          "session_name": "cao-fleet-demo",
+          "terminal_id": null,
+          "timestamp": "2026-11-04T10:00:10.000000+00:00",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-11"
+    },
+    {
+      "frame": [
+        "STEP_FINISHED",
+        {
+          "event_id": "evt-12",
+          "session_name": "cao-fleet-demo",
+          "step_id": "bbbb2222",
+          "step_name": "developer",
+          "terminal_id": "bbbb2222",
+          "timestamp": "2026-11-04T10:00:11.000000+00:00",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-12"
+    },
+    {
+      "frame": [
+        "RUN_FINISHED",
+        {
+          "event_id": "evt-13",
+          "run_id": "cao-fleet-demo",
+          "session_name": "cao-fleet-demo",
+          "status": "terminated",
+          "terminal_id": null,
+          "thread_id": "cao-fleet-demo",
+          "timestamp": "2026-11-04T10:00:12.000000+00:00",
+          "traceparent": null
+        }
+      ],
+      "id": "evt-13"
+    }
+  ],
+  "tracker_open_handoff_close_all": [
+    [
+      "TOOL_CALL_END",
+      {
+        "metadata": {
+          "closed_by": "session_end",
+          "orchestration_type": "handoff",
+          "receiver": "bbbb2222",
+          "sender": "aaaa1111"
+        },
+        "timestamp": null,
+        "tool_call_id": "evt-04",
+        "tool_call_name": "handoff"
+      }
+    ]
+  ],
+  "tracker_open_handoff_feed": [
+    [
+      "TOOL_CALL_START",
+      {
+        "event_id": "evt-04",
+        "metadata": {
+          "orchestration_type": "handoff",
+          "receiver": "bbbb2222",
+          "sender": "aaaa1111"
+        },
+        "session_name": "cao-fleet-demo",
+        "terminal_id": "aaaa1111",
+        "timestamp": "2026-11-04T10:00:03.000000+00:00",
+        "tool_call_id": "evt-04",
+        "tool_call_name": "handoff",
+        "traceparent": null
+      }
+    ]
+  ],
+  "tracker_sequence_close_all": [],
+  "tracker_sequence_feed": [
+    [
+      "STEP_STARTED",
+      {
+        "event_id": "evt-02",
+        "provider": "kiro_cli",
+        "session_name": "cao-fleet-demo",
+        "step_id": "aaaa1111",
+        "step_name": "supervisor",
+        "terminal_id": "aaaa1111",
+        "timestamp": "2026-11-04T10:00:01.000000+00:00",
+        "traceparent": null
+      }
+    ],
+    [
+      "STEP_STARTED",
+      {
+        "event_id": "evt-03",
+        "provider": "kiro_cli",
+        "session_name": "cao-fleet-demo",
+        "step_id": "bbbb2222",
+        "step_name": "developer",
+        "terminal_id": "bbbb2222",
+        "timestamp": "2026-11-04T10:00:02.000000+00:00",
+        "traceparent": null
+      }
+    ],
+    [
+      "TOOL_CALL_START",
+      {
+        "event_id": "evt-04",
+        "metadata": {
+          "orchestration_type": "handoff",
+          "receiver": "bbbb2222",
+          "sender": "aaaa1111"
+        },
+        "session_name": "cao-fleet-demo",
+        "terminal_id": "aaaa1111",
+        "timestamp": "2026-11-04T10:00:03.000000+00:00",
+        "tool_call_id": "evt-04",
+        "tool_call_name": "handoff",
+        "traceparent": null
+      }
+    ],
+    [
+      "TOOL_CALL_END",
+      {
+        "metadata": {
+          "closed_by": "superseded",
+          "disposition": "superseded",
+          "orchestration_type": "handoff",
+          "receiver": "bbbb2222",
+          "sender": "aaaa1111"
+        },
+        "timestamp": "2026-11-04T10:00:05.000000+00:00",
+        "tool_call_id": "evt-04",
+        "tool_call_name": "handoff"
+      }
+    ],
+    [
+      "TOOL_CALL_START",
+      {
+        "event_id": "evt-06",
+        "metadata": {
+          "orchestration_type": "a2a",
+          "receiver": "bbbb2222",
+          "sender": "aaaa1111"
+        },
+        "session_name": "cao-fleet-demo",
+        "terminal_id": "aaaa1111",
+        "timestamp": "2026-11-04T10:00:05.000000+00:00",
+        "tool_call_id": "evt-06",
+        "tool_call_name": "a2a_delegation",
+        "traceparent": null
+      }
+    ],
+    [
+      "STEP_FINISHED",
+      {
+        "event_id": "evt-12",
+        "session_name": "cao-fleet-demo",
+        "step_id": "bbbb2222",
+        "step_name": "developer",
+        "terminal_id": "bbbb2222",
+        "timestamp": "2026-11-04T10:00:11.000000+00:00",
+        "traceparent": null
+      }
+    ],
+    [
+      "TOOL_CALL_RESULT",
+      {
+        "metadata": {
+          "closed_by": "completion",
+          "orchestration_type": "a2a",
+          "receiver": "bbbb2222",
+          "sender": "aaaa1111"
+        },
+        "result": "",
+        "timestamp": "2026-11-04T10:00:11.000000+00:00",
+        "tool_call_id": "evt-06"
+      }
+    ],
+    [
+      "TOOL_CALL_END",
+      {
+        "metadata": {
+          "closed_by": "completion",
+          "orchestration_type": "a2a",
+          "receiver": "bbbb2222",
+          "sender": "aaaa1111"
+        },
+        "timestamp": "2026-11-04T10:00:11.000000+00:00",
+        "tool_call_id": "evt-06",
+        "tool_call_name": "a2a_delegation"
+      }
+    ]
+  ]
+}

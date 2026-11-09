@@ -1,0 +1,4 @@
+data: {"type":"RUN_STARTED","threadId":"od-gen","runId":"edit-offered","protocolVersion":"1.0"}
+
+data: {"type":"RUN_FINISHED","threadId":"od-gen","runId":"edit-offered","outcome":{"type":"interrupt","interrupts":[{"subagentRunId":"terminal:c0dec0de","id":"c3ece43e-ac5f-449c-a96e-6ed3531900f5","reason":"kiro:permission_request","message":"","responseSchema":{"type":"object","properties":{"approved":{"type":"boolean","description":"true=approve, false=deny"},"editedArgs":{"type":"string","description":"edited answer text, typed into the agent's prompt in place of yes/no"}},"required":["approved"]},"metadata":{"provider":"kiro_cli","terminalId":"c0dec0de","sessionName":"cao-od-gen","options":["approve","deny","edit"]}}]}}
+

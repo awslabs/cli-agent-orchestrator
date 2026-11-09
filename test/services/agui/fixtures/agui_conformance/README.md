@@ -1,11 +1,13 @@
 # Vendored AG-UI conformance fixtures
 
 These files are byte-identical copies of fixtures from the AG-UI conformance
-corpus, so the replay tests run without an ag-ui checkout.
+corpus, and of the AG-UI 1.0 JSON Schema, so the replay and schema-shape tests
+run without an ag-ui checkout.
 
 | File | Upstream path | Upstream commit | Git blob |
 | --- | --- | --- | --- |
 | `current-peer-declares-protocol-version.json` | `spec/1.0/conformance/streams/current-peer-declares-protocol-version.json` | [`7e7c1109f`](https://github.com/ag-ui-protocol/ag-ui/blob/7e7c1109f26e77cc32d87d351fb9e0b0bf56ff7f/spec/1.0/conformance/streams/current-peer-declares-protocol-version.json) | `175f8e2874393d05d1dad048c4bda53656b43a17` |
+| `schema.json` | `spec/1.0/schema.json` (the AG-UI 1.0 JSON Schema, Draft 2020-12) | [`08eae9dc`](https://github.com/ag-ui-protocol/ag-ui/blob/08eae9dc13546e91272efb2d0ef863e21acc6ee3/spec/1.0/schema.json) | `c2ce3c18036b6bb2afe583a9b916959e7dcd9b78` |
 
 Source: [ag-ui-protocol/ag-ui](https://github.com/ag-ui-protocol/ag-ui).
 
