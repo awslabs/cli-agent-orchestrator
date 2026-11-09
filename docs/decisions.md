@@ -643,7 +643,8 @@ it declares. With every point off, no decider code runs. Failures are cached
 until restart. `async decide` must
 not block the event loop; every call has a timeout. External deciders must not
 expose decision access through agent-tool registration hooks. Core bundles only
-`fixed_table`; external deciders are optional installed packages.
+`fixed_table`; external deciders are optional installed packages. To install and
+enable one step by step, see [the setup runbook](ephemeral-agents-agent-setup.md).
 
 ## External deciders
 

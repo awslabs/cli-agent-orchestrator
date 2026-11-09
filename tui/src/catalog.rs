@@ -1330,16 +1330,16 @@ fn entry(id: CommandId) -> Command {
         },
 
         // ── `cao plugin *` — Agent Plugins 1.0.0 ──────────────────────────────────────────
-        // HIDE for the whole group, deliberately. The verb itself is unresolved maintainer
-        // decision M1, and requirements.md 16.5 forbids shipping this surface to end users
-        // before it is settled — a TUI entry is exactly such a surface. `Handoff` would not
+        // HIDE for the whole group, deliberately. The surface does not ship to end users
+        // until it graduates (#1244); the verb is decision M1, recorded by the issue author
+        // in #573. A TUI entry is exactly such a surface. `Handoff` would not
         // satisfy that: per `Policy`'s own contract a HANDOFF row *is* offered in the TUI and
         // drives the terminal, so it ships the surface just as much as IN-APP does. Only
         // `Hidden` is "not offered at all", and FR-4.3 requires hidden commands be absent from
         // navigation rather than greyed out, which is the gate 16.5 actually asks for. This
         // mirrors `hidden=True` on the Click group.
         //
-        // Two further reasons keep these rows off IN-APP once M1 lands, so the reclassification
+        // Two further reasons keep these rows off IN-APP once it graduates, so the reclassification
         // then is HIDE → HANDOFF and not HIDE → IN-APP: `remove` must warn about live sessions
         // and wait for confirmation before it deletes anything, which a single captured
         // request/response cannot express; and `POST /plugins` runs untrusted content, whose
@@ -2402,7 +2402,7 @@ mod tests {
             42,
             "commands() must offer the 24 IN-APP plus 18 HANDOFF commands and nothing else; an \
              empty or short list would satisfy the Hidden check below while offering nothing. The \
-             four `cao plugin *` rows are HIDE pending maintainer decision M1, so they are \
+             four `cao plugin *` rows are HIDE pending graduation (#1244), so they are \
              deliberately absent from navigation (requirements.md 16.5, FR-4.3)"
         );
 
@@ -2493,7 +2493,7 @@ mod tests {
             ],
             "expected exactly these 18 HANDOFF commands; without this assertion the loop above \
              passes vacuously when zero entries are HANDOFF. `cao plugin *` is deliberately NOT \
-             here: those four rows are HIDE until maintainer decision M1 settles the verb"
+             here: those four rows are HIDE until the surface graduates (#1244)"
         );
     }
 

@@ -1,5 +1,7 @@
 """Tests for the FIFO reader manager."""
 
+import errno
+import fcntl
 import os
 import stat
 import threading
@@ -11,6 +13,34 @@ import pytest
 
 from cli_agent_orchestrator.services import fifo_reader as fr
 from cli_agent_orchestrator.services.fifo_reader import FifoManager, _open_fifo
+
+
+def _open_writer(fifo_path, timeout: float = 5.0) -> int:
+    """Open the write end of a FIFO without ever blocking in ``open()``.
+
+    A blocking ``O_WRONLY`` open waits until some process opens the read end.
+    If the reader thread under test never gets there (it is slow to start under
+    load, or it failed), that open waits forever and hangs the whole session.
+    So open with ``O_NONBLOCK``, which fails with ``ENXIO`` while there is no
+    reader, and retry until ``timeout``; then fail the test instead of hanging.
+    Once open, the fd is switched back to blocking, so writes behave as they
+    did with a blocking open.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            break
+        except OSError as error:
+            if error.errno != errno.ENXIO:
+                raise
+            if time.monotonic() >= deadline:
+                pytest.fail(f"no reader opened {fifo_path.name} within {timeout} s")
+            time.sleep(0.01)
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+    return fd
+
 
 pytestmark = pytest.mark.skipif(
     not hasattr(os, "mkfifo"), reason="FIFOs require a POSIX platform (os.mkfifo)"
@@ -436,7 +466,14 @@ class TestReaderLoopCoalescing:
         )
         with patch.object(fr.bus, "publish", side_effect=publish):
             reader.start()
-            writer = os.open(fifo_path, os.O_WRONLY)
+            try:
+                writer = _open_writer(fifo_path)
+            except BaseException:
+                # Stop the reader before the failure propagates, so a failed open
+                # never leaves a reader thread running into the next test.
+                stop_flag.set()
+                reader.join(2)
+                raise
             try:
                 os.write(writer, b"final \xe2")
                 assert first.wait(2)
@@ -1367,3 +1404,42 @@ class TestFifoPathHardening:
             assert stat.S_ISFIFO(os.fstat(fd).st_mode)
         finally:
             os.close(fd)
+
+
+class TestOpenWriter:
+    """``_open_writer`` never blocks: it waits for a reader up to a deadline, then fails."""
+
+    def test_fails_within_the_deadline_when_no_reader_opens(self, tmp_path):
+        fifo_path = tmp_path / "no-reader.fifo"
+        os.mkfifo(fifo_path)
+        start = time.monotonic()
+        with pytest.raises(
+            pytest.fail.Exception, match="no reader opened no-reader.fifo within 0.2 s"
+        ):
+            _open_writer(fifo_path, timeout=0.2)
+        assert time.monotonic() - start < 2.0
+
+    def test_waits_for_a_late_reader_and_returns_a_blocking_fd(self, tmp_path):
+        fifo_path = tmp_path / "late-reader.fifo"
+        os.mkfifo(fifo_path)
+        read_fds = []
+        late = threading.Timer(
+            0.1, lambda: read_fds.append(os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK))
+        )
+        late.start()
+        try:
+            fd = _open_writer(fifo_path, timeout=3.0)
+            try:
+                assert not fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_NONBLOCK
+                os.write(fd, b"x")
+                assert os.read(read_fds[0], 1) == b"x"
+            finally:
+                os.close(fd)
+        finally:
+            late.join()
+            for rfd in read_fds:
+                os.close(rfd)
+
+    def test_other_open_errors_are_raised(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            _open_writer(tmp_path / "missing.fifo", timeout=0.2)

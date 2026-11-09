@@ -278,15 +278,26 @@ the panel is refused too.
 | 2.35.1 | `@kiro/agent` 0.66.70 | measured |
 | 2.36.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 | 2.37.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
+| 2.37.1 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 | 3.0.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
+| 3.1.0 | `@kiro/agent` 0.66.91 | pending operator verification: refused at launch unless the operator opts in (below) |
+
+2.37.1 and 3.1.0 remain pending until the operator checklist (OC1–OC19,
+[#1167](https://github.com/awslabs/cli-agent-orchestrator/issues/1167)) passes.
+Until then, they are admitted only with `kiro.v3_allow_unverified_versions`.
+3.1.0 pins `KAS_0_66_91`; every agent and helper render remains byte-identical.
+The 3.1.0 probe is tested against captured help. No 2.37.1 help capture is
+available, so its coverage is schema lookup, pending refusal, opt-in admission
+and launch tests; it has no captured-help probe cases.
 
 Any other version refuses v3; v2 is not affected. A new kiro-cli release needs a
 CAO update before v3 runs on it.
 
-Every pending version runs the same v3 engine as 2.35.1, so CAO checks it with the
-same rules. Each was added by reading its installed engine and help screens, without
-running a chat. What a pending version still lacks is a live run of the operator
-checklist.
+The pending 2.36.0–3.0.0 versions reuse 2.35.1's v3 engine schema. 3.1.0 ships
+a different engine, statically reviewed with equal render-facing fields and tags,
+so CAO renders the same tools and rules. The pending rows are based on static
+review, without running a chat. What a pending version still lacks is a live run
+of the operator checklist.
 
 ### Pending versions (operator only)
 
@@ -318,7 +329,7 @@ is not checked.
 
 The message never names a path on the server (it may be a shared server); the server log does.
 
-| Message starts with | What it means | Fix |
+| Refusal rule | What it means | Fix |
 |---|---|---|
 | `kiro_v3_unsupported_version` | kiro-cli is a version CAO has no schema for | use a supported version, or `--engine v2` |
 | `kiro_v3_unverified_version` | the version is listed but not yet operator-verified | `--engine v2` until it is verified (operators running the checklist: see *Pending versions*) |
@@ -406,7 +417,7 @@ helper's own refusals. The [v3 table above](#when-a-v3-launch-is-refused) applie
 except that a helper is never told to use engine `v2`: the version and wrapper rows below
 replace those.
 
-| Message starts with | What it means | Fix |
+| Refusal rule | What it means | Fix |
 |---|---|---|
 | `kiro_ephemeral_engine:v2` | the request asked for engine `v2`; helpers run on v3 only | omit the engine, or pass `v3` |
 | `kiro_v3_global_home:secrets` | you have a Kiro secret store (`~/.kiro/secrets.json`) that Kiro has not marked as migrated, so Kiro would copy it into the helper's home | use a Claude Code or Codex helper, or an installed Kiro agent; CAO will not touch `~/.kiro` to change this |
@@ -416,7 +427,10 @@ replace those.
 | `kiro_v3_workspace_config:home` | the launch directory is your home folder, or is inside a home folder that is a git repository | launch from a repository folder, or use a worktree |
 | `kiro_v3_unverified_version` | the kiro-cli version is listed but not yet operator-verified | use a verified kiro-cli version; operators running the checklist can opt in (see [Pending versions](#pending-versions-operator-only)) |
 | `kiro_v3_unsupported_version` | kiro-cli is a version CAO has no schema for | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
-| `Kiro engine 'v3' requires wrapper flag` | the kiro-cli on the server's `PATH` doesn't list a flag the helper needs (`--trust-workspace`, or `--model` or `--effort` when asked for) | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
+| `unsupported_capability` | the kiro-cli on the server's `PATH` doesn't list a flag the helper needs (`--trust-workspace`, or `--model` or `--effort` when asked for), or doesn't advertise `v3` as an accepted `--agent-engine` value | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
+| `missing_executable` | the resolved kiro-cli could not be executed by the probe | check that kiro-cli is installed and executable for the server's user |
+| `timeout` | the kiro-cli capability probe timed out before a worker was launched; this is separate from a handoff worker timeout | check that `kiro-cli --help`, `chat --help` and `--version` finish promptly |
+| `malformed_output` | kiro-cli returned output the capability probe could not recognise | use a [supported kiro-cli version](#supported-kiro-cli-versions), or report the probe failure |
 | `kiro_home_invalid:ignored` | Kiro would ignore the helper's `KIRO_HOME` and use `~/.kiro`: the server's `HOME` is the helper's Kiro home (`ephemeral/kiro/<id>` or `ephemeral/kiro-probe` under the CAO home) or a folder inside it | set `HOME`, or `CAO_HOME_DIR`, so that `HOME` is not under `$CAO_HOME_DIR/ephemeral/` |
 | `kiro_home_invalid:forwarded` | the launch forwarded its own `KIRO_HOME` in `env_vars` | don't forward `KIRO_HOME`; each helper has its own |
 | `kiro_home_invalid:unsafe_path` | on herdr, the CAO home path holds characters herdr cannot pass to a pane | use a CAO home path of letters, digits and `-_./` |

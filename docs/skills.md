@@ -101,7 +101,7 @@ CAO ships with built-in skills including:
 | `cao-supervisor-protocols` | Multi-agent orchestration patterns for supervisors: `assign`, `handoff`, idle-based message delivery |
 | `cao-worker-protocols` | Worker-side callback and completion rules for assigned and handed-off tasks |
 | `cao-agent-plugin-creator` | Authors a new Agent Plugins 1.0.0 package from an empty directory: the `plugin.json` manifest, `skills/`, and an optional `mcp.json` |
-| `cao-agent-plugin-audit` | Audits an existing Agent Plugins 1.0.0 package against the vendored schemas and the Agent Skills limits that `cao plugin validate` does not check, using a bundled validator that needs no CAO install |
+| `cao-agent-plugin-audit` | Audits an existing Agent Plugins 1.0.0 package against the vendored schemas and the Agent Skills limits that `cao plugin validate` only warns about, using a bundled validator that needs no CAO install |
 
 ## Extra Skill Directories
 

@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -166,7 +166,7 @@ jobs:
       # place its whole-directory wheel assertion can cover THAT root rather than skipping it.
       # =================================================================================
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -250,7 +250,7 @@ jobs:
           node-version: "20"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Set up Python
         run: uv python install 3.12
@@ -353,7 +353,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -409,7 +409,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -461,7 +461,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -512,7 +512,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -541,7 +541,8 @@ jobs:
       - name: Record dog-food demo (asserts the plugin pipeline; gates on drift)
         # Runs run.sh OFFLINE (no provider binary, network, or secrets) — CAO
         # installing its own `cao` plugin through its own pipeline — and asserts
-        # validate/add/install(Kiro+OpenCode)/remove, exporting
+        # validate/add/install(Kiro+OpenCode)/remove, then validate/add/remove for
+        # every other package in build_agent_plugin.py's PACKAGES, exporting
         # docs/media/agent-plugins-dogfood-demo.gif. A non-zero exit or a missing
         # PASS marker (the pipeline regressed) fails this job — the shift-left
         # gate. The live OpenCode observational step (CAO_DOGFOOD_LIVE=1, needs
@@ -566,7 +567,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -592,6 +593,70 @@ jobs:
         # Non-zero exit fails the job; the script cleans up the server on exit.
         run: ./examples/ag-ui/ag-ui-stock-client-live/run.sh
 
+  ag-ui-operator-dashboard:
+    name: AG-UI operator dashboard
+    runs-on: ubuntu-latest
+    # Bounds a hung e2e: the job normally takes a few minutes.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: examples/ag-ui/ag-ui-operator-dashboard
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The keyless e2e drives real mock_cli terminals, which need tmux.
+      # Explicit, so the job does not depend on the runner image shipping tmux (ubuntu-latest, now ubuntu-26.04, does).
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (cao-server + agui run plane)
+        working-directory: .
+        run: uv sync --locked --all-extras --dev
+
+      # Node 22: the e2e runs e2e/e2e.ts with --experimental-strip-types.
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: examples/ag-ui/ag-ui-operator-dashboard/package-lock.json
+
+      - name: Install app dependencies (exact pins, install scripts off)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Dependency checks
+        run: npm run test:dependencies
+
+      - name: Type check
+        run: npm run typecheck
+
+      # Codecov ingests only the Python coverage.xml, so it never sees this
+      # TypeScript. vite.config.ts holds core/ to 100% lines, branches,
+      # functions and statements; a drop fails this step.
+      - name: Unit tests with coverage floor
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+      # A private cao-server (temp HOME, own tmux server, port 9896) with mock_cli
+      # terminals. SIMULATED: an agent showing a prompt. The harness types the
+      # marker "APPROVAL_REQUIRED: <text>" into a pane without Enter, standing in
+      # for a CLI that prints a permission prompt and waits. COVERED FOR REAL: the
+      # approval bridge, classification, the run plane, resume and key delivery.
+      # See examples/ag-ui/ag-ui-operator-dashboard/e2e/README.md.
+      - name: Keyless e2e (cao-server + mock_cli terminals)
+        run: ./e2e/run.sh
   # =======================================================================================
   # RUST TUI (issue #321, unit `rust-ci`). THE FIRST JOB IN ci.yml THAT INSPECTS THE RUST
   # CRATE AT ALL — measured before this change: `cargo` appeared in only
@@ -730,7 +795,7 @@ jobs:
       # without it, so `uv sync` would fail with `uv: command not found`. Caught by comparing every
       # job's setup-uv presence against its uv usage rather than assuming the toolchain was there.
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -840,7 +905,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Generate requirements.txt for scanning
         run: |

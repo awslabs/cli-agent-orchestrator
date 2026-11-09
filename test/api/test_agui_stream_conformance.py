@@ -42,6 +42,9 @@ def _isolate_stop_and_incarnations(monkeypatch: pytest.MonkeyPatch):
         "cli_agent_orchestrator.clients.database.get_session_incarnation",
         lambda name: f"inc-{name}",
     )
+    # No test reaches the real SessionLocal: by default CAO knows no terminal, and
+    # a test that needs one names it with _known_terminals().
+    _known_terminals(monkeypatch)
     yield
     if ambient_run is not None:
         ambient_run.reset_stop()
@@ -240,7 +243,13 @@ def test_relaunched_session_gets_a_new_subagent_run_id(monkeypatch: pytest.Monke
 # --- A-M8 ---------------------------------------------------------------------
 
 
-def test_killed_session_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_killed_session_finishes_its_subagents_and_leaves_the_run_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A kill is SUBAGENT_FINISHED with no outcome plus metadata.cao.endReason
+    # "killed". A stock 1.0 consumer reads an absent outcome as success (the 1.0
+    # subagent outcome has only success and suspended), so "killed" is CAO's
+    # extension; this test pins that shape and that the run itself stays open.
     install(
         monkeypatch,
         live=[R.SESSION_LAUNCH, R.TERMINAL_A_LAUNCH, R.TERMINAL_B_LAUNCH, R.SESSION_KILL],
@@ -323,6 +332,174 @@ def test_server_stop_ends_run_cancelled(monkeypatch: pytest.MonkeyPatch) -> None
     assert last["type"] == "RUN_FINISHED" and last["outcome"] == {"type": "cancelled"}
     assert last["metadata"]["cao"]["endReason"] == "server_stop"
     assert "TOOL_CALL_END" in _types(events)  # the open call was closed first
+
+
+def _held_bus(monkeypatch: pytest.MonkeyPatch, live: List[Dict[str, Any]]) -> threading.Event:
+    """A bus that holds its stream open after ``live`` until the returned event is set.
+
+    The test sets it from a safety timer, so a stream that ignores the stop signal
+    still ends, and the test fails on time instead of hanging.
+    """
+    install(monkeypatch)
+    released = threading.Event()
+
+    class _Held:
+        def register(self, overflow_close: bool = False) -> Any:
+            return object()
+
+        def unregister(self, sub: Any) -> None:
+            pass
+
+        async def drain(self, sub: Any):
+            for event in live:
+                yield event
+            while not released.is_set():
+                await asyncio.sleep(0.05)
+
+    monkeypatch.setattr("cli_agent_orchestrator.services.sse_bus.get_bus", lambda: _Held())
+    return released
+
+
+def _get_timed(handler: Any, params: Dict[str, Any], released: threading.Event) -> tuple:
+    """GET the stream, deliver ``handler(SIGTERM)`` after 0.5 s, release the bus at 5 s."""
+    import time
+
+    stop = threading.Timer(0.5, handler, args=(signal.SIGTERM, None))
+    safety = threading.Timer(5.0, released.set)
+    stop.start()
+    safety.start()
+    start = time.monotonic()
+    try:
+        code, body = _get(params)
+    finally:
+        stop.cancel()
+        safety.cancel()
+        released.set()
+    return code, body, time.monotonic() - start
+
+
+def test_server_stop_ends_a_legacy_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review note 2: the exit hook closed only the conformant streams, so an open
+    # framing=cao-legacy stream held uvicorn's shutdown until a second signal.
+    import uvicorn
+
+    released = _held_bus(monkeypatch, [R.SESSION_LAUNCH])
+    monkeypatch.setattr(uvicorn.Server, "handle_exit", uvicorn.Server.handle_exit)
+    ambient_run.install_uvicorn_exit_hook()
+    server = uvicorn.Server(uvicorn.Config(app))
+    code, body, elapsed = _get_timed(server.handle_exit, {"framing": "cao-legacy"}, released)
+    assert code == 200
+    assert elapsed < 4.0, f"the legacy stream ignored the stop signal ({elapsed:.1f} s)"
+    assert server.should_exit
+    assert re.search(r"(?m)^event: ", body)  # it is still the legacy wire
+
+
+def test_the_lifespan_hook_stops_streams_under_a_plain_uvicorn_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review note 2: `uvicorn cli_agent_orchestrator.api.main:app` never runs
+    # main(), so install_uvicorn_exit_hook() never runs either. uvicorn installs
+    # its own signal handler and then runs the lifespan, which wraps it.
+    import uvicorn
+
+    released = _held_bus(monkeypatch, [R.SESSION_LAUNCH])
+    server = uvicorn.Server(uvicorn.Config(app))
+    sigs = (signal.SIGINT, signal.SIGTERM)
+    saved = {sig: signal.getsignal(sig) for sig in sigs}
+    try:
+        for sig in sigs:
+            signal.signal(sig, server.handle_exit)  # what uvicorn's capture_signals does
+        ambient_run.install_signal_stop_hook()
+        handler = signal.getsignal(signal.SIGTERM)
+        code, body, elapsed = _get_timed(handler, {}, released)
+    finally:
+        for sig, previous in saved.items():
+            signal.signal(sig, previous)
+    assert elapsed < 4.0, f"the stream ignored the stop signal ({elapsed:.1f} s)"
+    assert server.should_exit  # uvicorn's own handler still ran
+    events = _conformant("review-note2-plain-uvicorn", body)
+    assert events[-1]["metadata"]["cao"]["endReason"] == "server_stop"
+
+
+def test_the_signal_stop_hook_wraps_once_and_only_a_callable_main_thread_handler() -> None:
+    calls: List[int] = []
+
+    def uvicorns(sig: int, frame: Any) -> None:
+        calls.append(sig)
+
+    saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        signal.signal(signal.SIGTERM, uvicorns)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)  # not a callable: left alone
+
+        worker = threading.Thread(target=ambient_run.install_signal_stop_hook)
+        worker.start()
+        worker.join()
+        assert signal.getsignal(signal.SIGTERM) is uvicorns  # off the main thread: a no-op
+
+        ambient_run.install_signal_stop_hook()
+        wrapped = signal.getsignal(signal.SIGTERM)
+        assert wrapped is not uvicorns
+        assert signal.getsignal(signal.SIGINT) is signal.SIG_DFL
+        ambient_run.install_signal_stop_hook()
+        assert signal.getsignal(signal.SIGTERM) is wrapped  # not wrapped twice
+
+        wrapped(signal.SIGTERM, None)
+        assert calls == [signal.SIGTERM]
+    finally:
+        for sig, previous in saved.items():
+            signal.signal(sig, previous)
+        ambient_run.reset_stop()
+
+
+def test_the_signal_stop_hook_leaves_the_patched_uvicorn_handler_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # cao-server's main() patches uvicorn.Server.handle_exit, so the handler
+    # uvicorn installs is a bound method of the patched function. The marker is
+    # found through the bound method, so the lifespan does not wrap it again.
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn.Server, "handle_exit", uvicorn.Server.handle_exit)
+    ambient_run.install_uvicorn_exit_hook()
+    server = uvicorn.Server(uvicorn.Config(app))
+    saved = signal.getsignal(signal.SIGTERM)
+    try:
+        signal.signal(signal.SIGTERM, server.handle_exit)
+        before = signal.getsignal(signal.SIGTERM)
+        ambient_run.install_signal_stop_hook()
+        assert signal.getsignal(signal.SIGTERM) == before
+    finally:
+        signal.signal(signal.SIGTERM, saved)
+
+
+def test_the_lifespan_startup_installs_the_signal_stop_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: List[str] = []
+    monkeypatch.setattr(ambient_run, "install_signal_stop_hook", lambda: calls.append("hook"))
+    with TestClient(app, base_url="http://localhost"):
+        assert calls == ["hook"]
+
+
+@pytest.mark.parametrize("thread_id", ["bad id!", "x" * 129, ""])
+def test_post_refuses_a_thread_id_the_get_refuses(
+    monkeypatch: pytest.MonkeyPatch, thread_id: str
+) -> None:
+    # Review note 6: one threadId rule for both methods, with the same 400.
+    install(monkeypatch, history=[R.SESSION_LAUNCH])
+    get_code, get_body = _get({"threadId": thread_id})
+    post_code, post_body = _post(_run_input(threadId=thread_id))
+    assert get_code == 400
+    assert post_code == 400, f"POST served threadId {thread_id!r} with {post_code}"
+    assert json.loads(post_body) == json.loads(get_body)
+
+
+def test_post_accepts_a_128_character_thread_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    install(monkeypatch, history=[R.SESSION_LAUNCH])
+    code, body = _post(_run_input(threadId="t" * 128))
+    assert code == 200
+    assert _conformant("review-note6-post-128", body)[0]["threadId"] == "t" * 128
 
 
 def test_max_seconds_ends_run_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -645,3 +822,376 @@ def test_request_stop_is_reentrant_on_the_lock_holding_thread() -> None:
     t.start()
     t.join(2.0)
     assert done.is_set(), "request_stop deadlocked while its thread held the waiters lock"
+
+
+# ---------------------------------------------------------------------------
+# #1232 review P3-1 / Note 3: only a terminal the run has open, or one CAO knows,
+# owns an event. A label such as "operator" (MCP Apps operator tools) or
+# "supervisor" (cao-mcp-server without CAO_TERMINAL_ID) is not a subagent.
+# ---------------------------------------------------------------------------
+
+
+def _known_terminals(
+    monkeypatch: pytest.MonkeyPatch, *known: str, labels: Optional[Dict[str, Dict[str, str]]] = None
+) -> None:
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.terminal_exists",
+        lambda terminal_id: terminal_id in known,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_label",
+        lambda terminal_id: (labels or {}).get(terminal_id) if terminal_id in known else None,
+        raising=False,
+    )
+
+
+def _session_launch(rid: str, session: str, ts: str) -> Dict[str, Any]:
+    return dict(R.SESSION_LAUNCH, id=rid, session_name=session, timestamp=ts)
+
+
+def _terminal_launch(rid: str, session: str, tid: str, agent: str, ts: str) -> Dict[str, Any]:
+    return dict(
+        R.TERMINAL_A_LAUNCH,
+        id=rid,
+        session_name=session,
+        terminal_id=tid,
+        timestamp=ts,
+        detail={"event_type": "post_create_terminal", "agent_name": agent, "provider": "kiro_cli"},
+    )
+
+
+def _assign(rid: str, session: str, sender: str, receiver: str, ts: str) -> Dict[str, Any]:
+    return dict(
+        R.HANDOFF,
+        id=rid,
+        session_name=session,
+        terminal_id=None,
+        timestamp=ts,
+        detail={"sender": sender, "receiver": receiver, "orchestration_type": "assign"},
+    )
+
+
+def _session_kill(rid: str, session: str, ts: str) -> Dict[str, Any]:
+    return dict(R.SESSION_KILL, id=rid, session_name=session, timestamp=ts)
+
+
+def _no_tag_outside_its_invocation(events: List[Dict[str, Any]]) -> None:
+    """Every subagentRunId is used only between its SUBAGENT_STARTED and FINISHED."""
+    open_ids: set = set()
+    finished: set = set()
+    for i, e in enumerate(events):
+        sid = e.get("subagentRunId")
+        if e["type"] == "SUBAGENT_STARTED":
+            assert sid not in finished, (i, e)
+            open_ids.add(sid)
+        elif e["type"] == "SUBAGENT_FINISHED":
+            open_ids.discard(sid)
+            finished.add(sid)
+        elif sid is not None:
+            assert sid in open_ids, f"event {i} {e['type']} tagged {sid}, not an open invocation"
+
+
+@pytest.mark.parametrize("sender", ["operator", "supervisor"])
+def test_a_sender_that_is_not_a_terminal_is_not_a_subagent(
+    monkeypatch: pytest.MonkeyPatch, sender: str
+) -> None:
+    # The stream from the #1232 review: two sessions, an assign from a label into
+    # each, and the first session ends between them.
+    _known_terminals(monkeypatch, "abcd1234", "ef015678")
+    install(
+        monkeypatch,
+        live=[
+            _session_launch("p-1", "cao-a", "2026-11-04T10:00:00.000000+00:00"),
+            _terminal_launch("p-2", "cao-a", "abcd1234", "dev", "2026-11-04T10:00:01.000000+00:00"),
+            _assign("p-3", "cao-a", sender, "abcd1234", "2026-11-04T10:00:02.000000+00:00"),
+            _session_kill("p-4", "cao-a", "2026-11-04T10:00:03.000000+00:00"),
+            _session_launch("p-5", "cao-b", "2026-11-04T10:00:04.000000+00:00"),
+            _terminal_launch("p-6", "cao-b", "ef015678", "rev", "2026-11-04T10:00:05.000000+00:00"),
+            _assign("p-7", "cao-b", sender, "ef015678", "2026-11-04T10:00:06.000000+00:00"),
+        ],
+    )
+    _, body = _get()
+    events = _conformant(f"review-P3-1-{sender}", body)
+
+    started = {e["subagentRunId"]: e for e in events if e["type"] == "SUBAGENT_STARTED"}
+    assert f"terminal:{sender}" not in started, "a label was announced as a subagent"
+    assert all(e.get("name") != "terminal" for e in started.values()), started
+    _no_tag_outside_its_invocation(events)
+
+    sessions = {e["name"]: sid for sid, e in started.items() if sid.startswith("session:")}
+    calls = [e for e in events if e["type"] == "TOOL_CALL_START"]
+    assert [c["toolCallId"] for c in calls] == ["p-3", "p-7"]
+    # Kept on the receiver's session, and the sender is still visible to a client.
+    assert [c.get("subagentRunId") for c in calls] == [sessions["cao-a"], sessions["cao-b"]]
+    assert [c["metadata"]["cao"]["sender"] for c in calls] == [sender, sender]
+
+
+def test_a_known_terminal_sender_owns_its_call_before_its_launch_is_seen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fix must not drop real terminals: one CAO knows (launched before this
+    # run's window) still owns its call.
+    _known_terminals(monkeypatch, "cccc3333", "bbbb2222")
+    install(
+        monkeypatch,
+        live=[
+            R.SESSION_LAUNCH,
+            R.TERMINAL_B_LAUNCH,
+            _assign("k-1", R.SESSION, "cccc3333", "bbbb2222", "2026-11-04T10:00:03.000000+00:00"),
+        ],
+    )
+    _, body = _get()
+    events = _conformant("review-P3-1-known-sender", body)
+    (call,) = [e for e in events if e["type"] == "TOOL_CALL_START"]
+    assert call["subagentRunId"] == "terminal:cccc3333"
+    assert "terminal:cccc3333" in {
+        e["subagentRunId"] for e in events if e["type"] == "SUBAGENT_STARTED"
+    }
+
+
+def test_a_replay_that_starts_after_a_launch_names_the_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review note 3, replay half: the replay window starts after both terminals'
+    # launch records, and the replay runs before the snapshot that has their
+    # names, so each was first announced with the generic name "terminal".
+    _known_terminals(
+        monkeypatch,
+        "aaaa1111",
+        "bbbb2222",
+        labels={
+            "aaaa1111": {"agent_profile": "supervisor", "provider": "kiro_cli"},
+            "bbbb2222": {"agent_profile": None, "provider": "claude_code"},
+        },
+    )
+    ui_from_b = dict(R.GENERATIVE_UI, id="n3-1", terminal_id="bbbb2222")
+    install(monkeypatch, history=[R.SESSION_LAUNCH, R.HANDOFF, ui_from_b])
+    _, body = _get({"since": SINCE})
+    events = _conformant("review-note3-replay-names", body)
+    started = {e["subagentRunId"]: e for e in events if e["type"] == "SUBAGENT_STARTED"}
+    assert started["terminal:aaaa1111"]["name"] == "supervisor"
+    assert started["terminal:aaaa1111"]["metadata"]["cao"]["provider"] == "kiro_cli"
+    assert started["terminal:bbbb2222"]["name"] == "claude_code"  # no profile: the provider
+
+
+def test_a_label_lookup_failure_keeps_the_generic_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    _known_terminals(monkeypatch, "aaaa1111", "bbbb2222")
+
+    def broken(terminal_id: str) -> Dict[str, str]:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_label", broken)
+    install(monkeypatch, history=[R.SESSION_LAUNCH, R.HANDOFF])
+    _, body = _get({"since": SINCE})
+    events = _conformant("review-note3-label-failure", body)
+    started = {e["subagentRunId"]: e for e in events if e["type"] == "SUBAGENT_STARTED"}
+    assert started["terminal:aaaa1111"]["name"] == "terminal"
+
+
+def test_a_finished_terminal_owns_no_later_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    # P3-1 result 2: nothing may be tagged with an invocation after its
+    # SUBAGENT_FINISHED, even when the sender is a real, known terminal.
+    _known_terminals(monkeypatch, "aaaa1111", "bbbb2222")
+    kill_a = dict(R.TERMINAL_B_KILL, id="f-1", terminal_id="aaaa1111")
+    late = _assign("f-2", R.SESSION, "aaaa1111", "bbbb2222", "2026-11-04T10:00:12.000000+00:00")
+    late_ui = dict(R.GENERATIVE_UI, id="f-3", terminal_id="aaaa1111")
+    install(
+        monkeypatch,
+        live=[R.SESSION_LAUNCH, R.TERMINAL_A_LAUNCH, R.TERMINAL_B_LAUNCH, kill_a, late, late_ui],
+    )
+    _, body = _get()
+    events = _conformant("review-P3-1-finished-sender", body)
+    _no_tag_outside_its_invocation(events)
+    (call,) = [e for e in events if e["type"] == "TOOL_CALL_START"]
+    assert call["subagentRunId"].startswith("session:")
+    assert call["metadata"]["cao"]["sender"] == "aaaa1111"
+
+
+def _call_to_an_unannounced_receiver(monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, Any]]:
+    """``operator`` assigns into a terminal of the same session that the run never
+    announced (it started before the replay window), then the session ends.
+
+    The receiver is in the record's session, as CAO's one producer of these records
+    writes it. Because the run never opened the receiver, closing the session's
+    open terminals does not reach the call; only the session's own close loop does.
+    """
+    _known_terminals(monkeypatch, "abcd1234", "ef015678")
+    install(
+        monkeypatch,
+        live=[
+            _session_launch("x-1", "cao-a", "2026-11-04T10:00:00.000000+00:00"),
+            _terminal_launch("x-2", "cao-a", "abcd1234", "dev", "2026-11-04T10:00:01.000000+00:00"),
+            _assign("x-3", "cao-a", "operator", "ef015678", "2026-11-04T10:00:02.000000+00:00"),
+            _session_kill("x-4", "cao-a", "2026-11-04T10:00:03.000000+00:00"),
+        ],
+    )
+    _, body = _get()
+    events = _conformant("review-note1-unannounced-receiver", body)
+    _no_tag_outside_its_invocation(events)
+    return events
+
+
+def test_a_session_owned_call_closes_before_its_session_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A call kept on a session (its sender is not a terminal) must close before
+    # the session's SUBAGENT_FINISHED, so it is never tagged with a finished
+    # invocation, even when the run never announced its receiver.
+    events = _call_to_an_unannounced_receiver(monkeypatch)
+    session_a = next(
+        e["subagentRunId"]
+        for e in events
+        if e["type"] == "SUBAGENT_STARTED" and e["name"] == "cao-a"
+    )
+    assert "terminal:ef015678" not in {
+        e["subagentRunId"] for e in events if e["type"] == "SUBAGENT_STARTED"
+    }
+    (start,) = [e for e in events if e["type"] == "TOOL_CALL_START"]
+    assert start["toolCallId"] == "x-3" and start["subagentRunId"] == session_a
+    types = [(e["type"], e.get("toolCallId") or e.get("subagentRunId")) for e in events]
+    assert types.index(("TOOL_CALL_END", "x-3")) < types.index(("SUBAGENT_FINISHED", session_a))
+
+
+def test_a_call_the_session_close_ends_is_closed_by_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The session's close loop ends the call as a completion, not as a stream that
+    # closed: the stream is still open, and the run goes on.
+    events = _call_to_an_unannounced_receiver(monkeypatch)
+    (end,) = [e for e in events if e["type"] == "TOOL_CALL_END" and e["toolCallId"] == "x-3"]
+    assert end["metadata"]["cao"]["closedBy"] == "completion"
+
+
+def test_a_failing_terminal_lookup_keeps_the_event_on_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A DB error in the "does CAO know this terminal" check must not break the
+    # stream: the event stays on the receiver's session and the run continues.
+    def _boom(terminal_id: str) -> bool:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.terminal_exists", _boom)
+    install(
+        monkeypatch,
+        live=[
+            R.SESSION_LAUNCH,
+            R.TERMINAL_B_LAUNCH,
+            _assign("e-1", R.SESSION, "cccc3333", "bbbb2222", "2026-11-04T10:00:03.000000+00:00"),
+            R.OTHER,
+        ],
+    )
+    _, body = _get()
+    events = _conformant("review-P3-1-lookup-error", body)
+    assert "RUN_ERROR" not in _types(events)
+    assert events[-1]["type"] == "RUN_FINISHED"
+    session = next(
+        e["subagentRunId"]
+        for e in events
+        if e["type"] == "SUBAGENT_STARTED" and e["name"] == R.SESSION
+    )
+    (call,) = [e for e in events if e["type"] == "TOOL_CALL_START"]
+    assert call["subagentRunId"] == session
+    assert "terminal:cccc3333" not in {
+        e["subagentRunId"] for e in events if e["type"] == "SUBAGENT_STARTED"
+    }
+    assert "RAW" in _types(events)  # the record after the failed lookup still arrives
+
+
+def test_emit_ui_for_an_unknown_terminal_announces_no_subagent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review Note 3: emit_ui with a terminal_id CAO does not know.
+    _known_terminals(monkeypatch)
+    ui = dict(R.GENERATIVE_UI, id="u-1", terminal_id="deadbeef")
+    install(monkeypatch, live=[R.SESSION_LAUNCH, ui])
+    _, body = _get()
+    events = _conformant("review-note3-emit-ui-unknown", body)
+    assert "terminal:deadbeef" not in {
+        e["subagentRunId"] for e in events if e["type"] == "SUBAGENT_STARTED"
+    }
+    (custom,) = [e for e in events if e["type"] == "CUSTOM" and e["name"] == "cao.generative_ui"]
+    assert custom.get("subagentRunId") != "terminal:deadbeef"
+    _no_tag_outside_its_invocation(events)
+
+
+# ---------------------------------------------------------------------------
+# #1232 review Note 1: mutants that survived the focused tests.
+# ---------------------------------------------------------------------------
+
+
+def test_a_killed_terminal_is_never_announced_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    relaunch = dict(R.TERMINAL_A_LAUNCH, id="m-2", timestamp="2026-11-04T10:00:12.000000+00:00")
+    kill_a = dict(R.TERMINAL_B_KILL, id="m-1", terminal_id="aaaa1111")
+    install(monkeypatch, live=[R.SESSION_LAUNCH, R.TERMINAL_A_LAUNCH, kill_a, relaunch])
+    _, body = _get()
+    events = _conformant("review-note1-no-reannounce", body)
+    starts = [
+        e
+        for e in events
+        if e["type"] == "SUBAGENT_STARTED" and e["subagentRunId"] == "terminal:aaaa1111"
+    ]
+    assert len(starts) == 1
+
+
+def test_a_record_in_both_the_replay_and_the_live_feed_is_narrated_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install(monkeypatch, history=[R.SESSION_LAUNCH, R.OTHER], live=[R.OTHER])
+    _, body = _get({"since": "2026-11-04T09:00:00.000000+00:00"})
+    events = _conformant("review-note1-replay-dedupe", body)
+    raws = [e for e in events if e["type"] == "RAW"]
+    assert len(raws) == 1, [e["type"] for e in events]
+
+
+def test_a_stream_opened_after_the_exit_signal_closes_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # request_stop() from the server-exit path is sticky by default: a stream that
+    # connects after it ends at once with server_stop, not when its source ends.
+    install(monkeypatch, live=[R.SESSION_LAUNCH, R.OTHER])
+    ambient_run.request_stop()
+    _, body = _get()
+    events = _conformant("review-note1-sticky-stop", body)
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert events[-1]["metadata"]["cao"]["endReason"] == "server_stop"
+
+
+def test_run_started_echoes_since_in_its_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    since = "2026-11-04T09:00:00.000000+00:00"
+    install(monkeypatch, history=[R.SESSION_LAUNCH])
+    _, body = _get({"since": since})
+    events = _conformant("review-note1-since", body)
+    assert events[0]["type"] == "RUN_STARTED"
+    assert events[0]["metadata"]["cao"]["since"] == since
+
+
+def test_cao_server_main_installs_the_exit_hook_before_uvicorn_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock, patch
+
+    import uvicorn
+
+    import cli_agent_orchestrator.api.main as main_module
+
+    calls: List[str] = []
+    monkeypatch.setattr(ambient_run, "install_uvicorn_exit_hook", lambda: calls.append("hook"))
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: calls.append("run"))
+    with (
+        patch.dict(os.environ),
+        patch("argparse.ArgumentParser.parse_args") as parse_args,
+    ):
+        parse_args.return_value = MagicMock(agents_dir=None, host=None, port=None, terminal=None)
+        main_module.main()
+    assert calls == ["hook", "run"]
+
+
+def test_the_lifespan_shutdown_signals_open_ambient_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: List[Dict[str, Any]] = []
+    monkeypatch.setattr(ambient_run, "request_stop", lambda **kw: seen.append(kw))
+    with TestClient(app, base_url="http://localhost"):
+        assert seen == []
+    assert seen == [{"sticky": False}]

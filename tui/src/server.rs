@@ -608,11 +608,11 @@ fn route(id: CommandId) -> Option<Route> {
         // ── `cao plugin *` — HIDE, all four ───────────────────────────────────────────────
         // Routeless on purpose, not for want of endpoints: `/plugins` exists (and now carries a
         // read-scope gate). `catalog.rs` classifies all four as `Policy::Hidden`, which is what
-        // requirements.md 16.5 requires while the verb is unresolved (M1): a HANDOFF row is
+        // the surface requires until it graduates (#1244): a HANDOFF row is
         // offered in navigation and drives the terminal, so it would ship the surface just as
         // much as IN-APP, and only HIDE is "not offered at all" (FR-4.3).
         //
-        // **When M1 lands these become HANDOFF, not IN-APP**, and they stay routeless even then:
+        // **When it graduates these become HANDOFF, not IN-APP**, and they stay routeless even then:
         // `remove` requires a warn-then-confirm exchange that a captured one-shot request cannot
         // carry, and `add` runs untrusted content whose warning belongs on real stdio. Wiring a
         // route here would satisfy the table while defeating the confirmation.

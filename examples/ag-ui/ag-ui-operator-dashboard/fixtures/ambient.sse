@@ -1,0 +1,110 @@
+data: {"type":"RUN_STARTED","metadata":{"cao":{"stream":"ambient"}},"threadId":"od-capture","runId":"4f1fb8af-ff3d-4808-91bd-7a9ad155f465","protocolVersion":"1.0"}
+
+data: {"type":"STATE_SNAPSHOT","snapshot":{"sessions":[],"terminals":[],"counts":{"sessions":0,"terminals":0},"scopes":["cao:read","cao:write","cao:admin"]}}
+
+id: 6661116a-748c-4884-a507-9dfe5bfa2b4a.0
+data: {"type":"SUBAGENT_STARTED","timestamp":1793994274723,"metadata":{"cao":{"sessionName":"cao-od-a"}},"subagentRunId":"session:ba886bde28f42302","name":"cao-od-a"}
+
+id: 6661116a-748c-4884-a507-9dfe5bfa2b4a
+data: {"type":"SUBAGENT_STARTED","timestamp":1793994274723,"metadata":{"cao":{"eventId":"6661116a-748c-4884-a507-9dfe5bfa2b4a","terminalId":"9f177a4f","sessionName":"cao-od-a","provider":"mock_cli"}},"subagentRunId":"terminal:9f177a4f","name":"developer","parentSubagentRunId":"session:ba886bde28f42302"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/counts/sessions","value":1},{"op":"replace","path":"/counts/terminals","value":1},{"op":"replace","path":"/sessions","value":[{"id":"cao-od-a","name":"cao-od-a","status":"detached"}]},{"op":"replace","path":"/terminals","value":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:30.894462+00:00"}]}]}
+
+id: 594caabe-df85-4e1f-8f05-8f964ced97ae
+data: {"type":"CUSTOM","timestamp":1793994274790,"metadata":{"cao":{"eventId":"594caabe-df85-4e1f-8f05-8f964ced97ae","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"594caabe-df85-4e1f-8f05-8f964ced97ae","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:34.790374+00:00","traceparent":null,"component":"approval_card","props":{"title":"Deploy to staging?","risk":"medium"}}}
+
+id: fac216e8-f023-459c-8df6-5b3f8729f751
+data: {"type":"CUSTOM","timestamp":1793994274802,"metadata":{"cao":{"eventId":"fac216e8-f023-459c-8df6-5b3f8729f751","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"fac216e8-f023-459c-8df6-5b3f8729f751","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:34.802776+00:00","traceparent":null,"component":"choice_prompt","props":{"question":"Which region?","choices":["us-east-1","eu-west-1"]}}}
+
+id: 30959cff-fc0c-40df-85ad-18163a409773
+data: {"type":"CUSTOM","timestamp":1793994274816,"metadata":{"cao":{"eventId":"30959cff-fc0c-40df-85ad-18163a409773","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"30959cff-fc0c-40df-85ad-18163a409773","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:34.816463+00:00","traceparent":null,"component":"diff_summary","props":{"files":3,"additions":42,"deletions":7}}}
+
+id: 70e12c81-ee48-4e57-b174-0c5303647e76
+data: {"type":"CUSTOM","timestamp":1793994274829,"metadata":{"cao":{"eventId":"70e12c81-ee48-4e57-b174-0c5303647e76","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"70e12c81-ee48-4e57-b174-0c5303647e76","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:34.829621+00:00","traceparent":null,"component":"progress","props":{"label":"Tests","value":60,"max":100}}}
+
+id: c7484fb3-1e16-4a0a-ae15-0dd9bfba7e87
+data: {"type":"CUSTOM","timestamp":1793994274841,"metadata":{"cao":{"eventId":"c7484fb3-1e16-4a0a-ae15-0dd9bfba7e87","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"c7484fb3-1e16-4a0a-ae15-0dd9bfba7e87","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:34.841422+00:00","traceparent":null,"component":"metric","props":{"label":"p95 latency","value":"212 ms"}}}
+
+id: 0eddcc42-4168-4265-a902-2cddb8a9ffd1
+data: {"type":"CUSTOM","timestamp":1793994274854,"metadata":{"cao":{"eventId":"0eddcc42-4168-4265-a902-2cddb8a9ffd1","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"0eddcc42-4168-4265-a902-2cddb8a9ffd1","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:34.854843+00:00","traceparent":null,"component":"agent_card","props":{"name":"developer","status":"busy"}}}
+
+id: da323e7a-8320-45d0-922d-fa0cd7847592
+data: {"type":"CUSTOM","timestamp":1793994274868,"metadata":{"cao":{"eventId":"da323e7a-8320-45d0-922d-fa0cd7847592","terminalId":"operator"}},"name":"cao.generative_ui","value":{"event_id":"da323e7a-8320-45d0-922d-fa0cd7847592","terminal_id":"operator","session_name":null,"timestamp":"2026-11-06T19:44:34.868209+00:00","traceparent":null,"component":"metric","props":{"label":"from a non-terminal sender","value":"1"}}}
+
+id: a09be5ef-8933-4463-90bf-7c3e5d141849
+data: {"type":"CUSTOM","timestamp":1793994274881,"metadata":{"cao":{"eventId":"a09be5ef-8933-4463-90bf-7c3e5d141849","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"a09be5ef-8933-4463-90bf-7c3e5d141849","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:34.881218+00:00","traceparent":null,"component":"metric","props":{"label":"<img src=x onerror=alert(1)>","value":"<script>alert(1)</script>"}}}
+
+id: bd7a7805-7f27-4638-a315-de79107b9f52
+data: {"type":"CUSTOM","timestamp":1793994274974,"metadata":{"cao":{"eventId":"bd7a7805-7f27-4638-a315-de79107b9f52","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"bd7a7805-7f27-4638-a315-de79107b9f52","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:34.974242+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"e822357b-10b6-40eb-bd10-c185207c917c","reason":"mock-cli:unknown_prompt","message":"","options":["approve","deny"],"provider":"mock_cli","terminal_id":"9f177a4f"}}}
+
+id: 4206f39f-530e-4b31-afc7-100eac92a45c
+data: {"type":"CUSTOM","timestamp":1793994275496,"metadata":{"cao":{"eventId":"4206f39f-530e-4b31-afc7-100eac92a45c","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"4206f39f-530e-4b31-afc7-100eac92a45c","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:35.496839+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"e822357b-10b6-40eb-bd10-c185207c917c","resolved":true,"outcome":"expired","provider":"mock_cli","terminal_id":"9f177a4f"}}}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:35.285401+00:00"}]}]}
+
+id: 3e5f247b-7908-4f81-b81d-b32088261103
+data: {"type":"CUSTOM","timestamp":1793994276300,"metadata":{"cao":{"eventId":"3e5f247b-7908-4f81-b81d-b32088261103","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"3e5f247b-7908-4f81-b81d-b32088261103","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:36.300405+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"e822357b-10b6-40eb-bd10-c185207c917c","resolved":true,"outcome":"approve","provider":"mock_cli","terminal_id":"9f177a4f"}}}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:36.299042+00:00"}]}]}
+
+id: d0481f3e-4e03-45f8-bc32-433786ff3bf0.0
+data: {"type":"SUBAGENT_STARTED","timestamp":1793994280314,"metadata":{"cao":{"sessionName":"cao-od-b"}},"subagentRunId":"session:34c68b59e03a052b","name":"cao-od-b"}
+
+id: d0481f3e-4e03-45f8-bc32-433786ff3bf0
+data: {"type":"SUBAGENT_STARTED","timestamp":1793994280314,"metadata":{"cao":{"eventId":"d0481f3e-4e03-45f8-bc32-433786ff3bf0","terminalId":"ecbb7401","sessionName":"cao-od-b","provider":"mock_cli"}},"subagentRunId":"terminal:ecbb7401","name":"developer","parentSubagentRunId":"session:34c68b59e03a052b"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/counts/sessions","value":2},{"op":"replace","path":"/counts/terminals","value":2},{"op":"replace","path":"/sessions","value":[{"id":"cao-od-a","name":"cao-od-a","status":"detached"},{"id":"cao-od-b","name":"cao-od-b","status":"detached"}]},{"op":"replace","path":"/terminals","value":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:36.299042+00:00"},{"id":"ecbb7401","session_name":"cao-od-b","provider":"mock_cli","agent_profile":"developer","window":"developer-82a0","status":null,"last_active":"2026-11-06T19:44:36.435397+00:00"}]}]}
+
+id: f4be1c9a-0345-4809-b4f1-9fe7dccd457f
+data: {"type":"CUSTOM","timestamp":1793994280463,"metadata":{"cao":{"eventId":"f4be1c9a-0345-4809-b4f1-9fe7dccd457f","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"f4be1c9a-0345-4809-b4f1-9fe7dccd457f","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:40.463144+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"3c64b679-fc70-4097-8fc8-d4b3bab628e0","reason":"mock-cli:unknown_prompt","message":"","options":["approve","deny"],"provider":"mock_cli","terminal_id":"9f177a4f"}}}
+
+id: d1d6f810-4ef7-4318-b933-d0dc733e3b8d
+data: {"type":"CUSTOM","timestamp":1793994280500,"metadata":{"cao":{"eventId":"d1d6f810-4ef7-4318-b933-d0dc733e3b8d","terminalId":"ecbb7401"}},"subagentRunId":"terminal:ecbb7401","name":"cao.generative_ui","value":{"event_id":"d1d6f810-4ef7-4318-b933-d0dc733e3b8d","terminal_id":"ecbb7401","session_name":null,"timestamp":"2026-11-06T19:44:40.500824+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"7570d6cd-df38-4a62-a5ef-9f2624a3fede","reason":"mock-cli:unknown_prompt","message":"","options":["approve","deny"],"provider":"mock_cli","terminal_id":"ecbb7401"}}}
+
+id: 6beb2bb6-7ba8-4be8-8a90-1ad5600ba6f5
+data: {"type":"CUSTOM","timestamp":1793994280776,"metadata":{"cao":{"eventId":"6beb2bb6-7ba8-4be8-8a90-1ad5600ba6f5","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"6beb2bb6-7ba8-4be8-8a90-1ad5600ba6f5","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:40.776552+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"3c64b679-fc70-4097-8fc8-d4b3bab628e0","resolved":true,"outcome":"expired","provider":"mock_cli","terminal_id":"9f177a4f"}}}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:40.710715+00:00"},{"id":"ecbb7401","session_name":"cao-od-b","provider":"mock_cli","agent_profile":"developer","window":"developer-82a0","status":null,"last_active":"2026-11-06T19:44:36.435397+00:00"}]}]}
+
+id: dc767d98-adc0-4fe1-8b46-6f01dbb62d24
+data: {"type":"CUSTOM","timestamp":1793994281728,"metadata":{"cao":{"eventId":"dc767d98-adc0-4fe1-8b46-6f01dbb62d24","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"dc767d98-adc0-4fe1-8b46-6f01dbb62d24","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:41.728719+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"3c64b679-fc70-4097-8fc8-d4b3bab628e0","resolved":true,"outcome":"approve","provider":"mock_cli","terminal_id":"9f177a4f"}}}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:41.727252+00:00"},{"id":"ecbb7401","session_name":"cao-od-b","provider":"mock_cli","agent_profile":"developer","window":"developer-82a0","status":null,"last_active":"2026-11-06T19:44:36.435397+00:00"}]}]}
+
+id: 9a65298b-3630-44cc-a99b-6269542f184d
+data: {"type":"CUSTOM","timestamp":1793994281979,"metadata":{"cao":{"eventId":"9a65298b-3630-44cc-a99b-6269542f184d","terminalId":"ecbb7401"}},"subagentRunId":"terminal:ecbb7401","name":"cao.generative_ui","value":{"event_id":"9a65298b-3630-44cc-a99b-6269542f184d","terminal_id":"ecbb7401","session_name":null,"timestamp":"2026-11-06T19:44:41.979817+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"7570d6cd-df38-4a62-a5ef-9f2624a3fede","resolved":true,"outcome":"expired","provider":"mock_cli","terminal_id":"ecbb7401"}}}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:41.727252+00:00"},{"id":"ecbb7401","session_name":"cao-od-b","provider":"mock_cli","agent_profile":"developer","window":"developer-82a0","status":null,"last_active":"2026-11-06T19:44:41.774808+00:00"}]}]}
+
+id: 954ca74e-19f3-43f1-9a8c-544f081c5faa
+data: {"type":"CUSTOM","timestamp":1793994282788,"metadata":{"cao":{"eventId":"954ca74e-19f3-43f1-9a8c-544f081c5faa","terminalId":"ecbb7401"}},"subagentRunId":"terminal:ecbb7401","name":"cao.generative_ui","value":{"event_id":"954ca74e-19f3-43f1-9a8c-544f081c5faa","terminal_id":"ecbb7401","session_name":null,"timestamp":"2026-11-06T19:44:42.788249+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"7570d6cd-df38-4a62-a5ef-9f2624a3fede","resolved":true,"outcome":"deny","provider":"mock_cli","terminal_id":"ecbb7401"}}}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:41.727252+00:00"},{"id":"ecbb7401","session_name":"cao-od-b","provider":"mock_cli","agent_profile":"developer","window":"developer-82a0","status":null,"last_active":"2026-11-06T19:44:42.787122+00:00"}]}]}
+
+id: d31a7b03-bd1b-48d1-b979-06d0139b4153
+data: {"type":"CUSTOM","timestamp":1793994284090,"metadata":{"cao":{"eventId":"d31a7b03-bd1b-48d1-b979-06d0139b4153","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"d31a7b03-bd1b-48d1-b979-06d0139b4153","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:44.090932+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"cf055aea-ae97-4543-a82c-e902455e5f20","reason":"mock-cli:unknown_prompt","message":"","options":["approve","deny"],"provider":"mock_cli","terminal_id":"9f177a4f"}}}
+
+id: bcdd9c0d-9a6d-4236-bd45-de89b3075994
+data: {"type":"CUSTOM","timestamp":1793994284669,"metadata":{"cao":{"eventId":"bcdd9c0d-9a6d-4236-bd45-de89b3075994","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"bcdd9c0d-9a6d-4236-bd45-de89b3075994","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:44.669120+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"cf055aea-ae97-4543-a82c-e902455e5f20","resolved":true,"outcome":"expired","provider":"mock_cli","terminal_id":"9f177a4f"}}}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:44.603099+00:00"},{"id":"ecbb7401","session_name":"cao-od-b","provider":"mock_cli","agent_profile":"developer","window":"developer-82a0","status":null,"last_active":"2026-11-06T19:44:42.787122+00:00"}]}]}
+
+id: 5521f968-a6e3-4789-8fe3-a3495222145e
+data: {"type":"CUSTOM","timestamp":1793994285705,"metadata":{"cao":{"eventId":"5521f968-a6e3-4789-8fe3-a3495222145e","terminalId":"9f177a4f"}},"subagentRunId":"terminal:9f177a4f","name":"cao.generative_ui","value":{"event_id":"5521f968-a6e3-4789-8fe3-a3495222145e","terminal_id":"9f177a4f","session_name":null,"timestamp":"2026-11-06T19:44:45.705168+00:00","traceparent":null,"component":"approval_card","props":{"interrupt_id":"cf055aea-ae97-4543-a82c-e902455e5f20","resolved":true,"outcome":"deny","provider":"mock_cli","terminal_id":"9f177a4f"}}}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"9f177a4f","session_name":"cao-od-a","provider":"mock_cli","agent_profile":"developer","window":"developer-2eb6","status":null,"last_active":"2026-11-06T19:44:45.703157+00:00"},{"id":"ecbb7401","session_name":"cao-od-b","provider":"mock_cli","agent_profile":"developer","window":"developer-82a0","status":null,"last_active":"2026-11-06T19:44:42.787122+00:00"}]}]}
+
+:keep-alive
+
+:keep-alive
+
+data: {"type":"SUBAGENT_FINISHED","metadata":{"cao":{"terminalId":"9f177a4f","endReason":"max_seconds"}},"subagentRunId":"terminal:9f177a4f"}
+
+data: {"type":"SUBAGENT_FINISHED","metadata":{"cao":{"terminalId":"ecbb7401","endReason":"max_seconds"}},"subagentRunId":"terminal:ecbb7401"}
+
+data: {"type":"SUBAGENT_FINISHED","metadata":{"cao":{"sessionName":"cao-od-a","endReason":"max_seconds"}},"subagentRunId":"session:ba886bde28f42302"}
+
+data: {"type":"SUBAGENT_FINISHED","metadata":{"cao":{"sessionName":"cao-od-b","endReason":"max_seconds"}},"subagentRunId":"session:34c68b59e03a052b"}
+
+data: {"type":"RUN_FINISHED","metadata":{"cao":{"endReason":"max_seconds"}},"threadId":"od-capture","runId":"4f1fb8af-ff3d-4808-91bd-7a9ad155f465","outcome":{"type":"cancelled"}}
+

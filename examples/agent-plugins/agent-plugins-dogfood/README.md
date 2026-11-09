@@ -12,10 +12,11 @@ produce a green recording. See the ["Verified by
 dog-fooding"](../../../docs/agent-plugins.md#verified-by-dog-fooding) section of
 the Agent Plugins guide for the embedded GIF.
 
-> `cao plugin` is **hidden** from `cao --help` pending maintainer decision M1
-> (Requirement 16.5) — it is reachable and fully usable, just deliberately
-> unadvertised. The recording narrates this so a hidden command does not look
-> broken. It does **not** open any ship gate.
+> `cao plugin` is hidden from `cao --help` and refuses to run unless
+> `CAO_AGENT_PLUGINS_ENABLED` is set, pending graduation (#1244); the verb is
+> decision M1, recorded by the issue author in #573. `run.sh` sets the variable
+> for its own scratch environment only, and the recording narrates this so a
+> hidden command does not look broken. It does **not** change the default.
 
 ## What each step asserts
 
@@ -27,6 +28,7 @@ the Agent Plugins guide for the embedded GIF.
 | 3b | `cao install … --provider kiro_cli` (opt-in profile) | The escape hatch, so the recording proves the whole rule rather than half of it: a second profile whose frontmatter declares `allowedTools: ["@builtin", fs_read, "@cao-ops"]` **does** get `@cao-ops` in the emitted list. Naming the server is how an operator authorises it. |
 | 4 | `cao install … --provider opencode_cli` | The server lands in `opencode.json` with a real boolean `"enabled": true`. **Finding 2** (in an isolated config): installing over a user's **own** same-named entry **preserves** it and **emits a finding** — user configuration is never silently clobbered. |
 | 5 | `cao plugin remove cao` | Cross-provider removal, per the handoff's §2a. **Kiro/Copilot:** the server is **absent** from the rewritten config (wholesale rewrite), and `@cao-ops` is still absent from the unnamed profile. On the opt-in profile the server is withdrawn while the operator's **own** `@cao-ops` entry is **preserved** — CAO withdraws what it configured, never what the operator wrote. **OpenCode:** there is no in-place delete, so the server is **disabled** (`enabled: false`) — CAO never deletes a key it may not own. |
+| 6 | `cao plugin validate`, `add`, `remove` over every other package | Each package in `PACKAGES` (`scripts/build_agent_plugin.py`) other than `cao`, read from that list so a new package is covered without editing `run.sh`: loadable with **no** findings, the discovered skills equal its allowlist exactly, each skill is projected as a symlink into the plugin store, and none is left after removal. |
 
 ## Offline by default, live behind a flag
 
@@ -40,6 +42,7 @@ substitute that still gates the recording.
 | Step 5 — Kiro absence + grant boundary | ✅ config read-back | ✅ config read-back |
 | Step 5 — OpenCode disabled | ✅ `opencode.json` shows `enabled: false` (proves CAO's **write**) | ✅ same |
 | Step 5 — OpenCode **no-spawn** | ⏭️ skipped | ✅ `opencode mcp list` reports `cao-ops` as `disabled` (○) and a **sentinel wrapper** confirms no subprocess is spawned, with a **positive control** that does spawn so "no spawn" is *observed* |
+| Step 6 — every other package | ✅ run | ✅ run |
 
 Reading back the `enabled: false` we just wrote proves our own write, not the
 behaviour the fix depends on — so §2a requires the **observational** step. It is

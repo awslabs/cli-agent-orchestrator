@@ -4,14 +4,13 @@ Structured as a direct sibling of ``cli/commands/skills.py``: the same
 ``click.group()`` shape, the same ``raise click.ClickException(str(exc))``
 convention, and the same post-mutation refresh of baked agent prompts.
 
-**Naming is not settled.** design.md records the verb as maintainer decision
-**M1** — ``cao plugin`` (recommended) versus ``cao agent-plugin`` — because
-``docs/plugins.md`` publicly promises ``cao plugin list/info/enable/disable``
-as a future surface for *event* plugins, and taking the noun retracts that
-promise. This module is built and tested under the recommended verb as a
-working placeholder. Per requirements.md 16.5, it must not ship to end users
-until maintainers resolve M1; that gate blocks release, not construction, and
-changing the verb is a one-line edit in ``cli/main.py`` plus this group's name.
+**The verb is decision M1.** design.md records it as Option A (``cao plugin``
+rather than ``cao agent-plugin``), signed off by the issue author in #573.
+``docs/plugins.md`` had promised ``cao plugin list/info/enable/disable`` for
+*event* plugins, and taking the noun retracts that promise. The surface is built
+but does not ship to end users until it graduates (#1244); that gate blocks
+release, not construction, and changing the verb is a one-line edit in
+``cli/main.py`` plus this group's name.
 """
 
 from __future__ import annotations
@@ -133,12 +132,12 @@ def _echo_affected(affected: List[AffectedSession]) -> None:
 
 
 # Two separate gates, doing two different jobs. ``hidden=True`` keeps the verb out
-# of ``cao --help`` because M1 has not settled what the verb should be called; the
-# group callback below is Requirement 16.5's *execution* gate, because hiding help
-# text leaves dispatch untouched and every subcommand still ran. Click has no
-# built-in "disabled group", so the callback — which Click invokes before any
-# subcommand — is the mechanism. When M1 lands, ``hidden`` flips and the gate's
-# default flips; they are independent decisions.
+# of ``cao --help`` until the surface graduates (#1244); the group callback below
+# is the *execution* gate, because hiding help text leaves dispatch untouched and
+# every subcommand still ran.
+# Click has no built-in "disabled group", so the callback — which Click invokes
+# before any subcommand — is the mechanism. When the surface graduates, ``hidden`` flips and
+# the gate's default flips; they are independent decisions.
 @click.group("plugin", hidden=True)
 def agent_plugin() -> None:
     """Manage agent plugins (Agent Plugins 1.0.0).
@@ -147,14 +146,14 @@ def agent_plugin() -> None:
     which reacts to CAO lifecycle events and is managed separately.
 
     Hidden from ``cao --help`` and refusing to execute unless
-    ``CAO_AGENT_PLUGINS_ENABLED`` is set, pending maintainer decision M1
-    (Requirement 16.5).
+    ``CAO_AGENT_PLUGINS_ENABLED`` is set, pending graduation (#1244). The verb is
+    decision M1, recorded by the issue author in #573.
     """
     if not agent_plugins_surface_enabled():
         raise click.ClickException(
-            "The agent plugin surface is not released yet (Requirement 16.5, "
-            "pending maintainer decision M1). Set CAO_AGENT_PLUGINS_ENABLED=1 to "
-            "enable it."
+            "The agent plugin surface is not released yet (pending graduation, "
+            "#1244; the verb is decision M1, recorded by the issue author in #573). "
+            "Set CAO_AGENT_PLUGINS_ENABLED=1 to enable it."
         )
 
 
