@@ -3,10 +3,11 @@
 from unittest.mock import MagicMock
 
 import pytest
+from libtmux.exc import LibTmuxException
 
 from cli_agent_orchestrator.backends.base import TerminalBackendError
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
-from cli_agent_orchestrator.clients.tmux import PaneSpawnUnavailable
+from cli_agent_orchestrator.clients.tmux import PaneSpawnUnavailable, TmuxLookupError
 
 
 @pytest.fixture
@@ -82,13 +83,32 @@ class TestWebAttach:
     def test_window_mode_input_needs_no_focus(self, client):
         backend = TmuxBackend(client=client)
 
-        assert backend.web_input_focus("ses", "win") is None
-        client.web_view_input_focus.assert_not_called()
+        argv, focus = backend.prepare_web_attach_input("ses", "win")
 
-    def test_pane_mode_input_focus_comes_from_tmux(self, client):
+        assert focus is None
+        assert argv[argv.index("link-window") + 2] == "ses:win"
+        client.web_view_attach_plan.assert_not_called()
+
+    def test_pane_mode_argv_and_focus_come_from_one_lookup(self, client):
         backend = TmuxBackend(client=client, spawn_mode="pane")
-        client.web_view_input_focus.return_value = ("@2", "%4")
+        client.web_view_attach_plan.return_value = (["tmux", "attach"], ("@2", "%4"))
 
-        assert backend.web_input_focus("ses", "coder-3") == ("@2", "%4")
+        assert backend.prepare_web_attach_input("ses", "coder-3") == (
+            ["tmux", "attach"],
+            ("@2", "%4"),
+        )
+        client.web_view_attach_plan.assert_called_once_with("ses", "coder-3")
         backend.focus_web_input("%4")
         client.select_pane.assert_called_once_with("%4")
+
+    @pytest.mark.parametrize(
+        "error",
+        [TmuxLookupError("listing failed to parse"), LibTmuxException("no server running")],
+    )
+    def test_pane_mode_lookup_failure_refuses_the_attach(self, client, error):
+        """'Could not tell' must not become 'needs no pane selected'."""
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+        client.web_view_attach_plan.side_effect = error
+
+        with pytest.raises(TerminalBackendError):
+            backend.prepare_web_attach_input("ses", "coder-3")

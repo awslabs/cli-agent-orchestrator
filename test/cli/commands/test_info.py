@@ -132,7 +132,8 @@ class TestInfoCommand:
             if argv[:2] == ["tmux", "display-message"]:
                 out.stdout = "caoweb-1a2b3c4d5e6f\n"
             elif argv[:2] == ["tmux", "show-options"]:
-                assert argv[-2:] == ["caoweb-1a2b3c4d5e6f", "@cao_web_view_of"]
+                # "=" makes tmux match the name exactly, never as a prefix.
+                assert argv[-2:] == ["=caoweb-1a2b3c4d5e6f", "@cao_web_view_of"]
                 out.stdout = "cao-test-session\n"
             return out
 

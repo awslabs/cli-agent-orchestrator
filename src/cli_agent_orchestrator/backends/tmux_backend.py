@@ -238,16 +238,25 @@ class TmuxBackend(TerminalBackend):
         # target is a pure function of its arguments and stays one.
         return self._client.web_view_attach_command(session_name, window_name)
 
-    def web_input_focus(self, session_name: str, window_name: str) -> Optional[Tuple[str, str]]:
-        """``(window_id, pane_id)`` for a pane terminal, None in window mode.
+    def prepare_web_attach_input(
+        self, session_name: str, window_name: str
+    ) -> Tuple[List[str], Optional[Tuple[str, str]]]:
+        """The browser attach argv, plus ``(window_id, pane_id)`` in pane mode.
 
         In pane mode several agents are panes of one window, and tmux keeps one
         active pane per window, not per client: keys from any browser terminal
-        on that window go to whichever pane was selected last.
+        on that window go to whichever pane is active. The handler serialises
+        input per window and selects the pane before each write. Argv and pane
+        come from one lookup; a lookup that fails refuses the attach.
         """
         if self._spawn_mode != "pane":
-            return None
-        return self._client.web_view_input_focus(session_name, window_name)
+            return web_view_attach_argv(session_name, f"{session_name}:{window_name}"), None
+        try:
+            return self._client.web_view_attach_plan(session_name, window_name)
+        except Exception as e:  # noqa: BLE001 — TmuxLookupError, or libtmux with the server gone
+            raise TerminalBackendError(
+                f"Could not locate terminal '{session_name}:{window_name}': {e}"
+            ) from e
 
     def focus_web_input(self, target: str) -> None:
         self._client.select_pane(target)

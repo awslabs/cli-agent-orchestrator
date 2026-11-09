@@ -369,18 +369,41 @@ class TestWebViewAttachCommand:
         assert "select-pane" not in argv
 
 
-class TestWebViewInputFocus:
-    def test_a_pane_terminal_names_its_window_and_pane(self, tmux):
+class TestWebViewAttachPlan:
+    def test_a_pane_terminal_links_the_window_it_names_for_focus(self, tmux):
+        """Argv and focus come from one lookup, so they cannot disagree."""
         pane = marked_pane("coder-3", "%4")
         pane.window.window_id = "@2"
         tmux.server.sessions.get.return_value = session_with(panes=[pane])
 
-        assert tmux.web_view_input_focus("ses", "coder-3") == ("@2", "%4")
+        argv, focus = tmux.web_view_attach_plan("ses", "coder-3")
+
+        assert focus == ("@2", "%4")
+        assert argv[argv.index("link-window") + 2] == "@2"
+        assert tmux.server.sessions.get.call_count == 1
 
     def test_a_window_terminal_needs_no_focus(self, tmux):
         tmux.server.sessions.get.return_value = session_with(window=MagicMock())
 
-        assert tmux.web_view_input_focus("ses", "win") is None
+        argv, focus = tmux.web_view_attach_plan("ses", "win")
+
+        assert focus is None
+        assert argv[argv.index("link-window") + 2] == "ses:win"
+
+    def test_an_unreadable_listing_raises_instead_of_needing_no_focus(self, tmux):
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
+        tmux.server.sessions.get.side_effect = ValueError("not enough values to unpack")
+
+        with pytest.raises(TmuxLookupError):
+            tmux.web_view_attach_plan("ses", "coder-3")
+
+    def test_the_plain_command_still_degrades_to_the_window_target(self, tmux):
+        tmux.server.sessions.get.side_effect = ValueError("not enough values to unpack")
+
+        argv = tmux.web_view_attach_command("ses", "coder-3")
+
+        assert argv[argv.index("link-window") + 2] == "ses:coder-3"
 
     def test_select_pane_targets_the_pane(self, tmux):
         tmux.server.cmd.return_value = MagicMock(returncode=0, stderr=[])

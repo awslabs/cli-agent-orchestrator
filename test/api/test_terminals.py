@@ -1679,6 +1679,10 @@ class TestWebSocketSubprocessTerm:
             raise _StopHere("captured Popen args")
 
         backend = MagicMock()
+        backend.prepare_web_attach_input.side_effect = lambda s, w: (
+            backend.prepare_web_attach(s, w),
+            None,
+        )
         backend.prepare_web_attach.return_value = [
             "tmux",
             "-u",
@@ -1723,6 +1727,10 @@ class TestWebSocketSubprocessTerm:
         ws.close = AsyncMock()
 
         backend = MagicMock()
+        backend.prepare_web_attach_input.side_effect = lambda s, w: (
+            backend.prepare_web_attach(s, w),
+            None,
+        )
         backend.prepare_web_attach.return_value = ["herdr", "--session", "cao"]
 
         captured: Dict[str, object] = {}
@@ -1763,6 +1771,10 @@ class TestWebSocketSubprocessTerm:
         ws.close = AsyncMock()
 
         backend = MagicMock()
+        backend.prepare_web_attach_input.side_effect = lambda s, w: (
+            backend.prepare_web_attach(s, w),
+            None,
+        )
         backend.prepare_web_attach.side_effect = TerminalBackendError("sensitive backend detail")
 
         with (

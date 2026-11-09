@@ -448,18 +448,23 @@ class TerminalBackend(ABC):
         """
         ...
 
-    def web_input_focus(self, session_name: str, window_name: str) -> Optional[Tuple[str, str]]:
-        """What a browser terminal must focus before its input reaches the agent.
+    def prepare_web_attach_input(
+        self, session_name: str, window_name: str
+    ) -> Tuple[List[str], Optional[Tuple[str, str]]]:
+        """``prepare_web_attach`` plus what the browser terminal's input must focus.
 
-        Returns ``(scope, target)``: ``scope`` names what several terminals
-        share (one focus per scope), ``target`` is what this terminal must
-        focus. None means input needs no focusing, the default: the attach
-        already routes it to the right agent.
+        Returns ``(argv, focus)``. ``focus`` is ``(scope, target)``: ``scope``
+        names what several terminals share (their input is serialised per
+        scope), ``target`` is what this terminal must focus before each input.
+        None means the attach alone routes input to the right agent, the
+        default. A backend that has to look the target up must take argv and
+        focus from the same lookup, and raise ``TerminalBackendError`` rather
+        than return None when the lookup fails.
         """
-        return None
+        return self.prepare_web_attach(session_name, window_name), None
 
     def focus_web_input(self, target: str) -> None:
-        """Focus ``target`` (from ``web_input_focus``) so input reaches it."""
+        """Focus ``target`` (from ``prepare_web_attach_input``) so input reaches it."""
         return None
 
     # --- Pipe-pane (logging) ---

@@ -391,6 +391,27 @@ The name is a label, not an authenticated identity: anything that can reach the
 tmux socket can set the same mark. Agents are not isolated from each other here,
 so this is in line with the rest of the backend rather than a new exposure.
 
+#### Browser terminals in pane mode
+
+A web terminal (the Workspace tab, or the Agents tab overlay) on a pane-mode
+agent shows the **whole** `pane_window`, every agent's pane tiled, with that
+agent's pane selected. Two web terminals on agents of the same window therefore
+show the same tiled window, not one agent each; window mode gives each terminal
+its own window.
+
+Input still reaches only the agent the terminal belongs to. tmux keeps one
+active pane per window, not per client, so cao-server selects the terminal's
+pane before every input it forwards and holds that window until tmux has read
+the input, so a paste in one terminal and a key in another cannot interleave.
+Input whose pane cannot be selected is dropped rather than sent to whichever
+pane is active, and a terminal whose pane cannot be found is not attached.
+
+One case is outside cao-server's reach: selecting another pane by hand, from a
+real terminal attached to the same window, in the instant between cao-server's
+selection and tmux reading the input. Work in a different window, or in window
+mode, if you drive pane-mode agents from a real terminal while typing to them
+from the browser.
+
 ### MCP Apps (`apps`)
 
 Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_agent_orchestrator/ext_apps/apps.py) for the `ui://cao/*` MCP App resource surface this gates.

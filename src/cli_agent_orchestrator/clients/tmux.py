@@ -475,7 +475,7 @@ def web_view_attach_argv(
 
     Pane spawn mode needs no pane selection here: the window holds every pane
     and tmux keeps one active pane per window, not per client, so the WebSocket
-    handler selects the terminal's pane itself (see ``web_view_input_focus``).
+    handler selects the terminal's pane itself (see ``web_view_attach_plan``).
     Keeping the chain free of a pane target also means a pane that vanishes
     mid-attach cannot stop the chain after the view exists, which would have
     left the view behind without ``destroy-unattached``.
@@ -1105,20 +1105,21 @@ class TmuxClient:
             logger.warning(f"Could not resolve a pane for {window_target}: {e}")
         return window_target
 
-    def _web_view_pane(self, session_name: str, terminal_name: str) -> Optional[Tuple[str, str]]:
+    def _locate_web_view_pane(
+        self, session_name: str, terminal_name: str
+    ) -> Optional[Tuple[str, str]]:
         """``(window_id, pane_id)`` when the terminal lives as a pane, else None.
 
-        A terminal with a window of its own is not a pane; a lookup that will
-        not read is treated as "not a pane" so the attach falls back to the
-        window target, which tmux then reports as missing in pane mode.
+        None means the terminal has a window of its own, or is not there at all
+        (the window target then makes tmux report it missing). A listing that
+        will not read raises ``TmuxLookupError``: the caller decides whether that
+        may degrade, because in pane mode "could not tell" must not become
+        "needs no pane selected".
         """
-        try:
-            session = self._find_session(session_name)
-            if session is None or self._find_window(session, session_name, terminal_name):
-                return None
-            pane = self._find_marked_pane(session, session_name, terminal_name)
-        except TmuxLookupError:
+        session = self._find_session(session_name)
+        if session is None or self._find_window(session, session_name, terminal_name):
             return None
+        pane = self._find_marked_pane(session, session_name, terminal_name)
         if pane is None or not pane.pane_id or not pane.window.window_id:
             return None
         return pane.window.window_id, pane.pane_id
@@ -1127,23 +1128,33 @@ class TmuxClient:
         """``web_view_attach_argv`` for a terminal that may live as a pane.
 
         A terminal without a window of its own is a marked pane, so the view
-        links the pane's window. The pane itself is selected by the WebSocket
-        handler (``web_view_input_focus``), not here.
+        links the pane's window. A lookup that will not read falls back to the
+        window target, which tmux reports as missing in pane mode. The browser
+        path uses ``web_view_attach_plan`` instead, which also returns the pane.
         """
-        located = self._web_view_pane(session_name, terminal_name)
+        try:
+            located = self._locate_web_view_pane(session_name, terminal_name)
+        except TmuxLookupError:
+            located = None
         if located is None:
             return web_view_attach_argv(session_name, f"{session_name}:{terminal_name}")
         return web_view_attach_argv(session_name, located[0])
 
-    def web_view_input_focus(
+    def web_view_attach_plan(
         self, session_name: str, terminal_name: str
-    ) -> Optional[Tuple[str, str]]:
-        """``(window_id, pane_id)`` a browser terminal must select before its input.
+    ) -> Tuple[List[str], Optional[Tuple[str, str]]]:
+        """The view argv and the ``(window_id, pane_id)`` its input must select.
 
-        Only a pane terminal has one: its window is shared with other agents'
-        panes, and keys go to whichever pane is active in that window.
+        Both come from ONE lookup, so the pane the WebSocket handler selects is
+        always the pane whose window the view links; a second lookup could
+        disagree (the pane exits in between) and leave input unselected. The
+        focus is None only for a terminal with a window of its own, whose view
+        holds nothing else. Raises ``TmuxLookupError`` when tmux cannot be read.
         """
-        return self._web_view_pane(session_name, terminal_name)
+        located = self._locate_web_view_pane(session_name, terminal_name)
+        if located is None:
+            return web_view_attach_argv(session_name, f"{session_name}:{terminal_name}"), None
+        return web_view_attach_argv(session_name, located[0]), located
 
     def select_pane(self, pane_id: str) -> None:
         """Make ``pane_id`` the active pane of its window.

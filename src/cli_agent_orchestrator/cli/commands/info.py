@@ -20,7 +20,7 @@ def _read_view_owner(view_name: str) -> Optional[str]:
     """The agent session a browser view session belongs to, from its owner tag."""
     try:
         result = subprocess.run(
-            ["tmux", "show-options", "-v", "-t", view_name, WEB_VIEW_OWNER_OPTION],
+            ["tmux", "show-options", "-v", "-t", f"={view_name}", WEB_VIEW_OWNER_OPTION],
             capture_output=True,
             text=True,
             check=True,
