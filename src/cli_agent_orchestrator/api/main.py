@@ -12,6 +12,7 @@ import signal
 import stat
 import struct
 import subprocess
+import sys
 import termios
 import time
 import weakref
@@ -226,6 +227,11 @@ from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils import delegation, server_lock
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
+from cli_agent_orchestrator.utils.execution_host import (
+    ServerHostCodeRefused,
+    refuse_server_host_code,
+    remote_auth_refusal,
+)
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
@@ -1672,6 +1678,14 @@ def _sweep_workflow_runs_at_startup() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
+    # #745 Phase 1: the remote backend cannot serve an authenticated API yet (see
+    # remote_auth_refusal). Checked first, before logging is set up (which creates
+    # files), the signal hooks, the server lock, the runner token, the database or
+    # any listener, so a refused start writes nothing. Reported on stderr.
+    auth_refusal = remote_auth_refusal()
+    if auth_refusal is not None:
+        print(auth_refusal, file=sys.stderr, flush=True)
+        raise SystemExit(1)
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     # Scrub credential query params (``?access_token=`` / ``?ticket=``) from
@@ -2122,6 +2136,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(ServerHostCodeRefused)
+async def _server_host_code_refused(request: Request, exc: ServerHostCodeRefused) -> JSONResponse:
+    """409: under the remote backend, user code would run on this host (#745)."""
+    return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
 
 
 @app.exception_handler(RequestValidationError)
@@ -7614,6 +7634,9 @@ async def submit_workflow_run_endpoint(
     # any insert so a rejected run leaves NO durable row and NO 202; (5) the awaited
     # HARD durable insert; (6) the in-process record C2 will drive.
     if isinstance(spec, ScriptSpec):
+        # Refused before the insert, like every gate here, so no 202 or RUNNING
+        # row exists for a script this server will not run (#745).
+        refuse_server_host_code("workflow script run")
         root = _script_root(body.working_directory)
         # Step 4 — script lint gate (OR-2): a lint fail -> 422 with a findings body,
         # in the handler's validation phase (never deferred into the background
@@ -10675,6 +10698,8 @@ async def run_flow(
     try:
         executed = await flow_service.execute_flow(name)
         return {"executed": executed}
+    except ServerHostCodeRefused as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

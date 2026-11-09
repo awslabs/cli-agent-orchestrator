@@ -73,6 +73,7 @@ from cli_agent_orchestrator.services.workflow_service import (
     bound_caller,
     run_registry,
 )
+from cli_agent_orchestrator.utils.execution_host import refuse_server_host_code
 
 logger = logging.getLogger(__name__)
 
@@ -1384,6 +1385,9 @@ async def run_script_workflow(
     # (shared validator, mirrors base start_run at workflow_service.py:713). A
     # traversal run_id would flow into the resume snapshot path and exec — reject
     # at the earliest boundary. Raises ValueError (-> 400) at the U5 boundary. ---
+    # A script is a subprocess of this process, on the server's host: under the
+    # remote backend it is refused before anything is linted, journaled or spawned.
+    refuse_server_host_code("workflow script run")
     _validate_key_part(run_id, "run_id")
 
     # --- Step 0: lint gate (M2 on the run path, US-B4 AC-1, BR-1) ---
@@ -1559,6 +1563,9 @@ async def run_script_workflow_prepared(
     blocking run. The ``finally`` clears the ``_active_drives`` liveness mark on
     EVERY exit path so a settled run stays resumable.
     """
+    # The async submission refuses before journaling (see its handler); this is
+    # the backstop, still before anything is spawned.
+    refuse_server_host_code("workflow script run")
     _active_drives.add(record.run_id)
     try:
         return await _drive_frozen(record, source, env, working_directory=working_directory)
@@ -1615,6 +1622,9 @@ async def resume_script_run(
     supplies decisions gets a ``ValueError`` for an unknown ``step_id`` or value
     (BR-6), which the resume route's existing bare-``ValueError`` arm maps to 400.
     """
+    # A script is a subprocess of this process, on the server's host: under the
+    # remote backend a resume is refused before anything is admitted or spawned.
+    refuse_server_host_code("workflow script resume")
     from cli_agent_orchestrator.services.workflow_service import update_run_generation
 
     # --- Gate 0: validate the run_id key BEFORE any journal/registry/path use

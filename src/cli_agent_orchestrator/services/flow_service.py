@@ -36,6 +36,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
     should_retain_deferred_failure_tombstone,
 )
+from cli_agent_orchestrator.utils.execution_host import refuse_server_host_code
 from cli_agent_orchestrator.utils.template import render_template
 
 logger = logging.getLogger(__name__)
@@ -244,6 +245,10 @@ async def execute_flow(name: str) -> bool:
         if not flow.script:
             output = {"execute": True, "output": {}}
         else:
+            # Under the remote backend the pre-script would run on this host,
+            # not on a runner (#745). Refused here, after the schedule was
+            # advanced, so the daemon does not retry it on every poll.
+            refuse_server_host_code(f"flow {name!r}: its pre-script")
             # Execute script
             script_path = Path(flow.script)
             if not script_path.is_absolute():
