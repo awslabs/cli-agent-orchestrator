@@ -982,6 +982,11 @@ async def send_message(
     the terminal that created this one via handoff/assign. This is the
     reliable way to send results back to your supervisor.
 
+    Any message from a worker to the terminal waiting on it counts as the
+    reply and ends that wait, including a progress note or a question; if
+    the worker then goes idle without a final reply, nothing more is
+    forwarded to the caller.
+
     An explicit receiver_id must be one of: a terminal you created via
     assign/handoff, the terminal that created you, or (when your profile
     grants the 'discovery' tool) a sibling that list_siblings returns for

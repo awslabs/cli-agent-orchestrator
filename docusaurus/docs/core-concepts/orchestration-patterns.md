@@ -96,6 +96,9 @@ assignment when the worker is created, and once the task has been delivered it w
   `[CAO worker ended]` notice, with the worker's last response when it can still be read.
 - A worker that is waiting on a sub-worker it assigned is not forwarded until that sub-worker has
   replied.
+- Any message from the worker to the supervisor counts as the reply and closes the wait, including a
+  progress note or a question. If the worker then goes idle without a final reply, nothing more is
+  forwarded.
 - A worker whose profile has no `cao-mcp-server` cannot call `send_message`. The assign result says
   so, the task text omits the reply instruction, and the last response is forwarded when the worker
   goes idle.
