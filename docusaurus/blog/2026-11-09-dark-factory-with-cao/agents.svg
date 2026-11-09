@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="560" viewBox="0 0 1000 560" role="img" aria-labelledby="title desc">
+  <title id="title">The three agents and their workers</title>
+  <desc id="desc">The user talks only to the conductor, one question at a time. The conductor exchanges CAO messages with the PR shepherd, which looks after the user's own pull requests, and with the PR reviewer, which reviews other people's pull requests. The shepherd creates, checks and deletes short-lived workers: a fixer, a main-merger, a pre-push reviewer, and a publisher or armer. A zero-token poll loop wakes the shepherd only on real events.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-grey" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#64748b"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: 1.5px; fill: #64748b; }
+      .box-title { font-size: 16px; font-weight: 700; fill: #0f172a; }
+      .box-copy { font-size: 13px; fill: #475569; }
+      .label { font-size: 12px; font-weight: 700; fill: #1d4ed8; }
+    </style>
+  </defs>
+
+  <rect width="1000" height="560" fill="#ffffff"/>
+  <text class="eyebrow" x="40" y="36">ONE CONVERSATION, EVERYTHING ELSE REPORTS UP</text>
+
+  <!-- User -->
+  <rect x="380" y="56" width="240" height="56" rx="14" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text class="box-title" x="500" y="81" text-anchor="middle">You (phone or terminal)</text>
+  <text class="box-copy" x="500" y="100" text-anchor="middle">one question at a time</text>
+
+  <path d="M500 112V148" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- Conductor -->
+  <rect x="340" y="152" width="320" height="76" rx="14" fill="#f8fafc" stroke="#0f172a" stroke-width="2"/>
+  <text class="box-title" x="500" y="180" text-anchor="middle">Conductor</text>
+  <text class="box-copy" x="500" y="200" text-anchor="middle">plans, delegates, verifies every result,</text>
+  <text class="box-copy" x="500" y="217" text-anchor="middle">edits standing OKs only on your words</text>
+
+  <!-- Links to shepherd and reviewer -->
+  <path d="M420 228L270 284" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <path d="M580 228L730 284" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text class="label" x="290" y="250">CAO messages</text>
+  <text class="label" x="640" y="250">CAO messages</text>
+
+  <!-- Shepherd -->
+  <rect x="80" y="288" width="320" height="72" rx="14" fill="#f8fafc" stroke="#0f172a" stroke-width="2"/>
+  <text class="box-title" x="240" y="315" text-anchor="middle">PR shepherd</text>
+  <text class="box-copy" x="240" y="336" text-anchor="middle">your own open PRs, until they merge</text>
+
+  <!-- Reviewer -->
+  <rect x="600" y="288" width="320" height="72" rx="14" fill="#f8fafc" stroke="#0f172a" stroke-width="2"/>
+  <text class="box-title" x="760" y="315" text-anchor="middle">PR reviewer</text>
+  <text class="box-copy" x="760" y="336" text-anchor="middle">other people's PRs</text>
+
+  <!-- Workers -->
+  <path d="M240 360V392" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow-grey)"/>
+  <text class="box-copy" x="252" y="382">creates, checks, deletes</text>
+  <rect x="40" y="396" width="560" height="64" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="box-title" x="60" y="421">Short-lived workers</text>
+  <text class="box-copy" x="60" y="443">fixer, main-merger · pre-push reviewer · publisher or armer</text>
+
+  <!-- Poll loop -->
+  <rect x="40" y="484" width="400" height="52" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text class="box-title" x="60" y="507">Poll loop</text>
+  <text class="box-copy" x="60" y="526">zero tokens; wakes the shepherd on real events</text>
+  <path d="M460 510C560 510 560 330 404 326" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow-grey)"/>
+  <text class="box-copy" x="560" y="500">wake</text>
+</svg>
