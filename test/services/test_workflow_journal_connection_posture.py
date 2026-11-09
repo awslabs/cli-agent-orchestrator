@@ -517,6 +517,36 @@ class TestASilentMigrationFailureIsNotCached:
 # ---------------------------------------------------------------------------
 # BR-7 — the observable contract is unchanged for every existing caller.
 # ---------------------------------------------------------------------------
+def test_a_failing_pragma_closes_the_connection_and_propagates(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``_connect`` closes its connection when the busy_timeout pragma fails.
+
+    The connection never reaches a caller, so nobody else could close it.
+    """
+    _connect().close()  # migrate this path first, outside the patch
+    opened = []
+    real_connect = sqlite3.connect
+
+    class _PragmaFails(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if sql.startswith("PRAGMA busy_timeout"):
+                raise sqlite3.OperationalError("simulated pragma failure")
+            return super().execute(sql, *args)
+
+    def connect(path, *args, **kwargs):
+        conn = real_connect(path, *args, factory=_PragmaFails, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(workflow_journal.sqlite3, "connect", connect)
+    with pytest.raises(sqlite3.OperationalError, match="simulated pragma failure"):
+        _connect()
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")  # closed
+
+
 def test_connect_signature_unchanged(db_path: Path):
     signature = inspect.signature(_connect)
     assert signature.parameters == {}

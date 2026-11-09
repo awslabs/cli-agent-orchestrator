@@ -64,6 +64,7 @@ from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.kiro_engine import canonical_kiro_engine
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -1364,7 +1365,7 @@ def _migrate_add_handoff_results() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS handoff_results (
                     job_id TEXT PRIMARY KEY,
@@ -1394,7 +1395,7 @@ def _migrate_decision_records_target_kind() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(decision_records)")
             columns = {row[1] for row in cursor.fetchall()}
             if columns and "target_kind" not in columns:
@@ -1424,7 +1425,7 @@ def _migrate_decision_records_provider_route() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(decision_records)")
             columns = {row[1] for row in cursor.fetchall()}
             if not columns:
@@ -1454,7 +1455,7 @@ def _migrate_project_aliases_schema() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             row = conn.execute(
                 "SELECT name FROM sqlite_master " "WHERE type='table' AND name='project_aliases'"
             ).fetchone()
@@ -1480,7 +1481,7 @@ def _migrate_memory_indexes() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_metadata (scope, scope_id)"
             )
@@ -1507,7 +1508,7 @@ def _migrate_memory_source_kind() -> None:
 
     expected_unique_columns = ("key", "scope", "scope_id", "source_kind")
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             table_exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_metadata'"
             ).fetchone()
@@ -1595,7 +1596,7 @@ def _migrate_add_access_count() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(memory_metadata)")
             columns = {row[1] for row in cursor.fetchall()}
             if "access_count" not in columns:
@@ -1622,7 +1623,7 @@ def _migrate_add_last_compiled_at() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(memory_metadata)")
             columns = {row[1] for row in cursor.fetchall()}
             if "last_compiled_at" not in columns:
@@ -1646,7 +1647,7 @@ def _migrate_add_related_keys() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(memory_metadata)")
             columns = {row[1] for row in cursor.fetchall()}
             if "related_keys" not in columns:
@@ -1675,7 +1676,7 @@ def _migrate_memory_relationships() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS memory_relationships ("
                 "id TEXT PRIMARY KEY, "
@@ -1760,7 +1761,7 @@ def _migrate_workflow_plan_approval() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_plan_approval ("
                 "plan_id TEXT PRIMARY KEY, "
@@ -1847,7 +1848,7 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
                             "index is absent from sqlite_master"
                         )
             return
-        with sqlite3.connect(target) as conn:
+        with closing_transaction(sqlite3.connect(target)) as conn:
             duplicates = conn.execute(
                 "SELECT key, scope, source_kind, COUNT(*) FROM memory_metadata "
                 "WHERE scope_id IS NULL GROUP BY key, scope, source_kind HAVING COUNT(*) > 1"
@@ -1897,7 +1898,7 @@ def _migrate_vault_exclusions() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS vault_exclusion ("
                 "vault_id VARCHAR NOT NULL, "
@@ -1939,7 +1940,7 @@ def _migrate_vault_migration_receipts() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             columns = conn.execute("PRAGMA table_info(vault_migration_receipt)").fetchall()
             if columns:
                 return
@@ -1972,7 +1973,7 @@ def _migrate_vault_key_provenance() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             for table in ("vault_note", "vault_exclusion"):
                 table_exists = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -2132,7 +2133,7 @@ def _migrate_workflow_index() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             row = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_index'"
             ).fetchone()
@@ -2216,7 +2217,7 @@ def _migrate_workflow_run() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_run ("
                 "run_id TEXT PRIMARY KEY, "
@@ -2328,7 +2329,7 @@ def _migrate_workflow_run_step() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_run_step ("
                 "run_id TEXT NOT NULL, "
@@ -2385,7 +2386,7 @@ def _migrate_workflow_outcome_indexes() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_outcome_session "
                 "ON workflow_outcomes (session_name, created_at)"
@@ -2422,7 +2423,7 @@ def _migrate_workflow_run_event() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_run_event ("
                 "run_id TEXT NOT NULL, "
@@ -2471,7 +2472,7 @@ def _migrate_workflow_run_seq() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_run_seq ("
                 "run_id TEXT PRIMARY KEY, "
@@ -2505,7 +2506,7 @@ def _migrate_workflow_run_indexes() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_workflow_run_started_at "
                 "ON workflow_run (started_at)"
@@ -2524,98 +2525,99 @@ def _migrate_terminals_schema() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        conn = sqlite3.connect(str(DATABASE_FILE))
-        cursor = conn.execute("PRAGMA table_info(terminals)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "description" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN description TEXT")
-            conn.commit()
-            logger.info("Migration: added description column to terminals table")
-        if "allowed_tools" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
-            conn.commit()
-            logger.info("Migration: added allowed_tools column to terminals table")
-        if "shell_command" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
-            conn.commit()
-            logger.info("Migration: added shell_command column to terminals table")
-        if "caller_id" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
-            conn.commit()
-            logger.info("Migration: added caller_id column to terminals table")
-        if "engine" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN engine TEXT")
-            conn.commit()
-            logger.info("Migration: added engine column to terminals table")
-        if "provider_variant" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN provider_variant TEXT")
-            conn.commit()
-            logger.info("Migration: added provider_variant column to terminals table")
-        if "group" not in columns:
-            # "group" is a SQL reserved word in some dialects but not SQLite;
-            # quoted defensively so this ALTER survives if that ever changes.
-            conn.execute('ALTER TABLE terminals ADD COLUMN "group" TEXT')
-            conn.commit()
-            logger.info("Migration: added group column to terminals table")
-        if "metadata" not in columns:
-            conn.execute('ALTER TABLE terminals ADD COLUMN "metadata" TEXT')
-            conn.commit()
-            logger.info("Migration: added metadata column to terminals table")
-        if "working_directory" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
-            conn.commit()
-            logger.info("Migration: added working_directory column to terminals table")
-        if "deferred_init_failure" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN deferred_init_failure TEXT")
-            conn.commit()
-            logger.info("Migration: added deferred_init_failure column to terminals table")
-        if "initial_delivery" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN initial_delivery TEXT")
-            conn.commit()
-            logger.info("Migration: added initial_delivery column to terminals table")
-        if "deferred_init_external_owner" not in columns:
-            conn.execute(
-                "ALTER TABLE terminals ADD COLUMN deferred_init_external_owner "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-            conn.commit()
-            logger.info("Migration: added deferred_init_external_owner column to terminals table")
-        if "deferred_init_runtime_reclaimed" not in columns:
-            conn.execute(
-                "ALTER TABLE terminals ADD COLUMN deferred_init_runtime_reclaimed "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-            conn.commit()
-            logger.info(
-                "Migration: added deferred_init_runtime_reclaimed column to terminals table"
-            )
-        if "session_incarnation_id" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN session_incarnation_id TEXT")
-            conn.commit()
-            logger.info("Migration: added session_incarnation_id column to terminals table")
-        if "model" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN model TEXT")
-            conn.commit()
-            logger.info("Migration: added model column to terminals table")
-        if "model_honored" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
-            conn.commit()
-            logger.info("Migration: added model_honored column to terminals table")
-        if "delegate_tools" not in columns:
-            # Nullable on purpose: rows from before the column have no recorded
-            # ceiling and read back as None, which create_terminal treats as
-            # "bounded by its own allowed_tools" (utils/delegation.ceiling_from_row).
-            conn.execute("ALTER TABLE terminals ADD COLUMN delegate_tools TEXT")
-            conn.commit()
-            logger.info("Migration: added delegate_tools column to terminals table")
-        if "identity_verified" not in columns:
-            # Nullable with no default (#1074): existing rows read back NULL, a
-            # legacy row, never False, so a Kiro pane running across the upgrade
-            # is not mistaken for one this version created and failed to verify.
-            conn.execute("ALTER TABLE terminals ADD COLUMN identity_verified BOOLEAN")
-            conn.commit()
-            logger.info("Migration: added identity_verified column to terminals table")
-        conn.close()
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
+            cursor = conn.execute("PRAGMA table_info(terminals)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "description" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN description TEXT")
+                conn.commit()
+                logger.info("Migration: added description column to terminals table")
+            if "allowed_tools" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
+                conn.commit()
+                logger.info("Migration: added allowed_tools column to terminals table")
+            if "shell_command" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
+                conn.commit()
+                logger.info("Migration: added shell_command column to terminals table")
+            if "caller_id" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
+                conn.commit()
+                logger.info("Migration: added caller_id column to terminals table")
+            if "engine" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN engine TEXT")
+                conn.commit()
+                logger.info("Migration: added engine column to terminals table")
+            if "provider_variant" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN provider_variant TEXT")
+                conn.commit()
+                logger.info("Migration: added provider_variant column to terminals table")
+            if "group" not in columns:
+                # "group" is a SQL reserved word in some dialects but not SQLite;
+                # quoted defensively so this ALTER survives if that ever changes.
+                conn.execute('ALTER TABLE terminals ADD COLUMN "group" TEXT')
+                conn.commit()
+                logger.info("Migration: added group column to terminals table")
+            if "metadata" not in columns:
+                conn.execute('ALTER TABLE terminals ADD COLUMN "metadata" TEXT')
+                conn.commit()
+                logger.info("Migration: added metadata column to terminals table")
+            if "working_directory" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
+                conn.commit()
+                logger.info("Migration: added working_directory column to terminals table")
+            if "deferred_init_failure" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN deferred_init_failure TEXT")
+                conn.commit()
+                logger.info("Migration: added deferred_init_failure column to terminals table")
+            if "initial_delivery" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN initial_delivery TEXT")
+                conn.commit()
+                logger.info("Migration: added initial_delivery column to terminals table")
+            if "deferred_init_external_owner" not in columns:
+                conn.execute(
+                    "ALTER TABLE terminals ADD COLUMN deferred_init_external_owner "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.commit()
+                logger.info(
+                    "Migration: added deferred_init_external_owner column to terminals table"
+                )
+            if "deferred_init_runtime_reclaimed" not in columns:
+                conn.execute(
+                    "ALTER TABLE terminals ADD COLUMN deferred_init_runtime_reclaimed "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.commit()
+                logger.info(
+                    "Migration: added deferred_init_runtime_reclaimed column to terminals table"
+                )
+            if "session_incarnation_id" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN session_incarnation_id TEXT")
+                conn.commit()
+                logger.info("Migration: added session_incarnation_id column to terminals table")
+            if "model" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN model TEXT")
+                conn.commit()
+                logger.info("Migration: added model column to terminals table")
+            if "model_honored" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
+                conn.commit()
+                logger.info("Migration: added model_honored column to terminals table")
+            if "delegate_tools" not in columns:
+                # Nullable on purpose: rows from before the column have no recorded
+                # ceiling and read back as None, which create_terminal treats as
+                # "bounded by its own allowed_tools" (utils/delegation.ceiling_from_row).
+                conn.execute("ALTER TABLE terminals ADD COLUMN delegate_tools TEXT")
+                conn.commit()
+                logger.info("Migration: added delegate_tools column to terminals table")
+            if "identity_verified" not in columns:
+                # Nullable with no default (#1074): existing rows read back NULL, a
+                # legacy row, never False, so a Kiro pane running across the upgrade
+                # is not mistaken for one this version created and failed to verify.
+                conn.execute("ALTER TABLE terminals ADD COLUMN identity_verified BOOLEAN")
+                conn.commit()
+                logger.info("Migration: added identity_verified column to terminals table")
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 

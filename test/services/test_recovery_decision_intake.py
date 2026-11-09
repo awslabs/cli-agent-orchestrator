@@ -62,6 +62,7 @@ import logging
 import sqlite3
 import subprocess
 import sys
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -87,6 +88,7 @@ from cli_agent_orchestrator.services.step_replay import ReplayVerdict, decide
 from cli_agent_orchestrator.services.step_result import serialise_envelope
 from cli_agent_orchestrator.services.workflow_errors import HaltRule
 from cli_agent_orchestrator.services.workflow_journal import apply_decisions
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 RUN = "run-1"
 STEP = "call-1"
@@ -108,6 +110,10 @@ RESULT_JSON = serialise_envelope(ENVELOPE)
 # A resumable script run's snapshot: ``resume_script_run``'s gate 4 needs a JSON object
 # carrying a string ``source``, and nothing in these tests ever executes it.
 SNAPSHOT = json.dumps({"source": "def main():\n    pass\n"})
+
+
+# Python 3.13 warns when it finalizes an unclosed sqlite3 connection.
+pytestmark = pytest.mark.filterwarnings("error::ResourceWarning")
 
 
 @pytest.fixture(autouse=True)
@@ -165,10 +171,11 @@ def client() -> TestClient:
     return TestClient(app, base_url="http://localhost")
 
 
-def _direct_connect() -> sqlite3.Connection:
+def _direct_connect() -> AbstractContextManager[sqlite3.Connection]:
+    """A direct connection for one block: committed (or rolled back), then closed."""
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
-    return sqlite3.connect(str(DATABASE_FILE))
+    return closing_transaction(sqlite3.connect(str(DATABASE_FILE)))
 
 
 def _db_path() -> str:
