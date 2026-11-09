@@ -200,6 +200,12 @@ class TerminalModel(Base):
     model = Column(String, nullable=True)  # resolved per-launch model; NULL = provider default
     model_honored = Column(Boolean, nullable=True)  # NULL = unknown for pre-migration rows
     working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
+    # The cao-runner hosting this terminal under the remote terminal backend
+    # (#745); NULL for a terminal on this host. The durable half of the runner
+    # hub's routing: a restarted server knows which runner owns a terminal
+    # before that runner reconnects. Its own column rather than a metadata key,
+    # because an agent can rewrite its metadata but must not move its placement.
+    runner_id = Column(String, nullable=True)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     # JSON-encoded delegation ceiling: the most this terminal may grant to the
     # children it creates (utils/delegation.py). Capped by the creator's own
@@ -2618,6 +2624,10 @@ def _migrate_terminals_schema() -> None:
                 conn.execute("ALTER TABLE terminals ADD COLUMN identity_verified BOOLEAN")
                 conn.commit()
                 logger.info("Migration: added identity_verified column to terminals table")
+            if "runner_id" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN runner_id TEXT")
+                conn.commit()
+                logger.info("Migration: added runner_id column to terminals table")
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
@@ -2682,6 +2692,7 @@ def create_terminal(
     description: Optional[str] = None,
     delegate_tools: Optional[List[str]] = None,
     identity_verified: Optional[bool] = None,
+    runner_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -2735,6 +2746,7 @@ def create_terminal(
             model=model,
             model_honored=model_honored,
             working_directory=working_directory,
+            runner_id=runner_id,
             # ``[]`` is an explicit deny-all and must round-trip as ``[]``: a
             # falsiness test stores it as SQL NULL, and every reader treats
             # NULL as "nothing resolved", which is unrestricted.
@@ -3321,6 +3333,31 @@ def list_siblings_by_group_prefix(
                     }
                 )
         return siblings
+
+
+def get_terminal_runner(terminal_id: str) -> Optional[str]:
+    """The cao-runner recorded for ``terminal_id`` (#745), or None."""
+    with SessionLocal() as db:
+        row = db.query(TerminalModel.runner_id).filter(TerminalModel.id == terminal_id).first()
+        return row[0] if row else None
+
+
+def list_runner_placements() -> List[Dict[str, str]]:
+    """Every terminal recorded on a cao-runner: id, session, window and runner."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(
+                TerminalModel.id,
+                TerminalModel.tmux_session,
+                TerminalModel.tmux_window,
+                TerminalModel.runner_id,
+            )
+            .filter(TerminalModel.runner_id.isnot(None))
+            .all()
+        )
+        return [
+            {"id": r[0], "tmux_session": r[1], "tmux_window": r[2], "runner_id": r[3]} for r in rows
+        ]
 
 
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:

@@ -10,7 +10,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -191,6 +191,24 @@ class StatusMonitor:
         # stale screen redraw.
         self._buffer_epochs: Dict[str, int] = {}
         self._last_status: Dict[str, TerminalStatus] = {}
+        # Terminals whose execution host is out of reach (remote backend, #745).
+        # Their last detected status is a statement about a pane nobody can see
+        # any more: it is reported as UNKNOWN until the host reports back, never
+        # as the stale PROCESSING/IDLE it last was. Empty for local backends.
+        self._unreachable: set = set()
+        # Terminals whose output stream lost bytes (remote backend, #745): a
+        # runner pipe overflowed or skipped a sequence number, or an output
+        # event for a tracked terminal was dropped on the bus. Detection may be
+        # built on incomplete output, so status reads UNKNOWN until a resync
+        # (resync_from_snapshot) has been processed. The value is the gap's
+        # generation: a gap during a resync keeps the latch set.
+        self._stream_gap: Dict[str, int] = {}
+        self._stream_gap_generation: int = 0
+        # Terminals whose dropped bus output events count as gaps; see
+        # track_stream_gaps. Local tmux terminals are not tracked.
+        self._gap_tracked: set = set()
+        # Called with a terminal id when a gap is latched, to start a resync.
+        self.on_stream_gap: Optional[Callable[[str], None]] = None
         # Generation in which PROCESSING was last established from provider
         # output/screen evidence. A cached PROCESSING latch can survive
         # notify_input_sent() into the next turn, so the status value alone is
@@ -337,7 +355,7 @@ class StatusMonitor:
         # Capture the loop up front, on the loop thread, so the debounce timers
         # scheduled from the worker thread can be marshaled back onto it.
         self._loop = asyncio.get_running_loop()
-        queue = bus.subscribe("terminal.*.output")
+        queue = bus.subscribe("terminal.*.output", on_drop=self._on_output_dropped)
         logger.info("StatusMonitor started")
 
         while True:
@@ -1100,6 +1118,10 @@ class StatusMonitor:
         if get_backend().supports_event_inbox():
             return StatusObservation(status, None)
         with self._lock:
+            if terminal_id in self._unreachable or terminal_id in self._stream_gap:
+                return StatusObservation(
+                    TerminalStatus.UNKNOWN, self._status_generation.get(terminal_id, 0)
+                )
             if terminal_id not in self._last_status:
                 # No detection has ever been applied/stamped for this terminal --
                 # there is no turn stamp to pair, so trust whatever get_status()
@@ -1228,9 +1250,104 @@ class StatusMonitor:
             logger.error(f"Error detecting status for {terminal_id}: {e}")
             return TerminalStatus.UNKNOWN
 
+    def set_unreachable(self, terminal_id: str, unreachable: bool) -> None:
+        """Mark a terminal's execution host out of (or back in) reach.
+
+        While marked, every status read answers UNKNOWN; the detector's own
+        state is kept, so clearing the mark restores whatever it last derived.
+        Each change is published, so a waiter blocked on a status topic wakes up
+        and re-reads instead of trusting the value it saw before.
+        """
+        with self._lock:
+            if unreachable:
+                if terminal_id in self._unreachable:
+                    return
+                self._unreachable.add(terminal_id)
+                published = TerminalStatus.UNKNOWN
+            else:
+                if terminal_id not in self._unreachable:
+                    return
+                self._unreachable.discard(terminal_id)
+                published = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+        bus.publish(f"terminal.{terminal_id}.status", {"status": published.value})
+
+    def track_stream_gaps(self, terminal_id: str) -> None:
+        """Treat a dropped output event for ``terminal_id`` as a gap in its stream."""
+        with self._lock:
+            self._gap_tracked.add(terminal_id)
+
+    def _on_output_dropped(self, topic: str) -> None:
+        terminal_id = terminal_id_from_topic(topic)
+        with self._lock:
+            tracked = terminal_id in self._gap_tracked
+        if tracked:
+            self.mark_stream_gap(terminal_id)
+
+    def mark_stream_gap(self, terminal_id: str) -> int:
+        """Latch a gap in ``terminal_id``'s output stream; its status reads UNKNOWN.
+
+        Returns the gap's generation. Publishes UNKNOWN on the first gap, so a
+        waiter re-reads, and asks ``on_stream_gap`` for a resync.
+        """
+        with self._lock:
+            self._stream_gap_generation += 1
+            generation: int = self._stream_gap_generation
+            first = terminal_id not in self._stream_gap
+            self._stream_gap[terminal_id] = generation
+            hook = self.on_stream_gap
+        if first:
+            logger.warning(f"output stream of terminal {terminal_id} has a gap; status UNKNOWN")
+            bus.publish(f"terminal.{terminal_id}.status", {"status": TerminalStatus.UNKNOWN.value})
+        if hook is not None:
+            try:
+                hook(terminal_id)
+            except Exception:  # noqa: BLE001 - the latch holds; the next gap retries
+                logger.exception(f"could not start a resync for terminal {terminal_id}")
+        return generation
+
+    def stream_gap_generation(self, terminal_id: str) -> Optional[int]:
+        """The generation of ``terminal_id``'s latched gap, or None if it has none."""
+        with self._lock:
+            return self._stream_gap.get(terminal_id)
+
+    def resync_from_snapshot(self, terminal_id: str, snapshot: str, generation: int) -> bool:
+        """Process a fresh pane snapshot and clear the gap latch it answers.
+
+        The snapshot is processed here, synchronously, not published on the bus
+        (where it could be dropped too). The latch is cleared only if no newer
+        gap was latched since ``generation`` was read; True when cleared.
+        """
+        self._process_chunk(terminal_id, snapshot)
+        # Detected now, under the usual latch rules, rather than at the next
+        # quiescence: clearing the latch must not expose the status that was
+        # derived from the stream before it lost bytes.
+        with self._lock:
+            buffer = self._buffers.get(terminal_id, "")
+            capture_generation = self._capture_generation.get(terminal_id, 0)
+        self._apply_detection(
+            terminal_id,
+            self._detect_status(terminal_id, buffer),
+            capture_generation=capture_generation,
+        )
+        with self._lock:
+            if self._stream_gap.get(terminal_id) != generation:
+                return False
+            del self._stream_gap[terminal_id]
+            published = (
+                TerminalStatus.UNKNOWN
+                if terminal_id in self._unreachable
+                else self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            )
+        logger.info(f"output stream of terminal {terminal_id} resynced")
+        bus.publish(f"terminal.{terminal_id}.status", {"status": published.value})
+        return True
+
     def clear_terminal(self, terminal_id: str) -> None:
         """Free buffer and status for a deleted terminal."""
         with self._lock:
+            self._unreachable.discard(terminal_id)
+            self._stream_gap.pop(terminal_id, None)
+            self._gap_tracked.discard(terminal_id)
             self._buffers.pop(terminal_id, None)
             self._buffer_epochs.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
@@ -1303,6 +1420,9 @@ class StatusMonitor:
         """
         from cli_agent_orchestrator.backends.registry import get_backend
 
+        with self._lock:
+            if terminal_id in self._unreachable or terminal_id in self._stream_gap:
+                return TerminalStatus.UNKNOWN
         if get_backend().supports_event_inbox():
             try:
                 provider = provider_manager.get_provider(terminal_id)
