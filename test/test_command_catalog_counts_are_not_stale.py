@@ -162,6 +162,7 @@ def test_the_distribution_test_name_matches_its_assertions():
         "fiftyfive": 55,
         "sixtythree": 63,
         "sixtyseven": 67,
+        "seventy": 70,
         "five": 5,
         "sixteen": 16,
     }

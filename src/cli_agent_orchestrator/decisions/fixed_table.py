@@ -4,6 +4,7 @@ from typing import Any, ClassVar, Mapping
 
 from cli_agent_orchestrator.decisions.types import (
     POINTS,
+    ROUTE_POINTS,
     DecisionAnswer,
     DecisionRequest,
     DecisionResponse,
@@ -13,7 +14,8 @@ from cli_agent_orchestrator.decisions.types import (
 class FixedTableDecider:
     name: ClassVar[str] = "fixed_table"
     version: ClassVar[str] = "1"
-    points: ClassVar[frozenset[str]] = frozenset(POINTS)
+    # The launch-routing points only: the built-in table never gets the task features (#1199).
+    points: ClassVar[frozenset[str]] = frozenset(ROUTE_POINTS)
 
     async def decide(self, request: DecisionRequest, config: Mapping[str, Any]) -> DecisionResponse:
         answers = {}

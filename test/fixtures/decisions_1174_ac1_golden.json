@@ -1,0 +1,622 @@
+{
+ "all_on_routes": {
+  "plan": {
+   "effort": "high",
+   "model": "codex-large",
+   "provider": "codex",
+   "records": 3
+  },
+  "requests": [
+   {
+    "contract_version": 1,
+    "facts": {
+     "kind": "assign",
+     "message_bytes": 84,
+     "profile": null,
+     "profile_role": null,
+     "provider": "claude_code",
+     "use_worktree": false
+    },
+    "message": "Read the whole payments service and map every caller of the charge API. Report only.",
+    "options": [
+     "claude_code",
+     "codex"
+    ],
+    "points": [
+     "provider.route"
+    ],
+    "profile_description": "Reads a large codebase end to end and maps call paths",
+    "purpose": "code_reading"
+   },
+   {
+    "contract_version": 1,
+    "facts": {
+     "kind": "assign",
+     "message_bytes": 84,
+     "profile": null,
+     "profile_role": null,
+     "provider": "codex",
+     "use_worktree": false
+    },
+    "message": "Read the whole payments service and map every caller of the charge API. Report only.",
+    "options": null,
+    "points": [
+     "model.route"
+    ],
+    "profile_description": "Reads a large codebase end to end and maps call paths",
+    "purpose": "code_reading"
+   },
+   {
+    "contract_version": 1,
+    "facts": {
+     "kind": "assign",
+     "message_bytes": 84,
+     "profile": null,
+     "profile_role": null,
+     "provider": "codex",
+     "use_worktree": false
+    },
+    "message": "Read the whole payments service and map every caller of the charge API. Report only.",
+    "options": null,
+    "points": [
+     "effort.route"
+    ],
+    "profile_description": "Reads a large codebase end to end and maps call paths",
+    "purpose": "code_reading"
+   }
+  ],
+  "rows": [
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": "codex",
+    "applied_enforcement": "sandboxed",
+    "applied_value": "codex",
+    "candidate_model": null,
+    "candidate_value": "codex",
+    "confidence": 0.9,
+    "contract_version": 1,
+    "decider": "route_test",
+    "decider_version": "1",
+    "decision_status": "done",
+    "fallback_enforcement": "hard",
+    "fallback_source": "creator",
+    "fallback_value": "claude_code",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": [
+     "claude_code",
+     "codex"
+    ],
+    "outcome": "applied",
+    "point": "provider.route",
+    "probabilities": {
+     "codex": 0.9
+    },
+    "provider": "codex",
+    "reason": null,
+    "state": "on",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   },
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": "large",
+    "applied_enforcement": null,
+    "applied_value": "large",
+    "candidate_model": "codex-large",
+    "candidate_value": "large",
+    "confidence": 0.9,
+    "contract_version": 1,
+    "decider": "route_test",
+    "decider_version": "1",
+    "decision_status": "done",
+    "fallback_enforcement": null,
+    "fallback_source": "policy",
+    "fallback_value": "medium",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": null,
+    "outcome": "applied",
+    "point": "model.route",
+    "probabilities": {
+     "large": 0.9
+    },
+    "provider": "codex",
+    "reason": null,
+    "state": "on",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   },
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": "high",
+    "applied_enforcement": null,
+    "applied_value": "high",
+    "candidate_model": null,
+    "candidate_value": "high",
+    "confidence": 0.9,
+    "contract_version": 1,
+    "decider": "route_test",
+    "decider_version": "1",
+    "decision_status": "done",
+    "fallback_enforcement": null,
+    "fallback_source": "policy",
+    "fallback_value": "medium",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": null,
+    "outcome": "applied",
+    "point": "effort.route",
+    "probabilities": {
+     "high": 0.9
+    },
+    "provider": "codex",
+    "reason": null,
+    "state": "on",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   }
+  ]
+ },
+ "fresh_settings": {
+  "plan": {
+   "effort": null,
+   "model": "claude_code-medium",
+   "provider": null,
+   "records": 0
+  },
+  "requests": [],
+  "rows": []
+ },
+ "model_and_effort_only": {
+  "plan": {
+   "effort": "high",
+   "model": "claude_code-large",
+   "provider": null,
+   "records": 2
+  },
+  "requests": [
+   {
+    "contract_version": 1,
+    "facts": {
+     "kind": "assign",
+     "message_bytes": 84,
+     "profile": null,
+     "profile_role": null,
+     "provider": "claude_code",
+     "use_worktree": false
+    },
+    "message": "Read the whole payments service and map every caller of the charge API. Report only.",
+    "options": null,
+    "points": [
+     "model.route"
+    ],
+    "profile_description": "Reads a large codebase end to end and maps call paths",
+    "purpose": "code_reading"
+   },
+   {
+    "contract_version": 1,
+    "facts": {
+     "kind": "assign",
+     "message_bytes": 84,
+     "profile": null,
+     "profile_role": null,
+     "provider": "claude_code",
+     "use_worktree": false
+    },
+    "message": "Read the whole payments service and map every caller of the charge API. Report only.",
+    "options": null,
+    "points": [
+     "effort.route"
+    ],
+    "profile_description": "Reads a large codebase end to end and maps call paths",
+    "purpose": "code_reading"
+   }
+  ],
+  "rows": [
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": "large",
+    "applied_enforcement": null,
+    "applied_value": "large",
+    "candidate_model": "claude_code-large",
+    "candidate_value": "large",
+    "confidence": 0.9,
+    "contract_version": 1,
+    "decider": "route_test",
+    "decider_version": "1",
+    "decision_status": "done",
+    "fallback_enforcement": null,
+    "fallback_source": "policy",
+    "fallback_value": "medium",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": null,
+    "outcome": "applied",
+    "point": "model.route",
+    "probabilities": {
+     "large": 0.9
+    },
+    "provider": "claude_code",
+    "reason": null,
+    "state": "on",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   },
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": "high",
+    "applied_enforcement": null,
+    "applied_value": "high",
+    "candidate_model": null,
+    "candidate_value": "high",
+    "confidence": 0.9,
+    "contract_version": 1,
+    "decider": "route_test",
+    "decider_version": "1",
+    "decision_status": "done",
+    "fallback_enforcement": null,
+    "fallback_source": "policy",
+    "fallback_value": "medium",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": null,
+    "outcome": "applied",
+    "point": "effort.route",
+    "probabilities": {
+     "high": 0.9
+    },
+    "provider": "claude_code",
+    "reason": null,
+    "state": "on",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   }
+  ]
+ },
+ "provider_only": {
+  "plan": {
+   "effort": null,
+   "model": null,
+   "provider": "codex",
+   "records": 1
+  },
+  "requests": [
+   {
+    "contract_version": 1,
+    "facts": {
+     "kind": "assign",
+     "message_bytes": 84,
+     "profile": null,
+     "profile_role": null,
+     "provider": "claude_code",
+     "use_worktree": false
+    },
+    "message": "Read the whole payments service and map every caller of the charge API. Report only.",
+    "options": [
+     "claude_code",
+     "codex"
+    ],
+    "points": [
+     "provider.route"
+    ],
+    "profile_description": "Reads a large codebase end to end and maps call paths",
+    "purpose": "code_reading"
+   }
+  ],
+  "rows": [
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": "codex",
+    "applied_enforcement": "sandboxed",
+    "applied_value": "codex",
+    "candidate_model": null,
+    "candidate_value": "codex",
+    "confidence": 0.9,
+    "contract_version": 1,
+    "decider": "route_test",
+    "decider_version": "1",
+    "decision_status": "done",
+    "fallback_enforcement": "hard",
+    "fallback_source": "creator",
+    "fallback_value": "claude_code",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": [
+     "claude_code",
+     "codex"
+    ],
+    "outcome": "applied",
+    "point": "provider.route",
+    "probabilities": {
+     "codex": 0.9
+    },
+    "provider": "codex",
+    "reason": null,
+    "state": "on",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   }
+  ]
+ },
+ "provider_shadow_model_on": {
+  "plan": {
+   "effort": null,
+   "model": "claude_code-large",
+   "provider": null,
+   "records": 2
+  },
+  "requests": [
+   {
+    "contract_version": 1,
+    "facts": {
+     "kind": "assign",
+     "message_bytes": 84,
+     "profile": null,
+     "profile_role": null,
+     "provider": "claude_code",
+     "use_worktree": false
+    },
+    "message": "Read the whole payments service and map every caller of the charge API. Report only.",
+    "options": null,
+    "points": [
+     "model.route"
+    ],
+    "profile_description": "Reads a large codebase end to end and maps call paths",
+    "purpose": "code_reading"
+   },
+   {
+    "contract_version": 1,
+    "facts": {
+     "kind": "assign",
+     "message_bytes": 84,
+     "profile": null,
+     "profile_role": null,
+     "provider": "claude_code",
+     "use_worktree": false
+    },
+    "message": "Read the whole payments service and map every caller of the charge API. Report only.",
+    "options": [
+     "claude_code",
+     "codex"
+    ],
+    "points": [
+     "provider.route"
+    ],
+    "profile_description": "Reads a large codebase end to end and maps call paths",
+    "purpose": "code_reading"
+   }
+  ],
+  "rows": [
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": "codex",
+    "applied_enforcement": null,
+    "applied_value": null,
+    "candidate_model": null,
+    "candidate_value": "codex",
+    "confidence": 0.9,
+    "contract_version": 1,
+    "decider": "route_test",
+    "decider_version": "1",
+    "decision_status": "done",
+    "fallback_enforcement": "hard",
+    "fallback_source": "creator",
+    "fallback_value": "claude_code",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": [
+     "claude_code",
+     "codex"
+    ],
+    "outcome": "shadow",
+    "point": "provider.route",
+    "probabilities": {
+     "codex": 0.9
+    },
+    "provider": "claude_code",
+    "reason": null,
+    "state": "shadow",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   },
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": "large",
+    "applied_enforcement": null,
+    "applied_value": "large",
+    "candidate_model": "claude_code-large",
+    "candidate_value": "large",
+    "confidence": 0.9,
+    "contract_version": 1,
+    "decider": "route_test",
+    "decider_version": "1",
+    "decision_status": "done",
+    "fallback_enforcement": null,
+    "fallback_source": "policy",
+    "fallback_value": "medium",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": null,
+    "outcome": "applied",
+    "point": "model.route",
+    "probabilities": {
+     "large": 0.9
+    },
+    "provider": "claude_code",
+    "reason": null,
+    "state": "on",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   }
+  ]
+ },
+ "single_option": {
+  "plan": {
+   "effort": "high",
+   "model": "claude_code-large",
+   "provider": null,
+   "records": 3
+  },
+  "requests": [
+   {
+    "contract_version": 1,
+    "facts": {
+     "kind": "assign",
+     "message_bytes": 84,
+     "profile": null,
+     "profile_role": null,
+     "provider": "claude_code",
+     "use_worktree": false
+    },
+    "message": "Read the whole payments service and map every caller of the charge API. Report only.",
+    "options": null,
+    "points": [
+     "model.route"
+    ],
+    "profile_description": "Reads a large codebase end to end and maps call paths",
+    "purpose": "code_reading"
+   },
+   {
+    "contract_version": 1,
+    "facts": {
+     "kind": "assign",
+     "message_bytes": 84,
+     "profile": null,
+     "profile_role": null,
+     "provider": "claude_code",
+     "use_worktree": false
+    },
+    "message": "Read the whole payments service and map every caller of the charge API. Report only.",
+    "options": null,
+    "points": [
+     "effort.route"
+    ],
+    "profile_description": "Reads a large codebase end to end and maps call paths",
+    "purpose": "code_reading"
+   }
+  ],
+  "rows": [
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": null,
+    "applied_enforcement": null,
+    "applied_value": null,
+    "candidate_model": null,
+    "candidate_value": null,
+    "confidence": null,
+    "contract_version": 1,
+    "decider": null,
+    "decider_version": null,
+    "decision_status": "done",
+    "fallback_enforcement": "hard",
+    "fallback_source": "creator",
+    "fallback_value": "claude_code",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": [
+     "claude_code"
+    ],
+    "outcome": "fallback",
+    "point": "provider.route",
+    "probabilities": null,
+    "provider": "claude_code",
+    "reason": "single_option",
+    "state": "on",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   },
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": "large",
+    "applied_enforcement": null,
+    "applied_value": "large",
+    "candidate_model": "claude_code-large",
+    "candidate_value": "large",
+    "confidence": 0.9,
+    "contract_version": 1,
+    "decider": "route_test",
+    "decider_version": "1",
+    "decision_status": "done",
+    "fallback_enforcement": null,
+    "fallback_source": "policy",
+    "fallback_value": "medium",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": null,
+    "outcome": "applied",
+    "point": "model.route",
+    "probabilities": {
+     "large": 0.9
+    },
+    "provider": "claude_code",
+    "reason": null,
+    "state": "on",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   },
+   {
+    "agent_profile": "Ramones-code_reading-3f9a",
+    "answer": "high",
+    "applied_enforcement": null,
+    "applied_value": "high",
+    "candidate_model": null,
+    "candidate_value": "high",
+    "confidence": 0.9,
+    "contract_version": 1,
+    "decider": "route_test",
+    "decider_version": "1",
+    "decision_status": "done",
+    "fallback_enforcement": null,
+    "fallback_source": "policy",
+    "fallback_value": "medium",
+    "kind": "assign",
+    "launch_status": "pending",
+    "launched_model": null,
+    "message_bytes": 84,
+    "model_honored": null,
+    "options": null,
+    "outcome": "applied",
+    "point": "effort.route",
+    "probabilities": {
+     "high": 0.9
+    },
+    "provider": "claude_code",
+    "reason": null,
+    "state": "on",
+    "target_kind": "ephemeral",
+    "terminal_id": null
+   }
+  ]
+ }
+}

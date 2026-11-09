@@ -1285,6 +1285,11 @@ class EphemeralDecisionInputs:
     description: Optional[str]
     # #1099: CAO's options for a provider "auto" spec; None for every other spec.
     provider_options: Optional[ProviderOptions] = None
+    # #1199 (provisional): the tier resolved at create, which a local match never goes below
+    # without a size answer, and whether the stored grant has web_fetch, for the advisory
+    # needs_network hint. The engine never sends either to a decider.
+    launch_tier: Optional[str] = None
+    network_granted: Optional[bool] = None
 
 
 def _equivalent_set(settings: dict[str, Any], provider: str) -> list[str]:
@@ -1402,7 +1407,15 @@ def decision_inputs(
         # #1099 (provisional): provider.route is asked first; its fallback is the row's.
         states = {"provider.route": "auto", **states}
         options = provider_options(row, spec, settings)
-    return EphemeralDecisionInputs(states, policy, spec.purpose, spec.description, options)
+    return EphemeralDecisionInputs(
+        states,
+        policy,
+        spec.purpose,
+        spec.description,
+        options,
+        launch_tier=row["model_tier"],
+        network_granted="web_fetch" in row["effective_tools"],
+    )
 
 
 @dataclass(frozen=True)
