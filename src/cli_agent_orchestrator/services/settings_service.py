@@ -575,6 +575,109 @@ def get_server_settings() -> Dict[str, Any]:
     return dict(result)
 
 
+# Keep finished child agents (#1225 phase 1). Machine-wide and off by default; the
+# numbers are the proposal for workshop use and every one is operator-tunable.
+KEEP_FINISHED_SETTING = "terminal.keep_finished"
+KEEP_FINISHED_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "idle_window_minutes": 60,
+    "max_per_session": 5,
+    "on_cap": "teardown_oldest",
+}
+KEEP_FINISHED_ON_CAP_VALUES = ("teardown_oldest", "dont_keep")
+# Inclusive bounds. A window longer than a week, or more than 100 idle CLIs in one
+# session, is almost certainly a typo, and either would hold RAM for no one.
+KEEP_FINISHED_WINDOW_RANGE = (1, 10080)
+KEEP_FINISHED_CAP_RANGE = (1, 100)
+
+
+class KeepFinishedSettingsError(ValueError):
+    """``terminal.keep_finished`` in settings.json holds a value CAO refuses.
+
+    Raised at load time with a message that names the dotted key, what is allowed
+    and what was found. A ``ValueError`` so ``cao config set`` reports it as a clean
+    CLI error and writes nothing.
+    """
+
+
+class KeepFinishedSettings(NamedTuple):
+    """The validated ``terminal.keep_finished`` block (#1225 phase 1)."""
+
+    enabled: bool
+    idle_window_minutes: int
+    max_per_session: int
+    on_cap: str
+
+
+def _keep_finished_whole_number(key: str, value: Any, bounds: Tuple[int, int]) -> int:
+    low, high = bounds
+    # bool is an int subclass, and a float such as 1.5 is not a whole number of
+    # anything: both are refused rather than coerced.
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise KeepFinishedSettingsError(
+            f"{KEEP_FINISHED_SETTING}.{key} must be a whole number from {low} to {high} "
+            f"(got {value!r})"
+        )
+    return value
+
+
+def parse_keep_finished_block(block: Any) -> KeepFinishedSettings:
+    """Validate a ``terminal.keep_finished`` object; absent keys take their defaults.
+
+    Raises:
+        KeepFinishedSettingsError: the block is not an object, names an unknown key,
+            or holds a value of the wrong type or outside its range.
+    """
+    if block is None:
+        block = {}
+    if not isinstance(block, dict):
+        raise KeepFinishedSettingsError(
+            f"{KEEP_FINISHED_SETTING} must be an object with the keys "
+            f"{', '.join(KEEP_FINISHED_DEFAULTS)} (got {type(block).__name__})"
+        )
+    unknown = sorted(set(block) - set(KEEP_FINISHED_DEFAULTS))
+    if unknown:
+        raise KeepFinishedSettingsError(
+            f"{KEEP_FINISHED_SETTING} has unknown key(s) {', '.join(unknown)}; "
+            f"the known keys are {', '.join(KEEP_FINISHED_DEFAULTS)}"
+        )
+    merged = {**KEEP_FINISHED_DEFAULTS, **block}
+    enabled = merged["enabled"]
+    if not isinstance(enabled, bool):
+        raise KeepFinishedSettingsError(
+            f"{KEEP_FINISHED_SETTING}.enabled must be true or false (got {enabled!r})"
+        )
+    on_cap = merged["on_cap"]
+    if on_cap not in KEEP_FINISHED_ON_CAP_VALUES:
+        raise KeepFinishedSettingsError(
+            f"{KEEP_FINISHED_SETTING}.on_cap must be one of "
+            f"{', '.join(KEEP_FINISHED_ON_CAP_VALUES)} (got {on_cap!r})"
+        )
+    return KeepFinishedSettings(
+        enabled=enabled,
+        idle_window_minutes=_keep_finished_whole_number(
+            "idle_window_minutes", merged["idle_window_minutes"], KEEP_FINISHED_WINDOW_RANGE
+        ),
+        max_per_session=_keep_finished_whole_number(
+            "max_per_session", merged["max_per_session"], KEEP_FINISHED_CAP_RANGE
+        ),
+        on_cap=on_cap,
+    )
+
+
+def get_keep_finished_settings() -> KeepFinishedSettings:
+    """Read ``terminal.keep_finished`` from settings.json (no environment override).
+
+    Absent means the defaults, so off. An unreadable settings.json reads as absent,
+    like every other lenient setting. A present but invalid block RAISES
+    :class:`KeepFinishedSettingsError`; callers that make a keep decision catch it
+    and behave as off, so a typo can only ever give today's behaviour.
+    """
+    terminal = _load().get("terminal", {})
+    block = terminal.get("keep_finished") if isinstance(terminal, dict) else None
+    return parse_keep_finished_block(block)
+
+
 def get_max_terminals() -> Optional[int]:
     """Max terminals this node will track, or None for unlimited.
 
