@@ -14,16 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A hung FIFO-writer test fails in 10 seconds instead of holding CI** (#1251 follow-up).
   `test_stdin_closing_before_any_reader_ends_the_writer` called the writer in-process, so a
   regression to a blocking `open()` would have hung the pytest worker; it now runs the writer in
-  a daemon thread joined with a timeout. The Unit Tests job also gains `timeout-minutes: 60`, so
-  any hung test ends the job within an hour instead of GitHub's default of six.
+  a daemon thread joined with a timeout. The Unit Tests job and the CAO MCP Apps job, whose backend
+  coverage step runs the same suite, also gain `timeout-minutes: 60`, so any hung test ends the
+  job within an hour instead of GitHub's default of six.
 - **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
   the sidecar beside `opencode.json` could not be read as a grant record, `cao install
   --provider opencode_cli` started from an empty record and wrote it back, dropping every other
-  agent's recorded grants. It now leaves the file as it is, logs a warning that names it, and
-  does not record this agent's grants. The install still completes. Until the sidecar is
-  repaired and the agent reinstalled, a plugin server's grant is withdrawn by plugin-store
-  containment, and a profile server's grant (`cao-mcp-server*`, say) is left in place, the
-  conservative direction.
+  agent's recorded grants. It now leaves the file as it is, logs a warning that names it and
+  says to repair it by hand (deleting it drops every agent's recorded grants), and does not
+  record this agent's grants. The install still completes. A plugin server's grant
+  is still withdrawn by plugin-store containment. A reinstall after the sidecar is repaired
+  records the servers the profile then names; a profile server's grant (`cao-mcp-server*`,
+  say) that was added while the sidecar was damaged, and that the profile no longer names,
+  stays until you remove it by hand.
 - **`cao install` exits 1 when the install fails** (#1270). It printed `Error: <message>` and
   exited 0, so a script or CI step could not tell a failed install from a successful one. It
   now exits 1 with the same message on stderr, like the rest of the CLI. A script that relied

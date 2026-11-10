@@ -242,6 +242,14 @@ def _grant_record_path() -> Path:
     return OPENCODE_CONFIG_FILE.with_name(GRANT_RECORD_FILENAME)
 
 
+# Appended to every warning about a damaged sidecar (#1273 review). Deleting the
+# file is the easy repair and loses every agent's recorded grants, which is the
+# loss failing closed exists to prevent.
+GRANT_RECORD_REPAIR_HINT = (
+    "Repair the file by hand; deleting it drops the recorded grants of every agent."
+)
+
+
 def read_grant_record() -> Dict[str, Any]:
     """Load the grant sidecar, degrading to an empty record.
 
@@ -257,10 +265,19 @@ def read_grant_record() -> Dict[str, Any]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        logger.warning("opencode grant record at %s is unreadable (%s) — ignoring", path, exc)
+        logger.warning(
+            "opencode grant record at %s is unreadable (%s) — ignoring. %s",
+            path,
+            exc,
+            GRANT_RECORD_REPAIR_HINT,
+        )
         return dict(_EMPTY_GRANT_RECORD, agents={})
     if not isinstance(loaded, dict) or not isinstance(loaded.get("agents"), dict):
-        logger.warning("opencode grant record at %s has an unexpected shape — ignoring", path)
+        logger.warning(
+            "opencode grant record at %s has an unexpected shape — ignoring. %s",
+            path,
+            GRANT_RECORD_REPAIR_HINT,
+        )
         return dict(_EMPTY_GRANT_RECORD, agents={})
     return loaded
 
@@ -274,10 +291,11 @@ def _write_grant_record(record: Dict[str, Any]) -> None:
 
     Best effort, symmetrically with :func:`read_grant_record`. By the time this
     runs ``opencode.json`` has already been updated, so raising would report the
-    install as *failed* after the user-visible half succeeded — and the cost of a
-    lost sidecar is only that CAO falls back to the containment proof, which is
-    exactly the pre-sidecar behaviour. An unwritable sidecar must not be worse
-    than an absent one.
+    install as *failed* after the user-visible half succeeded. A lost sidecar
+    costs CAO the record: plugin servers' grants fall back to the containment
+    proof, the pre-sidecar behaviour, and a profile server's grant it wrote has
+    no proof left, so it stays if the profile later drops that server. An
+    unwritable sidecar must not be worse than an absent one.
     """
     path = _grant_record_path()
     temp_path = path.with_name(f".{path.name}.tmp")
@@ -311,10 +329,12 @@ def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
     warning naming it, and this agent's row goes unrecorded. Starting from the
     empty default instead would publish it over the damaged file and drop every
     other agent's row. The install still completes: ``opencode.json`` has been
-    written by then. Until the sidecar is repaired and the agent reinstalled, a
-    plugin server's grant is withdrawn by plugin-store containment, and a
-    profile server's grant (``cao-mcp-server*``, say) is left in place, which is
-    the conservative direction.
+    written by then. A plugin server's grant is still withdrawn by plugin-store
+    containment. A reinstall after the sidecar is repaired records the servers
+    the profile then names, so a profile server's grant (``cao-mcp-server*``,
+    say) that was added while the sidecar was damaged, and that the profile no
+    longer names, has no proof left and stays until it is removed by hand
+    (#1273 review).
     """
     desired = sorted(set(keys))
     # The write sits inside the try, as in record_mcp_entry, so the handler can
@@ -335,9 +355,12 @@ def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
     except GrantRecordUnreadableError as exc:
         logger.warning(
             "opencode grant record is unreadable (%s); leaving it as it is and not "
-            "recording the grants of agent %s",
+            "recording the grants of agent %s. A profile server's grant added now "
+            "stays until removed by hand if the profile drops that server before the "
+            "agent is reinstalled over a repaired file. %s",
             exc,
             agent_name,
+            GRANT_RECORD_REPAIR_HINT,
         )
 
 
@@ -421,7 +444,12 @@ def record_mcp_entry(name: str, config: Mapping[str, Any]) -> None:
         record["version"] = 1
         _write_grant_record(record)
     except GrantRecordUnreadableError as exc:
-        logger.warning("opencode grant record is unreadable (%s); not recording mcp.%s", exc, name)
+        logger.warning(
+            "opencode grant record is unreadable (%s); not recording mcp.%s. %s",
+            exc,
+            name,
+            GRANT_RECORD_REPAIR_HINT,
+        )
 
 
 def is_recorded_mcp_entry(name: str, config: Mapping[str, Any]) -> bool:
