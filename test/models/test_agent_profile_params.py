@@ -9,6 +9,7 @@ the JSON-Schema are held to the same rules in
 from __future__ import annotations
 
 import json
+import logging
 import random
 
 import pytest
@@ -20,6 +21,22 @@ from cli_agent_orchestrator.models.agent_profile import (
     param_declaration_problems,
 )
 from cli_agent_orchestrator.models.workflow import _has_placeholder
+from cli_agent_orchestrator.services.profile_validator import validate_frontmatter
+from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
+
+_MODEL_LOGGER = "cli_agent_orchestrator.models.agent_profile"
+
+# Every line break other than "\n" and "\r": the rest of what ``str.splitlines()`` splits on.
+OTHER_LINE_BREAKS = {
+    "VT": "\v",
+    "FF": "\f",
+    "FS": "\x1c",
+    "GS": "\x1d",
+    "RS": "\x1e",
+    "NEL": "\x85",
+    "LS": "\u2028",
+    "PS": "\u2029",
+}
 
 
 def _profile(params: object) -> AgentProfile:
@@ -212,13 +229,18 @@ class TestInvalidDeclarations:
         assert fragment in problems[0][1]
 
     @pytest.mark.parametrize("label", list(INVALID))
-    def test_the_model_refuses_each_one(self, label: str) -> None:
+    def test_the_model_drops_each_one_with_a_warning(
+        self, label: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The profile still loads, so an agent that worked before ``params`` still launches."""
         params, _path, fragment = INVALID[label]
 
-        with pytest.raises(ValidationError) as excinfo:
-            _profile(params)
+        with caplog.at_level(logging.WARNING, logger=_MODEL_LOGGER):
+            profile = _profile(params)
 
-        assert fragment in str(excinfo.value)
+        assert profile.params is None
+        assert "agent profile 'orders-agent': its params block is ignored" in caplog.text
+        assert fragment in caplog.text
 
     def test_problems_in_several_entries_are_all_reported_in_order(self) -> None:
         problems = param_declaration_problems(
@@ -304,6 +326,70 @@ class TestValidDeclarations:
         decl = ProfileParamDecl(type="int", default=3)
 
         assert _profile({"limit": decl}).params == {"limit": decl}
+
+
+class TestOneLine:
+    """ "One line" means no line break of any kind, not only no "\\n" or "\\r"."""
+
+    @pytest.mark.parametrize("line_break", OTHER_LINE_BREAKS.values(), ids=OTHER_LINE_BREAKS)
+    def test_a_default_enum_value_or_description_with_one_is_refused(self, line_break: str) -> None:
+        problems = param_declaration_problems(
+            {
+                "d": {"default": f"a{line_break}b"},
+                "e": {"enum": [f"a{line_break}b"]},
+                "t": {"description": f"a{line_break}b"},
+            }
+        )
+
+        assert problems == [
+            (("d", "default"), "param 'd': default must be one line (no line breaks)"),
+            (("e", "enum", 0), "param 'e': enum[0] must be one line (no line breaks)"),
+            (("t", "description"), "param 't': description must be one line (no line breaks)"),
+        ]
+
+    def test_a_tab_and_other_control_characters_are_not_line_breaks(self) -> None:
+        assert param_declaration_problems({"d": {"default": "a\tb\x1fc\x07d"}}) == []
+
+
+class TestAProfileThatUsedParamsBefore:
+    """A profile whose ``params`` key predates the declaration block (review of #1291).
+
+    On main the unknown key was dropped and the profile loaded. It must still load and
+    launch, while ``cao profile validate`` and the write routes keep refusing the block.
+    """
+
+    TEXT = "---\nname: legacy\ndescription: old\nparams:\n  region: us-east-1\n---\nDo the work.\n"
+
+    def test_it_loads_with_no_params_and_one_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger=_MODEL_LOGGER):
+            profile = parse_agent_profile_text(self.TEXT, "legacy")
+
+        assert profile.name == "legacy"
+        assert profile.system_prompt == "Do the work."
+        assert profile.params is None
+        warnings = [r for r in caplog.records if r.name == _MODEL_LOGGER]
+        assert len(warnings) == 1
+        assert warnings[0].levelno == logging.WARNING
+        assert warnings[0].getMessage() == (
+            "agent profile 'legacy': its params block is ignored because it breaks 1 rule(s), "
+            "first: param 'region' must be a mapping, not a string. "
+            "Run 'cao profile validate' to see them all."
+        )
+
+    def test_the_warning_never_echoes_a_value(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger=_MODEL_LOGGER):
+            parse_agent_profile_text(self.TEXT, "legacy")
+
+        assert "us-east-1" not in caplog.text
+
+    def test_the_validator_still_refuses_it(self) -> None:
+        findings = validate_frontmatter(
+            {"name": "legacy", "description": "old", "params": {"region": "us-east-1"}}
+        )
+
+        assert [f.severity for f in findings if f.path and f.path.startswith("params")] == ["error"]
 
 
 class TestWhatTheUiReads:

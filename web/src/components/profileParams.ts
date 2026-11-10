@@ -11,7 +11,7 @@
 // runs no regex taken from the profile, and it changes only the params block.
 
 import type { ProfileValidationMessage, ProfileValidationResponse } from '../api'
-import { MAX_PARAMS, MAX_PARAM_VALUE_CHARS, PARAM_KEY_RE, PLACEHOLDER_RE, quote } from './workflow/workflowYaml'
+import { LINE_BREAK_RE, MAX_PARAMS, MAX_PARAM_VALUE_CHARS, PARAM_KEY_RE, PLACEHOLDER_RE, quote } from './workflow/workflowYaml'
 
 export type ParamType = 'string' | 'int' | 'bool'
 
@@ -95,7 +95,7 @@ function hasPlaceholder(value: string): boolean {
 function defaultError(type: ParamType, value: string): string | null {
   if (type === 'int') return INT_RE.test(value) ? null : 'Use a whole number, up to 18 digits.'
   if (type === 'bool') return value === 'true' || value === 'false' ? null : 'Use true or false.'
-  if (/[\r\n]/.test(value)) return 'Use one line.'
+  if (LINE_BREAK_RE.test(value)) return 'Use one line.'
   if (tooLong(value, MAX_PARAM_VALUE_CHARS)) return `Use at most ${MAX_PARAM_VALUE_CHARS} characters.`
   if (hasPlaceholder(value)) {
     return "A default can't hold a {{...}} placeholder. It is copied into workflow steps, where values are fixed when the workflow is built."
@@ -105,7 +105,7 @@ function defaultError(type: ParamType, value: string): string | null {
 
 function allowedValueError(type: ParamType, value: string): string | null {
   if (type === 'int') return INT_RE.test(value) ? null : 'Each allowed value must be a whole number, up to 18 digits.'
-  if (/[\r\n]/.test(value)) return 'Use one line for each allowed value.'
+  if (LINE_BREAK_RE.test(value)) return 'Use one line for each allowed value.'
   if (tooLong(value, MAX_PARAM_VALUE_CHARS)) return `Each allowed value can have at most ${MAX_PARAM_VALUE_CHARS} characters.`
   if (hasPlaceholder(value)) {
     return "An allowed value can't hold a {{...}} placeholder. Values are fixed when the workflow is built."
@@ -148,7 +148,7 @@ export function paramRowErrors(rows: ParamRow[]): ParamRowErrors[] {
       else if (allowed && !allowed.has(key(row.default))) errors.default = 'Use one of the allowed values.'
     }
 
-    if (/[\r\n]/.test(row.description)) errors.description = 'Use one line.'
+    if (LINE_BREAK_RE.test(row.description)) errors.description = 'Use one line.'
     else if (tooLong(row.description, MAX_DESCRIPTION_CHARS)) errors.description = `Use at most ${MAX_DESCRIPTION_CHARS} characters.`
 
     return errors

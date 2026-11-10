@@ -448,6 +448,31 @@ describe('WorkflowBuilder', () => {
     expect(screen.getByText(/Params are journaled in plaintext, so do not enter secrets/)).toBeInTheDocument()
     expect(screen.getByText('Saving rewrites the file from this form. Comments in the file are not kept.')).toBeInTheDocument()
   })
+
+  it.each([
+    ['create', () => <WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />],
+    ['edit', () => <WorkflowBuilder mode="edit" name="demo" onClose={() => {}} onSaved={() => {}} />],
+  ])('says what a YAML workflow cannot do and links to the workflow docs (%s)', async (_mode, ui) => {
+    vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue(SPEC)
+    render(ui())
+    const note = await screen.findByRole('note', { name: 'What YAML workflows cannot do' })
+    expect(note).toHaveTextContent('A YAML workflow runs a fixed list of steps, one at a time, in order.')
+    expect(note).toHaveTextContent('branch on a condition, loop, or run steps in parallel')
+    expect(note).toHaveTextContent("pass one step's answer to a later step")
+    expect(note).toHaveTextContent('run assign or send_message steps, which are not built yet')
+    expect(note).toHaveTextContent('For these, write a Python workflow.')
+    const link = within(note).getByRole('link', { name: 'workflow docs' })
+    expect(link).toHaveAttribute('href', 'https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/workflows.md')
+    expect(link).toHaveAttribute('target', '_blank')
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+  })
+
+  it('shows no limits note on a workflow it cannot edit', async () => {
+    vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue({ ...SPEC, mode: 'parallel' })
+    render(<WorkflowBuilder mode="edit" name="demo" onClose={() => {}} onSaved={() => {}} />)
+    await screen.findByText('mode: parallel')
+    expect(screen.queryByRole('note', { name: 'What YAML workflows cannot do' })).toBeNull()
+  })
 })
 
 describe('WorkflowFlow', () => {

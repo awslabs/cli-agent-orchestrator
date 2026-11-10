@@ -951,6 +951,13 @@ WORKFLOW_MAX_STEP_PARAMS = 32
 WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS = 512
 WORKFLOW_STEP_PARAM_KEY_RE = r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$"
 
+# A character that ends a line: exactly the ones ``str.splitlines()`` splits on. A step
+# param value, and a profile param's default, enum value or description, is one line, so
+# it holds none of them. The engine writes each step param on its own line of the step
+# prompt, and a value with U+2028 in it would add a line there. A test keeps this set
+# equal to the one ``str.splitlines()`` uses.
+WORKFLOW_STEP_PARAM_LINE_BREAK_RE = r"[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]"
+
 # A ``{{...}}`` placeholder, as the engine finds one in a prompt. This is the pattern of
 # ``workflow_service._PLACEHOLDER_RE``, and a test keeps the two equal. Param values are
 # fixed when the workflow is built, so the grammar check rejects a value that contains one.

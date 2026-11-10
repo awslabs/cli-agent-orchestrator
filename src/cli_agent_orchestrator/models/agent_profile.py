@@ -1,5 +1,6 @@
 """Agent profile models."""
 
+import logging
 import re
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
@@ -10,6 +11,7 @@ from pydantic import (
     StrictBool,
     StrictInt,
     StrictStr,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -19,9 +21,12 @@ from cli_agent_orchestrator.constants import (
     PROFILE_PARAM_DESCRIPTION_MAX_CHARS,
     PROFILE_PARAM_MAX_ENUM_VALUES,
     WORKFLOW_STEP_PARAM_KEY_RE,
+    WORKFLOW_STEP_PARAM_LINE_BREAK_RE,
     WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS,
 )
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+
+logger = logging.getLogger(__name__)
 
 PermissionMode = Literal["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
 
@@ -29,6 +34,7 @@ ProfileParamType = Literal["string", "int", "bool"]
 ProfileParamValue = Union[StrictBool, StrictInt, StrictStr]
 
 _PARAM_NAME_RE = re.compile(WORKFLOW_STEP_PARAM_KEY_RE)
+_LINE_BREAK_RE = re.compile(WORKFLOW_STEP_PARAM_LINE_BREAK_RE)
 _PARAM_TYPES = ("string", "int", "bool")
 _PARAM_KEYS = ("type", "required", "default", "description", "enum")
 # An int default or enum value has at most 18 digits, the same bound as a step's int value
@@ -112,7 +118,7 @@ def _one_line_problem(value: str, limit: int) -> Optional[str]:
     """Why ``value`` is not one line of at most ``limit`` characters, or None."""
     if len(value) > limit:
         return f"is {len(value)} characters (max {limit})"
-    if "\n" in value or "\r" in value:
+    if _LINE_BREAK_RE.search(value):
         return "must be one line (no line breaks)"
     return None
 
@@ -366,10 +372,30 @@ class AgentProfile(BaseModel):
 
     @field_validator("params", mode="before")
     @classmethod
-    def _check_params(cls, value: Any) -> Any:
-        if value is not None:
-            _raise_on(param_declaration_problems(value))
-        return value
+    def _check_params(cls, value: Any, info: ValidationInfo) -> Any:
+        """Drop a ``params`` block that breaks a rule, with a warning.
+
+        A profile written before ``params`` existed may use the key for something
+        else. It loaded then, because the unknown key was dropped, so it must still
+        load and launch. The strict check stays where a profile is written or checked:
+        ``cao profile validate``, ``POST /agents/profiles/validate``, the profile write
+        routes and the Profiles tab. A workflow step that uses a profile whose block was
+        dropped gets no params checks, as for a profile that declares none.
+        """
+        if value is None:
+            return None
+        problems = param_declaration_problems(value)
+        if not problems:
+            return value
+        # The messages name params and keys but never echo a value.
+        logger.warning(
+            "agent profile %r: its params block is ignored because it breaks %d rule(s), "
+            "first: %s. Run 'cao profile validate' to see them all.",
+            info.data.get("name"),
+            len(problems),
+            problems[0][1],
+        )
+        return None
 
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None

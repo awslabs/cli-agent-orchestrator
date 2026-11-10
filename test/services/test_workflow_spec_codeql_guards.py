@@ -141,15 +141,39 @@ def test_contained_exists_colocates_guard_with_sink() -> None:
 
 
 def test_update_existence_check_uses_contained_target() -> None:
-    """Update admission must not reintroduce the unchecked name-derived path."""
-    contained_exists_calls = [
-        call for call in _calls(svc.update_workflow) if _call_name(call) == "_contained_spec_exists"
-    ]
-    assert len(contained_exists_calls) == 1
+    """Update admission must not reintroduce the unchecked name-derived path.
+
+    The first check is the ``.py`` target. When it misses, one more check, run for the
+    ``.yaml`` and ``.yml`` names, tells a YAML workflow apart from a missing one (a 409
+    that says so). It takes a value ``_safe_spec_path`` returned, as the YAML writers do.
+    """
+    tree = ast.parse(inspect.getsource(svc.update_workflow))
+    contained = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and _call_name(node.value) == "_safe_spec_path"
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    contained_exists_calls = sorted(
+        (
+            call
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call) and _call_name(call) == "_contained_spec_exists"
+        ),
+        key=lambda call: (call.lineno, call.col_offset),
+    )
+    assert len(contained_exists_calls) == 2, "the .py target, then the YAML candidates"
     assert [ast.unparse(arg) for arg in contained_exists_calls[0].args] == [
         "lock_target",
         "safe_base",
     ]
+    for call in contained_exists_calls:
+        first, second = (ast.unparse(arg) for arg in call.args)
+        assert first in contained, f"{first} is not a contained target"
+        assert second == "safe_base"
 
 
 def test_contained_exists_refuses_an_escaping_symlink(tmp_path: Path) -> None:

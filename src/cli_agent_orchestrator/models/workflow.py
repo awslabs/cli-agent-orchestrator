@@ -45,6 +45,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_PLACEHOLDER_RE,
     WORKFLOW_SHIPPED_UNITS,
     WORKFLOW_STEP_PARAM_KEY_RE,
+    WORKFLOW_STEP_PARAM_LINE_BREAK_RE,
     WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS,
 )
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
@@ -73,6 +74,7 @@ logger = logging.getLogger(__name__)
 # Compiled once at import; validate_grammar is a pure function of the spec.
 _NAME_RE = re.compile(WORKFLOW_NAME_RE)
 _PARAM_KEY_RE = re.compile(WORKFLOW_STEP_PARAM_KEY_RE)
+_LINE_BREAK_RE = re.compile(WORKFLOW_STEP_PARAM_LINE_BREAK_RE)
 _PLACEHOLDER_RE = re.compile(WORKFLOW_PLACEHOLDER_RE)
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
 
@@ -615,7 +617,7 @@ def _param_errors(step: "WorkflowStep") -> List[str]:
                 f"step '{step.id}': param '{key}' is {len(value)} characters "
                 f"(max {WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS})"
             )
-        elif "\n" in value or "\r" in value:
+        elif _LINE_BREAK_RE.search(value):
             errors.append(f"step '{step.id}': param '{key}' must be one line (no line breaks)")
         elif _has_placeholder(value):
             errors.append(

@@ -5,6 +5,7 @@ import { describe, it, expect } from 'vitest'
 import type { WorkflowSpec } from '../api'
 import {
   BLOCKING_STEP_FIELDS,
+  LINE_BREAK_RE,
   MAX_PARAMS,
   errorsUnder,
   fromSpec,
@@ -382,6 +383,21 @@ describe('validateBuilder', () => {
     expect(at(4)).toBeUndefined()
     expect(at(5)).toBe('A param value can have at most 512 characters.')
     expect(at(6)).toBeUndefined()
+  })
+
+  it('refuses every line break the server refuses, not only \\n and \\r', () => {
+    const others = ['\v', '\f', '\u001c', '\u001d', '\u001e', '\u0085', '\u2028', '\u2029']
+    const values = [...others.map(b => `true${b}- dry_run: false`), 'a\tb\u001fc\u0007d']
+    const errors = validateBuilder(workflow({ steps: [step({ params: values.map((value, j) => ({ key: `k${j}`, value })) })] }))
+    others.forEach((_, j) => expect(errors[`steps.0.params.${j}.value`]).toBe('A param value cannot contain a line break.'))
+    // A tab and the other control characters are not line breaks.
+    expect(errors[`steps.0.params.${others.length}.value`]).toBeUndefined()
+  })
+
+  it('LINE_BREAK_RE matches exactly the characters Python str.splitlines() splits on', () => {
+    const matched: number[] = []
+    for (let cp = 0; cp <= 0xffff; cp++) if (LINE_BREAK_RE.test(String.fromCharCode(cp))) matched.push(cp)
+    expect(matched).toEqual([0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029])
   })
 
   it(`allows at most ${MAX_PARAMS} params on a step`, () => {

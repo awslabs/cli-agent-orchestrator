@@ -120,6 +120,11 @@ export const NAME_RE = /^[A-Za-z0-9_-]{1,64}$/
 export const PARAM_KEY_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/
 export const MAX_PARAMS = 32
 export const MAX_PARAM_VALUE_CHARS = 512
+/**
+ * A line break of any kind: the characters Python's str.splitlines() splits on, as
+ * constants.WORKFLOW_STEP_PARAM_LINE_BREAK_RE lists them. A param value is one line.
+ */
+export const LINE_BREAK_RE = /[\n\r\v\f\u001c-\u001e\u0085\u2028\u2029]/
 /** The engine's placeholder pattern. Param values are fixed, so none may hold one. */
 export const PLACEHOLDER_RE = /\{\{\s*([^{}]+?)\s*\}\}/
 /** A declared int param, as the server checks it. */
@@ -463,7 +468,7 @@ function nameError(value: string, what: string): string | null {
 
 /** The checks every param value gets, declared or free-form. */
 function paramValueError(value: string): string | null {
-  if (/[\r\n]/.test(value)) return 'A param value cannot contain a line break.'
+  if (LINE_BREAK_RE.test(value)) return 'A param value cannot contain a line break.'
   // Count code points, as the server does, not UTF-16 units.
   if ([...value].length > MAX_PARAM_VALUE_CHARS) return `A param value can have at most ${MAX_PARAM_VALUE_CHARS} characters.`
   if (PLACEHOLDER_RE.test(value)) return PLACEHOLDER_MESSAGE

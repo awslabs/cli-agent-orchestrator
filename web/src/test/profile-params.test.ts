@@ -187,6 +187,16 @@ describe('the row rules', () => {
     expect(errorsOf(row({ name: 'd', description: 'a\rb' }))[0].description).toBe('Use one line.')
   })
 
+  it.each([
+    ['VT', '\v'], ['FF', '\f'], ['FS', '\u001c'], ['GS', '\u001d'], ['RS', '\u001e'],
+    ['NEL', '\u0085'], ['LS', '\u2028'], ['PS', '\u2029'],
+  ])('a default, an allowed value and a description with %s are not one line', (_label, lineBreak) => {
+    const value = `a${lineBreak}b`
+    expect(errorsOf(row({ name: 'd', default: value }))[0].default).toBe('Use one line.')
+    expect(errorsOf(row({ name: 'e', allowed: `ok, ${value}` }))[0].allowed).toBe('Use one line for each allowed value.')
+    expect(errorsOf(row({ name: 't', description: value }))[0].description).toBe('Use one line.')
+  })
+
   it('hasParamRowErrors is true for any row error and for more than 32 rows', () => {
     expect(hasParamRowErrors([])).toBe(false)
     expect(hasParamRowErrors([row({ name: 'ok' })])).toBe(false)

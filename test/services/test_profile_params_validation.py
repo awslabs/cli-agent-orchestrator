@@ -58,11 +58,8 @@ def _errors(params: object) -> list:
 
 
 def _model_accepts(params: object) -> bool:
-    try:
-        AgentProfile(**_meta(params))
-    except ValueError:
-        return False
-    return True
+    """True when the model keeps the block. It drops one that breaks a rule, with a warning."""
+    return AgentProfile(**_meta(params)).params is not None
 
 
 def _schema_errors(params: object) -> list:
@@ -96,14 +93,14 @@ VALID = {
 
 
 class TestAgreement:
-    """For every case, the validator reports an error exactly when the model refuses."""
+    """For every case, the validator reports an error exactly when the model drops the block."""
 
     @pytest.mark.parametrize("label", list(INVALID))
-    def test_the_validator_refuses_what_the_model_refuses(self, label: str) -> None:
+    def test_the_validator_refuses_what_the_model_drops(self, label: str) -> None:
         params, _path, _fragment = INVALID[label]
 
         assert not _model_accepts(params)
-        assert _errors(params), f"{label}: the validator accepted what the model refuses"
+        assert _errors(params), f"{label}: the validator accepted what the model drops"
 
     @pytest.mark.parametrize("label", list(VALID))
     def test_the_validator_accepts_what_the_model_accepts(self, label: str) -> None:

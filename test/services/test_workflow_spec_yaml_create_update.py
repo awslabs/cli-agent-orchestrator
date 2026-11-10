@@ -376,6 +376,31 @@ def test_update_of_a_python_workflow_is_a_conflict_that_says_so(tmp_path: Path) 
     assert (tmp_path / "scripted.py").read_text() == PYTHON_SOURCE
 
 
+@pytest.mark.parametrize("filename", ["built.yaml", "built.yml"])
+def test_python_update_of_a_yaml_workflow_is_a_conflict_that_says_so(
+    tmp_path: Path, filename: str
+) -> None:
+    """The mirror of the case above (review of #1291): not "does not exist"."""
+    yaml_file = tmp_path / filename
+    yaml_file.write_text(_spec_yaml("built"))
+
+    with pytest.raises(
+        svc.WorkflowWriteConflictError,
+        match=r"^workflow 'built' is a YAML workflow; update it with tier 'yaml'$",
+    ):
+        svc.update_workflow(
+            "built", PYTHON_SOURCE, _sha(yaml_file.read_bytes()), scan_dir=str(tmp_path)
+        )
+    assert _entries(tmp_path) == [filename]
+    assert yaml_file.read_text() == _spec_yaml("built")
+
+
+def test_python_update_of_a_missing_workflow_is_still_not_found(tmp_path: Path) -> None:
+    with pytest.raises(svc.WorkflowNotFoundError, match="does not exist"):
+        svc.update_workflow("absent", PYTHON_SOURCE, "0" * 64, scan_dir=str(tmp_path))
+    assert _entries(tmp_path) == []
+
+
 def test_update_with_a_python_sibling_is_a_tier_collision(tmp_path: Path) -> None:
     yaml_file = tmp_path / "both.yaml"
     yaml_file.write_text(_spec_yaml("both", "v1"))

@@ -627,6 +627,39 @@ class TestStepParams:
         assert result.status == "fail"
         assert "step 's1': param 'k' must be one line (no line breaks)" in result.errors
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            f"true{line_break}- dry_run: false"
+            for line_break in ("\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
+        ]
+        + ["true\u2028"],
+        ids=["VT", "FF", "FS", "GS", "RS", "NEL", "LS", "PS", "trailing LS"],
+    )
+    def test_a_value_with_any_other_line_break_fails(self, value):
+        """Review of #1291: a U+2028 added a "- dry_run: false" line to the step prompt."""
+        result = validate_only(_step_yaml(_params_yaml({"dry_run": value})))
+        assert result.status == "fail"
+        assert "step 's1': param 'dry_run' must be one line (no line breaks)" in result.errors
+
+    def test_a_tab_and_other_control_characters_are_not_line_breaks(self):
+        assert validate_only(_step_yaml(_params_yaml({"k": "a\tb\x1fc\x07d"}))).status == "pass"
+
+    def test_the_line_break_set_is_the_one_str_splitlines_uses(self):
+        """Every code point, so the constant cannot drift from what "one line" means."""
+        import re
+        import sys
+
+        from cli_agent_orchestrator.constants import WORKFLOW_STEP_PARAM_LINE_BREAK_RE
+
+        pattern = re.compile(WORKFLOW_STEP_PARAM_LINE_BREAK_RE)
+        mismatched = [
+            hex(cp)
+            for cp in range(sys.maxunicode + 1)
+            if bool(pattern.fullmatch(chr(cp))) != (len(f"a{chr(cp)}b".splitlines()) == 2)
+        ]
+        assert mismatched == []
+
     def test_a_step_may_have_32_params_but_not_33(self):
         from cli_agent_orchestrator.constants import WORKFLOW_MAX_STEP_PARAMS
 

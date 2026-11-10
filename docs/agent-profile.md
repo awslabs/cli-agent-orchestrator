@@ -205,7 +205,14 @@ The rules:
   can be installed from a URL, and an author's regex would run on the server.
 
 A profile that breaks a rule is invalid: `cao profile validate` reports it, and
-the profile write routes refuse it.
+the profile write routes refuse it. A profile that is already installed with a
+broken `params` block still loads and launches, as it did before `params`
+existed. CAO ignores the block and logs a warning, and a workflow step that uses
+the profile gets no params checks.
+
+"One line" means the text has no line break of any kind: no `\n` or `\r`, and
+none of the other characters Python's `str.splitlines()` splits on, such as
+U+2028.
 
 CAO resolves `${VAR}` placeholders in the whole profile before it reads the
 frontmatter, so do not write `${` inside the `params` block.

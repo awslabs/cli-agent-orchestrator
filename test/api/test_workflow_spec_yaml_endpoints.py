@@ -380,8 +380,12 @@ def test_yaml_update_400s_leave_the_file(client, spec_dir, source, fragment):
     assert (spec_dir / "keep.yaml").read_text() == _spec_yaml("keep")
 
 
-def test_python_update_of_a_yaml_workflow_is_unchanged_404(client, spec_dir):
-    """The Python tier keeps its old answer: no ``<name>.py`` means unknown workflow."""
+def test_python_update_of_a_yaml_workflow_is_409_and_says_so(client, spec_dir):
+    """The mirror of the YAML update of a Python workflow (review of #1291).
+
+    It was 404 "unknown workflow" while GET returned the workflow, which left a CLI or
+    script caller that edits a builder-made file with no hint.
+    """
     created = _create(client, "yaml-only", _spec_yaml("yaml-only")).json()
 
     resp = client.put(
@@ -389,8 +393,19 @@ def test_python_update_of_a_yaml_workflow_is_unchanged_404(client, spec_dir):
         json={"source": PYTHON_GOOD, "expected_hash": created["content_hash"]},
     )
 
-    assert resp.status_code == 404, resp.text
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == (
+        "workflow 'yaml-only' is a YAML workflow; update it with tier 'yaml'"
+    )
     assert _entries(spec_dir) == ["yaml-only.yaml"]
+    assert (spec_dir / "yaml-only.yaml").read_text() == _spec_yaml("yaml-only")
+
+
+def test_python_update_of_a_missing_workflow_is_still_404(client, spec_dir):
+    resp = client.put("/workflows/absent", json={"source": PYTHON_GOOD, "expected_hash": "0" * 64})
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "unknown workflow 'absent'"
 
 
 # ---------------------------------------------------------------------------

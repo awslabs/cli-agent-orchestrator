@@ -6611,7 +6611,7 @@ async def create_workflow_endpoint(
     body: WorkflowCreateRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Create a NEW Python workflow spec, refusing to overwrite one (issue #583 FR-10).
+    """Create a NEW workflow spec, Python or YAML, refusing to overwrite one (issue #583 FR-10).
 
     THE FIRST NETWORK-REACHABLE SPEC WRITE PATH. ``create_workflow`` shipped in Bolt 3 pass 3A and had
     no caller — this endpoint and its ``PUT`` sibling are what make it reachable, for the CLI verbs and
@@ -6676,7 +6676,9 @@ async def update_workflow_endpoint(
     body: WorkflowUpdateRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Update an EXISTING Python workflow spec, refusing to create one (issue #583 FR-10, FR-8).
+    """Update an EXISTING workflow spec, refusing to create one (issue #583 FR-10, FR-8).
+
+    The spec is Python or YAML, as ``tier`` says (below).
 
     ``PUT`` because this replaces the whole spec at a named location, and the name keys the path exactly
     as it does for ``DELETE``.
@@ -6693,10 +6695,11 @@ async def update_workflow_endpoint(
     changed this spec", and the caller's next action differs completely. The wrong order produces a
     plausible answer rather than an error, which is why a test asserts the order structurally.
 
-    ``tier`` picks the service function: ``"python"`` (the default) is ``update_workflow``, unchanged;
-    ``"yaml"`` is ``update_yaml_workflow``, which replaces the YAML file at its own path. Its
-    ``WorkflowWriteConflictError`` (a Python workflow, or both ``.yaml`` and ``.yml`` present) is a
-    ``ValueError`` subclass and maps to 409 ahead of the bare ``ValueError`` arm for the same reason.
+    ``tier`` picks the service function: ``"python"`` (the default) is ``update_workflow``;
+    ``"yaml"`` is ``update_yaml_workflow``, which replaces the YAML file at its own path. Both raise
+    ``WorkflowWriteConflictError`` when the workflow is in the other tier, and the YAML one also when
+    both ``.yaml`` and ``.yml`` are present. It is a ``ValueError`` subclass and maps to 409 ahead of
+    the bare ``ValueError`` arm for the same reason.
     """
     from cli_agent_orchestrator.models.workflow import StaleSpecError, TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service

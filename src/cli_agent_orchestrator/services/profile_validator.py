@@ -462,8 +462,8 @@ def _collect_param_rule_findings(
     Three rules: a default is one of the enum values, an int value is not written with a
     decimal point (JSON has one number type, so ``1.0`` passes ``"type": "integer"``), and
     a string default or enum value has no ``{{...}}`` placeholder. All three come from
-    ``param_declaration_problems``, the check the model raises on, so a profile the
-    validator accepts is one the loader accepts.
+    ``param_declaration_problems``, the check the model applies, so the validator refuses
+    exactly the blocks the loader drops.
 
     A declaration the schema already reported is skipped, so one mistake is not
     reported twice, and an error on the block itself skips the whole check. The

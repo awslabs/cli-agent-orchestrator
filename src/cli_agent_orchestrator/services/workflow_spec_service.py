@@ -97,12 +97,12 @@ class SafePublicationUnavailableError(OSError):
 
 
 class WorkflowWriteConflictError(ValueError):
-    """A YAML update was refused because the files on disk conflict with it.
+    """An update was refused because the files on disk conflict with it.
 
-    Raised when the named workflow is a Python workflow, or when both
-    ``<name>.yaml`` and ``<name>.yml`` exist so the target is ambiguous. A
-    ``ValueError`` subclass, mapped to 409 before any bare ``ValueError`` arm,
-    the same way :class:`TierCollisionError` is.
+    Raised when a YAML update names a Python workflow, when a Python update names a
+    YAML workflow, or when both ``<name>.yaml`` and ``<name>.yml`` exist so the YAML
+    target is ambiguous. A ``ValueError`` subclass, mapped to 409 before any bare
+    ``ValueError`` arm, the same way :class:`TierCollisionError` is.
     """
 
 
@@ -1353,7 +1353,8 @@ def update_workflow(
 
     Raises:
         ValueError: invalid name, unwritable tier, lint errors, or malformed ``INPUTS``.
-        WorkflowNotFoundError: no spec with that name existed at update admission.
+        WorkflowNotFoundError: no Python or YAML workflow has that name.
+        WorkflowWriteConflictError: the workflow is a YAML workflow.
         TierCollisionError: a same-stem sibling exists in the other tier.
         StaleSpecError: the spec changed on disk since ``expected_hash`` was read.
     """
@@ -1361,6 +1362,16 @@ def update_workflow(
     lock_target = _safe_spec_path(target_path, safe_base)
     with strict_identity_lock(_workflow_lock_identity(lock_target, safe_base), Path(lock_target)):
         if not _contained_spec_exists(lock_target, safe_base):
+            # The mirror of update_yaml_workflow's refusal of a Python workflow, so a
+            # caller that edits a builder-made file is told why instead of "not found".
+            for extension in (".yaml", ".yml"):
+                yaml_target = _safe_spec_path(
+                    os.path.join(safe_base, f"{name}{extension}"), safe_base
+                )
+                if _contained_spec_exists(yaml_target, safe_base):
+                    raise WorkflowWriteConflictError(
+                        f"workflow '{name}' is a YAML workflow; update it with tier 'yaml'"
+                    )
             raise WorkflowNotFoundError(f"workflow '{name}' does not exist; use create to add it")
         _check_tier_collision(name, safe_base)
 

@@ -13,9 +13,12 @@
 // block editing. Edit also reads each distinct step profile once, for the
 // params it declares. Loading never pre-fills a default, because the file is
 // the truth. Picking a profile afterwards does, as it does in create mode.
+//
+// A note above the form says what a YAML workflow cannot do and points to
+// Python workflows for those cases.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AlertTriangle, ArrowDown, ArrowUp, ListChecks, Loader2, Plus, Save, Trash2, Workflow, X } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowUp, Info, ListChecks, Loader2, Plus, Save, Trash2, Workflow, X } from 'lucide-react'
 import { api, type ApiError, type ProviderInfo, type WorkflowValidation, type WorkflowWriteResult } from '../../api'
 import { useStore } from '../../store'
 import { useGeneration } from '../../hooks/useGeneration'
@@ -96,6 +99,46 @@ const fieldClass = (invalid: boolean) =>
 function FieldError({ message }: { message?: string }) {
   if (!message) return null
   return <p className="mt-0.5 text-xs text-red-400">{message}</p>
+}
+
+const WORKFLOW_DOCS_URL = 'https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/workflows.md'
+
+/**
+ * What a YAML workflow cannot do, so nobody builds one expecting it to. The engine
+ * reserves branching, loops and parallel modes, a step's answer reaches a later step
+ * only through output_schema, which the builder has no field for, and a run that uses
+ * assign or send_message is refused.
+ */
+function YamlLimitsNote() {
+  return (
+    <div
+      role="note"
+      aria-label="What YAML workflows cannot do"
+      className="mb-4 flex gap-2 rounded-xl border border-gray-800 bg-gray-950/40 p-3 text-xs text-gray-300"
+    >
+      <Info size={14} className="mt-0.5 shrink-0 text-gray-400" aria-hidden="true" />
+      <div className="min-w-0 space-y-1">
+        <p>A YAML workflow runs a fixed list of steps, one at a time, in order. Workflows made here cannot:</p>
+        <ul className="list-disc space-y-0.5 pl-5">
+          <li>branch on a condition, loop, or run steps in parallel</li>
+          <li>pass one step's answer to a later step</li>
+          <li>run assign or send_message steps, which are not built yet</li>
+        </ul>
+        <p>
+          For these, write a Python workflow. See the{' '}
+          <a
+            href={WORKFLOW_DOCS_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-emerald-400 underline hover:text-emerald-300"
+          >
+            workflow docs
+          </a>
+          .
+        </p>
+      </div>
+    </div>
+  )
 }
 
 export function WorkflowBuilder(props: WorkflowBuilderProps) {
@@ -335,6 +378,7 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
             </div>
           )}
 
+          {ready && <YamlLimitsNote />}
           {ready && (
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_24rem]">
               <div className="min-w-0 space-y-4">
