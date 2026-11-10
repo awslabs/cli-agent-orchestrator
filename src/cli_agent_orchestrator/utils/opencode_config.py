@@ -294,8 +294,9 @@ def _write_grant_record(record: Dict[str, Any]) -> None:
     install as *failed* after the user-visible half succeeded. A lost sidecar
     costs CAO the record: plugin servers' grants fall back to the containment
     proof, the pre-sidecar behaviour, and a profile server's grant it wrote has
-    no proof left, so it stays if the profile later drops that server. An
-    unwritable sidecar must not be worse than an absent one.
+    no proof left, so it stays if the profile drops that server before the agent
+    is next installed with a writable sidecar. An unwritable sidecar must not be
+    worse than an absent one.
     """
     path = _grant_record_path()
     temp_path = path.with_name(f".{path.name}.tmp")
@@ -304,9 +305,13 @@ def _write_grant_record(record: Dict[str, Any]) -> None:
         temp_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         temp_path.replace(path)
     except OSError as exc:
+        # Not GRANT_RECORD_REPAIR_HINT: the file is not damaged, it could not be
+        # written (a read-only directory, a full disk), so there is nothing to repair.
         logger.warning(
-            "Could not record OpenCode tool grants at %s (%s); CAO will fall back to "
-            "plugin-store containment when withdrawing them",
+            "Could not record OpenCode tool grants at %s (%s). A plugin server's grant "
+            "is still withdrawn by plugin-store containment; a profile server's grant "
+            "written now has no proof left and stays if the profile drops that server "
+            "before the agent is next installed with a writable sidecar.",
             path,
             exc,
         )
