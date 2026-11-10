@@ -18,6 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message can reach a worker in the middle of a turn, and the forward can then send the answer of
   that turn.
 
+- **A hung FIFO-writer test fails in 10 seconds instead of holding CI** (#1251 follow-up).
+  `test_stdin_closing_before_any_reader_ends_the_writer` called the writer in-process, so a
+  regression to a blocking `open()` would have hung the pytest worker; it now runs the writer in
+  a daemon thread joined with a timeout. The Unit Tests job also gains `timeout-minutes: 60`, so
+  any hung test ends the job within an hour instead of GitHub's default of six.
+- **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
+  the sidecar beside `opencode.json` could not be read as a grant record, `cao install
+  --provider opencode_cli` started from an empty record and wrote it back, dropping every other
+  agent's recorded grants. It now leaves the file as it is, logs a warning that names it, and
+  does not record this agent's grants. The install still completes. Until the sidecar is
+  repaired and the agent reinstalled, a plugin server's grant is withdrawn by plugin-store
+  containment, and a profile server's grant (`cao-mcp-server*`, say) is left in place, the
+  conservative direction.
+- **`cao install` exits 1 when the install fails** (#1270). It printed `Error: <message>` and
+  exited 0, so a script or CI step could not tell a failed install from a successful one. It
+  now exits 1 with the same message on stderr, like the rest of the CLI. A script that relied
+  on exit 0 after a failed install must change.
 - **Keep finished child agents open, for workshops and debugging** (#1225 phase 1). A new
   machine-wide setting, `terminal.keep_finished`, off by default
   (`cao config set terminal.keep_finished.enabled true`). While it is on, a successful
@@ -192,6 +209,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the decision record names the reason. kiro-cli checks the decided level against the model, as it
   does a stored effort, and a launch it refuses is not retried on the stored effort, so keep
   `min_effort` and `max_effort` to levels your Kiro models accept. Installed Kiro agents are unchanged.
+
+- **Ephemeral helpers can be matched to your models from task features** (#1199, off by default,
+  provisional). A decider can size a helper but can't tell which of your models suits the task.
+  With the new `task.features` switch on, CAO asks a decider that declares them four fixed yes/no
+  questions about the task (`task.long_context`, `task.deep_reasoning`, `task.read_only` and the
+  advisory `task.needs_network`), in one request beside `model.route`'s, with the same task text
+  and nothing new. CAO then matches the answers locally to the models you declare under
+  `decisions.match` in `settings.json`, which is never sent anywhere. The match may raise a
+  helper's tier up to `ephemeral.max_tier`, never below the decider's size answer, and, with
+  `provider.route` bound to the built-in `match` answerer, pick the CLI within your declared
+  equivalence set. It never widens the options, never takes a model outside `model_tiers`, and
+  never touches tools. #810's rule is amended for this, for the tier only: a decider still can't
+  raise a tier, providers or tools, and CAO's own match may raise only the tier, to a declared
+  model and up to `ephemeral.max_tier`. `needs_network` only adds a hint to the delegation note. Any
+  doubt runs today's choice. Shadow records the would-be match. Records gain eight nullable
+  `match_*` and `catalog_*` columns (an additive migration), and the new
+  `cao decisions match show`, `check` and `explain` explain every pick. With today's capability
+  table no equivalence set validates, so only the tier half routes until a second `hard` or
+  `sandboxed` CLI is available. See
+  [Matching helpers to models](docs/decisions.md#matching-helpers-to-models).
 
 - **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
   API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one

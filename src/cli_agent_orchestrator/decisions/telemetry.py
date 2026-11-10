@@ -24,6 +24,8 @@ FIELDS = {
     "reason": "reason",
     "latency_ms": "latency_ms",
     "model_honored": "model_honored",
+    # #1199: the local match's rule, a closed vocabulary.
+    "match_rule": "match_rule",
 }
 
 
@@ -41,7 +43,7 @@ def emit_record(row: dict[str, Any]) -> None:
         pass
     labels = {
         "cao.decision." + key: row[key]
-        for key in ("point", "state", "decider", "outcome", "reason")
+        for key in ("point", "state", "decider", "outcome", "reason", "match_rule")
         if row.get(key) is not None
     }
     meter = metrics.get_meter("cli_agent_orchestrator")

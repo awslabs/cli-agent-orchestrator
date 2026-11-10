@@ -26,6 +26,10 @@ jobs:
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # Bounds a hung test (#1251). The job takes 25-40 min on main (3.11 is the
+    # slower leg), so 60 is 1.5x the slowest recent run. Unbounded, a hang held
+    # the runner for GitHub's default of 360 min.
+    timeout-minutes: 60
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]

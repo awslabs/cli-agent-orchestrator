@@ -452,6 +452,19 @@ class DecisionRecordModel(Base):
     options = Column(Text, nullable=True)
     fallback_enforcement = Column(String, nullable=True)
     applied_enforcement = Column(String, nullable=True)
+    # #1199 (provisional): the local match, on the provider.route and model.route rows it
+    # touches; NULL on every other row. Closed vocabularies and a keyed hash only: the rule,
+    # the needs and the needs covered (JSON lists of feature names), the tie-break step, the
+    # size before the match (model.route rows), the pick ("<provider>/<tier>"), and the
+    # catalog's version and HMAC (under the message hash's key, hash_key_id).
+    match_rule = Column(String, nullable=True)
+    match_needs = Column(Text, nullable=True)
+    match_covered = Column(Text, nullable=True)
+    match_tiebreak = Column(String, nullable=True)
+    match_from = Column(String, nullable=True)
+    match_pick = Column(String, nullable=True)
+    catalog_version = Column(Integer, nullable=True)
+    catalog_hash = Column(String, nullable=True)
     __table_args__ = (
         Index("ix_decision_records_created_at", "created_at"),
         Index("ix_decision_records_terminal_id", "terminal_id"),
@@ -1343,6 +1356,8 @@ def init_db() -> None:
     _migrate_decision_records_target_kind()
     # Appended LAST (issue #1099). Three nullable decision_records columns, no backfill.
     _migrate_decision_records_provider_route()
+    # Appended LAST (issue #1199). Eight nullable decision_records columns, no backfill.
+    _migrate_decision_records_match()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1461,6 +1476,46 @@ def _migrate_decision_records_provider_route() -> None:
     except Exception as e:
         # Records cannot be written without the columns, so this is louder than debug.
         logger.warning(f"Migration check for decision_records provider.route columns failed: {e}")
+
+
+_MATCH_COLUMNS = {
+    "match_rule": "ALTER TABLE decision_records ADD COLUMN match_rule TEXT",
+    "match_needs": "ALTER TABLE decision_records ADD COLUMN match_needs TEXT",
+    "match_covered": "ALTER TABLE decision_records ADD COLUMN match_covered TEXT",
+    "match_tiebreak": "ALTER TABLE decision_records ADD COLUMN match_tiebreak TEXT",
+    "match_from": "ALTER TABLE decision_records ADD COLUMN match_from TEXT",
+    "match_pick": "ALTER TABLE decision_records ADD COLUMN match_pick TEXT",
+    "catalog_version": "ALTER TABLE decision_records ADD COLUMN catalog_version INTEGER",
+    "catalog_hash": "ALTER TABLE decision_records ADD COLUMN catalog_hash TEXT",
+}
+
+
+def _migrate_decision_records_match() -> None:
+    """Add the local match's eight nullable decision_records columns if missing (issue #1199).
+
+    Idempotent, like ``_migrate_decision_records_provider_route``: PRAGMA table_info gate, one
+    ALTER TABLE ADD COLUMN per missing column, nothing without the table. Fresh DBs already
+    have them from ``Base.metadata.create_all``. Existing rows keep NULL: no match touched
+    them. There is no down migration, as for every decision_records column: older code
+    selects only its own columns.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
+            cursor = conn.execute("PRAGMA table_info(decision_records)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if not columns:
+                return
+            for column, statement in _MATCH_COLUMNS.items():
+                if column not in columns:
+                    conn.execute(statement)
+                    logger.info(f"Migration: added {column} column to decision_records")
+    except Exception as e:
+        # Records cannot be written without the columns, so this is louder than debug.
+        logger.warning(f"Migration check for decision_records match columns failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:
