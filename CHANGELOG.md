@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
   the sidecar beside `opencode.json` could not be read as a grant record, `cao install
   --provider opencode_cli` started from an empty record and wrote it back, dropping every other
-  agent's recorded grants. It now leaves the file as it is, logs a warning that names it, and
-  does not record this agent's grants. The install still completes. A plugin server's grant
+  agent's recorded grants. It now leaves the file as it is, logs a warning that names it and
+  says to repair it by hand (deleting it drops every agent's recorded grants), and does not
+  record this agent's grants. The install still completes. A plugin server's grant
   is still withdrawn by plugin-store containment. A reinstall after the sidecar is repaired
   records the servers the profile then names; a profile server's grant (`cao-mcp-server*`,
   say) that was added while the sidecar was damaged, and that the profile no longer names,

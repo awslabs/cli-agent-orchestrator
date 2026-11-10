@@ -567,6 +567,29 @@ class TestGrantRecord:
         assert tools["cao-mcp-server*"] is True
         assert json.loads(sidecar.read_text())["agents"] == {"developer": ["cao-mcp-server*"]}
 
+    @pytest.mark.parametrize(
+        "writer, content",
+        [("grants", "{not json"), ("grants", '["not", "a", "record"]'), ("mcp", "{not json")],
+        ids=["grants-unreadable", "grants-wrong-shape", "mcp-unreadable"],
+    )
+    def test_every_damaged_sidecar_warning_says_to_repair_it_by_hand(
+        self, tmp_config: Path, caplog, writer: str, content: str
+    ):
+        """#1273 review: deleting the file is the easy fix, and it drops every
+        agent's recorded grants, so each warning says to repair it by hand."""
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.with_name("cao-grants.json").write_text(content, encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            if writer == "grants":
+                upsert_agent_tools("developer", ["cao-mcp-server"])
+            else:
+                record_mcp_entry("demo-tools", {"type": "local", "command": ["/x"]})
+        messages = [r.getMessage() for r in caplog.records if "grant record" in r.getMessage()]
+        assert messages
+        for message in messages:
+            assert "Repair the file by hand" in message, message
+            assert "drops the recorded grants of every agent" in message, message
+
     @pytest.mark.parametrize("damage", ["mode-000", "directory"])
     def test_an_unreadable_sidecar_is_left_intact_and_named(self, tmp_config: Path, caplog, damage):
         if damage == "mode-000" and hasattr(os, "geteuid") and os.geteuid() == 0:
