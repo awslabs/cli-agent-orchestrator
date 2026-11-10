@@ -534,6 +534,90 @@ class TestGrantRecord:
         if call == "upsert":
             assert tools == {"cao-mcp-server*": True}
 
+    @pytest.mark.parametrize("damaged_first", [True, False], ids=["damaged", "intact"])
+    def test_a_profile_grant_added_while_damaged_outlives_the_repair(
+        self, tmp_config: Path, caplog, damaged_first: bool
+    ):
+        """Known behaviour (#1273 review): nothing records a grant added while the
+        sidecar is damaged, so once the profile drops that server no proof covers
+        its key, and it stays after the repair until it is removed by hand. With
+        the sidecar intact, the same steps withdraw it. A second profile server the
+        profile keeps is unaffected either way, and its row is pinned too.
+        """
+        tmp_config.parent.mkdir(parents=True)
+        sidecar = tmp_config.with_name("cao-grants.json")
+        if damaged_first:
+            sidecar.write_text("{not json", encoding="utf-8")
+        # An install while damaged (or not) adds two profile servers' grants.
+        with caplog.at_level(logging.WARNING):
+            upsert_agent_tools("developer", ["cao-mcp-server", "x-server"])
+        if damaged_first:
+            assert any("stays until removed by hand" in r.getMessage() for r in caplog.records), [
+                r.getMessage() for r in caplog.records
+            ]
+            # Repaired by hand: the operator restores the row they know about.
+            sidecar.write_text(
+                '{"version": 1, "agents": {"developer": ["cao-mcp-server*"]}}', encoding="utf-8"
+            )
+        # The profile drops x-server, keeps cao-mcp-server, and is reinstalled twice.
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        tools = json.loads(tmp_config.read_text())["agent"]["developer"]["tools"]
+        assert ("x-server*" in tools) is damaged_first, tools
+        assert tools["cao-mcp-server*"] is True
+        assert json.loads(sidecar.read_text())["agents"] == {"developer": ["cao-mcp-server*"]}
+
+    @pytest.mark.parametrize(
+        "writer, content",
+        [("grants", "{not json"), ("grants", '["not", "a", "record"]'), ("mcp", "{not json")],
+        ids=["grants-unreadable", "grants-wrong-shape", "mcp-unreadable"],
+    )
+    def test_every_damaged_sidecar_warning_says_to_repair_it_by_hand(
+        self, tmp_config: Path, caplog, writer: str, content: str
+    ):
+        """#1273 review: deleting the file is the easy fix, and it drops every
+        agent's recorded grants, so each warning says to repair it by hand."""
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.with_name("cao-grants.json").write_text(content, encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            if writer == "grants":
+                upsert_agent_tools("developer", ["cao-mcp-server"])
+            else:
+                record_mcp_entry("demo-tools", {"type": "local", "command": ["/x"]})
+        messages = [r.getMessage() for r in caplog.records if "grant record" in r.getMessage()]
+        assert messages
+        for message in messages:
+            assert "Repair the file by hand" in message, message
+            assert "drops the recorded grants of every agent" in message, message
+
+    def test_an_unwritable_sidecar_warning_says_a_profile_grant_can_stay(
+        self, tmp_config: Path, caplog
+    ):
+        """#1283 review: when the sidecar cannot be written, only plugin servers'
+        grants fall back to containment; a profile server's grant has no proof."""
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("root writes into a read-only directory")
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.parent.chmod(0o500)
+        try:
+            with caplog.at_level(logging.WARNING):
+                cfg_module._write_grant_record(
+                    {"version": 1, "agents": {"developer": ["x-server*"]}}
+                )
+        finally:
+            tmp_config.parent.chmod(0o700)
+        messages = [r.getMessage() for r in caplog.records if "Could not record" in r.getMessage()]
+        assert len(messages) == 1, [r.getMessage() for r in caplog.records]
+        message = messages[0]
+        assert "A plugin server's grant is still withdrawn by plugin-store containment" in message
+        assert "a profile server's grant written now has no proof left" in message
+        assert (
+            "stays if the profile drops that server before the agent is next installed"
+            " with a writable sidecar." in message
+        )
+        assert "will fall back to plugin-store containment when withdrawing them" not in message
+        assert "x-server" not in message, "the warning must not carry a recorded value"
+
     @pytest.mark.parametrize("damage", ["mode-000", "directory"])
     def test_an_unreadable_sidecar_is_left_intact_and_named(self, tmp_config: Path, caplog, damage):
         if damage == "mode-000" and hasattr(os, "geteuid") and os.geteuid() == 0:

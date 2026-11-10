@@ -42,6 +42,7 @@ cao --version           # Show version
 | `cao terminal` | Terminal management |
 | `cao workflow` | Workflow management |
 | `cao update` | Update CAO to the latest version |
+| `cao decisions` | Manage launch decisions (status, set, tier, off, enable, list, match, …) |
 | `cao fleet` | Inspect and tear down a *remote* fleet's workers (status, shutdown) |
 | `cao worker` | Talk to one worker in a remote fleet (list, status, send, sessions, attach, logs, release) |
 | `cao flow` | **[Deprecated]** Alias for `schedule` |
@@ -66,6 +67,7 @@ cao launch [MESSAGE] --agents PROFILE [OPTIONS]
 | `--session-name TEXT` | Name of the session (default: auto-generated) |
 | `--headless` | Launch in detached mode (no interactive terminal) |
 | `--provider TEXT` | Provider to use (default: profile provider or `kiro_cli`) |
+| `--engine [v2\|v3\|kas]` | Kiro engine (`kiro_cli` only; default: the profile's engine, else `v2`; `kas` is an alias of `v3`). v3 is in preview: see [Kiro v3](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/kiro-cli.md#kiro-v3-preview) |
 | `--allowed-tools TEXT` | Override allowedTools (repeatable) |
 | `--async` | Send message and return immediately |
 | `--auto-approve` | Skip confirmation prompt |
@@ -415,13 +417,14 @@ profile name, a local `.md` path, or a URL on an allowlisted host
 (`github.com`, `raw.githubusercontent.com` by default).
 
 ```bash
-cao install AGENT_SOURCE [--provider PROVIDER] [--env KEY=VALUE]
+cao install AGENT_SOURCE [--provider PROVIDER] [--env KEY=VALUE] [--engine v2|v3|kas]
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--provider PROVIDER` | Provider to install for. Precedence: this flag, then the profile's `provider:` frontmatter, then `kiro_cli` |
 | `--env KEY=VALUE` | Substitute a value into `${VAR}` placeholders in the profile (repeatable) |
+| `--engine [v2\|v3\|kas]` | Kiro engine the agent file is for (`kiro_cli` only; `kas` is an alias of `v3`). `v3` writes one universal file both engines load; `v2` writes a v2-only file. Default: the profile's engine, else the installed file's format |
 
 ```bash
 # Install a built-in profile
@@ -432,6 +435,9 @@ cao install ./my-agent.md
 
 # Install for a specific provider
 cao install developer --provider claude_code
+
+# Install a Kiro agent for the v3 engine (preview)
+cao install reviewer --provider kiro_cli --engine v3
 ```
 
 ---
@@ -455,6 +461,11 @@ cao update
 
 After updating, restart any running `cao-server` to pick up the new version.
 
+Packages you added to CAO's tool environment with `--with`, such as a decider, are kept only by
+the unpinned PyPI path (`uv tool upgrade`). The git and version-pinned paths run without
+`--with` and drop them. Check and reinstall them after an update; see
+[the setup runbook](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/ephemeral-agents-agent-setup.md#3-install-the-decider-into-the-servers-python).
+
 ### Examples
 
 ```bash
@@ -463,6 +474,35 @@ cao update
 
 # If installed from git, it will fetch the latest commits:
 # $ uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade --reinstall
+```
+
+---
+
+## cao decisions
+
+Manage launch decisions: whether a decider may choose a delegated agent's model size, effort or
+CLI. Every decision point is off by default. See
+[Launch decisions](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/decisions.md)
+for what each point does and what a decider receives.
+
+| Subcommand | What it does |
+|------------|--------------|
+| `status` | Show effective local settings, installed deciders and their recent outcomes |
+| `set POINT STATE [--decider NAME]` | Set `model.route`, `effort.route`, `provider.route` or `task.features` to `off`, `shadow` or `on` |
+| `off` | Turn every point off and wait for in-flight decider requests |
+| `enable NAME` / `disable NAME` / `show NAME` | Run an installed decider's consent, revoke or status command (consent needs an interactive terminal) |
+| `tier PROVIDER TIER [MODEL] [--unset]` | Map a provider's `small`, `medium` or `large` tier to a model id |
+| `table POINT OPTION --profile NAME \| --role NAME` | Set the built-in `fixed_table` decider's answer |
+| `exclude --add NAME \| --remove NAME` | Keep an installed profile on its own model |
+| `tune [--on-timeout-ms N] [--threshold X] [--retention-days N]` | Change the timeout, confidence threshold or record retention |
+| `list [--point P] [--since T] [--limit N]` | List content-free decision records, newest first |
+| `purge [--before T \| --all] [--rotate-key]` | Delete records, optionally rotating the hash key |
+| `match show \| check \| explain` | Show, check and explain the local model catalog |
+
+```bash
+cao decisions status
+cao decisions set model.route shadow --decider fixed_table
+cao decisions off
 ```
 
 ---
