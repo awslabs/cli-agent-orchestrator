@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **`cao install` exits 1 when the install fails** (#1270). It printed `Error: <message>` and
+  exited 0, so a script or CI step could not tell a failed install from a successful one. It
+  now exits 1 with the same message on stderr, like the rest of the CLI. A script that relied
+  on exit 0 after a failed install must change.
 - **Keep finished child agents open, for workshops and debugging** (#1225 phase 1). A new
   machine-wide setting, `terminal.keep_finished`, off by default
   (`cao config set terminal.keep_finished.enabled true`). While it is on, a successful
