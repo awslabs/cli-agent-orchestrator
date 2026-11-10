@@ -1,0 +1,127 @@
+# Execution-only runners: one pool of identical pods. Each runs `cao-runner`
+# (tmux plus whatever provider CLI the server launches in it) and NO
+# cao-server. A runner dials out to the server's runner hub; nothing dials in,
+# so there is no runner Service.
+#
+# Each runner hosts one terminal (CAO_RUNNER_MAX_TERMINALS=1), so when an agent
+# assigns work, the new agent is placed on another free runner, in another pod.
+# Required anti-affinity puts every runner on its own node, which makes "another
+# runner" mean "another node" too; scale the pool to at most the node count.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cao-runner
+  labels:
+    app.kubernetes.io/name: cao-runner
+spec:
+  replicas: 2
+  # Replace one runner at a time, never surge: with required anti-affinity and
+  # a runner on every node, a surge pod has no node to go to and the rollout
+  # never finishes.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-runner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-runner
+        app.kubernetes.io/component: runner
+        app.kubernetes.io/part-of: cao-remote
+    spec:
+      # Runners need no Kubernetes API access.
+      automountServiceAccountToken: false
+      # The pod's pause process becomes PID 1 and reaps the orphans a tmux
+      # server and its agents leave behind; cao-runner itself is not an init.
+      shareProcessNamespace: true
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: cao-runner
+      containers:
+        - name: runner
+          image: cao-server
+          imagePullPolicy: IfNotPresent
+          command: ["cao-runner"]
+          env:
+            # ws:// is refused to anything but loopback unless the overlay
+            # opts in or serves wss:// (see the README's transport section).
+            - name: CAO_RUNNER_SERVER_URL
+              value: ws://cao-server.cao-remote.svc:9891
+            # Pinned off here, not left unset: an explicit env entry wins over
+            # envFrom, so cao-provider-env cannot switch cleartext on. Only an
+            # overlay patching this entry can (overlays/kind does).
+            - name: CAO_RUNNER_ALLOW_INSECURE
+              value: "0"
+            # A mounted file, not an env value: an env value stays readable in
+            # /proc/<pid>/environ for the life of the process.
+            - name: CAO_RUNNER_TOKEN_FILE
+              value: /var/run/cao-runner/token
+            # Present only while connected to the hub (the readinessProbe).
+            - name: CAO_RUNNER_READY_FILE
+              value: /home/cao/.cao/runner-ready
+            # The pod name: unique per replica and stable for the pod's life.
+            - name: CAO_RUNNER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CAO_RUNNER_MAX_TERMINALS
+              value: "1"
+            # The agents' in-session MCP servers reach the central API here.
+            # No API token is mounted: with terminal.backend=remote the server
+            # refuses to start with API auth on (#745 phase 1).
+            - name: CAO_API_HOST
+              value: cao-server.cao-remote.svc
+            - name: CAO_API_PORT
+              value: "9889"
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/runner
+          envFrom:
+            # Provider settings and credentials, supplied by the overlay or the
+            # operator. Only runner pods hold them; the server runs no agent.
+            - configMapRef:
+                name: cao-provider-env
+                optional: true
+            - secretRef:
+                name: cao-provider-credentials
+                optional: true
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/home/cao/.cao/runner-ready"]
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /home/cao/workspace
+            - name: runtime
+              mountPath: /home/cao/.cao
+            - name: runner-token
+              mountPath: /var/run/cao-runner
+              readOnly: true
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cao-remote-workspace
+        - name: runtime
+          emptyDir: {}
+        - name: runner-token
+          secret:
+            secretName: cao-runner-token
+            defaultMode: 0440

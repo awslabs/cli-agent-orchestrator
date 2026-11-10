@@ -1,0 +1,129 @@
+# The ONE cao-server. It runs the API, database, orchestration and status
+# detection, and no agent: every terminal it creates is placed on a cao-runner
+# (terminal.backend=remote). It needs no model credentials and no workspace.
+#
+# StatefulSet, one replica: its SQLite state, locks and FIFOs live on a
+# ReadWriteOnce claim, and a Deployment's rolling update would briefly run two
+# owners of that state. A StatefulSet replaces its pod only after the old one
+# is gone (outside a forced delete).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cao-server
+  labels:
+    app.kubernetes.io/name: cao-server
+spec:
+  serviceName: cao-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-server
+        app.kubernetes.io/part-of: cao-remote
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: cao-server
+          image: cao-server
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9889
+            - name: runner-hub
+              containerPort: 9891
+          env:
+            - name: CAO_TERMINAL_BACKEND
+              value: remote
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/state
+            # Profiles the agents use. Any agent can delegate work to another.
+            - name: CAO_INSTALL_PROFILES
+              value: "developer:claude_code reviewer:claude_code"
+            # Nothing to warm: no provider CLI runs in this pod.
+            - name: CAO_WARM_PROVIDER
+              value: "0"
+            # Service names only, no cluster DNS domain (it is not always
+            # cluster.local): the namespace's search path resolves them.
+            - name: CAO_ALLOWED_HOSTS
+              value: "cao-server,cao-server.cao-remote,cao-server.cao-remote.svc"
+            # The runner hub. Bound on all interfaces so runner pods can dial
+            # in; the Service is ClusterIP only, the NetworkPolicy limits who
+            # can reach it, and the runner token limits who is accepted.
+            - name: CAO_RUNNER_BIND_HOST
+              value: 0.0.0.0
+            - name: CAO_RUNNER_PORT
+              value: "9891"
+            # A mounted file, not an env value: an env value stays readable in
+            # /proc/<pid>/environ for the life of the process.
+            - name: CAO_RUNNER_TOKEN_FILE
+              value: /var/run/cao-runner/token
+            # How an agent ON A RUNNER reaches this server: written into each
+            # agent's MCP config in place of this pod's own bind address.
+            - name: CAO_RUNNER_AGENT_API_HOST
+              value: cao-server.cao-remote.svc
+            - name: CAO_RUNNER_AGENT_API_PORT
+              value: "9889"
+            # A runner pod may start after the request that needs it.
+            - name: CAO_RUNNER_PLACEMENT_TIMEOUT
+              value: "120"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: state
+              mountPath: /home/cao/.cao
+            - name: runner-token
+              mountPath: /var/run/cao-runner
+              readOnly: true
+      volumes:
+        - name: runner-token
+          secret:
+            secretName: cao-runner-token
+            defaultMode: 0440
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# In-cluster only, on purpose: the hub port (9891) is never exposed through an
+# Ingress, a LoadBalancer or a NodePort. Runners reach it from inside the
+# cluster; the API (9889) is reached with `kubectl port-forward`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cao-server
+  labels:
+    app.kubernetes.io/name: cao-server
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cao-server
+  ports:
+    - name: http
+      port: 9889
+      targetPort: 9889
+    - name: runner-hub
+      port: 9891
+      targetPort: 9891

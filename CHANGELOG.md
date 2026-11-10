@@ -18,6 +18,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any `cao-bridge` runtimes and their terminals before upgrading. A database written by the
   beta keeps its nullable `terminals.runtime_id` column; nothing reads it any more.
 
+- **Remote terminal backend [EXPERIMENTAL]** (#745). With `terminal.backend = "remote"`
+  (`CAO_TERMINAL_BACKEND=remote` or `cao-server --terminal remote`), one `cao-server` keeps the
+  API, the database, orchestration, status detection and the inbox, and places every terminal
+  on an execution-only `cao-runner` (new console script) that drives tmux on its own host or
+  pod. A runner dials out to the server's runner hub (its own port, `9891`) with a shared token
+  (`CAO_RUNNER_TOKEN_FILE` or `CAO_RUNNER_TOKEN`); the terminal row records its runner
+  (`terminals.runner_id`, nullable, added idempotently), and `GET /runners` lists the runners.
+  Routes that reach a remote terminal answer `503` (runner not connected, or no room), `504`
+  (outcome unknown) or `502` (the runner reported a failure); a terminal whose runner is out
+  of reach or whose output stream has a gap reads `unknown` until a fresh snapshot is
+  processed, including after a server or runner restart. A runner's report is accepted only
+  from the terminal's owner or the runner its pending placement chose. A runner refuses
+  `ws://` to anything but loopback unless `CAO_RUNNER_ALLOW_INSECURE=1`; the hub can serve
+  `wss://` (`CAO_RUNNER_TLS_CERT` / `CAO_RUNNER_TLS_KEY`). Under this backend `cao-server`
+  refuses to start with API authentication configured, refuses Python workflow scripts and
+  flow pre-scripts (`409`), and launches only `claude_code` and `mock_cli`
+  (`terminal.remote_providers`), whose launch does no execution-host work on the server.
+  Docs: `docs/remote-runners.md`; example:
+  `examples/cao-clusters/kubernetes/remote-runners/` (a cluster-neutral base and a kind
+  overlay).
+
 - **A reconnect no longer loses a tool call's end, and `toolCallName` is `assign`, not
   `OrchestrationType.ASSIGN`** (#1292). On the ambient AG-UI stream, a client that held an `assign`
   or `handoff` call open, lost its stream (an overflow, or a dropped connection) and reconnected
