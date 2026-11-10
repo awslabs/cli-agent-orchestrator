@@ -242,13 +242,17 @@ Withdrawing a grant is therefore restricted to keys CAO can *prove* are its own:
 A `<servername>*` key CAO has no record of and cannot place in the agent-plugin store is
 left alone rather than deleted on a guess.
 
-If `cao-grants.json` cannot be read (not valid JSON, not valid UTF-8, not readable,
-or a directory), CAO leaves it as it is, logs a warning that names it, and records
-nothing in it until it is readable again. Repair the file by hand rather than
-deleting it: deleting it drops the recorded grants of every agent, so CAO keeps
-only the agent-plugin store proof, and a profile server's grant it wrote whose
-server the profile drops before the agent is next installed stays in
-`opencode.json` until you remove it.
+If `cao-grants.json` cannot be read (not valid JSON, not valid UTF-8, not readable, a
+directory, or not a grant record), CAO leaves it as it is, logs a warning that names it,
+and records nothing in it until it is a readable grant record. Repair the file by hand
+rather than deleting it. Deleting it drops the recorded grants of every agent, so CAO
+keeps only the agent-plugin store proof, and a profile server's grant it wrote whose
+server the profile drops before the agent is next installed stays in `opencode.json`
+until you remove it. It also drops the `"mcp"` fingerprints described below: after a
+`CAO_HOME_DIR` move, the fingerprint is the only proof that an entry naming the old
+agent-plugin store is CAO's (`is_cao_owned_mcp_entry`, through
+`is_orphaned_recorded_mcp_entry`). Without it, CAO reports a plugin server of the same
+name as a collision, and neither updates nor disables that entry.
 
 The same two proofs decide which `mcp` entries are CAO's. For every agent-plugin
 server it writes, CAO records a SHA-256 fingerprint of the entry in `cao-grants.json`
