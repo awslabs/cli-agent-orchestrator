@@ -166,7 +166,7 @@ Pick a pattern with the user:
 
 | Pattern | Command | Survives a CAO upgrade? | Touches CAO itself? |
 | --- | --- | --- | --- |
-| A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | Only for a plain PyPI install upgraded with `uv tool upgrade`. For a git install, `cao update` drops it (see below). | Yes: CAO is reinstalled and may move to a newer version |
+| A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | Only for an unpinned PyPI install upgraded with `uv tool upgrade`. For a git or version-pinned install, `cao update` drops it (see below). | Yes: CAO is reinstalled and may move to a newer version |
 | B: add it to the tool's environment | `uv pip install --python "$CAO_PY" "cao-decider-jev @ <source>"` | **No.** The receipt never records it, so any CAO upgrade silently drops it | Not CAO's own package, but it can change dependencies CAO shares (such as `httpx`). Run it with `--dry-run` first and show the user the changes |
 
 **For pattern A, copy the source and the extras from the receipt.** The `cli-agent-orchestrator`
@@ -210,6 +210,9 @@ often it won't:
 
 - `cao update` on a git install runs `uv tool install <git source> --upgrade --reinstall` without
   any `--with`, so it removes the decider even after pattern A;
+- `cao update` on a version-pinned PyPI install (a receipt entry with a `specifier`) runs
+  `uv tool install cli-agent-orchestrator@latest --upgrade`, also without `--with`, so it removes
+  the decider too. An unpinned PyPI install runs `uv tool upgrade`, which keeps it;
 - on a local install, `cao update` changes nothing and prints a reinstall command that has no
   `--with` either;
 - after pattern B, any upgrade removes it.
@@ -304,7 +307,7 @@ executable on `PATH`. `enable` ends with:
 
 ```text
 Consent granted; effective states:
-{"effort.route": "off", "model.route": "shadow", "provider.route": "off"}
+{"effort.route": "off", "model.route": "shadow", "provider.route": "off", "task.features": "off"}
 ```
 
 The exact list of points can grow with CAO versions; what matters is `"model.route": "shadow"`.
@@ -442,8 +445,10 @@ every time.
 - **Kiro v3** refuses unsupported `kiro-cli` versions with `kiro_v3_unsupported_version` and
   pending, unverified versions with `kiro_v3_unverified_version`; the creating agent receives
   the specific rule and its remedy. Use a supported version for an unsupported refusal, or a
-  verified version for an unverified refusal. `kiro-cli` 3.1.0 is pending: it is refused by
-  default and only the operator can admit it with `kiro.v3_allow_unverified_versions`. Older
+  verified version for an unverified refusal. Which versions are verified or pending is listed
+  only in [Supported kiro-cli versions](kiro-cli.md#supported-kiro-cli-versions). A pending
+  version is refused by default, and only the operator can admit it with
+  `kiro.v3_allow_unverified_versions`. Older
   CAO builds returned a bare `unexpected_failure`, with the real reason only in the server log.
 
 ## 9. Undo

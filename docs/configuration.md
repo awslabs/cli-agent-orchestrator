@@ -155,12 +155,13 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 
 Creation and creator-owned launches are opt-in. `assign` and `handoff` launch
 creator-owned ephemeral names from the creator terminal.
-Only JSON `true` enables the tool, and agent terminals must restart to see it.
+Only JSON `true` enables the tool. An agent sees it only once its CAO MCP connection
+restarts: reconnect it (in Claude Code, `/mcp`) or restart the agent's terminal.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `false` | Enable ephemeral creation, claims and owner-only HTTP launch. |
-| `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex is an operator opt-in. |
+| `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex and Kiro (`kiro_cli`) are operator opt-ins. |
 | `max_brief_bytes` | `8192` | Maximum UTF-8 bytes after brief normalization. |
 | `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched or swept. |
 | `claim_lease_seconds` | `60` | Lease from claim to terminal creation. With `model_tier`, `effort` or `provider` set to `"auto"` it must be at least `n * decisions.on_timeout_ms / 1000 + 30`, where `n` counts the fields set to `"auto"`, `provider` included. |

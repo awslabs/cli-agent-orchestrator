@@ -39,8 +39,9 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
 }
 ```
 
-Only JSON `true` enables creation. Agent terminals must restart before they see the
-`create_ephemeral_agent` MCP tool. The server rechecks settings for every create request,
+Only JSON `true` enables creation. An agent sees the `create_ephemeral_agent` MCP tool only
+if its CAO MCP connection started after the change: reconnect it (in Claude Code, `/mcp`,
+then reconnect the CAO server) or restart the agent's terminal. The server rechecks settings for every create request,
 so an already registered tool is refused after the feature is turned off. Claims also
 recheck whether the feature is enabled before touching a name. Unreadable
 settings fail closed. `max_depth` accepts only integer 1. Ephemeral callers cannot create
@@ -349,6 +350,12 @@ admin scope. The JSON body is the flat eight-field spec: `spec_version` (1), `pu
 `brief`, `description`, `provider`, `tools`, `model_tier`, and `effort`. Optional fields
 can be omitted or null. Extra fields are refused. The MCP tool forwards this same body.
 
+`purpose` is 3 to 32 characters: a lowercase letter, then lowercase letters, digits or `_`
+(`^[a-z][a-z0-9_]{2,31}$`), so `review_auth_module` works and `Review auth` doesn't. It
+becomes the middle of the agent's name. `description` is optional, at most 280 characters.
+Neither may hold control characters. A body that breaks these rules, has a wrong type or
+carries an extra field is refused with `invalid_spec` (422), naming each field at fault.
+
 Providers are Claude Code by default, or Codex or Kiro when explicitly enabled by the
 operator. `provider: "auto"` lets a decider choose between equivalent providers at launch
 (see [Provider `auto`](#provider-auto)).
@@ -619,6 +626,19 @@ Create also refuses with `provider_unsupported`, `provider_not_allowed`,
 and effort refusals other than `auto_requires_bounds`, and before the creator tool-ceiling
 check (`tool_exceeds_creator:<atoms>`).
 
+Create has these refusals too:
+
+| HTTP status | Create rule | Meaning |
+| --- | --- | --- |
+| 422 | `invalid_spec` | the body has a bad field, a wrong type or an extra field (see above) |
+| 400 | `creator_unresolved` | the calling terminal isn't registered, or its tools can't be read |
+| 400 | `max_depth_exceeded` | an ephemeral agent tried to create one |
+| 400 | `brief_too_large` | the normalized brief exceeds `ephemeral.max_brief_bytes` |
+| 400 | `secret_detected` | the brief, description or purpose looks like it holds a credential |
+| 409 | `max_live_exceeded` | the session is at `ephemeral.max_live_per_session` |
+| 409 | `name_space_exhausted` | no free name was found for this purpose; retry |
+| 503 | `store_busy`, `store_lock_unavailable` | see [Operator settings](#operator-settings) |
+
 Every ephemeral live-profile load verifies the exact bytes parsed against the registry's
 `profile_sha256`, including claim-less launches and provider reloads. Missing rows or hashes
 and modified files fail closed. Finalize updates the hash only while the row is still claimed by
@@ -643,7 +663,7 @@ marked ephemeral and the existing delegation denial stays effective.
 ## Honesty statement
 
 > An ephemeral child's CAO-recorded allowlist is a subset of its creator's effective allowlist at creation time. Its generated profile declares only the CAO MCP server, no hooks or native agents, and `skills: []` so no skill catalog is inherited; named skills remain callable through `load_skill`; installed agent plugins' MCP servers are not added at launch; and CAO will not launch it with a wider list. An ephemeral child cannot create ephemerals. It cannot delegate or start or cancel workflows through CAO's MCP tools unless the operator sets `child_may_delegate`. That is all this guarantees. It does not guarantee:
-> 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. A Claude Code child also lacks Claude Code's own subagents (`Agent`/`Task`), `Monitor`, native skills (`Skill`), `AskUserQuestion` and plan mode, whatever its grant, as well as the [Claude Code built-ins CAO always removes](tool-restrictions.md#claude-code-built-ins-cao-always-removes). With `execute_bash`, though, its shell can still start any program, `claude` included, and run commands in the background. The operator's user-level Claude Code configuration still loads (`~/.claude/CLAUDE.md`, rules, and the hooks in its settings), as do the working directory's `CLAUDE.md` files and its `.claude/` settings, rules and hooks. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. On Kiro, an operator opt-in, the child runs on the v3 engine from a per-launch agent file in a CAO-owned `KIRO_HOME`: Kiro exposes only the tools that file selects and does not exclude, and the file denies every capability outside the grant. Before each task, CAO checks that the header names the agent, and that `/tools` and `/mcp list` show only what the file grants and `cao-mcp-server`; it refuses the launch when it cannot read them. The child runs its tools without approval prompts (`--trust-all-tools`). A Kiro child has no OS sandbox: with `fs_read` it reads any file you can; with `execute_bash` it has an unbounded shell and subagents; with `fs_write` it can write anywhere you can. CAO makes its agent file read-only and records whether it changed. Workspace steering and `AGENTS.md` in the working directory load. CAO does not certify Kiro Crew's own state under `~/.kiro/crew/`. Kiro helpers are claimed only on kiro-cli versions that passed the operator checklist. The create response's `enforcement` field reports this class: `hard` or `advisory`. A `provider: "auto"` child may run on any provider in its fallback's `ephemeral.provider_route` set, and while it does, the response, the registry row and the live profile still name the fallback.
+> 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. A Claude Code child also lacks Claude Code's own subagents (`Agent`/`Task`), `Monitor`, native skills (`Skill`), `AskUserQuestion` and plan mode, whatever its grant, as well as the [Claude Code built-ins CAO always removes](tool-restrictions.md#claude-code-built-ins-cao-always-removes). With `execute_bash`, though, its shell can still start any program, `claude` included, and run commands in the background. The operator's user-level Claude Code configuration still loads (`~/.claude/CLAUDE.md`, rules, and the hooks in its settings), as do the working directory's `CLAUDE.md` files and its `.claude/` settings, rules and hooks. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. On Kiro, an operator opt-in, the child runs on the v3 engine from a per-launch agent file in a CAO-owned `KIRO_HOME`: Kiro exposes only the tools that file selects and does not exclude, and the file denies every capability outside the grant. Before each task, CAO checks that the header names the agent, and that `/tools` and `/mcp list` show only what the file grants and `cao-mcp-server`; it refuses the launch when it cannot read them. The child runs its tools without approval prompts (`--trust-all-tools`). A Kiro child has no OS sandbox: with `fs_read` it reads any file you can; with `execute_bash` it has an unbounded shell and subagents; with `fs_write` it can write anywhere you can. CAO makes its agent file read-only and records whether it changed. Workspace steering and `AGENTS.md` in the working directory load. CAO does not certify Kiro Crew's own state under `~/.kiro/crew/`. Kiro helpers run only on the kiro-cli versions in [Supported kiro-cli versions](kiro-cli.md#supported-kiro-cli-versions); a version still pending operator verification runs only when the operator opts in with `kiro.v3_allow_unverified_versions`. The create response's `enforcement` field reports this class: `hard` or `advisory`. A `provider: "auto"` child may run on any provider in its fallback's `ephemeral.provider_route` set, and while it does, the response, the registry row and the live profile still name the fallback.
 > 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. MCP `send_message`, `answer_user_prompt` and `delete_terminal` bind targets to the caller's permitted terminal tree (#912). State-changing memory and metadata tools and workflow authoring (`workflow_create`/`workflow_update`; a changed spec needs a new plan approval, on by default) still use the coarse server grant (#671). With `child_may_delegate=true`, workflow cancellation also uses that grant, without run ownership binding.
 > 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself, edit `settings.json`, or read `ephemeral/live/`.
 > 4. **Per-tool MCP enforcement for installed profiles** (#671). Installed profiles ARE now bounded by their creator's recorded delegation ceiling through the same comparison (see [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance)); the remaining gap is the server-level `@cao-mcp-server` grant above.
