@@ -101,7 +101,9 @@ def launch_http(release_runtime, monkeypatch):
     monkeypatch.setattr(
         inbox_service.InboxService,
         "deliver_pending_in_background",
-        lambda self, terminal_id: self.deliver_pending(terminal_id),
+        lambda self, terminal_id, registry=None: self.deliver_pending(
+            terminal_id, registry=registry
+        ),
     )
     monkeypatch.setattr(terminal_service, "send_input", lambda *a, **kw: None)
     monkeypatch.setattr(terminal_service, "get_output", lambda *a: "done")

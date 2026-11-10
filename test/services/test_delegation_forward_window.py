@@ -23,14 +23,20 @@ from cli_agent_orchestrator.clients.database import (
     create_terminal,
     get_inbox_messages,
     list_open_edges_into,
+    list_open_edges_out_of,
     mark_assign_edges_delivered,
 )
 from cli_agent_orchestrator.constants import DELEGATION_PICKUP_TIMEOUT_SECONDS
 from cli_agent_orchestrator.models.delegation import EdgeSource
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    TerminalInputBlockedError,
+    TerminalInputBlockedReason,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.services import delegation_callback_service as svc
 from cli_agent_orchestrator.services import inbox_service as inbox_module
 from cli_agent_orchestrator.services import status_monitor as monitor_module
+from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
@@ -110,14 +116,16 @@ def world(monkeypatch):
         return True
 
     monkeypatch.setattr(InboxService, "_confirm_submitted", confirm)
-    # Forwards are delivered on a background thread in production; inline here,
+    # Forwards are delivered on a background pool in production; inline here,
     # through the evaluator's own seam, so each test sees the delivery (and the
     # evaluation made inside it) before it asserts, whatever earlier tests did
     # to the inbox singleton.
     monkeypatch.setattr(
         svc,
         "_deliver",
-        lambda receiver_id, _sender_id: inbox_module.inbox_service.deliver_pending(receiver_id),
+        lambda receiver_id, _sender_id, registry: inbox_module.inbox_service.deliver_pending(
+            receiver_id, registry=registry
+        ),
     )
     for terminal_id in (TOP, SUP, W1):
         _finished_turn(monitor, terminal_id)
@@ -379,3 +387,53 @@ class TestHerdrReportsTheTurnStart:
         assert svc.evaluate_completion(W1) == 1
         (forward,) = _pickup_timeouts_to(SUP)
         assert forward.endswith("---\nPREVIOUS ANSWER")
+
+
+class TestEdgesThatCanNeverBeArmed:
+    """An edge whose task can never be delivered must not stay OPEN (second review, P2-1)."""
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("tmux error"),
+            TerminalInputBlockedError(
+                "provider exited", reason=TerminalInputBlockedReason.PROVIDER_ERROR
+            ),
+        ],
+        ids=["exception", "refused"],
+    )
+    def test_failed_delivery_closes_its_edge_and_a_follow_up_gets_a_fresh_one(
+        self, world, monkeypatch, failure
+    ):
+        typed = inbox_module.terminal_service.dispatch_input.side_effect
+        monkeypatch.setattr(inbox_module.terminal_service.dispatch_input, "side_effect", failure)
+        _send(SUP, W1, "lost")
+        assert list_open_edges_into(W1) == []
+        assert list_open_edges_out_of(SUP) == []
+
+        monkeypatch.setattr(inbox_module.terminal_service.dispatch_input, "side_effect", typed)
+        _send(SUP, W1, "again")
+
+        (edge,) = list_open_edges_into(W1)
+        assert edge.delivered_at is not None
+        assert [m.message for m in get_inbox_messages(W1, limit=5)][-1] == "again"
+        assert edge.message_id == get_inbox_messages(W1, limit=5)[-1].id
+
+    def test_parent_of_a_worker_interrupted_by_a_restart_is_forwarded(self, world, monkeypatch):
+        _assign(TOP, SUP)
+        create_delegation_edge(SUP, W1, EdgeSource.ASSIGN)  # task never delivered
+        assert svc.evaluate_completion(SUP) == 0  # held back as nested work
+
+        for name, value in {
+            "list_pending_initial_delivery_terminal_ids": lambda: [W1],
+            "initial_delivery_pending": lambda _t: False,
+            "_persist_initial_delivery": lambda *_a, **_kw: True,
+            "get_terminal_metadata": lambda _t: None,
+        }.items():
+            monkeypatch.setattr(terminal_service, name, value)
+        assert asyncio.run(terminal_service.recover_interrupted_initial_deliveries()) is True
+
+        assert list_open_edges_out_of(SUP) == []
+        assert svc.evaluate_completion(SUP) == 1
+        (forward,) = _forwards_to(TOP)
+        assert forward.endswith("---\nSUP PREVIOUS ANSWER")

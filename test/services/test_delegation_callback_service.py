@@ -1,7 +1,9 @@
 """Tests for delegation_callback_service."""
 
 import asyncio
+import logging
 import threading
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -17,7 +19,12 @@ from cli_agent_orchestrator.clients.database import (
     list_open_edges_out_of,
     mark_assign_edges_delivered,
 )
-from cli_agent_orchestrator.models.delegation import EdgeReason, EdgeSource
+from cli_agent_orchestrator.models.delegation import (
+    DelegationEdge,
+    EdgeReason,
+    EdgeSource,
+    EdgeState,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import delegation_callback_service as svc
 from cli_agent_orchestrator.services.inbox_service import InboxService
@@ -52,6 +59,17 @@ class TestMessages:
         text = svc.build_worker_ended_message("w1", "developer", "was deleted", None)
         assert text.startswith("[CAO worker ended] Worker w1 (profile developer) was deleted")
         assert "(last response could not be read)" in text
+        assert "may still be running" not in text
+        assert "delete_terminal" not in text
+
+    def test_error_notice_says_the_worker_may_still_be_running(self):
+        text = svc.build_worker_ended_message(
+            "w1", "developer", "reached ERROR", "partial", may_be_running=True
+        )
+        assert text.startswith("[CAO worker ended] Worker w1 (profile developer) reached ERROR")
+        assert "The worker may still be running" in text
+        assert 'When done with it: delete_terminal("w1")' in text
+        assert text.endswith("---\npartial")
 
 
 class TestSendMessageRules:
@@ -255,6 +273,7 @@ class TestSweep:
 
 class TestConsumer:
     def test_idle_event_evaluates_and_error_event_ends(self):
+        registry = object()
         events = [
             {"topic": "terminal.w1.status", "data": {"status": "idle"}},
             {"topic": "terminal.w2.status", "data": {"status": "error"}},
@@ -273,9 +292,9 @@ class TestConsumer:
         ):
             bus.subscribe.return_value = FakeQueue()
             with pytest.raises(asyncio.CancelledError):
-                asyncio.run(svc.run())
-        ev.assert_called_once_with("w1")
-        ended.assert_called_once_with("w2", "reached ERROR")
+                asyncio.run(svc.run(registry))
+        ev.assert_called_once_with("w1", registry)
+        ended.assert_called_once_with("w2", "reached ERROR", registry, may_be_running=True)
 
 
 class TestDeliveryDoesNotBlock:
@@ -339,3 +358,70 @@ class TestDeliveryDoesNotBlock:
 
         assert self._started(started, "sup2") is True
         assert finished.is_set() is False
+
+
+class TestRegistryReachesDeliveries:
+    """Forwards and notices fire PostSendMessageEvent, as an inbox POST does."""
+
+    def test_forward_is_delivered_with_the_registry(self, db, env):
+        registry = object()
+        _armed("sup", "w1")
+        svc.evaluate_completion("w1", registry)
+        env["inbox"].deliver_pending_in_background.assert_called_once_with("sup", registry=registry)
+
+    def test_sweep_passes_the_registry(self, db, env):
+        registry = object()
+        _armed("sup", "w1")
+        svc.sweep(registry)
+        env["inbox"].deliver_pending_in_background.assert_called_once_with("sup", registry=registry)
+
+    def test_notice_is_delivered_with_the_registry(self, db, env):
+        registry = object()
+        _armed("sup", "w1")
+        svc.handle_worker_ended("w1", "was deleted", registry)
+        env["inbox"].deliver_pending_in_background.assert_called_once_with("sup", registry=registry)
+
+
+class TestWaitingOnUndeliveredEdge:
+    """An outbound edge that is never delivered holds the forward back; say so once."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_warnings(self, monkeypatch):
+        monkeypatch.setattr(svc, "_warned_undelivered", set())
+
+    @staticmethod
+    def _edge(edge_id, age_seconds, delivered=False):
+        now = datetime.now(timezone.utc)
+        return DelegationEdge(
+            id=edge_id,
+            caller_id="sup",
+            worker_id=f"w{edge_id}",
+            source=EdgeSource.ASSIGN,
+            state=EdgeState.OPEN,
+            reason=EdgeReason.NO_CALLBACK,
+            created_at=now - timedelta(seconds=age_seconds),
+            delivered_at=now if delivered else None,
+        )
+
+    def test_old_undelivered_edge_is_logged_once(self, caplog):
+        old = self._edge(1, svc.DELEGATION_PICKUP_TIMEOUT_SECONDS + 5)
+        with caplog.at_level(logging.WARNING, logger=svc.logger.name):
+            svc._warn_if_waiting_on_undelivered("sup", [old])
+            svc._warn_if_waiting_on_undelivered("sup", [old])
+        assert caplog.text.count("whose task has not been delivered") == 1
+        assert "sup is not forwarded while it waits on w1" in caplog.text
+
+    def test_young_or_delivered_edges_are_not_logged(self, caplog):
+        young = self._edge(1, 5)
+        armed = self._edge(2, svc.DELEGATION_PICKUP_TIMEOUT_SECONDS + 5, delivered=True)
+        with caplog.at_level(logging.WARNING, logger=svc.logger.name):
+            svc._warn_if_waiting_on_undelivered("sup", [young, armed])
+        assert "whose task has not been delivered" not in caplog.text
+
+    def test_evaluation_still_holds_the_forward_back(self, db, env, caplog):
+        _armed("sup", "w1")
+        create_delegation_edge("w1", "w2", EdgeSource.ASSIGN)
+        with patch(f"{MOD}._warn_if_waiting_on_undelivered") as warn:
+            assert svc.evaluate_completion("w1") == 0
+        (outbound,) = warn.call_args.args[1]
+        assert (warn.call_args.args[0], outbound.worker_id) == ("w1", "w2")

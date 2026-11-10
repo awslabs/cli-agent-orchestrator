@@ -8,7 +8,7 @@ import functools
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from itertools import groupby
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set
@@ -16,6 +16,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
+    close_message_edges,
     fail_orphaned_pending_messages,
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
@@ -31,6 +32,7 @@ from cli_agent_orchestrator.constants import (
     INBOX_SUBMIT_MAX_RESUBMITS,
     INBOX_SWEEP_FANOUT,
 )
+from cli_agent_orchestrator.models.delegation import EdgeState
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
@@ -80,6 +82,9 @@ class InboxService:
         # reaped — terminal ids are bounded by session lifecycle.
         self._delivery_locks_guard = threading.Lock()
         self._delivery_locks: Dict[str, threading.Lock] = {}
+        # Created on first use by deliver_pending_in_background.
+        self._background_pool_guard = threading.Lock()
+        self._background_pool: Optional[ThreadPoolExecutor] = None
 
     def _delivery_lock(self, terminal_id: str) -> threading.Lock:
         with self._delivery_locks_guard:
@@ -392,37 +397,73 @@ class InboxService:
                             f"message {message.id}: {e}"
                         )
                         update_message_status(message.id, MessageStatus.FAILED)
+                    self._close_message_edges(terminal_id, batch)
             except Exception as e:
                 for message in batch:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
+                self._close_message_edges(terminal_id, batch)
 
-    def deliver_pending_in_background(self, terminal_id: str) -> threading.Thread:
-        """Start ``deliver_pending`` for ``terminal_id`` on its own thread and return at once.
+    def deliver_pending_in_background(
+        self, terminal_id: str, registry: PluginRegistry | None = None
+    ) -> "Future[None]":
+        """Queue ``deliver_pending`` for ``terminal_id`` on a shared pool and return at once.
 
         For a caller that has already stored the message and must not wait out
         the submit confirmation, which holds an idle receiver for
         INBOX_SUBMIT_CONFIRM_TIMEOUT per attempt when it does not start. This is
         the split the inbox POST endpoint makes: the message is stored, so the
         caller's answer is already true, and the delivery and its confirmation
-        carry on by themselves. A failure is logged, never raised.
+        carry on by themselves. ``registry`` is passed through, so
+        PostSendMessageEvent fires as it does for the POST. A failure is logged,
+        never raised.
 
-        Returns the started thread, so a test can join it.
+        The pool has INBOX_SWEEP_FANOUT workers, the bound the sweeps fan out
+        over, so a burst (a session teardown with many waiting callers) cannot
+        start a thread per message. Deliveries to one receiver still run one at
+        a time under its lock, so a burst to one busy receiver can hold every
+        worker and delay deliveries to others until it drains.
+
+        Shutdown: the pool's workers are joined at interpreter exit, so exit
+        waits for queued and running deliveries, each up to a full submit
+        confirmation. A process killed between a message being marked
+        DELIVERED and its paste leaves it DELIVERED but never typed; the inbox
+        POST path has the same window.
+
+        Returns the delivery's future, so a test can wait on it.
 
         Thread Safety:
-            Safe from any thread. Deliveries to one receiver still run one at a
-            time under its delivery lock.
+            Safe from any thread.
         """
 
         def deliver() -> None:
             try:
-                self.deliver_pending(terminal_id)
-            except Exception as e:  # noqa: BLE001 - nobody waits on this thread
+                self.deliver_pending(terminal_id, registry=registry)
+            except Exception as e:  # noqa: BLE001 - nobody waits on this future
                 logger.warning(f"Background delivery to {terminal_id} failed: {e}")
 
-        thread = threading.Thread(target=deliver, name=f"cao-deliver-{terminal_id}", daemon=True)
-        thread.start()
-        return thread
+        with self._background_pool_guard:
+            if self._background_pool is None:
+                self._background_pool = ThreadPoolExecutor(
+                    max_workers=INBOX_SWEEP_FANOUT, thread_name_prefix="cao-deliver"
+                )
+            pool = self._background_pool
+        return pool.submit(deliver)
+
+    @staticmethod
+    def _close_message_edges(terminal_id: str, batch: List[InboxMessage]) -> None:
+        """Close the send_message delegation edges of a batch whose delivery failed.
+
+        A FAILED message is never retried, so its edges would never be armed:
+        left OPEN, they are never swept, keep the caller looking busy with
+        nested work, and stop a follow-up from opening a fresh edge. They are
+        closed as WORKER_ENDED, the state for an edge whose worker can no
+        longer answer it; no notice is sent. Best-effort, like arming.
+        """
+        try:
+            close_message_edges([m.id for m in batch], EdgeState.WORKER_ENDED)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Could not close delegation edges for {terminal_id}: {exc}")
 
     @staticmethod
     def _arm_message_edges(terminal_id: str, batch: List[InboxMessage]) -> None:

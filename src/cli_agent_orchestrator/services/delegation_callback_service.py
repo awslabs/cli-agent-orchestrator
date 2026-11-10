@@ -8,9 +8,11 @@ it still applies on backends that do not publish status events.
 """
 
 import asyncio
+import functools
 import logging
 import time
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import List, Optional, Set
 
 from cli_agent_orchestrator.clients.database import (
     close_delegation_edge,
@@ -32,6 +34,7 @@ from cli_agent_orchestrator.models.delegation import (
     EdgeState,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.inbox_service import inbox_service
@@ -90,11 +93,30 @@ def build_pickup_timeout_message(
 
 
 def build_worker_ended_message(
-    worker_id: str, profile: Optional[str], how: str, last_response: Optional[str]
+    worker_id: str,
+    profile: Optional[str],
+    how: str,
+    last_response: Optional[str],
+    *,
+    may_be_running: bool = False,
 ) -> str:
+    """The notice for a caller whose worker ended, or errored, before it replied.
+
+    ``may_be_running`` is for ERROR: the terminal is kept so it can be
+    inspected, and the worker may still be running, so the notice says so and
+    tells the caller how to close it.
+    """
+    still_running = (
+        "The worker may still be running; its terminal is kept for inspection, and a "
+        "later send_message from it still reaches you.\n"
+        f'When done with it: delete_terminal("{worker_id}")\n'
+        if may_be_running
+        else ""
+    )
     return (
         f"[CAO worker ended] Worker {worker_id} (profile {profile or 'unknown'}) {how} "
         "before sending you a result.\n"
+        f"{still_running}"
         "Below is its last response if it could be read.\n"
         "---\n"
         f"{last_response if last_response else _UNREADABLE}"
@@ -143,17 +165,18 @@ def _close_and_notify(edge: DelegationEdge, state: EdgeState, sender_id: str, te
     return close_delegation_edge_with_message(edge.id, state, sender_id, edge.caller_id, text)
 
 
-def _deliver(receiver_id: str, sender_id: str) -> None:
+def _deliver(receiver_id: str, sender_id: str, registry: PluginRegistry | None) -> None:
     """Start delivering a queued forward or notice to ``receiver_id``; do not wait for it.
 
     The message is already PENDING (queued in the commit that closed its edge),
     so nothing here has to wait for the receiver to pick it up. Waiting would
     hold a ``DELETE /terminals/{id}`` for up to a full submit confirmation per
     idle caller, and in the status-event consumer would delay every other
-    caller's forward behind one receiver that does not start.
+    caller's forward behind one receiver that does not start. ``registry`` is
+    passed through so PostSendMessageEvent fires for it, as for any inbox POST.
     """
     try:
-        inbox_service.deliver_pending_in_background(receiver_id)
+        inbox_service.deliver_pending_in_background(receiver_id, registry=registry)
     except Exception as exc:  # noqa: BLE001 - caller may be gone; edge is already closed
         logger.warning("delegation: could not notify %s from %s: %s", receiver_id, sender_id, exc)
 
@@ -167,7 +190,40 @@ def _seconds_since_last_input(terminal_id: str) -> Optional[float]:
     return None if sent_at is None else _monotonic() - sent_at
 
 
-def evaluate_completion(terminal_id: str) -> int:
+# Edge ids already warned about by _warn_if_waiting_on_undelivered, so a stuck
+# edge is logged once, not on every 30 s sweep.
+_warned_undelivered: Set[int] = set()
+
+
+def _warn_if_waiting_on_undelivered(terminal_id: str, outbound: List[DelegationEdge]) -> None:
+    """Log an outbound edge that has waited past the pickup timeout without delivery.
+
+    Such an edge holds ``terminal_id``'s own forward back as nested work. Its
+    message may still be queued for a worker that is busy, which is normal and
+    can take long, so the edge is not ignored; but an edge whose delivery can
+    never happen would hold the forward for good, and this makes it visible.
+    """
+    now = datetime.now(timezone.utc)
+    for edge in outbound:
+        if edge.delivered_at is not None or edge.id in _warned_undelivered:
+            continue
+        created = edge.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if (now - created).total_seconds() < DELEGATION_PICKUP_TIMEOUT_SECONDS:
+            continue
+        _warned_undelivered.add(edge.id)
+        logger.warning(
+            "delegation: %s is not forwarded while it waits on %s, whose task has not been "
+            "delivered %.0fs after the edge opened (edge %d)",
+            terminal_id,
+            edge.worker_id,
+            (now - created).total_seconds(),
+            edge.id,
+        )
+
+
+def evaluate_completion(terminal_id: str, registry: PluginRegistry | None = None) -> int:
     """Auto-forward ``terminal_id`` to its waiting callers if it is done.
 
     Forwards only when every condition holds: an armed open edge points into
@@ -200,7 +256,9 @@ def evaluate_completion(terminal_id: str) -> int:
     with inbox_service.hold_delivery_if_idle(terminal_id) as held:
         if not held:
             return 0  # a delivery is in flight; a later event or sweep re-checks
-        if list_open_edges_out_of(terminal_id):
+        outbound = list_open_edges_out_of(terminal_id)
+        if outbound:
+            _warn_if_waiting_on_undelivered(terminal_id, outbound)
             return 0
         if get_pending_messages(terminal_id, limit=1):
             return 0
@@ -236,20 +294,32 @@ def evaluate_completion(terminal_id: str) -> int:
     # Started after the worker's lock is released, and not waited for: the
     # delivery takes the caller's lock and can wait out a submit confirmation.
     for edge in forwarded:
-        _deliver(edge.caller_id, terminal_id)
+        _deliver(edge.caller_id, terminal_id, registry)
     if forwarded:
         logger.info("delegation: auto-forwarded %s to %d caller(s)", terminal_id, len(forwarded))
     return len(forwarded)
 
 
-def handle_worker_ended(terminal_id: str, how: str) -> None:
-    """Close edges touching an ended worker and notify callers waiting on it."""
+def handle_worker_ended(
+    terminal_id: str,
+    how: str,
+    registry: PluginRegistry | None = None,
+    *,
+    may_be_running: bool = False,
+) -> None:
+    """Close edges touching an ended worker and notify callers waiting on it.
+
+    ``may_be_running`` is set for ERROR, whose terminal is kept (see
+    ``build_worker_ended_message``).
+    """
     inbound = list_open_edges_into(terminal_id)
     notified: List[DelegationEdge] = []
     if inbound:
         profile = (get_terminal_metadata(terminal_id) or {}).get("agent_profile")
         last = _last_response(terminal_id)
-        text = build_worker_ended_message(terminal_id, profile, how, last)
+        text = build_worker_ended_message(
+            terminal_id, profile, how, last, may_be_running=may_be_running
+        )
         notified = [
             e for e in inbound if _close_and_notify(e, EdgeState.WORKER_ENDED, terminal_id, text)
         ]
@@ -257,7 +327,7 @@ def handle_worker_ended(terminal_id: str, how: str) -> None:
     # without a notice: their replies have no live receiver.
     close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
     for edge in notified:
-        _deliver(edge.caller_id, terminal_id)
+        _deliver(edge.caller_id, terminal_id, registry)
 
 
 def _log_cycles(worker_ids: List[str]) -> None:
@@ -280,17 +350,17 @@ def _log_cycles(worker_ids: List[str]) -> None:
             seen.append(node)
 
 
-def sweep() -> None:
+def sweep(registry: PluginRegistry | None = None) -> None:
     """Evaluate every armed worker. Covers missed events, herdr, and restarts."""
     for worker_id in list_armed_worker_ids():
         try:
-            evaluate_completion(worker_id)
+            evaluate_completion(worker_id, registry)
         except Exception as exc:  # noqa: BLE001 - one worker must not stop the sweep
             logger.debug("delegation sweep failed for %s: %s", worker_id, exc)
     _log_cycles(list_armed_worker_ids())
 
 
-async def run() -> None:
+async def run(registry: PluginRegistry | None = None) -> None:
     """Consume terminal.*.status: evaluate on IDLE/COMPLETED, end edges on ERROR."""
     queue = bus.subscribe("terminal.*.status")
     logger.info("DelegationCallbackService started")
@@ -300,8 +370,16 @@ async def run() -> None:
             status_value = event["data"]["status"]
             terminal_id = terminal_id_from_topic(event["topic"])
             if status_value in _DONE_STATE_VALUES:
-                await asyncio.to_thread(evaluate_completion, terminal_id)
+                await asyncio.to_thread(evaluate_completion, terminal_id, registry)
             elif status_value == TerminalStatus.ERROR.value:
-                await asyncio.to_thread(handle_worker_ended, terminal_id, "reached ERROR")
+                await asyncio.to_thread(
+                    functools.partial(
+                        handle_worker_ended,
+                        terminal_id,
+                        "reached ERROR",
+                        registry,
+                        may_be_running=True,
+                    )
+                )
         except Exception as exc:  # noqa: BLE001 - one bad event must not stop the consumer
             logger.error("DelegationCallbackService error: %s", exc)

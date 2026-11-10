@@ -2073,6 +2073,7 @@ class TestInboxReconciliationDaemon:
         assert first.args[0] == inbox_service.reconcile_orphaned_messages
         assert first.args[1] is registry
         assert second.args[0] == delegation_callback_service.sweep
+        assert second.args[1] is registry
 
 
 # ── lifespan ─────────────────────────────────────────────────────────

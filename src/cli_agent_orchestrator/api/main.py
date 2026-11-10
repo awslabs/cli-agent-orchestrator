@@ -66,7 +66,7 @@ from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     create_delegation_edge,
     create_inbox_message,
-    find_open_edge,
+    find_any_edge,
     get_handoff_result,
     get_inbox_messages,
     get_terminal_metadata,
@@ -287,7 +287,7 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
         except Exception:
             logger.exception("Inbox reconciliation daemon error")
         try:
-            await asyncio.to_thread(delegation_callback_service.sweep)
+            await asyncio.to_thread(delegation_callback_service.sweep, registry)
         except Exception:
             logger.exception("Delegation callback sweep error")
 
@@ -1786,7 +1786,7 @@ async def lifespan(app: FastAPI):
     status_monitor_task = asyncio.create_task(status_monitor.run())
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
-    delegation_callback_task = asyncio.create_task(delegation_callback_service.run())
+    delegation_callback_task = asyncio.create_task(delegation_callback_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
     # Start ApprovalBridge when AG-UI surface is enabled
@@ -4936,9 +4936,12 @@ async def create_terminal_in_session(
         )
         # Written before the response so the caller cannot go idle before the
         # server knows it is waiting on this worker. An idempotent replay returns
-        # the worker the first attempt created, whose edge already exists.
+        # the worker the first attempt created, whose edge already exists. Any
+        # edge counts, closed ones too: a replay after the first edge closed
+        # would otherwise write an edge that is never armed (the task was
+        # delivered once already) and would stay OPEN for good.
         if expect_callback:
-            existing_edge = await asyncio.to_thread(find_open_edge, caller_id, result.id)
+            existing_edge = await asyncio.to_thread(find_any_edge, caller_id, result.id)
             if existing_edge is None:
                 reason = (
                     EdgeReason.NO_CALLBACK if worker_can_reply else EdgeReason.NO_SEND_MESSAGE_TOOL

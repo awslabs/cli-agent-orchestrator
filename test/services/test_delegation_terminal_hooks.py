@@ -123,7 +123,7 @@ class TestDeleteNotifiesWaitingCaller:
             result = terminal_service.delete_terminal(WORKER, end_reason="deleted")
 
         assert result is False  # teardown deferred; the notice still went out
-        ended.assert_called_once_with(WORKER, "was deleted")
+        ended.assert_called_once_with(WORKER, "was deleted", None)
         dismantle.assert_called_once()
 
     def test_notice_failure_does_not_block_deletion(self):
@@ -242,3 +242,17 @@ class TestDeleteDoesNotWaitForPickup:
 
         (notice,) = get_inbox_messages(CALLER)
         assert notice.message.startswith(f"[CAO worker ended] Worker {WORKER}")
+
+
+def test_delete_passes_its_plugin_registry_to_the_notice():
+    registry = MagicMock()
+    with (
+        patch(
+            "cli_agent_orchestrator.services.delegation_callback_service.handle_worker_ended"
+        ) as ended,
+        patch.object(terminal_service, "capture_terminal_snapshot", return_value={}),
+        patch.object(terminal_service, "dismantle_terminal_runtime", return_value=False),
+    ):
+        terminal_service.delete_terminal(WORKER, registry=registry, end_reason="deleted")
+
+    ended.assert_called_once_with(WORKER, "was deleted", registry)

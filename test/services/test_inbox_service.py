@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
-from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS, INBOX_RECONCILE_INTERVAL
+from cli_agent_orchestrator.constants import (
+    INBOX_RECONCILE_GRACE_SECONDS,
+    INBOX_RECONCILE_INTERVAL,
+    INBOX_SWEEP_FANOUT,
+)
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
@@ -2328,24 +2332,25 @@ class TestHoldDeliveryIfIdle:
 
 
 class TestDeliverPendingInBackground:
-    def test_runs_deliver_pending_on_its_own_thread(self):
+    def test_runs_on_the_shared_pool_with_the_registry(self):
         service = InboxService()
+        registry = MagicMock()
         seen = []
-        with patch.object(
-            service,
-            "deliver_pending",
-            side_effect=lambda t: seen.append((t, threading.get_ident())),
-        ):
-            thread = service.deliver_pending_in_background("term-1")
-            thread.join(5)
 
-        assert thread.daemon is True
-        assert [t for t, _ in seen] == ["term-1"]
-        assert seen[0][1] != threading.get_ident()
+        def deliver(terminal_id, registry=None):
+            seen.append((terminal_id, registry, threading.current_thread().name))
+
+        with patch.object(service, "deliver_pending", side_effect=deliver):
+            service.deliver_pending_in_background("term-1", registry=registry).result(5)
+            service.deliver_pending_in_background("term-2").result(5)
+
+        assert [(t, r) for t, r, _ in seen] == [("term-1", registry), ("term-2", None)]
+        assert all(name.startswith("cao-deliver") for _, _, name in seen)
+        assert service._background_pool._max_workers == INBOX_SWEEP_FANOUT
 
     def test_failure_is_logged_not_raised(self, caplog):
         service = InboxService()
         with patch.object(service, "deliver_pending", side_effect=RuntimeError("pane gone")):
-            service.deliver_pending_in_background("term-1").join(5)
+            service.deliver_pending_in_background("term-1").result(5)
 
         assert "Background delivery to term-1 failed: pane gone" in caplog.text

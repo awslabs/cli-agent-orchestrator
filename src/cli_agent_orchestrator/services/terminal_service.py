@@ -48,6 +48,7 @@ from cli_agent_orchestrator.clients.database import delete_terminals_by_session 
 from cli_agent_orchestrator.clients.database import (
     LAUNCH_TARGET_KINDS,
     close_open_edges_for_terminal,
+    close_unarmed_assign_edges,
     count_runtime_allocated_terminals,
     create_inbox_message,
 )
@@ -4218,6 +4219,18 @@ async def recover_interrupted_initial_deliveries() -> bool:
             )
             if not settled:
                 continue
+            # The task will never be delivered, so its assign edges would never
+            # be armed: never swept, and holding the caller's own forward back
+            # as nested work for good. Closed without a notice, as this sweep
+            # sends none; the failure on the row says what happened.
+            try:
+                await asyncio.to_thread(
+                    close_unarmed_assign_edges, terminal_id, EdgeState.WORKER_ENDED
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort, like the notice paths
+                logger.warning(
+                    "Could not close delegation edges of interrupted %s: %s", terminal_id, exc
+                )
             metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
             if not metadata:
                 continue
@@ -6927,7 +6940,7 @@ def delete_terminal(
     try:
         from cli_agent_orchestrator.services import delegation_callback_service
 
-        delegation_callback_service.handle_worker_ended(terminal_id, "was deleted")
+        delegation_callback_service.handle_worker_ended(terminal_id, "was deleted", registry)
     except Exception as exc:  # noqa: BLE001 - deletion must proceed
         logger.warning("delete_terminal: delegation notice failed for %s: %s", terminal_id, exc)
     try:

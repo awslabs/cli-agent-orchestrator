@@ -4284,6 +4284,55 @@ def mark_message_edges_delivered(message_ids: List[int]) -> int:
         return count
 
 
+def close_message_edges(message_ids: List[int], state: EdgeState) -> int:
+    """Close the OPEN send_message edges opened by any of ``message_ids``.
+
+    For a delivery that failed for good: its edges would otherwise stay OPEN
+    and unarmed forever, never swept, and each would keep its caller looking
+    busy with nested work and stop a follow-up from opening a fresh edge.
+    """
+    if not message_ids:
+        return 0
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.message_id.in_(message_ids),
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .update(
+                {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return count
+
+
+def close_unarmed_assign_edges(worker_id: str, state: EdgeState) -> int:
+    """Close the OPEN assign edges into ``worker_id`` whose task was never delivered.
+
+    For a worker whose initial delivery can no longer happen (a restart
+    stranded it): an unarmed edge is never swept, so it would stay OPEN for good.
+    """
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.worker_id == worker_id,
+                DelegationEdgeModel.source == EdgeSource.ASSIGN.value,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+                DelegationEdgeModel.delivered_at.is_(None),
+            )
+            .update(
+                {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return count
+
+
 def close_delegation_edge(edge_id: int, state: EdgeState) -> bool:
     """Close an edge only if it is still OPEN. True when this call closed it.
 
@@ -4369,6 +4418,21 @@ def list_open_edges_out_of(caller_id: str) -> List[DelegationEdge]:
             .all()
         )
         return [_edge_from_row(r) for r in rows]
+
+
+def find_any_edge(caller_id: str, worker_id: str) -> Optional[DelegationEdge]:
+    """The oldest edge caller -> worker in any state, open or closed."""
+    with SessionLocal() as db:
+        row = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.caller_id == caller_id,
+                DelegationEdgeModel.worker_id == worker_id,
+            )
+            .order_by(DelegationEdgeModel.id)
+            .first()
+        )
+        return _edge_from_row(row) if row else None
 
 
 def find_open_edge(caller_id: str, worker_id: str) -> Optional[DelegationEdge]:

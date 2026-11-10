@@ -24,7 +24,7 @@ def test_create_terminal_with_expect_callback_opens_edge(client):
     with (
         patch(f"{MAIN}.terminal_service.create_terminal", new=AsyncMock(return_value=terminal)),
         patch(f"{MAIN}.create_delegation_edge") as create_edge,
-        patch(f"{MAIN}.find_open_edge", return_value=None),
+        patch(f"{MAIN}.find_any_edge", return_value=None),
     ):
         client.post(
             "/sessions/cao-s/terminals",
@@ -43,7 +43,7 @@ def test_create_terminal_worker_cannot_reply_sets_reason(client):
     with (
         patch(f"{MAIN}.terminal_service.create_terminal", new=AsyncMock(return_value=terminal)),
         patch(f"{MAIN}.create_delegation_edge") as create_edge,
-        patch(f"{MAIN}.find_open_edge", return_value=None),
+        patch(f"{MAIN}.find_any_edge", return_value=None),
     ):
         client.post(
             "/sessions/cao-s/terminals",
@@ -65,7 +65,7 @@ def test_create_terminal_default_opens_no_edge(client):
     with (
         patch(f"{MAIN}.terminal_service.create_terminal", new=AsyncMock(return_value=terminal)),
         patch(f"{MAIN}.create_delegation_edge") as create_edge,
-        patch(f"{MAIN}.find_open_edge", return_value=None),
+        patch(f"{MAIN}.find_any_edge", return_value=None),
     ):
         client.post(
             "/sessions/cao-s/terminals",
@@ -79,7 +79,7 @@ def test_create_terminal_replay_does_not_duplicate_edge(client):
     with (
         patch(f"{MAIN}.terminal_service.create_terminal", new=AsyncMock(return_value=terminal)),
         patch(f"{MAIN}.create_delegation_edge") as create_edge,
-        patch(f"{MAIN}.find_open_edge", return_value=MagicMock()),
+        patch(f"{MAIN}.find_any_edge", return_value=MagicMock()),
     ):
         client.post(
             "/sessions/cao-s/terminals",
