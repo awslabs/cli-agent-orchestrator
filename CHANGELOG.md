@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ws://` to anything but loopback unless `CAO_RUNNER_ALLOW_INSECURE=1`; the hub can serve
   `wss://` (`CAO_RUNNER_TLS_CERT` / `CAO_RUNNER_TLS_KEY`). Under this backend `cao-server`
   refuses to start with API authentication configured, refuses Python workflow scripts and
-  flow pre-scripts (`409`), and launches only `claude_code` and `mock_cli`
-  (`terminal.remote_providers`), whose launch does no execution-host work on the server.
+  flow pre-scripts (`409`), and launches only `claude_code` and `mock_cli`, whose launch
+  does no execution-host work on the server (`terminal.remote_providers` can only narrow that
+  list).
   Docs: `docs/remote-runners.md`; example:
   `examples/cao-clusters/kubernetes/remote-runners/` (a cluster-neutral base and a kind
   overlay).

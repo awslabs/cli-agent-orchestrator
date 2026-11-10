@@ -46,7 +46,7 @@ clients to `9889` independently.
 | Env var | Default | Purpose |
 |---|---|---|
 | `CAO_TERMINAL_BACKEND` | `tmux` | `remote` selects this backend (or `cao-server --terminal remote`). |
-| `CAO_TERMINAL_REMOTE_PROVIDERS` | `claude_code,mock_cli` | Providers the remote backend will launch; any other is refused before anything is created. See [Providers](#providers) before adding one. |
+| `CAO_TERMINAL_REMOTE_PROVIDERS` | `claude_code,mock_cli` | Providers the remote backend will launch; any other is refused before anything is created. It can only narrow the default (see [Providers](#providers)). |
 | `CAO_RUNNER_TOKEN_FILE` | *(none)* | File holding the runner token, e.g. a mounted Secret. Wins over `CAO_RUNNER_TOKEN`. |
 | `CAO_RUNNER_TOKEN` | *(none)* | The token itself, when no file is used. One of the two is required. |
 | `CAO_RUNNER_BIND_HOST` | `127.0.0.1` | Address the hub listens on; `0.0.0.0` for runners in other pods. |
@@ -179,10 +179,10 @@ refused write, a wait that never sees the pane ready), and where that is; later
 steps of such a launch are not observed. A provider joins the allowlist only
 once its launch completes in that test with nothing recorded.
 
-`CAO_TERMINAL_REMOTE_PROVIDERS` (`terminal.remote_providers`) narrows or widens
-the list the server will launch. Widening it to a provider outside the default
-bypasses that check: the provider launches with the server-host dependencies
-listed for it in the test, and reports the server's state as the runner's.
+`CAO_TERMINAL_REMOTE_PROVIDERS` (`terminal.remote_providers`) can only narrow
+that list. A provider it names outside the allowlist is ignored, with an error
+in the server log: its launch would do execution-host work on the server and
+report the server's state as the runner's.
 
 ## Security
 

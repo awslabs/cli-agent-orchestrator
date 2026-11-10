@@ -288,8 +288,8 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
   [EXPERIMENTAL]: one `cao-server` places every terminal on an execution-only
   `cao-runner` (see [Remote runners](remote-runners.md)).
 - `remote_providers`: with `backend: "remote"`, the providers the server will
-  launch on runners (default `"claude_code,mock_cli"`). See
-  [Providers](remote-runners.md#providers) before adding one.
+  launch on runners (default `"claude_code,mock_cli"`). It can only narrow that
+  default; see [Providers](remote-runners.md#providers).
 - `herdr_session`: the herdr session name to connect to (default `"cao"`).
 - `spawn_mode`: `"window"` (default) or `"pane"` — where a terminal created by
   `assign` / `handoff` lands. See [Watching a fleet in one window](#watching-a-fleet-in-one-window).

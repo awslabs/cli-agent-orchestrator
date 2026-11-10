@@ -80,8 +80,14 @@ class RemoteBackend(TerminalBackend):
         self, hub: Optional["RunnerHub"] = None, supported_providers: Optional[frozenset] = None
     ) -> None:
         self._hub = hub
+        # Configuration can only narrow the list, never widen it: a provider
+        # outside DEFAULT_REMOTE_PROVIDERS still does execution-host work on
+        # this server while it launches (see test/runner/test_provider_conformance.py)
+        # and would report the server's state as the runner's.
         self.supported_providers = (
-            supported_providers if supported_providers is not None else DEFAULT_REMOTE_PROVIDERS
+            frozenset(supported_providers) & DEFAULT_REMOTE_PROVIDERS
+            if supported_providers is not None
+            else DEFAULT_REMOTE_PROVIDERS
         )
         self._tmp_dir = str(CAO_HOME_DIR / "tmp")
         # (runner_id, file name) -> (size, mtime_ns) last staged, so an

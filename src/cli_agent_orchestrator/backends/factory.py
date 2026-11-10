@@ -94,6 +94,14 @@ class BackendFactory:
                 "terminal.remote_providers", default=",".join(sorted(DEFAULT_REMOTE_PROVIDERS))
             )
             providers = frozenset(p.strip() for p in str(configured).split(",") if p.strip())
+            refused = sorted(providers - DEFAULT_REMOTE_PROVIDERS)
+            if refused:
+                logger.error(
+                    f"terminal.remote_providers names {', '.join(refused)}, which the remote "
+                    "backend cannot launch: their launch does execution-host work on this "
+                    "server. They are ignored; the setting can only narrow "
+                    f"{', '.join(sorted(DEFAULT_REMOTE_PROVIDERS))}."
+                )
             logger.info(
                 "[EXPERIMENTAL] terminal_backend='remote': terminals run on cao-runner "
                 "processes connected to this server"
