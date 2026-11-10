@@ -355,7 +355,8 @@ can be omitted or null. Extra fields are refused. The MCP tool forwards this sam
 (`^[a-z][a-z0-9_]{2,31}$`), so `review_auth_module` works and `Review auth` doesn't. It
 becomes the middle of the agent's name. `description` is optional, at most 280 characters.
 Neither may hold control characters. A body that breaks these rules, has a wrong type or
-carries an extra field is refused with `invalid_spec` (422), naming each field at fault.
+carries an extra field is refused with `invalid_spec` (422). The message names each bad
+field, but an extra field shows only as `unknown field: extra_forbidden`.
 
 Providers are Claude Code by default, or Codex or Kiro when explicitly enabled by the
 operator. `provider: "auto"` lets a decider choose between equivalent providers at launch
@@ -631,6 +632,7 @@ Create has these refusals too:
 
 | HTTP status | Create rule | Meaning |
 | --- | --- | --- |
+| 404 | `ephemeral_disabled` | the feature is off; checked first |
 | 422 | `invalid_spec` | the body has a bad field, a wrong type or an extra field (see above) |
 | 400 | `creator_unresolved` | the calling terminal can't be resolved (not registered, unreadable tools or unknown provider) |
 | 400 | `max_depth_exceeded` | an ephemeral agent tried to create one |
