@@ -325,9 +325,10 @@ the authority for its key, consent and revoke commands.
 
 A decider's key may be stored once per OS user, and so shared by every CAO install on the
 machine; Jev's current version does this. The agent never runs `key set`, `key delete` or
-`key check --auth` — those are always the user's steps. On a second install, run plain
-`cao-decider-jev key check` first; if it reports the key present, tell the user they can skip
-`key set`. Check the decider's README for where it keeps its key.
+`key check --auth` — those are always the user's steps. On a second install, first run
+`"$(dirname "$CAO_PY")/cao-decider-jev" key check` (the check above); if it reports the key
+present, tell the user they can skip `key set`. Check the decider's README for where it keeps
+its key.
 
 ## 6. Restart the server and reconnect your MCP
 
