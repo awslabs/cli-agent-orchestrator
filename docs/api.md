@@ -204,6 +204,14 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   tracked in [#965](https://github.com/awslabs/cli-agent-orchestrator/issues/965)); see
   [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance) for what
   that does and does not guarantee.
+- `POST /sessions`, `POST /sessions/{session_name}/terminals` and
+  `POST /sessions/{session_name}/terminals:operator` accept an optional `engine` query
+  parameter, and `POST /terminals/run-step` an optional `engine` body field: the Kiro
+  engine, `v2` or `v3` (`kas` is accepted as an alias of `v3`). It is valid only with
+  the `kiro_cli` provider, and must agree with the profile's `engine`, if the profile
+  sets one. Omitted, the profile's engine applies, else `v2`. An ephemeral Kiro helper
+  runs on v3 only: an explicit `v2` is refused with `kiro_ephemeral_engine:v2`; omit
+  the engine, or use `v3` (`kas`). See [Kiro v3 (preview)](kiro-cli.md#kiro-v3-preview).
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
   rolling buffer (most recent `state_buffer_max` bytes of streamed output —
   server setting, 32KB by default, see [Configuration](configuration.md)),
@@ -281,8 +289,8 @@ to new inputs and edits; existing rows and stored fingerprints are not migrated.
 
 #### Delegation body fields
 
-Three JSON bodies carry delegation-decision fields for the `model.route`/
-`effort.route` points (see [Launch decisions](decisions.md)): `CreateTerminalBody`
+Three JSON bodies carry delegation-decision fields for the decision points
+(see [Launch decisions](decisions.md#points-and-states)): `CreateTerminalBody`
 (`POST /sessions/{session_name}/terminals`), `CreateSessionBody` (`POST /sessions`),
 and `RunStepRequest` (`POST /terminals/run-step`).
 

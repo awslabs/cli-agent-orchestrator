@@ -240,8 +240,15 @@ Withdrawing a grant is therefore restricted to keys CAO can *prove* are its own:
   which keeps grants from installs predating the sidecar cleanable
 
 A `<servername>*` key CAO has no record of and cannot place in the agent-plugin store is
-left alone rather than deleted on a guess. Deleting `cao-grants.json` is safe; it
-only costs CAO the first of the two proofs.
+left alone rather than deleted on a guess.
+
+If `cao-grants.json` cannot be read (not valid JSON, not valid UTF-8, not readable,
+or a directory), CAO leaves it as it is, logs a warning that names it, and records
+nothing in it until it is readable again. Repair the file by hand rather than
+deleting it: deleting it drops the recorded grants of every agent, so CAO keeps
+only the agent-plugin store proof, and a profile server's grant it wrote whose
+server the profile drops before the agent is next installed stays in
+`opencode.json` until you remove it.
 
 The same two proofs decide which `mcp` entries are CAO's. For every agent-plugin
 server it writes, CAO records a SHA-256 fingerprint of the entry in `cao-grants.json`

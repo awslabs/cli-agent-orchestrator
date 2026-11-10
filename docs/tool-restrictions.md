@@ -406,6 +406,7 @@ its `read` tag also brings `code`, which can write files. So for v3:
 | `fs_write` | `fs_append`, `str_replace`, `delete_file` | those, `fs_write` and `code` | `fs_write` |
 | `execute_bash` | `invoke_sub_agent` | that, `execute_bash` and the per-agent `subagent/…` tools | `shell`, `subagent` |
 | `web_fetch` | `remote_web_search` | that and `web_fetch` | `web_fetch`, `web_search` |
+| `@builtin` | `introspect` (beside v2's `goal` and `todo_list`) | that | no capability of its own |
 | `@server`, `@server/tool` | unchanged | that server's (or tool's) MCP tools | every other MCP tool |
 
 `tools` never holds the `read` tag; `excludedTools` removes everything the

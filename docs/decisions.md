@@ -2,7 +2,8 @@
 
 CAO routes normal delegations to installed profiles through `model.route` when
 the caller omits a model. Local and remote assign, elastic assign, handoff and
-CLI handoff use it. Both decision points are **off by default**, so normal
+CLI handoff use it. Every decision point (see [Points and states](#points-and-states)) is
+**off by default**, so normal
 launches keep their existing behavior until an operator enables routing.
 
 An ephemeral agent is routed only when its spec set `model_tier: "auto"`; see
@@ -316,9 +317,11 @@ ran on claude-opus-5-5 (auto: medium 0.90, matched long_context -> large)
 **With Codex as a second option**, the match can also move the helper between CLIs, but only
 within an `ephemeral.provider_route.equivalent` set you declared. On today's capability table
 Claude Code is `hard` and Codex `advisory`, so a set naming both is refused, and the CLI half of
-the match routes nothing yet. It applies once a second `hard` or `sandboxed` CLI is available,
-such as Kiro or the contained Codex launch. Then, with `provider.route` bound to the built-in
-matcher (`cao decisions set provider.route on --decider match`) and these declarations:
+the match routes nothing yet. It applies once a second `hard` or `sandboxed` CLI can be routed
+to, such as the contained Codex launch, or Kiro once CAO can route to it (Kiro helpers are
+already `hard`, but `provider.route` can't choose Kiro yet). Then, with `provider.route` bound
+to the built-in matcher (`cao decisions set provider.route on --decider match`) and these
+declarations:
 
 ```json
 "codex": {
@@ -461,7 +464,9 @@ complexity, which it's good at. The match only adds a capability the size can't 
 
 **Jev or JevK5?** CAO's side is identical: the same questions, request, matching and records. Tune
 `confidence_threshold` and `on_timeout_ms` for the decider you bind. One of them answering a
-feature poorly is what `ignore_features` is for.
+feature poorly is what `ignore_features` is for. Bind `task.features` only to a decider package
+that declares all four `task.*` feature points; with one that doesn't, every feature record says
+`decider_unavailable`. Check the package's own README for the points it declares.
 
 **How do I see why a helper ran where it did?** Its `model.route` and `provider.route` records,
 and `cao decisions match explain` with the recorded `match_needs`, the size (`match_from`), the
