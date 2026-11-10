@@ -57,6 +57,8 @@ REGISTRY_GATED_PENDING_SELECTORS = frozenset(
         # Admission gate, not a sweep: rejects a receiver with no row, which is
         # why a message can never be re-queued once its receiver is deleted.
         "create_inbox_message",
+        # Admission gate too: a forward is queued only while its receiver row exists.
+        "close_delegation_edge_with_message",
         # Fast path, OpenCode only; narrower than the reconcile sweep by design.
         "list_pending_receiver_ids_by_provider",
         # The reconcile sweep. Inner join: orphans are deliberately not retried.
