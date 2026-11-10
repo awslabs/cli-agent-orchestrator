@@ -590,6 +590,34 @@ class TestGrantRecord:
             assert "Repair the file by hand" in message, message
             assert "drops the recorded grants of every agent" in message, message
 
+    def test_an_unwritable_sidecar_warning_says_a_profile_grant_can_stay(
+        self, tmp_config: Path, caplog
+    ):
+        """#1283 review: when the sidecar cannot be written, only plugin servers'
+        grants fall back to containment; a profile server's grant has no proof."""
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("root writes into a read-only directory")
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.parent.chmod(0o500)
+        try:
+            with caplog.at_level(logging.WARNING):
+                cfg_module._write_grant_record(
+                    {"version": 1, "agents": {"developer": ["x-server*"]}}
+                )
+        finally:
+            tmp_config.parent.chmod(0o700)
+        messages = [r.getMessage() for r in caplog.records if "Could not record" in r.getMessage()]
+        assert len(messages) == 1, [r.getMessage() for r in caplog.records]
+        message = messages[0]
+        assert "A plugin server's grant is still withdrawn by plugin-store containment" in message
+        assert "a profile server's grant written now has no proof left" in message
+        assert (
+            "stays if the profile drops that server before the agent is next installed"
+            " with a writable sidecar." in message
+        )
+        assert "will fall back to plugin-store containment when withdrawing them" not in message
+        assert "x-server" not in message, "the warning must not carry a recorded value"
+
     @pytest.mark.parametrize("damage", ["mode-000", "directory"])
     def test_an_unreadable_sidecar_is_left_intact_and_named(self, tmp_config: Path, caplog, damage):
         if damage == "mode-000" and hasattr(os, "geteuid") and os.geteuid() == 0:
