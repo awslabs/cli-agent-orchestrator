@@ -554,13 +554,22 @@ class TestTerminalServiceHooks:
         with pytest.raises(ValueError):
             resolve("relative")
 
+    def test_the_provider_list_can_only_narrow_the_default(self):
+        assert RemoteBackend(supported_providers=frozenset({"mock_cli"})).supported_providers == {
+            "mock_cli"
+        }
+        widened = RemoteBackend(supported_providers=frozenset({"claude_code", "copilot_cli"}))
+        assert widened.supported_providers == {"claude_code"}
+        assert widened.unsupported_provider_reason("copilot_cli")
+        assert RemoteBackend(supported_providers=frozenset()).supported_providers == frozenset()
+
     def test_unsupported_provider_reason(self):
         b = RemoteBackend()
         assert b.unsupported_provider_reason("claude_code") is None
         assert "kiro_cli" in (b.unsupported_provider_reason("kiro_cli") or "")
 
 
-def test_factory_builds_remote_with_configured_providers(monkeypatch):
+def test_factory_builds_remote_with_configured_providers(monkeypatch, caplog):
     from cli_agent_orchestrator.backends.factory import BackendFactory
     from cli_agent_orchestrator.services.config_service import ConfigService
 
@@ -572,9 +581,13 @@ def test_factory_builds_remote_with_configured_providers(monkeypatch):
         return real_get(key, default=default, override=override)
 
     monkeypatch.setattr(ConfigService, "get", staticmethod(fake_get))
-    b = BackendFactory.create(backend_override="remote")
+    with caplog.at_level("ERROR"):
+        b = BackendFactory.create(backend_override="remote")
     assert isinstance(b, RemoteBackend)
-    assert b.supported_providers == frozenset({"mock_cli", "kiro_cli"})
+    # The setting narrows the default list; it cannot add kiro_cli to it.
+    assert b.supported_providers == frozenset({"mock_cli"})
+    assert "kiro_cli" in b.unsupported_provider_reason("kiro_cli")
+    assert any("kiro_cli" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
     with pytest.raises(TerminalBackendError, match="no runner hub"):
         b.create_session("s", "w", "aaaaaaaa")
 

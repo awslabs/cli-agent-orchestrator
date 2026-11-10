@@ -125,7 +125,7 @@ Timeouts and buffer sizes for the CAO runtime. Override only if you experience t
 |-----|---------|-------------|
 | `backend` | `"tmux"` | `"tmux"`, `"herdr"` (experimental), or `"remote"` (experimental: terminals run on execution-only `cao-runner`s; see [Remote runners](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/remote-runners.md)) |
 | `herdr_session` | `"cao"` | herdr session name to connect to |
-| `remote_providers` | `"claude_code,mock_cli"` | With `backend: "remote"`, the providers the server launches on runners |
+| `remote_providers` | `"claude_code,mock_cli"` | With `backend: "remote"`, the providers the server launches on runners; can only narrow the default |
 
 ### `apps`
 
