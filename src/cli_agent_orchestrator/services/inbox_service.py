@@ -16,7 +16,6 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
-    close_message_edges,
     fail_orphaned_pending_messages,
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
@@ -32,7 +31,6 @@ from cli_agent_orchestrator.constants import (
     INBOX_SUBMIT_MAX_RESUBMITS,
     INBOX_SWEEP_FANOUT,
 )
-from cli_agent_orchestrator.models.delegation import EdgeState
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
@@ -64,6 +62,13 @@ _SUBMIT_STARTED_STATUSES = {
     TerminalStatus.COMPLETED,
     TerminalStatus.WAITING_USER_ANSWER,
 }
+
+
+def _short_reason(exc: Exception) -> str:
+    """One line naming a delivery failure, for the caller's notice."""
+    text = " ".join(str(exc).split())
+    reason = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    return reason if len(reason) <= 200 else reason[:197] + "..."
 
 
 class InboxService:
@@ -397,12 +402,17 @@ class InboxService:
                             f"message {message.id}: {e}"
                         )
                         update_message_status(message.id, MessageStatus.FAILED)
-                    self._close_message_edges(terminal_id, batch)
+                    self._close_message_edges(
+                        terminal_id,
+                        batch,
+                        "the terminal refused input" + (f" ({e.reason.value})" if e.reason else ""),
+                        registry,
+                    )
             except Exception as e:
                 for message in batch:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
-                self._close_message_edges(terminal_id, batch)
+                self._close_message_edges(terminal_id, batch, _short_reason(e), registry)
 
     def deliver_pending_in_background(
         self, terminal_id: str, registry: PluginRegistry | None = None
@@ -451,17 +461,24 @@ class InboxService:
         return pool.submit(deliver)
 
     @staticmethod
-    def _close_message_edges(terminal_id: str, batch: List[InboxMessage]) -> None:
-        """Close the send_message delegation edges of a batch whose delivery failed.
+    def _close_message_edges(
+        terminal_id: str,
+        batch: List[InboxMessage],
+        reason: str,
+        registry: PluginRegistry | None,
+    ) -> None:
+        """Close the delegation edges of a batch whose delivery failed, telling each caller.
 
-        A FAILED message is never retried, so its edges would never be armed:
-        left OPEN, they are never swept, keep the caller looking busy with
-        nested work, and stop a follow-up from opening a fresh edge. They are
-        closed as WORKER_ENDED, the state for an edge whose worker can no
-        longer answer it; no notice is sent. Best-effort, like arming.
+        See ``delegation_callback_service.handle_delivery_failed``. Imported
+        here because that module imports this one. Best-effort, like arming: a
+        failure must not change the batch's FAILED status.
         """
         try:
-            close_message_edges([m.id for m in batch], EdgeState.WORKER_ENDED)
+            from cli_agent_orchestrator.services import delegation_callback_service
+
+            delegation_callback_service.handle_delivery_failed(
+                terminal_id, [m.id for m in batch], reason, registry
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Could not close delegation edges for {terminal_id}: {exc}")
 

@@ -10,9 +10,7 @@ from cli_agent_orchestrator.clients.database import (
     Base,
     close_delegation_edge,
     close_delegation_edge_with_message,
-    close_message_edges,
     close_open_edges_for_terminal,
-    close_unarmed_assign_edges,
     create_delegation_edge,
     create_terminal,
     delete_terminals_by_ids,
@@ -22,6 +20,8 @@ from cli_agent_orchestrator.clients.database import (
     list_armed_worker_ids,
     list_open_edges_into,
     list_open_edges_out_of,
+    list_open_message_edges,
+    list_unarmed_assign_edges,
     mark_assign_edges_delivered,
     mark_message_edges_delivered,
 )
@@ -171,28 +171,24 @@ def test_bulk_row_deletion_closes_edges_in_both_directions(db):
     assert get_inbox_messages("sup") == []
 
 
-def test_close_message_edges_closes_only_open_edges_of_those_messages(db):
-    create_delegation_edge("sup", "w1", EdgeSource.SEND_MESSAGE, message_id=10)
-    other = create_delegation_edge("sup", "w2", EdgeSource.SEND_MESSAGE, message_id=11)
+def test_list_open_message_edges_returns_open_edges_of_those_messages(db):
+    failed = create_delegation_edge("sup", "w1", EdgeSource.SEND_MESSAGE, message_id=10)
+    create_delegation_edge("sup", "w2", EdgeSource.SEND_MESSAGE, message_id=11)
+    closed = create_delegation_edge("top", "w1", EdgeSource.SEND_MESSAGE, message_id=10)
+    close_delegation_edge(closed.id, EdgeState.REPLIED)
 
-    assert close_message_edges([10, 99], EdgeState.WORKER_ENDED) == 1
-    assert close_message_edges([10], EdgeState.WORKER_ENDED) == 0
-
-    assert list_open_edges_into("w1") == []
-    assert [e.id for e in list_open_edges_into("w2")] == [other.id]
+    assert [e.id for e in list_open_message_edges([10, 99])] == [failed.id]
+    assert list_open_message_edges([]) == []
 
 
-def test_close_unarmed_assign_edges_leaves_armed_and_message_edges(db):
-    create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
-    follow_up = create_delegation_edge("top", "w1", EdgeSource.SEND_MESSAGE, message_id=3)
-    armed = create_delegation_edge("sup", "w2", EdgeSource.ASSIGN)
+def test_list_unarmed_assign_edges_skips_armed_and_message_edges(db):
+    unarmed = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+    create_delegation_edge("top", "w1", EdgeSource.SEND_MESSAGE, message_id=3)
+    create_delegation_edge("sup", "w2", EdgeSource.ASSIGN)
     mark_assign_edges_delivered("w2")
 
-    assert close_unarmed_assign_edges("w1", EdgeState.WORKER_ENDED) == 1
-    assert close_unarmed_assign_edges("w2", EdgeState.WORKER_ENDED) == 0
-
-    assert [e.id for e in list_open_edges_into("w1")] == [follow_up.id]
-    assert [e.id for e in list_open_edges_into("w2")] == [armed.id]
+    assert [e.id for e in list_unarmed_assign_edges("w1")] == [unarmed.id]
+    assert list_unarmed_assign_edges("w2") == []
 
 
 def test_find_any_edge_returns_a_closed_edge(db):

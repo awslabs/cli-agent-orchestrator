@@ -2354,3 +2354,17 @@ class TestDeliverPendingInBackground:
             service.deliver_pending_in_background("term-1").result(5)
 
         assert "Background delivery to term-1 failed: pane gone" in caplog.text
+
+
+class TestShortReason:
+    def test_names_the_exception_on_one_line(self):
+        from cli_agent_orchestrator.services.inbox_service import _short_reason
+
+        assert _short_reason(RuntimeError("tmux\n  error")) == "RuntimeError: tmux error"
+        assert _short_reason(RuntimeError()) == "RuntimeError"
+
+    def test_long_reasons_are_cut(self):
+        from cli_agent_orchestrator.services.inbox_service import _short_reason
+
+        reason = _short_reason(RuntimeError("x" * 500))
+        assert len(reason) == 200 and reason.endswith("...")

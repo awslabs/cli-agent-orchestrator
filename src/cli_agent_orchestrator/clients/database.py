@@ -4286,39 +4286,27 @@ def mark_message_edges_delivered(message_ids: List[int]) -> int:
         return count
 
 
-def close_message_edges(message_ids: List[int], state: EdgeState) -> int:
-    """Close the OPEN send_message edges opened by any of ``message_ids``.
-
-    For a delivery that failed for good: its edges would otherwise stay OPEN
-    and unarmed forever, never swept, and each would keep its caller looking
-    busy with nested work and stop a follow-up from opening a fresh edge.
-    """
+def list_open_message_edges(message_ids: List[int]) -> List[DelegationEdge]:
+    """OPEN send_message edges opened by any of ``message_ids``, armed or not."""
     if not message_ids:
-        return 0
+        return []
     with SessionLocal() as db:
-        count = (
+        rows = (
             db.query(DelegationEdgeModel)
             .filter(
                 DelegationEdgeModel.message_id.in_(message_ids),
                 DelegationEdgeModel.state == EdgeState.OPEN.value,
             )
-            .update(
-                {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},
-                synchronize_session=False,
-            )
+            .order_by(DelegationEdgeModel.id)
+            .all()
         )
-        db.commit()
-        return count
+        return [_edge_from_row(r) for r in rows]
 
 
-def close_unarmed_assign_edges(worker_id: str, state: EdgeState) -> int:
-    """Close the OPEN assign edges into ``worker_id`` whose task was never delivered.
-
-    For a worker whose initial delivery can no longer happen (a restart
-    stranded it): an unarmed edge is never swept, so it would stay OPEN for good.
-    """
+def list_unarmed_assign_edges(worker_id: str) -> List[DelegationEdge]:
+    """OPEN assign edges into ``worker_id`` whose task was never delivered."""
     with SessionLocal() as db:
-        count = (
+        rows = (
             db.query(DelegationEdgeModel)
             .filter(
                 DelegationEdgeModel.worker_id == worker_id,
@@ -4326,13 +4314,10 @@ def close_unarmed_assign_edges(worker_id: str, state: EdgeState) -> int:
                 DelegationEdgeModel.state == EdgeState.OPEN.value,
                 DelegationEdgeModel.delivered_at.is_(None),
             )
-            .update(
-                {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},
-                synchronize_session=False,
-            )
+            .order_by(DelegationEdgeModel.id)
+            .all()
         )
-        db.commit()
-        return count
+        return [_edge_from_row(r) for r in rows]
 
 
 def close_delegation_edge(edge_id: int, state: EdgeState) -> bool:

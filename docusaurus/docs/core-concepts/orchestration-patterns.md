@@ -95,7 +95,12 @@ assignment when the worker is created, and once the task has been delivered it w
   was too fast to show; the server then forwards the last response with a header that says so and
   asks the supervisor to check the worker's terminal before sending the message again.
 - If the worker is deleted or reaches an error state before replying, the supervisor receives a
-  `[CAO worker ended]` notice, with the worker's last response when it can still be read.
+  `[CAO worker ended]` notice, with the worker's last response when it can still be read. For an
+  error state, the notice says the worker may still be running.
+- If a message to the worker cannot be delivered (the terminal refuses input outside a dialog, or
+  the paste fails), or cao-server restarts before the assigned task was delivered, the supervisor
+  receives a `[CAO delivery failed]` notice that names the worker and asks it to check the worker's
+  terminal before sending again.
 - A worker that is waiting on a sub-worker it assigned is not forwarded until that sub-worker has
   replied.
 - Any message from the worker to the supervisor counts as the reply and closes the wait, including a

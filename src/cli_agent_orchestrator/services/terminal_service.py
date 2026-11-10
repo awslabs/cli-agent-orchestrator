@@ -48,7 +48,6 @@ from cli_agent_orchestrator.clients.database import delete_terminals_by_session 
 from cli_agent_orchestrator.clients.database import (
     LAUNCH_TARGET_KINDS,
     close_open_edges_for_terminal,
-    close_unarmed_assign_edges,
     count_runtime_allocated_terminals,
     create_inbox_message,
 )
@@ -4221,11 +4220,13 @@ async def recover_interrupted_initial_deliveries() -> bool:
                 continue
             # The task will never be delivered, so its assign edges would never
             # be armed: never swept, and holding the caller's own forward back
-            # as nested work for good. Closed without a notice, as this sweep
-            # sends none; the failure on the row says what happened.
+            # as nested work for good. Each is closed with a notice queued for
+            # its caller, which the inbox reconciliation sweep delivers.
             try:
+                from cli_agent_orchestrator.services import delegation_callback_service
+
                 await asyncio.to_thread(
-                    close_unarmed_assign_edges, terminal_id, EdgeState.WORKER_ENDED
+                    delegation_callback_service.handle_task_never_delivered, terminal_id
                 )
             except Exception as exc:  # noqa: BLE001 - best-effort, like the notice paths
                 logger.warning(

@@ -28,6 +28,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import DELEGATION_PICKUP_TIMEOUT_SECONDS
 from cli_agent_orchestrator.models.delegation import EdgeSource
+from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import (
     TerminalInputBlockedError,
     TerminalInputBlockedReason,
@@ -389,27 +390,46 @@ class TestHerdrReportsTheTurnStart:
         assert forward.endswith("---\nPREVIOUS ANSWER")
 
 
+def _notices_to(receiver_id: str) -> list:
+    return [
+        m.message
+        for m in get_inbox_messages(receiver_id, limit=50)
+        if m.message.startswith("[CAO delivery failed]")
+    ]
+
+
 class TestEdgesThatCanNeverBeArmed:
-    """An edge whose task can never be delivered must not stay OPEN (second review, P2-1)."""
+    """An edge whose task can never be delivered is closed, and its caller is told.
+
+    Second review, P2-1, and the approving reviews' P3-1: the caller always
+    hears back, also when the delivery fails for good.
+    """
 
     @pytest.mark.parametrize(
-        "failure",
+        ("failure", "reason"),
         [
-            RuntimeError("tmux error"),
-            TerminalInputBlockedError(
-                "provider exited", reason=TerminalInputBlockedReason.PROVIDER_ERROR
+            (RuntimeError("tmux error"), "RuntimeError: tmux error"),
+            (
+                TerminalInputBlockedError(
+                    "provider exited", reason=TerminalInputBlockedReason.PROVIDER_ERROR
+                ),
+                "the terminal refused input (provider_error)",
             ),
         ],
         ids=["exception", "refused"],
     )
     def test_failed_delivery_closes_its_edge_and_a_follow_up_gets_a_fresh_one(
-        self, world, monkeypatch, failure
+        self, world, monkeypatch, failure, reason
     ):
         typed = inbox_module.terminal_service.dispatch_input.side_effect
         monkeypatch.setattr(inbox_module.terminal_service.dispatch_input, "side_effect", failure)
         _send(SUP, W1, "lost")
         assert list_open_edges_into(W1) == []
         assert list_open_edges_out_of(SUP) == []
+        assert _notices_to(SUP) == [
+            f"[CAO delivery failed] Your message to worker {W1} (profile developer) was not "
+            f"delivered: {reason}. Check the worker's terminal before you send it again."
+        ]
 
         monkeypatch.setattr(inbox_module.terminal_service.dispatch_input, "side_effect", typed)
         _send(SUP, W1, "again")
@@ -419,7 +439,19 @@ class TestEdgesThatCanNeverBeArmed:
         assert [m.message for m in get_inbox_messages(W1, limit=5)][-1] == "again"
         assert edge.message_id == get_inbox_messages(W1, limit=5)[-1].id
 
-    def test_parent_of_a_worker_interrupted_by_a_restart_is_forwarded(self, world, monkeypatch):
+    def test_worker_error_after_a_failed_delivery_sends_nothing_more(self, world, monkeypatch):
+        monkeypatch.setattr(
+            inbox_module.terminal_service.dispatch_input, "side_effect", RuntimeError("tmux error")
+        )
+        _send(SUP, W1, "lost")
+        before = len(get_inbox_messages(SUP, limit=50))
+
+        svc.handle_worker_ended(W1, "reached ERROR", may_be_running=True)
+
+        assert len(get_inbox_messages(SUP, limit=50)) == before
+        assert len(_notices_to(SUP)) == 1
+
+    def test_restart_before_the_task_was_delivered_tells_the_caller(self, world, monkeypatch):
         _assign(TOP, SUP)
         create_delegation_edge(SUP, W1, EdgeSource.ASSIGN)  # task never delivered
         assert svc.evaluate_completion(SUP) == 0  # held back as nested work
@@ -434,6 +466,23 @@ class TestEdgesThatCanNeverBeArmed:
         assert asyncio.run(terminal_service.recover_interrupted_initial_deliveries()) is True
 
         assert list_open_edges_out_of(SUP) == []
+        (notice,) = get_inbox_messages(SUP, limit=50, status=MessageStatus.PENDING)
+        assert notice.message == (
+            f"[CAO delivery failed] cao-server restarted before the task for worker {W1} "
+            "(profile developer) was delivered. Check the worker's terminal; it may never "
+            "have received the task."
+        )
+        assert svc.evaluate_completion(SUP) == 0  # the notice is still queued for SUP
+
+        # The reconcile sweep delivers the notice; SUP reads it and answers.
+        inbox_module.inbox_service.deliver_pending(SUP)
+        _worker_answers(world, SUP, "SUP NEW ANSWER")
         assert svc.evaluate_completion(SUP) == 1
         (forward,) = _forwards_to(TOP)
-        assert forward.endswith("---\nSUP PREVIOUS ANSWER")
+        assert forward.endswith("---\nSUP NEW ANSWER")
+
+        svc.handle_worker_ended(W1, "reached ERROR", may_be_running=True)
+        assert len(_notices_to(SUP)) == 1
+        assert not any(
+            m.message.startswith("[CAO worker ended]") for m in get_inbox_messages(SUP, limit=50)
+        )

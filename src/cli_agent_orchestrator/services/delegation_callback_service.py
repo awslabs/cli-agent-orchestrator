@@ -25,6 +25,8 @@ from cli_agent_orchestrator.clients.database import (
     list_armed_worker_ids,
     list_open_edges_into,
     list_open_edges_out_of,
+    list_open_message_edges,
+    list_unarmed_assign_edges,
 )
 from cli_agent_orchestrator.constants import DELEGATION_PICKUP_TIMEOUT_SECONDS
 from cli_agent_orchestrator.models.delegation import (
@@ -120,6 +122,22 @@ def build_worker_ended_message(
         "Below is its last response if it could be read.\n"
         "---\n"
         f"{last_response if last_response else _UNREADABLE}"
+    )
+
+
+def build_delivery_failed_message(worker_id: str, profile: Optional[str], reason: str) -> str:
+    return (
+        f"[CAO delivery failed] Your message to worker {worker_id} "
+        f"(profile {profile or 'unknown'}) was not delivered: {reason}. "
+        "Check the worker's terminal before you send it again."
+    )
+
+
+def build_task_not_delivered_message(worker_id: str, profile: Optional[str]) -> str:
+    return (
+        f"[CAO delivery failed] cao-server restarted before the task for worker {worker_id} "
+        f"(profile {profile or 'unknown'}) was delivered. Check the worker's terminal; "
+        "it may never have received the task."
     )
 
 
@@ -328,6 +346,51 @@ def handle_worker_ended(
     close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
     for edge in notified:
         _deliver(edge.caller_id, terminal_id, registry)
+
+
+def handle_delivery_failed(
+    worker_id: str,
+    message_ids: List[int],
+    reason: str,
+    registry: PluginRegistry | None = None,
+) -> None:
+    """Close the edges of messages whose delivery failed for good, and tell each caller.
+
+    A FAILED message is never retried, so its edges would never be armed: left
+    OPEN, they are never swept, hold the caller's own forward back as nested
+    work, and stop a follow-up from opening a fresh edge. Each edge is closed
+    as worker_ended in the same commit that queues the caller's
+    ``[CAO delivery failed]`` notice, so the caller hears back, as it would
+    for a worker that ended.
+    """
+    edges = list_open_message_edges(message_ids)
+    if not edges:
+        return
+    profile = (get_terminal_metadata(worker_id) or {}).get("agent_profile")
+    text = build_delivery_failed_message(worker_id, profile, reason)
+    notified = [e for e in edges if _close_and_notify(e, EdgeState.WORKER_ENDED, worker_id, text)]
+    for edge in notified:
+        _deliver(edge.caller_id, worker_id, registry)
+
+
+def handle_task_never_delivered(worker_id: str) -> int:
+    """Close the unarmed assign edges of a worker whose task can no longer be delivered.
+
+    For the restart recovery: the task was accepted but cao-server restarted
+    before it was delivered, so its edges would never be armed. Each caller is
+    sent a ``[CAO delivery failed]`` notice, queued in the commit that closes
+    its edge. The notice is not delivered here: this runs at startup, before
+    the plugin registry and the status consumers exist, so the inbox
+    reconciliation sweep delivers it, with the registry, once it is due.
+
+    Returns the number of callers told.
+    """
+    edges = list_unarmed_assign_edges(worker_id)
+    if not edges:
+        return 0
+    profile = (get_terminal_metadata(worker_id) or {}).get("agent_profile")
+    text = build_task_not_delivered_message(worker_id, profile)
+    return sum(1 for e in edges if _close_and_notify(e, EdgeState.WORKER_ENDED, worker_id, text))
 
 
 def _log_cycles(worker_ids: List[str]) -> None:
