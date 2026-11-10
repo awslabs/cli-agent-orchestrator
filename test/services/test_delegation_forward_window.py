@@ -215,7 +215,9 @@ def _later(monkeypatch, seconds: float) -> None:
 
 
 def _pickup_timeouts_to(receiver_id: str) -> list:
-    return [m for m in _forwards_to(receiver_id) if "has not started on the last message" in m]
+    return [
+        m for m in _forwards_to(receiver_id) if "showed no sign of work on the last message" in m
+    ]
 
 
 class TestDeliveryNeverPickedUp:
@@ -255,7 +257,10 @@ class TestDeliveryNeverPickedUp:
         (forward,) = _pickup_timeouts_to(SUP)
         assert forward.startswith(f"[CAO auto-forward] Worker {W1} (profile developer) ")
         assert "may not have been picked up" in forward
-        assert f'Resend the message: send_message(receiver_id="{W1}"' in forward
+        assert (
+            "Check its terminal before you send the message again: "
+            f'send_message(receiver_id="{W1}"'
+        ) in forward
         assert forward.endswith("---\nPREVIOUS ANSWER")
         assert list_open_edges_into(W1) == []
 

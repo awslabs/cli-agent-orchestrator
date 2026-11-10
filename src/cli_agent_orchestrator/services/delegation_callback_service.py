@@ -76,13 +76,13 @@ def build_pickup_timeout_message(
 ) -> str:
     return (
         f"[CAO auto-forward] Worker {worker_id} (profile {profile or 'unknown'}) "
-        "has not started on the last message delivered to it.\n"
-        f"Reason: no sign of work {int(waited_seconds)}s after delivery; the message may not "
-        "have been picked up (its paste or Enter can be lost).\n"
-        "Below is its last response, read from the terminal. It is likely from an "
-        "earlier turn.\n"
-        f'The worker is still running. Resend the message: send_message(receiver_id="{worker_id}", '
-        "...), or check its terminal.\n"
+        "showed no sign of work on the last message delivered to it.\n"
+        f"Reason: no work was seen {int(waited_seconds)}s after delivery. The message may not "
+        "have been picked up (its paste or Enter can be lost), or the worker may have "
+        "answered too fast for its status to show it.\n"
+        "Below is its last response, read from the terminal. It can be from an earlier turn.\n"
+        "The worker is still running. Check its terminal before you send the message again: "
+        f'send_message(receiver_id="{worker_id}", ...)\n'
         f'When done with it: delete_terminal("{worker_id}")\n'
         "---\n"
         f"{last_response if last_response else _UNREADABLE}"

@@ -174,10 +174,13 @@ class TestEvaluateCompletion:
         assert svc.evaluate_completion("w1") == 1
         text = env["sent"][0][2]
         assert text.startswith(
-            "[CAO auto-forward] Worker w1 (profile developer) has not started on the last "
-            "message delivered to it."
+            "[CAO auto-forward] Worker w1 (profile developer) showed no sign of work on the "
+            "last message delivered to it."
         )
-        assert f"no sign of work {int(svc.DELEGATION_PICKUP_TIMEOUT_SECONDS)}s" in text
+        assert f"no work was seen {int(svc.DELEGATION_PICKUP_TIMEOUT_SECONDS)}s" in text
+        assert "It can be from an earlier turn." in text
+        assert "Check its terminal before you send the message again" in text
+        assert "Resend" not in text
         assert text.endswith("---\nfinal answer")
 
     def test_delivery_in_flight_blocks(self, db, env):

@@ -90,8 +90,9 @@ assignment when the worker is created, and once the task has been delivered it w
 - The forward waits until the worker has started on the last message delivered to it, so the
   supervisor never gets the answer to an earlier message. If the worker shows no sign of work for
   300 seconds after a delivery (`CAO_DELEGATION_PICKUP_TIMEOUT_SECONDS`), the message may not have
-  been picked up; the server then forwards the last response with a header that says so and asks
-  the supervisor to resend or check the worker.
+  been picked up, or the turn was too fast to show; the server then forwards the last response with
+  a header that says so and asks the supervisor to check the worker's terminal before sending the
+  message again.
 - If the worker is deleted or reaches an error state before replying, the supervisor receives a
   `[CAO worker ended]` notice, with the worker's last response when it can still be read.
 - A worker that is waiting on a sub-worker it assigned is not forwarded until that sub-worker has
