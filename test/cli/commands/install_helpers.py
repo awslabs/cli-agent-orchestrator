@@ -26,5 +26,8 @@ def _ok(result) -> None:
 
 
 def _refused(result) -> None:
-    assert result.exit_code == 0  # failure result, not a crash
+    # A refused install exits 1 through click (#1270); an exception other than
+    # click's SystemExit would be a crash, not a refusal.
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit), result.exception
     assert "Error:" in result.output, result.output
