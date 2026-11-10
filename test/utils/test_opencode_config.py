@@ -493,6 +493,129 @@ class TestGrantRecord:
         tools = json.loads(tmp_config.read_text())["agent"]["developer"]["tools"]
         assert tools == {"cao-mcp-server*": True}
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b'{"version": 1, "agents": {"other": ["other-tools*"]}',
+            b'["not", "a", "record"]',
+            b'{"version": 1, "agents": ["other"]}',
+            b'{"version": 1, "agents": {"other": ["other-tools*"]}, "n": "\xff"}',
+        ],
+        ids=["bad-json", "not-an-object", "agents-not-an-object", "invalid-utf-8"],
+    )
+    @pytest.mark.parametrize("call", ["upsert", "remove"])
+    def test_a_corrupt_sidecar_is_left_intact_and_named(
+        self, tmp_config: Path, caplog, content: bytes, call: str
+    ):
+        """#1271: the grant writer fails closed, like record_mcp_entry (GH #737).
+
+        Writing over the damaged file would drop every other agent's row, here
+        "other"'s. It stays byte-identical, a warning names it, and the agent's
+        own grant still lands in opencode.json.
+        """
+        tmp_config.parent.mkdir(parents=True)
+        if call == "remove":
+            upsert_agent_tools("developer", ["cao-mcp-server"])
+        sidecar = tmp_config.with_name("cao-grants.json")
+        sidecar.write_bytes(content)
+        with caplog.at_level(logging.WARNING):
+            if call == "upsert":
+                upsert_agent_tools("developer", ["cao-mcp-server"])
+            else:
+                remove_agent_tools("developer")
+        assert sidecar.read_bytes() == content
+        warnings = [
+            r.getMessage() for r in caplog.records if "not recording the grants" in r.getMessage()
+        ]
+        assert warnings and str(sidecar) in warnings[0], [r.getMessage() for r in caplog.records]
+        tools = (
+            json.loads(tmp_config.read_text()).get("agent", {}).get("developer", {}).get("tools")
+        )
+        if call == "upsert":
+            assert tools == {"cao-mcp-server*": True}
+
+    @pytest.mark.parametrize("damaged_first", [True, False], ids=["damaged", "intact"])
+    def test_a_profile_grant_added_while_damaged_outlives_the_repair(
+        self, tmp_config: Path, caplog, damaged_first: bool
+    ):
+        """Known behaviour (#1273 review): nothing records a grant added while the
+        sidecar is damaged, so once the profile drops that server no proof covers
+        its key, and it stays after the repair until it is removed by hand. With
+        the sidecar intact, the same steps withdraw it. A second profile server the
+        profile keeps is unaffected either way, and its row is pinned too.
+        """
+        tmp_config.parent.mkdir(parents=True)
+        sidecar = tmp_config.with_name("cao-grants.json")
+        if damaged_first:
+            sidecar.write_text("{not json", encoding="utf-8")
+        # An install while damaged (or not) adds two profile servers' grants.
+        with caplog.at_level(logging.WARNING):
+            upsert_agent_tools("developer", ["cao-mcp-server", "x-server"])
+        if damaged_first:
+            assert any("stays until removed by hand" in r.getMessage() for r in caplog.records), [
+                r.getMessage() for r in caplog.records
+            ]
+            # Repaired by hand: the operator restores the row they know about.
+            sidecar.write_text(
+                '{"version": 1, "agents": {"developer": ["cao-mcp-server*"]}}', encoding="utf-8"
+            )
+        # The profile drops x-server, keeps cao-mcp-server, and is reinstalled twice.
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        tools = json.loads(tmp_config.read_text())["agent"]["developer"]["tools"]
+        assert ("x-server*" in tools) is damaged_first, tools
+        assert tools["cao-mcp-server*"] is True
+        assert json.loads(sidecar.read_text())["agents"] == {"developer": ["cao-mcp-server*"]}
+
+    @pytest.mark.parametrize(
+        "writer, content",
+        [("grants", "{not json"), ("grants", '["not", "a", "record"]'), ("mcp", "{not json")],
+        ids=["grants-unreadable", "grants-wrong-shape", "mcp-unreadable"],
+    )
+    def test_every_damaged_sidecar_warning_says_to_repair_it_by_hand(
+        self, tmp_config: Path, caplog, writer: str, content: str
+    ):
+        """#1273 review: deleting the file is the easy fix, and it drops every
+        agent's recorded grants, so each warning says to repair it by hand."""
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.with_name("cao-grants.json").write_text(content, encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            if writer == "grants":
+                upsert_agent_tools("developer", ["cao-mcp-server"])
+            else:
+                record_mcp_entry("demo-tools", {"type": "local", "command": ["/x"]})
+        messages = [r.getMessage() for r in caplog.records if "grant record" in r.getMessage()]
+        assert messages
+        for message in messages:
+            assert "Repair the file by hand" in message, message
+            assert "drops the recorded grants of every agent" in message, message
+
+    @pytest.mark.parametrize("damage", ["mode-000", "directory"])
+    def test_an_unreadable_sidecar_is_left_intact_and_named(self, tmp_config: Path, caplog, damage):
+        if damage == "mode-000" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("root reads a mode-000 file")
+        tmp_config.parent.mkdir(parents=True)
+        sidecar = tmp_config.with_name("cao-grants.json")
+        if damage == "directory":
+            sidecar.mkdir()
+        else:
+            sidecar.write_text('{"version": 1, "agents": {"other": ["x*"]}}', encoding="utf-8")
+            sidecar.chmod(0)
+        try:
+            with caplog.at_level(logging.WARNING):
+                upsert_agent_tools("developer", ["cao-mcp-server"])
+        finally:
+            if not sidecar.is_dir():
+                sidecar.chmod(0o600)
+        if damage == "directory":
+            assert sidecar.is_dir() and not any(sidecar.iterdir())
+        else:
+            assert json.loads(sidecar.read_text()) == {"version": 1, "agents": {"other": ["x*"]}}
+        assert any(
+            "not recording the grants" in r.getMessage() and str(sidecar) in r.getMessage()
+            for r in caplog.records
+        )
+
 
 class TestRemoveAgentTools:
     def test_removes_existing_agent(self, tmp_config: Path):

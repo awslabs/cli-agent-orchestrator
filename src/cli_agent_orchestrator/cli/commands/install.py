@@ -135,8 +135,9 @@ def install(
         result = install_agent(agent_source, provider, parsed_env or None, engine=engine)
 
     if not result.success:
-        click.echo(f"Error: {result.message}", err=True)
-        return
+        # Exit 1 with "Error: <message>" on stderr, like the rest of the CLI, so
+        # a script can tell a failed install from a successful one (#1270).
+        raise click.ClickException(result.message)
 
     if local_profile is not None:
         click.echo("✓ Copied agent from file to local store")
