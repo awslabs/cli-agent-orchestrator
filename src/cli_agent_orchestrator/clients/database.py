@@ -32,6 +32,7 @@ from sqlalchemy import (
     exists,
     func,
     literal_column,
+    or_,
     text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -3847,16 +3848,33 @@ def delete_terminals_by_ids(terminal_ids: List[str], *, end_reason: str) -> int:
     it again could close an older launch left open under the same id. Each id
     is deleted on its own so its row count says who deleted it; see
     ``delete_terminal`` for why the finalize runs after commit.
+
+    Every delegation edge still open on one of the ids, in either direction, is
+    closed as worker_ended in the same commit, without a notice, as
+    ``terminal_service.delete_terminal_row`` does for a single row: an edge left
+    open would stay armed with no terminal behind it and be re-evaluated by
+    every sweep. Like there, this covers ids whose row another owner deleted.
     """
     if not terminal_ids:
         return 0
+    ids = list(dict.fromkeys(terminal_ids))
     with SessionLocal() as db:
         deleted_ids = [
             terminal_id
-            for terminal_id in dict.fromkeys(terminal_ids)
+            for terminal_id in ids
             if db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
         ]
         _delete_kept_rows(db, deleted_ids)
+        db.query(DelegationEdgeModel).filter(
+            DelegationEdgeModel.state == EdgeState.OPEN.value,
+            or_(DelegationEdgeModel.worker_id.in_(ids), DelegationEdgeModel.caller_id.in_(ids)),
+        ).update(
+            {
+                DelegationEdgeModel.state: EdgeState.WORKER_ENDED.value,
+                DelegationEdgeModel.closed_at: _utcnow(),
+            },
+            synchronize_session=False,
+        )
         db.commit()
     if deleted_ids:
         _finalize_launch_records_best_effort(deleted_ids, end_reason)

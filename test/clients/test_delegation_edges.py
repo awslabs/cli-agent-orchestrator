@@ -13,6 +13,7 @@ from cli_agent_orchestrator.clients.database import (
     close_open_edges_for_terminal,
     create_delegation_edge,
     create_terminal,
+    delete_terminals_by_ids,
     find_open_edge,
     get_inbox_messages,
     list_armed_worker_ids,
@@ -127,3 +128,20 @@ class TestCloseWithMessage:
 
         assert list_open_edges_into("w1") == []
         assert get_inbox_messages("sup") == []
+
+
+def test_bulk_row_deletion_closes_edges_in_both_directions(db):
+    create_terminal("w1", "cao-s", "w1", "claude_code")
+    create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+    mark_assign_edges_delivered("w1")
+    create_delegation_edge("w1", "w2", EdgeSource.ASSIGN)
+    create_delegation_edge("w2", "w1", EdgeSource.SEND_MESSAGE, message_id=4)
+    untouched = create_delegation_edge("sup", "w3", EdgeSource.ASSIGN)
+
+    assert delete_terminals_by_ids(["w1", "gone"], end_reason="session_teardown") == 1
+
+    assert list_open_edges_into("w1") == []
+    assert list_open_edges_out_of("w1") == []
+    assert list_armed_worker_ids() == []
+    assert [e.id for e in list_open_edges_into("w3")] == [untouched.id]
+    assert get_inbox_messages("sup") == []
