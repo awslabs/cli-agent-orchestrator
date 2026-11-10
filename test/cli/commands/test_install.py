@@ -213,15 +213,44 @@ class TestInstallCommand:
         mock_install.assert_not_called()
 
     def test_install_failure_prints_error(self, runner: CliRunner) -> None:
-        """Service failures should be surfaced as CLI errors without raising."""
+        """A service failure is a CLI error: exit 1, the message on stderr (#1270)."""
         with patch(
             "cli_agent_orchestrator.cli.commands.install.install_agent",
             return_value=InstallResult(success=False, message="Source not found: missing"),
         ):
             result = runner.invoke(install, ["missing"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error: Source not found: missing" in result.output
+
+    def test_a_failed_install_exits_1_with_the_error_on_stderr(self, runner: CliRunner) -> None:
+        """#1270: a script must be able to tell a failed install from a good one."""
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=InstallResult(success=False, message="Agent profile not found: nope"),
+        ):
+            result = runner.invoke(install, ["nope", "--provider", "opencode_cli"])
+
+        assert result.exit_code == 1
+        assert result.stderr.strip() == "Error: Agent profile not found: nope"
+        assert result.stdout == ""
+
+    def test_a_successful_install_still_exits_0(self, runner: CliRunner) -> None:
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=InstallResult(
+                success=True,
+                message="ok",
+                agent_name="developer",
+                context_file="/ctx/developer.md",
+            ),
+        ):
+            result = runner.invoke(install, ["developer"])
+
+        assert result.exit_code == 0, result.output
+        assert "Agent 'developer' installed successfully" in result.stdout
+        assert result.stderr == ""
 
     def test_install_invalid_env_format_returns_click_error(self, runner: CliRunner) -> None:
         """Assignments without '=' should fail validation with a user-friendly error."""

@@ -62,8 +62,11 @@ def invoke(surface, name, provider, tmp_path, monkeypatch, content=None):
             source = tmp_path / f"{name}.md"
             source.write_text(content)
         result = CliRunner().invoke(install, [str(source), "--provider", provider])
-        assert result.exit_code == 0, result.output
-        success, message = "installed successfully" in result.output, result.output
+        # Exit 0 on success, 1 on a refusal (#1270); anything else is a crash.
+        assert result.exit_code in {0, 1}, result.output
+        assert result.exit_code == 0 or isinstance(result.exception, SystemExit), result.exception
+        success, message = result.exit_code == 0, result.output
+        assert success == ("installed successfully" in result.output), result.output
     elif surface in {"api-name", "api-url"}:
         source = url if surface == "api-url" else name
         result = TestClient(app, base_url="http://localhost").post(

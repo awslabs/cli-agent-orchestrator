@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FleetClient.terminal_status` now defaults its read timeout to 5.0s (matching the local
   terminal poll ceiling in `wait_until_terminal_status`) instead of inheriting the module-wide
   60s read timeout, keeping stalled broker responses bounded within the caller's poll budget.
+- **A hung FIFO-writer test fails in 10 seconds instead of holding CI** (#1251 follow-up).
+  `test_stdin_closing_before_any_reader_ends_the_writer` called the writer in-process, so a
+  regression to a blocking `open()` would have hung the pytest worker; it now runs the writer in
+  a daemon thread joined with a timeout. The Unit Tests job also gains `timeout-minutes: 60`, so
+  any hung test ends the job within an hour instead of GitHub's default of six.
+- **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
+  the sidecar beside `opencode.json` could not be read as a grant record, `cao install
+  --provider opencode_cli` started from an empty record and wrote it back, dropping every other
+  agent's recorded grants. It now leaves the file as it is, logs a warning that names it, and
+  does not record this agent's grants. The install still completes. Until the sidecar is
+  repaired and the agent reinstalled, a plugin server's grant is withdrawn by plugin-store
+  containment, and a profile server's grant (`cao-mcp-server*`, say) is left in place, the
+  conservative direction.
+- **`cao install` exits 1 when the install fails** (#1270). It printed `Error: <message>` and
+  exited 0, so a script or CI step could not tell a failed install from a successful one. It
+  now exits 1 with the same message on stderr, like the rest of the CLI. A script that relied
+  on exit 0 after a failed install must change.
 - **Keep finished child agents open, for workshops and debugging** (#1225 phase 1). A new
   machine-wide setting, `terminal.keep_finished`, off by default
   (`cao config set terminal.keep_finished.enabled true`). While it is on, a successful
