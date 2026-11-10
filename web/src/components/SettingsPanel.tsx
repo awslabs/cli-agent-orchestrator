@@ -133,7 +133,7 @@ export function SettingsPanel() {
           placeholder={hasToken ? 'Token set for this tab' : 'Paste the server token'}
           autoComplete="off"
           data-testid="access-token-input"
-          className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-none"
+          className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-hidden"
         />
         <button
           onClick={saveToken}
@@ -281,7 +281,7 @@ export function SettingsPanel() {
             onChange={e => setNewDir(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && addDir()}
             placeholder="/path/to/agent-profiles"
-            className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-none"
+            className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-hidden"
           />
           <button
             onClick={addDir}

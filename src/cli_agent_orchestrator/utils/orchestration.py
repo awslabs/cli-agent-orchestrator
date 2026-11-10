@@ -27,6 +27,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
 
 import requests
@@ -48,7 +49,7 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.delegation import (
     REMOTE_FEATURE,
     DelegationCeilingError,
@@ -212,9 +213,68 @@ def append_sender_suffix(
     return message + "\n\n" + template.format(terminal_id=terminal_id)
 
 
+# Providers that add cao-mcp-server to the worker's MCP config themselves,
+# whatever the profile says (copilot_cli, antigravity_cli). opencode_cli is
+# included because its config path also references cao-mcp-server
+# (utils/opencode_config.py); that was not verified against a live run.
+_PROVIDERS_INJECTING_CAO_MCP = frozenset(
+    {
+        ProviderType.COPILOT_CLI.value,
+        ProviderType.ANTIGRAVITY_CLI.value,
+        ProviderType.OPENCODE_CLI.value,
+    }
+)
+
+
+def _declares_cao_mcp(mcp_servers: Optional[Dict[str, Any]]) -> bool:
+    for name, cfg in (mcp_servers or {}).items():
+        if name == "cao-mcp-server":
+            return True
+        if isinstance(cfg, dict):
+            command = cfg.get("command")
+            args = cfg.get("args") or []
+            if isinstance(command, str) and "cao-mcp-server" in command:
+                return True
+            if any(
+                isinstance(a, str)
+                and ("cao-mcp-server" in a or a == "cli_agent_orchestrator.mcp_server.server")
+                for a in args
+            ):
+                return True
+    return False
+
+
+def _worker_can_send_message(agent_profile: str) -> bool:
+    """False only when the worker is confidently known to lack a send_message tool.
+
+    A wrong False costs a misleading warning and a withheld instruction, so any
+    uncertainty (profile unreadable, provider not named by the profile) answers
+    True and leaves the auto-forward path to catch a real miss.
+    """
+    try:
+        profile = load_agent_profile(agent_profile)
+    except Exception:  # noqa: BLE001 - uncertainty answers True, see docstring
+        return True
+    if not profile.provider or profile.provider in _PROVIDERS_INJECTING_CAO_MCP:
+        return True
+    return _declares_cao_mcp(profile.mcpServers)
+
+
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 
+# How many times handoff's synchronous create is sent, all under the SAME
+# idempotency key and each with the full ``synchronous_create_timeout`` budget
+# (review on PR #773). That budget is the client's view of the server's init
+# allowance (issue #710); it can still be outrun, for example when the server
+# reads a larger ``provider_init_timeout`` than the client does. The client
+# never guesses from the exception type whether its timed-out attempt reached
+# the server: if it did, the retry is an idempotent replay, which cao-server
+# holds until the original provider.initialize() settles and then returns the
+# READY terminal (or the original failure); if it did not (e.g. a
+# ConnectTimeout), the retry is a fresh create that gets the same full budget
+# as a first attempt.
+_HANDOFF_CREATE_ATTEMPTS = 3
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
 
@@ -269,6 +329,18 @@ def _get_cleanup_nudge() -> str:
     except Exception:
         pass
     return ""
+
+
+def _teardown_sentence(terminal_id: Optional[str], torn_down: bool) -> str:
+    """State only whether the worker terminal was torn down (issue #1203).
+
+    No instruction and no liveness claim. Empty when no terminal is known, since
+    there is then no terminal to name.
+    """
+    if not terminal_id:
+        return ""
+    state = "was torn down" if torn_down else "was not torn down"
+    return f". Worker terminal {terminal_id} {state}."
 
 
 # --- Cross-node placement + callback routing (one-agent-per-pod topology) ---
@@ -806,14 +878,28 @@ class EphemeralClaim(NamedTuple):
     effective_tools: list[str]
     claim_id: Optional[str] = None
     terminal_id: Optional[str] = None
+    # #1099 (provisional): the stored spec declared provider "auto", so the launch may run
+    # another CLI than ``provider``; text shaped before the launch is provider-neutral.
+    provider_auto: bool = False
 
 
 class _ClaimRefused(ValueError):
     """Carry only the policy relay's public rule and message to the handler."""
 
-    def __init__(self, rule: str, message: str):
+    def __init__(
+        self,
+        rule: str,
+        message: str,
+        status_code: Optional[int] = None,
+        terminal_id: Optional[str] = None,
+    ):
         super().__init__(message)
         self.rule = rule
+        # The HTTP status behind a generic refusal, so handoff can tell a failed
+        # original (424) from an unknown outcome (review on PR #773).
+        self.status_code = status_code
+        # The failed original's retained terminal, named by a 424 (issue #943).
+        self.terminal_id = terminal_id
 
 
 def _local_claim_refusal(rule: str, detail: str = "") -> _ClaimRefused:
@@ -867,7 +953,12 @@ def _claim_ephemeral(
             return EphemeralClaim(
                 metadata["provider"], metadata["allowed_tools"], terminal_id=terminal_id
             )
-        return EphemeralClaim(data["provider"], data["effective_tools"], data["claim_id"])
+        return EphemeralClaim(
+            data["provider"],
+            data["effective_tools"],
+            data["claim_id"],
+            provider_auto=data.get("provider_auto") is True,
+        )
     except _ClaimRefused:
         raise
     except requests.exceptions.JSONDecodeError:
@@ -917,12 +1008,15 @@ def _create_terminal(
     use_worktree: bool = False,
     create_timeout: Optional[Union[float, Tuple[float, float]]] = None,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     claim: Optional[EphemeralClaim] = None,
     description: Optional[str] = None,
     *,
     delegation_message: Optional[str] = None,
     delegation_kind: Optional[str] = None,
     response_sink: Optional[Callable[[requests.Response], None]] = None,
+    expect_callback: bool = False,
+    worker_can_reply: bool = True,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -931,6 +1025,12 @@ def _create_terminal(
         working_directory: Optional working directory for the terminal
         claim: Optional ephemeral launch claim for binding the child terminal
         description: Optional description persisted on the child terminal
+        lookup_only: Review on PR #773. Ask cao-server only to RESOLVE
+            ``idempotency_key`` to the terminal a prior call committed: it
+            returns at once (without waiting for that terminal's provider
+            initialization), never allocates, and answers 404 when nothing is
+            committed. The result identifies a worker for inspection and
+            cleanup; it is not permission to send it input.
         idempotency_key: Review on PR #634, issue #616. Forwarded as a query
             param to whichever endpoint this call hits (existing-session or
             new-session); the server returns the terminal a PRIOR call with
@@ -949,6 +1049,10 @@ def _create_terminal(
             ``utils.init_allowance`` for that case (issue #710), as handoff
             does. A ``(connect, read)`` tuple is accepted as ``requests`` takes
             it, so only the read half is widened.
+            A client-side timeout on this call is not fatal to the caller:
+            retrying with the same ``idempotency_key`` either replays the
+            original create (and waits for its initialization) or performs it
+            if it never arrived (see ``_HANDOFF_CREATE_ATTEMPTS``).
         defer_init: If True, tell
             cao-server to skip the ``provider.initialize()`` wait and return
             as soon as the tmux window and DB record exist. Provider init
@@ -1054,6 +1158,10 @@ def _create_terminal(
         # Record the creating terminal so send_message can route callbacks
         # structurally instead of parsing IDs out of message text (issue #284).
         params["caller_id"] = current_terminal_id
+        if expect_callback:
+            params["expect_callback"] = "true"
+            if not worker_can_reply:
+                params["worker_can_reply"] = "false"
         if claim is not None and claim.claim_id is not None:
             params["claim_id"] = claim.claim_id
         if working_directory:
@@ -1068,6 +1176,8 @@ def _create_terminal(
             params["use_worktree"] = "true"
         if idempotency_key:
             params["idempotency_key"] = idempotency_key
+        if lookup_only:
+            params["lookup_only"] = "true"
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -1099,9 +1209,19 @@ def _create_terminal(
         if claim is not None and response.status_code >= 400:
             kind, message, _, rule = _parse_run_step_error(response)
             if kind == "ephemeral_policy":
-                raise _ClaimRefused(rule or "unexpected_failure", message)
+                raise _ClaimRefused(
+                    rule or "unexpected_failure",
+                    _bounded_launch_message(
+                        message, f"ephemeral launch failed ({response.status_code})"
+                    ),
+                )
             raise _ClaimRefused(
-                "unexpected_failure", f"ephemeral launch failed ({response.status_code})"
+                "unexpected_failure",
+                _claim_launch_error_message(response),
+                status_code=response.status_code,
+                terminal_id=(
+                    _retained_terminal_id(response) if response.status_code == 424 else None
+                ),
             )
         response.raise_for_status()
         terminal = response.json()
@@ -1121,17 +1241,19 @@ def _create_terminal(
         # match (review on PR #634, issue #616). The server fingerprints
         # session_name, and this branch mints a new one per invocation, so two
         # keyed retries from outside a CAO terminal produced different
-        # fingerprints for the same logical request: the retry 409'd against its
-        # own first attempt instead of reattaching to it. Deriving the name makes
+        # fingerprints for the same logical request: the retry missed its own
+        # first attempt instead of reattaching to it. Deriving the name makes
         # the request byte-identical across attempts, which is the precondition
         # the fingerprint check has always assumed.
         #
         # sha256 of the key, truncated to the same 8 hex chars
         # `generate_session_name` uses, so the result is indistinguishable in
         # shape from a generated name and satisfies the same tmux-name rules.
-        # Two DIFFERENT requests sharing a key collide on this name, which is
-        # correct: that is the conflict case, and it surfaces as the 409 the key
-        # is supposed to produce rather than as two sessions.
+        # Two DIFFERENT requests sharing a key collide on this name. Since issue
+        # #944 the server scopes the key by request fingerprint, so the second
+        # request is no longer refused with 409; it attempts its own create of
+        # the SAME session name and fails there, because that session exists.
+        # Use distinct keys for distinct requests.
         session_name = (
             generate_session_name_for_key(idempotency_key)
             if idempotency_key
@@ -1153,6 +1275,8 @@ def _create_terminal(
             params["use_worktree"] = "true"
         if idempotency_key:
             params["idempotency_key"] = idempotency_key
+        if lookup_only:
+            params["lookup_only"] = "true"
 
         json_body = {"description": normalize_description(description, truncate=True)}
         if initial_message is not None:
@@ -1182,7 +1306,9 @@ def _create_terminal(
 
     if response_sink is not None:
         response_sink(response)
-    return terminal["id"], provider
+    # The created terminal's own provider: a routed ephemeral launch runs another CLI than
+    # the request named (#1099), and every later step reuses or shapes for this one.
+    return terminal["id"], terminal.get("provider") or provider
 
 
 def _send_direct_input(
@@ -1356,6 +1482,8 @@ def _terminal_id_from_detail(detail: str) -> Optional[str]:
 
 def _parse_run_step_error(
     response: requests.Response,
+    *,
+    scrape_terminal_id: bool = True,
 ) -> tuple[Optional[str], str, Optional[str], Optional[str]]:
     """Parse a run-step error into ``(kind, message, terminal_id, policy_rule)``.
 
@@ -1363,7 +1491,8 @@ def _parse_run_step_error(
     ``{"message", "kind", "terminal_id"}`` so callers read the failure kind and
     the live terminal as fields. Falls back to the legacy plain-string detail
     (+ regex terminal-id scrape) when the structured shape is absent, so a
-    newer client still works against an older server.
+    newer client still works against an older server. Callers can disable the
+    scrape for untrusted launch text without discarding structured worker ids.
     """
     try:
         payload = response.json()
@@ -1378,9 +1507,27 @@ def _parse_run_step_error(
         rule = detail.get("rule", "unexpected_failure") if kind == "ephemeral_policy" else None
         return kind, message, detail.get("terminal_id"), rule
     if isinstance(detail, str) and detail:
-        return None, detail, _terminal_id_from_detail(detail), None
+        tid = _terminal_id_from_detail(detail) if scrape_terminal_id else None
+        return None, detail, tid, None
     fallback = f"status {response.status_code}"
     return None, fallback, None, None
+
+
+def _bounded_launch_message(message: object, fallback: str) -> str:
+    """Bound decoded launch text before relaying and normalise whitespace."""
+    if not isinstance(message, str):
+        return fallback
+    cleaned = " ".join(
+        "".join(
+            " " if ch.isspace() else ch for ch in message[:4096] if ch.isspace() or ch.isprintable()
+        ).split()
+    )
+    return cleaned or fallback
+
+
+def _claim_launch_error_message(response: requests.Response) -> str:
+    """Hide non-policy launch errors after a claim, including paths and git stderr."""
+    return f"ephemeral launch failed ({response.status_code})"
 
 
 def _receiver_provider(receiver_id: str) -> Optional[str]:
@@ -1422,7 +1569,7 @@ def _receiver_provider(receiver_id: str) -> Optional[str]:
     return None
 
 
-def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
+def _send_to_inbox(receiver_id: str, message: str, expect_reply: bool = False) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
     Cross-node routing (one-agent-per-pod topology): when this terminal was
@@ -1456,6 +1603,8 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         base_url = callback_url
 
     params = {"sender_id": sender_id, "message": message}
+    if expect_reply:
+        params["expect_reply"] = "true"
 
     def _inbox_headers(target_base_url: str) -> Optional[Dict[str, str]]:
         # BOTH header sets, and the union is not a compromise between two merge
@@ -1551,13 +1700,14 @@ _CLIENT_TIMEOUT_HEADROOM = 180
 async def _run_step_and_build_result(
     payload: Dict[str, Any],
     agent_profile: str,
-    provider: str,
+    provider: Optional[str],
     timeout: int,
     start_time: float,
     base_url: str = API_BASE_URL,
     target_host: Optional[str] = None,
     *,
     response_sink: Optional[Callable[[requests.Response], None]] = None,
+    caller_deletes_terminal: bool = False,
 ) -> HandoffResult:
     """POST ``payload`` to ``/terminals/run-step`` and map the response to a HandoffResult.
 
@@ -1582,6 +1732,10 @@ async def _run_step_and_build_result(
     as before. ``target_host`` is needed here in ADDITION to ``base_url``
     because it is not merely a URL: it selects the connect-timeout shape and it
     is the name quoted back to the operator in the remote-cleanup hints below.
+
+    ``caller_deletes_terminal``: the caller deletes the terminal itself after this
+    returns (the early-terminal-id path). The success message then leaves out the
+    cleanup nudge, and the caller adds it back if its own delete fails.
     """
     known_terminal_id: Optional[str] = payload.get("reuse_terminal_id")
     # Read off the payload for the same reason ``reuse_terminal_id`` is: the
@@ -1665,48 +1819,85 @@ async def _run_step_and_build_result(
         # run-step endpoint returns a STRUCTURED detail object
         # ({message, kind, terminal_id}) so we read terminal_id and the
         # failure kind as fields rather than scraping the message.
-        kind, structured_detail, tid, rule = _parse_run_step_error(response)
+        kind, structured_detail, tid, rule = _parse_run_step_error(
+            response,
+            scrape_terminal_id=not (
+                payload.get("claim_id") is not None and 400 <= response.status_code < 500
+            ),
+        )
         # worker RAN LONG (timeout) vs CRASHED (terminal reached ERROR) must
         # be reported distinctly so a 5s crash is not mislabeled as an
         # N-second timeout. The structured `kind` is authoritative; the
         # status code is only the fallback when an older server omits it
         # (504 -> timeout, 502 -> error).
+        # Only a worker that errored or ran long is named with its job and its
+        # teardown outcome. Every other failure path either tears the worker down
+        # server-side or has no worker, so this branch makes no claim about it.
+        worker_outcome = False
         if kind == "ephemeral_policy":
-            msg = structured_detail
+            msg = _bounded_launch_message(
+                structured_detail, f"ephemeral launch failed ({response.status_code})"
+            )
         # Generic text is only for failures before any worker is known; a launched
         # worker's timeout, error or extraction failure keeps its handoff result.
         elif (
             payload.get("claim_id") is not None
             and kind not in ("error", "timeout")
             and response.status_code not in (502, 504)
-            and tid is None
+            and (tid is None or 400 <= response.status_code < 500)
         ):
-            msg = f"ephemeral launch failed ({response.status_code})"
+            msg = _claim_launch_error_message(response)
             rule = "unexpected_failure"
+            # Structured worker ids survive on every status; only scraped 4xx
+            # ids (e.g. an unallocated git worktree terminal) are dropped above.
+            # A retained 424 can also name its worker at the top level.
+            if response.status_code == 424:
+                tid = tid or _retained_terminal_id(response)
         elif kind == "error" or (kind is None and response.status_code == 502):
             msg = f"Handoff failed: worker errored ({structured_detail})"
+            worker_outcome = True
         elif kind == "timeout" or (kind is None and response.status_code == 504):
             msg = f"Handoff timed out after {timeout} seconds"
+            worker_outcome = True
         else:
             msg = f"Handoff failed: {structured_detail}"
         resolved_tid = tid or known_terminal_id
+        remote_cleaned = False
         if target_host and resolved_tid:
             # A failed/timed-out step leaves its terminal ALIVE server-side
             # (run_agent_step only tears down on success). Locally the
             # supervisor can delete_terminal it; remotely that terminal
             # occupies a max=1 worker pod's ONLY slot and the local delete
-            # cannot reach it — so clean it up here, best-effort.
-            if _cleanup_remote_terminal(base_url, resolved_tid):
+            # cannot reach it — so clean it up here, best-effort. Done before the
+            # message is built, because a successful cleanup means the worker WAS
+            # torn down, and the teardown sentence must say so.
+            remote_cleaned = _cleanup_remote_terminal(base_url, resolved_tid)
+        job_id_for_result: Optional[str] = None
+        if worker_outcome:
+            job_id_for_result = job_id
+            job_suffix = f" (job {job_id})" if job_id else ""
+            msg += job_suffix + _teardown_sentence(resolved_tid, torn_down=remote_cleaned)
+        if target_host and resolved_tid:
+            if remote_cleaned:
                 msg += f" (remote terminal {resolved_tid} on {target_host} cleaned up)"
             else:
+                # After the teardown sentence the period is already there; without it,
+                # the note starts with ". " as it always did.
+                lead = " " if worker_outcome else ". "
                 msg += (
-                    f". Cleanup of remote terminal {resolved_tid} failed — it still "
+                    f"{lead}Cleanup of remote terminal {resolved_tid} failed — it still "
                     f"occupies a slot on {target_host}; terminal {resolved_tid} lives "
                     f"on {target_host}; DELETE {base_url}/terminals/{resolved_tid} "
                     f"(or delete_terminal('{resolved_tid}', target_host='{target_host}'))."
                 )
         return HandoffResult(
-            success=False, message=msg, rule=rule, output=None, terminal_id=resolved_tid
+            success=False,
+            message=msg,
+            rule=rule,
+            output=None,
+            terminal_id=resolved_tid,
+            job_id=job_id_for_result,
+            pending=None,
         )
 
     if response_sink is not None:
@@ -1726,16 +1917,259 @@ async def _run_step_and_build_result(
 
     execution_time = time.time() - start_time
     placement = f" on node {target_host}" if target_host else ""
+    # A missing field (an older server) reads as not torn down: the conservative wording.
+    torn_down = data.get("torn_down") is True
+    # Suppressed when the worker was torn down. The early-terminal-id caller deletes its
+    # own terminal after this returns, so it adds the nudge itself if that delete fails.
+    nudge = "" if (torn_down or caller_deletes_terminal) else _get_cleanup_nudge()
     return HandoffResult(
         success=True,
-        message=f"Successfully handed off to {agent_profile} ({provider})"
-        f"{placement} in {execution_time:.2f}s" + _get_cleanup_nudge(),
+        # None for a provider "auto" claim: the provider that ran is in GET /terminals/<id>.
+        message=f"Successfully handed off to {agent_profile}"
+        + (f" ({provider})" if provider else "")
+        + f"{placement} in {execution_time:.2f}s"
+        + _teardown_or_keep_sentence(terminal_id, data, torn_down)
+        + nudge,
         output=output,
         terminal_id=terminal_id,
     )
 
 
+def _format_kept_until(value: Any) -> str:
+    """A keep-window end from the API (ISO 8601) as ``YYYY-MM-DD HH:MM UTC``."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _kept_sentence(terminal_id: Optional[str], kept_until: Any, note: Any) -> str:
+    """The sentence a KEPT worker gets in place of the #1203 teardown sentence (#1225)."""
+    sentence = f". Worker terminal {terminal_id} was kept until {_format_kept_until(kept_until)}."
+    if isinstance(note, str) and note:
+        sentence += f" {note}"
+    return sentence + (
+        f" Read its last answer with `cao agent result {terminal_id}`, "
+        "or open its pane to see what it did."
+    )
+
+
+def _teardown_or_keep_sentence(
+    terminal_id: Optional[str], data: Dict[str, Any], torn_down: bool
+) -> str:
+    """What happened to a handoff's worker: torn down, not torn down, or kept (#1225).
+
+    The #1203 teardown sentence, unchanged, on every path but one: a worker the
+    server KEPT (``kept_until`` set) says "kept until ..." in its place. A keep can
+    never hide a delete that happened -- ``torn_down`` wins if both were ever set.
+    A worker the setting did not keep (the cap, a busy session) gets the teardown
+    sentence and then the server's reason. With the setting off the server sends no
+    keep fields, so this is exactly the #1203 sentence.
+    """
+    note = data.get("keep_note")
+    note = note if isinstance(note, str) and note else ""
+    if data.get("kept_until") and not torn_down:
+        return _kept_sentence(terminal_id, data["kept_until"], note)
+    sentence = _teardown_sentence(terminal_id, torn_down)
+    if note:
+        sentence += f" {note}" if sentence else f". {note}"
+    return sentence
+
+
 # Implementation functions
+
+
+class _HandoffCreateUnresolved(Exception):
+    """The create ended without telling the caller whether a worker exists.
+
+    Raised when the bounded attempts all time out, or when an attempt that
+    follows a timeout gets an HTTP error or claim refusal other than a failed
+    original create (424). Other transport errors propagate unchanged.
+    In both cases an earlier attempt may have committed a worker under the same
+    key, so the caller looks its identity up before reporting the failure. The
+    original error is the ``__cause__``.
+    """
+
+
+class _HandoffCreateFailed(RuntimeError):
+    """A replay found the original create failed (HTTP 424), with its cause.
+
+    ``terminal_id`` names the failed terminal when cao-server retained its row
+    for a deferred provider cleanup, so the caller can report it for deletion
+    (issue #943).
+    """
+
+    def __init__(self, message: str, terminal_id: Optional[str] = None):
+        super().__init__(message)
+        self.terminal_id = terminal_id
+
+
+def _retained_terminal_id(response: Optional[requests.Response]) -> Optional[str]:
+    """Return the ``terminal_id`` a 424 names for a retained failed terminal."""
+    if response is None:
+        return None
+    try:
+        terminal_id = response.json().get("terminal_id")
+    except (AttributeError, ValueError):
+        return None
+    return terminal_id if isinstance(terminal_id, str) and terminal_id else None
+
+
+def _http_error_detail(exc: requests.exceptions.HTTPError) -> str:
+    """Return the ``detail`` cao-server sent with an error response, if any."""
+    if exc.response is None:
+        return str(exc)
+    try:
+        detail = exc.response.json().get("detail")
+    except (AttributeError, ValueError):
+        detail = None
+    return detail if isinstance(detail, str) and detail else str(exc)
+
+
+def _create_handoff_terminal(
+    agent_profile: str,
+    working_directory: Optional[str],
+    *,
+    engine: Optional[str],
+    model: Optional[str],
+    use_worktree: bool,
+    idempotency_key: str,
+    description: Optional[str] = None,
+    claim: Optional[EphemeralClaim] = None,
+    delegation_message: Optional[str] = None,
+    delegation_kind: Optional[str] = None,
+    response_sink: Optional[Callable[[requests.Response], None]] = None,
+) -> Tuple[str, str]:
+    """Synchronously create handoff's worker, retrying a client timeout.
+
+    Every attempt carries the SAME idempotency key and the full
+    ``synchronous_create_timeout`` budget (review on PR #773). Only a timeout is
+    retried. Whether or not the timed-out attempt reached cao-server, the next
+    one is safe: a replay is held server-side until the original
+    provider.initialize() settles, and an attempt that never arrived is simply
+    performed.
+
+    A replay of a create whose initialization FAILED comes back as HTTP 424
+    with the cause. That is the original failure, so it is raised with that
+    cause and never retried: retrying would start a second worker for a key
+    whose first one already failed. Any other HTTP error or claim refusal
+    after a timeout is not retried either; it raises
+    ``_HandoffCreateUnresolved`` so the caller can still look up a worker an
+    earlier attempt may have committed.
+    """
+    claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
+    saw_timeout = False
+    for attempt in range(1, _HANDOFF_CREATE_ATTEMPTS + 1):
+        try:
+            return _create_terminal(
+                agent_profile,
+                working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                create_timeout=synchronous_create_timeout(agent_profile),
+                idempotency_key=idempotency_key,
+                description=description,
+                delegation_message=delegation_message,
+                delegation_kind=delegation_kind,
+                response_sink=response_sink,
+                **claim_kwargs,
+            )
+        except requests.exceptions.Timeout as exc:
+            saw_timeout = True
+            if attempt == _HANDOFF_CREATE_ATTEMPTS:
+                raise _HandoffCreateUnresolved(str(exc)) from exc
+            logger.warning(
+                "handoff: create attempt %d/%d timed out; retrying with the same "
+                "idempotency key",
+                attempt,
+                _HANDOFF_CREATE_ATTEMPTS,
+            )
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 424:
+                raise _HandoffCreateFailed(
+                    _http_error_detail(exc), _retained_terminal_id(exc.response)
+                ) from exc
+            if saw_timeout:
+                raise _HandoffCreateUnresolved(str(exc)) from exc
+            raise
+        except _ClaimRefused as exc:
+            # With a claim, _create_terminal reports every 4xx/5xx as a refusal,
+            # so the 424 and other-error branches above never see it (review on
+            # PR #773). A 424 is the failed original, as without a claim: raise
+            # it and do not look anything up. After a timeout, any other refusal
+            # may hide a worker an earlier attempt committed: let the caller
+            # look it up. With nothing committed the caller re-raises this
+            # refusal, so its rule and message stay.
+            if saw_timeout and exc.status_code != 424:
+                raise _HandoffCreateUnresolved(str(exc)) from exc
+            raise
+    raise AssertionError("unreachable")  # the loop always returns or raises
+
+
+def _lookup_committed_handoff_terminal(
+    agent_profile: str,
+    working_directory: Optional[str],
+    *,
+    engine: Optional[str],
+    model: Optional[str],
+    use_worktree: bool,
+    idempotency_key: str,
+    description: Optional[str] = None,
+    claim: Optional[EphemeralClaim] = None,
+) -> Optional[str]:
+    """Return the terminal_id cao-server committed for this key, if any.
+
+    Used only after ``_create_handoff_terminal`` has exhausted its bounded
+    attempts (review on PR #773). Every one of those attempts may have been a
+    replay held behind a provider initialization that simply outlasted them
+    (a profile's ``provider_init_timeout`` is not capped by the retry
+    ceiling), in which case the worker exists and will finish starting, but
+    no response ever carried its id. This is the ``lookup_only`` form of the
+    same keyed request: it does not wait and cannot allocate, so it recovers
+    the identity of committed work without starting any. ``None`` means there
+    is nothing to recover (or the lookup itself failed), and the caller
+    reports the original timeout unchanged.
+    """
+    claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
+    try:
+        terminal_id, _provider = _create_terminal(
+            agent_profile,
+            working_directory,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
+            # A lookup answers without waiting for init, but it is still a
+            # create request to the server, so it carries the same derived
+            # budget as every other one (issue #710).
+            create_timeout=synchronous_create_timeout(agent_profile),
+            idempotency_key=idempotency_key,
+            lookup_only=True,
+            description=description,
+            **claim_kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001 -- best-effort recovery of an id
+        logger.info("handoff: no committed terminal recovered after create timeout: %s", exc)
+        return None
+    return terminal_id
+
+
+def _notify_terminal_id(on_terminal_id: Optional[Callable[[str], None]], terminal_id: str) -> None:
+    """Report a terminal_id to the caller's callback without letting it break the handoff."""
+    if on_terminal_id is None:
+        return
+    try:
+        on_terminal_id(terminal_id)
+    except Exception as exc:  # noqa: BLE001 -- a UI callback must never break the handoff
+        logger.warning(
+            "handoff: on_terminal_id callback failed for terminal %s: %s", terminal_id, exc
+        )
+
+
 async def _handoff_impl(
     agent_profile: str,
     message: str,
@@ -1944,7 +2378,12 @@ async def _handoff_impl(
             # session; caller_id/allowed_tools preserve #284 callback routing
             # and tool inheritance. Byte-for-byte the original single-seam
             # behavior (BR-8) -- this is what the MCP tool always takes.
-            shaped_message = _shape_handoff_message(provider, message)
+            # #1099 (provisional): a provider "auto" claim may run on any CLI in its set, so
+            # it always gets the blocking-handoff banner, which is correct for any of them.
+            auto = claim is not None and claim.provider_auto
+            shaped_message = _shape_handoff_message(
+                ProviderType.CODEX.value if auto else provider, message
+            )
             # Minted HERE, before the POST, so the key exists on the client even
             # if the response never arrives (issue #447). The server records the
             # result under it; client-side generation is what makes it available
@@ -1986,7 +2425,7 @@ async def _handoff_impl(
             result = await _run_step_and_build_result(
                 payload,
                 agent_profile,
-                provider,
+                None if auto else provider,
                 timeout,
                 start_time,
                 base_url=base_url,
@@ -2016,27 +2455,60 @@ async def _handoff_impl(
         # be a flat 150s (#634), which was below a successful Claude init at
         # 3T=180s, let alone Kimi's 300s or Antigravity's 370s.
         claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
-        terminal_id, provider = _create_terminal(
-            agent_profile,
-            working_directory,
-            engine=engine,
-            model=model,
-            use_worktree=use_worktree,
-            create_timeout=synchronous_create_timeout(agent_profile),
-            idempotency_key=idempotency_key,
-            description=description,
-            delegation_message=message,
-            delegation_kind="handoff",
-            response_sink=_decision_response_sink(notes),
-            **claim_kwargs,
-        )
-        if on_terminal_id is not None:
-            try:
-                on_terminal_id(terminal_id)
-            except Exception as exc:  # noqa: BLE001 -- a UI callback must never break the handoff
-                logger.warning(
-                    "handoff: on_terminal_id callback failed for terminal %s: %s", terminal_id, exc
-                )
+        # A key is synthesized here even when the caller passed none (true of
+        # every caller today -- see this function's idempotency_key docstring
+        # note): it is used ONLY as this create call's own retry-safety net
+        # below, never forwarded past this function, so it carries none of
+        # the cross-call submission-dedup risk that note describes.
+        create_key = idempotency_key or uuid.uuid4().hex
+        try:
+            terminal_id, provider = _create_handoff_terminal(
+                agent_profile,
+                working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                idempotency_key=create_key,
+                description=description,
+                delegation_message=message,
+                delegation_kind="handoff",
+                response_sink=_decision_response_sink(notes),
+                **claim_kwargs,
+            )
+        except _HandoffCreateUnresolved as unresolved:
+            # The create ended without an answer. That says nothing about
+            # whether a worker was committed, and readiness is a separate
+            # question from identity: recover the id if there is one, report it,
+            # and send NOTHING to a terminal that is not known to be ready.
+            terminal_id = _lookup_committed_handoff_terminal(
+                agent_profile,
+                working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                idempotency_key=create_key,
+                description=description,
+                **claim_kwargs,
+            )
+            if terminal_id is None:
+                # Nothing is committed for this key: report the error that ended
+                # the create (the last attempt's), as before this lookup.
+                raise unresolved.__cause__ or unresolved
+            _notify_terminal_id(on_terminal_id, terminal_id)
+            return HandoffResult(
+                success=False,
+                message=(
+                    f"Handoff failed: worker terminal {terminal_id} was created, but "
+                    f"the create call did not complete ({unresolved}), so no task was "
+                    "sent to it. It may still become ready; inspect or delete it using "
+                    "this terminal_id."
+                ),
+                output=None,
+                terminal_id=terminal_id,
+                job_id=None,
+                pending=None,
+            )
+        _notify_terminal_id(on_terminal_id, terminal_id)
 
         if not wait:
             # --no-wait: send the prompt and return immediately. The terminal
@@ -2090,7 +2562,12 @@ async def _handoff_impl(
         if provider == ProviderType.KIRO_CLI.value and engine is not None:
             payload["engine"] = engine
         result = await _run_step_and_build_result(
-            payload, agent_profile, provider, timeout, start_time
+            payload,
+            agent_profile,
+            provider,
+            timeout,
+            start_time,
+            caller_deletes_terminal=True,
         )
         if result.success:
             # Best-effort, mirroring run_agent_step's own teardown philosophy
@@ -2100,13 +2577,38 @@ async def _handoff_impl(
             # errored, or timed-out wait leaves the terminal alive on purpose,
             # so the operator can inspect/recover it via status/result/cancel,
             # which is the entire point of surfacing terminal_id early.
-            cleanup = _delete_terminal_impl(terminal_id, check_binding=False)
+            # keep_if_enabled: under terminal.keep_finished (#1225) the server keeps
+            # a child worker (one started from inside an agent's pane) instead of
+            # deleting it; a worker started from an operator shell has no caller and
+            # is deleted as before. A kept answer is a success that deleted nothing,
+            # so it never counts as torn down.
+            cleanup = _delete_terminal_impl(terminal_id, check_binding=False, keep_if_enabled=True)
+            kept = cleanup.get("kept") is True
+            torn_down = bool(cleanup.get("success")) and not kept
             if not cleanup.get("success"):
                 logger.warning(
                     "handoff: post-success teardown of terminal %s failed: %s",
                     terminal_id,
                     cleanup.get("message"),
                 )
+            # The step result said "not torn down" because the server was told
+            # teardown=False. Replace that with what this delete actually did: a
+            # teardown, a keep (#1225, "kept until ..."), or neither.
+            if kept:
+                replacement = _kept_sentence(
+                    terminal_id, cleanup.get("kept_until"), cleanup.get("keep_note")
+                )
+            else:
+                replacement = _teardown_sentence(terminal_id, torn_down=torn_down)
+                if cleanup.get("keep_note"):
+                    replacement += f" {cleanup['keep_note']}"
+            message = result.message.replace(
+                _teardown_sentence(terminal_id, torn_down=False), replacement
+            )
+            if not torn_down:
+                # The terminal is still there, so the cleanup nudge still applies.
+                message += _get_cleanup_nudge()
+            result.message = message
         if result.success:
             result.message = _append_decision_note(result.message, notes)
         return result
@@ -2116,8 +2618,20 @@ async def _handoff_impl(
             success=False,
             rule=exc.rule,
             message=str(exc),
-            terminal_id=terminal_id,
+            terminal_id=terminal_id or exc.terminal_id,
             output=None,
+            job_id=None,
+            pending=None,
+        )
+
+    except _HandoffCreateFailed as e:
+        # The original create failed. Its terminal is named only when its row
+        # was retained for a deferred provider cleanup (issue #943).
+        return HandoffResult(
+            success=False,
+            message=f"Handoff failed: {str(e)}",
+            output=None,
+            terminal_id=e.terminal_id,
             job_id=None,
             pending=None,
         )
@@ -2344,7 +2858,9 @@ def _assign_worker_provider(agent_profile: str, claim: Optional[EphemeralClaim])
     ``@``-leading tasks.
     """
     if claim is not None:
-        return claim.provider
+        # #1099 (provisional): a provider "auto" claim may run on the structured-prompt
+        # provider, where the suffix would become a prompt parameter, so it is dropped.
+        return ProviderType.KIRO_CLI.value if claim.provider_auto else claim.provider
     return _resolve_handoff_provider(agent_profile).provider
 
 
@@ -2362,6 +2878,7 @@ def _assign_impl(
     description: Optional[str] = None,
     *,
     delegation_message: Optional[str] = None,
+    expect_callback: bool = True,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -2441,7 +2958,12 @@ def _assign_impl(
         # agent assign`` shell), not on the cao-server side. The helper leaves
         # a kiro-cli ``@<prompt> [args]`` invocation untouched (issue #70) and
         # looks the worker's provider up only when the task leads with ``@``.
-        if ENABLE_SENDER_ID_INJECTION:
+        # An ephemeral claim pins the worker's provider, which the profile does not
+        # show, so a claimed worker is taken to be able to reply.
+        can_reply = (
+            _worker_can_send_message(agent_profile) if expect_callback and claim is None else True
+        )
+        if ENABLE_SENDER_ID_INJECTION and can_reply:
             worker_message = append_sender_suffix(
                 message,
                 ASSIGN_SUFFIX_TEMPLATE,
@@ -2469,6 +2991,8 @@ def _assign_impl(
             use_worktree=use_worktree,
             delegation_message=canonical_message,
             response_sink=_decision_response_sink(notes),
+            expect_callback=expect_callback,
+            worker_can_reply=can_reply,
             **claim_kwargs,
         )
 
@@ -2482,6 +3006,13 @@ def _assign_impl(
                     f"delivered once it is ready. "
                     f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
                     + _get_cleanup_nudge()
+                    + (
+                        " Note: this worker's profile has no cao-mcp-server, so it cannot "
+                        "call send_message; its last response will be auto-forwarded to you "
+                        "when it goes idle."
+                        if expect_callback and not can_reply
+                        else ""
+                    )
                 ),
                 notes,
             ),
@@ -2510,7 +3041,9 @@ def _assign_impl(
 
 
 # Implementation function for send_message
-def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
+def _send_message_impl(
+    receiver_id: Optional[str], message: str, expect_reply: bool = False
+) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
         own_terminal_id = _current_terminal_id()
@@ -2608,7 +3141,7 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
                 provider=lambda: _receiver_provider(receiver),
             )
 
-        return _send_to_inbox(receiver, message)
+        return _send_to_inbox(receiver, message, expect_reply=expect_reply)
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw
@@ -2625,7 +3158,11 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
 
 
 def _delete_terminal_impl(
-    terminal_id: str, target_host: Optional[str] = None, *, check_binding: bool = True
+    terminal_id: str,
+    target_host: Optional[str] = None,
+    *,
+    check_binding: bool = True,
+    keep_if_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Implementation of delete_terminal logic.
 
@@ -2642,6 +3179,15 @@ def _delete_terminal_impl(
     (see ``_target_binding_denial``). Internal callers that are tearing down a
     terminal they created in the same call pass ``False``; the tool and CLI
     paths keep the default.
+
+    ``keep_if_enabled`` (issue #1225 phase 1): sent ONLY by the agent-side callers,
+    the ``delete_terminal`` MCP tool and ``cao agent handoff``'s own post-success
+    teardown. While ``terminal.keep_finished`` is on, cao-server then keeps an idle
+    child instead of deleting it, and the result says ``kept`` and until when.
+    ``cao agent cancel --delete`` and every other operator path leave it False, so
+    they always delete at once. The flag is a convenience, not a security
+    boundary: it can only turn a delete into a keep, never the reverse. False sends
+    exactly the request this function sent before.
     """
     # Hoisted above the try because the HTTPError arm below interpolates it: if
     # it were assigned inside, a raise before that line would turn a reportable
@@ -2653,6 +3199,9 @@ def _delete_terminal_impl(
             denial = _target_binding_denial(terminal_id, base_url=base_url)
             if denial:
                 return {"success": False, "message": denial}
+        delete_kwargs: Dict[str, Any] = (
+            {"params": {"keep_if_enabled": "true"}} if keep_if_enabled else {}
+        )
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
             headers=_auth_headers_for(base_url) or None,
@@ -2660,6 +3209,7 @@ def _delete_terminal_impl(
             # hang for the full read timeout; a local delete keeps its single
             # scalar timeout so default-path behavior is unchanged.
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if target_host else _mcp_timeout(),
+            **delete_kwargs,
         )
         if response.status_code == 409:
             return {
@@ -2679,10 +3229,27 @@ def _delete_terminal_impl(
                     "delete_terminal after the Grok process exits."
                 ),
             }
-        return {
-            "success": True,
-            "message": f"Terminal {terminal_id}{location} deleted successfully",
-        }
+        keep_note = payload.get("keep_note")
+        keep_note = keep_note if isinstance(keep_note, str) and keep_note else None
+        if payload.get("kept") is True:
+            # Nothing was deleted: say so, and until when CAO keeps it (#1225).
+            kept_until = payload.get("kept_until")
+            message = (
+                f"Terminal {terminal_id}{location} was kept until "
+                f"{_format_kept_until(kept_until)}, not deleted."
+            )
+            return {
+                "success": True,
+                "kept": True,
+                "kept_until": kept_until,
+                "keep_note": keep_note,
+                "message": f"{message} {keep_note}" if keep_note else message,
+            }
+        message = f"Terminal {terminal_id}{location} deleted successfully"
+        if keep_note:
+            # Said only while keeping is on: why this one was deleted anyway.
+            return {"success": True, "message": f"{message}. {keep_note}", "keep_note": keep_note}
+        return {"success": True, "message": message}
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return {"success": False, "message": f"Terminal {terminal_id}{location} not found"}
@@ -2722,7 +3289,7 @@ def _status_impl(terminal_id: str) -> Dict[str, Any]:
             }
         response.raise_for_status()
         terminal = response.json()
-        return {
+        result = {
             "success": True,
             "terminal_id": terminal.get("id", terminal_id),
             "status": terminal.get("status"),
@@ -2730,6 +3297,10 @@ def _status_impl(terminal_id: str) -> Dict[str, Any]:
             "provider": terminal.get("provider"),
             "session_name": terminal.get("session_name"),
         }
+        if terminal.get("kept_until"):
+            # #1225: only for a kept child, so the output is unchanged otherwise.
+            result["kept_until"] = terminal["kept_until"]
+        return result
     except requests.HTTPError as exc:
         detail = (
             _extract_error_detail(exc.response, str(exc)) if exc.response is not None else str(exc)

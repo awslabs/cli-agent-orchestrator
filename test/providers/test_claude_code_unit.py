@@ -1440,6 +1440,44 @@ class TestClaudeCodeProviderMisc:
 
         assert "--resume" not in command
 
+    def test_build_claude_command_with_fresh_session_id(self):
+        """Issue #1082 (provisional): a fresh launch's CAO-generated session_id
+        maps to `claude --session-id <sid>`."""
+        provider = ClaudeCodeProvider(
+            "test123",
+            "test-session",
+            "window-0",
+            session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+        )
+        command = provider._build_claude_command()
+
+        assert "--session-id 11d55034-bb41-46ca-8686-59a9dbff16b5" in command
+
+    def test_build_claude_command_no_session_id_by_default(self):
+        """Mutation guard: without session_id the command must not carry
+        --session-id at all."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        command = provider._build_claude_command()
+
+        assert "--session-id" not in command
+
+    def test_build_claude_command_resume_wins_over_session_id(self):
+        """Issue #1082 AC: 'Given a resumed launch, then it still uses --resume,
+        as today.' The two ids are mutually exclusive on a single launch, but if
+        both were ever set together --resume must win and --session-id must be
+        absent."""
+        provider = ClaudeCodeProvider(
+            "test123",
+            "test-session",
+            "window-0",
+            resume_session_id="resume-sid",
+            session_id="fresh-sid",
+        )
+        command = provider._build_claude_command()
+
+        assert "--resume resume-sid" in command
+        assert "--session-id" not in command
+
     @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
         """Test building Claude command with system prompt."""
@@ -1867,6 +1905,122 @@ class TestClaudeCodeProviderClaudeConfig:
 
         assert "--effort" not in command
 
+    # A decided per-launch effort (#1068 C, #1083 ruling): the launch plan's effort wins over
+    # the profile's static claudeConfig.effort, giving exactly one --effort, and is never
+    # written back to the profile.
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_wins_over_claude_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = {"effort": "medium"}
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_claude_command()
+
+        assert command.count("--effort") == 1
+        assert "--effort high" in command
+        assert "--effort medium" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_no_per_launch_effort_falls_back_to_claude_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = {"effort": "medium"}
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort=None)
+        command = provider._build_claude_command()
+
+        assert command.count("--effort") == 1 and "--effort medium" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_is_emitted_when_claude_config_absent(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_claude_command()
+
+        assert command.count("--effort") == 1 and "--effort high" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_is_not_emitted_for_a_native_agent(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.native_agent = "my-claude-agent"
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_claude_command()
+
+        assert "--agent my-claude-agent" in command and "--effort" not in command
+
+    def test_a_per_launch_effort_is_emitted_with_no_cao_profile(self):
+        # No CAO profile exists: honors_effort is still True on this path (#201a §2.2).
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort="high")
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ):
+            command = provider._build_claude_command()
+
+        assert "--agent agent" in command
+        assert command.count("--effort") == 1 and "--effort high" in command
+
+    def test_a_per_launch_effort_and_a_fresh_session_id_both_apply(self):
+        # #1143's --session-id and #1083's per-launch --effort are independent
+        # flags on independent code paths; both must reach the command together.
+        provider = ClaudeCodeProvider(
+            "tid", "sess", "win", "agent", effort="high", session_id="fresh-sid"
+        )
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ):
+            command = provider._build_claude_command()
+
+        assert "--session-id fresh-sid" in command
+        assert command.count("--effort") == 1 and "--effort high" in command
+
+    def test_a_per_launch_effort_and_resume_both_apply(self):
+        # --resume (durable-orchestra recovery) and the per-launch --effort are
+        # independent too: resuming a prior conversation still honors a decided effort.
+        provider = ClaudeCodeProvider(
+            "tid", "sess", "win", "agent", effort="high", resume_session_id="resume-sid"
+        )
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ):
+            command = provider._build_claude_command()
+
+        assert "--resume resume-sid" in command
+        assert "--session-id" not in command
+        assert command.count("--effort") == 1 and "--effort high" in command
+
+    def test_no_per_launch_effort_with_no_cao_profile_emits_nothing(self):
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", effort=None)
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ):
+            command = provider._build_claude_command()
+
+        assert "--effort" not in command
+
 
 class TestClaudeCodeProviderPermissionMode:
 
@@ -1930,6 +2084,193 @@ class TestClaudeCodeProviderPermissionMode:
 
         assert "--disallowedTools" in command
         assert "Bash" in command
+
+
+# Claude Code's own agent-messaging and agent-spawning built-ins (always cut on a
+# restricted grant) and the shell companions now mapped to execute_bash.
+_AGENT_TOOLS_CUT = (
+    "SendMessage",
+    "ListAgents",
+    "SendFile",
+    "FetchInboxMessage",
+    "Workflow",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "RemoteTrigger",
+    "EnterWorktree",
+    "ExitWorktree",
+    "TeamCreate",
+    "TeamDelete",
+)
+_SHELL_COMPANIONS_CUT = ("TaskStop", "GetTask", "PowerShell")
+
+
+def _helper_profile(mock_load):
+    mock_profile = MagicMock()
+    mock_profile.model = None
+    mock_profile.system_prompt = None
+    mock_profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+    mock_profile.permissionMode = None
+    mock_load.return_value = mock_profile
+    return mock_profile
+
+
+def _blocked(command: str) -> list:
+    args = shlex.split(command.split("; ")[-1])
+    return [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
+
+
+class TestClaudeCodeBuiltinAgentToolsArgv:
+    """The launch argv cuts Claude Code's own agent tools on a restricted grant.
+
+    A live helper granted ``fs_read`` and ``@cao-mcp-server`` replied with
+    Claude Code's built-in ``SendMessage``, which no CAO terminal receives, so
+    its answer was lost. CAO's ``send_message`` must stay available.
+    """
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_helper_argv_cuts_each_new_tool(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-cut", "sess", "win", "agent", allowed_tools=["fs_read", "@cao-mcp-server"]
+        )
+        command = provider._build_claude_command()
+        blocked = _blocked(command)
+        for tool in _AGENT_TOOLS_CUT + _SHELL_COMPANIONS_CUT:
+            assert blocked.count(tool) == 1, tool
+        assert "Read" not in blocked
+        assert "LSP" not in blocked
+        assert [tool for tool in blocked if tool.startswith(("mcp__", "@"))] == []
+        # send_message is still on offer: the one MCP server is loaded and only
+        # it, and nothing names it in the deny list.
+        config = _extract_mcp_config(command)
+        assert set(config["mcpServers"]) == {"cao-mcp-server"}
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_developer_default_loses_only_the_agent_tools(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-dev",
+            "sess",
+            "win",
+            "agent",
+            allowed_tools=["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
+        )
+        command = provider._build_claude_command()
+        assert _blocked(command) == sorted(_AGENT_TOOLS_CUT)
+        _extract_mcp_config(command)
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_unrestricted_argv_has_no_disallowed_tools(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider("term-yolo", "sess", "win", "agent", allowed_tools=["*"])
+        command = provider._build_claude_command()
+        assert "--disallowedTools" not in command
+        _extract_mcp_config(command)
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_mcp_entries_are_skipped(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-mcp", "sess", "win", "agent", allowed_tools=["@cao-mcp-server", "@other"]
+        )
+        command = provider._build_claude_command()
+        blocked = _blocked(command)
+        assert "Bash" in blocked and "Read" in blocked and "SendMessage" in blocked
+        assert [tool for tool in blocked if tool.startswith(("mcp__", "@"))] == []
+        _extract_mcp_config(command)
+
+
+_EPHEMERAL_HELPER_CUT = (
+    "Agent",
+    "Task",
+    "Monitor",
+    "Skill",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
+_HELPER_ATOMS = ["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"]
+
+
+class TestClaudeCodeEphemeralHelperArgv:
+    """An ephemeral helper's argv cuts the seven, whatever its grant.
+
+    The flag is the provider manager's, from the launch's ephemeral binding; the
+    profile text never decides it.
+    """
+
+    @pytest.mark.parametrize(
+        "allowed",
+        [[atom, "@cao-mcp-server"] for atom in _HELPER_ATOMS]
+        + [_HELPER_ATOMS + ["@cao-mcp-server"]],
+    )
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_helper_argv_cuts_each_of_the_seven_once(self, mock_load, allowed):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-eph", "sess", "win", "agent", allowed_tools=allowed, ephemeral=True
+        )
+        command = provider._build_claude_command()
+        blocked = _blocked(command)
+        for tool in _EPHEMERAL_HELPER_CUT + _AGENT_TOOLS_CUT:
+            assert blocked.count(tool) == 1, tool
+        assert len(blocked) == len(set(blocked))
+        assert [tool for tool in blocked if tool.startswith(("mcp__", "@"))] == []
+        assert set(_extract_mcp_config(command)["mcpServers"]) == {"cao-mcp-server"}
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_an_all_atoms_helper_loses_exactly_the_two_lists(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-all",
+            "sess",
+            "win",
+            "agent",
+            allowed_tools=_HELPER_ATOMS + ["@cao-mcp-server"],
+            ephemeral=True,
+        )
+        command = provider._build_claude_command()
+        assert _blocked(command) == sorted(_AGENT_TOOLS_CUT + _EPHEMERAL_HELPER_CUT)
+        _extract_mcp_config(command)
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_the_same_grant_installed_keeps_the_seven_it_maps(self, mock_load):
+        _helper_profile(mock_load)
+        provider = ClaudeCodeProvider(
+            "term-inst", "sess", "win", "agent", allowed_tools=["execute_bash", "@cao-mcp-server"]
+        )
+        command = provider._build_claude_command()
+        blocked = _blocked(command)
+        for tool in _EPHEMERAL_HELPER_CUT:
+            assert tool not in blocked, tool
+        _extract_mcp_config(command)
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_profile_text_that_reads_like_a_helper_does_not_set_the_flag(self, mock_load):
+        from cli_agent_orchestrator.services.ephemeral_service import FENCE_SENTENCE
+
+        profile = _helper_profile(mock_load)
+        profile.name = "Ramones-log_triage-3f9a"
+        profile.description = "ephemeral helper"
+        profile.system_prompt = FENCE_SENTENCE + "\nTask."
+        provider = ClaudeCodeProvider(
+            "term-text", "sess", "win", "agent", allowed_tools=["execute_bash"]
+        )
+        blocked = _blocked(provider._build_claude_command())
+        for tool in ("Skill", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "Agent"):
+            assert tool not in blocked, tool
+
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
+    def test_installed_developer_default_and_star_are_unchanged(self, mock_load):
+        _helper_profile(mock_load)
+        developer = ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
+        dev = ClaudeCodeProvider("term-dv", "sess", "win", "agent", allowed_tools=developer)
+        assert _blocked(dev._build_claude_command()) == sorted(_AGENT_TOOLS_CUT)
+        star = ClaudeCodeProvider("term-st", "sess", "win", "agent", allowed_tools=["*"])
+        assert "--disallowedTools" not in star._build_claude_command()
 
 
 class TestClaudeCodeProviderYoloRootRegression:

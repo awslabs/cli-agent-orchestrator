@@ -133,6 +133,15 @@ ENUM_SUBSET_ALLOWLIST = {
         "TerminalStatus",
         "PROCESSING, UNKNOWN",
     ): "not-yet-settled pair: UNKNOWN is treated as still-starting, not as done",
+    # ---- input refusals the inbox keeps pending ----
+    # TerminalInputBlockedReason has four members. The two named are the refusals
+    # a later delivery can clear; PROVIDER_ERROR and INIT_FAILED are permanent, and
+    # a member added later is failed too until someone decides it is transient.
+    (
+        "cli_agent_orchestrator/services/inbox_service.py",
+        "TerminalInputBlockedReason",
+        "IDENTITY_PENDING, WAITING_USER_ANSWER",
+    ): "transient refusals (#896, #1074): a dialog closes, an identity check completes",
     # ---- workflow / run state ----
     # RunState has four members (RUNNING, COMPLETED, FAILED, CANCELLED). Each
     # subset below is the complement of RUNNING in some combination, which is

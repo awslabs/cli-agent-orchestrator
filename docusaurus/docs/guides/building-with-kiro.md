@@ -41,7 +41,11 @@ cao launch --agents code_supervisor --provider kiro_cli
 Kiro CLI **requires** an agent profile -- it cannot be launched without one. Always use `--agents <profile>`.
 :::
 
-CAO always passes `--trust-all-tools` to Kiro CLI so agents don't block on tool permission prompts. In `--yolo` mode, `--legacy-ui` is additionally forced to bypass Kiro's interactive consent dialog.
+CAO always passes `--trust-all-tools` to Kiro CLI so agents don't block on tool permission prompts. CAO never passes `--legacy-ui`: it can't be combined with the engine CAO selects, and on its own it drops Kiro to an engine that serves no MCP tools. On the v2 engine, if kiro-cli shows its one-time `--trust-all-tools` consent dialog at startup, CAO accepts it for that session only. On v3, CAO answers no dialog and refuses the launch instead.
+
+:::note Kiro v3 (preview)
+`cao launch ... --engine v3` runs Kiro's v3 engine. It is opt-in and still in preview: CAO checks the agent's limits before any task is typed, and refuses kiro-cli versions it hasn't verified. Kiro can also run ephemeral helpers, on v3 only. See [Kiro v3 (preview)](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/kiro-cli.md#kiro-v3-preview) and [Ephemeral helpers on v3](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/kiro-cli.md#ephemeral-helpers-on-v3).
+:::
 
 ## Dual UI Mode
 
@@ -81,6 +85,8 @@ cao config set agents.dirs.kiro_cli /path/to/my/agents
 # Via environment variable
 export CAO_AGENTS_DIR=/path/to/my/agents
 ```
+
+On the v3 engine, Kiro loads agents only from `~/.kiro/agents`, so a v3 launch with `CAO_AGENTS_DIR` set elsewhere is refused (`kiro_v3_agents_dir_unsupported`). Use the default directory for v3 agents.
 
 ## Skill Delivery
 

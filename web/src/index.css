@@ -1,6 +1,35 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+@config '../tailwind.config.js';
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+
+  /* Keep the v3 Preflight pointer cursor on buttons and gray placeholders. */
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-gray-400);
+  }
+}
 
 body {
   background: #0f0f14;
@@ -11,9 +40,13 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
 
-*:focus-visible {
-  outline: 2px solid #059669;
-  outline-offset: 2px;
+/* Tailwind CSS v4 puts utilities in a cascade layer. Keep this default in the
+   base layer so that focus and outline utilities still override it. */
+@layer base {
+  *:focus-visible {
+    outline: 2px solid #059669;
+    outline-offset: 2px;
+  }
 }
 
 /* Memory graph node drag (MemoryGraphView). Sigma v4 rewrites the container's

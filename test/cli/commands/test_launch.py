@@ -1,6 +1,7 @@
 """Tests for launch command."""
 
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1682,6 +1683,69 @@ def test_launch_gate_names_native_enforcement():
     assert "WARNING: this provider does not enforce" not in result.output
 
 
+_DOCS = Path(__file__).resolve().parents[3] / "docs" / "tool-restrictions.md"
+
+# The Blocked line `cao launch` prints for the developer default on Claude Code:
+# only Claude Code's own messaging and agent tools, which every restricted grant
+# loses. It used to read "(none)" while the argv still cut these.
+_DEVELOPER_BLOCKED = (
+    "  Blocked:  CronCreate, CronDelete, CronList, EnterWorktree, ExitWorktree, "
+    "FetchInboxMessage, ListAgents, RemoteTrigger, ScheduleWakeup, SendFile, "
+    "SendMessage, TeamCreate, TeamDelete, Workflow"
+)
+
+
+def _launch_with_tools(provider: str, tools):
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        args = ["--agents", "test-agent", "--provider", provider, "--headless"]
+        for tool in tools:
+            args += ["--allowed-tools", tool]
+        return runner.invoke(launch, args, input="y\n")
+
+
+def _blocked_line(output: str) -> str:
+    lines = [line for line in output.splitlines() if line.startswith("  Blocked:  ")]
+    assert len(lines) == 1, output
+    return lines[0]
+
+
+def _docs_blocked_line(allowed_line: str) -> str:
+    lines = _DOCS.read_text(encoding="utf-8").splitlines()
+    index = lines.index(allowed_line)
+    assert lines[index + 1].startswith("  Blocked:  ")
+    return lines[index + 1]
+
+
+def test_launch_gate_blocked_line_for_the_claude_code_developer_default():
+    tools = ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
+    result = _launch_with_tools("claude_code", tools)
+    assert result.exit_code == 0, result.output
+    assert _blocked_line(result.output) == _DEVELOPER_BLOCKED
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        ["@cao-mcp-server", "fs_read", "fs_list"],
+        ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
+    ],
+)
+def test_launch_gate_blocked_line_matches_the_docs_example(tools):
+    """docs/tool-restrictions.md shows these two prompts; they must stay true."""
+    result = _launch_with_tools("claude_code", tools)
+    assert result.exit_code == 0, result.output
+    assert _blocked_line(result.output) == _docs_blocked_line("  Allowed:  " + ", ".join(tools))
+
+
 def test_launch_gate_warns_when_the_provider_cannot_enforce():
     """A restricted profile on cursor_cli runs unrestricted; the gate must say so
     instead of showing a Blocked list that looks real."""
@@ -1880,6 +1944,35 @@ def test_launch_prints_a_refused_memory_sidecar():
     assert "memory_manager sidecar was NOT launched" in result.output
     assert "fs_list" in result.output
     assert "cao launch --memory" in result.output
+
+
+@pytest.mark.parametrize(
+    ("notes", "shown"),
+    [
+        (["kiro_v3_unverified_version_admitted: kiro-cli 2.36.0 is pending"], True),
+        (None, False),
+        ("not a list", False),
+    ],
+)
+def test_launch_prints_each_launch_note_as_a_warning(notes, shown):
+    """A Kiro v3 launch the operator opt-in admitted on a pending kiro-cli version
+    carries a note (#1167, provisional); the CLI says it where the operator is."""
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "0000a1b2",
+            "name": "test-terminal",
+            "launch_notes": notes,
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        result = runner.invoke(launch, ["--agents", "reviewer", "--headless", "--yolo"])
+    assert result.exit_code == 0, result.output
+    assert ("WARNING: kiro_v3_unverified_version_admitted" in result.output) is shown
+    assert "not a list" not in result.output
 
 
 def test_launch_is_quiet_about_a_scheduled_memory_sidecar():

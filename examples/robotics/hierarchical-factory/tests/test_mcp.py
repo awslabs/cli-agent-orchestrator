@@ -299,7 +299,8 @@ def test_the_live_view_serves_only_the_page_and_the_measured_state(controller):
         assert page.status_code == 200
         assert page.headers["content-type"].startswith("text/html")
         # Page-relative, so the page also works behind the path prefix of a port forward.
-        assert 'fetch("state"' in page.text and 'fetch("/state"' not in page.text
+        assert 'fetch("state?t=" + Date.now()' in page.text and 'fetch("/state' not in page.text
+        assert page.headers["cache-control"] == "no-store, max-age=0"
         # The robot pictures are inlined: one for each team color, and a blocked one.
         assert "__ROBOT_SPRITES__" not in page.text
         assert page.text.count("data:image/png;base64,") == 5
@@ -307,6 +308,9 @@ def test_the_live_view_serves_only_the_page_and_the_measured_state(controller):
         assert set(re.findall(r"https?://[^\s\"')]+", page.text)) == {"http://www.w3.org/2000/svg"}
         state = client.get(base + "/state")
         assert state.status_code == 200
+        assert state.headers["cache-control"] == "no-store, max-age=0"
+        # A cache-busting query is the same state, so the poll URL of the page works.
+        assert client.get(base + "/state?t=1").json()["run_id"] == world.run_id
         data = state.json()
         assert data["run_id"] == world.run_id
         assert data["commands"][0]["command_id"] == "form-1"
@@ -415,3 +419,31 @@ def test_extra_host_names_come_only_from_the_environment(monkeypatch):
     assert factory_mcp.allowed_hosts() is None
     monkeypatch.setenv("FACTORY_ALLOWED_HOSTS", " ide.example.com , ,other.example ")
     assert factory_mcp.allowed_hosts() == ["ide.example.com", "other.example"]
+
+
+def test_a_routine_longer_than_the_scene_limit_fails_the_schema(controller):
+    url, credentials, world, _ = controller
+    limit = world.scene.teams["east"].max_routine_moves
+
+    async def exercise():
+        async with controller_client(url, credentials["east"].get_secret_value()) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    "start_shipping",
+                    {
+                        "command_id": "ship",
+                        "units": 2,
+                        "batch": 2,
+                        "routine": ["spin"] * limit + ["run"],
+                    },
+                )
+
+    asyncio.run(exercise())
+
+
+def test_make_server_refuses_a_scene_that_disagrees_with_the_schema_limit(tmp_path):
+    data = json.loads((EXAMPLE / "factory.json").read_text())
+    data["teams"]["east"]["max_routine_moves"] += 1
+    world = World(Scene.model_validate(data), allow_motion=True)
+    with pytest.raises(ValueError, match="max_routine_moves"):
+        make_server(world, {}, tmp_path / "snapshot.json")

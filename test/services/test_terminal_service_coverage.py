@@ -10,7 +10,7 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
-pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+pytestmark = pytest.mark.usefixtures("isolated_memory_db", "kiro_agent_store_not_under_test")
 
 
 class TestCreateTerminalCleanup:
@@ -80,7 +80,7 @@ class TestCreateTerminalCleanup:
         mock_pm.cleanup_provider.assert_called_once_with("tid1")
         mock_tmux.kill_session.assert_called_once()
         assert lifecycle == ["kill", "cleanup"]
-        mock_db_delete.assert_called_once_with("tid1")
+        mock_db_delete.assert_called_once_with("tid1", end_reason="launch_failed")
 
     @pytest.mark.asyncio
     @patch(
@@ -150,7 +150,7 @@ class TestCreateTerminalCleanup:
             )
 
         mock_pm.cleanup_provider.assert_called_once()
-        mock_db_delete.assert_called_once_with("tid1")
+        mock_db_delete.assert_called_once_with("tid1", end_reason="launch_failed")
         mock_tmux.kill_session.assert_not_called()
         mock_tmux.kill_window.assert_called_once_with("cao-existing", "w1")
 
@@ -327,7 +327,7 @@ class TestCreateTerminalCleanup:
             )
 
         # DB rollback runs even though cleanup_provider raised first.
-        mock_db_delete.assert_called_once_with("tid1")
+        mock_db_delete.assert_called_once_with("tid1", end_reason="launch_failed")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
@@ -367,6 +367,7 @@ class TestCreateTerminalCleanup:
         mock_provider = MagicMock()
         # initialize is awaited on the success path; AsyncMock returns cleanly
         mock_provider.initialize = AsyncMock(return_value=True)
+        mock_provider.identity_verified = True  # a healthy Kiro launch (#1074)
         mock_pm.create_provider.return_value = mock_provider
         mock_log_dir.__truediv__ = MagicMock(return_value=MagicMock())
 
@@ -508,7 +509,7 @@ class TestDeleteTerminal:
 
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
 
-        result = delete_terminal("tid1")
+        result = delete_terminal("tid1", end_reason="deleted")
 
         assert result is True
         mock_tmux.stop_pipe_pane.assert_called_once_with("ses", "win")
@@ -528,7 +529,7 @@ class TestDeleteTerminal:
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
         mock_tmux.stop_pipe_pane.side_effect = Exception("pipe error")
 
-        result = delete_terminal("tid1")
+        result = delete_terminal("tid1", end_reason="deleted")
 
         assert result is True
         mock_tmux.kill_window.assert_called_once()
@@ -546,7 +547,7 @@ class TestDeleteTerminal:
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
         mock_tmux.kill_window.side_effect = Exception("kill error")
 
-        result = delete_terminal("tid1")
+        result = delete_terminal("tid1", end_reason="deleted")
 
         assert result is True
         mock_pm.cleanup_provider.assert_called_once()
@@ -563,7 +564,7 @@ class TestDeleteTerminal:
         mock_db_del.side_effect = Exception("DB error")
 
         with pytest.raises(Exception, match="DB error"):
-            delete_terminal("tid1")
+            delete_terminal("tid1", end_reason="deleted")
 
 
 class TestGetOutputContext:

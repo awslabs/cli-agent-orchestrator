@@ -69,7 +69,7 @@ export function RunList({ runs, selectedRunId, loading, error, onSelect }: RunLi
                   <span className="sr-only">{cue.sr}</span>
                 </span>
                 <span className="text-sm font-medium text-gray-200 truncate">{run.workflow_name}</span>
-                <span className="text-[10px] text-gray-500 bg-gray-800 px-1.5 py-0.5 rounded ml-auto">
+                <span className="text-[10px] text-gray-500 bg-gray-800 px-1.5 py-0.5 rounded-sm ml-auto">
                   {run.tier}
                 </span>
               </div>

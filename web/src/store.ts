@@ -23,6 +23,13 @@ interface Snackbar {
   message: string
 }
 
+// What starting a workflow run produced: the new run id, the plan id a human
+// must approve first (issue #583 approval gate), or null on any other error.
+export type StartRunOutcome =
+  | { runId: string }
+  | { approvalPlanId: string; message?: string }
+  | null
+
 interface Store {
   sessions: Session[]
   activeSession: string | null
@@ -74,6 +81,13 @@ interface Store {
   // poll cannot produce an unhandled rejection.
   fetchWorkflowRuns: () => Promise<string | null>
   selectWorkflowRun: (runId: string | null) => Promise<void>
+  refreshSelectedRun: () => Promise<void>
+  // Workflow run controls. Each surfaces a snackbar,
+  // refreshes the run list, and (re)selects the affected run so the detail pane
+  // follows it live. startWorkflowRun resolves to a StartRunOutcome.
+  startWorkflowRun: (nameOrPath: string, inputs: Record<string, unknown>, runId?: string) => Promise<StartRunOutcome>
+  cancelWorkflowRun: (runId: string) => Promise<void>
+  resumeWorkflowRun: (runId: string) => Promise<StartRunOutcome>
   setWorkflowEvents: (events: WorkflowEvent[], gaps: GapMarker[]) => void
   appendWorkflowEvent: (event: WorkflowEvent) => void
   addWorkflowGap: (gap: GapMarker) => void
@@ -255,6 +269,72 @@ export const useStore = create<Store>((set, get) => ({
       if (get().selectedRunId !== runId) return
       set({ selectedRun: null })
       get().showSnackbar({ type: 'error', message: e?.message || 'Failed to load run' })
+    }
+  },
+
+  // Re-read the selected run's inspection (state + steps) in place. Unlike
+  // selectWorkflowRun it neither blanks the pane nor resets the timeline, so the
+  // detail can poll it while a run is live. Same stale-response guard; a failed
+  // read keeps the last snapshot and the next poll retries.
+  refreshSelectedRun: async () => {
+    const runId = get().selectedRunId
+    if (!runId || !get().selectedRun) return
+    try {
+      const inspection = await api.inspectWorkflowRun(runId)
+      if (get().selectedRunId !== runId) return
+      set({ selectedRun: inspection })
+    } catch { /* keep the last snapshot */ }
+  },
+
+  startWorkflowRun: async (nameOrPath, inputs, runId) => {
+    try {
+      const ack = await api.submitWorkflowRun({
+        name_or_path: nameOrPath,
+        inputs,
+        run_id: runId || undefined,
+      })
+      get().showSnackbar({ type: 'success', message: `Started run ${ack.run_id}` })
+      await get().fetchWorkflowRuns()
+      await get().selectWorkflowRun(ack.run_id)
+      return { runId: ack.run_id }
+    } catch (e: any) {
+      // A first run of a new plan is refused until a human approves it. That is
+      // an expected step, not a failure, so hand the plan id back to the caller.
+      const planId = e?.detailMeta?.plan_id
+      if (e?.kind === 'approval_required' && typeof planId === 'string' && planId) {
+        return { approvalPlanId: planId, message: e?.detail }
+      }
+      get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to start workflow run' })
+      return null
+    }
+  },
+
+  cancelWorkflowRun: async (runId) => {
+    try {
+      await api.cancelWorkflowRun(runId)
+      get().showSnackbar({ type: 'success', message: `Cancelling ${runId}` })
+      await get().fetchWorkflowRuns()
+      if (get().selectedRunId === runId) await get().selectWorkflowRun(runId)
+    } catch (e: any) {
+      get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to cancel run' })
+    }
+  },
+
+  resumeWorkflowRun: async (runId) => {
+    try {
+      await api.resumeWorkflowRun(runId)
+      get().showSnackbar({ type: 'success', message: `Resuming ${runId}` })
+      await get().fetchWorkflowRuns()
+      if (get().selectedRunId === runId) await get().selectWorkflowRun(runId)
+      return { runId }
+    } catch (e: any) {
+      // Resume re-checks the plan, so an edited script comes back approval_required.
+      const planId = e?.detailMeta?.plan_id
+      if (e?.kind === 'approval_required' && typeof planId === 'string' && planId) {
+        return { approvalPlanId: planId, message: e?.detail }
+      }
+      get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to resume run' })
+      return null
     }
   },
 

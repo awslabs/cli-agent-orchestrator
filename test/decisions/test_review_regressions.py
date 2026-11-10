@@ -207,6 +207,7 @@ def test_policy_rejection_set_matches_all_error_subclasses():
     assert POLICY_REJECTION_REASONS == frozenset(
         {
             "above_ceiling",
+            "below_floor",
             "explicit_unmapped",
             "provider_not_allowed",
             "model_override_not_allowed",

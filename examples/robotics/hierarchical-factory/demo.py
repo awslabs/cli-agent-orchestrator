@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 
 import robot_model
 import yaml
-from factory_mcp import allowed_hosts, controller_client, make_server
+from factory_mcp import allowed_hosts, check_scene_matches_schema, controller_client, make_server
 from fastmcp.server import create_proxy
 from recorder import Recorder, RecordingError, ensure_empty_directory
 from simulation import Scene, World
@@ -118,6 +118,7 @@ def write_private(path: Path, value: dict) -> None:
 
 def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dict:
     scene = Scene.model_validate_json(scene_file.read_text(encoding="utf-8"))
+    check_scene_matches_schema(scene)
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
     if provider not in CAO_PROVIDERS:
@@ -277,6 +278,8 @@ def _hang_up(signum, frame) -> None:
 def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> None:
     manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     scene = Scene.model_validate_json((run_dir / "scene.json").read_text(encoding="utf-8"))
+    # Before started.json: a scene that disagrees with the schema must not consume the run.
+    check_scene_matches_schema(scene)
     tokens = {}
     for actor, metadata in manifest["actors"].items():
         credentials = json.loads(

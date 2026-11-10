@@ -39,6 +39,7 @@ from typing import Optional
 
 from cli_agent_orchestrator.clients.database import _migrate_workflow_plan_approval
 from cli_agent_orchestrator.constants import DATABASE_FILE
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,7 @@ def _connect() -> sqlite3.Connection:
     hot path.
     """
     _migrate_workflow_plan_approval()
+    # The caller owns the connection and closes it (closing_transaction).
     return sqlite3.connect(str(DATABASE_FILE))
 
 
@@ -82,7 +84,7 @@ def grant(plan_id: str, approved_by: str) -> None:
     errors nor overwrites the original ``approved_at`` / ``approved_by``. Harmless to repeat, impossible to
     rewrite.
     """
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO workflow_plan_approval (plan_id, approved_at, approved_by) "
             "VALUES (?, ?, ?)",
@@ -99,7 +101,7 @@ UNKNOWN = "unknown"
 def approval_state(plan_id: str) -> str:
     """Return APPROVED, ABSENT, or UNKNOWN when the database cannot be read."""
     try:
-        with _connect() as conn:
+        with closing_transaction(_connect()) as conn:
             row = conn.execute(
                 "SELECT 1 FROM workflow_plan_approval WHERE plan_id = ?", (plan_id,)
             ).fetchone()
@@ -122,7 +124,7 @@ def get_approval(plan_id: str) -> Optional[PlanApproval]:
     ``approval-gate`` routes on :func:`approval_state`.
     """
     try:
-        with _connect() as conn:
+        with closing_transaction(_connect()) as conn:
             row = conn.execute(
                 "SELECT plan_id, approved_at, approved_by FROM workflow_plan_approval WHERE plan_id = ?",
                 (plan_id,),

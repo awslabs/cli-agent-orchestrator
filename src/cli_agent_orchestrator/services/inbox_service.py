@@ -8,9 +8,10 @@ import functools
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from itertools import groupby
-from typing import Callable, Dict, Iterable, Optional, Set
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -19,6 +20,7 @@ from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
+    mark_message_edges_delivered,
     update_message_status,
 )
 from cli_agent_orchestrator.constants import (
@@ -29,7 +31,7 @@ from cli_agent_orchestrator.constants import (
     INBOX_SUBMIT_MAX_RESUBMITS,
     INBOX_SWEEP_FANOUT,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     TerminalInputBlockedError,
@@ -62,6 +64,13 @@ _SUBMIT_STARTED_STATUSES = {
 }
 
 
+def _short_reason(exc: Exception) -> str:
+    """One line naming a delivery failure, for the caller's notice."""
+    text = " ".join(str(exc).split())
+    reason = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    return reason if len(reason) <= 200 else reason[:197] + "..."
+
+
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle."""
 
@@ -78,6 +87,9 @@ class InboxService:
         # reaped — terminal ids are bounded by session lifecycle.
         self._delivery_locks_guard = threading.Lock()
         self._delivery_locks: Dict[str, threading.Lock] = {}
+        # Created on first use by deliver_pending_in_background.
+        self._background_pool_guard = threading.Lock()
+        self._background_pool: Optional[ThreadPoolExecutor] = None
 
     def _delivery_lock(self, terminal_id: str) -> threading.Lock:
         with self._delivery_locks_guard:
@@ -297,6 +309,15 @@ class InboxService:
                 # The paste is in the pane: the immediate-delivery caller may
                 # answer now. Everything below is confirmation and recovery.
                 after_dispatch()
+                # Delegation edges opened by this batch are armed only after the
+                # submit confirmation has run. An edge armed on the paste alone
+                # could be evaluated while the receiver's screen still holds
+                # the previous answer, before it shows the new turn. They are armed even
+                # when the confirmation gives up, because pickup can lag
+                # delivery by more than that wait. The evaluator's own check
+                # that the receiver started on its last input keeps an
+                # unpicked delivery from forwarding the previous answer, and
+                # its pickup timeout tells the caller if it never starts.
                 if INBOX_SUBMIT_CONFIRMATION and not eager:
                     if get_backend().supports_event_inbox():
                         # Event-inbox backends (herdr) push delivery synchronously
@@ -335,6 +356,7 @@ class InboxService:
                             registry=registry,
                             sender_id=sender_id,
                         )
+                self._arm_message_edges(terminal_id, batch)
             except TerminalNotFoundError as e:
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                 # for this window). Treat as transient: reset to PENDING so the
@@ -359,11 +381,18 @@ class InboxService:
                 # on herdr, status_monitor.get_status() shells out to the herdr CLI
                 # and returns UNKNOWN on any error, which would misclassify a
                 # provably-transient dialog refusal as FAILED and strand it anyway.
-                if e.reason == TerminalInputBlockedReason.WAITING_USER_ANSWER:
+                #
+                # A Kiro terminal this server is still initializing has not passed
+                # its identity check yet (#1074); that is transient too, and the
+                # reconcile sweep delivers once the check has been recorded.
+                if e.reason in (
+                    TerminalInputBlockedReason.WAITING_USER_ANSWER,
+                    TerminalInputBlockedReason.IDENTITY_PENDING,
+                ):
                     for message in batch:
                         update_message_status(message.id, MessageStatus.PENDING)
                     logger.warning(
-                        f"Terminal {terminal_id} is waiting on a user answer; leaving "
+                        f"Terminal {terminal_id} cannot take input yet; leaving "
                         f"{len(batch)} message(s) pending for retry: {e}"
                     )
                 else:
@@ -373,10 +402,120 @@ class InboxService:
                             f"message {message.id}: {e}"
                         )
                         update_message_status(message.id, MessageStatus.FAILED)
+                    self._close_message_edges(
+                        terminal_id,
+                        batch,
+                        "the terminal refused input" + (f" ({e.reason.value})" if e.reason else ""),
+                        registry,
+                    )
             except Exception as e:
                 for message in batch:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
+                self._close_message_edges(terminal_id, batch, _short_reason(e), registry)
+
+    def deliver_pending_in_background(
+        self, terminal_id: str, registry: PluginRegistry | None = None
+    ) -> "Future[None]":
+        """Queue ``deliver_pending`` for ``terminal_id`` on a shared pool and return at once.
+
+        For a caller that has already stored the message and must not wait out
+        the submit confirmation, which holds an idle receiver for
+        INBOX_SUBMIT_CONFIRM_TIMEOUT per attempt when it does not start. This is
+        the split the inbox POST endpoint makes: the message is stored, so the
+        caller's answer is already true, and the delivery and its confirmation
+        carry on by themselves. ``registry`` is passed through, so
+        PostSendMessageEvent fires as it does for the POST. A failure is logged,
+        never raised.
+
+        The pool has INBOX_SWEEP_FANOUT workers, the bound the sweeps fan out
+        over, so a burst (a session teardown with many waiting callers) cannot
+        start a thread per message. Deliveries to one receiver still run one at
+        a time under its lock, so a burst to one busy receiver can hold every
+        worker and delay deliveries to others until it drains.
+
+        Shutdown: the pool's workers are joined at interpreter exit, so exit
+        waits for queued and running deliveries, each up to a full submit
+        confirmation. A process killed between a message being marked
+        DELIVERED and its paste leaves it DELIVERED but never typed; the inbox
+        POST path has the same window.
+
+        Returns the delivery's future, so a test can wait on it.
+
+        Thread Safety:
+            Safe from any thread.
+        """
+
+        def deliver() -> None:
+            try:
+                self.deliver_pending(terminal_id, registry=registry)
+            except Exception as e:  # noqa: BLE001 - nobody waits on this future
+                logger.warning(f"Background delivery to {terminal_id} failed: {e}")
+
+        with self._background_pool_guard:
+            if self._background_pool is None:
+                self._background_pool = ThreadPoolExecutor(
+                    max_workers=INBOX_SWEEP_FANOUT, thread_name_prefix="cao-deliver"
+                )
+            pool = self._background_pool
+        return pool.submit(deliver)
+
+    @staticmethod
+    def _close_message_edges(
+        terminal_id: str,
+        batch: List[InboxMessage],
+        reason: str,
+        registry: PluginRegistry | None,
+    ) -> None:
+        """Close the delegation edges of a batch whose delivery failed, telling each caller.
+
+        See ``delegation_callback_service.handle_delivery_failed``. Imported
+        here because that module imports this one. Best-effort, like arming: a
+        failure must not change the batch's FAILED status.
+        """
+        try:
+            from cli_agent_orchestrator.services import delegation_callback_service
+
+            delegation_callback_service.handle_delivery_failed(
+                terminal_id, [m.id for m in batch], reason, registry
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Could not close delegation edges for {terminal_id}: {exc}")
+
+    @staticmethod
+    def _arm_message_edges(terminal_id: str, batch: List[InboxMessage]) -> None:
+        """Arm the send_message delegation edges opened by ``batch``.
+
+        Arming is bookkeeping. A failure here must not reach the delivery's
+        exception handlers, which would mark a delivered batch as FAILED.
+        """
+        try:
+            mark_message_edges_delivered([m.id for m in batch])
+        except Exception as arm_exc:  # noqa: BLE001
+            logger.warning(f"Could not arm delegation edges for {terminal_id}: {arm_exc}")
+
+    @contextmanager
+    def hold_delivery_if_idle(self, terminal_id: str) -> Iterator[bool]:
+        """Hold the terminal's delivery lock if no delivery holds it; yield whether held.
+
+        A delivery marks its messages DELIVERED before it types them, and the
+        receiver's status stays at its latched IDLE or COMPLETED until the new
+        turn shows. A reader that must not mistake that window for a finished
+        turn (the delegation callback) holds this while it decides. It never
+        waits: a delivery in flight yields False, and the caller retries on a
+        later status event or sweep.
+
+        Thread Safety:
+            Safe from any thread. Must not be held while delivering to the same
+            terminal: the lock is not reentrant.
+        """
+        lock = self._delivery_lock(terminal_id)
+        held = lock.acquire(blocking=False)
+        try:
+            yield held
+        finally:
+            if held:
+                lock.release()
 
     def _wait_for_pickup(
         self,

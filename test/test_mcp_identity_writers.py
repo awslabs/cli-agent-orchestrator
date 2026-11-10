@@ -103,6 +103,12 @@ EXPORTS_REAL_ID = (
     "forwarded CAO_TERMINAL_ID cannot win; not an MCP server entry"
 )
 
+READS_ANOTHER_PROCESS = (
+    "reads the key out of ANOTHER process's environment (psutil) to decide "
+    "whether that process belongs to the terminal being cleaned up; the value "
+    "is compared and never copied into an env handed to a child process"
+)
+
 RESOLVES_COMMAND_ONLY = (
     "resolves the bundled cao-mcp-server command/args and never touches `env`; "
     "only the caller knows which terminal it is launching for, so forwarding is "
@@ -153,6 +159,12 @@ ALLOWED: Dict[str, str] = {
         "additionally names the key in Codex's `env_vars` inheritance list, "
         "which requests the REAL parent value and can hold no foreign one"
     ),
+    "providers/kiro_launch_home.py::_cao_mcp_entry": (
+        "builds the ephemeral Kiro helper's one cao-mcp-server entry from "
+        "constants, so no profile-declared env reaches it, and writes the "
+        "launch's own terminal id unconditionally (even an empty one, which "
+        "keeps the server a BOUND caller; the forwarder would omit it)"
+    ),
     "providers/kimi_cli.py::_build_kimi_code_command": (
         "exports the REAL id on the launch line (`env CAO_TERMINAL_ID=<self>`) "
         "for Kimi Code's children to inherit; the per-server override lives in "
@@ -176,6 +188,13 @@ ALLOWED: Dict[str, str] = {
     "security/mcp_tool_gate.py::caller_is_bound": READS_OWN_IDENTITY,
     "services/vault/reader.py::_resolve_injection_policy": READS_OWN_IDENTITY,
     "utils/orchestration.py::_current_terminal_id": READS_OWN_IDENTITY,
+    # -- reads of another process's identity -------------------------------
+    "utils/private_home.py::<module>": (
+        "defines TERMINAL_ID_ENV, a second module-level spelling of the key used "
+        "only by inspect_home_process below; MODULE_LEVEL_ALIASES makes every "
+        "use of that name, in any module, an identity occurrence"
+    ),
+    "utils/private_home.py::inspect_home_process": READS_ANOTHER_PROCESS,
     "utils/orchestration.py::_local_claim_refusal": READS_OWN_IDENTITY,
     "utils/orchestration.py::_remote_ephemeral_refusal": READS_OWN_IDENTITY,
     "utils/orchestration.py::_send_direct_input": READS_OWN_IDENTITY,
@@ -204,6 +223,7 @@ ALLOWED_OCCURRENCES: Dict[str, int] = {
     "providers/antigravity_cli.py::_register_mcp_servers": 2,
     "providers/codex.py::_build_codex_command": 2,
     "providers/kimi_cli.py::_build_kimi_code_command": 2,
+    "providers/kiro_launch_home.py::_cao_mcp_entry": 1,
     "providers/minimax_code.py::_serialize_server": 0,
     "security/mcp_tool_gate.py::caller_is_bound": 1,
     "services/vault/reader.py::_resolve_injection_policy": 1,
@@ -215,6 +235,8 @@ ALLOWED_OCCURRENCES: Dict[str, int] = {
     "utils/orchestration.py::_local_claim_refusal": 1,
     "utils/orchestration.py::_remote_ephemeral_refusal": 1,
     "utils/orchestration.py::_send_direct_input": 1,
+    "utils/private_home.py::<module>": 2,
+    "utils/private_home.py::inspect_home_process": 1,
 }
 
 #: Sites that MUST be found, so a broken walker cannot pass vacuously: one of
@@ -234,6 +256,7 @@ SENTINELS = {
     "providers/kimi_cli.py::_build_kimi_code_command",
     "providers/kimi_cli.py::_build_kimi_command",
     "providers/kimi_runtime_home.py::merge_mcp_servers",
+    "providers/kiro_launch_home.py::_cao_mcp_entry",
     "providers/minimax_code.py::_serialize_server",
     "providers/minimax_code.py::_write_plugin",
     "providers/omp.py::_write_extension_root",
@@ -242,6 +265,7 @@ SENTINELS = {
     "utils/mcp_resolution.py::forward_terminal_identity",
     "utils/opencode_config.py::translate_mcp_server_config",
     "utils/orchestration.py::_current_terminal_id",
+    "utils/private_home.py::inspect_home_process",
 }
 
 
@@ -254,19 +278,60 @@ def _callee(call: ast.Call) -> str:
     return ""
 
 
+def _module_level_aliases(tree: ast.Module) -> Set[str]:
+    """Names a module binds, at top level, to the identity key string itself.
+
+    ``TERMINAL_ID_ENV = "CAO_TERMINAL_ID"`` (``utils/private_home.py``, merged
+    from main) is a second constant for the key. The string is an occurrence in
+    ``<module>``, but every later ``env[TERMINAL_ID_ENV] = x`` spells neither
+    ``IDENTITY_NAMES`` entry, so classifying that ``<module>`` site in ``ALLOWED``
+    would otherwise open a blind alias. Collected for the whole package (see
+    ``MODULE_LEVEL_ALIASES``) so importing the name elsewhere is seen too.
+    """
+    aliases: Set[str] = set()
+    for node in tree.body:
+        targets: List[ast.expr] = []
+        value: Optional[ast.expr] = None
+        if isinstance(node, ast.Assign):
+            targets, value = list(node.targets), node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        if (
+            isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+            and value.value in IDENTITY_NAMES
+        ):
+            aliases.update(t.id for t in targets if isinstance(t, ast.Name))
+    return aliases
+
+
+def _package_aliases() -> Set[str]:
+    found: Set[str] = set()
+    for path in sorted(SRC.rglob("*.py")):
+        found |= _module_level_aliases(ast.parse(path.read_text(encoding="utf-8")))
+    return found
+
+
+#: Every module-level constant in the package that holds the key string. A use
+#: of one of these names counts as an identity occurrence in EVERY module.
+MODULE_LEVEL_ALIASES = _package_aliases()
+
+
 def _local_identity_names(tree: ast.Module) -> Set[str]:
-    """``IDENTITY_NAMES`` plus any local alias an import gave one of them.
+    """``IDENTITY_NAMES`` plus every alias a constant or an import gave one.
 
     ``from ...mcp_resolution import CAO_TERMINAL_ID_ENV as TERMINAL_KEY`` leaves
     the recognisable name only on the import statement; the writes spell
     ``TERMINAL_KEY``. Resolving the alias is what keeps "rename the constant"
-    from being an escape hatch.
+    from being an escape hatch. The same goes for a module-level constant bound
+    to the key string, in this module or anywhere in the package.
     """
-    names = set(IDENTITY_NAMES)
+    known = set(IDENTITY_NAMES) | MODULE_LEVEL_ALIASES | _module_level_aliases(tree)
+    names = set(known)
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
-                if alias.asname and alias.name.split(".")[-1] in IDENTITY_NAMES:
+                if alias.asname and alias.name.split(".")[-1] in known:
                     names.add(alias.asname)
     return names
 
@@ -481,6 +546,22 @@ MISSED_SHAPES: List[Tuple[str, str, str]] = [
         "variable-held key",
         "snippet.py::f",
         "def f(env, x):\n    key = 'CAO_TERMINAL_ID'\n    env[key] = x\n",
+    ),
+    (
+        "module-level constant holding the key (private_home's shape, merged from main)",
+        "snippet.py::f",
+        "KEY = 'CAO_TERMINAL_ID'\n\n\ndef f(env, x):\n    env[KEY] = x\n",
+    ),
+    (
+        "annotated module-level constant holding the key",
+        "snippet.py::f",
+        "KEY: str = 'CAO_TERMINAL_ID'\n\n\ndef f(env, x):\n    env[KEY] = x\n",
+    ),
+    (
+        "a package-wide alias imported from the module that defines it",
+        "snippet.py::f",
+        "from cli_agent_orchestrator.utils.private_home import TERMINAL_ID_ENV as K\n\n\n"
+        "def f(env, x):\n    env[K] = x\n",
     ),
     (
         "double-star unpack of a dict literal",

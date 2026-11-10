@@ -80,6 +80,14 @@ class TmuxBackend(TerminalBackend):
         except Exception as e:
             raise TerminalBackendError(f"Failed to create session '{session_name}': {e}") from e
 
+    def restore_session_env(self, session_name: str, key: str, launch_value: str) -> None:
+        try:
+            self._client.restore_session_env(session_name, key, launch_value)
+        except Exception as e:
+            raise TerminalBackendError(
+                f"Failed to restore {key} in session '{session_name}': {e}"
+            ) from e
+
     def session_exists(self, session_name: str) -> bool:
         return self._client.session_exists(session_name)
 

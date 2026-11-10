@@ -55,6 +55,7 @@
       "input": "middle_east",
       "output": "dock",
       "max_batch": 4,
+      "max_routine_moves": 6,
       "run_to": [3.3, 0],
       "run_speed_m_s": 1.6,
       "turn_deg_s": 90,

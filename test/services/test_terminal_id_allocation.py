@@ -56,7 +56,7 @@ def _seed_stale_pending_message(receiver_id: str, message: str = "stale") -> Non
             )
         )
         db.commit()
-    assert db_delete_terminal(receiver_id) is True
+    assert db_delete_terminal(receiver_id, end_reason="deleted") is True
 
 
 @pytest.mark.usefixtures("isolated_memory_db")
@@ -80,7 +80,7 @@ class TestTerminalIdInUse:
             idempotency_key="key-1",
             request_fingerprint="fp-1",
         )
-        db_delete_terminal("gone1234")
+        db_delete_terminal("gone1234", end_reason="deleted")
 
         assert database.terminal_id_in_use("gone1234") is True
 
@@ -119,7 +119,9 @@ class TestAllocateTerminalId:
         assert mock_generate.call_count == terminal_service._TERMINAL_ID_ALLOCATION_ATTEMPTS
 
 
-@pytest.mark.usefixtures("isolated_memory_db")
+# ``kiro_cli`` is a stand-in here: no agent file is installed for ``developer``,
+# and the provider double reports a passed identity check (#1074).
+@pytest.mark.usefixtures("isolated_memory_db", "kiro_agent_store_not_under_test")
 class TestCreateTerminalAvoidsReissuedIds:
     """The acceptance scenario end to end: a queued message must not follow the id."""
 
@@ -156,6 +158,7 @@ class TestCreateTerminalAvoidsReissuedIds:
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         provider = AsyncMock()
         provider.initialize.return_value = True
+        provider.identity_verified = True
         mock_provider_manager.create_provider.return_value = provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 

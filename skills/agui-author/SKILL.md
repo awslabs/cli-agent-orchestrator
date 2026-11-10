@@ -2,16 +2,19 @@
 name: agui-author
 description: Author live dashboard UI from an agent via the `emit_ui` MCP tool. Emit
   one of six allow-listed components (approval_card, choice_prompt, diff_summary,
-  progress, metric, agent_card) with JSON props and it renders in any AG-UI client
-  watching the fleet. Use when you want the operator to see a decision, a diff, or a
-  status readout instead of scrolling terminal text. Arbitrary HTML/markup is refused.
+  progress, metric, agent_card) with JSON props and it renders in any dashboard
+  that handles CAO's `cao.generative_ui` event. Use when you want the operator to
+  see a decision, a diff, or a status readout instead of scrolling terminal text.
+  Arbitrary HTML/markup is refused.
 ---
 
 # Authoring generative UI over AG-UI
 
-CAO exposes an **AG-UI** stream (`GET /agui/v1/stream`) that any dashboard —
-CopilotKit, the AG-UI Dojo, or a plain `EventSource` — renders
-without CAO-specific code. As an agent you can push a **declarative UI intent**
+CAO exposes an **AG-UI** 1.0 stream (`GET`/`POST /agui/v1/stream`) that any AG-UI client —
+CopilotKit, the AG-UI Dojo, or a plain `EventSource` — can consume. Your UI
+intents ride on it as AG-UI `CUSTOM` events named `cao.generative_ui`, so a
+dashboard renders them only if it handles that name (the CAO examples under
+`examples/ag-ui/` do). As an agent you can push a **declarative UI intent**
 onto that stream with the `emit_ui` MCP tool. The operator sees a rendered card,
 not raw text — and because every provider's intents render uniformly, they can't
 tell (and don't need to) which CLI agent produced which card.
@@ -156,7 +159,8 @@ curl -sX POST http://localhost:9889/agui/v1/emit_ui \
   -d '{"component":"progress","props":{"label":"demo","value":0.5}}'
 ```
 
-A `GENERATIVE_UI` frame with your component appears on the stream; an off-list
+A `data:` frame with `"type":"CUSTOM"` and `"name":"cao.generative_ui"` appears
+on the stream, carrying your component and props in `value`; an off-list
 component is refused with HTTP 400.
 
 ## See also

@@ -28,12 +28,15 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from cli_agent_orchestrator.clients.database import upsert_handoff_result
-from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
+from cli_agent_orchestrator.models.kiro_engine import (
+    KiroEngine,
+    canonical_kiro_engine,
+    parse_kiro_engine,
+)
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services import frozen_run_memory, launch_guard, terminal_service
 from cli_agent_orchestrator.services.provider_error_classifier import (
     classify_provider_error,
@@ -106,10 +109,6 @@ async def _validate_reused_terminal(
 
     explicit_engine = parse_kiro_engine(requested_engine)
     assert explicit_engine is not None
-    if explicit_engine == KiroEngine.KAS:
-        # KAS remains unavailable regardless of which engine the terminal
-        # persisted; use the same structured Phase 0 guard as terminal creation.
-        raise KiroPhase0KASError(profile_has_v2_policy=False)
 
     persisted_engine = parse_kiro_engine(metadata.get("engine"))
     if persisted_engine is None:
@@ -459,6 +458,7 @@ async def run_agent_step(
     launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
+    keep_on_success: Optional[Callable[[str], bool]] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -575,6 +575,15 @@ async def run_agent_step(
             ``terminal_service.create_terminal``'s own docstring for the
             resolution/teardown mechanics. Ignored when reusing a terminal.
             Default False = behavior unchanged.
+        keep_on_success: Optional keep decision for the SUCCESS teardown only
+            (issue #1225 phase 1). Called off the loop with the terminal id once
+            the step has succeeded and its result is persisted; ``True`` means the
+            terminal was kept, so neither the exit command nor the delete runs.
+            Every other teardown in this function (cancellation, extraction
+            failure, provider error) ignores it, and so do the paths that leave
+            the terminal alive on purpose. A hook that raises is logged and read
+            as ``False``. Default None = behavior unchanged; only the run-step
+            route passes one, for a handoff.
         job_id: Optional durable-result key (issue #447). When given, the
             extracted result is persisted via ``upsert_handoff_result`` BETWEEN
             extraction and teardown — before the terminal that carries the only
@@ -600,6 +609,7 @@ async def run_agent_step(
     """
     created_here = reuse_terminal_id is None
     terminal_id = reuse_terminal_id
+    launched_provider = provider
 
     if created_here:
         await asyncio.to_thread(
@@ -656,7 +666,9 @@ async def run_agent_step(
             model=model,
             # ``StepCallFields.engine`` is the enum's ``value`` by contract — the CALLER
             # normalises, so ``step_fingerprint`` can stay a stdlib-only leaf module.
-            engine=engine.value if isinstance(engine, KiroEngine) else engine,
+            # ``canonical_kiro_engine`` maps a member to its value and ``kas`` to
+            # ``v3`` without validating, so both spellings share one key (#1167).
+            engine=canonical_kiro_engine(engine),
             allowed_tools=None if allowed_tools is None else tuple(allowed_tools),
             effective_working_directory=working_directory,
             use_worktree=use_worktree,
@@ -721,6 +733,12 @@ async def run_agent_step(
             caller_ceiling=caller_ceiling,
         )
         terminal_id = terminal.id
+        # #1099: a routed ephemeral launch runs another CLI than the request names; its
+        # output is classified with the provider that actually ran. Terminal stores the
+        # enum's value (use_enum_values).
+        ran = getattr(terminal.provider, "value", terminal.provider)
+        if isinstance(ran, str):
+            launched_provider = ran
 
         # BR-31: make the terminal this call just made visible to U4's orphan
         # sweep, and (issue #583, BR-3) write its durable ``running`` row, BEFORE
@@ -854,11 +872,11 @@ async def run_agent_step(
     # when the rolling buffer is empty) is deferred until a row actually matches.
     # Only a candidate match pays for the capture, and only then is it re-read to
     # confirm the line is provider chrome rather than a marker-owned answer.
-    provider_error = classify_provider_error(provider, last_message)
+    provider_error = classify_provider_error(launched_provider, last_message)
     if provider_error is not None:
         script_output = await asyncio.to_thread(terminal_service.get_output_context, terminal_id)
         provider_error = classify_provider_error(
-            provider, last_message, script_output=script_output
+            launched_provider, last_message, script_output=script_output
         )
     if provider_error is not None:
         # Unlike the crash/timeout paths above, the CLI here is HEALTHY and idle: it
@@ -872,16 +890,11 @@ async def run_agent_step(
         if teardown and created_here:
             await _best_effort_teardown(terminal_id, registry)
         raise StepExecutionError(
-            f"provider error ({provider_error.slug}) from {provider}: {provider_error.detail}",
+            f"provider error ({provider_error.slug}) from {launched_provider}: "
+            f"{provider_error.detail}",
             kind=provider_error.kind,
             terminal_id=terminal_id,
         )
-
-    result = AgentStepResult(
-        terminal_id=terminal_id,
-        last_message=last_message,
-        status=TerminalStatus.COMPLETED,
-    )
 
     # Persist BEFORE teardown (issue #447): the terminal about to be destroyed
     # is the only other place this result lives, so a crash during teardown
@@ -904,13 +917,32 @@ async def run_agent_step(
                 job_id[:8],
             )
 
+    torn_down = False
     if teardown and created_here:
-        await _best_effort_teardown(terminal_id, registry)
+        kept = False
+        if keep_on_success is not None:
+            try:
+                kept = bool(await asyncio.to_thread(keep_on_success, terminal_id))
+            except Exception as exc:  # noqa: BLE001 — a keep failure falls back to teardown
+                logger.warning(
+                    "run_agent_step: keep decision for terminal %s failed; tearing down: %s",
+                    terminal_id,
+                    exc,
+                )
+        # A kept worker was not torn down, so torn_down stays False (#1203 / #1225):
+        # it reports only a delete that really happened.
+        if not kept:
+            torn_down = await _best_effort_teardown(terminal_id, registry)
 
-    return result
+    return AgentStepResult(
+        terminal_id=terminal_id,
+        last_message=last_message,
+        status=TerminalStatus.COMPLETED,
+        torn_down=torn_down,
+    )
 
 
-async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegistry]) -> None:
+async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegistry]) -> bool:
     """Exit-then-delete a terminal this call created — best-effort (never raises).
 
     Mirrors the old handoff lifecycle: send the provider's graceful exit command
@@ -918,6 +950,9 @@ async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegis
     never turn a settled step (success OR cancellation) into a failure. Shared by
     the success teardown and the cancellation path (issue #409b) so a cancelled
     step reclaims its terminal exactly the way a successful one does.
+
+    Returns True only if ``delete_terminal`` succeeded (issue #1203). A failed
+    graceful exit does not affect the result; only the delete decides it.
     """
     try:
         # Graceful CLI shutdown before kill_window (e.g. "/exit" for Claude Code,
@@ -937,10 +972,24 @@ async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegis
         # Off the loop: delete_terminal does blocking tmux kills, a full-history
         # scrollback snapshot, and DB writes — the exact teardown that wedged the
         # server in issue #382.
-        await asyncio.to_thread(terminal_service.delete_terminal, terminal_id, registry=registry)
+        deleted = await asyncio.to_thread(
+            terminal_service.delete_terminal,
+            terminal_id,
+            registry=registry,
+            end_reason="deleted",
+        )
     except Exception as exc:  # noqa: BLE001 — teardown is best-effort; the step already settled
         logger.warning(
             "run_agent_step: failed to tear down terminal %s after settle: %s",
             terminal_id,
             exc,
         )
+        return False
+    # delete_terminal returns False (without raising) when cleanup was deferred and
+    # the row kept for a retry. That is not a teardown, so it must not be reported as one.
+    if not deleted:
+        logger.warning(
+            "run_agent_step: teardown of terminal %s was deferred; the terminal was not deleted",
+            terminal_id,
+        )
+    return bool(deleted)

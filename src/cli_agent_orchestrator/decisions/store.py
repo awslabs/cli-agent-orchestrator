@@ -23,6 +23,20 @@ from cli_agent_orchestrator.decisions.hashing import (
 
 logger = logging.getLogger(__name__)
 STATUS_WINDOW_HOURS = 24
+# #1199: JSON-list columns, and the columns update_match may write.
+_LIST_COLUMNS = ("options", "match_needs", "match_covered")
+MATCH_COLUMNS = (
+    "match_rule",
+    "match_needs",
+    "match_covered",
+    "match_tiebreak",
+    "match_from",
+    "match_pick",
+    "catalog_version",
+    "catalog_hash",
+)
+# A transient value: the canonical catalog text, hashed here and never stored.
+CATALOG_TEXT = "catalog_canonical"
 
 
 def _count_label(reason: str | None, decision_status: str | None) -> str:
@@ -121,6 +135,10 @@ class DecisionStore:
                 data["message_bytes"] = len(message.encode("utf-8"))
             if isinstance(data.get("probabilities"), dict):
                 data["probabilities"] = json.dumps(data["probabilities"])
+            # #1099: provider.route's per-launch options, as a JSON list; #1199: the match's
+            # needs and covered needs, the same way.
+            self._lists(data)
+            self._catalog_hash(data)
             with self.sessions() as db:
                 row = database.DecisionRecordModel(**data)
                 db.add(row)
@@ -145,6 +163,19 @@ class DecisionStore:
             return None
 
     @staticmethod
+    def _lists(data: dict[Any, Any]) -> None:
+        for key in _LIST_COLUMNS:
+            if isinstance(data.get(key), (list, tuple)):
+                data[key] = json.dumps(list(data[key]))
+
+    def _catalog_hash(self, data: dict[Any, Any]) -> None:
+        """#1199: replace the transient catalog text with its keyed hash, never storing it."""
+        text = data.pop(CATALOG_TEXT, None)
+        if isinstance(text, str):
+            data["catalog_hash"], key_id = self._key.digest(text)
+            data.setdefault("hash_key_id", key_id)
+
+    @staticmethod
     def _dict(row: Any) -> dict[str, Any]:
         data = {
             column.name: getattr(row, column.name)
@@ -152,6 +183,9 @@ class DecisionStore:
         }
         if data["probabilities"] is not None:
             data["probabilities"] = json.loads(data["probabilities"])
+        for key in _LIST_COLUMNS:
+            if data[key] is not None:
+                data[key] = json.loads(data[key])
         for key in ("created_at", "updated_at"):
             if isinstance(data[key], datetime):
                 data[key] = data[key].isoformat()
@@ -186,6 +220,42 @@ class DecisionStore:
                         self._shadow_rows.discard(record_id)
         except Exception:
             logger.warning("Decision record update failed")
+
+    def update_match(self, record_ids: tuple[int, ...], values: dict[str, Any]) -> None:
+        """#1199: write a match's columns onto rows no match has written yet.
+
+        Only the match columns are written, and only where match_rule is still NULL, so a
+        shadow feature job can add its would-be match to rows already finished at launch,
+        and nothing ever overwrites one. Records only; nothing is emitted.
+
+        A row's one hash_key_id names the key of its message hash and its catalog hash. The
+        catalog hash is computed here under the current key, so it is written only onto a row
+        whose hash_key_id names that key, or that has none yet and gets it. A row hashed under
+        a key rotated since (``cao decisions purge --rotate-key``) is left without a match.
+        """
+        try:
+            data: dict[Any, Any] = dict(values)
+            self._catalog_hash(data)
+            self._lists(data)
+            if set(data) - set(MATCH_COLUMNS) - {"hash_key_id"}:
+                raise ValueError("update_match writes the match columns only")
+            key_id = data.pop("hash_key_id", None)
+            data["updated_at"] = datetime.now(timezone.utc)
+            model = database.DecisionRecordModel
+            with self.sessions() as db:
+                for record_id in record_ids:
+                    query = db.query(model).filter(
+                        model.id == record_id, model.match_rule.is_(None)
+                    )
+                    if key_id is None:
+                        query.update(data)
+                    else:
+                        query.filter(
+                            or_(model.hash_key_id == key_id, model.hash_key_id.is_(None))
+                        ).update({**data, "hash_key_id": key_id})
+                db.commit()
+        except Exception:
+            logger.warning("Decision match update failed")
 
     def bind(
         self,

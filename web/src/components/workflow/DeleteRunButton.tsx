@@ -42,7 +42,7 @@ export function DeleteRunButton({ runId, workflowName }: DeleteRunButtonProps) {
         type="button"
         onClick={() => setOpen(true)}
         aria-label="Delete this run"
-        className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium text-red-300 bg-red-950/40 hover:bg-red-900/50 rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-red-500"
+        className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium text-red-300 bg-red-950/40 hover:bg-red-900/50 rounded-lg transition-colors focus:outline-hidden focus:ring-2 focus:ring-red-500"
       >
         <Trash2 size={14} aria-hidden="true" />
         Delete run

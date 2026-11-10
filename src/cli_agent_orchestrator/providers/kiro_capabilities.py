@@ -7,12 +7,18 @@ complete it before creating a backend session, database row, or provider.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+from cli_agent_orchestrator.providers.kiro_v3_schema import (
+    KiroV3Refusal,
+    KiroV3UnsupportedVersionError,
+    kiro_v3_schema_for_cli_version,
+)
 
 ProbeRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -22,16 +28,20 @@ _FLAG_CAPABILITIES = {
     "ui": "--legacy-ui",
     "trust": "--trust-all-tools",
     "mcp_startup": "--require-mcp-startup",
+    # Requested only when a launch sets an effort (#1074 phase 5).
+    "effort": "--effort",
+    # Every v3 launch skips the workspace-trust dialog with it (#1167).
+    "trust_workspace": "--trust-workspace",
 }
 _BARE_BOOLEAN_FLAGS = frozenset(
     {
-        "--v3",
         "--legacy-ui",
         "--trust-all-tools",
         "--require-mcp-startup",
+        "--trust-workspace",
     }
 )
-_VALUE_BEARING_FLAGS = frozenset({"--agent", "--model"})
+_VALUE_BEARING_FLAGS = frozenset({"--agent", "--model", "--effort"})
 _REQUESTED_FLAGS = frozenset(
     {
         "--agent-engine",
@@ -100,21 +110,37 @@ class KiroCapabilityError(ValueError):
         self.version = version
 
 
-class KiroPhase0KASError(ValueError):
-    """Raised after KAS capability probing, before runtime allocation."""
+#: What a missing v3 wrapper flag's refusal suggests by default; an ephemeral
+#: helper, which runs only on v3, names its own (#1167 Phase 2).
+MISSING_FLAG_REMEDY = "Retry with engine 'v2'."
 
-    def __init__(self, profile_has_v2_policy: bool) -> None:
-        profile_note = (
-            " The selected profile contains v2 allowedTools/toolsSettings that "
-            "cannot be translated to Cedar in Phase 0."
-            if profile_has_v2_policy
-            else ""
-        )
-        super().__init__(
-            "Kiro engine 'kas' is not available in Phase 0: KAS profiles and Cedar "
-            "policy translation are not implemented. Retry with engine 'v2'." + profile_note
-        )
-        self.engine = KiroEngine.KAS
+
+def missing_flag_message(
+    engine: KiroEngine, flag: str, version: Optional[str], remedy: Optional[str]
+) -> str:
+    """The refusal for a wrapper flag ``engine`` needs that Kiro wrapper help did not list."""
+    detail = f" Detected wrapper version: {version}." if version else ""
+    retry = f" {remedy}" if remedy else ""
+    return (
+        f"Kiro engine '{engine.value}' requires wrapper flag {flag!r}, "
+        f"but it was not advertised by Kiro wrapper help.{detail}{retry}"
+    )
+
+
+class KiroV3LaunchError(KiroV3Refusal):
+    """A Kiro v3 launch refused by one of CAO's own checks (#1167); nothing was typed.
+
+    ``code`` is provisional: ``kiro_v3_bad_effort``, ``kiro_v3_unrestricted``,
+    ``kiro_v3_home_unsupported``, ``kiro_v3_not_installed``,
+    ``kiro_v3_agent_unreadable`` and ``kiro_v3_bad_cwd`` refuse before allocation
+    (``kiro_v3_bad_cwd`` also at the workspace re-check after the header);
+    ``kiro_v3_trust_dialog`` and ``kiro_v3_startup_dialog`` after kiro-cli started,
+    with no key sent to the dialog.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -140,6 +166,7 @@ def _run(
     engine: KiroEngine,
     *,
     stdin: Optional[int] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one bounded probe command and normalize execution failures."""
     try:
@@ -150,6 +177,8 @@ def _run(
         }
         if stdin is not None:
             kwargs["stdin"] = stdin
+        if env is not None:
+            kwargs["env"] = dict(env)
         result = runner(list(command), **kwargs)
     except FileNotFoundError as exc:
         raise KiroCapabilityError(
@@ -202,7 +231,7 @@ def _supports_declared_invocation(flag: str, variadic: bool, value: Optional[str
         # ``[VALUE]`` leaves the bare invocation valid; required values do not.
         return value is None or value.startswith("[")
     if flag == "--agent-engine":
-        # The separate engine-value parser below verifies that ``v2`` is valid.
+        # The separate engine-value parser below verifies the requested value.
         return True
     # CAO always supplies a value for --agent and --model.
     return value is not None
@@ -307,6 +336,8 @@ def probe_kiro_capabilities(
     timeout: float = 5.0,
     chat_help_timeout: float = 10.0,
     runner: ProbeRunner = subprocess.run,
+    executable: str = "kiro-cli",
+    env: Optional[Mapping[str, str]] = None,
 ) -> KiroCapabilities:
     """Probe the selected engine mechanism and each requested wrapper feature.
 
@@ -314,15 +345,22 @@ def probe_kiro_capabilities(
     receives a closed stdin so the probe cannot enter interactive mode, and its
     timeout is independently configurable because wrapper startup can be slower
     than the root command.
+
+    ``executable`` and ``env`` default to the PATH ``kiro-cli`` and the server
+    environment. An ephemeral helper passes the absolute kiro-cli it will type
+    into the pane and a CAO-owned ``KIRO_HOME``, so the binary probed is the
+    binary launched (#1167 Phase 2). Only help and the version run: no session
+    starts.
     """
-    root_help_result = _run(runner, ("kiro-cli", "--help"), timeout, engine)
+    root_help_result = _run(runner, (executable, "--help"), timeout, engine, env=env)
     root_help_output = (root_help_result.stdout or "") + "\n" + (root_help_result.stderr or "")
     chat_help_result = _run(
         runner,
-        ("kiro-cli", "chat", "--help"),
+        (executable, "chat", "--help"),
         chat_help_timeout,
         engine,
         stdin=subprocess.DEVNULL,
+        env=env,
     )
     chat_help_output = (chat_help_result.stdout or "") + "\n" + (chat_help_result.stderr or "")
     flags = _flags_from_help(root_help_output) | _flags_from_help(chat_help_output)
@@ -330,7 +368,7 @@ def probe_kiro_capabilities(
 
     version: Optional[str] = None
     try:
-        version_result = _run(runner, ("kiro-cli", "--version"), timeout, engine)
+        version_result = _run(runner, (executable, "--version"), timeout, engine, env=env)
         version_output = (version_result.stdout or "") + "\n" + (version_result.stderr or "")
         version_match = _VERSION_RE.search(version_output) or _VERSION_RE.search(
             root_help_output + "\n" + chat_help_output
@@ -344,8 +382,10 @@ def probe_kiro_capabilities(
         if version_match:
             version = version_match.group(1)
 
-    required = ["--agent-engine" if engine == KiroEngine.V2 else "--v3"]
-    for capability in requested:
+    # Both engines are selected by ``chat --agent-engine <value>`` (#1167). The
+    # root ``--v3`` flag starts the same engine but is neither probed nor used.
+    required = ["--agent-engine"]
+    for capability in sorted(requested):
         try:
             required.append(_FLAG_CAPABILITIES[capability])
         except KeyError as exc:
@@ -353,43 +393,68 @@ def probe_kiro_capabilities(
 
     for flag in required:
         if flag not in flags:
-            detail = f" Detected wrapper version: {version}." if version else ""
-            retry = " Retry with engine 'v2'." if engine == KiroEngine.KAS else ""
+            remedy = MISSING_FLAG_REMEDY if engine == KiroEngine.V3 else None
             raise KiroCapabilityError(
                 "unsupported_capability",
                 engine,
-                f"Kiro engine '{engine.value}' requires wrapper flag {flag!r}, "
-                f"but it was not advertised by Kiro wrapper help.{detail}{retry}",
+                missing_flag_message(engine, flag, version, remedy),
                 capability=flag,
                 version=version,
             )
-    if engine == KiroEngine.V2 and not agent_engines:
+    if not agent_engines:
         detail = f" Detected wrapper version: {version}." if version else ""
         raise KiroCapabilityError(
             "unsupported_capability",
             engine,
-            "Kiro engine 'v2' requires Kiro wrapper help to advertise "
-            "'--agent-engine' with an explicit 'v2' value, but it did not."
+            f"Kiro engine '{engine.value}' requires Kiro wrapper help to advertise "
+            f"'--agent-engine' with an explicit '{engine.value}' value, but it did not."
             f"{detail}",
-            capability="--agent-engine=v2",
+            capability=f"--agent-engine={engine.value}",
             version=version,
         )
-    if engine == KiroEngine.V2 and KiroEngine.V2.value not in agent_engines:
+    if engine.value not in agent_engines:
         detail = f" Detected wrapper version: {version}." if version else ""
         raise KiroCapabilityError(
             "unsupported_capability",
             engine,
-            "Kiro engine 'v2' requires '--agent-engine' to accept 'v2', "
-            "but the wrapper did not advertise that value."
+            f"Kiro engine '{engine.value}' requires '--agent-engine' to accept "
+            f"'{engine.value}', but the wrapper did not advertise that value."
             f"{detail}",
-            capability="--agent-engine=v2",
+            capability=f"--agent-engine={engine.value}",
             version=version,
         )
+    if engine == KiroEngine.V3:
+        # v3 runs only on an allow-listed kiro-cli version, whose engine
+        # schema CAO has pinned. Checked on every v3 create, never cached;
+        # v2 is never affected.
+        try:
+            kiro_v3_schema_for_cli_version(version)
+        except KiroV3UnsupportedVersionError as exc:
+            raise KiroCapabilityError(
+                KiroV3UnsupportedVersionError.code,
+                engine,
+                str(exc),
+                capability="--version",
+                version=version,
+            ) from exc
     return KiroCapabilities(
         version=version,
         flags=flags,
         agent_engines=agent_engines,
     )
+
+
+#: Removed from a v3 launch's environment (#1167): the variable that force-adds
+#: MCP servers whatever ``tools`` says, the upgrader's agent-directory
+#: override, an engine variable of unknown purpose, and any ``KIRO_HOME`` a
+#: pane's rc files export (an installed v3 agent runs with the default Kiro
+#: home). An ephemeral helper assigns its own ``KIRO_HOME`` instead of the last.
+KIRO_V3_UNSET_ENV = (
+    "ASBX_KIRO_MANDATORY_MCPS",
+    "KIRO_AGENT_CONFIG_DIR",
+    "KIRO_AGENT_ENGINE",
+    "KIRO_HOME",
+)
 
 
 def build_kiro_command(
@@ -398,8 +463,26 @@ def build_kiro_command(
     *,
     model: Optional[str] = None,
     yolo: bool = False,
+    effort: Optional[str] = None,
+    executable: str = "kiro-cli",
+    kiro_home: Optional[str] = None,
 ) -> list[str]:
     """Build a deterministic Kiro command without executing it.
+
+    v3 (#1167) runs as ``/usr/bin/env -u … kiro-cli chat --agent-engine v3
+    --trust-workspace --trust-all-tools [--model m] [--effort e] --agent <name>``.
+    ``env`` is absolute so PATH order cannot swap it, and it execs kiro-cli, so
+    the pane's exit-to-shell check is unchanged. Trust-all is always on for v3,
+    and only together with the universal agent file's unconditional denies.
+
+    ``executable`` and ``kiro_home`` are for an ephemeral helper, on v3 only
+    (#1167 Phase 2). It names kiro-cli by the absolute path the server resolved
+    and probed, because the pane's login shell can reorder PATH, and in place
+    of ``-u KIRO_HOME`` it assigns ``KIRO_HOME=<home>``, which ``env`` applies
+    after any rc file's export. A ``kiro_home`` needs an absolute
+    ``executable``, and an ``executable`` holding ``=`` refuses (``env`` would
+    take it as an assignment). With both unset every installed command, v3 or
+    v2, is unchanged.
 
     There is deliberately no ``legacy_ui`` option, because ``--legacy-ui`` can
     no longer be combined with the engine CAO pins. kiro-cli rejects the pair
@@ -415,20 +498,50 @@ def build_kiro_command(
     auto-answered after launch instead; see
     ``KiroCliProvider._wait_ready_accepting_trust_dialog``.
     """
-    if engine == KiroEngine.KAS:
-        command = ["kiro-cli", "--v3", "chat"]
+    if engine != KiroEngine.V3 and (executable != "kiro-cli" or kiro_home is not None):
+        raise ValueError("a per-launch kiro-cli or KIRO_HOME is only for the v3 engine")
+    if (executable != "kiro-cli" and not os.path.isabs(executable)) or (
+        kiro_home is not None and not os.path.isabs(kiro_home)
+    ):
+        raise ValueError("a per-launch kiro-cli and KIRO_HOME must be absolute paths")
+    if kiro_home is not None and not os.path.isabs(executable):
+        # A helper's command never resolves kiro-cli through the pane's PATH.
+        raise ValueError("a per-launch KIRO_HOME needs the absolute kiro-cli the probe ran")
+    if "=" in executable:
+        # env would read it as NAME=VALUE and exec the next word instead.
+        raise ValueError("a kiro-cli path holding '=' would be read by env as an assignment")
+    if engine == KiroEngine.V3:
+        command = ["/usr/bin/env"]
+        for name in KIRO_V3_UNSET_ENV:
+            if name == "KIRO_HOME" and kiro_home is not None:
+                continue
+            command.extend(["-u", name])
+        if kiro_home is not None:
+            command.append(f"KIRO_HOME={kiro_home}")
+        command.extend(
+            [
+                executable,
+                "chat",
+                "--agent-engine",
+                KiroEngine.V3.value,
+                "--trust-workspace",
+                "--trust-all-tools",
+            ]
+        )
     else:
         command = ["kiro-cli", "chat", "--agent-engine", KiroEngine.V2.value]
         if yolo:
             command.append("--trust-all-tools")
     if model:
         command.extend(["--model", model])
+    if effort:
+        command.extend(["--effort", effort])
     command.extend(["--agent", agent_profile])
     return command
 
 
 def requested_kiro_capabilities(
-    engine: KiroEngine, *, model: Optional[str], yolo: bool
+    engine: KiroEngine, *, model: Optional[str], yolo: bool, effort: Optional[str] = None
 ) -> set[str]:
     """Return every wrapper feature used by the launch lifecycle.
 
@@ -441,6 +554,39 @@ def requested_kiro_capabilities(
     requested = {"profile"}
     if model:
         requested.add("model")
+    if effort:
+        requested.add("effort")
     if engine == KiroEngine.V2 and yolo:
         requested.add("trust")
+    if engine == KiroEngine.V3:
+        # Every v3 launch passes both (#1167), whatever ``yolo`` says.
+        requested.update(("trust", "trust_workspace"))
     return requested
+
+
+_EFFORT_VALUE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+
+
+def kiro_effort_value(effort: object) -> str:
+    """An ``--effort`` value, checked: a lowercase level, never something read as a flag.
+
+    Passed through unchanged (kiro-cli checks it against the model's own
+    levels). Shared by a profile's ``kiroConfig.effort`` and a launch plan's
+    effort, so both are held to one rule.
+    """
+    if not isinstance(effort, str) or not _EFFORT_VALUE.fullmatch(effort):
+        raise ValueError("kiroConfig.effort must be a lowercase level such as low, medium or high")
+    return effort
+
+
+def kiro_effort(profile: object) -> Optional[str]:
+    """The ``--effort`` value a profile's ``kiroConfig.effort`` sets, or None.
+
+    Passed through unchanged (kiro-cli checks it against the model's own
+    levels). A value that could be read as another flag is refused, not
+    dropped. Provisional (#1074 M8); defined exactly as #1074 does.
+    """
+    config = getattr(profile, "kiroConfig", None)
+    if not isinstance(config, dict) or config.get("effort") is None:
+        return None
+    return kiro_effort_value(config["effort"])

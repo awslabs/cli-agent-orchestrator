@@ -26,6 +26,10 @@ jobs:
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # Bounds a hung test (#1251). The job takes 25-40 min on main (3.11 is the
+    # slower leg), so 60 is 1.5x the slowest recent run. Unbounded, a hang held
+    # the runner for GitHub's default of 360 min.
+    timeout-minutes: 60
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
@@ -35,7 +39,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -48,9 +52,7 @@ jobs:
 
       - name: Install Trivy for inventory regressions
         if: matrix.python-version == '3.12'
-        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
-        with:
-          version: v0.70.0
+        uses: ./.github/actions/install-trivy
 
       - name: Run unit tests with coverage
         # CAO_MUST_RUN names the assurance gates this leg owns; a `must_run`
@@ -120,7 +122,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
@@ -168,7 +170,7 @@ jobs:
       # place its whole-directory wheel assertion can cover THAT root rather than skipping it.
       # =================================================================================
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -232,6 +234,11 @@ jobs:
   cao-mcp-apps:
     name: CAO MCP Apps
     runs-on: ubuntu-latest
+    # Bounds a hung test (#1273 review). "Backend coverage" below runs the same
+    # pytest suite as Unit Tests; over 60 runs this job took a mean of 33.3 min
+    # and a max of 37.9, so 60 matches Unit Tests and is 1.6x the slowest.
+    # Unbounded, a hang held the runner for GitHub's default of 360 min.
+    timeout-minutes: 60
 
     # Per-tier test timing budgets (Requirement 20.3), surfaced as env so the
     # vitest tiers (Phase II+) and CI can enforce them:
@@ -252,7 +259,7 @@ jobs:
           node-version: "20"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Set up Python
         run: uv python install 3.12
@@ -355,7 +362,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -411,7 +418,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -463,7 +470,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -514,7 +521,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -543,7 +550,8 @@ jobs:
       - name: Record dog-food demo (asserts the plugin pipeline; gates on drift)
         # Runs run.sh OFFLINE (no provider binary, network, or secrets) — CAO
         # installing its own `cao` plugin through its own pipeline — and asserts
-        # validate/add/install(Kiro+OpenCode)/remove, exporting
+        # validate/add/install(Kiro+OpenCode)/remove, then validate/add/remove for
+        # every other package in build_agent_plugin.py's PACKAGES, exporting
         # docs/media/agent-plugins-dogfood-demo.gif. A non-zero exit or a missing
         # PASS marker (the pipeline regressed) fails this job — the shift-left
         # gate. The live OpenCode observational step (CAO_DOGFOOD_LIVE=1, needs
@@ -568,7 +576,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -588,9 +596,76 @@ jobs:
         # Boots a CAO_AGUI_ENABLED cao-server with a keyless mock_cli fleet,
         # POSTs a RunAgentInput to /agui/v1/run with the pinned @ag-ui/client
         # HttpAgent, and asserts a live frame is received (AC3 / spec task 17.2).
+        # It then checks the ambient stream (GET/POST /agui/v1/stream) with the
+        # same SDK's verifyEvents (verify-ambient.mjs): the streams the
+        # conformance tests capture, plus one live HttpAgent run.
         # Non-zero exit fails the job; the script cleans up the server on exit.
         run: ./examples/ag-ui/ag-ui-stock-client-live/run.sh
 
+  ag-ui-operator-dashboard:
+    name: AG-UI operator dashboard
+    runs-on: ubuntu-latest
+    # Bounds a hung e2e: the job normally takes a few minutes.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: examples/ag-ui/ag-ui-operator-dashboard
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The keyless e2e drives real mock_cli terminals, which need tmux.
+      # Explicit, so the job does not depend on the runner image shipping tmux (ubuntu-latest, now ubuntu-26.04, does).
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (cao-server + agui run plane)
+        working-directory: .
+        run: uv sync --locked --all-extras --dev
+
+      # Node 22: the e2e runs e2e/e2e.ts with --experimental-strip-types.
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: examples/ag-ui/ag-ui-operator-dashboard/package-lock.json
+
+      - name: Install app dependencies (exact pins, install scripts off)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Dependency checks
+        run: npm run test:dependencies
+
+      - name: Type check
+        run: npm run typecheck
+
+      # Codecov ingests only the Python coverage.xml, so it never sees this
+      # TypeScript. vite.config.ts holds core/ to 100% lines, branches,
+      # functions and statements; a drop fails this step.
+      - name: Unit tests with coverage floor
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+      # A private cao-server (temp HOME, own tmux server, port 9896) with mock_cli
+      # terminals. SIMULATED: an agent showing a prompt. The harness types the
+      # marker "APPROVAL_REQUIRED: <text>" into a pane without Enter, standing in
+      # for a CLI that prints a permission prompt and waits. COVERED FOR REAL: the
+      # approval bridge, classification, the run plane, resume and key delivery.
+      # See examples/ag-ui/ag-ui-operator-dashboard/e2e/README.md.
+      - name: Keyless e2e (cao-server + mock_cli terminals)
+        run: ./e2e/run.sh
   # =======================================================================================
   # RUST TUI (issue #321, unit `rust-ci`). THE FIRST JOB IN ci.yml THAT INSPECTS THE RUST
   # CRATE AT ALL — measured before this change: `cargo` appeared in only
@@ -729,7 +804,7 @@ jobs:
       # without it, so `uv sync` would fail with `uv: command not found`. Caught by comparing every
       # job's setup-uv presence against its uv usage rather than assuming the toolchain was there.
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -839,62 +914,64 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Generate requirements.txt for scanning
         run: |
           uv export --locked --format requirements-txt > requirements.txt
 
-      # SR-4 (interview Q1): `exit-code: 1` makes this job FAIL on a CRITICAL/HIGH finding.
-      # Before this, the step had no exit-code, so it uploaded SARIF and continued — meaning
-      # "Security Scan passed" attested that a scan COMPLETED, not that it was clean. The
-      # rest of the repo already treats scanners as gates: secret-scan.yml passes
-      # `--exit-code 1` to gitleaks at both :68 and :82. This closes the inconsistency
-      # rather than introducing a new policy. (#321)
-      #
-      # SARIF is still produced and uploaded (see the next step's `if: always()`), so the
-      # Security tab keeps its history even on a failing run.
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.69.3
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
+      # REPORT (never fails on findings): every severity, both default scanners, so the Security
+      # tab keeps MEDIUM/LOW history (#568 DR-5). Runs BEFORE both gates, so a red gate still
+      # leaves a SARIF for the `if: always()` upload below.
+      - name: Trivy report (SARIF, all severities)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'sarif'
           output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
-          exit-code: '1'
+          exit-code: '0'
+          skip-setup-trivy: true
 
-      # FR-8: the SARIF step above writes findings to a FILE, so a failing scan
-      # logs an exit code and names nothing — diagnosing #568 took an out-of-band
-      # `gh api .../code-scanning/alerts` call to learn what had failed. This step
-      # re-runs the same scan in table format so the finding appears in the log.
-      #
-      # `if: failure()` — runs only when the gate above fails, so a green run pays
-      # nothing. `exit-code: '0'` — this step must not be the one that fails the
-      # job; the gate above already did, and a second failure would obscure which
-      # step is authoritative.
-      #
-      # No `severity:` input, matching the effective gate: trivy-action's
-      # entrypoint.sh unsets TRIVY_SEVERITY whenever format is sarif, so the step
-      # above scans at ALL severities. Passing CRITICAL,HIGH here would print a
-      # narrower set than the one that failed the build — and could print NOTHING
-      # while the job is red.
-      - name: Show Trivy findings in the log
-        if: failure()
+      # SECRET GATE: FAIL on a committed secret of ANY severity (Security Scan's policy since
+      # #321, kept on purpose). Trivy's `severity:` filter applies to every scanner in a run, so
+      # the CRITICAL/HIGH/UNKNOWN gate below would let a MEDIUM/LOW secret (e.g. a JWT) through.
+      # No `severity:` input here = no TRIVY_SEVERITY = every severity gates. gitleaks
+      # (secret-scan.yml) scans PR ranges only, not pushes to main.
+      - name: Trivy secret gate (all severities)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'secret'
+          format: 'table'
+          exit-code: '1'
+          skip-setup-trivy: true
+
+      # VULNERABILITY GATE (SR-4, #321): FAIL on a fixable CRITICAL, HIGH or UNKNOWN finding.
+      # UNKNOWN = advisory not yet scored: it gates until scored, then follows its real severity.
+      # Fixable MEDIUM/LOW are report-only (#568 OQ-1). Table format honours `severity:`
+      # (trivy-action only discards it for SARIF) and prints what failed (FR-8).
+      - name: Trivy gate (CRITICAL/HIGH/UNKNOWN)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'table'
+          severity: 'CRITICAL,HIGH,UNKNOWN'
           ignore-unfixed: true
-          exit-code: '0'
+          exit-code: '1'
+          skip-setup-trivy: true
 
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
-        # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL finding
-        # would fail the scan step and SKIP the upload, hiding the very finding that failed
-        # the build from the Security tab.
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v3
+        # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL/HIGH
+        # finding would fail the gate step and SKIP the upload, hiding the very finding that
+        # failed the build from the Security tab.
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'

@@ -95,7 +95,7 @@ Security scans run:
 checked-out tree, including unchanged dependencies, development dependencies,
 and advisories with no published fix.** This is separate from the existing
 Trivy `Security Scan` and PR-delta `Dependency Review` checks; neither replaces
-this whole-graph gate. The older scan's lower-severity/secret policy is unchanged.
+this whole-graph gate. The older scan fails on a committed secret of any severity and on a fixable CRITICAL, HIGH or UNKNOWN (not yet scored) vulnerability; fixable MEDIUM and LOW vulnerabilities are reported to the Security tab without failing CI.
 
 The job runs inside every CI run on PRs targeting `main` (including forks) and
 pushes to `main`, without path filters. The
@@ -267,7 +267,7 @@ The lockfiles include these published fixes across all affected toolchains:
 | `compression` | `1.8.2` | Docs | CVE-2026-87776 |
 | `proxy-addr` | `2.0.8` | Docs | CVE-2026-90711 |
 | `joi` | `17.13.8` | Docs | CVE-2026-90771 |
-| `postcss-selector-parser` | `7.1.6` | Docs, web | CVE-2026-104844 |
+| `postcss-selector-parser` | `7.1.6` | Docs | CVE-2026-104844 |
 | `tinypool` | `2.1.2` | Docs | CVE-2026-104848, CVE-2026-104849 |
 
 The selector-parser v6 and Tinypool v1 consumer ranges exclude their fixed
@@ -468,27 +468,34 @@ brew install trivy  # macOS
 # or
 sudo apt-get install trivy  # Ubuntu/Debian
 
-# Scan the repository, at every severity and with Trivy's default scanner set —
-# this is what the CI gate actually does (see the note below).
-# `--frozen` matters: a plain `uv export` rewrites the tracked uv.lock.
+# Reproduce both CI gates: secrets at every severity, then fixable
+# CRITICAL/HIGH/UNKNOWN vulnerabilities (see the note below). `--frozen`
+# matters: a plain `uv export` rewrites the tracked uv.lock.
 uv export --frozen --format requirements-txt > requirements.txt  # so Python deps are scanned
-trivy fs --ignore-unfixed --exit-code 1 .
+trivy fs --scanners secret --exit-code 1 .
+trivy fs --severity CRITICAL,HIGH,UNKNOWN --ignore-unfixed --exit-code 1 .
 rm -f requirements.txt
 ```
 
-> **Do not add `--severity HIGH,CRITICAL` or `--scanners vuln`.** Both make the
-> local check *weaker than the gate*, so it passes while CI fails.
+> The `security` job in `.github/workflows/ci.yml` runs Trivy three times. A
+> **report** step (`format: 'sarif'`, no `severity:`, `exit-code: '0'`) never
+> fails on findings, so the Security tab keeps every severity. A **secret gate**
+> (`scanners: 'secret'`, no `severity:`, `exit-code: '1'`) fails on a committed
+> secret of any severity, as Security Scan always has, on pull requests and on
+> pushes to `main`. A **vulnerability gate** (`format: 'table'`, `severity:
+> 'CRITICAL,HIGH,UNKNOWN'`, `ignore-unfixed: true`, `exit-code: '1'`) fails on a
+> fixable CRITICAL, HIGH or UNKNOWN finding. UNKNOWN means the advisory hasn't
+> been scored yet, so it gates until it has a severity.
 >
-> The `security` job in `.github/workflows/ci.yml` does pass
-> `severity: 'CRITICAL,HIGH'` to `trivy-action`, but the action's `entrypoint.sh`
-> runs `unset TRIVY_SEVERITY` whenever `format` is `sarif` and
-> `limit-severities-for-sarif` is not `true`. CI uses `format: 'sarif'`, so that
-> input is discarded and the job logs `Building SARIF report with all severities`
-> — **the gate fails on a finding of any severity, including MEDIUM and LOW.**
-> Similarly, CI passes no `scanners` input, so Trivy runs its defaults: the job
-> log shows both `[vuln] Vulnerability scanning is enabled` and
-> `[secret] Secret scanning is enabled`. `--scanners vuln` would hide the
-> secret findings CI blocks on. (See issue #568.)
+> Secrets get their own step because Trivy's `--severity` filter applies to
+> every scanner in a run: a single CRITICAL/HIGH step would stop failing on
+> MEDIUM and LOW secrets, such as a committed JWT. Table format honours
+> `severity:`; only the SARIF format has `TRIVY_SEVERITY` unset by the action's
+> `entrypoint.sh`. So the two commands above match the two gates exactly. This
+> resolves #568 OQ-1: the one narrowing is that fixable MEDIUM and LOW
+> vulnerabilities are report-only. Don't add `--severity` to the secret command
+> or drop it, and don't add `--scanners vuln` to the second; each would make the
+> local check weaker than CI.
 
 The bundled wrapper runs the full dependency gate first, then other available
 local scanners:

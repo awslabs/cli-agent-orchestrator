@@ -391,7 +391,7 @@ class TestValidateAgentProfileEndpoint:
 
     def test_schema_violation_is_an_error_with_a_path(self, client) -> None:
         """JSON-Schema failures must be error severity and carry the field path."""
-        content = "---\nname: test-agent\nengine: v3\n---\n\nBody.\n"
+        content = "---\nname: test-agent\nengine: v4\n---\n\nBody.\n"
         response = client.post("/agents/profiles/validate", json={"content": content})
 
         assert response.status_code == 200
@@ -618,7 +618,7 @@ class TestCreateAgentProfileEndpoint:
 
     def test_invalid_profile_is_rejected_and_not_written(self, client, write_store) -> None:
         """Validation runs before persistence, so nothing reaches disk."""
-        content = "---\nname: bad\nengine: v3\n---\n\nBody.\n"
+        content = "---\nname: bad\nengine: v4\n---\n\nBody.\n"
 
         response = client.post("/agents/profiles", json={"name": "bad", "content": content})
 
@@ -725,7 +725,7 @@ class TestReplaceAgentProfileEndpoint:
 
         response = client.put(
             "/agents/profiles/guarded",
-            json={"content": "---\nname: guarded\nengine: v3\n---\n\nBody.\n"},
+            json={"content": "---\nname: guarded\nengine: v4\n---\n\nBody.\n"},
         )
 
         assert response.status_code == 400
@@ -902,7 +902,7 @@ class TestWriteRejectionShape:
             "post: schema error",
             "post",
             "/agents/profiles",
-            {"name": "x", "content": "---\nname: x\nengine: v3\n---\n\nB.\n"},
+            {"name": "x", "content": "---\nname: x\nengine: v4\n---\n\nB.\n"},
         ),
         (
             "post: name mismatch",
@@ -958,7 +958,7 @@ class TestWriteRejectionShape:
         """A schema failure must say which field, so a form can render it."""
         response = client.post(
             "/agents/profiles",
-            json={"name": "x", "content": "---\nname: x\nengine: v3\n---\n\nB.\n"},
+            json={"name": "x", "content": "---\nname: x\nengine: v4\n---\n\nB.\n"},
         )
 
         errors = response.json()["detail"]["errors"]

@@ -80,12 +80,14 @@ than merely unimplemented.
 ## Managing plugins
 
 > [!NOTE]
-> The command verb below is **provisional**. It is recorded as maintainer
-> decision **M1** and is not settled: `docs/plugins.md` publicly promises
-> `cao plugin list / info / enable / disable` as a future surface for *event*
-> plugins, so taking the noun for agent plugins retracts a documented roadmap
-> item. This page documents the recommended option; the decision must be
-> recorded before the surface ships.
+> The command verb below is **decided**. Decision **M1** is recorded as
+> Option A (signed off by the issue author, 2026-09-18, in
+> [the #573 design](issues/573-agent-plugins/design.md)): `cao plugin` names
+> agent plugins. That retracts a roadmap item, because `docs/plugins.md` had
+> promised `cao plugin list / info / enable / disable` for *event* plugins;
+> event plugins get `cao event-plugin …` if that surface is built. Deciding the
+> verb did not ship it. The surface is still gated; see the "built but not
+> shipped" note further down this section.
 
 ```bash
 # Install from a local directory
@@ -162,14 +164,16 @@ The same operations are available over the HTTP API — `GET/POST /plugins`,
 
 > [!NOTE]
 > The whole management surface is **built but not shipped**. Requirement 16.5
-> forbids it reaching end users before **M1** is recorded, so it is off by
-> default and refuses to execute: the `cao plugin` command group and all four
+> forbade it reaching end users while **M1** was open. M1 is now decided, but
+> shipping is a separate maintainer decision, graduation, tracked in
+> [#1244](https://github.com/awslabs/cli-agent-orchestrator/issues/1244). Until
+> then the surface is off by default and refuses to execute: the `cao plugin` command group and all four
 > HTTP routes are gated on the `CAO_AGENT_PLUGINS_ENABLED` environment variable
 > (`1`/`true`/`yes`), the routes returning 404 and the command group erroring out
 > without it. The web **Plugins** tab is additionally gated off at build time by
 > `PLUGINS_TAB_ENABLED` in `web/src/featureFlags.ts`, and the four TUI rows are
 > `Policy::Hidden` and filtered out of the command palette entirely. To try the
-> surface before M1 lands, export the variable:
+> surface before it graduates, export the variable:
 >
 > ```bash
 > export CAO_AGENT_PLUGINS_ENABLED=1
@@ -284,6 +288,16 @@ the plugin root (`skill.link_escapes_root`), one whose target is missing
 of the package still install. A `skills/<name>` that is itself a symlink
 *contained* in the root stays permitted, as §4.1 requires.
 
+`cao plugin validate` also measures each loaded skill against the Agent Skills
+limits CAO's loader does not enforce: the name pattern `^[a-z0-9]+(-[a-z0-9]+)*$`
+(`skill.name_pattern`), a name of at most 64 characters (`skill.name_length`), a
+`description` of at most 1024 characters (`skill.description_length`), and a body
+of at most 500 lines after the frontmatter (`skill.body_length`). Each is a
+`WARNING`: CAO still loads and delivers the skill and the exit status is
+unchanged, but another Agent Skills client may reject it. The codes match the
+`cao-agent-plugin-audit` skill's validator, which reports the same conditions as
+failures.
+
 Copy-mode projections are assembled in a staging directory and moved into place
 with a single rename, so the projected path only ever contains a complete tree. A
 failed copy leaves nothing behind: unmarked content at a projected path would be
@@ -368,16 +382,22 @@ When the merge happens matters, and it is worth knowing as an operator:
 What "withdrawn" means depends on how a provider stores its config, and the
 difference is deliberate rather than an inconsistency:
 
-- **Kiro and Copilot** rewrite the agent's own file (`<name>.json`,
-  `<name>.agent.md`) wholesale on every refresh, so a removed plugin's server is
-  simply **absent** afterwards.
+- **Kiro** rewrites the agent's own file (`<name>.json`) wholesale on every
+  refresh, so a removed plugin's server is simply **absent** afterwards.
+- **Copilot** never stores plugin servers in a file. Its `<name>.agent.md`
+  carries only the agent's name, description and prompt, and the servers are
+  passed with `--additional-mcp-config` each time a terminal launches, which is
+  why the table above lists it as launch time. A removed plugin's server is
+  therefore absent from the next launch. A refresh still rewrites
+  `<name>.agent.md`, because its prompt bakes in the skill catalog.
 - **OpenCode** shares one `opencode.json` that CAO edits *in place*, and CAO must
   never delete a key it might not own. A removed plugin's server is therefore
   **disabled** (`"enabled": false`), not deleted: OpenCode will not spawn it, and
   re-installing the plugin re-enables it. The trade is that the disabled entry —
   with its now-dangling command — stays visible in `opencode mcp list` until you
-  remove it by hand. Pruning it outright needs provenance CAO does not yet record
-  and is tracked as a follow-up.
+  remove it by hand. CAO now records a fingerprint of each plugin server it writes
+  (see [`opencode-cli.md`](opencode-cli.md)), but still disables rather than
+  prunes withdrawn entries; pruning on that record is tracked as a follow-up.
 
 Server names collide the way skill names do, and are resolved by the same kind of
 rule rather than by timing. **A server your profile already declares always
@@ -484,18 +504,20 @@ Some entries are rejected, always with a report and never silently:
 
 ## CAO's own packages
 
-CAO ships itself as two agent plugins, so any Agent-Plugins-compatible client
-can drive a CAO session without CAO-specific integration code:
+CAO ships its own agent plugins, so any Agent-Plugins-compatible client can
+drive a CAO session, extend CAO, or author and audit an agent plugin without
+CAO-specific integration code:
 
 | Package | Install this if you are… | Skills | Also ships |
 |---|---|---|---|
 | [`cao`](../agent-plugin/cao) | **an operator** driving CAO from another client | `cao-session-management`, `cao-agent-routing`, `cao-supervisor-protocols`, `cao-worker-protocols` | the `cao-ops` MCP server |
-| [`cao-contributor`](../agent-plugin/cao-contributor) | **a contributor** extending CAO itself | `cao-provider`, `cao-plugin` | — |
+| [`cao-contributor`](../agent-plugin/cao-contributor) | **a contributor** extending CAO itself | `cao-provider`, `cao-plugin`, `cao-contributing` | — |
+| [`cao-agent-plugin-lifecycle`](../agent-plugin/cao-agent-plugin-lifecycle) | **an author** writing a new Agent Plugins 1.0.0 package or auditing an existing one | `cao-agent-plugin-creator`, `cao-agent-plugin-audit` | — |
 
 The skill names are the folder names you will see under
 `~/.aws/cli-agent-orchestrator/skills/` after installing, which is what makes a
 collision report readable when one of them clashes with a skill you already have.
-Both packages are generated from CAO's own `skills/` directory by
+Every package is generated from CAO's own `skills/` directory by
 `scripts/build_agent_plugin.py`, and `make check-agent-plugin` fails if the
 generated packages drift from it — so this table, the packages, and the shipped
 skills cannot disagree for long.
@@ -518,6 +540,9 @@ call. The version is pinned exactly, and the build refuses to write a pin that
 is not already published on PyPI. `cao-contributor` ships no `mcp.json` at all:
 authoring skills work through the host agent's own tools and need no CAO
 runtime, so the `uv` and `cao-server` prerequisites do not apply to it.
+`cao-agent-plugin-lifecycle` ships no `mcp.json` either: its skills need no CAO
+runtime, and the audit skill's validator is a standalone script that carries its
+own pinned copy of the schemas.
 
 The build also refuses to write a pin whose published `cao-ops-mcp-server` does
 not bound its HTTP requests, and it decides that by **inspecting the published
@@ -539,6 +564,16 @@ findings, allowlist agreement, `mcp.json` conformance — is unaffected. Strict
 equality lives behind `--check --require-current-pin`, which that job runs after
 it has pushed, so a forgotten repin is still caught, just not on everyone
 else's PR.
+
+To rebuild after editing a packaged skill without moving the pin, run
+`make agent-plugin-keep-pin` (`scripts/build_agent_plugin.py --keep-committed-pin`).
+It renders every package at the version the committed packages already pin, contacts
+no PyPI, and
+refuses, writing nothing, when the committed manifests are missing, unreadable or
+disagree, naming each package and its version. `make agent-plugin` renders at
+`pyproject.toml`'s version and so moves the pin; that is the release job's step.
+When `make check-agent-plugin` cannot tell the committed pin, it says why before
+listing the drift that follows.
 
 ```bash
 # From a clone
@@ -708,6 +743,110 @@ What each step asserts, and why it is the load-bearing one:
 
 The runnable example, the offline-vs-live assertion matrix, and the recorder are
 in [`examples/agent-plugins/agent-plugins-dogfood/`](../examples/agent-plugins/agent-plugins-dogfood/README.md).
+
+**`cao-agent-plugin-lifecycle` is not exercised by that recording**, which
+installs only `cao`. It is gated in CI by `make check-agent-plugin`, and it is
+**audited by a skill it carries**: the `cao-agent-plugin-audit` validator, run
+against the package, reported no fatal, skipped, limit or warning finding at the
+commit that added the package. That audit is not run in CI; rerun it by hand.
+
+```bash
+uv run --script skills/cao-agent-plugin-audit/scripts/validate_agent_plugin.py ./agent-plugin/cao-agent-plugin-lifecycle
+```
+
+At the commit that added the package, this exits `0` and ends with
+`summary: 0 fatal, 0 skipped, 0 limit, 0 warning, 1 advisory; exit 0`. The
+advisory is the listing of the manifest's description beside the skills that
+would load, which the audit prints whenever it reads a manifest, for a reader to
+compare. On the same
+package, `CAO_AGENT_PLUGINS_ENABLED=1 cao plugin validate
+./agent-plugin/cao-agent-plugin-lifecycle --json` reports `"loadable": true` and
+no findings, exit `0`.
+
+## Conformance to Agent Plugins 1.0.0
+
+This table maps each client requirement in Agent Plugins 1.0.0 to the CAO code that
+implements it and the test or corpus case that proves it. The rows follow the
+[client conformance checklist](https://agent-plugins.org/client-implementers/conformance)
+(21 items), with section numbers from the
+[specification](https://agent-plugins.org/specification). The checklist is
+non-normative, and the specification governs where they differ. The guide for
+client authors is
+[Implement an Agent Plugins client](https://agent-plugins.org/client-implementers/implement-an-agent-plugins-client).
+A checklist item is split into more than one row where CAO's status differs between
+its parts.
+
+The specification defines no conformance suite, so this table is CAO's own record,
+not a certification. Each test it names asserts the requirement on its row.
+
+Statuses:
+
+- **Implemented**: CAO does it, and the row names the evidence.
+- **Delegated**: CAO does not launch MCP servers. It writes them into each
+  provider's configuration or launch command (see
+  [Which providers receive plugin MCP servers](#which-providers-receive-plugin-mcp-servers)),
+  and the provider CLI starts and connects to them. A delegated row is a runtime
+  behaviour of that CLI, which CAO's tests do not observe.
+- **Not implemented**: the specification requires it and CAO does not do it.
+- **Not applicable**: the requirement binds someone other than this client.
+
+Code paths are relative to `src/cli_agent_orchestrator/agent_plugins/`, and line
+numbers are as of `381d21a3`. Test paths are relative to `test/agent_plugins/`. A
+corpus case is a directory under `fixtures/corpus/`, and
+`test_conformance_corpus.py::test_corpus_case` checks its expected findings in
+`fixtures/corpus/cases.json` as an exact set.
+
+### Plugin loader
+
+| # | Requirement | Spec | Status | CAO code | Proven by |
+|---|---|---|---|---|---|
+| 1 | Load a plugin from a directory, and reject package paths that resolve outside the root, including through symlinks | §4.1, §11.1.1 | Implemented | `validation.py:232` `validate_plugin`; `containment.py:48` `resolve_within_root`; `manifest.escapes_root` (`validation.py:328`), `skill.escapes_root`, `skill.link_escapes_root` (`:869`), `mcp.escapes_root` (`mcp_mapping.py:972`) | corpus `skill-escapes-root`, `skill-symlink-inside-root`; `test_validation.py::TestTotalityOnHostileInputs::test_manifest_symlinked_outside_the_root`; `test_nested_containment.py::TestNestedLinksAreValidatedBeforeAnythingIsCopied::test_a_nested_link_to_an_external_file_skips_only_that_skill`; `test_mcp_mapping.py::TestLoadAndMap::test_an_mcp_json_symlinked_outside_the_root_is_refused` |
+| 2 | Select local manifest rules from `$schema`, and never retrieve a schema while loading | §5.2 | Implemented | Vendored schemas pinned by sha256 in `schemas/agent_plugins/1.0.0/PIN.json`; `validation.py:155` `_refuse_retrieval`; `manifest.schema_unsupported` (`:450`) | corpus `manifest-unsupported-schema`; `test_schema_pin.py::TestOfflineValidation::test_valid_plugin_validates_with_sockets_blocked`, `::test_unknown_schema_is_rejected_offline_rather_than_fetched`; `test_schema_pin.py::TestRegistryRefusesRetrieval::test_remote_ref_resolution_is_refused` |
+| 3 | Validate the closed `plugin.json` schema, the required `$schema` and `name`, and the name constraints | §5.2, §5.3, §5.5 | Implemented | `manifest.schema_missing` (`validation.py:434`); `_schema_findings` (`:524`), which reports `manifest.invalid` and `manifest.name_invalid` (`:543`) | corpus `manifest-missing-name`, `manifest-bad-name`; `test_validation.py::TestManifestFatality::test_missing_schema_field_is_fatal`, `::test_name_constraint_violations_are_fatal` |
+| 4 | Report and ignore unknown top-level fields | §5.2 | Implemented | `manifest.unknown_field` (`validation.py:511`) | corpus `manifest-unknown-field`; `test_validation.py::TestManifestTolerances::test_unknown_top_level_field_is_a_warning_and_the_plugin_loads` |
+| 5 | Ignore a non-object `extensions`, and ignore unimplemented namespaces without validating their values | §8.1, §11.1.3 | Implemented. CAO implements no namespace, so every well-formed `extensions` member is dropped unread | `manifest.extensions_not_object` (`validation.py:493`); object-valued `extensions` dropped at `:502` | corpus `extensions-not-object`, `extensions-unimplemented-namespace`; `test_validation.py::TestManifestTolerances::test_extension_namespace_contents_are_never_validated` |
+| 6 | Reject other fatal manifest violations before discovering any component | §5.2, §11.3.2 | Implemented | `_validate_plugin_inner` (`validation.py:265`) returns before `_discover_skills` (`:580`) and `_map_mcp` (`:949`) run | corpus `manifest-missing`, `manifest-invalid-json`; `test_conformance_corpus.py::TestCanonicalExample::test_a_fatal_violation_rejects_before_any_component_loads` |
+
+### Discovery and isolation
+
+| # | Requirement | Spec | Status | CAO code | Proven by |
+|---|---|---|---|---|---|
+| 7 | Discover supported component types only from their fixed locations, and skills only one level deep | §6.1, §7.1 | Implemented | Fixed names `skills` and `mcp.json` (`validation.py:72-73`); `_discover_skills` reads immediate children only (`:624`) | corpus `mcp-present`; `test_validation.py::TestComponentDiscovery::test_skill_discovery_is_not_recursive` |
+| 8 | Treat a missing component location as valid absence | §6.2 | Implemented | `_discover_skills` and `load_and_map` (`mcp_mapping.py:958`) return no finding for an absent location | corpus `skills-absent`; `test_validation.py::TestComponentDiscovery::test_missing_skills_directory_is_not_an_error` |
+| 9a | Isolate an invalid component type, an invalid skill and an invalid MCP entry at their own boundaries | §6.2, §7.1, §7.2.2, §11.3.3 | Implemented | `skills.not_a_directory` (`validation.py:612`); `skill.missing_skill_md` (`:677`); `skill.invalid` (`:699`); `mcp.not_a_file` (`mcp_mapping.py:990`); `mcp.invalid_json` (`:1007`); `mcp.server_invalid` (`:681`) | corpus `skills-not-a-directory`, `skill-invalid-sibling`, `skill-missing-skill-md`, `mcp-invalid`; `test_validation.py::test_property_sibling_independence`; `test_validation.py::TestMcpComponentDiscovery::test_mcp_json_that_is_a_directory_is_skipped` |
+| 9b | Skip a skill that breaks the Agent Skills limits: the name pattern, the 64-character name, the 1024-character description and the 500-line body | §7.1 | **Not implemented**. CAO reports each as a `WARNING` and still loads the skill. Whether to enforce them is an open maintainer question | `agent_skills_limit_violations` (`src/cli_agent_orchestrator/utils/skills.py:232`, outside `agent_plugins/`), reported at `validation.py:719` | `test_skill_limits.py::TestEachLimit::test_a_broken_limit_is_a_warning_and_the_skill_still_loads`, which pins the current non-enforcing behaviour |
+| 10 | Ignore unsupported component types, and support at least one of skills or MCP servers | §7, §11.1.8, §11.3.1 | Implemented. CAO supports both | Discovery reads only the two fixed locations (`validation.py:72-73`), so nothing else in the package is read | Support: `test_validation.py::TestHappyPath::test_skills_are_discovered`, `test_validation.py::TestMcpComponentDiscovery::test_a_valid_mcp_json_is_mapped`. No test plants an unsupported component directory, such as a client-extension directory, and checks that it is ignored |
+
+### MCP support
+
+| # | Requirement | Spec | Status | CAO code | Proven by |
+|---|---|---|---|---|---|
+| 11 | Support at least one of stdio and Streamable HTTP | §7.2.1 (Transport support) | Implemented, per provider. Eight providers carry stdio, Streamable HTTP and SSE; `opencode_cli`, `codex` and `antigravity_cli` carry stdio only; `hermes` and `mock_cli` have no MCP path, which is reported as `mcp.provider_unsupported` | `PROVIDER_TRANSPORTS` (`mcp_mapping.py:103`) | `test_mcp_launch_delivery.py::TestEveryDeliveringProviderIsCovered::test_every_provider_type_has_a_transport_row`; `test_mcp_mapping.py::TestTransportMatrix::test_http_transports_map_for_providers_that_carry_them`, `::test_a_provider_with_no_mcp_path_reports_provider_unsupported` |
+| 12 | Use each entry's declared transport for the initial connection attempt | §7.2.1 (Transport support) | Delegated. CAO never substitutes a transport: an unsupported one is skipped with `mcp.transport_unsupported` (`mcp_mapping.py:771`, §7.2.2 rule 4). The connection attempt is the provider CLI's | `_map_entry` (`mcp_mapping.py:719`) | CAO's half: `test_mcp_mapping.py::TestTransportMatrix::test_an_unsupported_transport_is_skipped_not_substituted`; `test_mcp_launch_delivery.py::TestKimiCarriesTheDeclaredTransport::test_an_sse_plugin_server_reaches_kimi_as_transport_sse` |
+| 13 | Validate the closed top-level `mcp.json` and each server entry independently | §7.2.1, §7.2.2 | Implemented | `_document_errors` (`mcp_mapping.py:626`); `_server_errors` (`:646`) | corpus `mcp-invalid`; `test_mcp_mapping.py::TestTheDocumentEntryBoundary::test_one_invalid_server_does_not_drop_its_valid_siblings`; `::TestDocumentLevelFailures::test_an_unknown_top_level_key_still_disables_mcp` |
+| 14a | Keep a stdio `command` as one token, never split or placeholder-expanded, and resolve a `./` command against the plugin root | §7.2.1 (stdio) | Implemented | `_map_stdio` (`mcp_mapping.py:816`); `mcp.command_invalid` (`:835`); `mcp.command_escapes_root` (`:849`) | `test_mcp_mapping.py::TestCommandIsOneToken::test_a_command_with_spaces_is_not_split`, `::test_a_command_is_never_placeholder_expanded`, `::test_a_dot_rooted_command_is_resolved_inside_the_plugin`, `::test_a_dot_rooted_command_escaping_the_root_is_skipped` |
+| 14b | Resolve a bare `command` with the platform's executable search | §7.2.1 (stdio) | Delegated. CAO passes a bare name through unchanged, and the provider CLI that spawns the server resolves it | `_map_stdio` (`mcp_mapping.py:860`) | CAO's half: `test_mcp_mapping.py::TestCommandIsOneToken::test_a_bare_command_passes_through_untouched` |
+| 15a | Provide a dedicated, writable `PLUGIN_DATA` directory that survives plugin updates | §9.1 | Implemented. Created owner-only (`0o700`) at install, kept by `cao plugin add --force`, and kept on removal unless purged | `installer.py:198`; `store.py:122` `plugin_data_dir` | `test_installer.py::TestInstallHappyPath::test_install_creates_the_plugin_data_directory`; `test_store.py::TestPluginDataSurvivesUpdates::test_data_survives_a_publish_over_an_existing_name`; `test_install_ordering.py::TestDataDirectoryPrecedesPublish::test_reinstalling_preserves_existing_plugin_data`; `test_store.py::TestPermissions::test_store_directories_are_owner_only` |
+| 15b | Set `PLUGIN_ROOT` and `PLUGIN_DATA` after the configured `env`, and invalidate an entry that declares either name | §9.1, §9.2 | Implemented, in the server configuration CAO writes | `mcp.env_reserved_key` (`mcp_mapping.py:876`); both names set last (`:915-917`) | `test_mcp_mapping.py::TestCaoSuppliedEnv::test_plugin_root_and_data_are_injected`, `::test_a_plugin_declaring_a_reserved_key_invalidates_that_entry` |
+| 15c | Start the subprocess with that `env` overlaid on a base environment | §9.1 | Delegated. The provider CLI chooses the base environment and starts the process. CAO has not traced each provider's spawn path | n/a | none |
+| 16 | Expand only `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`, single-pass, only in `args`, `env` values and `cwd` | §9.2, §11.1.6 | Implemented | `expand_placeholders` (`mcp_mapping.py:275`), called only for `args`, `env` values and `cwd` in `_map_stdio` | `test_mcp_mapping.py::TestExpansionTargets::test_args_elements_are_expanded`, `::test_env_values_are_expanded_but_keys_are_not`, `::test_a_url_is_never_expanded`, `::test_header_names_and_values_are_never_expanded`; `test_mcp_mapping.py::test_property_only_the_two_placeholders_are_replaced`, `::test_property_expansion_is_single_pass`; `test_mcp_delivery.py::TestTheRealSeam::test_an_unrelated_placeholder_stays_literal_in_the_provider_config` |
+| 17a | Default `cwd` to the plugin root; accept only `./`-, `${PLUGIN_ROOT}`- or `${PLUGIN_DATA}`-rooted forms; contain each after expansion | §7.2.1 (stdio), §11.1.7 | Implemented. Providers without a native `cwd` key get a `/bin/sh -c 'cd …'` wrapper, or the entry is skipped with `mcp.cwd_unsupported` where `/bin/sh` is missing | Default at `mcp_mapping.py:891-893`; containment `mcp.cwd_escapes_root` (`:903`); the form is the `cwd` pattern in the pinned `mcp.schema.json`, enforced per entry by `_server_errors` | `test_mcp_mapping.py::TestExpansionTargets::test_cwd_defaults_to_the_plugin_root`, `::test_cwd_is_expanded_and_contained`, `::test_a_plugin_data_rooted_cwd_is_checked_against_plugin_data`; `::TestPerEntryIsolation::test_a_bad_cwd_invalidates_only_that_entry`; `::TestCwdShim::test_the_shim_rewrites_command_and_args_and_drops_cwd`; `::TestCwdUnavailable::test_stdio_entries_are_skipped_and_remote_siblings_still_map`. No test plants a `cwd` in another form, such as a bare `data` |
+| 17b | Remote `url`: absolute HTTP or HTTPS, no user information or fragment, HTTPS off loopback, never expanded | §7.2.1 (Streamable HTTP) | Implemented | `_remote_url_findings` (`mcp_mapping.py:495`); `mcp.url_invalid` (`:506`); `mcp.url_insecure` (`:545`) | `test_mcp_mapping.py::TestRemoteUrlSemantics::test_cleartext_http_is_refused_off_loopback`, `::test_cleartext_http_is_allowed_on_loopback`, `::test_a_structurally_prohibited_url_is_refused` |
+| 17c | Headers: valid HTTP fields, no name repeated under different casing, never expanded | §7.2.1 (Streamable HTTP) | Implemented | `_header_findings` (`mcp_mapping.py:552`) | `test_mcp_mapping.py::TestRemoteHeaderSemantics::test_an_invalid_header_refuses_only_that_entry`, `::test_names_differing_only_in_case_are_a_conflict` |
+| 17d | Never forward configured headers to another origin through a redirect or an SSE endpoint event without user authorization | §7.2.1 (Streamable HTTP) | Delegated. The provider CLI makes the HTTP connection | n/a | none |
+| 18 | Continue loading after an independent MCP server fails to start, connect, authenticate or complete the handshake | §7.2.2 rule 5, §11.3.3 | Delegated. These failures happen in the provider CLI. CAO's configuration-time isolation is row 13 | n/a | none |
+
+### Versioning
+
+| # | Requirement | Spec | Status | CAO code | Proven by |
+|---|---|---|---|---|---|
+| 19 | Require `mcp.json` to target the same specification version as `plugin.json`; a mismatch disables only MCP | §10.1, §7.2.2 rule 2 | Implemented. CAO pins one version, 1.0.0, so an `mcp.json` targeting another version is caught first by the unsupported-schema check and reported as `mcp.schema_unsupported`. The equality check covers a future second supported version | `mcp.schema_unsupported` (`mcp_mapping.py:361`); `mcp.schema_version_mismatch` (`:379`) | `test_validation.py::TestMcpComponentDiscovery::test_a_version_mismatched_mcp_json_disables_mcp`; `test_mcp_mapping.py::TestDocumentLevelFailures::test_a_version_mismatch_with_plugin_json_disables_mcp` |
+| 20 | Never reassign a published canonical schema identifier to different contents | §10.1 | Not applicable. This binds the specification's publishers. On the client side, CAO pins the bytes it was built against and fails a build when they drift | `schemas/agent_plugins/1.0.0/PIN.json` | `test_schema_pin.py::TestPinIntegrity::test_vendored_bytes_hash_to_the_recorded_value`; `::TestDriftGuard::test_check_fails_on_a_hash_mismatch` |
+| 21 | Let plugins keep targeting older versions under the client's compatibility policy | §10.1 | Implemented. CAO's policy is 1.0.0 only, the only published version, and any other version is rejected with `manifest.schema_unsupported` | `validation.py:450` | `test_validation.py::TestManifestFatality::test_unrecognized_schema_version_is_fatal_and_names_the_pin` |
+
+Two requirements fall outside the checklist and are covered above: the default
+working directory (§11.1.7) is row 17a, and the extension-directory rule (§8.2)
+applies only to a namespace a client implements, and CAO implements none.
 
 ## Security posture, stated plainly
 

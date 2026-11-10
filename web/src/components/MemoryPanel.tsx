@@ -5,6 +5,7 @@ import { ConfirmModal } from './ConfirmModal'
 import { Brain, Search, Trash2, ChevronDown, ChevronRight, List, Share2 } from 'lucide-react'
 import { CustomSelect } from './CustomSelect'
 import { MemoryGraphView } from './MemoryGraphView'
+import { MemoryExport } from './MemoryExport'
 
 type ViewMode = 'list' | 'graph'
 
@@ -214,9 +215,13 @@ export function MemoryPanel() {
             value={graphScopeId}
             onChange={e => setGraphScopeId(e.target.value)}
             placeholder="project scope_id (e.g. github-com-…)"
-            className="bg-gray-900 border border-gray-700 text-gray-200 text-xs rounded-lg px-3 py-2 w-72 focus:border-emerald-500 focus:outline-none font-mono"
+            className="bg-gray-900 border border-gray-700 text-gray-200 text-xs rounded-lg px-3 py-2 w-72 focus:border-emerald-500 focus:outline-hidden font-mono"
           />
         )}
+
+        <div className="ml-auto">
+          <MemoryExport memories={memories} />
+        </div>
       </div>
 
       {viewMode === 'graph' ? (
@@ -256,7 +261,7 @@ export function MemoryPanel() {
               value={search}
               onChange={e => setSearch(e.target.value)}
               placeholder="Filter keys..."
-              className="bg-gray-900 border border-gray-700 text-gray-200 text-xs rounded-lg pl-8 pr-3 py-1.5 w-48 focus:border-emerald-500 focus:outline-none"
+              className="bg-gray-900 border border-gray-700 text-gray-200 text-xs rounded-lg pl-8 pr-3 py-1.5 w-48 focus:border-emerald-500 focus:outline-hidden"
             />
           </div>
         </div>
@@ -297,7 +302,7 @@ export function MemoryPanel() {
                     {/* Delete */}
                     <button
                       onClick={e => { e.stopPropagation(); setPendingDelete(m) }}
-                      className="p-1.5 text-gray-500 hover:text-red-400 transition-colors rounded"
+                      className="p-1.5 text-gray-500 hover:text-red-400 transition-colors rounded-sm"
                       title="Delete memory"
                     >
                       <Trash2 size={14} />

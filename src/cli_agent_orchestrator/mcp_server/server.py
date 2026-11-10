@@ -352,7 +352,8 @@ if ENABLE_WORKING_DIRECTORY:
             description='Optional working directory where the agent should execute (e.g., "/path/to/workspace/src/Package")',
         ),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -393,7 +394,11 @@ if ENABLE_WORKING_DIRECTORY:
         3. Send the message to the terminal
         4. Monitor until completion
         5. Return the agent's response
-        6. Clean up the terminal with /exit
+        6. Report the teardown outcome. On success the result states whether the
+           worker terminal was torn down. On a timeout or worker error it names the
+           terminal and job and states the terminal was not torn down. When the
+           operator has turned on keeping finished agents, a successful worker is
+           kept instead, and the result says until when; CAO tears it down later.
 
         ## Working Directory
 
@@ -469,7 +474,8 @@ else:
             le=3600,
         ),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -508,7 +514,11 @@ else:
         2. Send the message to the terminal (starts in supervisor's current directory)
         3. Monitor until completion
         4. Return the agent's response
-        5. Clean up the terminal with /exit
+        5. Report the teardown outcome. On success the result states whether the
+           worker terminal was torn down. On a timeout or worker error it names the
+           terminal and job and states the terminal was not torn down. When the
+           operator has turned on keeping finished agents, a successful worker is
+           kept instead, and the result says until when; CAO tears it down later.
 
         ## Model
 
@@ -637,6 +647,11 @@ Returns:
 _assign_description = _build_assign_description(
     ENABLE_SENDER_ID_INJECTION, ENABLE_WORKING_DIRECTORY
 )
+_expect_callback_field_desc = (
+    "If true (default), the server guarantees you hear back: if the worker goes idle "
+    "without calling send_message, its last response is forwarded to you, and if it ends "
+    "you are told. Set false for fire-and-forget workers."
+)
 _assign_message_field_desc = (
     "The task message to send to the worker agent."
     if ENABLE_SENDER_ID_INJECTION
@@ -655,7 +670,8 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Optional working directory where the agent should execute"
         ),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -676,6 +692,10 @@ if ENABLE_WORKING_DIRECTORY:
                 description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
             ),
         ] = None,
+        expect_callback: bool = Field(
+            default=True,
+            description=_expect_callback_field_desc,
+        ),
     ) -> Dict[str, Any]:
         denied = _tool_denied_reason("assign")
         if denied:
@@ -689,6 +709,8 @@ if ENABLE_WORKING_DIRECTORY:
             use_worktree=use_worktree,
             target_host=target_host,
             description=description,
+            # A direct call passes the FieldInfo default; only an explicit False opts out.
+            expect_callback=expect_callback is not False,
         )
 
 else:
@@ -700,7 +722,8 @@ else:
         ),
         message: str = Field(description=_assign_message_field_desc),
         engine: Optional[str] = Field(
-            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+            default=None,
+            description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
         use_worktree: bool = Field(
@@ -721,6 +744,10 @@ else:
                 description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
             ),
         ] = None,
+        expect_callback: bool = Field(
+            default=True,
+            description=_expect_callback_field_desc,
+        ),
     ) -> Dict[str, Any]:
         denied = _tool_denied_reason("assign")
         if denied:
@@ -734,6 +761,8 @@ else:
             use_worktree=use_worktree,
             target_host=target_host,
             description=description,
+            # A direct call passes the FieldInfo default; only an explicit False opts out.
+            expect_callback=expect_callback is not False,
         )
 
 
@@ -793,7 +822,10 @@ async def assign_elastic(
             "contains."
         ),
     ),
-    engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
+    engine: Optional[str] = Field(
+        default=None,
+        description="Explicit Kiro engine for the worker (v2 or v3; kas is an alias of v3)",
+    ),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
     description: Annotated[
         Optional[str],
@@ -939,6 +971,14 @@ async def send_message(
             "this one via handoff/assign (the recorded caller)."
         ),
     ),
+    expect_reply: bool = Field(
+        default=False,
+        description=(
+            "Set true when messaging a terminal you did not assign and you are waiting for "
+            "its reply; the server then forwards its last response if it goes idle without "
+            "replying. Follow-ups to your own workers are tracked automatically."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Send a message to another terminal's inbox.
 
@@ -948,6 +988,11 @@ async def send_message(
     When receiver_id is omitted, the message goes to the recorded caller —
     the terminal that created this one via handoff/assign. This is the
     reliable way to send results back to your supervisor.
+
+    Any message from a worker to the terminal waiting on it counts as the
+    reply and ends that wait, including a progress note or a question; if
+    the worker then goes idle without a final reply, nothing more is
+    forwarded to the caller.
 
     An explicit receiver_id must be one of: a terminal you created via
     assign/handoff, the terminal that created you, or (when your profile
@@ -961,6 +1006,10 @@ async def send_message(
     Returns:
         Dict with success status and message details
     """
+    # Called directly (not through FastMCP), the unset default is the FieldInfo
+    # object, which is truthy. Only an explicit True asks for a reply.
+    if expect_reply is True:
+        return _send_message_impl(receiver_id, message, expect_reply=True)
     return _send_message_impl(receiver_id, message)
 
 
@@ -1023,9 +1072,10 @@ async def emit_ui(
 
     Lets an agent author a small, declarative UI intent (an approval card, a
     choice prompt, a diff summary, a progress/metric readout, …) that appears
-    live in any AG-UI client watching this fleet. The intent is validated
-    server-side against a frozen allow-list — arbitrary HTML/markup is never
-    accepted — so this is safe to call from any agent.
+    live on the fleet's AG-UI stream as a ``CUSTOM`` event named
+    ``cao.generative_ui``; a dashboard that handles that name renders it. The
+    intent is validated server-side against a frozen allow-list — arbitrary
+    HTML/markup is never accepted — so this is safe to call from any agent.
 
     Args:
         component: One of the allow-listed component names.
@@ -1113,12 +1163,17 @@ def delete_terminal(
     worker, so the node must run a cao-server that reports it (this release
     or later) and must not have restarted since the worker was created.
 
+    When the operator has turned on keeping finished agents for this machine,
+    an idle worker you created is kept instead of deleted, so people can look at
+    what it did afterwards. The result then says ``kept`` and until when; CAO
+    tears it down itself later, so there is nothing more for you to do.
+
     Args:
         terminal_id: The terminal ID to delete
         target_host: Remote CAO node hosting the terminal; omit for local
 
     Returns:
-        Dict with success status and message
+        Dict with success status and message (plus ``kept``/``kept_until`` when kept)
     """
     # Direct (non-MCP) invocation — e.g. existing unit tests calling the
     # function positionally — receives the pydantic FieldInfo object as the
@@ -1132,7 +1187,12 @@ def delete_terminal(
     # a real Optional[str] that needs no laundering.
     if not isinstance(target_host, str) or not target_host.strip():
         target_host = None
-    return _delete_terminal_impl(terminal_id, target_host=target_host)
+    # keep_if_enabled marks this as an AGENT's delete (#1225 phase 1): only this
+    # tool sends it, so every operator delete stays immediate. Remote workers are
+    # out of phase 1, so a target_host delete never asks for a keep.
+    return _delete_terminal_impl(
+        terminal_id, target_host=target_host, keep_if_enabled=target_host is None
+    )
 
 
 @mcp.tool()
@@ -1721,7 +1781,7 @@ async def create_ephemeral_agent(
         WithJsonSchema(
             {
                 "anyOf": [
-                    {"type": "string", "enum": list(ephemeral_providers())},
+                    {"type": "string", "enum": [*ephemeral_providers(), "auto"]},
                     {"type": "null"},
                 ]
             }
@@ -1758,7 +1818,9 @@ async def create_ephemeral_agent(
     The CAO-recorded tool list is bounded by the creator's effective list.
     This is not an OS privilege boundary or a per-tool MCP restriction.
     Codex tools are advisory when the operator enables Codex, and the response's
-    ``enforcement`` field reports ``hard`` or ``advisory``. The feature defaults
+    ``enforcement`` field reports ``hard`` or ``advisory``. ``provider="auto"`` lets
+    the operator's decider choose the CLI at launch, within the operator's declared
+    provider sets; it falls back to your own provider. The feature defaults
     off; see docs/ephemeral-agents.md for the full honesty statement.
     """
     return await _create_ephemeral_from_arguments(
@@ -1914,6 +1976,12 @@ async def memory_store(
     """
     from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, store_memory
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    # Checked before the remote branch, as in memory_recall: the owner applies
+    # its own switch, never this caller's (#1087).
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
 
     try:
         terminal_context = _get_terminal_context_from_env()
@@ -2078,6 +2146,12 @@ async def memory_forget(
     """
     from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    # Checked before the remote branch, as in memory_recall: the owner applies
+    # its own switch, never this caller's (#1087).
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
 
     try:
         terminal_context = _get_terminal_context_from_env()
@@ -2212,6 +2286,16 @@ async def report_outcome(
             "Conclusions only — never transcripts, logs, or file contents. Max 1000 chars."
         ),
     ),
+    terminal_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Join this outcome to one launch (issue #1082): the terminal id of the "
+            "worker this unit of work was performed by. Must be your own terminal "
+            "or one you created directly via assign/handoff (still allowed after it "
+            "was deleted); anything else is refused. The result's launch_linked "
+            "says whether a launch record was joined."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Record the outcome of a unit of agent work (self-learning signal).
 
@@ -2229,6 +2313,13 @@ async def report_outcome(
                 "success": False,
                 "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
             }
+        if terminal_id:
+            # Stops a live outsider before anything is posted. POST /outcomes
+            # is the authority: it re-checks against the stored launch record,
+            # which also covers a torn-down target this lookup cannot see.
+            denial = _target_binding_denial(terminal_id)
+            if denial:
+                return {"success": False, "error": denial}
         payload = mcp_utils.post_body_json(
             "/outcomes",
             {
@@ -2240,12 +2331,16 @@ async def report_outcome(
                 "source_terminal_id": terminal_context["terminal_id"],
                 "score": score,
                 "friction_notes": friction_notes,
+                "launch_terminal_id": terminal_id,
             },
             timeout=_mcp_timeout(),
         )
         # Only the id: the route returns the whole record, and echoing it would
         # newly surface friction_notes back to the agent that wrote them.
-        return {"success": True, "outcome_id": payload["outcome"]["id"]}
+        result: Dict[str, Any] = {"success": True, "outcome_id": payload["outcome"]["id"]}
+        if terminal_id:
+            result["launch_linked"] = payload.get("launch_linked") is True
+        return result
     except requests.RequestException as e:
         return _outcome_tool_error(e, "Failed to record outcome")
     except Exception as e:
