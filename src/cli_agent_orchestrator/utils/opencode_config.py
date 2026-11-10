@@ -304,23 +304,41 @@ def _recorded_grants(agent_name: str) -> Set[str]:
 
 
 def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
-    """Set (or clear) the sidecar row for *agent_name*, writing only on change."""
-    record = read_grant_record()
-    agents = record.setdefault("agents", {})
-    if not isinstance(agents, dict):  # pragma: no cover - read_grant_record guarantees dict
-        agents = {}
-        record["agents"] = agents
+    """Set (or clear) the sidecar row for *agent_name*, writing only on change.
+
+    Fails closed, like :func:`record_mcp_entry` (#1271, GH #737). A sidecar that
+    exists but cannot be read as a grant record is left exactly as it is, with a
+    warning naming it, and this agent's row goes unrecorded. Starting from the
+    empty default instead would publish it over the damaged file and drop every
+    other agent's row. The install still completes: ``opencode.json`` has been
+    written by then. Until the sidecar is repaired and the agent reinstalled, a
+    plugin server's grant is withdrawn by plugin-store containment, and a
+    profile server's grant (``cao-mcp-server*``, say) is left in place, which is
+    the conservative direction.
+    """
     desired = sorted(set(keys))
-    if desired:
-        if agents.get(agent_name) == desired:
-            return
-        agents[agent_name] = desired
-    else:
-        if agent_name not in agents:
-            return
-        agents.pop(agent_name)
-    record["version"] = 1
-    _write_grant_record(record)
+    # The write sits inside the try, as in record_mcp_entry, so the handler can
+    # only ever skip it and never publish a fallback (the #737 guard's rule).
+    try:
+        record = _load_grant_record_or_raise()
+        agents = record["agents"]
+        if desired:
+            if agents.get(agent_name) == desired:
+                return
+            agents[agent_name] = desired
+        else:
+            if agent_name not in agents:
+                return
+            agents.pop(agent_name)
+        record["version"] = 1
+        _write_grant_record(record)
+    except GrantRecordUnreadableError as exc:
+        logger.warning(
+            "opencode grant record is unreadable (%s); leaving it as it is and not "
+            "recording the grants of agent %s",
+            exc,
+            agent_name,
+        )
 
 
 def mcp_entry_fingerprint(config: Mapping[str, Any]) -> str:

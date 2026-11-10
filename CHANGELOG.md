@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
+  the sidecar beside `opencode.json` could not be read as a grant record, `cao install
+  --provider opencode_cli` started from an empty record and wrote it back, dropping every other
+  agent's recorded grants. It now leaves the file as it is, logs a warning that names it, and
+  does not record this agent's grants. The install still completes. Until the sidecar is
+  repaired and the agent reinstalled, a plugin server's grant is withdrawn by plugin-store
+  containment, and a profile server's grant (`cao-mcp-server*`, say) is left in place, the
+  conservative direction.
 - **`cao install` exits 1 when the install fails** (#1270). It printed `Error: <message>` and
   exited 0, so a script or CI step could not tell a failed install from a successful one. It
   now exits 1 with the same message on stderr, like the rest of the CLI. A script that relied
