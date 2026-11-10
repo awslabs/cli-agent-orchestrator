@@ -781,6 +781,16 @@ class Runner:
             return backend.get_pane_working_directory(session, window)
         if op == "get_pane_current_command":
             return backend.get_pane_current_command(session, window)
+        if op == "merge_user_json":
+            # This runner's own home: an allowlisted file id, never a path.
+            from cli_agent_orchestrator.utils.user_settings import merge_user_json
+
+            updates = args.get("updates")
+            if not isinstance(updates, dict):
+                raise ValueError("merge_user_json needs an object of updates")
+            return merge_user_json(str(args.get("file")), updates)
+        if op == "execution_user_is_root":
+            return getattr(os, "geteuid", lambda: -1)() == 0
         if op == "pipe_pane":
             key = (session, window)
             pipe_id = args.get("pipe_id")

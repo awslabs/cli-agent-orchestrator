@@ -4,10 +4,11 @@ Defines the contract that all terminal backends (tmux, herdr, etc.) must satisfy
 Core services depend only on this ABC, never on a concrete backend directly.
 """
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -516,6 +517,23 @@ class TerminalBackend(ABC):
         server then leaves path validation to the host that owns the path.
         """
         return True
+
+    def merge_user_json(
+        self, session_name: str, window_name: str, file_id: str, updates: Dict[str, Any]
+    ) -> bool:
+        """Merge ``updates`` into an allowlisted user settings file of the terminal's host.
+
+        For a backend whose terminals run beside the server that is this host's
+        file (``utils.user_settings``); a backend that runs them elsewhere
+        merges it there. True when the file changed.
+        """
+        from cli_agent_orchestrator.utils.user_settings import merge_user_json
+
+        return merge_user_json(file_id, updates)
+
+    def execution_user_is_root(self, session_name: str, window_name: str) -> bool:
+        """Whether the terminal's host runs its panes as root (this host, by default)."""
+        return getattr(os, "geteuid", lambda: -1)() == 0
 
     def unsupported_provider_reason(self, provider: str) -> Optional[str]:
         """Why this backend cannot launch ``provider``, or None if it can."""

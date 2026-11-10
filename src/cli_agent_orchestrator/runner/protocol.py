@@ -113,6 +113,10 @@ OPS = frozenset(
         "pipe_pane",
         "stop_pipe_pane",
         "stage_files",
+        # Execution-host facts and preparation a provider launch needs (#745):
+        # answered on the runner, never on the server's host.
+        "merge_user_json",
+        "execution_user_is_root",
     }
 )
 
