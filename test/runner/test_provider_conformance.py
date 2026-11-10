@@ -133,6 +133,18 @@ class _Sandbox:
             os.path.abspath(os.fspath(d)) for d in profile_store
         ]
         self.writable = [os.path.join(cao_home, n) for n in CONTROL_PLANE_WRITE]
+        # The same directory under its resolved name (macOS: /tmp and /var are
+        # symlinks into /private) is mapped back to the name used above, so a
+        # provider that resolves its paths is judged and recorded alike.
+        # Computed now, before the sandbox patches os.lstat.
+        self._aliases = sorted(
+            {
+                os.path.realpath(r): r
+                for r in (self.home, self.cao_home, self.cwd, self.scratch, *self.read_scope)
+                if os.path.realpath(r) != r
+            }.items(),
+            key=lambda item: -len(item[0]),
+        )
         self.violations: List[str] = []
         self._lock = threading.Lock()
         self._active = False
@@ -167,7 +179,14 @@ class _Sandbox:
 
         return run
 
+    def canonical(self, text: str) -> str:
+        for real, alias in self._aliases:
+            if text == real or text.startswith(real + os.sep):
+                return alias + text[len(real) :]
+        return text
+
     def record(self, kind: str, detail: str) -> None:
+        detail = " ".join(self.canonical(word) for word in detail.split(" "))
         detail = detail.replace(self.cao_home, "$CAO_HOME").replace(self.home, "~")
         with self._lock:
             if f"{kind}: {detail}" not in self.violations:
@@ -187,7 +206,7 @@ class _Sandbox:
         text = self._text(path)
         if text is None or "__pycache__" in text:
             return None
-        return os.path.abspath(text)
+        return self.canonical(os.path.abspath(text))
 
     @staticmethod
     def _under(text, roots) -> bool:
@@ -365,6 +384,28 @@ def sandbox(monkeypatch, tmp_path, tmp_path_factory):
         monkeypatch.setattr(os, name, guard_open(f"os.{name}", getattr(os, name), never))
     for name in ("mkdir", "chmod", "unlink", "rmdir"):
         monkeypatch.setattr(os, name, guard_open(f"os.{name}", getattr(os, name), always))
+    # Path.mkdir(exist_ok=True) and os.makedirs(exist_ok=True) swallow an error
+    # when the directory already exists here, so a refused os.mkdir alone would
+    # let the launch carry on or stop depending on what this host happens to
+    # hold (a /tmp left by an earlier run). Refuse them before they look.
+    import pathlib
+
+    real_path_mkdir = pathlib.Path.mkdir
+
+    def path_mkdir(self, *args, **kwargs):
+        if box.watching() and box.host_write(self, "os.mkdir"):
+            refuse_write("Path.mkdir", self)
+        return real_path_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "mkdir", path_mkdir)
+    real_makedirs = os.makedirs
+
+    def makedirs(name, *args, **kwargs):
+        if box.watching() and box.host_write(name, "os.mkdir"):
+            refuse_write("os.makedirs", name)
+        return real_makedirs(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "makedirs", makedirs)
     # Moves and links write their destination (Path.symlink_to is os.symlink).
     for name in ("replace", "rename", "symlink", "link"):
         real_move = getattr(os, name)
@@ -519,6 +560,9 @@ def test_the_sandbox_records_every_primitive_from_every_kind_of_thread(sandbox):
             os.open(scratch / "p2", os.O_CREAT | os.O_WRONLY)
         ),
         "os.mkdir outside": lambda: os.mkdir(scratch / "d"),
+        # Refused even where the directory already exists (exist_ok swallows that).
+        "Path.mkdir exist_ok on an existing dir": lambda: scratch.mkdir(exist_ok=True),
+        "os.makedirs exist_ok on an existing dir": lambda: os.makedirs(scratch, exist_ok=True),
         "os.replace outside": lambda: os.replace(target, scratch / "moved"),
         "os.symlink outside": lambda: os.symlink(target, scratch / "ln"),
         "Path.symlink_to outside": lambda: (scratch / "ln2").symlink_to(target),
@@ -687,12 +731,11 @@ def test_every_other_provider_is_refused_before_its_launch_code_runs(provider_na
 # relative to the server's HOME), pinned so a port removes entries on purpose.
 KNOWN_VIOLATIONS: Dict[str, List[str]] = {
     "antigravity_cli": [
-        "host read: os.stat ~/.gemini/config",
         "host read: os.stat ~/.gemini/config/mcp_config.json",
         "which: agy",
         "which: cao-mcp-server",
+        "write: Path.mkdir ~/.gemini/config",
         "write: open ~/.gemini/config/mcp_config.json.tmp",
-        "write: os.mkdir ~/.gemini/config",
     ],
     "copilot_cli": ["command: ~/.copilot", "spawn: subprocess.run copilot"],
     "cursor_cli": ["which: agent", "which: cursor-agent"],
@@ -705,14 +748,13 @@ KNOWN_VIOLATIONS: Dict[str, List[str]] = {
         "host read: os.stat $CAO_HOME/grok/terminals/<terminal>",
         "uid: geteuid",
         "which: grok",
-        "write: os.mkdir $CAO_HOME/grok/terminals/<terminal>",
+        "write: Path.mkdir $CAO_HOME/grok/terminals/<terminal>",
     ],
     "kimi_cli": [
         "host read: os.stat /tmp/cao_kimi_<uid>",
         "host read: os.stat /tmp/cao_kimi_<uid>/<digest>",
         "uid: getuid",
-        "write: os.mkdir /tmp/cao_kimi_<uid>",
-        "write: os.mkdir /tmp/cao_kimi_<uid>/<digest>",
+        "write: Path.mkdir /tmp/cao_kimi_<uid>",
     ],
     "mcode": [
         "host read: os.lstat $CAO_HOME/providers",
@@ -721,12 +763,11 @@ KNOWN_VIOLATIONS: Dict[str, List[str]] = {
         "host read: os.stat $CAO_HOME/providers/minimax_code",
         "host read: os.stat $CAO_HOME/providers/minimax_code/<digest>",
         "which: mcode",
-        "write: os.mkdir $CAO_HOME/providers/minimax_code/<digest>",
+        "write: Path.mkdir $CAO_HOME/providers/minimax_code/<digest>",
     ],
     "omp": [
-        "host read: os.stat $CAO_HOME/tmp/omp/aaaaaaaa",
         "which: omp",
-        "write: os.mkdir $CAO_HOME/tmp/omp/aaaaaaaa",
+        "write: Path.mkdir $CAO_HOME/tmp/omp/aaaaaaaa",
     ],
     "opencode_cli": ["spawn: subprocess.run opencode"],
     # codex, hermes and kiro_cli record nothing from initialize(); Kiro's
