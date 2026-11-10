@@ -431,3 +431,27 @@ def test_a_tombstone_only_peer_does_not_keep_the_session(real_db, runtime):
     assert backend.session_exists(SESSION) is False
     assert session_env.get_session_env(SESSION) == {}
     assert "tomb1277" in _rows(SESSION)
+
+
+class _JoinThenUnconfirmedKillUnknownSessionBackend(_JoinThenUnconfirmedKillBackend):
+    """The kill returns False, and the strict lookup cannot say whether the session exists."""
+
+    def session_exists_strict(self, session_name):
+        raise RuntimeError("list-sessions failed")
+
+
+def test_unconfirmed_kill_with_an_unknown_session_leaves_a_joined_row_alone(real_db, runtime):
+    """No confirmed kill and no strict "absent": the joined peer may be alive, so no sweep."""
+    backend = _JoinThenUnconfirmedKillUnknownSessionBackend(
+        SESSION, "peer1277", "w-peer1277", "false"
+    )
+    set_backend(backend)
+    _seed_incarnation(backend, ("c1277", "w-c1277"), [])
+
+    terminal_service._roll_back_cancelled_create(SESSION, "c1277", "w-c1277", created_session=True)
+
+    assert backend.joined_record_id is not None
+    assert "peer1277" in _rows(SESSION)
+    record = database.get_launch_record("peer1277")
+    assert record["end_reason"] is None
+    assert record["ended_at"] is None

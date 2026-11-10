@@ -422,3 +422,19 @@ async def test_busy_with_no_pre_launch_shell_reading_is_not_accepted(real_db):
             frames=[RESUMED_LONG],
             pane_commands=(None, "claude"),
         )
+
+
+@pytest.mark.asyncio
+async def test_busy_with_a_failed_deadline_reading_is_not_accepted(real_db):
+    """The pre-launch shell was read, but the deadline reading fails: fail closed.
+
+    An unreadable foreground process is not evidence that ``claude`` is running.
+    """
+    provider = _provider()
+    with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
+        await _initialize(
+            provider,
+            status_at_deadline=TerminalStatus.PROCESSING,
+            frames=[RESUMED_LONG],
+            pane_commands=("zsh", None),
+        )
