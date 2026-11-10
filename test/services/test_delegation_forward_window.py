@@ -111,11 +111,13 @@ def world(monkeypatch):
 
     monkeypatch.setattr(InboxService, "_confirm_submitted", confirm)
     # Forwards are delivered on a background thread in production; inline here,
-    # so each test sees the delivery (and the evaluation made inside it) at once.
+    # through the evaluator's own seam, so each test sees the delivery (and the
+    # evaluation made inside it) before it asserts, whatever earlier tests did
+    # to the inbox singleton.
     monkeypatch.setattr(
-        InboxService,
-        "deliver_pending_in_background",
-        lambda self, terminal_id: self.deliver_pending(terminal_id),
+        svc,
+        "_deliver",
+        lambda receiver_id, _sender_id: inbox_module.inbox_service.deliver_pending(receiver_id),
     )
     for terminal_id in (TOP, SUP, W1):
         _finished_turn(monitor, terminal_id)

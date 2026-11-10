@@ -94,11 +94,14 @@ def launch_http(release_runtime, monkeypatch):
     # on its own thread: the in-memory store shares one SQLite connection
     # across threads, and a delivery thread that runs on beside the delete (or
     # past the test) would interleave its transactions with the test's.
+    # Patched on the class: monkeypatch restores an instance attribute by setting
+    # it to the bound method it read, which would leave the singleton shadowing
+    # the class method (and any later class-level patch) for every later test.
     monkeypatch.setattr(inbox_service, "INBOX_SUBMIT_CONFIRMATION", False)
     monkeypatch.setattr(
-        inbox_service.inbox_service,
+        inbox_service.InboxService,
         "deliver_pending_in_background",
-        inbox_service.inbox_service.deliver_pending,
+        lambda self, terminal_id: self.deliver_pending(terminal_id),
     )
     monkeypatch.setattr(terminal_service, "send_input", lambda *a, **kw: None)
     monkeypatch.setattr(terminal_service, "get_output", lambda *a: "done")
