@@ -343,7 +343,9 @@ codex/large         gpt-5.5-pro        2000000  medium  yes           yes       
 rule: covered (long_context, read_only) · tie-break: only · pick: codex/large
 ```
 
-The helper then runs `codex --model gpt-5.5-pro` inside Codex's sandbox class (read-only or workspace-write, no network), where tool atoms are advisory and Codex always has a confined shell; the note says
+The helper then runs `codex --model gpt-5.5-pro` inside Codex's sandbox class (read-only or
+workspace-write, no network), where tool atoms are advisory and Codex always has a confined shell;
+the note says
 `ran on gpt-5.5-pro (auto: medium 0.90, matched long_context+read_only -> codex large)`.
 
 **Today** the same command prints `codex (advisory)` and
