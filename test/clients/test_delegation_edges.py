@@ -154,8 +154,12 @@ def test_bulk_row_deletion_closes_edges_in_both_directions(db):
     create_delegation_edge("w1", "w2", EdgeSource.ASSIGN)
     create_delegation_edge("w2", "w1", EdgeSource.SEND_MESSAGE, message_id=4)
     untouched = create_delegation_edge("sup", "w3", EdgeSource.ASSIGN)
+    # "gone" has no row (another owner deleted it); its edge closes all the same.
+    create_delegation_edge("sup", "gone", EdgeSource.ASSIGN)
 
     assert delete_terminals_by_ids(["w1", "gone"], end_reason="session_teardown") == 1
+
+    assert list_open_edges_into("gone") == []
 
     assert list_open_edges_into("w1") == []
     assert list_open_edges_out_of("w1") == []
