@@ -234,6 +234,11 @@ jobs:
   cao-mcp-apps:
     name: CAO MCP Apps
     runs-on: ubuntu-latest
+    # Bounds a hung test (#1273 review). "Backend coverage" below runs the same
+    # pytest suite as Unit Tests; over 60 runs this job took a mean of 33.3 min
+    # and a max of 37.9, so 60 matches Unit Tests and is 1.6x the slowest.
+    # Unbounded, a hang held the runner for GitHub's default of 360 min.
+    timeout-minutes: 60
 
     # Per-tier test timing budgets (Requirement 20.3), surfaced as env so the
     # vitest tiers (Phase II+) and CI can enforce them:
