@@ -16,10 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sidecar beside `opencode.json` could not be read as a grant record, `cao install
   --provider opencode_cli` started from an empty record and wrote it back, dropping every other
   agent's recorded grants. It now leaves the file as it is, logs a warning that names it, and
-  does not record this agent's grants. The install still completes. Until the sidecar is
-  repaired and the agent reinstalled, a plugin server's grant is withdrawn by plugin-store
-  containment, and a profile server's grant (`cao-mcp-server*`, say) is left in place, the
-  conservative direction.
+  does not record this agent's grants. The install still completes. A plugin server's grant
+  is still withdrawn by plugin-store containment. A reinstall after the sidecar is repaired
+  records the servers the profile then names; a profile server's grant (`cao-mcp-server*`,
+  say) that was added while the sidecar was damaged, and that the profile no longer names,
+  stays until you remove it by hand.
 - **`cao install` exits 1 when the install fails** (#1270). It printed `Error: <message>` and
   exited 0, so a script or CI step could not tell a failed install from a successful one. It
   now exits 1 with the same message on stderr, like the rest of the CLI. A script that relied

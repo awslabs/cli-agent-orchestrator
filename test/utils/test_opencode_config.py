@@ -534,6 +534,39 @@ class TestGrantRecord:
         if call == "upsert":
             assert tools == {"cao-mcp-server*": True}
 
+    @pytest.mark.parametrize("damaged_first", [True, False], ids=["damaged", "intact"])
+    def test_a_profile_grant_added_while_damaged_outlives_the_repair(
+        self, tmp_config: Path, caplog, damaged_first: bool
+    ):
+        """Known behaviour (#1273 review): nothing records a grant added while the
+        sidecar is damaged, so once the profile drops that server no proof covers
+        its key, and it stays after the repair until it is removed by hand. With
+        the sidecar intact, the same steps withdraw it. A second profile server the
+        profile keeps is unaffected either way, and its row is pinned too.
+        """
+        tmp_config.parent.mkdir(parents=True)
+        sidecar = tmp_config.with_name("cao-grants.json")
+        if damaged_first:
+            sidecar.write_text("{not json", encoding="utf-8")
+        # An install while damaged (or not) adds two profile servers' grants.
+        with caplog.at_level(logging.WARNING):
+            upsert_agent_tools("developer", ["cao-mcp-server", "x-server"])
+        if damaged_first:
+            assert any("stays until removed by hand" in r.getMessage() for r in caplog.records), [
+                r.getMessage() for r in caplog.records
+            ]
+            # Repaired by hand: the operator restores the row they know about.
+            sidecar.write_text(
+                '{"version": 1, "agents": {"developer": ["cao-mcp-server*"]}}', encoding="utf-8"
+            )
+        # The profile drops x-server, keeps cao-mcp-server, and is reinstalled twice.
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        tools = json.loads(tmp_config.read_text())["agent"]["developer"]["tools"]
+        assert ("x-server*" in tools) is damaged_first, tools
+        assert tools["cao-mcp-server*"] is True
+        assert json.loads(sidecar.read_text())["agents"] == {"developer": ["cao-mcp-server*"]}
+
     @pytest.mark.parametrize("damage", ["mode-000", "directory"])
     def test_an_unreadable_sidecar_is_left_intact_and_named(self, tmp_config: Path, caplog, damage):
         if damage == "mode-000" and hasattr(os, "geteuid") and os.geteuid() == 0:

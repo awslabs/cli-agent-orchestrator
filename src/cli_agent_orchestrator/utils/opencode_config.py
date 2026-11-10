@@ -311,10 +311,12 @@ def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
     warning naming it, and this agent's row goes unrecorded. Starting from the
     empty default instead would publish it over the damaged file and drop every
     other agent's row. The install still completes: ``opencode.json`` has been
-    written by then. Until the sidecar is repaired and the agent reinstalled, a
-    plugin server's grant is withdrawn by plugin-store containment, and a
-    profile server's grant (``cao-mcp-server*``, say) is left in place, which is
-    the conservative direction.
+    written by then. A plugin server's grant is still withdrawn by plugin-store
+    containment. A reinstall after the sidecar is repaired records the servers
+    the profile then names, so a profile server's grant (``cao-mcp-server*``,
+    say) that was added while the sidecar was damaged, and that the profile no
+    longer names, has no proof left and stays until it is removed by hand
+    (#1273 review).
     """
     desired = sorted(set(keys))
     # The write sits inside the try, as in record_mcp_entry, so the handler can
@@ -335,7 +337,9 @@ def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
     except GrantRecordUnreadableError as exc:
         logger.warning(
             "opencode grant record is unreadable (%s); leaving it as it is and not "
-            "recording the grants of agent %s",
+            "recording the grants of agent %s. A profile server's grant added now "
+            "stays until removed by hand if the profile drops that server before the "
+            "agent is reinstalled over a repaired file",
             exc,
             agent_name,
         )
