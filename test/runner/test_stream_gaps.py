@@ -271,7 +271,10 @@ class TestResync:
         assert manager.calls == []
 
     def test_the_backend_retries_until_the_resync_lands(self, monitor, manager, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
         monkeypatch.setattr(fifo_mod, "fifo_manager", manager)
+        monkeypatch.setattr(terminal_service, "ensure_stream_reader", lambda tid: True)
         monkeypatch.setattr(rb_mod, "_RESYNC_RETRY_DELAY", 0.0)
         attempts = []
         real = manager.resync
@@ -281,18 +284,24 @@ class TestResync:
             return real(terminal_id) if len(attempts) > 2 else False
 
         manager.resync = flaky
-        _idle(monitor)
+        # The worker registry is module-global: start clean, with an id no
+        # other test's worker can still be running for.
+        manager._pane_probe["rrrrrrrr"] = manager._pane_probe.pop("aaaaaaaa")
+        manager._rearm["rrrrrrrr"] = manager._rearm.pop("aaaaaaaa")
+        monkeypatch.setattr(rb_mod, "_resyncing", set())
+        monkeypatch.setattr(rb_mod, "_resync_again", set())
+        _idle(monitor, "rrrrrrrr")
         monitor.on_stream_gap = rb_mod._request_resync
-        monitor.mark_stream_gap("aaaaaaaa")
+        monitor.mark_stream_gap("rrrrrrrr")
         for _ in range(200):
-            if monitor.stream_gap_generation("aaaaaaaa") is None:
+            if monitor.stream_gap_generation("rrrrrrrr") is None:
                 break
             import time
 
             time.sleep(0.01)
-        assert monitor.get_status("aaaaaaaa") is TerminalStatus.IDLE
-        assert attempts == ["aaaaaaaa"] * 3
-        assert "aaaaaaaa" not in rb_mod._resyncing
+        assert monitor.get_status("rrrrrrrr") is TerminalStatus.IDLE
+        assert attempts == ["rrrrrrrr"] * 3
+        assert "rrrrrrrr" not in rb_mod._resyncing
 
 
 def test_a_gap_frame_reaches_the_status_monitor_through_the_backend(monitor, tmp_path):

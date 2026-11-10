@@ -371,7 +371,6 @@ class RunnerHub:
         self._ownership: Optional[Callable[[str, str], Optional[bool]]] = None
         self._reachability: Optional[Callable[[List[str], bool], None]] = None
         self._stream_gap: Optional[Callable[[str], None]] = None
-        self._rearm: Optional[Callable[[List[Tuple[str, str, str]]], None]] = None
         self._reconcile_lock = threading.Lock()
         # runner_id -> (reports per terminal, unknown terminals awaiting the
         # registry's verdict with the window each was reported in);
@@ -557,7 +556,9 @@ class RunnerHub:
                 report = self._replace_runner_routes(
                     info.runner_id, hello.get("terminals") or [], hello.get("creating") or []
                 )
-                lost_pipes = self._lost_pipes_locked(info.runner_id, hello.get("pipes"))
+                restore = self._streams_to_restore_locked(
+                    info.runner_id, hello.get("pipes"), report
+                )
                 self._save_state_locked()
                 self._changed.notify_all()
         if refuse:
@@ -569,8 +570,14 @@ class RunnerHub:
             f"pool={info.accepts_unclaimed}, max_terminals={info.max_terminals})"
         )
         await ws.send(json.dumps({"type": "welcome", "protocol": PROTOCOL_VERSION}))
+        # Gaps first, reachability second: clearing "unreachable" republishes
+        # the last detected status, and for a stream that lost output (or has
+        # no reader at all after a server restart) that status is stale. A
+        # stale IDLE would let the inbox type into a pane nobody has seen
+        # since. The gap keeps it UNKNOWN until a resync restores the stream.
+        for terminal_id in restore:
+            self._report_stream_gap(terminal_id)
         self._after_report(info.runner_id, report)
-        self._start_rearm(info.runner_id, lost_pipes)
 
         try:
             async for raw in ws:
@@ -971,7 +978,6 @@ class RunnerHub:
         *,
         ownership: Optional[Callable[[str, str], Optional[bool]]] = None,
         reachability: Optional[Callable[[List[str], bool], None]] = None,
-        rearm: Optional[Callable[[List[Tuple[str, str, str]]], None]] = None,
         stream_gap: Optional[Callable[[str], None]] = None,
     ) -> None:
         """Connect the hub to the server's registry and status detector.
@@ -981,16 +987,15 @@ class RunnerHub:
         never writes the row, so no report can move a terminal's placement;
         ``reachability(terminal_ids, reachable)`` tells the
         status detector a runner went out of (or back in) reach;
-        ``rearm([(session, window, fifo_path)])`` re-opens the output pipes a
-        restarted runner process no longer has; ``stream_gap(terminal_id)`` says a
-        terminal's output stream lost bytes (a sink overflow or a sequence gap),
-        so status derived from it is not to be trusted. The hub stays free of database
+        ``stream_gap(terminal_id)`` says a terminal's output stream lost bytes (a
+        sink overflow, a sequence gap, a pipe a restarted runner or server no
+        longer has), so status derived from it is not to be trusted until a
+        resync restores the stream. The hub stays free of database
         and status imports, and testable without them.
         """
         self._ownership = ownership
         self._stream_gap = stream_gap
         self._reachability = reachability
-        self._rearm = rearm
 
     def seed_placements(self, placements: Iterable[Dict[str, str]]) -> None:
         """Restore routes from the registry's persisted placements at startup.
@@ -1051,41 +1056,37 @@ class RunnerHub:
                 for stale in [t for t, (_, at) in pending.items() if now - at > _PLACEMENT_GRACE]:
                     del pending[stale]
 
-    def _lost_pipes_locked(self, runner_id: str, pipes: Any) -> List[Tuple[str, str, str]]:
-        """Open sinks for this runner's routed windows whose pipe it no longer runs.
+    def _streams_to_restore_locked(self, runner_id: str, pipes: Any, report: _Report) -> List[str]:
+        """Terminals a runner's hello claims whose output stream must be restored.
 
-        A reconnect of the same process keeps its pipes (and replays their
-        buffered output). A NEW process that re-adopted surviving panes has
-        none, so without re-arming, the server would detect status from a
-        stream that silently stopped. A runner that does not list its pipes
-        is taken to have them all.
+        After a server restart the hub has no pipe for any route; after a
+        runner restart the new process runs none of the pipes the hub has. A
+        runner that does not list its pipes is taken to run all of those the
+        hub knows. A terminal that has no pipe yet because its create is still
+        arming one (being placed, or just placed) is left to that create; once
+        the hub has a pipe the runner does not run, the stream is lost however
+        new the terminal is.
         """
-        if not isinstance(pipes, list):
-            return []
-        live = {p for p in pipes if isinstance(p, str)}
-        lost: List[Tuple[str, str, str]] = []
-        for (rid, session, window), pipe_id in self._pipe_of.items():
-            sink = self._sinks.get(pipe_id)
-            if rid != runner_id or pipe_id in live or sink is None:
+        live = {p for p in pipes if isinstance(p, str)} if isinstance(pipes, list) else None
+        restore: List[str] = []
+        for (session, window), terminal_id in report.accepted.items():
+            if not terminal_id:
                 continue
-            if (session, window) in self._routes:
-                lost.append((session, window, sink.fifo_path))
-        return lost
+            pipe_id = self._pipe_of.get((runner_id, session, window))
+            if pipe_id is None:
+                if terminal_id not in self._placing and terminal_id not in self._settling:
+                    restore.append(terminal_id)
+            elif live is not None and pipe_id not in live:
+                restore.append(terminal_id)
+        return restore
 
-    def _start_rearm(self, runner_id: str, lost: List[Tuple[str, str, str]]) -> None:
-        if not lost or self._rearm is None:
+    def _report_stream_gap(self, terminal_id: str) -> None:
+        if self._stream_gap is None:
             return
-        logger.info(f"runner {runner_id} lost {len(lost)} output pipe(s); re-arming")
-        rearm = self._rearm
-
-        def run() -> None:
-            try:
-                rearm(lost)
-            except Exception:  # noqa: BLE001 - retried on the next reconnect
-                logger.exception(f"could not re-arm output pipes on runner {runner_id}")
-
-        # pipe_pane is a hub call, which the hub thread itself may not make.
-        threading.Thread(target=run, name=f"runner-rearm-{runner_id}", daemon=True).start()
+        try:
+            self._stream_gap(terminal_id)
+        except Exception:  # noqa: BLE001 - status is advisory; routing must go on
+            logger.exception(f"runner hub: stream gap callback failed for {terminal_id}")
 
     def _notify_reachability(self, terminal_ids: List[str], reachable: bool) -> None:
         if not terminal_ids or self._reachability is None:
@@ -1178,8 +1179,11 @@ class RunnerHub:
                 return False
             self._routes[key] = _Route(runner_id=runner_id, terminal_id=terminal_id)
             del self._unconfirmed[terminal_id]
+            has_pipe = (runner_id, key[0], key[1]) in self._pipe_of
             self._save_state_locked()
             self._changed.notify_all()
+        if not has_pipe:
+            self._report_stream_gap(terminal_id)  # before reachability, as on a hello
         self._notify_reachability([terminal_id], True)
         logger.info(f"terminal {terminal_id} confirmed on runner {runner_id}; routed")
         return True

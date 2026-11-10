@@ -1133,6 +1133,63 @@ Prompt.
         mock_create_terminal.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("session_alive", [True, False])
+    @patch("cli_agent_orchestrator.services.flow_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_execute_flow_retains_rows_when_a_reader_does_not_stop(
+        self,
+        mock_db_get,
+        mock_update_times,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_status_monitor,
+        mock_provider_manager,
+        mock_create_terminal,
+        mock_send_input,
+        mock_delete_terminals,
+        mock_fifo_manager,
+        session_alive,
+    ):
+        """A reader stop that fails keeps the rows, in both recycle branches (#745)."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(
+                "---\nname: stuck-reader-flow\nschedule: '* * * * *'\nagent_profile: developer\n---\nPrompt.\n"
+            )
+            f.flush()
+            mock_flow = Flow(
+                name="stuck-reader-flow",
+                file_path=f.name,
+                schedule="* * * * *",
+                agent_profile="developer",
+                provider="mock_cli",
+                script="",
+                enabled=True,
+                next_run=datetime.now(),
+            )
+        mock_db_get.return_value = mock_flow
+        mock_get_backend.return_value.session_exists.return_value = session_alive
+        mock_list_terminals.return_value = [{"id": "ffff0005"}]
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_provider_manager.cleanup_provider.return_value = True
+        mock_fifo_manager.stop_reader.return_value = False  # timed out
+
+        assert await execute_flow("stuck-reader-flow") is False
+        mock_fifo_manager.stop_reader.assert_called_once_with("ffff0005")
+        mock_delete_terminals.assert_not_called()
+        mock_create_terminal.assert_not_called()
+        from cli_agent_orchestrator.services import terminal_service
+
+        terminal_service.forget_stream_lifecycle("ffff0005")
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")

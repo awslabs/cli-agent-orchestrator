@@ -209,6 +209,41 @@ def _is_terminal_busy(terminal_id: str) -> bool:
         return False
 
 
+def _stop_recycled_stream(terminal_id: str) -> bool:
+    """Tear down a recycled terminal's event-driven pipeline; False if its reader survived.
+
+    Stops the FIFO reader thread (and unlinks its *.fifo file) and clears the
+    StatusMonitor buffers. Without this, repeated flow runs leak background
+    reader threads and stale FIFO files / status entries. Under the stream
+    lifecycle lock, with the terminal marked closing first, as a terminal
+    teardown does: a stream restore (remote backend, after a restart) either
+    finished before or never recreates the reader afterwards. A reader that
+    did not stop (``stop_reader`` timed out or raised) makes the recycle keep
+    the terminal's row, its retry handle, as an incomplete provider cleanup
+    does; dropping the row would leave a tracked reader nobody can stop.
+    """
+    from cli_agent_orchestrator.services.terminal_service import (
+        mark_stream_closing,
+        stream_lifecycle,
+    )
+
+    stopped = True
+    with stream_lifecycle(terminal_id):
+        mark_stream_closing(terminal_id)
+        try:
+            if fifo_manager.stop_reader(terminal_id) is False:
+                logger.warning(f"FIFO reader for {terminal_id} did not stop")
+                stopped = False
+        except Exception as e:
+            logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
+            stopped = False
+        try:
+            status_monitor.clear_terminal(terminal_id)
+        except Exception as e:
+            logger.warning(f"Failed to clear status buffers for {terminal_id}: {e}")
+    return stopped
+
+
 def _delete_recycled_terminal_rows(terminal_ids: List[str]) -> None:
     """Release names only after the existing bulk deletion succeeds."""
     if delete_terminals_by_ids(terminal_ids, end_reason="session_teardown"):
@@ -216,6 +251,10 @@ def _delete_recycled_terminal_rows(terminal_ids: List[str]) -> None:
 
         for terminal_id in terminal_ids:
             ephemeral_service.release(terminal_id, "terminal_gone")
+        from cli_agent_orchestrator.services.terminal_service import forget_stream_lifecycle
+
+        for terminal_id in terminal_ids:
+            forget_stream_lifecycle(terminal_id)  # their rows are gone
 
 
 async def execute_flow(name: str) -> bool:
@@ -319,24 +358,14 @@ async def execute_flow(name: str) -> bool:
             if conductor and await asyncio.to_thread(_is_terminal_busy, conductor["id"]):
                 logger.info(f"Flow {name}: session {session_name} is busy, skipping")
                 return False
+            cleanup_complete = True
             for t in terminals:
-                # Tear down the event-driven pipeline for each recycled terminal:
-                # stop the FIFO reader thread (and unlink its *.fifo file) and clear
-                # the StatusMonitor buffers. Without this, repeated flow runs leak
-                # background reader threads and stale FIFO files / status entries.
-                try:
-                    fifo_manager.stop_reader(t["id"])
-                except Exception as e:
-                    logger.warning(f"Failed to stop FIFO reader for {t['id']}: {e}")
-                try:
-                    status_monitor.clear_terminal(t["id"])
-                except Exception as e:
-                    logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
+                if not _stop_recycled_stream(str(t["id"])):
+                    cleanup_complete = False
             backend.kill_session(session_name)
             # A provider's private state must outlive the process that owns
             # it.  Grok cleanup confirms any escaped updater has stopped
             # before recursively deleting its private GROK_HOME.
-            cleanup_complete = True
             for t in terminals:
                 # Do not bulk-delete DB rows if a Grok private home is still
                 # owned by a process we cannot safely inspect. Retained rows
@@ -367,6 +396,10 @@ async def execute_flow(name: str) -> bool:
             ]
             cleanup_complete = True
             for terminal_metadata in cleanup_rows:
+                # The session is gone, but a reader for its terminal may not
+                # be (a restore may have recreated one): stopped here as well.
+                if not _stop_recycled_stream(str(terminal_metadata["id"])):
+                    cleanup_complete = False
                 if provider_manager.cleanup_provider(terminal_metadata["id"]) is False:
                     cleanup_complete = False
             if not cleanup_complete:

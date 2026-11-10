@@ -53,14 +53,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Re-arming the output pipes a restarted runner lost: attempts, and the base
-# delay between them (linear backoff).
-_REARM_ATTEMPTS = 3
-_REARM_RETRY_DELAY = 2.0
-
-# A stream gap is answered by a resync (a fresh pane snapshot); retried this
+# A stream gap, or a stream a restarted runner or server lost, is answered by a
+# resync (reader ensured, pipe re-armed, a fresh pane snapshot); retried this
 # many times, this many seconds apart times the attempt, before it waits for
-# the next gap.
+# the next gap or report.
 _RESYNC_ATTEMPTS = 5
 _RESYNC_RETRY_DELAY = 1.0
 
@@ -110,7 +106,6 @@ class RemoteBackend(TerminalBackend):
         hub.bind(
             ownership=_terminal_owned,
             reachability=_mark_reachability,
-            rearm=self._rearm_pipes,
             stream_gap=_mark_stream_gap,
         )
         from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -160,30 +155,6 @@ class RemoteBackend(TerminalBackend):
         if port:
             env["CAO_API_PORT"] = port
         return env
-
-    def _rearm_pipes(self, lost: List[Tuple[str, str, str]]) -> None:
-        """Re-open each lost pipe, retrying briefly.
-
-        A window still failing after the retries is left to the FIFO liveness
-        watchdog, which re-arms a pane whose content moves while its FIFO stays
-        silent.
-        """
-        pending = list(lost)
-        for attempt in range(_REARM_ATTEMPTS):
-            failed: List[Tuple[str, str, str]] = []
-            for session_name, window_name, fifo_path in pending:
-                try:
-                    self.pipe_pane(session_name, window_name, fifo_path)
-                except Exception as exc:  # noqa: BLE001 - one window must not stop the rest
-                    logger.warning(
-                        f"re-arming output of {session_name}:{window_name} failed "
-                        f"(attempt {attempt + 1}/{_REARM_ATTEMPTS}): {exc}"
-                    )
-                    failed.append((session_name, window_name, fifo_path))
-            if not failed:
-                return
-            pending = failed
-            time.sleep(_REARM_RETRY_DELAY * (attempt + 1))
 
     def placement_of(self, terminal_id: str) -> Optional[str]:
         located = self._hub.route_for_terminal(terminal_id) if self._hub is not None else None
@@ -740,6 +711,7 @@ def _request_resync(terminal_id: str) -> None:
 
 
 def _resync_worker(terminal_id: str) -> None:
+    from cli_agent_orchestrator.services import terminal_service
     from cli_agent_orchestrator.services.fifo_reader import fifo_manager
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -750,8 +722,19 @@ def _resync_worker(terminal_id: str) -> None:
             for attempt in range(_RESYNC_ATTEMPTS):
                 if status_monitor.stream_gap_generation(terminal_id) is None:
                     break  # cleared (or the terminal is gone)
-                if fifo_manager.resync(terminal_id):
-                    break
+                # Under the stream lifecycle lock a teardown also takes, so a
+                # delete never runs between the reader and the pipe being
+                # restored, and nothing is restored once it has begun.
+                with terminal_service.stream_lifecycle(terminal_id):
+                    if not terminal_service.ensure_stream_reader(terminal_id):
+                        # Being torn down, or gone: nothing left to restore,
+                        # and no later request for it may find a worker here.
+                        with _resync_lock:
+                            _resyncing.discard(terminal_id)
+                            _resync_again.discard(terminal_id)
+                        return
+                    if fifo_manager.resync(terminal_id):
+                        break
                 time.sleep(_RESYNC_RETRY_DELAY * (attempt + 1))
             else:
                 logger.warning(
@@ -764,8 +747,11 @@ def _resync_worker(terminal_id: str) -> None:
                     _resyncing.discard(terminal_id)
                     return
     except BaseException:
+        # One exit for a failure too: neither registry may keep a terminal
+        # whose worker is gone, or no later gap would start another.
         with _resync_lock:
             _resyncing.discard(terminal_id)
+            _resync_again.discard(terminal_id)
         raise
 
 

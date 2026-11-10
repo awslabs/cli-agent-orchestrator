@@ -18,6 +18,7 @@ Terminal Workflow:
 """
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import json
@@ -31,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import requests
 from pydantic import ValidationError
@@ -70,6 +71,7 @@ from cli_agent_orchestrator.clients.database import (
     list_siblings_by_group_prefix,
     list_terminals_by_session,
     mark_terminal_identity_verified,
+    terminal_exists,
     terminal_id_in_use,
     update_last_active,
     update_terminal_deferred_init_external_owner,
@@ -3172,13 +3174,7 @@ async def _create_terminal_unguarded(
             # NOT a bare pipe_pane() — a stalled pane still reports pane_pipe=1,
             # so the backend's ``pipe-pane -o`` toggle would just switch the
             # dead pipe OFF instead of restarting it.
-            def _probe_pane(s=session_name, w=window_name) -> str:
-                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
-
-            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
-                get_backend().stop_pipe_pane(s, w)
-                get_backend().pipe_pane(s, w, p)
-
+            _probe_pane, _rearm_pipe = _pipe_reader_hooks(session_name, window_name, fifo_path)
             fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
 
             # Configure pipe-pane to stream output to the FIFO. This enables
@@ -6716,6 +6712,82 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
     return metadata
 
 
+def _pipe_reader_hooks(
+    session_name: str, window_name: str, fifo_path: Path
+) -> Tuple[Callable[[], str], Callable[[], None]]:
+    """The liveness probe and re-arm a pipe-pane terminal's FIFO reader is enrolled with.
+
+    The re-arm does stop-then-start, NOT a bare pipe_pane(): a stalled pane
+    still reports pane_pipe=1, so the backend's ``pipe-pane -o`` toggle would
+    just switch the dead pipe OFF instead of restarting it.
+    """
+
+    def probe(s: str = session_name, w: str = window_name) -> str:
+        return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+    def rearm(s: str = session_name, w: str = window_name, p: str = str(fifo_path)) -> None:
+        get_backend().stop_pipe_pane(s, w)
+        get_backend().pipe_pane(s, w, p)
+
+    return probe, rearm
+
+
+# Per-terminal stream lifecycle (#745): a stream restore (ensure_stream_reader
+# plus the resync that re-arms the pipe) and a teardown's pipe/reader stop take
+# the same lock, and a teardown marks the terminal closing so no restore runs
+# after it. The marker is forgotten with the row.
+_STREAM_LIFECYCLE_GUARD = threading.Lock()
+_STREAM_LIFECYCLE_LOCKS: Dict[str, threading.RLock] = {}
+_STREAMS_CLOSING: Set[str] = set()
+
+
+@contextlib.contextmanager
+def stream_lifecycle(terminal_id: str) -> Iterator[None]:
+    """Hold ``terminal_id``'s stream lifecycle lock (re-entrant)."""
+    with _STREAM_LIFECYCLE_GUARD:
+        lock = _STREAM_LIFECYCLE_LOCKS.setdefault(terminal_id, threading.RLock())
+    with lock:
+        yield
+
+
+def mark_stream_closing(terminal_id: str) -> None:
+    """Refuse any later stream restore of ``terminal_id``: its teardown has begun."""
+    with _STREAM_LIFECYCLE_GUARD:
+        _STREAMS_CLOSING.add(terminal_id)
+
+
+def forget_stream_lifecycle(terminal_id: str) -> None:
+    """Drop ``terminal_id``'s stream lifecycle state once it is known to have no row."""
+    with _STREAM_LIFECYCLE_GUARD:
+        _STREAMS_CLOSING.discard(terminal_id)
+        _STREAM_LIFECYCLE_LOCKS.pop(terminal_id, None)
+
+
+def ensure_stream_reader(terminal_id: str) -> bool:
+    """Make sure ``terminal_id`` has a FIFO reader; False if it must not have one.
+
+    For a terminal that outlived this process (the remote backend reseeds its
+    route after a restart) nothing recreated the reader its output stream
+    needs. Created here exactly as at launch, with the same probe and re-arm.
+    Refused for a terminal being torn down or without a row. The caller holds
+    :func:`stream_lifecycle` and re-arms the pipe after this.
+    """
+    with _STREAM_LIFECYCLE_GUARD:
+        closing = terminal_id in _STREAMS_CLOSING
+    if closing:
+        return False
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        return False
+    if fifo_manager.has_reader(terminal_id):
+        return True
+    fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+    probe, rearm = _pipe_reader_hooks(metadata["tmux_session"], metadata["tmux_window"], fifo_path)
+    fifo_manager.create_reader(terminal_id, pane_probe=probe, rearm=rearm)
+    logger.info(f"recreated the FIFO reader of terminal {terminal_id}")
+    return True
+
+
 def dismantle_terminal_runtime(
     terminal_id: str,
     metadata: Optional[Dict],
@@ -6823,26 +6895,32 @@ def dismantle_terminal_runtime(
         except Exception as e:
             logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
 
-    if metadata and kill_window and not tombstone:
-        # Stop pipe-pane logging. Before the FIFO steps below, so the pane stops
-        # writing to the FIFO before its reader (and the FIFO file) go away.
-        try:
-            get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
-        except Exception as e:
-            logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+    # Marked closing first, under the stream lifecycle lock: a stream restore
+    # (remote backend, after a restart) that is about to recreate this
+    # terminal's reader and pipe either finished before this point or refuses
+    # from here on, so neither outlives the teardown (see ensure_stream_reader).
+    with stream_lifecycle(terminal_id):
+        mark_stream_closing(terminal_id)
+        if metadata and kill_window and not tombstone:
+            # Stop pipe-pane logging. Before the FIFO steps below, so the pane stops
+            # writing to the FIFO before its reader (and the FIFO file) go away.
+            try:
+                get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+            except Exception as e:
+                logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
 
-    # Deliberately OUTSIDE the `if metadata:` block below: both of these need
-    # only terminal_id. Gating them on metadata meant a failed snapshot (a
-    # `get_terminal_metadata` that raised, or "database is locked") skipped them,
-    # orphaning the FIFO reader thread and the status-detector buffers for a
-    # terminal whose row the by-id sweep then deleted anyway -- a reader with
-    # nothing left to read from and no record it exists.
-    try:
-        if fifo_manager.stop_reader(terminal_id) is False:
+        # Deliberately OUTSIDE the `if metadata:` block: both of these need
+        # only terminal_id. Gating them on metadata meant a failed snapshot (a
+        # `get_terminal_metadata` that raised, or "database is locked") skipped them,
+        # orphaning the FIFO reader thread and the status-detector buffers for a
+        # terminal whose row the by-id sweep then deleted anyway -- a reader with
+        # nothing left to read from and no record it exists.
+        try:
+            if fifo_manager.stop_reader(terminal_id) is False:
+                runtime_complete = False
+        except Exception as e:
+            logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
             runtime_complete = False
-    except Exception as e:
-        logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
-        runtime_complete = False
 
     # Clear state detector buffers for this terminal
     try:
@@ -6942,6 +7020,10 @@ def delete_terminal_row(
         _delete_deferred_init_complete_fallback(terminal_id)
     if deleted:
         ephemeral_service.release(terminal_id, "terminal_gone")
+    if deleted or not terminal_exists(terminal_id):
+        # Absent, whichever call removed the row (or none ever existed): the
+        # closing marker and lock have nothing left to guard.
+        forget_stream_lifecycle(terminal_id)
     logger.info(f"Deleted terminal: {terminal_id}")
     if deleted and metadata:
         dispatch_plugin_event(
