@@ -9194,16 +9194,20 @@ def _ws_input_refusal(
 # Reading is not always delivering. tmux cannot tell a lone Escape from the
 # start of an escape sequence, so it keeps a trailing ``\x1b`` as a partial key
 # until its ``escape-time`` timer expires, and only then sends it to the pane
-# that is active AT THAT TIME. So a frame that ends in Escape leaves an "Escape
-# hold" on its window: other terminals wait it out before they select a pane.
-# The terminal that sent it does not wait: its own next bytes resolve the
-# partial key while its own pane is still the active one.
+# that is active AT THAT TIME. It does the same with a trailing ``\x1b[`` or
+# ``\x1b]`` (Alt+[ and Alt+]), which also start longer sequences. So a frame
+# that ends in any of these leaves an "Escape hold" on its window: other
+# terminals wait it out before they select a pane. The terminal that sent it
+# does not wait: its own next bytes resolve the partial key while its own pane
+# is still the active one.
 # How long a writer waits for tmux to read its input before it lets the window
 # go anyway (tmux stalled), and the poll step while it waits.
 _WEB_INPUT_DRAIN_TIMEOUT_S = 2.0
 _WEB_INPUT_DRAIN_POLL_S = 0.002
 # The Escape hold when the backend cannot say how long its key timer is.
 _WEB_INPUT_ESCAPE_HOLD_FALLBACK_S = 0.55
+# Frame endings tmux keeps as a partial key: Escape, Alt+[ and Alt+].
+_WEB_INPUT_PARTIAL_KEYS = (b"\x1b", b"\x1b[", b"\x1b]")
 
 
 class _WebInputWindow:
@@ -9254,7 +9258,7 @@ class _WebInputWindow:
 
     def after_write(self, owner: object, raw: bytes, escape_hold_s: float) -> None:
         """Record whether ``owner``'s frame left tmux holding a partial Escape."""
-        if raw.endswith(b"\x1b"):
+        if raw.endswith(_WEB_INPUT_PARTIAL_KEYS):
             if self.hold_owner is None:
                 self.hold_released = asyncio.Event()
             self.hold_owner = owner

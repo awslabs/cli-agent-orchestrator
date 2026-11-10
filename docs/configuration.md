@@ -402,23 +402,28 @@ its own window.
 **Keys** reach only the agent the terminal belongs to. tmux keeps one active
 pane per window, not per client, so cao-server selects the terminal's pane
 before every input it forwards and holds that window until tmux has read the
-input, so a paste in one terminal and a key in another cannot interleave. A key
-that ends in Escape holds the window a little longer: tmux keeps a lone Escape
-until its `escape-time` runs out (10 ms by default since tmux 3.5, 500 ms
-before), in case more of an escape sequence follows, and only then delivers it
-to the pane that is active. So for at least half a second after Escape, other
-web terminals on the same window wait before their next key, and a terminal
-opened on that window in that time selects its pane only afterwards. The
-terminal that sent Escape does not wait. Input whose pane cannot be selected is
-dropped rather than sent to whichever pane is active, and a terminal whose pane
-cannot be found is not attached.
+input, so a paste in one terminal and a key in another cannot interleave. Input
+that ends in Escape, Alt+[ or Alt+] holds the window a little longer: tmux keeps
+these as a partial key until its `escape-time` runs out (10 ms by default since
+tmux 3.5, 500 ms before), in case more of an escape sequence follows, and only
+then delivers them to the pane that is active. So after such a key, other web
+terminals on the same window wait before their next key, and a terminal opened
+on that window in that time selects its pane only afterwards. The wait lasts
+until the sending terminal's next key or until `escape-time` runs out, counted
+as at least 500 ms, so it is at most about half a second with tmux's defaults.
+The terminal that sent the key does not wait. Input whose pane cannot be
+selected is dropped rather than sent to whichever pane is active, and a terminal
+whose pane cannot be found is not attached.
 
 **The mouse** works as it does in tmux: a click or the wheel acts on the pane
 under the pointer, even another agent's tile. A click makes that pane the
-active one; your next key goes to your own agent again. The wheel puts the pane
-under the pointer into copy mode, where it reads keys as copy-mode commands, so
-an agent scrolled that way does not see what is typed to it until copy mode
-ends: press `q` in that agent's terminal (or scroll back to the bottom).
+active one; your next key goes to your own agent again. The wheel goes to the
+program in the pane under the pointer if that program uses the mouse or (since
+tmux 3.6) is in the alternate screen, as full-screen agent CLIs usually are.
+Otherwise it puts that pane into copy mode, where it reads keys as copy-mode
+commands, so an agent scrolled that way does not see what is typed to it until
+copy mode ends: press `q` in that agent's terminal (or scroll back to the
+bottom).
 
 One case is outside cao-server's reach: selecting another pane by hand, from a
 real terminal attached to the same window, in the instant between cao-server's

@@ -327,6 +327,22 @@ class TestALoneEscapeHoldsTheWindow:
         assert seen == [main_module._WEB_INPUT_ESCAPE_HOLD_FALLBACK_S]
 
     @pytest.mark.asyncio
+    async def test_a_failed_read_falls_back_to_a_safe_hold(self):
+        seen = []
+        real_after_write = main_module._WebInputWindow.after_write
+
+        def spy(self, owner, raw, escape_hold_s):
+            seen.append(escape_hold_s)
+            return real_after_write(self, owner, raw, escape_hold_s)
+
+        with _pty_attach(self._plan) as state:
+            state.backend.web_input_escape_hold.side_effect = Exception("tmux went away")
+            with patch.object(main_module._WebInputWindow, "after_write", spy):
+                await _attach([_input("\x1b")])
+
+        assert seen == [main_module._WEB_INPUT_ESCAPE_HOLD_FALLBACK_S]
+
+    @pytest.mark.asyncio
     async def test_window_terminals_never_ask_for_the_hold(self):
         with _pty_attach((_ARGV, None)) as state:
             await _attach([_input("\x1b")])
@@ -341,8 +357,25 @@ class TestWebInputWindow:
 
         window.after_write(a, b"\x1b[A", 5.0)  # a whole arrow-key sequence
         assert window.hold_owner is None
+        window.after_write(a, b"\x1b]0;title\x07", 5.0)  # a whole OSC sequence
+        assert window.hold_owner is None
         window.after_write(a, b"abc\x1b", 5.0)
         assert window.hold_owner is a
+
+    @pytest.mark.parametrize(
+        "frame",
+        [b"\x1b[", b"\x1b]", b"abc\x1b[", b"abc\x1b]"],
+        ids=["alt[", "alt]", "x+alt[", "x+alt]"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_trailing_alt_bracket_leaves_a_hold(self, frame):
+        """tmux keeps ``\\x1b[`` and ``\\x1b]`` as partial keys too, like a lone Escape."""
+        window, a = main_module._WebInputWindow(), object()
+
+        window.after_write(a, frame, 5.0)
+        assert window.hold_owner is a
+        window.after_write(a, b"x", 5.0)
+        assert window.hold_owner is None
 
     @pytest.mark.asyncio
     async def test_only_the_owner_skips_the_hold(self):
@@ -389,6 +422,66 @@ class TestWebInputWindow:
         started = time.monotonic()
         await window.wait_for_hold(b)
         assert time.monotonic() - started >= 0.2
+
+    @pytest.mark.asyncio
+    async def test_waiting_out_a_new_hold_does_not_starve_the_event_loop(self):
+        """A hold after a release needs a fresh Event: waiting on the old, set
+        one returns at once, and the wait loop would spin without yielding."""
+        window, a, b = main_module._WebInputWindow(), object(), object()
+        window.after_write(a, b"\x1b", 5.0)
+        window.after_write(a, b"x", 5.0)  # released: the Event is set
+        window.after_write(a, b"\x1b", 0.2)
+
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(ticker())
+        await asyncio.sleep(0)  # let the ticker start
+        try:
+            await window.wait_for_hold(b)
+        finally:
+            task.cancel()
+        assert ticks >= 5
+
+    @pytest.mark.asyncio
+    async def test_a_second_escape_keeps_the_waiters_event(self):
+        """A repeated Escape extends the hold; it must not orphan the Event a
+        waiter is already on, or the owner's release would not wake it."""
+        window, a, b = main_module._WebInputWindow(), object(), object()
+        window.after_write(a, b"\x1b", 5.0)
+
+        started = time.monotonic()
+        waiter = asyncio.create_task(window.wait_for_hold(b))
+        await asyncio.sleep(0.05)  # b is waiting on the hold's Event
+        window.after_write(a, b"\x1b", 5.0)
+        window.after_write(a, b"x", 5.0)
+        await asyncio.wait_for(waiter, timeout=1.0)
+        assert time.monotonic() - started < 1.0
+
+    @pytest.mark.asyncio
+    async def test_a_hold_that_starts_while_queued_on_the_lock_is_waited_out(self):
+        """``turn`` re-checks the hold once it has the lock: a hold can start
+        between a terminal's wait and its turn at the lock."""
+        window, a, b = main_module._WebInputWindow(), object(), object()
+        b_entered = asyncio.Event()
+
+        async def b_turn():
+            async with window.turn(b):
+                b_entered.set()
+
+        async with window.turn(a):
+            waiter = asyncio.create_task(b_turn())
+            await asyncio.sleep(0.05)  # no hold yet: b is queued on the lock
+            assert not b_entered.is_set()
+            held_at = time.monotonic()
+            window.after_write(a, b"\x1b", 0.2)
+        await asyncio.wait_for(waiter, timeout=2.0)
+        assert time.monotonic() - held_at >= 0.2
 
 
 class TestTheAttachFailsClosed:
