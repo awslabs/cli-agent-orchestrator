@@ -439,6 +439,28 @@ class TestEdgesThatCanNeverBeArmed:
         assert [m.message for m in get_inbox_messages(W1, limit=5)][-1] == "again"
         assert edge.message_id == get_inbox_messages(W1, limit=5)[-1].id
 
+    def test_dialog_refusal_keeps_the_edge_open_until_the_retry_delivers(self, world, monkeypatch):
+        """WAITING_USER_ANSWER is transient: the message stays PENDING and its edge OPEN."""
+        typed = inbox_module.terminal_service.dispatch_input.side_effect
+        monkeypatch.setattr(
+            inbox_module.terminal_service.dispatch_input,
+            "side_effect",
+            TerminalInputBlockedError(
+                "dialog open", reason=TerminalInputBlockedReason.WAITING_USER_ANSWER
+            ),
+        )
+        _send(SUP, W1, "follow-up")
+
+        (edge,) = list_open_edges_into(W1)
+        assert edge.delivered_at is None
+        assert _notices_to(SUP) == []
+
+        monkeypatch.setattr(inbox_module.terminal_service.dispatch_input, "side_effect", typed)
+        inbox_module.inbox_service.deliver_pending(W1)  # the reconcile sweep's retry
+
+        (edge,) = list_open_edges_into(W1)
+        assert edge.delivered_at is not None
+
     def test_worker_error_after_a_failed_delivery_sends_nothing_more(self, world, monkeypatch):
         monkeypatch.setattr(
             inbox_module.terminal_service.dispatch_input, "side_effect", RuntimeError("tmux error")
