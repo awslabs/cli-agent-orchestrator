@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.mcp_server import server
-from cli_agent_orchestrator.services import agent_step, terminal_service
+from cli_agent_orchestrator.services import agent_step, inbox_service, terminal_service
 from cli_agent_orchestrator.services.terminal_service import get_output as _real_get_output
 from cli_agent_orchestrator.utils import orchestration
 
@@ -87,6 +87,18 @@ def launch_http(release_runtime, monkeypatch):
 
     monkeypatch.setattr(
         terminal_service.status_monitor, "get_status", lambda _: TerminalStatus.IDLE
+    )
+    # Every terminal reads IDLE and none ever starts, so a delivery into one
+    # (a worker-ended notice when a child is deleted) would otherwise wait out
+    # the whole submit confirmation. The delivery also runs inline here, not
+    # on its own thread: the in-memory store shares one SQLite connection
+    # across threads, and a delivery thread that runs on beside the delete (or
+    # past the test) would interleave its transactions with the test's.
+    monkeypatch.setattr(inbox_service, "INBOX_SUBMIT_CONFIRMATION", False)
+    monkeypatch.setattr(
+        inbox_service.inbox_service,
+        "deliver_pending_in_background",
+        inbox_service.inbox_service.deliver_pending,
     )
     monkeypatch.setattr(terminal_service, "send_input", lambda *a, **kw: None)
     monkeypatch.setattr(terminal_service, "get_output", lambda *a: "done")

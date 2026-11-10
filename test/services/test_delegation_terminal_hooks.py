@@ -4,6 +4,7 @@ Arming on confirmed delivery, closing edges on a deferred-init failure notice,
 and notifying waiting callers when a worker is deleted.
 """
 
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,6 +22,7 @@ from cli_agent_orchestrator.clients.database import (
     mark_assign_edges_delivered,
 )
 from cli_agent_orchestrator.models.delegation import EdgeSource
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import terminal_service
 
 SVC = "cli_agent_orchestrator.services.delegation_callback_service"
@@ -193,3 +195,50 @@ class TestRowDeletionClosesEdges:
         assert notice.message.startswith(f"[CAO worker ended] Worker {WORKER}")
         assert notice.message.endswith("---\nhalf done")
         assert list_open_edges_into(WORKER) == []
+
+
+class TestDeleteDoesNotWaitForPickup:
+    def test_delete_returns_before_the_caller_confirms_pickup(self, isolated_memory_db):
+        """An idle caller that never starts on the notice must not hold the delete.
+
+        Uses the file-backed test database: the notice is delivered on another
+        thread, which an in-memory SQLite database would not be shared with.
+        """
+        from cli_agent_orchestrator.services.inbox_service import InboxService
+
+        create_terminal(CALLER, "cao-s", "sup", "claude_code")
+        create_delegation_edge(CALLER, WORKER, EdgeSource.ASSIGN)
+        confirming, release, confirmed = threading.Event(), threading.Event(), threading.Event()
+
+        def confirm(*_args, **_kwargs):
+            confirming.set()
+            release.wait(3)  # an idle caller that does not start
+            confirmed.set()
+            return False
+
+        service = InboxService()
+        with (
+            patch(f"{SVC}.inbox_service", service),
+            patch(f"{SVC}.terminal_service") as worker_pane,
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", True),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service"),
+            patch("cli_agent_orchestrator.services.inbox_service.get_backend") as backend,
+            patch.object(InboxService, "_confirm_submitted", side_effect=confirm),
+            patch.object(terminal_service, "capture_terminal_snapshot", return_value={}),
+            patch.object(terminal_service, "dismantle_terminal_runtime", return_value=True),
+            patch.object(terminal_service, "db_delete_terminal", return_value=True),
+            patch.object(terminal_service, "ephemeral_service"),
+        ):
+            worker_pane.get_output.return_value = "half done"
+            monitor.get_status.return_value = TerminalStatus.IDLE
+            backend.return_value.supports_event_inbox.return_value = False
+            try:
+                assert terminal_service.delete_terminal(WORKER, end_reason="deleted") is True
+                assert confirming.wait(5) is True  # the notice was pasted
+                assert confirmed.is_set() is False  # and the delete did not wait for pickup
+            finally:
+                release.set()
+
+        (notice,) = get_inbox_messages(CALLER)
+        assert notice.message.startswith(f"[CAO worker ended] Worker {WORKER}")

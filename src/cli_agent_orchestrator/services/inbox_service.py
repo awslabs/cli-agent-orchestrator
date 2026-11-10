@@ -397,6 +397,33 @@ class InboxService:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
 
+    def deliver_pending_in_background(self, terminal_id: str) -> threading.Thread:
+        """Start ``deliver_pending`` for ``terminal_id`` on its own thread and return at once.
+
+        For a caller that has already stored the message and must not wait out
+        the submit confirmation, which holds an idle receiver for
+        INBOX_SUBMIT_CONFIRM_TIMEOUT per attempt when it does not start. This is
+        the split the inbox POST endpoint makes: the message is stored, so the
+        caller's answer is already true, and the delivery and its confirmation
+        carry on by themselves. A failure is logged, never raised.
+
+        Returns the started thread, so a test can join it.
+
+        Thread Safety:
+            Safe from any thread. Deliveries to one receiver still run one at a
+            time under its delivery lock.
+        """
+
+        def deliver() -> None:
+            try:
+                self.deliver_pending(terminal_id)
+            except Exception as e:  # noqa: BLE001 - nobody waits on this thread
+                logger.warning(f"Background delivery to {terminal_id} failed: {e}")
+
+        thread = threading.Thread(target=deliver, name=f"cao-deliver-{terminal_id}", daemon=True)
+        thread.start()
+        return thread
+
     @staticmethod
     def _arm_message_edges(terminal_id: str, batch: List[InboxMessage]) -> None:
         """Arm the send_message delegation edges opened by ``batch``.

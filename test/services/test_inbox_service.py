@@ -2,6 +2,7 @@
 
 import asyncio
 import textwrap
+import threading
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -2324,3 +2325,27 @@ class TestHoldDeliveryIfIdle:
 
         assert seen == [False]
         assert service._delivery_lock("term-1").locked() is False
+
+
+class TestDeliverPendingInBackground:
+    def test_runs_deliver_pending_on_its_own_thread(self):
+        service = InboxService()
+        seen = []
+        with patch.object(
+            service,
+            "deliver_pending",
+            side_effect=lambda t: seen.append((t, threading.get_ident())),
+        ):
+            thread = service.deliver_pending_in_background("term-1")
+            thread.join(5)
+
+        assert thread.daemon is True
+        assert [t for t, _ in seen] == ["term-1"]
+        assert seen[0][1] != threading.get_ident()
+
+    def test_failure_is_logged_not_raised(self, caplog):
+        service = InboxService()
+        with patch.object(service, "deliver_pending", side_effect=RuntimeError("pane gone")):
+            service.deliver_pending_in_background("term-1").join(5)
+
+        assert "Background delivery to term-1 failed: pane gone" in caplog.text

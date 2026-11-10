@@ -110,6 +110,13 @@ def world(monkeypatch):
         return True
 
     monkeypatch.setattr(InboxService, "_confirm_submitted", confirm)
+    # Forwards are delivered on a background thread in production; inline here,
+    # so each test sees the delivery (and the evaluation made inside it) at once.
+    monkeypatch.setattr(
+        InboxService,
+        "deliver_pending_in_background",
+        lambda self, terminal_id: self.deliver_pending(terminal_id),
+    )
     for terminal_id in (TOP, SUP, W1):
         _finished_turn(monitor, terminal_id)
     return MagicMock(monitor=monitor, screens=screens, inside=inside, pastes=pastes)

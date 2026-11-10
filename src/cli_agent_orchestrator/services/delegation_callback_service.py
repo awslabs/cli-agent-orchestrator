@@ -144,8 +144,16 @@ def _close_and_notify(edge: DelegationEdge, state: EdgeState, sender_id: str, te
 
 
 def _deliver(receiver_id: str, sender_id: str) -> None:
+    """Start delivering a queued forward or notice to ``receiver_id``; do not wait for it.
+
+    The message is already PENDING (queued in the commit that closed its edge),
+    so nothing here has to wait for the receiver to pick it up. Waiting would
+    hold a ``DELETE /terminals/{id}`` for up to a full submit confirmation per
+    idle caller, and in the status-event consumer would delay every other
+    caller's forward behind one receiver that does not start.
+    """
     try:
-        inbox_service.deliver_pending(receiver_id)
+        inbox_service.deliver_pending_in_background(receiver_id)
     except Exception as exc:  # noqa: BLE001 - caller may be gone; edge is already closed
         logger.warning("delegation: could not notify %s from %s: %s", receiver_id, sender_id, exc)
 
@@ -225,8 +233,8 @@ def evaluate_completion(terminal_id: str) -> int:
             for edge in inbound
             if _close_and_notify(edge, EdgeState.AUTO_FORWARDED, terminal_id, text(edge))
         ]
-    # Delivered after the worker's lock is released: delivering to the caller
-    # takes the caller's lock and can wait out a submit confirmation.
+    # Started after the worker's lock is released, and not waited for: the
+    # delivery takes the caller's lock and can wait out a submit confirmation.
     for edge in forwarded:
         _deliver(edge.caller_id, terminal_id)
     if forwarded:

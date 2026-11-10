@@ -1,6 +1,7 @@
 """Tests for delegation_callback_service."""
 
 import asyncio
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +20,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.delegation import EdgeReason, EdgeSource
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import delegation_callback_service as svc
+from cli_agent_orchestrator.services.inbox_service import InboxService
 
 MOD = "cli_agent_orchestrator.services.delegation_callback_service"
 
@@ -274,3 +276,66 @@ class TestConsumer:
                 asyncio.run(svc.run())
         ev.assert_called_once_with("w1")
         ended.assert_called_once_with("w2", "reached ERROR")
+
+
+class TestDeliveryDoesNotBlock:
+    """A forward or notice is queued with its edge close, then delivered on its own
+    thread: no caller waits for a receiver's submit confirmation (PR #1247, review 3)."""
+
+    @pytest.fixture
+    def slow_inbox(self, db):
+        """Deliveries to "sup1" block until released (at most 3 s); others finish at once.
+
+        ``finished`` is set when the "sup1" delivery returns. A caller that
+        waited for it would see it set; one that did not, returns first.
+        """
+        release, finished = threading.Event(), threading.Event()
+        started = {}
+
+        def deliver(receiver_id, *_args, **_kwargs):
+            started.setdefault(receiver_id, threading.Event()).set()
+            if receiver_id == "sup1":
+                release.wait(3)
+                finished.set()
+
+        service = InboxService()
+        with (
+            patch(f"{MOD}.inbox_service", service),
+            patch.object(service, "deliver_pending", side_effect=deliver),
+            patch(f"{MOD}.status_monitor") as sm,
+            patch(f"{MOD}.terminal_service") as ts,
+            patch(f"{MOD}.get_terminal_metadata", return_value={"agent_profile": "developer"}),
+        ):
+            sm.get_status.return_value = TerminalStatus.IDLE
+            sm.started_on_last_input.return_value = True
+            ts.get_output.return_value = "final answer"
+            try:
+                yield finished, started
+            finally:
+                release.set()
+
+    @staticmethod
+    def _started(started, receiver_id):
+        return started.setdefault(receiver_id, threading.Event()).wait(5)
+
+    def test_worker_ended_returns_before_the_caller_picks_up(self, slow_inbox):
+        finished, started = slow_inbox
+        _armed("sup1", "w1")
+
+        svc.handle_worker_ended("w1", "was deleted")
+
+        assert self._started(started, "sup1") is True
+        assert finished.is_set() is False  # returned while the delivery still waits
+        assert list_open_edges_into("w1") == []
+
+    def test_slow_forward_does_not_delay_another_callers_forward(self, slow_inbox):
+        finished, started = slow_inbox
+        _armed("sup1", "w1")
+        _armed("sup2", "w2")
+
+        assert svc.evaluate_completion("w1") == 1
+        assert self._started(started, "sup1") is True
+        assert svc.evaluate_completion("w2") == 1
+
+        assert self._started(started, "sup2") is True
+        assert finished.is_set() is False
