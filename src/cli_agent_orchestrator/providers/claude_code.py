@@ -22,6 +22,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.runner.protocol import RunnerReportedError
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
@@ -708,7 +709,7 @@ class ClaudeCodeProvider(BaseProvider):
         # running as root. We only omit it for yolo+root; non-root yolo still needs
         # the flag so Claude won't prompt for tool approval inside a headless tmux
         # pane and silently block handoff/assign flows.
-        is_root = getattr(os, "geteuid", lambda: -1)() == 0
+        is_root = self._execution_user_is_root()
 
         if profile and profile.permissionMode:
             command_parts = ["claude", "--permission-mode", profile.permissionMode]
@@ -878,6 +879,46 @@ class ClaudeCodeProvider(BaseProvider):
             ") 2>/dev/null"
         )
         return f"{unset_cmd}; {claude_cmd}"
+
+    def _runs_elsewhere(self) -> bool:
+        """Whether this terminal runs off this host (the remote backend, #745)."""
+        return getattr(get_backend(), "resolves_paths_locally", True) is False
+
+    def _execution_user_is_root(self) -> bool:
+        """Whether the user the CLI runs as is root, asked of the host it runs on.
+
+        Under the remote backend that is the terminal's runner, not this
+        server: the answer decides ``--dangerously-skip-permissions``, which
+        Claude Code refuses when run as root.
+        """
+        if self._runs_elsewhere():
+            return get_backend().execution_user_is_root(self.session_name, self.window_name) is True
+        return getattr(os, "geteuid", lambda: -1)() == 0
+
+    def _ensure_skip_bypass_prompt_on_execution_host(self) -> None:
+        """Set ``skipDangerousModePermissionPrompt`` where the CLI will read it.
+
+        Locally that is this host's ``~/.claude/settings.json``
+        (:meth:`_ensure_skip_bypass_prompt_setting`). Under the remote backend
+        it is the runner's, merged there atomically and fail-closed; an
+        unreadable file is left alone and the startup-prompt handler answers the
+        prompt instead (see ``utils.user_settings``).
+        """
+        if not self._runs_elsewhere():
+            self._ensure_skip_bypass_prompt_setting()
+            return
+        try:
+            get_backend().merge_user_json(
+                self.session_name,
+                self.window_name,
+                "claude_settings",
+                {"skipDangerousModePermissionPrompt": True},
+            )
+        except RunnerReportedError as exc:
+            logger.warning(
+                f"Terminal {self.terminal_id}: could not set skipDangerousModePermissionPrompt "
+                f"on its runner ({exc}); the startup prompt will be answered instead"
+            )
 
     @staticmethod
     def _ensure_skip_bypass_prompt_setting() -> None:
@@ -1206,7 +1247,7 @@ class ClaudeCodeProvider(BaseProvider):
         # Not exhaustive: wait_for_shell's own backend polling, _load_profile(),
         # and _build_claude_command's temp-file I/O above/below are still
         # loop-side -- tens of ms each, not the multi-second pileup #451 fixes.
-        await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
+        await asyncio.to_thread(self._ensure_skip_bypass_prompt_on_execution_host)
 
         # Build properly escaped command string
         command = self._build_claude_command(profile)

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+from cli_agent_orchestrator.utils.execution_host import runs_terminals_elsewhere
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.backends.base import TerminalBackend
@@ -100,6 +101,15 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
         """Write the <cao-memory> block into <cwd>/.claude/CLAUDE.md."""
 
         if event.provider != "claude_code":
+            return
+        if runs_terminals_elsewhere():
+            # The remote backend (#745): the pane and its working directory are
+            # on a runner, not on this machine, so the file this plugin writes
+            # would land in the server's filesystem (or nowhere). Skipped; the
+            # memory context still reaches the agent through its first input.
+            logger.debug(
+                "claude_code_memory: %s runs on a runner; not writing here", event.terminal_id
+            )
             return
 
         try:

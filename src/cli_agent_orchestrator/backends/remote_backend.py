@@ -590,6 +590,34 @@ class RemoteBackend(TerminalBackend):
             )
             return None
 
+    def merge_user_json(
+        self, session_name: str, window_name: str, file_id: str, updates: Dict[str, Any]
+    ) -> bool:
+        """Merge ``updates`` into a user settings file on the terminal's runner.
+
+        The provider CLI reads it there, so the server's own copy is never
+        touched (see ``utils.user_settings``).
+        """
+        runner_id, terminal_id = self._routed(session_name, window_name)
+        value = self.hub.call(
+            runner_id,
+            "merge_user_json",
+            self._window_args(
+                session_name, window_name, terminal_id, file=file_id, updates=dict(updates)
+            ),
+        )
+        return bool(value)
+
+    def execution_user_is_root(self, session_name: str, window_name: str) -> bool:
+        """Whether the terminal's runner runs its panes as root."""
+        runner_id, terminal_id = self._routed(session_name, window_name)
+        value = self.hub.call(
+            runner_id,
+            "execution_user_is_root",
+            self._window_args(session_name, window_name, terminal_id),
+        )
+        return value is True
+
     def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
         route = self.hub.route(session_name, window_name)
         if route is None:
