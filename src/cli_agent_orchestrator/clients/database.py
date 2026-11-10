@@ -496,6 +496,10 @@ LAUNCH_TARGET_KINDS = ("installed", "ephemeral", "workflow")
 # ``kept_expired`` and ``kept_evicted`` (#1225) are a kept child torn down by the
 # keep reaper after its idle window, and a kept child torn down to make room under
 # ``terminal.keep_finished.max_per_session``.
+# ``creator_rollback`` (#1277) is a terminal whose session was killed by the
+# rollback of ANOTHER terminal's failed create: the create that made the session
+# failed and, seeing no other row in it, killed the session. A row that joined
+# it anyway (written without this process's lifecycle lock) died with it.
 LAUNCH_END_REASONS = (
     "launch_failed",
     "deleted",
@@ -504,6 +508,7 @@ LAUNCH_END_REASONS = (
     "session_teardown",
     "kept_expired",
     "kept_evicted",
+    "creator_rollback",
 )
 
 
@@ -808,6 +813,40 @@ def get_launch_record(terminal_id: str) -> Optional[Dict[str, Any]]:
             .first()
         )
         return None if row is None else _launch_record_dict(row)
+
+
+def terminal_has_recorded_cao_call(terminal_id: str, since: datetime) -> bool:
+    """Did ``terminal_id`` make a CAO call the server recorded at or after ``since``?
+
+    Read-only evidence that a terminal still counted as initializing is in fact
+    up and working (#1277): a launch record naming it as the caller (its
+    ``assign``/``handoff`` reached the server and created a worker) or an
+    ephemeral profile it owns (its ``create_ephemeral_agent`` call). ``since``
+    is when this terminal's init began, so a row left by an earlier terminal that
+    reused the 8-hex id never counts. Raises on a genuine DB error; the caller
+    treats that as "no evidence".
+    """
+    with SessionLocal() as db:
+        launched = (
+            db.query(LaunchRecordModel.id)
+            .filter(
+                LaunchRecordModel.caller_id == terminal_id,
+                LaunchRecordModel.created_at >= since,
+            )
+            .first()
+        )
+        if launched is not None:
+            return True
+        owned = (
+            db.query(EphemeralAgentModel.name)
+            .filter(
+                EphemeralAgentModel.owner_kind == "terminal",
+                EphemeralAgentModel.owner_id == terminal_id,
+                EphemeralAgentModel.created_at >= since,
+            )
+            .first()
+        )
+        return owned is not None
 
 
 def compute_busy_seconds(record_id: int) -> float:

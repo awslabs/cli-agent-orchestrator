@@ -87,6 +87,30 @@ Constraints:
 Both change while [keeping finished agents](#keep-finished-agents-for-workshops-and-debugging)
 is turned on.
 
+## When a launch fails while it starts
+
+A terminal's window and database record exist before its CLI agent has finished
+starting. With `cao launch` the supervisor's pane is already live while CAO is still
+waiting for it to be ready, so you can type into it, and it can `assign` workers into
+its own session. If that start then fails (for example, the CLI never reaches a ready
+state within `provider_init_timeout`), CAO undoes what the failed create built:
+
+- **Other agents have joined the session**: only the failed terminal's window and
+  record are removed. The workers keep running and stay listed, and the session keeps
+  any environment forwarded with `cao launch --env`. CAO logs a warning that names the
+  terminals it kept.
+- **The failed terminal is alone in the session it created**: the whole session is
+  removed and its forwarded environment is cleared.
+
+Each launch record ends with a reason. A terminal removed because another terminal's
+failed create took its session down ends with `creator_rollback`, not `pane_closed`.
+That can only happen when a terminal joins the session between CAO's check for other
+terminals and the kill, so it is rare.
+
+Claude Code also treats a supervisor that is visibly working at the deadline as
+started, rather than failed. See
+[Claude Code: how CAO knows it has started](claude-code.md#how-cao-knows-claude-code-has-started).
+
 ## Terminal count nudge
 
 When a session reaches 10 terminals, `assign` and `handoff` responses include:
