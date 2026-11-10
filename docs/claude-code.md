@@ -159,8 +159,9 @@ default).
   started if its status is processing **and** there is evidence that real work began:
   CAO saw it ready earlier in this start and you have typed into it since, or it has
   already made a CAO call that the server recorded (an `assign`, a `handoff` or a
-  `create_ephemeral_agent`). CAO logs a warning and finishes the launch. The deadline is
-  not extended. Without that evidence the launch fails as before.
+  `create_ephemeral_agent`). Claude Code must also still be running in the pane, rather
+  than the pane being back at its shell. CAO logs a warning and finishes the launch. The
+  deadline is not extended. Without that evidence the launch fails as before.
 
 If a launch does fail, the agents it already started are kept. See
 [When a launch fails while it starts](terminal-lifecycle.md#when-a-launch-fails-while-it-starts).

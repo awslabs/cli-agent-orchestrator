@@ -585,6 +585,12 @@ class ClaudeCodeProvider(BaseProvider):
         # When this init began (UTC), so only CAO calls made during it count as
         # evidence of real work (#1277). Set at the top of initialize().
         self._init_started_at: Optional[datetime] = None
+        # The pane's foreground process before ``claude`` was typed (the shell),
+        # read in initialize(). Private on purpose: it only lets the busy-start
+        # check below tell a live agent from a pane that is back at its shell,
+        # and does not turn on the input-delivery shell guard that the public
+        # ``shell_baseline`` drives for other providers.
+        self._launch_shell: Optional[str] = None
         # Issue #1082 (provisional): a CAO-generated id for a FRESH launch
         # (never set together with ``resume_session_id`` -- the caller only
         # generates one when there is nothing to resume), passed as
@@ -1187,6 +1193,12 @@ class ClaudeCodeProvider(BaseProvider):
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
+        # #1277: remember which process is the shell, so a busy start can be
+        # told apart from a pane whose ``claude`` exited (see
+        # _busy_with_evidence_of_real_work). Best-effort: no reading only means
+        # a busy start is never accepted, the pre-#1277 behaviour.
+        self._launch_shell = await asyncio.to_thread(self._read_pane_command)
+
         # Prevent bypass permissions dialog from appearing (settings-based fix).
         # This does blocking file I/O (~/.claude/settings.json read+write)
         # directly on the event loop this coroutine runs on -- small in
@@ -1288,6 +1300,10 @@ class ClaudeCodeProvider(BaseProvider):
             naming it as the caller (``assign``/``handoff``) or an ephemeral
             profile it owns (``create_ephemeral_agent``).
 
+        and ``claude`` is still the pane's foreground process
+        (``_claude_still_in_pane``): a stale PROCESSING screen over a pane that
+        is back at its shell is never accepted.
+
         PROCESSING alone is not enough: CAO's own launch keystrokes arm the
         PROCESSING transition. Any failure to read either signal answers False,
         so the launch fails exactly as it did before. Synchronous (status and DB
@@ -1299,10 +1315,11 @@ class ClaudeCodeProvider(BaseProvider):
         try:
             if status_monitor.get_status(self.terminal_id) != TerminalStatus.PROCESSING:
                 return False
-            if self._startup_ready_seen:
-                return True
             since = self._init_started_at
-            return since is not None and terminal_has_recorded_cao_call(self.terminal_id, since)
+            evidence = self._startup_ready_seen or (
+                since is not None and terminal_has_recorded_cao_call(self.terminal_id, since)
+            )
+            return evidence and self._claude_still_in_pane()
         except Exception:
             logger.warning(
                 "Could not check %s for evidence of real work at the init deadline",
@@ -1310,6 +1327,43 @@ class ClaudeCodeProvider(BaseProvider):
                 exc_info=True,
             )
             return False
+
+    def _read_pane_command(self) -> Optional[str]:
+        """The pane's foreground process name, or None when it cannot be read."""
+        try:
+            command = get_backend().get_pane_current_command(self.session_name, self.window_name)
+        except Exception:
+            logger.warning(
+                "Could not read the foreground process of %s", self.terminal_id, exc_info=True
+            )
+            return None
+        return command if isinstance(command, str) and command else None
+
+    def _claude_still_in_pane(self) -> bool:
+        """Is something other than the pre-launch shell in the pane's foreground?
+
+        The same comparison Codex and Kiro use for their exit-to-shell checks
+        (current foreground command against the shell read before launch). Fails
+        closed: with no pre-launch reading, or no current one, CAO cannot tell
+        ``claude`` from the shell and answers False.
+        """
+        if self._launch_shell is None:
+            logger.warning(
+                "Terminal %s: no pre-launch shell reading; not accepting a busy start",
+                self.terminal_id,
+            )
+            return False
+        current = self._read_pane_command()
+        if current is None or current == self._launch_shell:
+            logger.warning(
+                "Terminal %s: the pane's foreground process is %s (the shell was %s); "
+                "not accepting a busy start",
+                self.terminal_id,
+                current,
+                self._launch_shell,
+            )
+            return False
+        return True
 
     async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:
         """Settle-check readiness gate for the Ink input box.

@@ -831,7 +831,14 @@ def _roll_back_creator_window_keeping_peers_locked(
     which still serves later windows. If the backend reports the session gone
     after the window kill (tmux drops a session with its last window, e.g. when
     the only peer's pane had already exited), the env is cleared then, so a
-    secret never outlives the session it was forwarded to. Best-effort, never
+    secret never outlives the session it was forwarded to.
+
+    That decision uses ``session_exists_strict``, never the lenient probe: the
+    lenient one turns a lookup error into "absent", which would drop a live
+    session's env and leave its workers' later windows without it. A lookup
+    that raises keeps the env. On tmux the strict check raises on a lookup
+    error; on herdr it is the lenient check (``backends/base.py`` default), so
+    there a failed ``workspace list`` still reads as absent. Best-effort, never
     raises.
     """
     logger.warning(
@@ -851,15 +858,37 @@ def _roll_back_creator_window_keeping_peers_locked(
         except Exception:
             logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
     try:
-        session_gone = not get_backend().session_exists(session_name)
+        session_gone = not get_backend().session_exists_strict(session_name)
     except Exception:
-        logger.exception(f"Rollback: could not check whether {session_name} still exists")
+        logger.exception(
+            f"Rollback: could not check whether {session_name} still exists; "
+            "keeping its forwarded env"
+        )
         return
     if session_gone:
         try:
             clear_session_env(session_name)
         except Exception:
             logger.exception(f"Rollback: failed to clear session env for {session_name}")
+
+
+def _session_known_gone_locked(session_name: str, kill_confirmed: bool) -> bool:
+    """After a creator's ``kill_session``: is the session known to be gone?
+
+    True for a confirmed kill, or when ``session_exists_strict`` finds it absent
+    (a kill that reported False because the session was reaped in between). A
+    lookup that raises answers False: an unknown session may still hold a live
+    peer. CALLER HOLDS the lock. Never raises.
+    """
+    if kill_confirmed:
+        return True
+    try:
+        return not get_backend().session_exists_strict(session_name)
+    except Exception:
+        logger.exception(
+            f"Rollback: could not confirm {session_name} is gone; leaving its rows alone"
+        )
+        return False
 
 
 def _delete_rows_killed_with_session_locked(session_name: str, terminal_id: str) -> None:
@@ -874,6 +903,9 @@ def _delete_rows_killed_with_session_locked(session_name: str, terminal_id: str)
     the cause, instead of leaving it for herdr's ``workspace.closed`` to stamp
     ``pane_closed`` or a sweep to stamp ``stale_cleanup``. The failed creator's
     own row is left to the caller, which deletes it as ``launch_failed``.
+    The caller runs this only once the session is known to be gone (a confirmed
+    kill, or a strict lookup that finds it absent): with the kill unconfirmed
+    the peer may still be alive, and deleting its row would orphan it from CAO.
     Best-effort, never raises.
     """
     peers = _peer_terminal_ids_locked(session_name, terminal_id)
@@ -949,8 +981,10 @@ def _roll_back_backend_create_locked(
         # keyed to a session name that is gone and may later be reused.
         # `finally` still lets a BaseException propagate, which is what we want:
         # a Ctrl-C must not be swallowed here.
+        kill_confirmed = False
         try:
-            if not get_backend().kill_session(session_name):
+            kill_confirmed = bool(get_backend().kill_session(session_name))
+            if not kill_confirmed:
                 # Falsy means the backend could not confirm the kill (or found
                 # nothing to kill). Either way the name may still be live, so say
                 # so -- a silent branch here is how an orphan goes unnoticed.
@@ -965,7 +999,7 @@ def _roll_back_backend_create_locked(
                 clear_session_env(session_name)
             except Exception:
                 logger.exception(f"Rollback: failed to clear session env for {session_name}")
-        if terminal_id is not None:
+        if terminal_id is not None and _session_known_gone_locked(session_name, kill_confirmed):
             _delete_rows_killed_with_session_locked(session_name, terminal_id)
     else:
         try:

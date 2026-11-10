@@ -308,3 +308,126 @@ def test_unreadable_registry_keeps_the_session_rather_than_risk_peers(
     assert backend.kill_session_calls == 0
     assert backend.windows(SESSION) == {"w-p1277"}
     assert session_env.get_session_env(SESSION) == {"K": "v"}
+
+
+class _StrictLookupErrorBackend(FakeTmuxBackend):
+    """The session is alive, but the backend cannot answer whether it exists.
+
+    The lenient ``session_exists`` turns that lookup error into False (herdr: a
+    non-zero ``workspace list`` or bad JSON; tmux: most lookup errors), and the
+    strict one raises. Neither is evidence that the session is gone.
+    """
+
+    def session_exists(self, session_name):
+        return False
+
+    def session_exists_strict(self, session_name):
+        raise RuntimeError("workspace list failed")
+
+
+def test_keep_peers_keeps_the_env_when_the_session_lookup_errors(real_db, runtime):
+    """A transient lookup error after the window kill must not drop a live session's env."""
+    backend = _StrictLookupErrorBackend()
+    set_backend(backend)
+    _seed_incarnation(backend, ("c1277", "w-c1277"), [("p1277", "w-p1277")])
+    session_env.set_session_env(SESSION, {"K": "v"})
+
+    terminal_service._roll_back_cancelled_create(SESSION, "c1277", "w-c1277", created_session=True)
+
+    assert backend.kill_session_calls == 0
+    assert backend.windows(SESSION) == {"w-p1277"}
+    assert session_env.get_session_env(SESSION) == {"K": "v"}
+
+
+class _JoinThenUnconfirmedKillBackend(_JoinDuringKillBackend):
+    """A peer joins after the check, and the kill is not confirmed.
+
+    ``mode="false"``: ``kill_session`` returns False and the session survives.
+    ``mode="raise"``: it raises and the session survives. ``mode="gone"``: it
+    returns False but the session is in fact gone (reaped in between), which the
+    strict lookup confirms.
+    """
+
+    def __init__(self, session_name, peer_id, peer_window, mode):
+        super().__init__(session_name, peer_id, peer_window)
+        self._mode = mode
+
+    def kill_session(self, session_name):
+        target, peer_id, peer_window = self._join
+        if session_name == target and self.joined_record_id is None:
+            self._sessions[session_name].add(peer_window)
+            database.create_terminal(
+                terminal_id=peer_id,
+                tmux_session=session_name,
+                tmux_window=peer_window,
+                provider="claude_code",
+                agent_profile="developer",
+                session_incarnation_id=database.get_session_incarnation(session_name),
+            )
+            self.joined_record_id = database.create_launch_record(
+                terminal_id=peer_id,
+                session_name=session_name,
+                provider="claude_code",
+                target_name="developer",
+                target_kind=None,
+                launched_model=None,
+                model_honored=None,
+            )
+        self.kill_session_calls += 1
+        if self._mode == "raise":
+            raise RuntimeError("kill-session failed")
+        if self._mode == "gone":
+            self._sessions.pop(session_name, None)
+        return False
+
+
+@pytest.mark.parametrize("mode", ["false", "raise"])
+def test_unconfirmed_kill_leaves_a_joined_row_alone(real_db, runtime, mode):
+    """The sweep runs only after a confirmed kill: a live peer is never stamped as killed."""
+    backend = _JoinThenUnconfirmedKillBackend(SESSION, "peer1277", "w-peer1277", mode)
+    set_backend(backend)
+    _seed_incarnation(backend, ("c1277", "w-c1277"), [])
+
+    terminal_service._roll_back_cancelled_create(SESSION, "c1277", "w-c1277", created_session=True)
+
+    assert backend.joined_record_id is not None
+    assert backend.session_exists(SESSION) is True
+    assert "peer1277" in _rows(SESSION)
+    record = database.get_launch_record("peer1277")
+    assert record["end_reason"] is None
+    assert record["ended_at"] is None
+
+
+def test_unconfirmed_kill_of_a_session_that_is_gone_still_records_the_cause(real_db, runtime):
+    """A False from the kill with the session strictly absent counts as killed."""
+    backend = _JoinThenUnconfirmedKillBackend(SESSION, "peer1277", "w-peer1277", "gone")
+    set_backend(backend)
+    _seed_incarnation(backend, ("c1277", "w-c1277"), [])
+
+    terminal_service._roll_back_cancelled_create(SESSION, "c1277", "w-c1277", created_session=True)
+
+    assert backend.session_exists(SESSION) is False
+    assert "peer1277" not in _rows(SESSION)
+    assert database.get_launch_record("peer1277")["end_reason"] == "creator_rollback"
+
+
+def test_a_tombstone_only_peer_does_not_keep_the_session(real_db, runtime):
+    """A retained deferred-init failure tombstone has no runtime: it is not a peer.
+
+    The session is torn down as if the creator were alone, and the tombstone row
+    is left for the reconciliation that retains it (it is not swept either).
+    """
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed_incarnation(backend, ("c1277", "w-c1277"), [("tomb1277", "w-tomb1277")])
+    database.update_terminal_deferred_init_failure(
+        "tomb1277", {"reason": "deferred init failed", "retained": True}
+    )
+    session_env.set_session_env(SESSION, {"K": "v"})
+
+    terminal_service._roll_back_cancelled_create(SESSION, "c1277", "w-c1277", created_session=True)
+
+    assert backend.kill_session_calls == 1
+    assert backend.session_exists(SESSION) is False
+    assert session_env.get_session_env(SESSION) == {}
+    assert "tomb1277" in _rows(SESSION)

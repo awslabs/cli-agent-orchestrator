@@ -188,15 +188,23 @@ async def test_fresh_launch_does_not_use_the_resumed_composer_signal():
 # --- Fix 2: PROCESSING at the deadline with evidence of real work -----------
 
 
-async def _initialize(provider, *, status_at_deadline, frames, during_init=None):
+async def _initialize(
+    provider, *, status_at_deadline, frames, during_init=None, pane_commands=("zsh", "claude")
+):
     """Run ``initialize()`` with the readiness wait timing out.
 
     ``frames`` feeds the real startup handler. ``during_init`` runs inside the
     readiness wait (the window in which a live pane makes its CAO calls). The
-    status read after the wait returns ``status_at_deadline``.
+    status read after the wait returns ``status_at_deadline``. ``pane_commands``
+    are the pane's foreground process names, read in order (the last one
+    repeats): before the launch (the shell), then at the deadline.
     """
     clock = _Clock()
     frames = list(frames)
+    commands = list(pane_commands)
+
+    def _pane_command(*_a, **_k):
+        return commands.pop(0) if len(commands) > 1 else commands[0]
 
     async def _wait(*_a, **_k):
         if during_init is not None:
@@ -227,6 +235,7 @@ async def _initialize(provider, *, status_at_deadline, frames, during_init=None)
         patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep", AsyncMock()),
     ):
         backend.get_history.side_effect = _history
+        backend.get_pane_current_command.side_effect = _pane_command
         return await provider.initialize()
 
 
@@ -244,14 +253,14 @@ def _record_call_from(caller_id):
     )
 
 
-def _own_ephemeral_profile(owner_id):
+def _own_ephemeral_profile(owner_id, owner_kind="terminal"):
     """Persist what ``create_ephemeral_agent`` from ``owner_id`` leaves behind."""
     now = datetime.now(timezone.utc)
     with database.SessionLocal() as db:
         db.add(
             database.EphemeralAgentModel(
                 name="Band-purpose-1277",
-                owner_kind="terminal",
+                owner_kind=owner_kind,
                 owner_id=owner_id,
                 session_name="sess",
                 state="defined",
@@ -340,4 +349,76 @@ async def test_ready_seen_but_not_busy_still_times_out(real_db):
     with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
         await _initialize(
             provider, status_at_deadline=TerminalStatus.UNKNOWN, frames=[RESUMED_LONG]
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_ephemeral_profile_owned_before_this_init_is_not_evidence(real_db):
+    """Terminal ids are reused: a profile an earlier ``t1277`` owned does not count."""
+    _own_ephemeral_profile("t1277")
+    provider = _provider()
+    with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
+        await _initialize(
+            provider, status_at_deadline=TerminalStatus.PROCESSING, frames=["Loading..."]
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_ephemeral_profile_of_another_owner_kind_is_not_evidence(real_db):
+    """Only a TERMINAL owner is this pane; any other owner kind with the same id is not.
+
+    ``create_ephemeral_agent`` writes ``owner_kind="terminal"`` today. The column
+    is generic, so a future owner kind whose id happens to equal this terminal's
+    must not count as a call from it.
+    """
+    provider = _provider()
+    with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
+        await _initialize(
+            provider,
+            status_at_deadline=TerminalStatus.PROCESSING,
+            frames=["Loading..."],
+            during_init=lambda: _own_ephemeral_profile("t1277", owner_kind="operator"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_ready_screen_from_an_earlier_init_does_not_carry_over(real_db):
+    """The ready-seen evidence belongs to one init; a second init starts without it."""
+    provider = _provider()
+    assert await _initialize(
+        provider, status_at_deadline=TerminalStatus.PROCESSING, frames=[RESUMED_LONG]
+    )
+    with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
+        await _initialize(
+            provider, status_at_deadline=TerminalStatus.PROCESSING, frames=["Loading..."]
+        )
+
+
+@pytest.mark.asyncio
+async def test_busy_screen_over_a_bare_shell_is_not_accepted(real_db):
+    """If ``claude`` has exited, a stale PROCESSING screen must not pass as a started agent.
+
+    The pane's foreground process is back to the shell it was before the launch,
+    so the evidence (a ready screen seen earlier) no longer describes a live agent.
+    """
+    provider = _provider()
+    with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
+        await _initialize(
+            provider,
+            status_at_deadline=TerminalStatus.PROCESSING,
+            frames=[RESUMED_LONG],
+            pane_commands=("zsh", "zsh"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_busy_with_no_pre_launch_shell_reading_is_not_accepted(real_db):
+    """No baseline means CAO cannot tell claude from the shell, so it does not accept."""
+    provider = _provider()
+    with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
+        await _initialize(
+            provider,
+            status_at_deadline=TerminalStatus.PROCESSING,
+            frames=[RESUMED_LONG],
+            pane_commands=(None, "claude"),
         )
