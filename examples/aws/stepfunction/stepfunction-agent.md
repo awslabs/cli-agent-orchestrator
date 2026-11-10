@@ -18,6 +18,30 @@ mcpServers:
     type: stdio
     command: cao-mcp-server
     args: []
+params:
+  profile:
+    description: "AWS CLI profile name"
+    required: true
+  region:
+    description: "AWS region"
+    required: true
+  state_machine_arn:
+    description: "Step Functions state machine ARN"
+    required: true
+  execution_name_prefix:
+    description: "Prefix for generated execution names"
+    default: "cao-exec"
+  input_payload:
+    description: "JSON input to the state machine (rendered via heredoc, safe for arbitrary JSON)"
+    default: "{}"
+  poll_interval_seconds:
+    description: "Seconds between status checks"
+    type: int
+    default: 15
+  timeout_seconds:
+    description: "Max seconds to wait for completion"
+    type: int
+    default: 600
 ---
 
 # Step Functions Agent
@@ -42,6 +66,17 @@ Install this agent with your values via `cao install --env`:
 
 See `config.json` in this folder for a reference of all values.
 
+In a workflow, a step that uses this profile sets these params instead. Each
+one fills the placeholder named next to it:
+
+- `profile` fills `${AWS_PROFILE}`
+- `region` fills `${AWS_REGION}`
+- `state_machine_arn` fills `${STATE_MACHINE_ARN}`
+- `execution_name_prefix` fills `${EXECUTION_NAME_PREFIX}`
+- `input_payload` fills `${INPUT_PAYLOAD}`
+- `poll_interval_seconds` fills `${POLL_INTERVAL_SECONDS}`
+- `timeout_seconds` fills `${TIMEOUT_SECONDS}`
+
 ## Message Input
 
 This agent recognizes two operations based on the runtime message:
@@ -60,6 +95,11 @@ The execution ARN for monitoring is extracted from the message. These agents
 process inputs from trusted supervisors only.
 
 ## Instructions
+
+When the message has a "Parameters for this step" list, it comes from a workflow
+step. Use each value there in place of the `${...}` placeholder that its param
+fills, as listed under Configuration. Outside a workflow, the placeholders work
+as before.
 
 ### Trigger Operation
 

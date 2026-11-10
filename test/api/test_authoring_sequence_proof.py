@@ -178,6 +178,11 @@ def test_no_authoring_surface_accepts_a_format_parameter():
     and FOREVER, because a test never answers a question — it would be a green assertion with no teeth
     from the day it was written. The only way this criterion can actually regress is someone adding a
     ``--format`` option or a ``language=`` field, and THIS is the assertion that fails then.
+
+    The HTTP request models carry one exception, ``tier``, for the web workflow builder. The builder
+    always saves YAML, so it asks the user nothing either. ``tier`` defaults to ``"python"``, the agent
+    tools never send it (``test_the_agent_tools_never_send_a_tier``), and every other format-like field
+    is still refused here.
     """
     import inspect
 
@@ -198,7 +203,44 @@ def test_no_authoring_surface_accepts_a_format_parameter():
 
     for model in (WorkflowCreateRequest, WorkflowUpdateRequest, WorkflowValidateRequest):
         fields = set(model.model_fields)
-        assert not (fields & banned), f"{model.__name__} exposes {fields & banned}"
+        assert not (fields & (banned - {"tier"})), f"{model.__name__} exposes {fields & banned}"
+        assert model.model_fields["tier"].default == "python", (
+            f"{model.__name__}.tier must default to 'python', so a caller that sends no tier "
+            "gets a Python spec and is never asked"
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_agent_tools_never_send_a_tier(agent_world, tmp_path, monkeypatch):
+    """The agent's three authoring tools send no ``tier``, so what they write is always Python.
+
+    Asserted on the request bodies the tools actually send to the real routes. A tool that started
+    sending ``tier`` would put the format question back on the agent's path, which FR-10 forbids.
+    """
+    bodies = []
+    route_post, route_put = mcp.requests.post, mcp.requests.put
+
+    def _post(url, json=None, **kw):
+        bodies.append(json)
+        return route_post(url, json=json, **kw)
+
+    def _put(url, json=None, **kw):
+        bodies.append(json)
+        return route_put(url, json=json, **kw)
+
+    monkeypatch.setattr(mcp.requests, "post", _post)
+    monkeypatch.setattr(mcp.requests, "put", _put)
+
+    verdict = await _tool("workflow_validate")(source=CLEAN_SOURCE)
+    created = await _tool("workflow_create")(name="no-tier", source=CLEAN_SOURCE)
+    updated = await _tool("workflow_update")(
+        name="no-tier", source=CLEAN_SOURCE + "\n# edit\n", expected_hash=created["content_hash"]
+    )
+
+    assert verdict["ok"] is created["ok"] is updated["ok"] is True, (verdict, created, updated)
+    assert len(bodies) == 3
+    assert [body for body in bodies if "tier" in body] == []
+    assert sorted(p.name for p in (tmp_path / "workflows").iterdir()) == ["no-tier.py"]
 
 
 def test_the_cli_authoring_verbs_offer_no_format_option():

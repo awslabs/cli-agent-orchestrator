@@ -143,10 +143,20 @@ def test_update_rejects_a_trailing_newline_name_without_modifying_its_file(tmp_p
     assert target.read_text() == GOOD
 
 
-@pytest.mark.parametrize("yaml_name", ["thing.yaml", "thing.yml", "THING.YAML"])
-def test_refuses_yaml_with_a_message_naming_the_restriction(tmp_path: Path, yaml_name: str) -> None:
-    """BR-3A3-2 — an agent that reasonably tried YAML should learn the rule."""
-    with pytest.raises(ValueError, match="YAML specs cannot be created or updated"):
+@pytest.mark.parametrize(
+    "yaml_name,extension", [("thing.yaml", ".yaml"), ("thing.yml", ".yml"), ("THING.YAML", ".yaml")]
+)
+def test_refuses_a_yaml_extension_because_names_are_bare(
+    tmp_path: Path, yaml_name: str, extension: str
+) -> None:
+    """BR-3A3-2 — an agent that put an extension on the name should learn the rule.
+
+    YAML specs are writable now (``tier="yaml"``), so the refusal no longer says they are not.
+    The reason is the same as for ``.py``: names are bare, and the service picks the extension.
+    """
+    with pytest.raises(
+        ValueError, match=f"pass a bare workflow name without the '\\{extension}' extension"
+    ):
         svc.create_workflow(yaml_name, GOOD, scan_dir=str(tmp_path))
     assert _entries(tmp_path) == []
 

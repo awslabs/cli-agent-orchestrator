@@ -1023,3 +1023,178 @@ async def test_reprompt_keeps_the_rendered_attempt_prompt(monkeypatch):
     assert prompts[1].startswith("Review PR 869\n\n")
     assert "workflow_return" in prompts[1]
     assert "{{" not in prompts[1]
+
+
+# ---------------------------------------------------------------------------
+# Step params and call type (the workflow builder's step fields)
+# ---------------------------------------------------------------------------
+_BLOCK = "\n\nParameters for this step:\n"
+
+
+def _params_step(params=None, *, step_id="s1", call=None, prompt="go", **extra) -> WorkflowStep:
+    return WorkflowStep(
+        id=step_id,
+        provider="claude_code",
+        agent="dev",
+        prompt=prompt,
+        params=params,
+        call=call,
+        **extra,
+    )
+
+
+def test_build_step_prompt_without_params_is_the_substituted_prompt():
+    rec = _record_with(inputs={"topic": "cats"})
+    step = _params_step(prompt="about {{workflow.inputs.topic}}")
+
+    assert ws._build_step_prompt(step, rec) == ws._substitute(step.prompt, rec) == "about cats"
+
+
+def test_build_step_prompt_with_empty_params_adds_no_block():
+    rec = _record_with(inputs={"topic": "cats"})
+    step = _params_step({}, prompt="about {{workflow.inputs.topic}}")
+
+    assert ws._build_step_prompt(step, rec) == "about cats"
+
+
+def test_build_step_prompt_appends_params_in_declaration_order():
+    rec = _record_with(inputs={"topic": "cats"})
+    step = _params_step(
+        {"table-name": "example-table", "aws-profile-name": "beta"},
+        prompt="Check {{workflow.inputs.topic}}.",
+    )
+
+    assert ws._build_step_prompt(step, rec) == (
+        "Check cats.\n"
+        "\n"
+        "Parameters for this step:\n"
+        "- table-name: example-table\n"
+        "- aws-profile-name: beta"
+    )
+
+
+def test_param_values_are_literal_and_never_substituted():
+    """A value that looks like a placeholder is sent as text. Substituting it would raise here."""
+    rec = _record_with(inputs={"topic": "cats"})
+    step = _params_step({"note": "{{workflow.inputs.missing}}"})
+
+    assert ws._build_step_prompt(step, rec) == "go" + _BLOCK + "- note: {{workflow.inputs.missing}}"
+
+
+def test_build_step_prompt_template_override_keeps_the_params_block():
+    rec = _record_with(inputs={"topic": "cats"})
+    step = _params_step({"k": "v"})
+
+    assert ws._build_step_prompt(step, rec, "redo {{workflow.inputs.topic}}") == (
+        "redo cats" + _BLOCK + "- k: v"
+    )
+
+
+def test_build_step_prompt_still_raises_for_an_unresolvable_template():
+    rec = _record_with()
+    with pytest.raises(ws.WorkflowEngineError):
+        ws._build_step_prompt(_params_step({"k": "v"}, prompt="{{workflow.inputs.nope}}"), rec)
+
+
+@pytest.mark.asyncio
+async def test_a_spec_without_params_sends_the_unchanged_prompt(monkeypatch):
+    prompts: List[str] = []
+
+    async def execute(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", execute)
+    result = await ws.start_run(_spec(), {}, "no-params")
+
+    assert result.state == RunState.COMPLETED
+    assert prompts == ["go"]
+
+
+@pytest.mark.asyncio
+async def test_every_attempt_sends_the_params_block(monkeypatch):
+    """A retry rebuilds the prompt through the same helper, so it carries the same params."""
+    prompts: List[str] = []
+
+    async def execute(**kwargs):
+        prompts.append(kwargs["prompt"])
+        if len(prompts) == 1:
+            raise StepExecutionError("boom", kind="error", terminal_id="tx")
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", execute)
+    spec = _spec(steps=[_params_step({"aws-profile-name": "beta"}, retries=1)])
+
+    result = await ws.start_run(spec, {}, "params-retry")
+
+    assert result.steps[0].attempts == 2
+    assert prompts == ["go" + _BLOCK + "- aws-profile-name: beta"] * 2
+
+
+@pytest.mark.asyncio
+async def test_the_reprompt_repeats_the_params_block(monkeypatch):
+    prompts: List[str] = []
+
+    async def execute(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", execute)
+    spec = _spec(steps=[_params_step({"table-name": "t1"}, output_schema=_SCHEMA)])
+
+    result = await ws.start_run(spec, {}, "params-reprompt")
+
+    assert result.steps[0].state == StepState.COMPLETED_UNVALIDATED
+    first = "go" + _BLOCK + "- table-name: t1"
+    assert prompts[0] == first
+    assert prompts[1].startswith(first + "\n\n")
+    assert "workflow_return" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_handoff_and_no_call_both_run(monkeypatch):
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    spec = _spec(steps=[_params_step(step_id="s1", call="handoff"), _params_step(step_id="s2")])
+
+    result = await ws.start_run(spec, {}, "handoff-run")
+
+    assert result.state == RunState.COMPLETED
+    assert mock.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["assign", "send_message"])
+async def test_a_reserved_call_is_refused_before_any_terminal_or_journal_row(monkeypatch, call):
+    """Never run as a handoff (B3-BR-10), and refused before the run record exists."""
+    mock = AsyncMock(return_value=_ok())
+    inserted = MagicMock()
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    monkeypatch.setattr(ws, "_journal_insert_run", inserted)
+    spec = _spec(
+        steps=[_params_step(step_id="s1", call="handoff"), _params_step(step_id="s2", call=call)]
+    )
+
+    with pytest.raises(NotBuiltYetError) as excinfo:
+        await ws.start_run(spec, {}, f"run-{call.replace('_', '-')}")
+
+    assert str(excinfo.value) == f"step 's2' uses call '{call}', which is reserved (not built yet)"
+    mock.assert_not_awaited()
+    inserted.assert_not_called()
+    assert ws.run_registry == {}
+    assert ws._active_drives == set()
+
+
+def test_refuse_reserved_calls_names_the_first_reserved_step():
+    spec = _spec(
+        steps=[
+            _params_step(step_id="a"),
+            _params_step(step_id="b", call="send_message"),
+            _params_step(step_id="c", call="assign"),
+        ]
+    )
+    with pytest.raises(NotBuiltYetError, match="^step 'b' uses call 'send_message'"):
+        ws._refuse_reserved_calls(spec)
+    ws._refuse_reserved_calls(
+        _spec(steps=[_params_step(call="handoff"), _params_step(step_id="s2")])
+    )

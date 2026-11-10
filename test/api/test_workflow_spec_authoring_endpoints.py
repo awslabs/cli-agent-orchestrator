@@ -296,13 +296,17 @@ def test_a_lint_error_refuses_an_update_too(client, spec_dir):
 
 
 def test_a_yaml_name_is_refused_without_disclosing_internal_validation_detail(client, spec_dir):
-    """A path-free validation message remains actionable at the HTTP boundary."""
+    """A path-free validation message remains actionable at the HTTP boundary.
+
+    YAML is writable with ``tier: "yaml"``, so the refusal now says what is wrong with the request:
+    the name carries an extension, and names are bare in both tiers.
+    """
     resp = client.post("/workflows", json={"name": "as-yaml.yaml", "source": GOOD})
 
     assert resp.status_code == 400, resp.text
-    assert "YAML specs cannot be created or updated" in resp.json()["detail"]
+    assert "pass a bare workflow name without the '.yaml' extension" in resp.json()["detail"]
     assert str(spec_dir) not in resp.json()["detail"]
-    assert not any(spec_dir.iterdir()), "nothing may be written for a refused tier"
+    assert not any(spec_dir.iterdir()), "nothing may be written for a refused name"
 
 
 def test_an_oversize_spec_is_refused_with_the_stable_public_error(client, spec_dir):

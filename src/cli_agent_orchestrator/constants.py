@@ -943,6 +943,32 @@ WORKFLOW_MAX_SPEC_BYTES = 256 * 1024
 WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH = 8
 WORKFLOW_MAX_INPUTS = 64
 
+# Per-step ``params`` (the workflow builder's key and value rows). Each key matches
+# WORKFLOW_STEP_PARAM_KEY_RE and each value is a single-line string. The engine adds
+# them to the step prompt as literal text, and they are journaled in plaintext with
+# the spec snapshot, so they must never carry secrets.
+WORKFLOW_MAX_STEP_PARAMS = 32
+WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS = 512
+WORKFLOW_STEP_PARAM_KEY_RE = r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$"
+
+# A ``{{...}}`` placeholder, as the engine finds one in a prompt. This is the pattern of
+# ``workflow_service._PLACEHOLDER_RE``, and a test keeps the two equal. Param values are
+# fixed when the workflow is built, so the grammar check rejects a value that contains one.
+WORKFLOW_PLACEHOLDER_RE = r"\{\{\s*([^{}]+?)\s*\}\}"
+
+# A step value for a param its profile declares as ``int``: a whole number of at most
+# 18 digits, so it fits a signed 64-bit integer.
+WORKFLOW_STEP_PARAM_INT_RE = r"^-?[0-9]{1,18}$"
+
+# Profile ``params`` (agent profile frontmatter): the params a workflow step that uses the
+# profile must fill. A profile declares at most PROFILE_MAX_PARAMS, each named by the
+# WORKFLOW_STEP_PARAM_KEY_RE rule. An ``enum`` lists 1 to PROFILE_PARAM_MAX_ENUM_VALUES
+# values. A string default or enum value is one line of at most
+# WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS characters, the same limit as a step value.
+PROFILE_MAX_PARAMS = 32
+PROFILE_PARAM_MAX_ENUM_VALUES = 32
+PROFILE_PARAM_DESCRIPTION_MAX_CHARS = 200
+
 # SQLite busy-timeout for journal connections, in milliseconds (issue #583, NFR-4).
 # Journal writes are single-row upserts in one short transaction, so the realistic
 # contention window is milliseconds; 5000 gives ~3 orders of magnitude of headroom, which

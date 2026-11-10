@@ -476,3 +476,233 @@ class TestBolt3AdditiveModelChanges:
         assert RunState.FAILED.value == "failed"
         assert RunState.CANCELLED.value == "cancelled"
         assert {s.value for s in RunState} == {"running", "completed", "failed", "cancelled"}
+
+
+def _step_yaml(step_extra: str = "", *, second_step: str = "") -> str:
+    """A one-step spec with extra step keys appended (each line pre-indented by 4)."""
+    return (
+        "name: wf\n"
+        "steps:\n"
+        "  - id: s1\n"
+        "    provider: p\n"
+        "    agent: a\n"
+        "    prompt: x\n" + step_extra + second_step
+    )
+
+
+def _params_yaml(entries: dict) -> str:
+    import json as _json
+
+    lines = "".join(f"      {_json.dumps(k)}: {_json.dumps(v)}\n" for k, v in entries.items())
+    return "    params:\n" + lines
+
+
+class TestStepCall:
+    """``call``: how a step is handed to its agent. Only ``handoff`` runs today."""
+
+    def test_call_and_params_default_to_none(self):
+        step = WorkflowSpec(**_spec_kwargs()).steps[0]
+        assert step.call is None
+        assert step.params is None
+
+    @pytest.mark.parametrize("call", ["handoff", "assign", "send_message"])
+    def test_each_call_type_constructs(self, call):
+        spec = WorkflowSpec(
+            **_spec_kwargs(
+                steps=[{"id": "s1", "provider": "p", "agent": "a", "prompt": "x", "call": call}]
+            )
+        )
+        assert spec.steps[0].call == call
+
+    @pytest.mark.parametrize("call", ["Handoff", "parallel", ""])
+    def test_an_unknown_call_type_fails(self, call):
+        result = validate_only(_step_yaml(f'    call: "{call}"\n'))
+        assert result.status == "fail"
+
+    @pytest.mark.parametrize("extra", ["", "    call: handoff\n"])
+    def test_handoff_or_no_call_passes(self, extra):
+        assert validate_only(_step_yaml(extra)) == ValidationResult(status="pass")
+
+    @pytest.mark.parametrize("call", ["assign", "send_message"])
+    def test_a_reserved_call_is_pass_reserved_with_the_construct_note(self, call):
+        result = validate_only(_step_yaml(f"    call: {call}\n"))
+        assert result.status == "pass_reserved"
+        assert result.reserved_notes == [f"construct '{call}' is reserved (not built yet)"]
+        assert result.errors == []
+
+    def test_reserved_call_notes_are_listed_once_in_step_order(self):
+        steps = "".join(
+            f"  - {{id: s{i}, provider: p, agent: a, prompt: x, call: {call}}}\n"
+            for i, call in enumerate(["send_message", "handoff", "assign", "send_message"], 2)
+        )
+        result = validate_only(_step_yaml(second_step=steps))
+        assert result.reserved_notes == [
+            "construct 'send_message' is reserved (not built yet)",
+            "construct 'assign' is reserved (not built yet)",
+        ]
+
+    def test_the_registry_reserves_assign_and_send_message(self):
+        assert is_reserved("assign") is True
+        assert is_reserved("send_message") is True
+        assert is_reserved("handoff") is False, "handoff is the call type the engine runs"
+
+
+class TestStepParams:
+    """``params``: literal per-step strings, checked by the grammar (BR-7 aggregation)."""
+
+    def test_valid_params_pass_and_keep_declaration_order(self):
+        entries = {"aws-profile-name": "beta", "table.name": "t", "Account_1": "123456789012"}
+        result = validate_only(_step_yaml(_params_yaml(entries)))
+        assert result.status == "pass"
+        spec = WorkflowSpec(
+            **_spec_kwargs(
+                steps=[
+                    {"id": "s1", "provider": "p", "agent": "a", "prompt": "x", "params": entries}
+                ]
+            )
+        )
+        assert list(spec.steps[0].params) == ["aws-profile-name", "table.name", "Account_1"]
+
+    def test_empty_params_pass(self):
+        assert validate_only(_step_yaml("    params: {}\n")).status == "pass"
+
+    @pytest.mark.parametrize(
+        "key", ["1abc", "-lead", "has space", "a" * 65, "", "trailing\n", "semi;colon"]
+    )
+    def test_an_invalid_key_fails_naming_the_step_and_key(self, key):
+        result = validate_only(_step_yaml(_params_yaml({key: "v"})))
+        assert result.status == "fail"
+        assert any(e.startswith(f"step 's1': param name {key!r} is invalid") for e in result.errors)
+
+    def test_a_key_of_64_characters_passes(self):
+        assert validate_only(_step_yaml(_params_yaml({"k" * 64: "v"}))).status == "pass"
+
+    def test_a_non_string_key_fails(self):
+        result = validate_only(_step_yaml("    params:\n      123: v\n"))
+        assert result.status == "fail"
+        assert any("param name 123 is invalid" in e for e in result.errors)
+
+    @pytest.mark.parametrize(
+        "raw,kind",
+        [
+            ("123456789012", "a number"),
+            ("1.5", "a number"),
+            ("true", "a boolean"),
+            ("yes", "a boolean"),
+            ("null", "null"),
+            ("", "null"),
+            ("[1, 2]", "a list"),
+            ("{a: b}", "a mapping"),
+        ],
+    )
+    def test_a_non_string_value_fails_and_says_to_quote_it(self, raw, kind):
+        result = validate_only(_step_yaml(f"    params:\n      acct: {raw}\n"))
+        assert result.status == "fail"
+        assert f"step 's1': param 'acct' must be a string, not {kind} (quote the value)" in (
+            result.errors
+        )
+
+    def test_a_quoted_number_is_a_string_and_passes(self):
+        assert validate_only(_step_yaml('    params:\n      acct: "123456789012"\n')).status == (
+            "pass"
+        )
+
+    def test_a_value_may_be_512_characters_but_not_513(self):
+        from cli_agent_orchestrator.constants import WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS
+
+        at_cap = validate_only(
+            _step_yaml(_params_yaml({"k": "x" * WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS}))
+        )
+        over = validate_only(
+            _step_yaml(_params_yaml({"k": "x" * (WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS + 1)}))
+        )
+        assert WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS == 512
+        assert at_cap.status == "pass"
+        assert over.status == "fail"
+        assert "step 's1': param 'k' is 513 characters (max 512)" in over.errors
+
+    @pytest.mark.parametrize("value", ["line1\nline2", "line1\rline2", "trailing\n"])
+    def test_a_value_with_a_line_break_fails(self, value):
+        result = validate_only(_step_yaml(_params_yaml({"k": value})))
+        assert result.status == "fail"
+        assert "step 's1': param 'k' must be one line (no line breaks)" in result.errors
+
+    def test_a_step_may_have_32_params_but_not_33(self):
+        from cli_agent_orchestrator.constants import WORKFLOW_MAX_STEP_PARAMS
+
+        at_cap = validate_only(_step_yaml(_params_yaml({f"k{i}": "v" for i in range(32)})))
+        over = validate_only(_step_yaml(_params_yaml({f"k{i}": "v" for i in range(33)})))
+        assert WORKFLOW_MAX_STEP_PARAMS == 32
+        assert at_cap.status == "pass"
+        assert over.errors == ["step 's1' declares 33 params (max 32)"]
+
+    @pytest.mark.parametrize("raw,kind", [('"text"', "a string"), ("[a, b]", "a list")])
+    def test_params_must_be_a_mapping(self, raw, kind):
+        result = validate_only(_step_yaml(f"    params: {raw}\n"))
+        assert result.errors == [
+            f"step 's1': params must be a mapping of names to string values, not {kind}"
+        ]
+
+    def test_param_errors_aggregate_with_every_other_grammar_error(self):
+        """One ValueError carries all of them (BR-7), not just the first field error."""
+        second = "  - {id: s1, provider: p, agent: a, prompt: y, params: {bad key: v, n: 7}}\n"
+        result = validate_only(_step_yaml(_params_yaml({"ok": "v"}), second_step=second))
+        assert result.status == "fail"
+        assert "duplicate step id 's1'" in result.errors
+        assert any("param name 'bad key' is invalid" in e for e in result.errors)
+        assert "step 's1': param 'n' must be a string, not a number (quote the value)" in (
+            result.errors
+        )
+
+    def test_a_param_violation_raises_from_construction_too(self):
+        with pytest.raises(ValueError, match="param 'n' must be a string"):
+            WorkflowSpec(
+                **_spec_kwargs(
+                    steps=[
+                        {
+                            "id": "s1",
+                            "provider": "p",
+                            "agent": "a",
+                            "prompt": "x",
+                            "params": {"n": 7},
+                        }
+                    ]
+                )
+            )
+
+
+class TestSnapshotCompatibility:
+    """Run journals store ``spec.model_dump_json()``; old snapshots must still load."""
+
+    # The step shape every run journaled before ``call``/``params`` existed carries.
+    _OLD_SNAPSHOT = (
+        '{"name":"wf","description":"","mode":"sequential","inputs":{},"steps":[{"id":"s1",'
+        '"provider":"claude_code","agent":"dev","prompt":"go","engine":null,"output_schema":null,'
+        '"when":null,"until":null,"max_iterations":null,"on_stall":null,"on_no_progress":null,'
+        '"on_failure":null,"retries":null}]}'
+    )
+
+    def test_an_old_snapshot_without_the_new_keys_loads(self):
+        spec = WorkflowSpec.model_validate_json(self._OLD_SNAPSHOT)
+        assert spec.steps[0].call is None
+        assert spec.steps[0].params is None
+
+    def test_a_new_snapshot_appends_call_and_params_after_the_old_keys(self):
+        spec = WorkflowSpec.model_validate_json(self._OLD_SNAPSHOT)
+        assert spec.model_dump_json() == (
+            self._OLD_SNAPSHOT[: -len("}]}")] + ',"call":null,"params":null}]}'
+        )
+
+    def test_params_survive_a_snapshot_round_trip_in_order(self):
+        step = {
+            "id": "s1",
+            "provider": "p",
+            "agent": "a",
+            "prompt": "x",
+            "call": "handoff",
+            "params": {"z": "1", "a": "2"},
+        }
+        spec = WorkflowSpec(**_spec_kwargs(steps=[step]))
+        rebuilt = WorkflowSpec.model_validate_json(spec.model_dump_json())
+        assert list(rebuilt.steps[0].params.items()) == [("z", "1"), ("a", "2")]
+        assert rebuilt.steps[0].call == "handoff"

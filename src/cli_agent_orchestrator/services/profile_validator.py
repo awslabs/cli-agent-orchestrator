@@ -30,6 +30,10 @@ from jsonschema import Draft202012Validator as _Draft202012Validator
 from jsonschema import ValidationError, validators
 
 from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+from cli_agent_orchestrator.models.agent_profile import (
+    ProfileParamDecl,
+    param_declaration_problems,
+)
 
 Severity = Literal["error", "warning"]
 
@@ -126,6 +130,12 @@ def load_profile_schema() -> dict:
 _MAX_RENDERED_BYTES = 1_000_000
 _MAX_DEPTH = 64
 
+# The most UTF-8 bytes the ``params`` block may take as JSON in a validate
+# response. Without it, YAML aliases let a small request reuse one long enum in
+# every param, and the response grew about 32 times larger than the request.
+# The largest bundled example's block takes under 1 KB.
+_MAX_PARAMS_RESPONSE_BYTES = 64_000
+
 # Ceiling on a single finding's text. The collector applies it to every producer,
 # even though jsonschema is the one that can interpolate a large instance.
 _MAX_FINDING_CHARS = 2_000
@@ -212,6 +222,16 @@ class _FindingCollector:
         """Record omission without counting or exhausting the producer."""
         if self._omitted_severity is None or severity == "error":
             self._omitted_severity = severity
+
+    def has_error_under(self, key: str) -> bool:
+        """Whether an error added so far has the path ``key`` or a path below it."""
+        below = f"{key}."
+        return any(
+            finding.severity == "error"
+            and finding.path is not None
+            and (finding.path == key or finding.path.startswith(below))
+            for finding in self._findings
+        )
 
     def finalize(self) -> list[ValidationMessage]:
         """Return findings with exactly one trailing marker when truncated."""
@@ -418,19 +438,81 @@ def _collect_non_string_key_findings(metadata: object, collector: _FindingCollec
     return walk(metadata, "")
 
 
+def _schema_error_message(error: ValidationError) -> str:
+    """The text a person reads for one JSON-Schema error.
+
+    jsonschema words a failed ``not`` as "<instance> should not be valid under <schema>",
+    which names neither the rule nor the fix. Where the profile schema uses ``not``, the
+    subschema that holds it states the rule in its ``description``, so that is shown
+    instead. Every other error keeps jsonschema's own message.
+    """
+    if getattr(error, "validator", None) == "not":
+        subschema = getattr(error, "schema", None)
+        description = subschema.get("description") if isinstance(subschema, dict) else None
+        if isinstance(description, str) and description:
+            return description
+    return str(error.message)
+
+
+def _collect_param_rule_findings(
+    params: object, schema_errors: list[ValidationError], collector: _FindingCollector
+) -> bool:
+    """Add the ``params`` rules the schema does not state, in document order.
+
+    Three rules: a default is one of the enum values, an int value is not written with a
+    decimal point (JSON has one number type, so ``1.0`` passes ``"type": "integer"``), and
+    a string default or enum value has no ``{{...}}`` placeholder. All three come from
+    ``param_declaration_problems``, the check the model raises on, so a profile the
+    validator accepts is one the loader accepts.
+
+    A declaration the schema already reported is skipped, so one mistake is not
+    reported twice, and an error on the block itself skips the whole check. The
+    schema stops a block of more than 32 entries, so this walks at most 32.
+
+    Returns:
+        ``True`` when every finding fitted, or ``False`` when the collector rejected one.
+    """
+    reported = {
+        tuple(error.absolute_path)[1:2]
+        for error in schema_errors
+        if tuple(error.absolute_path)[:1] == ("params",)
+    }
+    if () in reported:
+        return True
+    for path, message in param_declaration_problems(params):
+        if path[:1] in reported:
+            continue
+        dotted = ".".join(str(part) for part in ("params", *path))
+        if not collector.add(ValidationMessage("error", message, dotted)):
+            return False
+    return True
+
+
 def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
     """Validate a frontmatter dict against the schema and CAO conventions.
 
     Returns a bounded prefix in stable producer order: deprecated fields, then
     non-string mapping keys, then a bounded JSON-Schema prefix sorted by path,
-    then ``allowedTools`` vocabulary warnings, then the role check. At most
-    ``_MAX_FINDINGS`` are returned, including one final omission marker when the
-    shared count or aggregate-text budget fills. An empty list means the profile
-    is valid with no advisories.
+    then the ``params`` rules the schema does not state, then ``allowedTools``
+    vocabulary warnings, then the role check. At most ``_MAX_FINDINGS`` are
+    returned, including one final omission marker when the shared count or
+    aggregate-text budget fills. An empty list means the profile is valid with no
+    advisories.
 
     A document outside the structural ceilings is the one exception to that
     order: it is reported and nothing further runs, because the later steps are
     exactly what such a document is expensive in.
+    """
+    return _check_frontmatter(metadata)[0]
+
+
+def _check_frontmatter(metadata: dict) -> tuple[list[ValidationMessage], bool]:
+    """The findings :func:`validate_frontmatter` returns, and whether ``params`` passed.
+
+    The flag is True only when the frontmatter has a ``params`` key, every check on
+    that block ran, and none of them reported an error at ``params`` or below it. When
+    the checks stop before the block is finished, at the structural ceilings or when
+    the findings budget fills, the flag is False.
     """
     collector = _FindingCollector()
 
@@ -445,19 +527,19 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
                     f"Use 'allowedTools' instead.",
                 )
             ):
-                return collector.finalize()
+                return collector.finalize(), False
 
     # 2. Structural ceilings, before anything traverses or validates the
     #    document: rendered size, nesting depth, and cycles.
     structural = _structural_bound_finding(metadata)
     if structural is not None:
         collector.add(structural)
-        return collector.finalize()
+        return collector.finalize(), False
 
     # 3. Non-string mapping keys, which JSON Schema cannot see. Stream findings
     #    into the shared collector and stop the walk as soon as its budget fills.
     if not _collect_non_string_key_findings(metadata, collector):
-        return collector.finalize()
+        return collector.finalize(), False
 
     # 4. JSON-Schema structural validation. Consume only the remaining capacity
     #    plus one lookahead before sorting, so the iterator and sort allocation
@@ -468,11 +550,20 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
     omitted_schema_errors = len(sampled_errors) > remaining
     for error in sorted(sampled_errors[:remaining], key=lambda e: [str(p) for p in e.path]):
         path = ".".join(str(p) for p in error.absolute_path) or "(root)"
-        if not collector.add(ValidationMessage("error", error.message, path)):
-            return collector.finalize()
+        if not collector.add(ValidationMessage("error", _schema_error_message(error), path)):
+            return collector.finalize(), False
     if omitted_schema_errors:
         collector.mark_omitted("error")
-        return collector.finalize()
+        return collector.finalize(), False
+
+    # 4b. The ``params`` rules the schema does not state. Every schema error is in
+    #     ``sampled_errors`` here, since a truncated sample returned above. Every
+    #     check on the block has run once this step finishes.
+    params_passed = False
+    if "params" in metadata:
+        if not _collect_param_rule_findings(metadata["params"], sampled_errors, collector):
+            return collector.finalize(), False
+        params_passed = not collector.has_error_under("params")
 
     # 5. allowedTools vocabulary check (advisory, not blocking).
     #
@@ -494,7 +585,7 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
                         f"vocabulary. It may be silently ignored by some providers.",
                     )
                 ):
-                    return collector.finalize()
+                    return collector.finalize(), params_passed
 
     # 6. Role check (advisory — custom roles are valid but worth flagging).
     #
@@ -511,7 +602,20 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
             )
         )
 
-    return collector.finalize()
+    return collector.finalize(), params_passed
+
+
+def _parse_frontmatter(text: str) -> dict:
+    """The frontmatter of profile markdown, as parsed YAML.
+
+    Raises:
+        ValueError: ``text`` could not be parsed as frontmatter.
+    """
+    try:
+        post = frontmatter.loads(text)
+    except Exception as e:
+        raise ValueError(f"Error reading profile: {e}") from e
+    return post.metadata
 
 
 def validate_profile_text(text: str) -> list[ValidationMessage]:
@@ -524,8 +628,60 @@ def validate_profile_text(text: str) -> list[ValidationMessage]:
     Raises:
         ValueError: ``text`` could not be parsed as frontmatter.
     """
+    return validate_frontmatter(_parse_frontmatter(text))
+
+
+@dataclass(frozen=True)
+class ProfileTextValidation:
+    """The findings for one profile document, and its ``params`` block as the model reads it.
+
+    ``params`` holds validated declarations in declaration order, and is empty for an
+    empty block. It is None when the frontmatter has no ``params`` key, when a finding
+    is an error at ``params`` or below it, when the checks stopped before the block
+    was finished, or when the block takes more than ``_MAX_PARAMS_RESPONSE_BYTES`` as
+    JSON.
+    """
+
+    findings: list[ValidationMessage]
+    params: Optional[dict[str, ProfileParamDecl]]
+
+
+def validate_profile_text_with_params(text: str) -> ProfileTextValidation:
+    """Validate profile markdown, and read its ``params`` block when the block passed.
+
+    The findings are the ones :func:`validate_profile_text` returns. The text is read
+    as written, so a ``${VAR}`` placeholder stays as it is. The block is built from
+    validated ``ProfileParamDecl`` objects, never from the parsed YAML, so the model's
+    limits bound its size however many YAML aliases the text uses.
+
+    Raises:
+        ValueError: ``text`` could not be parsed as frontmatter.
+    """
+    metadata = _parse_frontmatter(text)
+    findings, params_passed = _check_frontmatter(metadata)
+    params = _declared_params(metadata["params"]) if params_passed else None
+    if params is not None and _params_json_bytes(params) > _MAX_PARAMS_RESPONSE_BYTES:
+        params = None
+    return ProfileTextValidation(findings, params)
+
+
+def _params_json_bytes(params: dict[str, ProfileParamDecl]) -> int:
+    """The UTF-8 bytes ``params`` takes as JSON, dumped the way the routes dump it.
+
+    The model bounds the input, so this costs at most a few milliseconds.
+    """
+    dumped = {name: decl.model_dump(exclude_none=True) for name, decl in params.items()}
+    return len(json.dumps(dumped, ensure_ascii=False).encode("utf-8"))
+
+
+def _declared_params(params: dict) -> Optional[dict[str, ProfileParamDecl]]:
+    """Each declaration, built as ``AgentProfile.params`` builds it, in declaration order.
+
+    Called only on a block that passed every check, and the model accepts what the
+    checks pass (``test/services/test_profile_params_validation.py`` pins that). None
+    is the fallback if the two ever disagree, so a caller never sees a model error.
+    """
     try:
-        post = frontmatter.loads(text)
-    except Exception as e:
-        raise ValueError(f"Error reading profile: {e}") from e
-    return validate_frontmatter(post.metadata)
+        return {name: ProfileParamDecl.model_validate(entry) for name, entry in params.items()}
+    except ValueError:
+        return None

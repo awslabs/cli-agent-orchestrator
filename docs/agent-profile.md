@@ -52,6 +52,8 @@ portable and make profile listings useful.
   translations for provider files used inside a container.
 - `provider_init_timeout` (integer, seconds): per-profile provider
   initialization timeout.
+- `params` (object): the params a workflow step that uses this profile must
+  fill. See [Workflow step params](#workflow-step-params).
 - `prompt` (string): additional provider prompt text.
 
 ### Provider configuration
@@ -153,6 +155,69 @@ provider_init_timeout: 180
 The container must mount the host directory at the documented guest path.
 Current path-map consumption is provider-specific, so confirm support in the
 relevant provider guide before depending on it.
+
+## Workflow step params
+
+`params` declares the params a YAML workflow step that uses this profile must
+fill. The workflow builder shows one input per declared param, and the server
+checks each step's values against the declaration when a workflow is validated
+and when a run starts. See
+[Params a profile declares](workflows.md#params-a-profile-declares).
+
+```yaml
+params:
+  table_name:
+    description: DynamoDB table name
+    required: true
+  partition_key_type:
+    description: DynamoDB key type
+    required: true
+    enum: [S, N, B]
+  limit:
+    description: Max items to return
+    type: int
+    default: 1
+```
+
+`params` is CAO-native. CAO never writes it into a provider's agent file or
+agent JSON.
+
+The rules:
+
+- At most 32 params. Each name starts with a letter and has at most 64
+  characters, using letters, digits, `_`, `.` and `-`, the same rule as a step
+  param name.
+- Each param is a mapping with only these keys:
+  - `type`: `string`, `int` or `bool`. The default is `string`.
+  - `required`: `true` or `false`. The default is `false`.
+  - `default`: the value the workflow builder fills in. It matches `type`, and
+    a YAML boolean is not an `int`. A string default is one line of at most 512
+    characters, with no `{{...}}` placeholder: the builder copies a default
+    into a step's params, where values are fixed when the workflow is built.
+    Single braces, as in `{"a": 1}`, are allowed. With `enum`, it must be one
+    of the enum values. A required param cannot have a default.
+  - `description`: one line of at most 200 characters.
+  - `enum`: 1 to 32 distinct values of the declared type. A string value is one
+    line of at most 512 characters, with no `{{...}}` placeholder. A `bool`
+    param cannot have one.
+- An `int` default or enum value has at most 18 digits.
+- `pattern`, `minimum`, `maximum` and `maxLength` are not supported. A profile
+  can be installed from a URL, and an author's regex would run on the server.
+
+A profile that breaks a rule is invalid: `cao profile validate` reports it, and
+the profile write routes refuse it.
+
+CAO resolves `${VAR}` placeholders in the whole profile before it reads the
+frontmatter, so do not write `${` inside the `params` block.
+
+A step's values are journaled in plaintext with the run's spec snapshot, so a
+param never holds a secret. Pass the name of a profile or a secret instead.
+
+In the web UI, Create profile, From scratch, has a Params section. Edit and
+Clone show the same section above the profile text. Changing a param there
+rewrites only the `params` block in the text, and comments inside that block
+are not kept. The section suggests params from the `${...}` placeholders in the
+prompt, and you choose which ones to add.
 
 ## Installation
 
