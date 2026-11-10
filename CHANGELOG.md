@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **A hung FIFO-writer test fails in 10 seconds instead of holding CI** (#1251 follow-up).
+  `test_stdin_closing_before_any_reader_ends_the_writer` called the writer in-process, so a
+  regression to a blocking `open()` would have hung the pytest worker; it now runs the writer in
+  a daemon thread joined with a timeout. The Unit Tests job also gains `timeout-minutes: 60`, so
+  any hung test ends the job within an hour instead of GitHub's default of six.
 - **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
   the sidecar beside `opencode.json` could not be read as a grant record, `cao install
   --provider opencode_cli` started from an empty record and wrote it back, dropping every other
