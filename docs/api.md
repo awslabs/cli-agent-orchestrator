@@ -184,8 +184,8 @@ See [Agent Profiles](agent-profile.md) and
   child directory names for any path the server user can read, confined
   only by the path policy's blocked subtrees (`/etc`, `/proc`, `/sys`,
   `/dev`, `/root`, the system binary and library trees are refused at any
-  depth; `/` and `/tmp` themselves stay listable so a picker can descend
-  through them). That is still stronger than the existence check
+  depth, bar `/dev/shm`; `/` and `/tmp` themselves stay listable so a picker
+  can descend through them). That is still stronger than the existence check
   `working_directory` already gives a caller, so under an auth-enabled
   deployment a read-scope token can enumerate the allowed tree; confine it
   to a root if that is your deployment shape.
