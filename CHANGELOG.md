@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **`assign` guarantees a callback by default.** If a worker goes idle without calling
+  `send_message`, the server forwards its last response to the caller, labelled as auto-forwarded;
+  if the worker is deleted or errors first, the caller is told, and if a message or the task cannot
+  be delivered (including a restart before the task was delivered), the caller gets a
+  `[CAO delivery failed]` notice. Opt out per call with
+  `expect_callback=False`. `send_message` gains `expect_reply` for terminals you did not assign.
+  Local assigns only; `target_host` and elastic workers are not covered (#1246). A forward waits
+  until the worker has started on the last message delivered to it; a worker that shows no sign of
+  work for `CAO_DELEGATION_PICKUP_TIMEOUT_SECONDS` (default 300) after a delivery is forwarded with
+  a header saying the message may not have been picked up. With `CAO_EAGER_INBOX_DELIVERY=true`, a
+  message can reach a worker in the middle of a turn, and the forward can then send the answer of
+  that turn.
+
 - **A hung FIFO-writer test fails in 10 seconds instead of holding CI** (#1251 follow-up).
   `test_stdin_closing_before_any_reader_ends_the_writer` called the writer in-process, so a
   regression to a blocking `open()` would have hung the pytest worker; it now runs the writer in

@@ -47,6 +47,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import delete_terminals_by_session  # noqa: F401  # isort: skip  # fmt: skip
 from cli_agent_orchestrator.clients.database import (
     LAUNCH_TARGET_KINDS,
+    close_open_edges_for_terminal,
     count_runtime_allocated_terminals,
     create_inbox_message,
 )
@@ -69,6 +70,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    mark_assign_edges_delivered,
     mark_terminal_identity_verified,
     terminal_id_in_use,
     update_last_active,
@@ -93,6 +95,7 @@ from cli_agent_orchestrator.constants import (
     TURN_START_CONFIRM_SECONDS,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.delegation import EdgeState
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import (
     KiroEngine,
@@ -3490,6 +3493,13 @@ def _notify_caller_of_deferred_failure(
             terminal_id,
         )
 
+    # The caller has just been told the worker failed. Close its edges here so
+    # neither a forward nor a second worker-ended notice follows.
+    try:
+        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        logger.warning("Deferred-init failure: could not close edges for %s: %s", terminal_id, exc)
+
     ephemeral_service.release(terminal_id, "launch_failed")
     if delete_worker:
         try:
@@ -4208,6 +4218,20 @@ async def recover_interrupted_initial_deliveries() -> bool:
             )
             if not settled:
                 continue
+            # The task will never be delivered, so its assign edges would never
+            # be armed: never swept, and holding the caller's own forward back
+            # as nested work for good. Each is closed with a notice queued for
+            # its caller, which the inbox reconciliation sweep delivers.
+            try:
+                from cli_agent_orchestrator.services import delegation_callback_service
+
+                await asyncio.to_thread(
+                    delegation_callback_service.handle_task_never_delivered, terminal_id
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort, like the notice paths
+                logger.warning(
+                    "Could not close delegation edges of interrupted %s: %s", terminal_id, exc
+                )
             metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
             if not metadata:
                 continue
@@ -5284,6 +5308,10 @@ def _schedule_deferred_init(
                 # in-memory mask lifts in ``finally`` so a client that reads
                 # delivered never sees an unmasked status first (#566).
                 await asyncio.to_thread(_persist_initial_delivery, terminal_id, "delivered")
+                # The task is in the worker now, so its waiting callers may be
+                # owed a forward once it goes idle. Before this point an idle
+                # worker has not seen the task and must not trigger one.
+                await asyncio.to_thread(mark_assign_edges_delivered, terminal_id)
             await _clear_deferred_init_external_owner(terminal_id)
         except ProviderExitedInputBlockedError as e:
             # Caught BEFORE the TerminalInputBlockedError branch below, whose
@@ -6870,6 +6898,15 @@ def delete_terminal_row(
         # DB row was already deleted by another lifecycle owner.
         _delete_deferred_failure_fallback(terminal_id)
         _delete_deferred_init_complete_fallback(terminal_id)
+    # Close every delegation edge still open on this terminal, without a
+    # notice. ``delete_terminal`` has already told waiting callers; session
+    # teardown, retention cleanup and the stale-row purge come straight here,
+    # and an edge they left open would stay armed with no terminal behind it,
+    # re-evaluated by every sweep. Runs even when another owner deleted the row.
+    try:
+        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+    except Exception as exc:  # noqa: BLE001 - best-effort; the row is already gone
+        logger.warning("Could not close delegation edges of %s: %s", terminal_id, exc)
     if deleted:
         ephemeral_service.release(terminal_id, "terminal_gone")
     logger.info(f"Deleted terminal: {terminal_id}")
@@ -6899,6 +6936,14 @@ def delete_terminal(
     ``dismantle_terminal_runtime``), leaving the row in place for a retry.
     ``end_reason`` is passed through to ``delete_terminal_row``.
     """
+    # Tell any caller waiting on this worker before teardown starts. Imported
+    # here because delegation_callback_service imports this module.
+    try:
+        from cli_agent_orchestrator.services import delegation_callback_service
+
+        delegation_callback_service.handle_worker_ended(terminal_id, "was deleted", registry)
+    except Exception as exc:  # noqa: BLE001 - deletion must proceed
+        logger.warning("delete_terminal: delegation notice failed for %s: %s", terminal_id, exc)
     try:
         metadata = capture_terminal_snapshot(terminal_id)
         if not dismantle_terminal_runtime(terminal_id, metadata):

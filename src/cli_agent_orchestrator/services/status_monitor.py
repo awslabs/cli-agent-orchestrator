@@ -215,6 +215,16 @@ class StatusMonitor:
         # it predates the turn's own output (#814). Absent means never dispatched
         # (fresh terminal, or state lost on restart) and any stamp counts.
         self._dispatch_generation: Dict[str, int] = {}
+        # Per-terminal OUTPUT generation at the last notify_input_sent. A
+        # COMPLETED whose ``_status_generation`` is above it was earned by
+        # output that landed after that input (see started_on_last_input).
+        self._dispatch_output_generation: Dict[str, int] = {}
+        # Per-terminal monotonic time of the last notify_input_sent, and of the
+        # last native PROCESSING/WAITING report (note_native_activity). Only
+        # event-inbox backends (herdr) use the pair: they feed no output
+        # through _process_chunk, so they have no generations to compare.
+        self._input_sent_at: Dict[str, float] = {}
+        self._native_activity_at: Dict[str, float] = {}
         # Per-terminal monotonic timestamp of the last stale-PROCESSING capture-pane
         # attempt — the STALE_PROCESSING_CAPTURE_INTERVAL_S rate limit. Absence is None,
         # deliberately NOT 0.0: time.monotonic()'s reference point is arbitrary, so a 0.0
@@ -1110,6 +1120,86 @@ class StatusMonitor:
             applied = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             return StatusObservation(applied, self._status_generation.get(terminal_id, 0))
 
+    def started_on_last_input(self, terminal_id: str) -> bool:
+        """True when the terminal has shown work on the last input sent to it.
+
+        A ready status latched before an input stays cached after it until the
+        monitor sees the new turn, so IDLE or COMPLETED alone cannot say whether
+        the terminal has finished that input or has not started it yet. This
+        answers the second question for the delegation callback: forwarding a
+        terminal's last response in that window would forward the previous
+        turn's answer.
+
+        Pipe-pane backends (tmux) count any of: PROCESSING or
+        WAITING_USER_ANSWER observed from output that landed after the input
+        (the same stamps ``_processing_observed_this_turn_locked`` reads), or a
+        COMPLETED earned from such output (a fast turn can reach COMPLETED with
+        no PROCESSING detected in between). IDLE earned after the input does
+        not count: a PROCESSING -> IDLE re-read of the old prompt is not
+        evidence that the input ran. The optimistic PROCESSING latch of
+        ``assume_processing_on_dispatch`` stamps neither, so it does not count.
+
+        Event-inbox backends (herdr) feed no output here, so they count a
+        native PROCESSING or WAITING_USER_ANSWER report (``note_native_activity``)
+        made after the input. A turn that herdr never reports as working reads
+        as not started, which is the safe side for the callback: it waits, up
+        to its pickup timeout, instead of forwarding the previous answer.
+
+        A terminal that has had no input since this monitor started tracking it
+        (a fresh terminal, or state lost on restart) reads as started, because
+        there is no newer input it could still be about to start.
+
+        Thread Safety:
+            Lock-guarded; safe from any thread.
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        native = get_backend().supports_event_inbox()
+        with self._lock:
+            if native:
+                sent_at = self._input_sent_at.get(terminal_id)
+                if sent_at is None:
+                    return True
+                active_at = self._native_activity_at.get(terminal_id)
+                return active_at is not None and active_at > sent_at
+            dispatched = self._dispatch_generation.get(terminal_id)
+            if dispatched is None:
+                return True
+            if self._processing_generation.get(terminal_id, dispatched) > dispatched:
+                return True
+            if self._waiting_generation.get(terminal_id, dispatched) > dispatched:
+                return True
+            completed = self._last_status.get(terminal_id) == TerminalStatus.COMPLETED
+            earned_at = self._status_generation.get(terminal_id, 0)
+            return completed and earned_at > self._dispatch_output_generation.get(terminal_id, 0)
+
+    def last_input_at(self, terminal_id: str) -> Optional[float]:
+        """``time.monotonic()`` at the last ``notify_input_sent``, or None if none was seen.
+
+        Lets a caller bound how long it waits for ``started_on_last_input``:
+        an input that is never picked up (a lost paste, a swallowed Enter)
+        never shows work.
+
+        Thread Safety:
+            Lock-guarded; safe from any thread.
+        """
+        with self._lock:
+            return self._input_sent_at.get(terminal_id)
+
+    def note_native_activity(self, terminal_id: str) -> None:
+        """Record that an event-inbox backend reported the terminal working or blocked.
+
+        herdr reports agent state on its own event socket rather than through
+        terminal output, so ``started_on_last_input`` cannot see the turn
+        start from output generations. ``HerdrInboxService`` calls this for
+        every ``working`` or ``blocked`` report of a managed pane.
+
+        Thread Safety:
+            Lock-guarded; safe from any thread, including the event loop.
+        """
+        with self._lock:
+            self._native_activity_at[terminal_id] = time.monotonic()
+
     def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> None:
         """Arm the next PROCESSING transition.
 
@@ -1137,6 +1227,10 @@ class StatusMonitor:
             # Where this turn begins; a PROCESSING stamp has to get past it to count
             # as this turn's observation (see _processing_observed_this_turn_locked).
             self._dispatch_generation[terminal_id] = self._capture_generation[terminal_id]
+            self._dispatch_output_generation[terminal_id] = self._output_generation.get(
+                terminal_id, 0
+            )
+            self._input_sent_at[terminal_id] = time.monotonic()
             # ``_idle_from_completed`` is deliberately NOT cleared here. The marker
             # says the current IDLE is a previous COMPLETED with its box scrolled
             # off, and arming does not change what is on screen. Clearing it on
@@ -1239,6 +1333,9 @@ class StatusMonitor:
             self._allow_processing_revert.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
             self._dispatch_generation.pop(terminal_id, None)
+            self._dispatch_output_generation.pop(terminal_id, None)
+            self._input_sent_at.pop(terminal_id, None)
+            self._native_activity_at.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             self._recheck_cache.pop(terminal_id, None)
@@ -1272,6 +1369,9 @@ class StatusMonitor:
             self._allow_processing_revert.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
             self._dispatch_generation.pop(terminal_id, None)
+            self._dispatch_output_generation.pop(terminal_id, None)
+            self._input_sent_at.pop(terminal_id, None)
+            self._native_activity_at.pop(terminal_id, None)
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
