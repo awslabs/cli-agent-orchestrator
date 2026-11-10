@@ -833,6 +833,13 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
 
                     for terminal_id in sweep_ids:
                         ephemeral_service.release(terminal_id, "terminal_gone")
+                # Their rows are gone (or never existed), so is their stream state.
+                from cli_agent_orchestrator.services.terminal_service import (
+                    forget_stream_lifecycle,
+                )
+
+                for terminal_id in sweep_ids:
+                    forget_stream_lifecycle(terminal_id)
             except Exception as e:
                 logger.warning(f"Failed to sweep registry rows for {session_name}: {e}")
                 result["errors"].append(

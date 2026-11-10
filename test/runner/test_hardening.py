@@ -991,8 +991,16 @@ class TestReachability:
         assert monitor.get_status("aaaaaaaa") is TerminalStatus.UNKNOWN
 
     def test_a_new_runner_process_gets_its_lost_pipes_re_armed(
-        self, monitor, make_hub, runners, tmp_path
+        self, registry, monitor, make_hub, runners, tmp_path, monkeypatch
     ):
+        from cli_agent_orchestrator.backends import remote_backend as rb_mod
+        from cli_agent_orchestrator.services import fifo_reader, terminal_service
+
+        monkeypatch.setattr(rb_mod, "_RESYNC_RETRY_DELAY", 0.05)  # under load a try can fail
+        # The resync worker registry is module-global: another test's worker for
+        # the same id may still be retrying, and would absorb this request.
+        monkeypatch.setattr(rb_mod, "_resyncing", set())
+        monkeypatch.setattr(rb_mod, "_resync_again", set())
         h = make_hub()
         backend = RemoteBackend()
         backend._tmp_dir = str(tmp_path / "srv")
@@ -1002,16 +1010,34 @@ class TestReachability:
         a = runners(h, "a", tmp_path / "a")
         wait_for(lambda: "a" in h.connected_runners())
         backend.create_session("s1", "w", "aaaaaaaa")
-        backend.pipe_pane("s1", "w", str(tmp_path / "server.fifo"))
+        _row("aaaaaaaa", runner_id="a")
+        fifo = str(tmp_path / "server.fifo")
+        backend.pipe_pane("s1", "w", fifo)
+        manager = fifo_reader.FifoManager()  # the reader this terminal was created with
+        manager._pane_probe["aaaaaaaa"] = lambda: backend.get_history("s1", "w")
+        manager._rearm["aaaaaaaa"] = lambda: (
+            backend.stop_pipe_pane("s1", "w"),
+            backend.pipe_pane("s1", "w", fifo),
+        )
+        manager._readers["aaaaaaaa"] = threading.Event()
+        monkeypatch.setattr(fifo_reader, "fifo_manager", manager)
+        monkeypatch.setattr(terminal_service, "fifo_manager", manager)
         first_pipe = h._pipe_of[("a", "s1", "w")]
+        h.end_placing("aaaaaaaa", routed=True)
+        with h._lock:
+            h._settling.pop("aaaaaaaa", None)  # long past its creation
         a.stop()
         wait_for(lambda: "a" not in h.connected_runners())
 
-        # A new process: same panes (re-adopted), but none of the pipes.
+        # A new process: same panes (re-adopted), but none of the pipes. The
+        # terminal is latched UNKNOWN until its stream is restored, never left
+        # at a status derived before the outage.
         b = runners(h, "a", tmp_path / "a2", hosting={("s1", "w"): "aaaaaaaa"})
-        wait_for(lambda: ("s1", "w") in b.local.piped)
-        wait_for(lambda: h._pipe_of.get(("a", "s1", "w")) not in (None, first_pipe))
+        # Re-armed by the resync worker, a thread of its own: generous under load.
+        wait_for(lambda: ("s1", "w") in b.local.piped, 20)
+        wait_for(lambda: h._pipe_of.get(("a", "s1", "w")) not in (None, first_pipe), 20)
         assert b.runner._pipes[("s1", "w")].pipe_id == h._pipe_of[("a", "s1", "w")]
+        wait_for(lambda: monitor.stream_gap_generation("aaaaaaaa") is None, 20)  # resynced
 
     def test_a_reconnect_of_the_same_process_keeps_its_pipes(
         self, monitor, make_hub, runners, tmp_path
@@ -1027,10 +1053,13 @@ class TestReachability:
         backend.create_session("s1", "w", "aaaaaaaa")
         backend.pipe_pane("s1", "w", str(tmp_path / "server.fifo"))
         pipe_id = h._pipe_of[("a", "s1", "w")]
+        report = hub_mod._Report(accepted={("s1", "w"): "aaaaaaaa"})
+        h.end_placing("aaaaaaaa", routed=True)
         with h._lock:
-            assert h._lost_pipes_locked("a", [pipe_id]) == []
-            assert h._lost_pipes_locked("a", None) == []  # not listed: assume kept
-            assert h._lost_pipes_locked("a", []) == [("s1", "w", str(tmp_path / "server.fifo"))]
+            h._settling.pop("aaaaaaaa", None)  # long past its creation
+            assert h._streams_to_restore_locked("a", [pipe_id], report) == []
+            assert h._streams_to_restore_locked("a", None, report) == []  # not listed: kept
+            assert h._streams_to_restore_locked("a", [], report) == ["aaaaaaaa"]
 
     def test_a_pane_its_runner_stops_reporting_reads_unknown(
         self, monitor, make_hub, runners, tmp_path, monkeypatch
@@ -1093,22 +1122,6 @@ class TestReachability:
         assert old_pipe not in h._sinks  # no longer fed from the old incarnation
         wait_for(lambda: "aaaaaaaa" in monitor._unreachable)
         assert "bbbbbbbb" not in monitor._unreachable
-
-    def test_a_failed_re_arm_is_retried(self, monkeypatch):
-        from cli_agent_orchestrator.backends import remote_backend as rb_mod
-
-        monkeypatch.setattr(rb_mod, "_REARM_RETRY_DELAY", 0.0)
-        backend = RemoteBackend()
-        calls = []
-
-        def flaky(session, window, path):
-            calls.append(session)
-            if len(calls) == 1:
-                raise rb_mod.RunnerOutcomeUnknown("lost")
-
-        monkeypatch.setattr(backend, "pipe_pane", flaky)
-        backend._rearm_pipes([("s1", "w", "/tmp/f")])
-        assert calls == ["s1", "s1"]
 
     def test_an_expired_runner_stops_keeping_its_session_alive(self, make_hub, runners, tmp_path):
         h = make_hub(expiry=0.3)

@@ -54,9 +54,12 @@ def _wait(predicate, timeout: float = 30.0, interval: float = 0.25, what: str = 
         try:
             last = predicate()
         except requests.RequestException as exc:
+            # Not ready yet (e.g. a server still starting): keep waiting. An
+            # exception object is truthy and must not read as success.
             last = exc
-        if last:
-            return last
+        else:
+            if last:
+                return last
         time.sleep(interval)
     raise AssertionError(f"{what} not met in {timeout}s (last: {last!r})")
 
@@ -152,6 +155,14 @@ class Stack:
         self.runner = self._spawn("runner", [str(BIN / "cao-runner")], env)
         _wait(self.ready_file.exists, 30, what="runner ready file")
         _wait(lambda: self.runner_connected(), 30, what="runner connected")
+
+    def restart_server(self) -> None:
+        """Stop cao-server and start a new process on the same state (a rollout)."""
+        if self.server is not None and self.server.poll() is None:
+            self.server.terminate()
+            self.server.wait(timeout=30)
+        self.start_server()
+        _wait(lambda: self.runner_connected(), 60, what="runner reconnected")
 
     def runner_connected(self) -> bool:
         rows = requests.get(f"{self.base}/runners", timeout=5).json()
@@ -379,3 +390,49 @@ def test_the_runner_token_never_reaches_the_agent(stack, terminal):
     pane = stack.tmux("capture-pane", "-p", "-S", "-", "-t", f"={name.replace(':', ':=')}")
     assert token not in pane.stdout
     assert json.dumps(token) not in (stack.root / "runner.log").read_text(errors="replace")
+
+
+def test_a_restarted_server_restores_status_streams_and_inbox_delivery(stack, terminal):
+    """A cao-server rollout: the terminal outlives the server process.
+
+    Nothing in the new process has its output stream. It must read UNKNOWN,
+    never a status from before the restart, until the stream is restored;
+    then status, streamed output and inbox delivery all work again.
+    """
+    stack.restart_server()
+    assert terminal in stack.runner_windows()  # the agent kept running
+    _wait(lambda: stack.status(terminal) != "unknown", 60, what="status restored")
+    r = requests.post(
+        f"{stack.base}/terminals/{terminal}/input",
+        params={"message": "after-server-restart"},
+        timeout=60,
+    )
+    assert r.ok, r.text
+    _wait(
+        lambda: "MOCK: after-server-restart" in stack.streamed(terminal),
+        30,
+        what="restored stream",
+    )
+    _wait(lambda: stack.status(terminal) in ("idle", "completed"), 30, what="settled again")
+    r = requests.post(
+        f"{stack.base}/terminals/{terminal}/inbox/messages",
+        params={"sender_id": "e2e-sender", "message": "inbox-after-server-restart"},
+        timeout=60,
+    )
+    assert r.ok, r.text
+
+    def delivered():
+        messages = requests.get(
+            f"{stack.base}/terminals/{terminal}/inbox/messages", timeout=10
+        ).json()
+        return any(
+            m["message"] == "inbox-after-server-restart" and m["status"] == "delivered"
+            for m in messages
+        )
+
+    _wait(delivered, 60, what="inbox delivered after the restart")
+    _wait(
+        lambda: "MOCK: inbox-after-server-restart" in stack.output(terminal),
+        30,
+        what="the message reached the pane",
+    )

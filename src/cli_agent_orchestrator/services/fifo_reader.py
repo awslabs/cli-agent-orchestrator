@@ -267,10 +267,18 @@ class FifoManager:
         with self._lock:
             if terminal_id in self._pane_probe:
                 self._last_data_at[terminal_id] = time.monotonic()
+                # The pipe was just re-armed and the snapshot stands in for
+                # what it has not forwarded yet: not a cold start to re-arm.
+                self._ever_delivered[terminal_id] = True
         # Same CRLF replay as _rearm_stalled_pipe, for the same reason.
         return status_monitor.resync_from_snapshot(
             terminal_id, content.replace("\n", "\r\n"), generation
         )
+
+    def has_reader(self, terminal_id: str) -> bool:
+        """Whether a reader is running for ``terminal_id``."""
+        with self._lock:
+            return terminal_id in self._readers
 
     def stop_reader(self, terminal_id: str) -> bool:
         """Stop the reader thread (if running) and delete the FIFO file.
