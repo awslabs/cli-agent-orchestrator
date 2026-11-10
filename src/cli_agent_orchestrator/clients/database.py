@@ -531,7 +531,9 @@ class LaunchStatusEventModel(Base):
     """Status transitions for a launch, used to compute busy time (issue #1082).
 
     Content-free: just the status label and when it was observed. tmux
-    terminals get one row per detected change (``StatusMonitor._apply_detection``);
+    terminals get one row per detected change (``StatusMonitor._apply_detection``
+    and the two ``get_status`` latch changes, the native-swarm revoke and the
+    stale-capture recovery);
     herdr terminals get one row per change in the ``agent_status`` herdr
     reports for a managed pane (``HerdrInboxService``). Rows carry only the
     terminal id; ``compute_busy_seconds`` attributes them to one launch by time.
