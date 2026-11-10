@@ -156,7 +156,8 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 Creation and creator-owned launches are opt-in. `assign` and `handoff` launch
 creator-owned ephemeral names from the creator terminal.
 Only JSON `true` enables the tool. An agent sees it only once its CAO MCP connection
-restarts: reconnect it (in Claude Code, `/mcp`) or restart the agent's terminal.
+restarts: reconnect it (in Claude Code, `/mcp`, then reconnect the CAO server) or restart the
+agent's terminal.
 
 | Setting | Default | Description |
 |---------|---------|-------------|

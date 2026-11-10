@@ -41,8 +41,9 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
 
 Only JSON `true` enables creation. An agent sees the `create_ephemeral_agent` MCP tool only
 if its CAO MCP connection started after the change: reconnect it (in Claude Code, `/mcp`,
-then reconnect the CAO server) or restart the agent's terminal. The server rechecks settings for every create request,
-so an already registered tool is refused after the feature is turned off. Claims also
+then reconnect the CAO server) or restart the agent's terminal. The server rechecks settings
+for every create request, so an already registered tool is refused after the feature is
+turned off. Claims also
 recheck whether the feature is enabled before touching a name. Unreadable
 settings fail closed. `max_depth` accepts only integer 1. Ephemeral callers cannot create
 other ephemerals, even when `child_may_delegate` allows the existing delegation tools.
@@ -631,7 +632,7 @@ Create has these refusals too:
 | HTTP status | Create rule | Meaning |
 | --- | --- | --- |
 | 422 | `invalid_spec` | the body has a bad field, a wrong type or an extra field (see above) |
-| 400 | `creator_unresolved` | the calling terminal isn't registered, or its tools can't be read |
+| 400 | `creator_unresolved` | the calling terminal can't be resolved (not registered, unreadable tools or unknown provider) |
 | 400 | `max_depth_exceeded` | an ephemeral agent tried to create one |
 | 400 | `brief_too_large` | the normalized brief exceeds `ephemeral.max_brief_bytes` |
 | 400 | `secret_detected` | the brief, description or purpose looks like it holds a credential |

@@ -319,8 +319,9 @@ within an `ephemeral.provider_route.equivalent` set you declared. On today's cap
 Claude Code is `hard` and Codex `advisory`, so a set naming both is refused, and the CLI half of
 the match routes nothing yet. It applies once a second `hard` or `sandboxed` CLI can be routed
 to, such as the contained Codex launch, or Kiro once CAO can route to it (Kiro helpers are
-already `hard`, but `provider.route` can't choose Kiro yet). Then, with `provider.route` bound to the built-in
-matcher (`cao decisions set provider.route on --decider match`) and these declarations:
+already `hard`, but `provider.route` can't choose Kiro yet). Then, with `provider.route` bound
+to the built-in matcher (`cao decisions set provider.route on --decider match`) and these
+declarations:
 
 ```json
 "codex": {
