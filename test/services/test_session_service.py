@@ -794,12 +794,14 @@ class TestStaleLabelIsNotInheritedByANewSession:
     """
 
     @pytest.fixture
-    def create_harness(self):
+    def create_harness(self, kiro_agent_store_not_under_test):
         """``create_terminal`` with a mocked backend, stopped at the tmux create.
 
         The clear runs before the backend is asked for anything, so raising
         there proves the clear happened without standing up tmux or a provider.
-        Same seams as ``test_working_directory_point_of_use.py``.
+        Same seams as ``test_working_directory_point_of_use.py``, including the
+        opt-out of the Kiro agent-store check (#1074): ``kiro_cli`` is a
+        stand-in here and "developer" is not an installed Kiro agent.
         """
         from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
