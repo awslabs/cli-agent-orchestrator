@@ -12,7 +12,10 @@ the pane was visibly up and working:
   ``claude_code_1277_resumed_ready_long.txt`` (no banner, empty composer box at
   the bottom), ``claude_code_1277_resumed_ready_short.txt`` (banner still on
   screen) and ``claude_code_1277_resume_trust_dialog.txt`` (the trust dialog a
-  resume in an untrusted folder draws first).
+  resume in an untrusted folder draws first), all with default Claude settings;
+  ``claude_code_1277_resumed_ready_long_vim_footer.txt`` is the same long resume
+  under an operator configuration with ``tui: fullscreen`` and vim editor mode
+  (an ``-- INSERT --`` footer and an agents indicator below the composer box).
 * **Fix 2, a busy supervisor at the deadline.** A user typing into the pane
   during init made the supervisor PROCESSING, and the readiness wait accepts
   only IDLE/COMPLETED/WAITING_USER_ANSWER, so init "timed out" and the rollback
@@ -35,6 +38,7 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 
 FIXTURES = Path(__file__).parent / "fixtures"
 RESUMED_LONG = (FIXTURES / "claude_code_1277_resumed_ready_long.txt").read_text()
+RESUMED_LONG_VIM = (FIXTURES / "claude_code_1277_resumed_ready_long_vim_footer.txt").read_text()
 RESUMED_SHORT = (FIXTURES / "claude_code_1277_resumed_ready_short.txt").read_text()
 RESUME_TRUST = (FIXTURES / "claude_code_1277_resume_trust_dialog.txt").read_text()
 RESUME_ID = "00000000-0000-4000-8000-000000001277"
@@ -91,11 +95,12 @@ async def _run_handler(provider, frames, *, outer_timeout=60.0):
 
 
 @pytest.mark.asyncio
-async def test_resumed_ready_screen_without_banner_returns_without_the_outer_cap(caplog):
+@pytest.mark.parametrize("screen", [RESUMED_LONG, RESUMED_LONG_VIM], ids=["default", "vim_footer"])
+async def test_resumed_ready_screen_without_banner_returns_without_the_outer_cap(caplog, screen):
     """Acceptance 4: a resumed REPL that is ready ends the handler at once."""
     provider = _provider()
     with caplog.at_level(logging.INFO, logger="cli_agent_orchestrator.providers.claude_code"):
-        backend, clock = await _run_handler(provider, [RESUMED_LONG])
+        backend, clock = await _run_handler(provider, [screen])
 
     assert "outer cap" not in caplog.text
     assert clock.now < 10
