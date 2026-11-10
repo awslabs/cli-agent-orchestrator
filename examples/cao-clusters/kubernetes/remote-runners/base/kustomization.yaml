@@ -1,0 +1,18 @@
+# One cao-server, a pool of identical execution-only runners (#745).
+#
+# Cluster-neutral: no storage class, no registry, no model provider. An overlay
+# supplies those (overlays/kind for a local cluster; an EKS overlay follows).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: cao-remote
+resources:
+  - namespace.yaml
+  - workspace.yaml
+  - server.yaml
+  - runners.yaml
+  - networkpolicy.yaml
+images:
+  # An overlay sets the image it built or pulls.
+  - name: cao-server
+    newName: cao-server
+    newTag: dev

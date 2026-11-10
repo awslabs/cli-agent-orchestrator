@@ -89,6 +89,8 @@ _UNSCOPED_DOCS = [
     "mcp-apps.md",
     "memory.md",
     "otel-deployment.md",
+    # #745 remote runners: one event-plugin reference (server extensions still load).
+    "remote-runners.md",
     # Provider docs that gained an agent-plugin MCP-delivery note in review 3 on
     # #584. Every occurrence in them is CAO's own noun, so the strict rule fits
     # directly — no third-party "Plugin" to work around.

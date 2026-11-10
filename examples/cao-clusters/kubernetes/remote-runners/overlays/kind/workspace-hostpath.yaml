@@ -1,0 +1,19 @@
+# kind stand-in for a shared ReadWriteMany workspace: every kind node
+# bind-mounts the same host directory at /cao-workspace (kind-config.yaml), so
+# a hostPath volume there is the same files on every node.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: cao-remote-workspace
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: ["ReadWriteMany"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /cao-workspace/remote-runners
+    type: DirectoryOrCreate
+  claimRef:
+    namespace: cao-remote
+    name: cao-remote-workspace

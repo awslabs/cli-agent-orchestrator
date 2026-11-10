@@ -1,0 +1,35 @@
+# Local test overlay for a kind cluster (see kind-config.yaml and deploy.sh).
+#
+# What it adds over the cluster-neutral base, and only for a local cluster:
+# - a hostPath volume standing in for a shared ReadWriteMany workspace;
+# - cleartext ws:// between runners and the hub (CAO_RUNNER_ALLOW_INSECURE=1).
+#   The traffic stays on the kind node network of one machine; never set this
+#   on a network you do not fully trust. Serve wss:// there instead.
+# No model provider is configured: create the cao-provider-env ConfigMap and
+# the cao-provider-credentials Secret yourself to run a real provider (README).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - workspace-hostpath.yaml
+patches:
+  - target: {kind: PersistentVolumeClaim, name: cao-remote-workspace}
+    patch: |-
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: cao-remote-workspace}
+      spec:
+        storageClassName: ""
+        volumeName: cao-remote-workspace
+  - target: {kind: Deployment, name: cao-runner}
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: cao-runner}
+      spec:
+        template:
+          spec:
+            containers:
+              - name: runner
+                env:
+                  - {name: CAO_RUNNER_ALLOW_INSECURE, value: "1"}

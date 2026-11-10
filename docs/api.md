@@ -443,6 +443,18 @@ that check is inert.
 
 See [Workflows](workflows.md).
 
+### Remote runners
+
+- `GET /runners` lists the connected `cao-runner`s and what they host, under the
+  remote terminal backend (`404` under any other backend). See
+  [Remote runners](remote-runners.md).
+- Under the remote backend, the routes that reach a terminal answer `503` (its
+  runner is not connected, or no runner had room), `504` (sent, outcome
+  unknown) or `502` (the runner reported a failure), and a terminal whose
+  status cannot be trusted reads `unknown`. Python workflow scripts and flow
+  pre-scripts are refused with `409`. See
+  [Failure outcomes](remote-runners.md#failure-outcomes).
+
 ### Fleet
 
 Read-only views of a CAO cluster's workers, reached through the fleet's worker broker

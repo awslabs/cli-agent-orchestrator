@@ -284,7 +284,12 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 }
 ```
 
-- `backend`: `"tmux"` (default) or `"herdr"` [EXPERIMENTAL].
+- `backend`: `"tmux"` (default), `"herdr"` [EXPERIMENTAL], or `"remote"`
+  [EXPERIMENTAL]: one `cao-server` places every terminal on an execution-only
+  `cao-runner` (see [Remote runners](remote-runners.md)).
+- `remote_providers`: with `backend: "remote"`, the providers the server will
+  launch on runners (default `"claude_code,mock_cli"`). See
+  [Providers](remote-runners.md#providers) before adding one.
 - `herdr_session`: the herdr session name to connect to (default `"cao"`).
 - `spawn_mode`: `"window"` (default) or `"pane"` — where a terminal created by
   `assign` / `handoff` lands. See [Watching a fleet in one window](#watching-a-fleet-in-one-window).
@@ -308,7 +313,7 @@ Select a backend for a single run without touching `settings.json`:
 cao-server --terminal herdr
 ```
 
-`--terminal` (CLI flag) beats `CAO_TERMINAL_BACKEND` (env var) beats `terminal.backend` (file) beats the `"tmux"` default — the standard precedence chain. See [herdr.md](herdr.md) for herdr-specific setup, viewing/attaching, and troubleshooting.
+`--terminal` (CLI flag) beats `CAO_TERMINAL_BACKEND` (env var) beats `terminal.backend` (file) beats the `"tmux"` default — the standard precedence chain. See [herdr.md](herdr.md) for herdr-specific setup, viewing/attaching, and troubleshooting, and [Remote runners](remote-runners.md) for the remote backend's `CAO_RUNNER_*` settings, which are read from the environment only.
 
 #### Watching a fleet in one window
 
@@ -477,6 +482,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 |---|---|---|
 | `CAO_TERMINAL_BACKEND` | `terminal.backend` | str |
 | `CAO_HERDR_SESSION` | `terminal.herdr_session` | str |
+| `CAO_TERMINAL_REMOTE_PROVIDERS` | `terminal.remote_providers` | comma-separated list |
 | `CAO_TERMINAL_SPAWN_MODE` | `terminal.spawn_mode` | str |
 | `CAO_TERMINAL_PANE_WINDOW` | `terminal.pane_window` | str |
 | `CAO_TERMINAL_PANE_LAYOUT` | `terminal.pane_layout` | str |

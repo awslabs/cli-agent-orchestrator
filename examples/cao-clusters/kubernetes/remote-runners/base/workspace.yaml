@@ -1,0 +1,13 @@
+# The workspace every runner mounts. Agents that work on the same task share a
+# checkout, and they may run on different nodes, so the claim is
+# ReadWriteMany. No storage class here: the overlay provides the volume
+# (overlays/kind binds a hostPath volume; on EKS this is EFS).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cao-remote-workspace
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 10Gi
