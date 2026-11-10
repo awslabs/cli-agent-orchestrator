@@ -13,6 +13,7 @@ from cli_agent_orchestrator.clients.database import (
     create_delegation_edge,
     find_open_edge,
     list_open_edges_into,
+    list_open_edges_out_of,
     mark_assign_edges_delivered,
 )
 from cli_agent_orchestrator.models.delegation import EdgeReason, EdgeSource
@@ -233,6 +234,7 @@ class TestWorkerEnded:
         create_delegation_edge("w1", "w2", EdgeSource.ASSIGN)
         svc.handle_worker_ended("w1", "reached ERROR")
         assert env["sent"] == []
+        assert list_open_edges_out_of("w1") == []
 
 
 class TestSweep:

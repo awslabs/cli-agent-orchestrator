@@ -129,6 +129,23 @@ class TestCloseWithMessage:
         assert list_open_edges_into("w1") == []
         assert get_inbox_messages("sup") == []
 
+    def test_failed_message_insert_leaves_the_edge_open(self, db):
+        """Close and queue are one commit: if the queue fails, the claim is undone."""
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+
+        with patch(
+            "cli_agent_orchestrator.clients.database.InboxModel",
+            side_effect=RuntimeError("insert failed"),
+        ):
+            with pytest.raises(RuntimeError, match="insert failed"):
+                close_delegation_edge_with_message(
+                    edge.id, EdgeState.AUTO_FORWARDED, "w1", "sup", "result"
+                )
+
+        assert [e.id for e in list_open_edges_into("w1")] == [edge.id]
+        assert get_inbox_messages("sup") == []
+
 
 def test_bulk_row_deletion_closes_edges_in_both_directions(db):
     create_terminal("w1", "cao-s", "w1", "claude_code")

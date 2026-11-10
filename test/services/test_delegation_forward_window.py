@@ -340,6 +340,23 @@ class TestHerdrReportsTheTurnStart:
         (forward,) = _forwards_to(SUP)
         assert forward.endswith("---\nNEW ANSWER")
 
+    def test_connect_snapshot_showing_work_counts(self, herdr, monkeypatch):
+        """A working pane seen in the connect-time snapshot, after the input, is work."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=MagicMock())
+        service.register_terminal(W1, "pane-1")
+        monkeypatch.setattr(
+            service,
+            "_fetch_snapshot",
+            lambda: {"panes": [{"pane_id": "pane-1", "agent_status": "working"}]},
+        )
+        asyncio.run(service._deliver_settled_panes())
+        herdr.screens[W1] = "NEW ANSWER"
+
+        assert herdr.monitor.started_on_last_input(W1) is True
+        assert svc.evaluate_completion(W1) == 1
+        (forward,) = _forwards_to(SUP)
+        assert forward.endswith("---\nNEW ANSWER")
+
     def test_work_reported_before_the_input_does_not_count(self, herdr):
         self._herdr_reports("working")
         herdr.monitor.notify_input_sent(W1)  # another input after that report
