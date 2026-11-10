@@ -154,17 +154,52 @@ async def test_directory_exists_by_the_time_the_backend_is_asked_to_create(
 
 
 @pytest.mark.asyncio
-async def test_without_the_flag_a_missing_directory_is_still_refused(harness, tmp_path):
+@pytest.mark.parametrize("new_session", [True, False])
+async def test_without_the_flag_a_missing_directory_is_still_refused(
+    harness, tmp_path, new_session
+):
     """The MCP ``handoff``/``assign`` path never asked for creation and must
-    not start getting it: the default keeps the backend's must-exist rule."""
+    not start getting it: the default keeps the backend's must-exist rule.
+
+    The refusal is a ``WorkingDirectoryError``, not a bare ``ValueError``: on
+    the two in-session routes a bare one means "session not found" (404), and
+    the documented answer for a directory the caller got wrong is a 400
+    (haofeif P3-1 and gutosantos82 on PR #1036).
+    """
     target = tmp_path / "never"
-    harness.session_exists.return_value = False
-    with pytest.raises(ValueError, match="does not exist"):
+    harness.session_exists.return_value = not new_session
+    with pytest.raises(WorkingDirectoryError, match="does not exist"):
         await create_terminal(
             "kiro_cli",
             "developer",
             session_name="cao-mcp",
-            new_session=True,
+            new_session=new_session,
             working_directory=str(target),
         )
     assert not target.exists()
+    harness.create_session.assert_not_called()
+    harness.create_window.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_working_directory", [False, True])
+async def test_the_servers_own_cwd_being_unusable_is_not_a_client_error(
+    harness, create_working_directory
+):
+    """No ``working_directory`` in the request means the server's own cwd. If
+    THAT cannot be resolved the client did nothing wrong, so the error stays a
+    plain ``ValueError`` and is never dressed up as the caller's bad path."""
+    harness.session_exists.return_value = False
+    with patch(
+        f"{_TS}._resolve_working_directory",
+        side_effect=ValueError("Working directory does not exist: /gone"),
+    ):
+        with pytest.raises(ValueError, match="does not exist") as excinfo:
+            await create_terminal(
+                "kiro_cli",
+                "developer",
+                session_name="cao-cwd",
+                new_session=True,
+                create_working_directory=create_working_directory,
+            )
+    assert not isinstance(excinfo.value, WorkingDirectoryError)

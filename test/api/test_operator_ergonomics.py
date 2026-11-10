@@ -611,27 +611,106 @@ class TestCreationIsPerRequest:
             load_profile.return_value = AgentProfile(name="developer", description="Developer")
             backend.session_exists.return_value = False
             backend.create_session.side_effect = RuntimeError("stop at the tmux create")
+            backend.create_window.side_effect = RuntimeError("stop at the tmux create")
             yield backend
 
+    #: The three create routes, each with what it needs beyond the shared
+    #: parameters and whether its session must already exist. ``POST
+    #: /sessions/{name}/terminals`` is the one the MCP ``handoff`` and ``assign``
+    #: tools use, and it requires the delegating terminal's id (#948).
+    CALLER_ID = "dcba8765"
+    ROUTES = [
+        pytest.param("/sessions", {"session_name": "cao-ff"}, False, id="sessions"),
+        pytest.param("/sessions/cao-ff/terminals", {"caller_id": CALLER_ID}, True, id="terminals"),
+        pytest.param("/sessions/cao-ff/terminals:operator", {}, True, id="operator"),
+    ]
+
+    @pytest.fixture
+    def registered_caller(self):
+        """A row for ``CALLER_ID`` with an unrestricted ceiling, so the
+        delegation check (#948), which runs before the path is resolved, lets
+        the in-session create through to the code under test."""
+        row = {"id": self.CALLER_ID, "agent_profile": "supervisor", "allowed_tools": ["*"]}
+        ts = "cli_agent_orchestrator.services.terminal_service"
+        with (
+            patch(f"{ts}.get_terminal_metadata", return_value=row),
+            patch(f"{ts}.delegation.ceiling_from_row", return_value=["*"]),
+        ):
+            yield row
+
+    @pytest.mark.parametrize("route, extra, session_exists", ROUTES)
     def test_without_the_field_a_missing_directory_is_still_the_fail_fast_error(
-        self, client, real_create, tmp_path
+        self, client, real_create, registered_caller, tmp_path, route, extra, session_exists
     ):
         """What the MCP tools send: no field. The must-exist refusal they
-        document, and nothing created."""
+        document, and nothing created -- as a 400 on EVERY create route.
+
+        The two in-session routes used to answer 404 here, because their
+        generic ``ValueError`` arm means "session not found" (haofeif P3-1 and
+        gutosantos82 on PR #1036). ``handoff`` and ``assign`` drop the response
+        body, so the status code is the only thing the agent sees. The session
+        EXISTS in those two cases, so a 404 would be plainly wrong, and a route
+        whose default flipped to true would get as far as the backend create.
+        """
         target = tmp_path / "typo" / "project"
+        real_create.session_exists.return_value = session_exists
         resp = client.post(
-            "/sessions",
+            route,
             params={
                 "provider": "kiro_cli",
                 "agent_profile": "developer",
-                "session_name": "cao-ff",
                 "working_directory": str(target),
+                **extra,
             },
         )
         assert resp.status_code == 400, resp.text
         assert "does not exist" in resp.json()["detail"]
         assert not target.exists()
         real_create.create_session.assert_not_called()
+        real_create.create_window.assert_not_called()
+
+    @pytest.mark.parametrize("route, extra, session_exists", ROUTES)
+    def test_a_blocked_directory_without_the_field_is_a_400_too(
+        self, client, real_create, registered_caller, route, extra, session_exists
+    ):
+        """Every refusal of a path the caller supplied is the caller's error,
+        not only the missing-directory one: ``/etc`` exists and is refused by
+        the path policy."""
+        real_create.session_exists.return_value = session_exists
+        resp = client.post(
+            route,
+            params={
+                "provider": "kiro_cli",
+                "agent_profile": "developer",
+                "working_directory": "/etc",
+                **extra,
+            },
+        )
+        assert resp.status_code == 400, resp.text
+        assert "not allowed" in resp.json()["detail"]
+        real_create.create_session.assert_not_called()
+        real_create.create_window.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "route, extra", [r.values[:2] for r in ROUTES[1:]], ids=["terminals", "operator"]
+    )
+    def test_a_missing_session_is_still_a_404_on_the_in_session_routes(
+        self, client, real_create, registered_caller, tmp_path, route, extra
+    ):
+        """The other half: the 404 keeps its meaning. A usable directory and a
+        session that is not there is still "session not found"."""
+        real_create.session_exists.return_value = False
+        resp = client.post(
+            route,
+            params={
+                "provider": "kiro_cli",
+                "agent_profile": "developer",
+                "working_directory": str(tmp_path),
+                **extra,
+            },
+        )
+        assert resp.status_code == 404, resp.text
+        assert "not found" in resp.json()["detail"]
 
     def test_with_the_field_true_the_directory_is_created(self, client, real_create, tmp_path):
         """What the dashboard sends. The mkdir happens at the point of use, so
@@ -805,7 +884,7 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         assert resp.status_code == 400
         assert "not allowed" in resp.json()["detail"]
 
-    @pytest.mark.parametrize("endpoint", ["session", "terminal"])
+    @pytest.mark.parametrize("endpoint", ["session", "terminal", "operator"])
     def test_component_over_name_max_is_a_400_not_a_500(self, client, endpoint, tmp_path):
         """Under the 4096 total cap but over the OS's 255 per component:
         ``Path.exists()`` raised ``OSError(36)`` and both endpoints answered
@@ -824,7 +903,7 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         ts.create_terminal.assert_not_called()
         svc.create_session.assert_not_called()
 
-    @pytest.mark.parametrize("endpoint", ["session", "terminal"])
+    @pytest.mark.parametrize("endpoint", ["session", "terminal", "operator"])
     def test_windows_path_that_leaves_its_drive_is_a_400(self, client, endpoint, tmp_path):
         mnt = tmp_path / "mnt"
         (mnt / "c").mkdir(parents=True)
@@ -841,18 +920,19 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         ts.create_terminal.assert_not_called()
         svc.create_session.assert_not_called()
 
+    @pytest.mark.parametrize("endpoint", ["terminal", "operator"])
     def test_working_directory_error_from_the_terminal_service_is_a_400_not_a_404(
-        self, client, tmp_path
+        self, client, tmp_path, endpoint
     ):
         """The point-of-use mkdir can still fail (EACCES on a parent, a
-        read-only filesystem). ``POST /sessions/{name}/terminals`` maps a bare
-        ValueError to 404 "session not found"; a refused directory must come
-        out as the 400 it is."""
+        read-only filesystem). Both in-session routes map a bare ValueError to
+        404 "session not found"; a refused directory must come out as the 400
+        it is."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as ts:
             ts.create_terminal = AsyncMock(
                 side_effect=WorkingDirectoryError("Folder '/x' could not be created: EACCES")
             )
-            resp = self._create(client, "terminal", str(tmp_path))
+            resp = self._create(client, endpoint, str(tmp_path))
         assert resp.status_code == 400
         assert "could not be created" in resp.json()["detail"]
 
@@ -865,7 +945,28 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         }
         if endpoint == "session":
             return client.post("/sessions", params=params)
+        if endpoint == "operator":
+            # The Web UI's "Add Agent": no caller identity (it is refused there).
+            return client.post("/sessions/cao-demo/terminals:operator", params=params)
         return TestWorkingDirectoryNormalizationAtTheBoundary._post_terminal(client, params)
+
+    def test_the_operator_route_strips_quotes_and_forwards_the_normalized_path(
+        self, client, tmp_path
+    ):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as ts:
+            ts.create_terminal = AsyncMock(return_value=self._terminal())
+            resp = self._create(client, "operator", f'"{tmp_path}"')
+        assert resp.status_code == 201, resp.json()
+        assert ts.create_terminal.call_args.kwargs["working_directory"] == str(tmp_path)
+        assert ts.create_terminal.call_args.kwargs["create_working_directory"] is False
+
+    def test_the_operator_route_rejects_a_relative_path_before_the_service(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as ts:
+            ts.create_terminal = AsyncMock()
+            resp = self._create(client, "operator", "relative/not/absolute")
+        assert resp.status_code == 400
+        assert "absolute" in resp.json()["detail"].lower()
+        ts.create_terminal.assert_not_called()
 
     def test_create_terminal_in_session_normalizes_too(self, client, tmp_path):
         with (

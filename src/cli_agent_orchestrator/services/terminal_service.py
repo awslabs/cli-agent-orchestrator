@@ -201,6 +201,7 @@ from cli_agent_orchestrator.utils.enforcement import (
 from cli_agent_orchestrator.utils.ephemeral_capabilities import capability_for
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.paths import (
+    WorkingDirectoryError,
     ensure_working_directory,
     validate_working_directory,
 )
@@ -2021,8 +2022,10 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
-        WorkingDirectoryError: If ``create_working_directory`` is set and the
-            directory is refused by the path policy or cannot be created.
+        WorkingDirectoryError: If the ``working_directory`` the caller supplied
+            is refused: it does not exist and ``create_working_directory`` is
+            not set, the path policy blocks it, or it cannot be created. A 400
+            on all three create routes.
         IdempotencyKeyNotFound: If ``lookup_only`` and no terminal is
             recorded for this key AND this request (HTTP 404)
         TerminalRecordCorruptError: If the terminal a key maps to has a stored
@@ -2783,9 +2786,16 @@ async def _create_terminal_unguarded(
             # create routes without the flag, so a path with a typo is still
             # refused here and the agent can correct it. The Web UI sets it.
             resolved_working_directory = _resolve_working_directory(working_directory)
-        except ValueError:
-            if not (create_working_directory and working_directory is not None):
-                raise
+        except ValueError as e:
+            if working_directory is None:
+                raise  # the server's own cwd, not a client error
+            if not create_working_directory:
+                # The caller supplied this path and did not ask for creation,
+                # so the refusal is the caller's to correct. As a plain
+                # ValueError it reached the generic arm of the two in-session
+                # routes, whose 404 means "session not found"; the documented
+                # answer is a 400 on every create route (PR #1036 review).
+                raise WorkingDirectoryError(str(e)) from e
             # Refused as must-exist by an HTTP create endpoint (#724): the
             # operator may be pointing at a directory that does not exist yet.
             # Re-judge it with the SAME policy but allow_create: a missing
