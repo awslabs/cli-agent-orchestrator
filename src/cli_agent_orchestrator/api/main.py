@@ -4599,8 +4599,8 @@ async def create_session(
     cases answer **404**. A key whose terminal has since been torn down is
     stale and simply creates fresh.
 
-    ``create_working_directory`` (#724, contract ruled by @plauzy and
-    @call-me-ram on PR #1036): opt in to CREATING ``working_directory`` when it
+    ``create_working_directory`` (#724; contract ruled on PR #1036, comment
+    6392043764): opt in to CREATING ``working_directory`` when it
     does not exist yet. Default false, which is the must-exist behavior every
     caller has always had, so the fail-fast contract the MCP ``handoff`` and
     ``assign`` tools document ("must exist and be accessible") stays true for
@@ -5081,8 +5081,8 @@ async def create_terminal_in_session(
     cases answer **404**. A key whose terminal has since been torn down is
     stale and simply creates fresh.
 
-    ``create_working_directory`` (#724, contract ruled by @plauzy and
-    @call-me-ram on PR #1036): opt in to CREATING ``working_directory`` when it
+    ``create_working_directory`` (#724; contract ruled on PR #1036, comment
+    6392043764): opt in to CREATING ``working_directory`` when it
     does not exist yet. Default false, so the fail-fast contract the MCP
     ``handoff`` and ``assign`` tools document ("must exist and be accessible")
     stays true -- they reach this route and send nothing, and a typo'd path
@@ -5338,8 +5338,8 @@ async def create_terminal_in_session_as_operator(
     the tracked follow-up. Synchronous only: no ``defer_init``, no initial
     message; a message is sent to the created terminal afterwards.
 
-    ``create_working_directory`` (#724, contract ruled by @plauzy and
-    @call-me-ram on PR #1036): as on ``POST /sessions``. The Web UI's "Add
+    ``create_working_directory`` (#724; contract ruled on PR #1036, comment
+    6392043764): as on ``POST /sessions``. The Web UI's "Add
     Agent" sends true; the default is the must-exist behavior.
     """
     try:

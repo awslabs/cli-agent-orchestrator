@@ -549,7 +549,8 @@ class TestSettingsWritersStayOffTheEventLoop:
 
 
 class TestCreationIsPerRequest:
-    """The contract ruled by @plauzy and @call-me-ram on PR #1036, end to end.
+    """The per-request creation contract (ruled on PR #1036, comment
+    6392043764), end to end.
 
     haofeif's P3-1: both create endpoints used to pass
     ``create_working_directory=True`` unconditionally, so the MCP ``handoff``
@@ -733,9 +734,9 @@ class TestCreationIsPerRequest:
         assert real_create.create_session.call_args.args[3] == str(target.resolve())
 
     def test_the_field_is_the_last_query_parameter_on_both_create_routes(self, client):
-        """haofeif reads the generated OpenAPI: appending keeps every existing
-        property index stable, so a client generated from the old schema still
-        lines up."""
+        """Appending keeps every existing property index in the generated
+        OpenAPI stable, so a client generated from the old schema still lines
+        up."""
         schema = client.get("/openapi.json").json()
         for path, method in (
             ("/sessions", "post"),
