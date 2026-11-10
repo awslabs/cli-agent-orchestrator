@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.models.workflow import (
     InputDecl,
@@ -154,7 +155,7 @@ async def test_workflow_step_forwards_explicit_engine(monkeypatch):
 
     await ws.start_run(spec, {}, "engine-run")
 
-    assert mock.await_args.kwargs["engine"] == "kas"
+    assert mock.await_args.kwargs["engine"] is KiroEngine.V3
 
 
 @pytest.mark.asyncio
@@ -984,7 +985,7 @@ async def test_provider_error_retries_do_not_leak_terminals(monkeypatch):
     monkeypatch.setattr(
         ts,
         "delete_terminal",
-        MagicMock(side_effect=lambda tid, registry=None: deleted.append(tid)),
+        MagicMock(side_effect=lambda tid, registry=None, end_reason=None: deleted.append(tid)),
     )
     monkeypatch.setattr(agent_step, "wait_until_status", AsyncMock(return_value=True))
     monkeypatch.setattr(

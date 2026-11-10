@@ -1,0 +1,37 @@
+The Kiro CLI
+
+Usage: kiro-cli [OPTIONS] [COMMAND]
+
+Commands:
+  agent         Manage agents
+  chat          AI assistant in your terminal
+  login         Log in to Kiro
+  logout        Log out of Kiro
+  whoami        Print info about the current login session
+  profile       Show the profile associated with this idc user
+  settings      Customize appearance & behavior
+  diagnostic    Run diagnostic tests
+  issue         Create a new Github issue
+  crew          Launch Kiro Crew, installing it if it is not already installed
+  mcp           Model Context Protocol (MCP)
+  powers        Manage Powers (install and uninstall plugins)
+  update        Check for and install updates
+  integrations  Manage system integrations
+  serve         Start a persistent WebSocket server for the v3 engine
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+  -v, --verbose...              Increase logging verbosity
+      --agent <AGENT>           Launch chat with the given agent, shorthand for chat --agent
+      --tui                     Launch chat in TUI mode
+      --legacy-ui               Launch chat in legacy UI mode [aliases: --classic]
+      --v3                      Launch the next generation Kiro agent
+      --v2                      Use the V2 agent engine (the pre-3.0 default)
+  -r, --resume                  Resume the most recent conversation from this directory
+      --resume-id <SESSION_ID>  Resume a specific conversation by session ID
+      --resume-picker           Interactively select a conversation to resume from this directory
+                                [aliases: --list]
+      --cloud                   Run this session in a cloud sandbox, shorthand for chat --cloud
+      --repo <REPO>             Repository to open in a cloud session, shorthand for chat --repo
+  -h, --help                    Print help
+  -V, --version                 Print version

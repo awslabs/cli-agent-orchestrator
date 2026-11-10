@@ -13,6 +13,8 @@ Two of these carry the unit's load:
 """
 
 import json
+import logging
+import subprocess
 
 import pytest
 
@@ -134,7 +136,7 @@ def test_the_plan_id_does_not_depend_on_the_working_directory(monkeypatch, tmp_p
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda _cwd: {"available": True, "commit": "c", "dirty": False},
+        lambda _cwd, **_kw: {"available": True, "commit": "c", "dirty": False},
     )
     a = _frozen(cwd=str(tmp_path))["plan_id"]
     b = _frozen(cwd="/some/other/path")["plan_id"]
@@ -155,7 +157,7 @@ def test_an_unavailable_worktree_snapshot_has_no_approvable_plan_id(monkeypatch)
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda _cwd: {
+        lambda _cwd, **_kw: {
             "available": False,
             "commit": "deadbeef",
             "worktree_state": {"status": "unavailable"},
@@ -177,7 +179,7 @@ def test_an_unavailable_snapshot_reaches_the_gate_without_a_plan_id(monkeypatch)
         "worktree_state": {"status": "unavailable"},
     }
     baselines = iter((available, unavailable))
-    monkeypatch.setattr(manifest_freeze, "derive_baseline", lambda _cwd: next(baselines))
+    monkeypatch.setattr(manifest_freeze, "derive_baseline", lambda _cwd, **_kw: next(baselines))
     monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
 
     approved_manifest = manifest_freeze.build_manifest_json(source_hash="abc123", inputs={"k": "v"})
@@ -208,7 +210,7 @@ def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda _cwd: {
+        lambda _cwd, **_kw: {
             "available": True,
             "commit": "first",
             "worktree_state": {"status": "clean"},
@@ -218,7 +220,7 @@ def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda _cwd: {
+        lambda _cwd, **_kw: {
             "available": True,
             "commit": "second",
             "worktree_state": {"status": "clean"},
@@ -229,7 +231,7 @@ def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda _cwd: {
+        lambda _cwd, **_kw: {
             "available": False,
             "commit": "second",
             "worktree_state": {"status": "unavailable"},
@@ -257,7 +259,7 @@ def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkey
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda root: {
+        lambda root, **_kw: {
             "available": True,
             "commit": "0123456789abcdef0123456789abcdef01234567",
             "worktree_state": {"status": "clean"},
@@ -267,6 +269,162 @@ def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkey
         _frozen()["plan_id"]
         == "plan-v2:c89991b472d5f8aed662a8677d00770f3ae19224d17c95112f3863545f248d38"
     )
+
+
+# ---------------------------------------------------------------------------
+# The freeze's ONE root stat reaches the guard for EITHER root kind, while only a
+# non-Git root's pair reaches plan_id (fanhongy's ask 2 on PR #1051, pins 1 and 2)
+# ---------------------------------------------------------------------------
+
+
+def _git_repository(path, *, content: str):
+    """A real one-commit repository at ``path``, so the Git branch of the baseline is exercised.
+
+    A patched ``derive_baseline`` cannot stand in here: the whole question is what the REAL derivation
+    puts in, and leaves out of, the baseline for a directory that is genuinely inside Git.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "T"],
+    ):
+        subprocess.run(args, cwd=path, check=True, capture_output=True)
+    (path / "f.txt").write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, capture_output=True)
+    return path
+
+
+def test_a_git_roots_baseline_carries_no_root_identity_so_git_plan_ids_do_not_move(
+    tmp_path, monkeypatch
+):
+    """PIN 1. The guard now binds a Git root; ``plan_id`` still must not.
+
+    ``freeze_manifest`` hands ``launch_guard.capture`` its one stat for either root kind, because
+    nothing recomputes ``plan_id`` inside a run or at resume. The IDENTIFIER side has to be untouched
+    by that: the pair must stay out of ``repo_baseline``, or "two checkouts in the same state are ONE
+    plan" dies and every Git plan on every machine needs a fresh approval.
+
+    Two assertions, because each fails on its own. The absent key is the mechanism. The two clones
+    sharing one ``plan_id`` is the property the mechanism exists for, and it is the thing a reader of
+    ``git_baseline``'s module docstring is promised. The golden value in
+    ``test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged`` carries the arithmetic: it was
+    computed before this change and is unchanged by it.
+    """
+    _store(tmp_path, monkeypatch)
+    repo = _git_repository(tmp_path / "repo", content="one")
+    document = _frozen(cwd=str(repo))
+    assert "root_identity" not in document["repo_baseline"], (
+        "a Git root's device and inode reached repo_baseline, therefore plan_id: every existing Git "
+        "approval is now invalid and two checkouts in the same state are two plans"
+    )
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(repo), str(clone)], check=True, capture_output=True)
+    assert _frozen(cwd=str(clone))["plan_id"] == document["plan_id"], (
+        "two checkouts of the same commit with the same clean worktree are no longer one plan, so a "
+        "Git root is being identified by location rather than by content"
+    )
+
+
+def test_an_unbindable_non_git_root_logs_its_reason_at_warning_and_no_path(
+    tmp_path, monkeypatch, caplog
+):
+    """fanhongy's P3-4(b) on PR #1051: the promise that the server SAYS so was not pinned.
+
+    ``CHANGELOG.md`` and ``docs/workflows.md`` both promise that where the filesystem supplies no
+    usable inode, CAO records the fallback instead of skipping it and "the server logs that reason
+    with no path". fanhongy downgraded this ``logger.warning`` to ``debug`` and all 422 focused tests
+    passed, so the promise was documentation only.
+
+    WARNING specifically, not merely "a log line": a debug line is invisible at the default level,
+    which is the whole difference between a recorded fallback and a silent one. And no path, mirroring
+    ``test_returns_none_and_logs_rather_than_raising`` and this module's path-free diagnostics rule --
+    the unbound marker in the manifest is where the operator reads WHICH plan this is.
+    """
+    _store(tmp_path, monkeypatch)
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(
+        manifest_freeze,
+        "root_identity",
+        lambda path: {"bound": False, "reason": "root_identity_unsupported"},
+    )
+    with caplog.at_level("WARNING"):
+        frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={}, cwd=str(root))
+
+    assert frozen.manifest_json is not None, "an unbindable root is approvable, not a refusal"
+    unbound = [
+        record
+        for record in caplog.records
+        if "could not bind the working-directory root identity" in record.message
+    ]
+    assert len(unbound) == 1 and unbound[0].levelno == logging.WARNING, (
+        "the unbound-root fallback is not reported at WARNING, so an operator running at the default "
+        f"level never learns the plan they approved has a weaker binding (records={caplog.records})"
+    )
+    assert "root_identity_unsupported" in unbound[0].getMessage()
+    assert str(tmp_path) not in caplog.text, "this module's diagnostics must stay path-free"
+
+
+@pytest.mark.parametrize("kind", ["git", "non-git"])
+def test_the_freeze_hands_the_guard_the_one_stat_it_took_for_either_root_kind(
+    tmp_path, monkeypatch, kind
+):
+    """PIN 2. ``FrozenManifest.root_identity`` IS the single stat, for a Git root as much as a non-Git one.
+
+    Two regressions this catches, and both are silent:
+
+    * reading the guard's value back off the baseline (``baseline.get("root_identity")``) rather than
+      from the stat. That is what left a Git root arriving at the guard as ``None``, so a Git worktree
+      replaced mid-run or across a resume was never detected (ask 2).
+    * taking a SECOND stat for the guard. The second would be read after the approval gate, so a root
+      replaced in that window would be recorded as the approved one -- the P3-3 window this PR exists
+      to keep closed. Exactly one call is the only form of that assertion that cannot be satisfied by
+      two stats that happen to agree on an idle filesystem.
+    """
+    _store(tmp_path, monkeypatch)
+    if kind == "git":
+        root = _git_repository(tmp_path / "root", content="one")
+    else:
+        root = tmp_path / "root"
+        root.mkdir()
+        from cli_agent_orchestrator.utils import git_baseline
+
+        assert git_baseline.derive_baseline(str(root)).get("repository") is False, (
+            "fixture assumption broken: this root must be outside Git for the non-Git case to mean "
+            "anything"
+        )
+
+    observed = []
+    real = manifest_freeze.root_identity
+
+    def counting(path):
+        value = real(path)
+        observed.append(value)
+        return value
+
+    monkeypatch.setattr(manifest_freeze, "root_identity", counting)
+    frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={}, cwd=str(root))
+
+    assert len(observed) == 1, (
+        f"the freeze stat'd the root {len(observed)} times for a {kind} root; the identifier and the "
+        "guard must describe one observation of the directory, not two either side of the gate"
+    )
+    assert frozen.root_identity == observed[0], (
+        f"a {kind} root's guard value is not the stat the freeze took "
+        f"(got {frozen.root_identity!r}, stat was {observed[0]!r})"
+    )
+    assert frozen.root_identity is not None and frozen.root_identity["bound"] is True
+
+    baseline = json.loads(frozen.manifest_json or "{}")["repo_baseline"]
+    if kind == "git":
+        assert "root_identity" not in baseline, "see PIN 1: the pair must not reach plan_id here"
+    else:
+        assert (
+            baseline["root_identity"] == frozen.root_identity
+        ), "a non-Git root's plan_id and its guard disagree about which directory was approved"
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +606,7 @@ def test_a_freeze_that_fails_before_the_profile_set_carries_no_snapshot(monkeypa
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda root: {"available": False, "reason": "git_timeout"},
+        lambda root, **_kw: {"available": False, "reason": "git_timeout"},
     )
     frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={})
     assert frozen.manifest_json is None

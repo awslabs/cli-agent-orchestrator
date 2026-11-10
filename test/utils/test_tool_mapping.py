@@ -4,14 +4,36 @@ import pytest
 
 from cli_agent_orchestrator.utils.tool_mapping import (
     ALL_NATIVE_TOOLS,
+    EPHEMERAL_ALWAYS_DISALLOWED,
     KIRO_BUILTIN_CHROME,
+    TOOL_MAPPING,
     format_tool_summary,
     get_allowed_tools,
     get_disallowed_tools,
+    get_launch_disallowed_tools,
     granted_mcp_servers,
     kiro_agent_tools,
     resolve_allowed_tools,
     tool_constraint_instruction,
+)
+
+# Claude Code's own agent-messaging and agent-spawning built-ins, written out
+# here rather than imported so a name dropped from the code fails these tests.
+CLAUDE_CODE_ALWAYS_CUT = (
+    "SendMessage",
+    "ListAgents",
+    "SendFile",
+    "FetchInboxMessage",
+    "Workflow",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "RemoteTrigger",
+    "EnterWorktree",
+    "ExitWorktree",
+    "TeamCreate",
+    "TeamDelete",
 )
 
 
@@ -180,11 +202,15 @@ class TestGetDisallowedTools:
         assert "Write" in result
 
     def test_claude_code_developer_allows_all(self):
-        """Developer (fs_*, execute_bash, web_fetch) should not block anything."""
+        """Developer (fs_*, execute_bash, web_fetch) keeps every mapped tool.
+
+        It loses only Claude Code's own agent-messaging and agent-spawning
+        built-ins, which every restricted Claude Code grant loses.
+        """
         result = get_disallowed_tools(
             "claude_code", ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
         )
-        assert result == []
+        assert result == sorted(CLAUDE_CODE_ALWAYS_CUT)
 
     def test_claude_code_reviewer_blocks_write(self):
         """Reviewer with fs_read and fs_list should block Edit, Write, Bash."""
@@ -388,10 +414,258 @@ class TestClaudeCodeSubagentEscape:
         )
         assert "Task" not in disallowed
         assert "Agent" not in disallowed
-        assert disallowed == []
+        assert disallowed == sorted(CLAUDE_CODE_ALWAYS_CUT)
 
     def test_unrestricted_star_keeps_everything(self):
         assert get_disallowed_tools("claude_code", ["*"]) == []
+
+
+# The Claude Code mapping before Claude Code's own agent tools were cut, kept
+# so an explicit list can be checked to change by the new cuts and nothing else.
+_CLAUDE_CODE_MAPPING_BEFORE = {
+    "execute_bash": ["Bash", "BashOutput", "KillShell", "Task", "Agent", "Monitor"],
+    "fs_read": ["Read"],
+    "fs_write": ["Edit", "Write", "NotebookEdit"],
+    "fs_list": ["Glob", "Grep"],
+    "fs_*": ["Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep"],
+    "web_fetch": ["WebFetch", "WebSearch"],
+}
+
+# Every other provider's mapping on the base, frozen so a change to any of them
+# fails test_other_providers_are_unchanged rather than moving its expectation.
+_OTHER_PROVIDER_MAPPINGS_BEFORE = {
+    "antigravity_cli": {
+        "execute_bash": ["run_shell_command"],
+        "fs_read": ["read_file", "list_directory", "search_file_content", "glob"],
+        "fs_write": ["write_file", "replace"],
+        "fs_list": ["list_directory", "glob", "search_file_content"],
+        "fs_*": [
+            "read_file",
+            "write_file",
+            "replace",
+            "list_directory",
+            "search_file_content",
+            "glob",
+        ],
+        "web_fetch": ["web_fetch", "google_web_search"],
+    },
+    "copilot_cli": {
+        "execute_bash": ["shell"],
+        "fs_read": ["read"],
+        "fs_write": ["write"],
+        "fs_list": ["list", "grep"],
+        "fs_*": ["read", "write", "list", "grep"],
+    },
+    "grok_cli": {
+        "execute_bash": ["Bash"],
+        "fs_read": ["Read", "NotebookRead"],
+        "fs_write": ["Edit", "Write", "NotebookEdit"],
+        "fs_list": ["Grep", "Glob"],
+        "fs_*": ["Read", "NotebookRead", "Edit", "Write", "NotebookEdit", "Grep", "Glob"],
+        "web_fetch": ["WebFetch", "WebSearch"],
+    },
+    "kiro_cli": {
+        "execute_bash": ["execute_bash", "shell", "subagent", "use_aws"],
+        "fs_read": ["fs_read", "read", "knowledge"],
+        "fs_write": ["fs_write", "write", "code"],
+        "fs_list": ["glob", "grep"],
+        "fs_*": ["fs_read", "read", "knowledge", "fs_write", "write", "code", "glob", "grep"],
+        "web_fetch": ["web_fetch", "web_search"],
+    },
+}
+
+# Newly mapped Claude Code 2.1.318 built-ins and the CAO tools that keep them.
+_NEWLY_MAPPED = {
+    "TaskStop": {"execute_bash"},
+    "GetTask": {"execute_bash"},
+    "PowerShell": {"execute_bash"},
+    "LSP": {"fs_read", "fs_*"},
+}
+
+_RESTRICTED_GRANTS = [
+    [],
+    ["@cao-mcp-server"],
+    ["fs_read", "@cao-mcp-server"],
+    ["@cao-mcp-server", "fs_read", "fs_list"],
+    ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"],
+    ["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"],
+    ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
+    ["fs_write", "web_fetch"],
+    ["execute_bash"],
+    ["@cao-mcp-server", "@other-server", "discovery"],
+]
+
+
+def _cut_before(allowed):
+    every = {tool for tools in _CLAUDE_CODE_MAPPING_BEFORE.values() for tool in tools}
+    kept = set()
+    for cao_tool in allowed:
+        kept.update(_CLAUDE_CODE_MAPPING_BEFORE.get(cao_tool, []))
+    return every - kept
+
+
+class TestClaudeCodeBuiltinAgentToolsCut:
+    """Claude Code's own agent-messaging and agent-spawning built-ins.
+
+    Found live: a Claude Code helper granted ``fs_read`` and
+    ``@cao-mcp-server`` sent its answer with Claude Code's built-in
+    ``SendMessage`` instead of CAO's ``send_message``, got "Not sent — no
+    agent named '<supervisor id>' is reachable", and its answer never
+    arrived. No CAO grant maps to these tools, so the cut never named them.
+    """
+
+    @pytest.mark.parametrize("allowed", _RESTRICTED_GRANTS)
+    def test_every_restricted_grant_cuts_them(self, allowed):
+        disallowed = get_disallowed_tools("claude_code", allowed)
+        assert set(CLAUDE_CODE_ALWAYS_CUT) <= set(disallowed)
+
+    @pytest.mark.parametrize("allowed", [["*"], ["fs_read", "*", "@cao-mcp-server"]])
+    def test_unrestricted_keeps_them(self, allowed):
+        assert get_disallowed_tools("claude_code", allowed) == []
+
+    @pytest.mark.parametrize("allowed", _RESTRICTED_GRANTS)
+    def test_cao_mcp_tools_are_never_named(self, allowed):
+        """CAO's send_message stays reachable whatever the grant.
+
+        A Claude Code 2.1.318 deny matches by exact name, a legacy alias, a
+        ``*`` glob or an ``mcp__<server>`` prefix, and treats a name with ``_``
+        as an MCP name. Every cut name is a bare built-in name, so none can
+        reach ``mcp__cao-mcp-server__send_message``.
+        """
+        disallowed = get_disallowed_tools("claude_code", allowed)
+        assert "mcp__cao-mcp-server__send_message" not in disallowed
+        assert "mcp__cao-mcp-server" not in disallowed
+        assert [
+            tool
+            for tool in disallowed
+            if not tool.isalpha() or not tool[0].isupper() or "cao" in tool.lower()
+        ] == []
+
+    def test_mt_j_cc2_helper_grant(self):
+        """The helper grant from the live run keeps Read and LSP only."""
+        disallowed = get_disallowed_tools("claude_code", ["fs_read", "@cao-mcp-server"])
+        assert "SendMessage" in disallowed
+        assert "ListAgents" in disallowed
+        assert "Read" not in disallowed
+        assert "LSP" not in disallowed
+        assert disallowed == sorted(
+            _cut_before(["fs_read"])
+            | set(CLAUDE_CODE_ALWAYS_CUT)
+            | {"TaskStop", "GetTask", "PowerShell"}
+        )
+
+    @pytest.mark.parametrize("allowed", _RESTRICTED_GRANTS)
+    def test_explicit_lists_change_by_the_new_cuts_only(self, allowed):
+        newly_cut = {tool for tool, keepers in _NEWLY_MAPPED.items() if not keepers & set(allowed)}
+        expected = _cut_before(allowed) | set(CLAUDE_CODE_ALWAYS_CUT) | newly_cut
+        assert get_disallowed_tools("claude_code", allowed) == sorted(expected)
+
+    @pytest.mark.parametrize("tool", ["TaskStop", "GetTask", "PowerShell"])
+    def test_shell_companions_follow_execute_bash(self, tool):
+        assert tool in get_disallowed_tools("claude_code", ["fs_*", "web_fetch"])
+        assert tool not in get_disallowed_tools("claude_code", ["execute_bash"])
+
+    def test_lsp_follows_fs_read(self):
+        assert "LSP" in get_disallowed_tools("claude_code", ["fs_list", "execute_bash"])
+        assert "LSP" in get_disallowed_tools("claude_code", ["fs_write"])
+        assert "LSP" not in get_disallowed_tools("claude_code", ["fs_read"])
+        assert "LSP" not in get_disallowed_tools("claude_code", ["fs_*"])
+
+    @pytest.mark.parametrize("allowed", _RESTRICTED_GRANTS)
+    def test_tool_search_is_never_cut(self, allowed):
+        """MCP tools, CAO's included, load through ToolSearch when deferred."""
+        assert "ToolSearch" not in get_disallowed_tools("claude_code", allowed)
+
+    def test_the_subagent_tool_still_follows_execute_bash(self):
+        """Whether helpers may use Claude Code subagents at all is not decided here."""
+        with_bash = get_disallowed_tools("claude_code", ["fs_read", "execute_bash"])
+        assert "Agent" not in with_bash and "Task" not in with_bash
+        without_bash = get_disallowed_tools("claude_code", ["fs_read"])
+        assert "Agent" in without_bash and "Task" in without_bash
+
+    def test_no_other_provider_was_added_or_removed(self):
+        assert set(TOOL_MAPPING) - {"claude_code"} == set(_OTHER_PROVIDER_MAPPINGS_BEFORE)
+
+    @pytest.mark.parametrize("provider", sorted(_OTHER_PROVIDER_MAPPINGS_BEFORE))
+    @pytest.mark.parametrize("allowed", _RESTRICTED_GRANTS)
+    def test_other_providers_are_unchanged(self, provider, allowed):
+        """Pinned to the frozen base mappings, not the live table, so an edit to
+        another provider's mapping fails here."""
+        mapping = _OTHER_PROVIDER_MAPPINGS_BEFORE[provider]
+        every = {tool for tools in mapping.values() for tool in tools}
+        kept = set()
+        for cao_tool in allowed:
+            kept.update(mapping.get(cao_tool, []))
+        assert ALL_NATIVE_TOOLS[provider] == every
+        result = get_disallowed_tools(provider, allowed)
+        assert result == sorted(every - kept)
+        assert get_allowed_tools(provider, allowed) == sorted(kept)
+        assert set(result).isdisjoint(CLAUDE_CODE_ALWAYS_CUT)
+
+
+# The seven Claude Code built-ins an ephemeral helper never gets,
+# written out so a name dropped from the code fails these tests.
+EPHEMERAL_HELPER_CUT = (
+    "Agent",
+    "Task",
+    "Monitor",
+    "Skill",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
+
+_HELPER_ATOMS = ["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"]
+_HELPER_GRANTS = (
+    [[atom, "@cao-mcp-server"] for atom in _HELPER_ATOMS]
+    + [[atom] for atom in _HELPER_ATOMS]
+    + [_HELPER_ATOMS + ["@cao-mcp-server"], ["@cao-mcp-server"], []]
+)
+
+
+class TestEphemeralClaudeCodeHelperCut:
+    """An ephemeral Claude Code helper never gets subagents, Monitor, skills,
+    questions or plan mode, whatever its grant; nothing else changes."""
+
+    @pytest.mark.parametrize("allowed", _HELPER_GRANTS)
+    def test_every_helper_grant_cuts_the_seven(self, allowed):
+        cut = get_launch_disallowed_tools("claude_code", allowed, ephemeral=True)
+        for tool in EPHEMERAL_HELPER_CUT:
+            assert cut.count(tool) == 1, tool
+        assert cut == sorted(
+            set(get_disallowed_tools("claude_code", allowed)) | set(EPHEMERAL_HELPER_CUT)
+        )
+
+    @pytest.mark.parametrize("allowed", [["*"], None])
+    def test_a_helper_loses_the_seven_even_unrestricted(self, allowed):
+        assert get_launch_disallowed_tools("claude_code", allowed, ephemeral=True) == sorted(
+            EPHEMERAL_HELPER_CUT
+        )
+
+    @pytest.mark.parametrize("allowed", _RESTRICTED_GRANTS + _HELPER_GRANTS)
+    def test_installed_launches_are_unchanged(self, allowed):
+        assert get_launch_disallowed_tools("claude_code", allowed) == get_disallowed_tools(
+            "claude_code", allowed
+        )
+
+    def test_installed_developer_default_and_star_are_unchanged(self):
+        developer = ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
+        assert get_launch_disallowed_tools("claude_code", developer) == sorted(
+            CLAUDE_CODE_ALWAYS_CUT
+        )
+        assert get_launch_disallowed_tools("claude_code", ["*"]) == []
+        assert get_launch_disallowed_tools("claude_code", None) == []
+
+    @pytest.mark.parametrize("provider", ["codex", "kiro_cli", "copilot_cli", "grok_cli"])
+    @pytest.mark.parametrize("allowed", _HELPER_GRANTS)
+    def test_no_other_provider_gets_the_helper_cut(self, provider, allowed):
+        assert get_launch_disallowed_tools(
+            provider, allowed, ephemeral=True
+        ) == get_disallowed_tools(provider, allowed)
+
+    def test_the_helper_cut_is_keyed_to_claude_code_only(self):
+        assert set(EPHEMERAL_ALWAYS_DISALLOWED) == {"claude_code"}
+        assert EPHEMERAL_ALWAYS_DISALLOWED["claude_code"] == EPHEMERAL_HELPER_CUT
 
 
 class TestGrantedMcpServers:

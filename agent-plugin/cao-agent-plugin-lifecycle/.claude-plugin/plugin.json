@@ -1,0 +1,5 @@
+{
+  "name": "cao-agent-plugin-lifecycle",
+  "version": "2.5.3",
+  "description": "Skills for the Agent Plugins 1.0.0 package lifecycle: author a new package from an empty directory (the plugin.json manifest, skills/ and an optional mcp.json), and audit an existing one against the vendored schemas and the Agent Skills limits that CAO's own validator only warns about. The audit skill bundles a validator that needs no CAO install and opens no network connection itself; its first run needs its dependencies available."
+}

@@ -482,8 +482,16 @@ class TestCommittedPackageVersion:
         assert bap.committed_package_version() is None
 
     def test_packages_disagreeing_is_unknowable(self, monkeypatch, tmp_path):
-        """Two versions is drift, and drift must not become the baseline."""
-        for name, version in (("cao", "2.5.0"), ("cao-contributor", "2.4.0")):
+        """Two versions is drift, and drift must not become the baseline.
+
+        One manifest per entry in ``bap.PACKAGES``, so the disagreement, not a
+        missing manifest, is what makes the version unknowable. Deriving the names
+        from ``PACKAGES`` keeps a later package covered without editing this test.
+        """
+        names = [config.name for config in bap.PACKAGES]
+        assert len(names) >= 2
+        versions = ["2.4.0"] + ["2.5.0"] * (len(names) - 1)
+        for name, version in zip(names, versions):
             directory = tmp_path / name
             directory.mkdir(parents=True)
             (directory / "plugin.json").write_text(
@@ -491,6 +499,19 @@ class TestCommittedPackageVersion:
             )
         monkeypatch.setattr(bap, "PACKAGES_DIR", tmp_path)
         assert bap.committed_package_version() is None
+
+    def test_packages_agreeing_give_their_version(self, monkeypatch, tmp_path):
+        """The positive control for the disagreement case: one manifest per
+        ``bap.PACKAGES`` entry, all at the same version, gives that version.
+        """
+        for config in bap.PACKAGES:
+            directory = tmp_path / config.name
+            directory.mkdir(parents=True)
+            (directory / "plugin.json").write_text(
+                json.dumps({"name": config.name, "version": "2.5.0"}), encoding="utf-8"
+            )
+        monkeypatch.setattr(bap, "PACKAGES_DIR", tmp_path)
+        assert bap.committed_package_version() == "2.5.0"
 
     def test_an_unknowable_version_falls_back_to_pyproject(self, monkeypatch, tmp_path):
         """So the operator sees "package missing", not an error about discovery."""

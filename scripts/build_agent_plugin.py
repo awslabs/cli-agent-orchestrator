@@ -8,14 +8,15 @@ CAO ships **two** packages, split by audience rather than cosmetically:
                      Agent-Plugins-compatible client. "Install profiles, launch
                      sessions, message a running fleet."
 ``cao-contributor``  **Contributor** — someone extending CAO itself. Authoring a
-                     provider, authoring an event plugin.
+                     provider, authoring an event plugin, working on the repo
+                     itself.
 ===================  ==========================================================
 
 Shipping repo-development skills inside the operator package would enlarge the
 prompt surface of every foreign agent that installs it with instructions it will
 never act on, so each package's skills all serve one story.
 
-Both packages are **generated and committed**, following the canonical-source +
+Every package is **generated and committed**, following the canonical-source +
 generated-mirror + ``--check`` pattern ``scripts/sync_skills.py`` already uses.
 Committing them is what makes ``cao plugin add ./agent-plugin/cao`` work from a
 clone with no build step, and what lets a foreign client point at the
@@ -25,7 +26,7 @@ tested.
 
 Usage::
 
-    python scripts/build_agent_plugin.py            # regenerate both packages
+    python scripts/build_agent_plugin.py            # regenerate every package
     python scripts/build_agent_plugin.py --check     # CI guard: exit 1 on drift
 
 Naming caveats, both deliberate and both recorded rather than silently resolved:
@@ -34,9 +35,9 @@ Naming caveats, both deliberate and both recorded rather than silently resolved:
   the event-plugin authoring skill depend on **maintainer decision M4**. Both are
   provisional. Because each package's allowlist is *data*, a rename is a
   one-line edit here plus a rebuild — no restructuring.
-* ``cao-contributing`` is **conditional and not present**. It depends on PR #448,
-  which is open and still a draft, so this build does not claim it. Adding it
-  when #448 lands is likewise one allowlist line.
+* ``cao-contributing`` ships in the contributor package. It was held back while
+  PR #448 was a draft; #448 merged, and adding it was the one allowlist line this
+  design promised (#1120).
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 CANONICAL_SKILLS_DIR = ROOT / "skills"
@@ -63,6 +64,22 @@ PYPROJECT = ROOT / "pyproject.toml"
 SPEC_VERSION = "1.0.0"
 PLUGIN_SCHEMA_ID = f"https://agent-plugins.org/schemas/{SPEC_VERSION}/plugin.schema.json"
 MCP_SCHEMA_ID = f"https://agent-plugins.org/schemas/{SPEC_VERSION}/mcp.schema.json"
+# The human-readable specification, as opposed to the two machine-readable
+# schema ids above. Named once because both rendered files cite it.
+SPEC_URL = "https://agent-plugins.org/specification"
+
+# Absolute GitHub URLs for the generated files. A RELATIVE link is wrong in
+# anything this script renders: the whole point of a package is to be installed
+# somewhere else, and `cao plugin add <url> --subdir agent-plugin/<name>` copies
+# the directory out of the repository, leaving `../../docs/...` pointing at
+# nothing (audit follow-up 6).
+REPO_URL = "https://github.com/awslabs/cli-agent-orchestrator"
+AGENT_PLUGINS_DOC_URL = f"{REPO_URL}/blob/main/docs/agent-plugins.md"
+# Release notes live on the GitHub Release for the tag, which is `v` + the
+# version (`git tag --list 'v2.5*'` -> v2.5.2, v2.5.3, v2.5.4). The repo has no
+# per-package changelog to point at, so this is the existing convention rather
+# than a new notes system (audit follow-up 7).
+RELEASE_NOTES_URL_TEMPLATE = f"{REPO_URL}/releases/tag/v{{version}}"
 
 # The distribution the packaged MCP server is launched from, and the console
 # script that server exposes.
@@ -146,9 +163,11 @@ CONTRIBUTOR = PackageConfig(
     name="cao-contributor",
     description=(
         "Skills for extending CLI Agent Orchestrator: authoring providers and event "
-        "plugins. Development-facing; install the `cao` plugin instead to drive sessions."
+        "plugins, and working on the repo itself (dev loop, CI gates, dependency and "
+        "lockfile rules). Development-facing; install the `cao` plugin instead to "
+        "drive sessions."
     ),
-    keywords=["cao", "development", "provider", "extension"],
+    keywords=["cao", "development", "provider", "extension", "contributing", "ci"],
     skills=[
         # Authoring a new provider: the skill encodes the provider contract that is
         # otherwise only discoverable by reading providers/.
@@ -156,18 +175,43 @@ CONTRIBUTOR = PackageConfig(
         # Authoring an *event* plugin. Packaged under whichever name M4 settles on,
         # since the packaged folder name must equal the frontmatter `name`.
         "cao-plugin",
-        # `cao-contributing` joins here when PR #448 lands. Deliberately absent:
-        # the skill does not exist in the tree yet and this build does not claim it.
+        # Working on CAO itself: the dev loop, the CI gate map, dependency and
+        # lockfile rules, and PR discipline. Added once PR #448 merged (#1120).
+        "cao-contributing",
     ],
     excluded_note=(
         "Excluded: every operator-facing skill (they belong in the `cao` package), and "
-        "the adjacent-feature and vendored skills excluded there for the same reasons. "
-        "`cao-contributing` is conditional on PR #448 (open, draft) and is not present; "
-        "adding it is a one-line allowlist edit in scripts/build_agent_plugin.py."
+        "the adjacent-feature and vendored skills excluded there for the same reasons."
     ),
 )
 
-PACKAGES: List[PackageConfig] = [OPERATOR, CONTRIBUTOR]
+LIFECYCLE = PackageConfig(
+    name="cao-agent-plugin-lifecycle",
+    description=(
+        "Skills for the Agent Plugins 1.0.0 package lifecycle: author a new package "
+        "from an empty directory (the plugin.json manifest, skills/ and an optional "
+        "mcp.json), and audit an existing one against the vendored schemas and the "
+        "Agent Skills limits that CAO's own validator only warns about. The audit "
+        "skill bundles a validator that needs no CAO install and opens no network "
+        "connection itself; its first run needs its dependencies available."
+    ),
+    keywords=["cao", "agent-plugins", "authoring", "audit", "skills"],
+    skills=[
+        # Authoring an Agent Plugin from scratch: the manifest contract, read from
+        # the vendored schema, and CAO's validation gate.
+        "cao-agent-plugin-creator",
+        # Auditing an existing package. Ships its validator script and a bundled,
+        # pin-checked copy of the vendored schema bytes it validates against.
+        "cao-agent-plugin-audit",
+    ],
+    excluded_note=(
+        "Excluded: every operator skill (in the `cao` package) and every contributor "
+        "skill (in `cao-contributor`). The event-plugin authoring skill is in "
+        "`cao-contributor`; it is unrelated to Agent Plugins."
+    ),
+)
+
+PACKAGES: List[PackageConfig] = [OPERATOR, CONTRIBUTOR, LIFECYCLE]
 
 
 class BuildError(RuntimeError):
@@ -298,36 +342,62 @@ def pin_changed(version: str) -> bool:
     return True
 
 
-def committed_package_version() -> Optional[str]:
-    """The version the COMMITTED packages were generated at, or ``None``.
+def committed_pin_report() -> Tuple[Optional[str], List[str]]:
+    """The version the COMMITTED packages were generated at, and why it is unknown.
+
+    Returns ``(version, [])`` when every package in ``PACKAGES`` has a readable
+    manifest whose ``version`` is a non-empty string and all of them agree. Otherwise
+    returns ``(None, problems)``, one line per reason: a missing or unreadable
+    manifest names its package, a non-string or empty ``version`` names its package
+    and the value, and a disagreement names every package with its version.
 
     ``--check`` must compare the committed bytes against *the version they were
     built at*, not against whatever ``pyproject.toml`` currently says. Otherwise
     ``release.yml`` bumping the version on ``main`` turns every rendered file into
     a ``CONTENT DIFFERS`` finding and reddens ``main`` and every open PR, before
-    the job that exists to repin has had a chance to run (defect G1c).
-
-    Both packages carry the version, and they are written by the same pass, so
-    disagreement between them is itself drift. ``None`` means "cannot tell" -- a
-    missing, unreadable, or internally inconsistent set of packages -- and the
-    caller then falls back to the ``pyproject`` version so the existing
-    "package missing" / ``CONTENT DIFFERS`` diagnostics are what the operator
-    sees, rather than an error about version discovery.
+    the job that exists to repin has had a chance to run (defect G1c). Every
+    package carries the version and all are written by the same pass, so
+    disagreement between any two of them is itself drift.
     """
-    versions = set()
+    problems: List[str] = []
+    versions: Dict[str, str] = {}
     for config in PACKAGES:
         manifest_path = PACKAGES_DIR / config.name / "plugin.json"
+        rel = f"agent-plugin/{config.name}/plugin.json"
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
+        except FileNotFoundError:
+            problems.append(f"{config.name}: {rel} is missing")
+            continue
+        except (OSError, ValueError) as exc:
+            problems.append(f"{config.name}: {rel} is unreadable ({exc})")
+            continue
+        if not isinstance(manifest, dict):
+            problems.append(f"{config.name}: {rel} is not a JSON object")
+            continue
         version = manifest.get("version")
         if not isinstance(version, str) or not version:
-            return None
-        versions.add(version)
-    if len(versions) != 1:
-        return None
-    return versions.pop()
+            problems.append(f"{config.name}: {rel} version {version!r} is not a non-empty string")
+            continue
+        versions[config.name] = version
+    if len(set(versions.values())) > 1:
+        listing = ", ".join(f"{name}={version}" for name, version in versions.items())
+        problems.append(f"the committed packages disagree on their version: {listing}")
+    if problems:
+        return None, problems
+    return next(iter(versions.values())), []
+
+
+def committed_package_version() -> Optional[str]:
+    """The version the COMMITTED packages were generated at, or ``None``.
+
+    ``None`` means "cannot tell" -- a missing, unreadable, or internally
+    inconsistent set of packages; :func:`committed_pin_report` says which. The
+    caller then falls back to the ``pyproject`` version so the existing
+    "package missing" / ``CONTENT DIFFERS`` diagnostics are still produced, and
+    ``--check`` reports the reason alongside them.
+    """
+    return committed_pin_report()[0]
 
 
 def pin_ordering_problems(committed: str, current: str) -> List[str]:
@@ -575,6 +645,7 @@ def verify_published(version: str) -> None:
 def render_changelog(config: PackageConfig, version: str) -> str:
     """Render a package CHANGELOG recording what it ships and what it omits."""
     skill_lines = "\n".join(f"- `{skill}`" for skill in config.skills) or "- (none)"
+    release_notes = RELEASE_NOTES_URL_TEMPLATE.format(version=version)
     return f"""\
 # Changelog — `{config.name}`
 
@@ -584,9 +655,14 @@ any hand edit.
 
 ## {version}
 
-Targets the [Agent Plugins 1.0.0](https://agent-plugins.org/specification)
-specification. Version is synced from CAO's own package metadata, so the plugin
-and the CAO release it corresponds to cannot diverge.
+Targets the [Agent Plugins {SPEC_VERSION}]({SPEC_URL})
+specification.
+
+This package is pinned to CAO v{version}; see
+[its release notes]({release_notes}).
+Between releases the skills here are rebuilt from `main`, so they can be newer
+than that release. The release workflow re-pins after publishing, which is why
+the committed pin lags by one release by construction.
 
 Skills:
 
@@ -625,7 +701,8 @@ From GitHub, without cloning:
 cao plugin add https://github.com/awslabs/cli-agent-orchestrator --subdir {install_path}
 ```
 
-Any Agent-Plugins-compatible client can install this directory the same way.
+Any [Agent-Plugins-compatible]({SPEC_URL}) client can install this directory
+the same way.
 
 ## Contents
 
@@ -633,8 +710,8 @@ Version `{version}`, synced from CAO's package metadata.
 
 {chr(10).join(f"- `{skill}`" for skill in config.skills) or "- (none)"}
 
-See [docs/agent-plugins.md](../../docs/agent-plugins.md) for the prerequisites
-and the localhost-only posture.
+See [docs/agent-plugins.md]({AGENT_PLUGINS_DOC_URL}) for the prerequisites and
+the localhost-only posture.
 """
 
 
@@ -845,7 +922,14 @@ def _schema_version(schema_id: str) -> str:
     return match.group(1) if match else ""
 
 
-def run_build(*, verify_pypi: bool = True, require_bounded_client: bool = False) -> int:
+def run_build(
+    *,
+    verify_pypi: bool = True,
+    require_bounded_client: bool = False,
+    keep_committed_pin: bool = False,
+) -> int:
+    if keep_committed_pin:
+        return _build_at_committed_pin()
     version = package_version()
     ships_mcp = any(config.ships_mcp for config in PACKAGES)
     if verify_pypi and ships_mcp:
@@ -880,10 +964,36 @@ def run_build(*, verify_pypi: bool = True, require_bounded_client: bool = False)
     return 0
 
 
-def run_check(*, require_current_pin: bool = False) -> int:
-    """Evaluate **both** packages independently and report both outcomes.
+def _build_at_committed_pin() -> int:
+    """``--keep-committed-pin``: rebuild every package at the version it already pins.
 
-    A failure in one package must not suppress reporting a failure in the other —
+    For a contributor who edited a packaged skill. It never contacts PyPI: the
+    committed pin was verified when it was written, and this build does not change
+    it. It refuses, writing nothing, when the committed pin cannot be read.
+    """
+    version, problems = committed_pin_report()
+    if version is None:
+        raise BuildError(
+            "--keep-committed-pin cannot tell which version the committed packages pin:\n"
+            + "\n".join(f"  - {problem}" for problem in problems)
+            + "\nFix the committed manifests, or rebuild at pyproject.toml's version with "
+            "a plain `python scripts/build_agent_plugin.py`."
+        )
+    PACKAGES_DIR.mkdir(parents=True, exist_ok=True)
+    for config in PACKAGES:
+        build_package(config, version, PACKAGES_DIR)
+        print(f"  built agent-plugin/{config.name}/ ({len(config.skills)} skill(s))")
+    print(
+        f"Built {len(PACKAGES)} agent plugin package(s) at the committed version "
+        f"{version} (pyproject.toml is at {package_version()}; the pin was not moved)"
+    )
+    return 0
+
+
+def run_check(*, require_current_pin: bool = False) -> int:
+    """Evaluate **every** package independently and report every outcome.
+
+    A failure in one package must not suppress reporting a failure in another —
     otherwise the contributor package can quietly rot behind a green check on the
     operator package.
 
@@ -904,10 +1014,12 @@ def run_check(*, require_current_pin: bool = False) -> int:
     import tempfile
 
     current_version = package_version()
+    pin_problems: List[str] = []
     if require_current_pin:
         version = current_version
     else:
-        version = committed_package_version() or current_version
+        committed, pin_problems = committed_pin_report()
+        version = committed or current_version
 
     all_problems: Dict[str, List[str]] = {}
 
@@ -928,16 +1040,31 @@ def run_check(*, require_current_pin: bool = False) -> int:
         all_problems.setdefault(PACKAGES[0].name, []).extend(ordering)
 
     failed = {name: problems for name, problems in all_problems.items() if problems}
+    if pin_problems:
+        # Say WHY the committed pin is unknown, before the per-package drift that
+        # follows from checking against pyproject's version instead (#1152).
+        print(
+            f"Agent plugin committed pin unknown, so the packages were checked against "
+            f"pyproject.toml's {current_version}:",
+            file=sys.stderr,
+        )
+        for problem in pin_problems:
+            print(f"  - {problem}", file=sys.stderr)
+        print("", file=sys.stderr)
     if failed:
         print("Agent plugin packages are OUT OF SYNC or non-conformant:", file=sys.stderr)
         for name, problems in failed.items():
             print(f"\n  {name}:", file=sys.stderr)
             for problem in problems:
                 print(f"    - {problem}", file=sys.stderr)
-        print(
-            "\nRun: python scripts/build_agent_plugin.py  (then commit the result)",
-            file=sys.stderr,
-        )
+        if pin_problems or require_current_pin or ordering:
+            # The pin is unknown, must become pyproject's, or is ahead of it: only
+            # a plain build (which pins pyproject's version) can fix any of those.
+            hint = "python scripts/build_agent_plugin.py"
+        else:
+            # Plain drift at a known pin, so rebuilding must not move it.
+            hint = "python scripts/build_agent_plugin.py --keep-committed-pin"
+        print(f"\nRun: {hint}  (then commit the result)", file=sys.stderr)
         return 1
 
     names = ", ".join(config.name for config in PACKAGES)
@@ -989,7 +1116,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             "the repin does and strict equality there would redden `main`."
         ),
     )
+    parser.add_argument(
+        "--keep-committed-pin",
+        action="store_true",
+        help=(
+            "Rebuild every package at the version the committed packages already pin, "
+            "instead of pyproject.toml's. For a contributor who edited a packaged skill. "
+            "Never contacts PyPI, and refuses when the committed packages are missing, "
+            "unreadable or disagree."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.keep_committed_pin and args.require_bounded_client:
+        parser.error(
+            "--keep-committed-pin cannot be combined with --require-bounded-client: it "
+            "keeps a pin that was verified when it was written, and contacts no PyPI"
+        )
+    if args.keep_committed_pin and args.check:
+        parser.error("--keep-committed-pin builds; it cannot be combined with --check")
 
     try:
         if args.check:
@@ -997,6 +1141,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_build(
             verify_pypi=not args.skip_publish_check,
             require_bounded_client=args.require_bounded_client,
+            keep_committed_pin=args.keep_committed_pin,
         )
     except BuildError as exc:
         print(f"Agent plugin build failed: {exc}", file=sys.stderr)

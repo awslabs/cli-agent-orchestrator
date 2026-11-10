@@ -19,6 +19,17 @@ from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.utils.tool_mapping import get_launch_disallowed_tools
+
+EPHEMERAL_HELPER_CUT = (
+    "Agent",
+    "Task",
+    "Monitor",
+    "Skill",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
 
 CHILD = "eeeeeeee"
 
@@ -63,6 +74,66 @@ async def test_owner_launch_is_bound_and_marked_ephemeral(runtime_store, with_cl
     assert audit(name)["events"][-1]["terminal_id"] == CHILD
     assert audit(name)["events"][-1]["effective_tools"] == terminal.allowed_tools
     assert factory.call_args.args[5] == terminal.allowed_tools
+    # The bind is what marks the launch a helper's, and its bound
+    # event records the deny list the launch command will carry.
+    assert factory.call_args.kwargs["ephemeral"] is True
+    recorded = audit(name)["events"][-1]["disallowed_tools"]
+    assert recorded == get_launch_disallowed_tools(
+        "claude_code", terminal.allowed_tools, ephemeral=True
+    )
+    for tool in EPHEMERAL_HELPER_CUT + ("SendMessage", "ListAgents", "Workflow"):
+        assert recorded.count(tool) == 1, tool
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowed_tools", [None, ["fs_read", "@cao-mcp-server"]])
+async def test_an_installed_profile_that_reads_like_a_helper_is_not_a_helper(
+    runtime_store, allowed_tools
+):
+    """The flag comes from the bind, never from the profile text."""
+    from cli_agent_orchestrator.services.ephemeral_service import FENCE_SENTENCE
+
+    env, name, backend, factory = runtime_store
+    tools_line = "allowedTools:\n  - fs_read\n  - '@cao-mcp-server'\n" if allowed_tools else ""
+    # Shaped like a helper's generated profile: no skills, only the CAO MCP server, a
+    # reserved-looking description and the helper fence. It is still an installed profile.
+    (env[3] / "ordinary.md").write_text(
+        "---\nname: ordinary\ndescription: Ramones-log_triage-3f9a ephemeral helper\n"
+        "provider: claude_code\nskills: []\n"
+        "mcpServers:\n  cao-mcp-server:\n    command: cao-mcp-server\n    args: []\n"
+        + tools_line
+        + "---\n"
+        + FENCE_SENTENCE
+        + "\nTask.\n"
+    )
+    terminal = await terminal_service.create_terminal(
+        "claude_code", "ordinary", session_name="cao-session"
+    )
+    assert terminal.ephemeral is False
+    assert "ephemeral" not in factory.call_args.kwargs
+    assert database.get_ephemeral_agent(name)["state"] != "launched"
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_helper_launch_still_gets_the_flag(runtime_store, monkeypatch):
+    """assign launches helpers with defer_init=True: the flag must not depend on that path."""
+    env, name, backend, factory = runtime_store
+    token = claim(env, name)["claim_id"]
+    schedule = Mock(return_value=None)
+    monkeypatch.setattr(terminal_service, "_schedule_deferred_init", schedule)
+    terminal = await terminal_service.create_terminal(
+        "claude_code",
+        name,
+        session_name="cao-session",
+        caller_id=CALLER,
+        claim_id=token,
+        initial_message="inspect",
+        defer_init=True,
+    )
+    assert terminal.ephemeral is True
+    assert factory.call_args.kwargs["ephemeral"] is True
+    schedule.assert_called_once()
+    assert schedule.call_args.args[0] is factory.return_value
 
 
 @pytest.mark.parametrize(
@@ -152,12 +223,13 @@ async def test_prebind_failure_ends_claim_and_allows_new_claim(runtime_store, mo
         monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: 0)
         monkeypatch.setattr(terminal_service, "count_runtime_allocated_terminals", lambda: 1)
     elif failure == "key":
-        expected = terminal_service.IdempotencyKeyConflict
+        # A key hit on a stored row that does not validate fails before bind.
+        expected = terminal_service.TerminalRecordCorruptError
         args["idempotency_key"] = "key"
         monkeypatch.setattr(
             terminal_service,
             "get_idempotency_record",
-            lambda _: Mock(terminal_id="dddddddd", request_fingerprint="wrong"),
+            lambda _: Mock(terminal_id="dddddddd", request_fingerprint="any"),
         )
         monkeypatch.setattr(terminal_service, "get_terminal", lambda _: dict(id="dddddddd"))
     elif failure in ("load", "cancel"):
@@ -253,7 +325,9 @@ async def test_different_claim_is_not_an_idempotent_replay(runtime_store):
         idempotency_key="key",
     )
     assert first.id == CHILD
-    with pytest.raises(terminal_service.IdempotencyKeyConflict):
+    # A different claim is a different request, so it has its own empty slot
+    # under the key and never resolves to the first claim's terminal (#944).
+    with pytest.raises(terminal_service.IdempotencyKeyNotFound):
         await terminal_service.create_terminal(
             "claude_code",
             name,
@@ -261,6 +335,7 @@ async def test_different_claim_is_not_an_idempotent_replay(runtime_store):
             caller_id=CALLER,
             claim_id="b" * 32,
             idempotency_key="key",
+            lookup_only=True,
         )
     assert database.get_ephemeral_agent(name)["state"] == "launched"
 
@@ -582,7 +657,7 @@ async def test_deferred_provider_cleanup_waits_for_delete(release_runtime, monke
     )
     assert database.get_ephemeral_agent(name)["state"] == "launched"
     monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda _: True)
-    assert terminal_service.delete_terminal(CHILD)
+    assert terminal_service.delete_terminal(CHILD, end_reason="deleted")
     assert_released(env, name, "terminal_deleted")
 
 
@@ -1071,5 +1146,65 @@ def test_ordinary_delete_never_opens_ephemeral_write_transaction(release_runtime
     database.create_terminal(ordinary, "cao-session", "ordinary", "claude_code")
     transaction = Mock(side_effect=AssertionError("ordinary deletion must not take write lock"))
     monkeypatch.setattr(env[0], "_transaction", transaction)
-    assert terminal_service.delete_terminal_row(ordinary, None) is True
+    assert terminal_service.delete_terminal_row(ordinary, None, end_reason="deleted") is True
     transaction.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_claim", [False, True])
+async def test_modified_profile_refused_before_allocation(runtime_store, with_claim):
+    env, name, backend, factory = runtime_store
+    token = claim(env, name)["claim_id"] if with_claim else None
+    path = env[2] / "ephemeral/live" / (name + ".md")
+    path.write_bytes(path.read_bytes() + b"\nUnverified instructions.\n")
+    with pytest.raises(env[0].EphemeralPolicyError) as exc:
+        await terminal_service.create_terminal(
+            "claude_code", name, session_name="cao-session", caller_id=CALLER, claim_id=token
+        )
+    assert exc.value.rule == "spec_unavailable"
+    assert database.get_ephemeral_agent(name)["state"] == "pending"
+    factory.assert_not_called()
+    backend.create_window.assert_not_called()
+    assert database.get_terminal_metadata(CHILD) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
+async def test_launch_omits_catalog_but_named_skill_load_remains(
+    runtime_store, monkeypatch, tmp_path, provider_name
+):
+    from cli_agent_orchestrator.mcp_server import server
+    from cli_agent_orchestrator.utils import skills
+
+    env, name, backend, factory = runtime_store
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    row_update(env, name, provider=provider_name)
+    root = tmp_path / "skills"
+    folder = root / "example"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text(
+        "---\nname: example\ndescription: Test skill\n---\nNamed skill content."
+    )
+    monkeypatch.setattr(skills, "SKILLS_DIR", root)
+    monkeypatch.setattr(skills, "_skill_search_dirs", lambda: [root])
+    assert "## Available Skills" in skills.build_skill_catalog()
+    monkeypatch.setattr(terminal_service, "build_skill_catalog", skills.build_skill_catalog)
+    await terminal_service.create_terminal(
+        provider_name, name, session_name="cao-session", caller_id=CALLER
+    )
+    assert not factory.call_args.kwargs["skill_prompt"]
+    # Exercise the MCP client and real API handler without a socket or server.
+    from cli_agent_orchestrator.api.main import app
+
+    client = TestClient(app, base_url="http://localhost")
+    monkeypatch.setattr(
+        server.requests, "get", lambda *args, **kwargs: client.get("/skills/example")
+    )
+    monkeypatch.setenv("CAO_TERMINAL_ID", CHILD)
+    monkeypatch.setattr(
+        server,
+        "_get_terminal_context_from_env",
+        lambda: {"ephemeral": True, "allowed_tools": ["@cao-mcp-server"]},
+    )
+    assert server._tool_denied_reason("load_skill") is None
+    assert await server.load_skill("example") == "Named skill content."

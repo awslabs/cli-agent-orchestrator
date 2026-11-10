@@ -5,13 +5,21 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
+      # `testpypi` and `pypi` publish to that one index (the manual paths below).
+      # `release` runs the SAME chain a `release` event runs, from a v* tag:
+      # verify -> build -> TestPyPI -> smoke test -> maintainer-approved PyPI. It exists
+      # because a GitHub Release created by release.yml under GITHUB_TOKEN never emits
+      # `on: release`. A maintainer dispatches it on the tag release.yml pushed (release.yml
+      # itself never dispatches anything), so prevent_self_review on the `pypi` environment
+      # makes a second maintainer approve the upload.
       environment:
-        description: 'Target environment (manual dispatch only)'
+        description: 'testpypi or pypi alone, or release: the full chain from a v* tag'
         required: true
         type: choice
         options:
           - testpypi
           - pypi
+          - release
 
 permissions:
   contents: read
@@ -36,9 +44,10 @@ jobs:
   # TestPyPI upload with `400 File already exists`. In every case the tag had been placed on
   # a commit whose pyproject.toml still carried the PREVIOUS version, so the matrix built
   # artifacts that were already published and twine named the artifact, not the tag.
-  # `release.yml` (bump, commit, tag) cannot push to `main` under the branch rulesets, so
-  # releases are cut by hand as a `chore: release vX.Y.Z` PR plus a GitHub Release; this job
-  # is what catches the second step happening without the first.
+  # `release.yml` never bumped uv.lock, so no tag it cut could pass this check, and releases
+  # were cut by hand as a `chore: release vX.Y.Z` PR plus a GitHub Release; this job is what
+  # catches the second step happening without the first. (release.yml now bumps uv.lock and
+  # runs this same check before it tags, #652.)
   #
   # `GITHUB_REF_NAME` is read from the ENVIRONMENT, not interpolated with `${{ }}` into the
   # script, so the ref can never be executed as shell (zizmor template-injection). On a
@@ -54,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -62,21 +71,32 @@ jobs:
       # indexes diverge in both directions (2.1.0 and 2.2.0 exist only on TestPyPI, 2.4.1 only
       # on PyPI), so the question is asked of BOTH: a version on either one is a guaranteed
       # `400 File already exists` ~80 minutes from now. (Review on PR #947.)
+      #
+      # A `release` dispatch runs the release-event chain, so it gets the release-event check,
+      # and it must be dispatched from a TAG. The `pypi` environment's deployment policy admits
+      # the `main` branch and `v*` tags (read 2026-11-02), and a branch can be NAMED like a
+      # version, so this GITHUB_REF_TYPE check is the workflow's own guard, not the policy's.
       - name: Refuse a release tag whose version the tree does not carry, or that an index already has
-        if: github.event_name == 'release'
-        run: >-
-          python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME"
-          --index https://test.pypi.org --index https://pypi.org
+        if: github.event_name == 'release' || inputs.environment == 'release'
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::error::the release chain runs from a v* tag, not the $GITHUB_REF_TYPE $GITHUB_REF_NAME"
+            exit 1
+          fi
+          python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME" \
+            --index https://test.pypi.org --index https://pypi.org
 
       # A manual dispatch uploads to exactly one index, chosen by `inputs.environment`, so
       # only THAT index is asked: a testpypi dispatch must not be refused on pypi.org state,
       # and a pypi dispatch must not be passed on test.pypi.org state. The index is selected
       # in `env:` and read from the environment; nothing from the event reaches `run:`.
       #
-      # The `pypi` environment is restricted to `v*` tags, so the PyPI escape hatch always
-      # runs on a tag ref; when it does, the tag gets the same comparison a release does.
+      # The `pypi` environment's deployment policy admits the `main` branch and `v*` tags
+      # (read 2026-11-02), so the PyPI escape hatch can run on either. From a tag, the tag
+      # gets the same comparison a release does; from `main`, only the tree and the target
+      # index are checked.
       - name: Manual dispatch; check the tree agrees with itself and the target index lacks the version
-        if: github.event_name != 'release'
+        if: github.event_name != 'release' && inputs.environment != 'release'
         env:
           TARGET_INDEX: ${{ inputs.environment == 'testpypi' && 'https://test.pypi.org' || 'https://pypi.org' }}
         run: |
@@ -197,7 +217,7 @@ jobs:
       # explicit keeps one convention instead of two, and does not depend on which image
       # happens to ship a `python` shim. It cannot affect the wheels — cibuildwheel ignores
       # the host interpreter when selecting build Pythons. (#321)
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -246,7 +266,7 @@ jobs:
       # (`[tool.cibuildwheel] test-command`) installs the wheel and RUNS `cao tui`, so a
       # wheel whose binary is missing, non-executable, or built for the wrong architecture
       # fails HERE rather than on an operator's machine (SR-1).
-      - uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1
+      - uses: pypa/cibuildwheel@f9b966cfadf4109556cadc5bb39ddb72d0ce664e  # v4.3.5
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
           # See `macos-target` in the matrix: this is what keeps delocate from rejecting a
@@ -303,7 +323,7 @@ jobs:
           npm ci
           npm run build
 
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
 
       - name: Build sdist
         run: uv build --sdist
@@ -316,7 +336,10 @@ jobs:
 
   publish-testpypi:
     name: Publish to TestPyPI
-    if: github.event_name == 'release' || github.event.inputs.environment == 'testpypi'
+    if: >-
+      github.event_name == 'release' ||
+      github.event.inputs.environment == 'testpypi' ||
+      github.event.inputs.environment == 'release'
     needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -350,15 +373,16 @@ jobs:
       - name: Assert the full platform set is present and none is tagged 'any'
         run: python scripts/assert_wheel_matrix.py --dist dist/
 
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
           repository-url: https://test.pypi.org/legacy/
 
   smoke-test:
     name: Smoke test from TestPyPI (${{ matrix.label }})
-    # Only runs on Release-triggered publishes. Manual workflow_dispatch
-    # skips the smoke-test because we have no tagged version to pin against.
-    if: github.event_name == 'release'
+    # Runs on the release chain: a `release` event, or a `release` dispatch from a v* tag
+    # (verify-release-version refuses any other ref). The testpypi and pypi dispatches skip
+    # it because they are not guaranteed a tagged version to pin against.
+    if: github.event_name == 'release' || github.event.inputs.environment == 'release'
     needs: publish-testpypi
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -375,7 +399,7 @@ jobs:
           # matrix in step with that one is what makes "every wheel we ship is installed and
           # executed by CI" true rather than aspirational.
     steps:
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -447,6 +471,7 @@ jobs:
       needs.build-sdist.result == 'success' &&
       (
         (github.event_name == 'release' && needs.smoke-test.result == 'success') ||
+        (github.event.inputs.environment == 'release' && needs.smoke-test.result == 'success') ||
         (github.event.inputs.environment == 'pypi' && needs.smoke-test.result == 'skipped')
       )
     runs-on: ubuntu-latest
@@ -477,9 +502,9 @@ jobs:
 
       # SHA-pinned (SR-2, interview Q10). `release/v1` is a mutable BRANCH, and this action
       # holds the OIDC credential path to PyPI — the highest-consequence supply-chain
-      # exposure in this workflow. dc37677b is the commit that `release/v1` and the v1.14.2
+      # exposure in this workflow. 7245906f is the commit that `release/v1` and the v1.14.3
       # tag both pointed at when this was pinned; verified by dereferencing the annotated tag.
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
 
   # Closes review 5222539218 item 8 on #584. The committed `agent-plugin/cao/mcp.json`
   # pins an exact published version, so the pin can only ever name a release that already
@@ -516,7 +541,7 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
 
       - name: Install the project
         run: uv sync --locked --all-extras --dev

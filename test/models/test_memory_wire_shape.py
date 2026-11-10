@@ -3,10 +3,10 @@
 #968 pinned the default serialized recall payload per client surface in
 ``test/services/test_memory_861_default_parity_extended.py``. Those pins are
 per-endpoint, and only the ``/internal/memory/recall`` one dumps the model
-wholesale — the MCP ``memory_recall`` tool hand-builds its response from an
-explicit key allowlist. So a field added to ``Memory`` widens the wire on some
-surfaces and not others, and the endpoint pins report it as a diff in a 22-key
-dict rather than as "you added a field to the model".
+wholesale — the MCP ``memory_recall`` tool projects it down to the keys
+declared in ``MCP_RECALL_KEYS``. So a field added to ``Memory`` widens the
+wire on some surfaces and not others, and the endpoint pins report it as a
+diff in a 22-key dict rather than as "you added a field to the model".
 
 This module pins the invariant at the model instead, where the decision is
 actually made:

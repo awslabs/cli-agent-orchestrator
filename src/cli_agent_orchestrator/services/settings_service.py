@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
-from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, RETENTION_DAYS
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite, locked_atomic_write
 from cli_agent_orchestrator.utils.paths import normalized_path
 
@@ -111,23 +111,37 @@ EPHEMERAL_DEFAULTS = {
     "pending_ttl_seconds": 900,
     "claim_lease_seconds": 60,
     "max_depth": 1,
+    "min_tier": None,
+    "max_tier": None,
+    "default_tier": None,
+    "min_effort": None,
+    "max_effort": None,
+    "default_effort": None,
+    # #1099 (provisional): disjoint sets of providers a decider may route between; none by
+    # default, so nothing is asked until the operator declares one.
+    "provider_route": {"equivalent": []},
+    # Lifecycle cleanup (#1079); every default here awaits maintainer confirmation.
+    "max_live_per_session": 0,  # No cap; operators opt in.
+    "launch_grace_seconds": 600,
+    "sweep_interval_seconds": 300,
+    "retention_days": RETENTION_DAYS,
 }
 
 
 def get_ephemeral_settings() -> Dict[str, Any]:
     """Read the operator-only block strictly, without environment overrides."""
+    from cli_agent_orchestrator.services.model_tiers import load_model_tiers
+
     settings = _load_or_raise()
     block = settings.get("ephemeral", {})
     if not isinstance(block, dict):
         block = {}
     result = {**EPHEMERAL_DEFAULTS, **block}
-    result["_ignored_policy"] = [
-        "ephemeral." + key
-        for key in ("max_tier", "default_tier", "max_effort", "default_effort")
-        if block.get(key) is not None
-    ]
-    if settings.get("model_tiers") is not None:
-        result["_ignored_policy"].append("model_tiers")
+    result["_model_tiers"] = load_model_tiers(settings)
+    # #1068 A15: an auto spec's lease floor reads the on-mode timeout from this same snapshot.
+    result["_decisions"] = settings.get("decisions")
+    # child_may_delegate() reads its own key from the same block.
+    result["_unknown_keys"] = sorted(set(block) - set(EPHEMERAL_DEFAULTS) - {"child_may_delegate"})
     return result
 
 
@@ -135,6 +149,20 @@ def child_may_delegate() -> bool:
     """Operator-only ephemeral.child_may_delegate; no environment overrides."""
     block = _load_or_raise().get("ephemeral", {})
     return isinstance(block, dict) and block.get("child_may_delegate") is True
+
+
+def kiro_v3_allow_unverified_versions() -> bool:
+    """Operator-only ``kiro.v3_allow_unverified_versions`` (default false).
+
+    Provisional (#1167). When JSON ``true``, a Kiro v3 launch may run on a
+    kiro-cli version whose allow-list entry is still pending operator
+    verification, so that the operator can run the live checklist on it.
+    Nothing else is widened: a version absent from the allow-list still
+    refuses, and every other v3 check still applies. No environment override;
+    an unreadable settings file reads as off.
+    """
+    block = _load().get("kiro", {})
+    return isinstance(block, dict) and block.get("v3_allow_unverified_versions") is True
 
 
 def _load() -> Dict[str, Any]:
@@ -606,6 +634,109 @@ def get_server_settings() -> Dict[str, Any]:
     _server_settings_cache = result
     _server_settings_mtime_ns = mtime_ns
     return dict(result)
+
+
+# Keep finished child agents (#1225 phase 1). Machine-wide and off by default; the
+# numbers are the proposal for workshop use and every one is operator-tunable.
+KEEP_FINISHED_SETTING = "terminal.keep_finished"
+KEEP_FINISHED_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "idle_window_minutes": 60,
+    "max_per_session": 5,
+    "on_cap": "teardown_oldest",
+}
+KEEP_FINISHED_ON_CAP_VALUES = ("teardown_oldest", "dont_keep")
+# Inclusive bounds. A window longer than a week, or more than 100 idle CLIs in one
+# session, is almost certainly a typo, and either would hold RAM for no one.
+KEEP_FINISHED_WINDOW_RANGE = (1, 10080)
+KEEP_FINISHED_CAP_RANGE = (1, 100)
+
+
+class KeepFinishedSettingsError(ValueError):
+    """``terminal.keep_finished`` in settings.json holds a value CAO refuses.
+
+    Raised at load time with a message that names the dotted key, what is allowed
+    and what was found. A ``ValueError`` so ``cao config set`` reports it as a clean
+    CLI error and writes nothing.
+    """
+
+
+class KeepFinishedSettings(NamedTuple):
+    """The validated ``terminal.keep_finished`` block (#1225 phase 1)."""
+
+    enabled: bool
+    idle_window_minutes: int
+    max_per_session: int
+    on_cap: str
+
+
+def _keep_finished_whole_number(key: str, value: Any, bounds: Tuple[int, int]) -> int:
+    low, high = bounds
+    # bool is an int subclass, and a float such as 1.5 is not a whole number of
+    # anything: both are refused rather than coerced.
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise KeepFinishedSettingsError(
+            f"{KEEP_FINISHED_SETTING}.{key} must be a whole number from {low} to {high} "
+            f"(got {value!r})"
+        )
+    return value
+
+
+def parse_keep_finished_block(block: Any) -> KeepFinishedSettings:
+    """Validate a ``terminal.keep_finished`` object; absent keys take their defaults.
+
+    Raises:
+        KeepFinishedSettingsError: the block is not an object, names an unknown key,
+            or holds a value of the wrong type or outside its range.
+    """
+    if block is None:
+        block = {}
+    if not isinstance(block, dict):
+        raise KeepFinishedSettingsError(
+            f"{KEEP_FINISHED_SETTING} must be an object with the keys "
+            f"{', '.join(KEEP_FINISHED_DEFAULTS)} (got {type(block).__name__})"
+        )
+    unknown = sorted(set(block) - set(KEEP_FINISHED_DEFAULTS))
+    if unknown:
+        raise KeepFinishedSettingsError(
+            f"{KEEP_FINISHED_SETTING} has unknown key(s) {', '.join(unknown)}; "
+            f"the known keys are {', '.join(KEEP_FINISHED_DEFAULTS)}"
+        )
+    merged = {**KEEP_FINISHED_DEFAULTS, **block}
+    enabled = merged["enabled"]
+    if not isinstance(enabled, bool):
+        raise KeepFinishedSettingsError(
+            f"{KEEP_FINISHED_SETTING}.enabled must be true or false (got {enabled!r})"
+        )
+    on_cap = merged["on_cap"]
+    if on_cap not in KEEP_FINISHED_ON_CAP_VALUES:
+        raise KeepFinishedSettingsError(
+            f"{KEEP_FINISHED_SETTING}.on_cap must be one of "
+            f"{', '.join(KEEP_FINISHED_ON_CAP_VALUES)} (got {on_cap!r})"
+        )
+    return KeepFinishedSettings(
+        enabled=enabled,
+        idle_window_minutes=_keep_finished_whole_number(
+            "idle_window_minutes", merged["idle_window_minutes"], KEEP_FINISHED_WINDOW_RANGE
+        ),
+        max_per_session=_keep_finished_whole_number(
+            "max_per_session", merged["max_per_session"], KEEP_FINISHED_CAP_RANGE
+        ),
+        on_cap=on_cap,
+    )
+
+
+def get_keep_finished_settings() -> KeepFinishedSettings:
+    """Read ``terminal.keep_finished`` from settings.json (no environment override).
+
+    Absent means the defaults, so off. An unreadable settings.json reads as absent,
+    like every other lenient setting. A present but invalid block RAISES
+    :class:`KeepFinishedSettingsError`; callers that make a keep decision catch it
+    and behave as off, so a typo can only ever give today's behaviour.
+    """
+    terminal = _load().get("terminal", {})
+    block = terminal.get("keep_finished") if isinstance(terminal, dict) else None
+    return parse_keep_finished_block(block)
 
 
 def get_max_terminals() -> Optional[int]:

@@ -68,6 +68,21 @@ class TestRunStepEndpoint:
         assert kwargs["prompt"] == "do it"
         assert kwargs["model"] is None
 
+    @pytest.mark.parametrize("torn_down", [True, False])
+    def test_response_reports_torn_down_from_the_step(self, client, torn_down):
+        """Issue #1203: the response states whether the server deleted the worker."""
+        result = AgentStepResult(
+            terminal_id="abc12345",
+            last_message="all done",
+            status=TerminalStatus.COMPLETED,
+            torn_down=torn_down,
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+
+        assert resp.status_code == 200
+        assert resp.json()["torn_down"] is torn_down
+
     def test_model_forwarded_to_substrate(self, client):
         result = AgentStepResult(
             terminal_id="abc12345", last_message="all done", status=TerminalStatus.COMPLETED
@@ -206,7 +221,7 @@ class TestRunStepEndpoint:
 
     def test_invalid_engine_is_422(self, client):
         with patch(_RUN_STEP, new=AsyncMock()) as m_run:
-            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(engine="v3"))
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(engine="v4"))
 
         assert resp.status_code == 422
         m_run.assert_not_awaited()
@@ -485,6 +500,44 @@ class TestRunStepEndpoint:
         assert resp.status_code == 504
         detail = resp.json()["detail"]
         assert detail["kind"] == "timeout"
+
+    def test_a_reused_kiro_terminal_still_being_checked_is_a_retryable_409(self, client):
+        """#1074: a reused Kiro terminal whose identity check is still running
+        refuses input as identity_pending. Nothing was typed and the same call
+        can succeed once it is ready, so it is not reported as a timeout."""
+        from cli_agent_orchestrator.models.terminal import TerminalInputBlockedReason
+        from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
+
+        refusal = TerminalInputBlockedError(
+            "Terminal abc12345 has not passed its Kiro identity check yet. "
+            "Retry when it is ready.",
+            reason=TerminalInputBlockedReason.IDENTITY_PENDING,
+        )
+        with patch(_RUN_STEP, new=AsyncMock(side_effect=refusal)):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert (detail["kind"], detail["retryable"]) == ("identity_pending", True)
+        assert "Retry when it is ready" in detail["message"]
+
+    def test_a_reused_kiro_terminal_whose_init_ended_unverified_stays_504(self, client):
+        """The permanent refusal is not retryable; it keeps the timeout shape."""
+        from cli_agent_orchestrator.models.terminal import (
+            ProviderExitedInputBlockedError,
+            TerminalInputBlockedReason,
+        )
+
+        refusal = ProviderExitedInputBlockedError(
+            "Terminal abc12345 failed deferred initialization (identity_unverified). "
+            "Refusing to deliver input.",
+            reason=TerminalInputBlockedReason.INIT_FAILED,
+        )
+        with patch(_RUN_STEP, new=AsyncMock(side_effect=refusal)):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+
+        assert resp.status_code == 504
+        assert resp.json()["detail"]["kind"] == "timeout"
 
 
 @pytest.mark.parametrize("description", [None, "", "  ", "Review code", "😀" * 65])

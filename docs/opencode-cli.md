@@ -8,7 +8,13 @@ The OpenCode CLI provider enables CLI Agent Orchestrator (CAO) to work with **Op
 
 ## Prerequisites
 
-1. **OpenCode binary** — install from [opencode.ai](https://opencode.ai):
+1. **OpenCode binary** — OpenCode v1.x or v2.x with the Mini interface (verified with v2.2.3). Install v2 with:
+   ```bash
+   npm install -g @opencode/cli
+   opencode --version
+   opencode mini --help
+   ```
+   Existing v1 installations remain supported:
    ```bash
    npm install -g opencode-ai
    # or
@@ -23,6 +29,30 @@ The OpenCode CLI provider enables CLI Agent Orchestrator (CAO) to work with **Op
 On its **first ever launch** against a fresh CAO config directory (`~/.aws/opencode/`), OpenCode runs `npm install @opencode-ai/plugin` — roughly 57 MB of dependencies that take **5–30 seconds** to install. The TUI will appear blank until the install completes. This is expected; CAO's 120-second initialization timeout covers it automatically.
 
 Subsequent launches complete in ~2 seconds.
+
+### CLI generations
+
+CAO checks `opencode --version` and the interactive interface's help before
+launching a worker. Unknown major versions, failed probes, and missing required
+flags fail initialization with a diagnostic rather than timing out.
+
+| Generation | Launch | Terminal protocol |
+|---|---|---|
+| v1.x | `opencode --agent developer [--model provider/model]` | Full-screen TUI, `ctrl+p commands`, `▣` turn summary |
+| v2.x | `opencode mini --standalone --agent developer [--model provider/model]` | Scrollback Mini, `ctrl+p menu`, plain agent/model/duration summary |
+
+The v2 root command does **not** accept `--agent` or `--model`. Mini must
+advertise both flags and `--standalone`. A private server is required so MCP
+subprocesses inherit this worker's `CAO_TERMINAL_ID` and managed configuration,
+rather than a background service's environment from a different terminal.
+
+Both generations use the installed Markdown profiles and CAO's
+`~/.aws/opencode/opencode.json`. OpenCode v2's compatibility loader translates
+v1 frontmatter permissions, per-agent tool gates, and MCP declarations into its
+native schema. CAO does not migrate or overwrite personal configuration or
+credentials. V2 receives an environment-only CLI UI overlay that enables footer
+and turn summaries, fixes the relevant keybindings, and hides reasoning/tool
+transcripts for reliable result extraction. It does not auto-approve permissions.
 
 ## Quick Start
 
@@ -82,7 +112,7 @@ Storage layout:
 ```
 ~/.aws/opencode/
 ├── opencode.json          # MCP servers + per-agent tool gating (written by cao install)
-├── cao-grants.json        # CAO's record of which tool grants it wrote (see below)
+├── cao-grants.json        # CAO's record of the tool grants and plugin mcp entries it wrote
 ├── package.json           # written by opencode on first launch
 ├── node_modules/          # ~57 MB, written by opencode on first launch
 └── agents/
@@ -150,7 +180,18 @@ The provider detects terminal state from the tmux capture buffer (ANSI-stripped)
 | `PROCESSING` | `esc interrupt` footer keybind |
 | `COMPLETED` | `▣ <agent> · <model> · Ns` completion marker followed by idle footer |
 | `WAITING_USER_ANSWER` | `△ Permission required` or `△ Always allow` heading |
-| `ERROR` | Fallback — no state marker matched |
+| `ERROR` | CLI exited to its launching shell, or initialization displayed an error/help |
+| `UNKNOWN` | No recognized state marker |
+
+Mini uses `ctrl+p menu` for readiness, `esc interrupt` (or `esc stop` at
+narrower widths) for processing, and `<agent> · <model> · <duration>` followed
+by a current idle footer for completion. Permission dialogs retain the `△`
+heading. Results come from the last completed turn in terminal scrollback,
+excluding the `›` user prompt and turn summary. Keep the pane wide enough to
+display the footer and summary without truncation; manually hiding these markers
+or changing the pinned keybindings can prevent detection. Terminal extraction is
+bounded by CAO's scrollback capture limit, so very long results may not be fully
+available.
 
 ## MCP Server Wiring
 
@@ -199,8 +240,34 @@ Withdrawing a grant is therefore restricted to keys CAO can *prove* are its own:
   which keeps grants from installs predating the sidecar cleanable
 
 A `<servername>*` key CAO has no record of and cannot place in the agent-plugin store is
-left alone rather than deleted on a guess. Deleting `cao-grants.json` is safe; it
-only costs CAO the first of the two proofs.
+left alone rather than deleted on a guess.
+
+If `cao-grants.json` cannot be read (not valid JSON, not valid UTF-8, not readable, a
+directory, or not a grant record), CAO leaves it as it is, logs a warning that names it,
+and records nothing in it until it is a readable grant record. Repair the file by hand
+rather than deleting it. Deleting it drops the recorded grants of every agent, so CAO
+keeps only the agent-plugin store proof, and a profile server's grant it wrote whose
+server the profile drops before the agent is next installed stays in `opencode.json`
+until you remove it. It also drops the `"mcp"` fingerprints described below: after a
+`CAO_HOME_DIR` move, the fingerprint is the only proof that an entry naming the old
+agent-plugin store is CAO's (`is_cao_owned_mcp_entry`, through
+`is_orphaned_recorded_mcp_entry`). Without it, CAO reports a plugin server of the same
+name as a collision, and neither updates nor disables that entry.
+
+The same two proofs decide which `mcp` entries are CAO's. For every agent-plugin
+server it writes, CAO records a SHA-256 fingerprint of the entry in `cao-grants.json`
+(under `"mcp"`; the fingerprint ignores `enabled`). `~/.aws/opencode` does not follow
+`CAO_HOME_DIR`, so two CAO homes share `opencode.json` and the sidecar. An entry
+inside the current agent-plugin store is CAO's. An entry inside another store is CAO's
+only once that store's plugin directory is gone, for example after `CAO_HOME_DIR`
+moved: CAO then updates it on install and sets `"enabled": false` when no installed
+plugin delivers it. While the other store's plugin directory still exists, another
+live CAO home may be using the entry, so CAO leaves it enabled and unchanged, and
+reports a plugin server of the same name as a collision. An entry you edited no
+longer matches its fingerprint, and is then CAO's only if its paths resolve inside
+the current agent-plugin store.
+Anything else is yours: CAO reports a plugin server of the same name instead of
+overwriting your entry, and never disables it.
 
 One exception to "your tool policy survives", and it predates this behaviour: a
 grant is *re-applied* on every refresh, so setting `"<servername>*": false` by hand
@@ -228,6 +295,9 @@ uv run pytest -m e2e test/e2e/test_assign.py -k opencode -v
 
 # Run a single test
 uv run pytest -m e2e test/e2e/test_assign.py::TestOpenCodeCliAssign::test_assign_with_callback -v
+
+# Real Codex supervisor -> OpenCode v2 developer -> supervisor via MCP handoff
+uv run pytest -o addopts='' -m e2e test/e2e/test_opencode_v2_delegation.py -v
 ```
 
 The `test_assign_with_callback` test validates all four orchestration modes:
@@ -298,10 +368,11 @@ OPENCODE_CONFIG_DIR=~/.aws/opencode opencode --help
 
 Ensure the CAO server running on port 9889 is the **dev version**, not the pre-installed binary:
 ```bash
-# Kill any stale installed binary
-pkill -f 'cao-server'
-# Start the dev server
-uv run cao-server
+# Stop the existing server on port 9889 first (Ctrl-C in its terminal,
+# or stop its service), then start this checkout's editable source.
+uv sync --group dev
+uv run python -c 'import cli_agent_orchestrator; print(cli_agent_orchestrator.__file__)'
+uv run cao-server --port 9889
 ```
 
 ### Authentication / model errors
@@ -312,7 +383,32 @@ OpenCode itself handles model authentication. Verify your credentials are set fo
 
 CAO emits only `allow` or `deny` in the permission frontmatter, so `△ Permission required` should not appear for CAO-managed tools. If it does:
 1. Verify the profile's `allowedTools` / `role` grants the tool in question and reinstall — CAO translates allowed tools directly to `permission: allow`.
-2. If the prompt comes from a tool outside CAO's vocabulary, respond to it manually in the tmux window, or use `--yolo` to disable all restrictions **(DANGEROUS — allows any command including `aws`, `rm`, `curl`)**.
+2. If the prompt comes from a tool outside CAO's vocabulary, respond to it manually in the tmux window. OpenCode's CAO integration does not support a runtime permission bypass.
+
+### `Unrecognized flag: --agent` or Mini initialization failure
+
+CAO probes the CLI using the server's `PATH`, then launches it using the worker
+shell's `PATH`. Run these checks both in the environment that starts `cao-server`
+(including its service environment, if applicable) and inside the worker's tmux shell:
+
+```bash
+printf '%s\n' "$PATH"
+command -v opencode
+opencode --version
+opencode --help
+# For v2:
+opencode mini --help
+```
+
+Both environments must resolve the same OpenCode executable and version. Align
+their `PATH` values if they differ, then restart the server and recreate the worker.
+A server finding v1 while the worker runs v2 can produce `Unrecognized flag: --agent`.
+Ensure the CAO server runs the modified checkout as shown above.
+V2 must launch with `mini --standalone`; simply adding `mini`
+while reusing a shared service can attach MCP servers to the wrong terminal.
+If initialization reports an exit, inspect the pane tail in the error for missing
+credentials, invalid models, missing installed agents, or configuration errors.
+Do not pass `--auto` to work around permission failures.
 
 ### Status stuck as `PROCESSING`
 

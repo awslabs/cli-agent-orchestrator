@@ -329,6 +329,11 @@ class AguiConstruct(ABC):
     ) -> None:
         """Validate and emit a generative-UI intent.
 
+        Uses the same allow-list as the ``/agui/v1/emit_ui`` producer. An
+        accepted intent reaches AG-UI clients as a ``CUSTOM`` event named
+        ``cao.generative_ui`` whose ``value`` carries ``component`` and
+        ``props``; AG-UI 1.0 has no generative-UI event type of its own.
+
         Raises ``ValueError`` if:
         - *component* is not in the allow-list
         - *props* is not JSON-serializable

@@ -12,6 +12,7 @@ ModelTiers = Mapping[str, Mapping[str, str]]
 POLICY_REJECTION_REASONS: frozenset[str] = frozenset(
     {
         "above_ceiling",
+        "below_floor",
         "explicit_unmapped",
         "provider_not_allowed",
         "model_override_not_allowed",
@@ -25,6 +26,8 @@ class DecisionInputError(ValueError):
     """A launch violates a deterministic input constraint."""
 
     reason: str | None = None
+    # The decision point a bound violation names, or None when the error names no point.
+    point: str | None = None
 
 
 class PolicyConfigError(DecisionInputError):
@@ -37,8 +40,20 @@ class PolicyViolation(DecisionInputError):
     reason = "above_ceiling"
 
     def __init__(self, point: str, value: str, ceiling: str) -> None:
+        self.point = point
         super().__init__(
             f"{'tier' if point == 'model.route' else 'effort'} '{value}' is above the policy ceiling '{ceiling}' for {point}"
+        )
+
+
+class BelowFloorError(PolicyViolation):
+    reason = "below_floor"
+
+    def __init__(self, point: str, value: str, floor: str) -> None:
+        self.point = point
+        DecisionInputError.__init__(
+            self,
+            f"{'tier' if point == 'model.route' else 'effort'} '{value}' is below the policy floor '{floor}' for {point}",
         )
 
 
@@ -95,12 +110,21 @@ class PolicyBounds:
     default_effort: Effort | None = None
     max_effort: Effort | None = None
     allowed_providers: frozenset[str] | None = None
+    # #1068 MF5 (provisional): an optional tier floor.
+    min_tier: Tier | None = None
+    # #1083 Q2 (provisional): an optional effort floor, following #1068's tier floor.
+    min_effort: Effort | None = None
 
+    # Explicit per point: provider.route has no ceiling, floor or default (#1099), so
+    # validate skips it, cap leaves its answer alone and resolve_fallback names the creator.
     def ceiling_for(self, point: str) -> str | None:
-        return self.max_tier if point == "model.route" else self.max_effort
+        return {"model.route": self.max_tier, "effort.route": self.max_effort}.get(point)
+
+    def floor_for(self, point: str) -> str | None:
+        return {"model.route": self.min_tier, "effort.route": self.min_effort}.get(point)
 
     def default_for(self, point: str) -> str | None:
-        return self.default_tier if point == "model.route" else self.default_effort
+        return {"model.route": self.default_tier, "effort.route": self.default_effort}.get(point)
 
     def validate(self, model_tiers: ModelTiers) -> None:
         for point, spec in POINTS.items():
@@ -115,6 +139,16 @@ class PolicyBounds:
                 and spec.options.index(default) > spec.options.index(ceiling)
             ):
                 raise PolicyConfigError(f"{point} default exceeds ceiling")
+            floor = self.floor_for(point)
+            if floor is None:
+                continue
+            if floor not in spec.options:
+                raise PolicyConfigError(f"invalid policy value for {point}")
+            if ceiling is not None and spec.options.index(floor) > spec.options.index(ceiling):
+                raise PolicyConfigError(f"{point} floor exceeds ceiling")
+            if default is None or spec.options.index(floor) > spec.options.index(default):
+                raise PolicyConfigError(f"{point} floor requires a default at or above it")
+        tiers = POINTS["model.route"].options
         if self.allowed_providers is not None and not self.allowed_providers <= {
             p.value for p in ProviderType
         }:
@@ -127,11 +161,9 @@ class PolicyBounds:
                 continue
             required: list[str] = []
             if self.max_tier is not None:
-                required.extend(
-                    POINTS["model.route"].options[
-                        : POINTS["model.route"].options.index(self.max_tier) + 1
-                    ]
-                )
+                # Every tier a capped answer or explicit value can reach, floor to ceiling.
+                start = tiers.index(self.min_tier) if self.min_tier is not None else 0
+                required.extend(tiers[start : tiers.index(self.max_tier) + 1])
             if self.default_tier is not None:
                 required.append(self.default_tier)
             for tier in required:
@@ -146,6 +178,9 @@ class PolicyBounds:
         options = POINTS[point].options
         if value not in options:
             raise DecisionInputError(f"invalid explicit value for {point}")
+        floor = self.floor_for(point)
+        if floor is not None and options.index(value) < options.index(floor):
+            raise BelowFloorError(point, value, floor)
         ceiling = self.ceiling_for(point)
         if ceiling is not None and options.index(value) > options.index(ceiling):
             raise PolicyViolation(point, value, ceiling)
@@ -153,8 +188,10 @@ class PolicyBounds:
             raise UnmappedTierError(point, provider, value, "explicit_unmapped")
 
     def cap(self, point: str, option: str) -> tuple[str, bool]:
-        ceiling = self.ceiling_for(point)
+        ceiling, floor = self.ceiling_for(point), self.floor_for(point)
         options = POINTS[point].options
+        if floor is not None and options.index(option) < options.index(floor):
+            return floor, True
         if ceiling is not None and options.index(option) > options.index(ceiling):
             return ceiling, True
         return option, False
@@ -170,6 +207,9 @@ def resolve_fallback(
     tiers: Mapping[str, str],
     provider: str,
 ) -> Fallback | MissingTier:
+    if point == "provider.route":
+        # #1099 (provisional): v1 always falls back to the creator's provider.
+        return Fallback(provider, "creator")
     if point == "model.route" and profile is not None and profile.model:
         return Fallback(profile.model, "profile")
     default = policy.default_for(point)

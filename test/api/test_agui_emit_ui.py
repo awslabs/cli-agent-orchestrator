@@ -2,7 +2,7 @@
 
 Proves the loop is real end-to-end: an agent-authored UI intent is validated
 server-side against the frozen allow-list, published onto the fleet event bus,
-and maps to a GENERATIVE_UI frame via the AG-UI adapter. Off-list components
+and maps to a CUSTOM ``cao.generative_ui`` frame via the AG-UI adapter. Off-list components
 are refused at the producer (400) so they never reach the bus.
 """
 
@@ -13,7 +13,8 @@ from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.services.agui_stream import (
-    AGUI_GENERATIVE_UI,
+    AGUI_CUSTOM,
+    CAO_GENERATIVE_UI_EVENT_NAME,
     to_agui_event,
 )
 
@@ -44,14 +45,16 @@ def test_emit_ui_publishes_generative_ui_intent():
     assert body["component"] == "approval_card"
     assert body["event_id"]
 
-    # The event is now in the fleet history; the adapter maps it to GENERATIVE_UI.
+    # The event is now in the fleet history; the adapter maps it to CUSTOM cao.generative_ui.
     from cli_agent_orchestrator.services.event_log_service import get_event_log
 
     events = get_event_log().history()
     match = [e for e in events if e.get("id") == body["event_id"]]
     assert match, "emitted event not found in fleet history"
     agui_type, data = to_agui_event(match[0])
-    assert agui_type == AGUI_GENERATIVE_UI
+    assert agui_type == AGUI_CUSTOM
+    assert data["name"] == CAO_GENERATIVE_UI_EVENT_NAME
+    data = data["value"]
     assert data["component"] == "approval_card"
     assert data["props"]["title"] == "Approve handoff?"
 

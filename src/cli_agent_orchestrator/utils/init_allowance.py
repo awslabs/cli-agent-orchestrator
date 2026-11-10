@@ -28,19 +28,56 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
+from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_store
+
 # Provider init is not one wait of ``provider_init_timeout`` (T). A successful
 # path legitimately spans several T-bounded phases. The longest that scales
 # with T is about 3T: Claude's shell wait + startup-prompt handler outer cap +
 # readiness wait (``claude_code.initialize``), and Kimi's shell wait + two
-# phases of ``max(120, T)`` once T >= 120 (``kimi_cli.initialize``). Kiro's is
-# 2T (``kiro_cli.initialize``; the 4T ``--legacy-ui`` retry that an earlier
-# version of this comment cited was removed in #691). The fourth T is margin
-# for settle time and for the event loop being busy with other creates.
+# phases of ``max(120, T)`` once T >= 120 (``kimi_cli.initialize``). Kiro's v1/v2
+# path is 2T (``kiro_cli.initialize``; the 4T ``--legacy-ui`` retry that an
+# earlier version of this comment cited was removed in #691), but Kiro's v3
+# path adds the ``/mcp`` reopen loop and a final prompt wait, each bounded by
+# T, plus about 17s of fixed waits (the success close after the last ``/mcp``
+# check, the ``/tools`` read and the identity reads) -- so up to about 4T+17s
+# (#1167). A ``/tools`` list too long for the pane adds about 2.5s more: it is
+# read screen by screen within the T of that final prompt wait, which keeps
+# only one render wait (2.5s) as a floor, so the read, the prompt check after
+# it and the wait end at most about 7.5s past that T (one screen's render
+# wait, the prompt check and the floor), where a list that fits took 5s. So a
+# successful v3 init can spend up to about 4T+19.5s in its waits and sleeps.
+# Those 19.5s count sleeps only. About 60 backend calls (pane reads, keys and
+# status polls, each a tmux or herdr command) also fall outside the T-bounded
+# waits: the 5 identity reads, about 31 in the ``/mcp`` loop's last open and its
+# closes, about 18 after the last ``/tools`` Down, and a few between phases.
+# One such call is several processes, not one: on tmux a read runs four
+# (``list-sessions``, ``list-windows``, ``list-panes``, ``capture-pane``) and a
+# key five; on herdr every call runs three. A call takes about 0.1s on an idle
+# machine (estimated: four processes at 15-25ms each) and, measured through
+# ``TmuxBackend`` at a load average of 15, about 0.2s under load (median about
+# 0.18s, p90 about 0.25s). Priced at 0.25s per
+# call, the calls add about 15s, so a worst-case successful v3 init is about
+# 4T+34.5s. The fourth T is therefore no longer pure margin: v3 uses it, and the
+# fixed overshoot has to fit in the delivery-confirmation headroom added below,
+# not in this linear term. It fits only up to T of about 90s (see there and
+# ``test_init_allowance_kiro_v3_covered_up_to_its_boundary``).
 _INIT_PHASES = 4
 
 # Worst case of the server's confirm-and-resubmit loop after a send
 # (``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` x (1 + ``_DEFERRED_SUBMIT_MAX_RESUBMITS``)
 # = 32s) with headroom for the pre-dispatch work (memory injection) and polling.
+# This headroom also has to absorb Kiro v3's overshoot beyond 4T: about 19.5s
+# of waits plus about 15s of backend calls at 0.25s each, 34.5s in all (see
+# ``_INIT_PHASES``). While Antigravity's 370s floor sets the budget (T up to
+# 92.5s) the client waits 398s after the 32s loop, which covers a worst-case
+# v3 init while 4T+34.5 <= 398, that is T up to about 90s; the default T=60s
+# leaves about two minutes spare. Once ``_INIT_PHASES * T`` sets the budget,
+# 60 - 32 leaves only 28s, so above T of about 90s a worst-case successful v3
+# init on a heavily loaded machine can outlast the client's wait (#710). That
+# gap is documented, not closed (#1167 follow-up): closing it means raising
+# this, which every provider's client waits on, or cutting the processes per
+# call during the attestation. Lowering this, adding a fixed wait or more pane
+# reads to the Kiro v3 init path, or a slower backend, moves that boundary.
 _DELIVERY_CONFIRM_ALLOWANCE = 60
 
 # Connect budget for a synchronous create. Kept small and SEPARATE from the read
@@ -60,12 +97,12 @@ def resolve_init_timeout(
 
     The global value comes from this process's server settings (``settings``
     when given, else ``get_server_settings()``). A profile override is resolved
-    through ``load_launch_profile``, the same loader the server uses
-    (``terminal_service.py``, ``claude_code.py``, ``codex.py``) -- a reserved
-    ephemeral name is served exclusively from the server-owned live store, and
-    ``load_agent_profile`` alone cannot see it. A profile that cannot be loaded
-    here falls back to the global value rather than failing the caller -- the
-    server resolves the real profile itself; this only sizes a wait.
+    through ``load_launch_profile`` for installed profiles. Reserved ephemeral
+    names use the global value without loading: generated profiles have no init
+    override, and their server-owned loader verifies the state registry. MCP
+    clients must not open that registry merely to size a wait. The server loads
+    and verifies the real profile itself. An installed profile that cannot be
+    loaded here also falls back to the global value rather than failing the call.
 
     The result is ``max(global, override)``, not the override alone.
     ``BaseProvider.get_init_timeout`` prefers the override, but six providers
@@ -86,7 +123,7 @@ def resolve_init_timeout(
         settings = get_server_settings()
     base = int(settings["provider_init_timeout"])
 
-    if not agent_profile:
+    if not agent_profile or routes_to_ephemeral_store(agent_profile):
         return base
 
     from cli_agent_orchestrator.utils.agent_profiles import load_launch_profile

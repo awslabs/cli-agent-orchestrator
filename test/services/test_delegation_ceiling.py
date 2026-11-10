@@ -57,6 +57,7 @@ def launch(monkeypatch):
     monkeypatch.setattr(f"{_TS}.FIFO_DIR", fifo_dir)
     provider = AsyncMock()
     provider.initialize.return_value = True
+    provider.identity_verified = True  # a healthy Kiro launch (#1074)
     pm = MagicMock()
     pm.create_provider.return_value = provider
     monkeypatch.setattr(f"{_TS}.provider_manager", pm)
@@ -323,6 +324,91 @@ async def test_kiro_installed_policy_within_the_row_launches(launch, kiro_instal
         allowed_tools=["fs_read"],
     )
     assert child.allowed_tools == ["fs_read"]
+
+
+@pytest.fixture
+def kiro_universal_install(tmp_path, monkeypatch):
+    """A v3-enabled install's universal file (#1167): v2 names plus v3 ids, and permissions."""
+    import json
+
+    from cli_agent_orchestrator.services import install_service
+    from cli_agent_orchestrator.utils.tool_mapping import kiro_universal_tools
+
+    monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", str(tmp_path))
+    monkeypatch.setattr(f"{_TS}.probe_kiro_capabilities", lambda engine, requested: MagicMock())
+
+    def _write(profile, allowed, extra=()):
+        tools = kiro_universal_tools(allowed) + list(extra)
+        (tmp_path / f"{profile}.json").write_text(
+            json.dumps(
+                {"tools": tools, "excludedTools": ["knowledge"], "permissions": {"rules": []}}
+            )
+        )
+
+    return _write
+
+
+@pytest.mark.asyncio
+async def test_kiro_universal_file_within_the_row_is_not_falsely_refused(
+    launch, kiro_universal_install
+):
+    """Step 0d compares a universal file with the universal map (#1167, G13)."""
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    kiro_universal_install("developer", ["fs_read"])
+    child = await create_terminal(
+        "kiro_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        caller_id="0000beef",
+        allowed_tools=["fs_read"],
+    )
+    assert child.allowed_tools == ["fs_read"]
+
+
+@pytest.mark.asyncio
+async def test_kiro_universal_file_wider_than_the_row_is_still_refused(
+    launch, kiro_universal_install
+):
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    kiro_universal_install("developer", ["fs_read"], extra=["read", "execute_bash"])
+    with pytest.raises(InstalledPolicyExceedsAllowlistError) as excinfo:
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    assert set(excinfo.value.excess) == {"read", "execute_bash"}
+
+
+@pytest.mark.asyncio
+async def test_kiro_upgraded_v2_file_is_compared_with_the_v2_map(launch, kiro_universal_install):
+    """Kiro's upgrader adds ``permissions`` and a ``kiroUpgrade`` marker to a v2
+    file. It is still v2 names, so Step 0d compares it with the v2 map, and a
+    create bounded by the reviewer row is not refused for ``read`` (maintainer
+    review on #1178)."""
+    import shutil
+    from pathlib import Path
+
+    from cli_agent_orchestrator.services import install_service
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    upgraded = Path(__file__).parent / "fixtures" / "kiro_v3_agents" / "upgraded-v2ro.json"
+    shutil.copyfile(upgraded, Path(install_service.KIRO_AGENTS_DIR) / "developer.json")
+    child = await create_terminal(
+        "kiro_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        caller_id="0000beef",
+        allowed_tools=REVIEWER,
+    )
+    assert child.allowed_tools == REVIEWER
 
 
 @pytest.mark.asyncio
@@ -781,8 +867,26 @@ async def test_kiro_bounded_launch_with_an_unreadable_agent_file_is_refused(
 
 
 @pytest.mark.asyncio
-async def test_kiro_operator_launch_without_an_installed_file_is_not_refused(launch, kiro_install):
-    """The operator path is untouched: no caller, no ceiling comparison to fail closed on."""
+async def test_kiro_operator_launch_without_an_installed_file_is_refused_as_unresolvable(
+    launch, kiro_install
+):
+    """No caller, so no ceiling comparison; but kiro-cli would not fail on the missing
+    agent, it would start its built-in kiro_default with every built-in tool (#1074).
+    The agent check refuses it, and the same launch goes ahead once installed."""
+    from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
+    with pytest.raises(KiroAgentIdentityError) as excinfo:
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            allowed_tools=["fs_read"],
+        )
+    assert excinfo.value.kind == "agent_not_found"
+    assert not isinstance(excinfo.value, DelegationCeilingError)
+
+    kiro_install("developer", ["fs_read"])
     child = await create_terminal(
         "kiro_cli",
         "developer",
@@ -794,11 +898,26 @@ async def test_kiro_operator_launch_without_an_installed_file_is_not_refused(lau
 
 
 @pytest.mark.asyncio
-async def test_kiro_unrestricted_delegator_without_an_installed_file_is_not_refused(
+async def test_kiro_unrestricted_delegator_without_an_installed_file_is_refused_as_unresolvable(
     launch, kiro_install
 ):
-    """A ``*`` ceiling has nothing the installed file could exceed; the warning path stays."""
+    """A ``*`` ceiling has nothing the installed file could exceed, so no delegation
+    refusal; the missing agent is still refused by the agent check (#1074)."""
+    from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
     _seed("0000beef", "sup", SUPERVISOR, ["*"])
+    with pytest.raises(KiroAgentIdentityError) as excinfo:
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    assert not isinstance(excinfo.value, DelegationCeilingError)
+
+    kiro_install("developer", ["fs_read"])
     child = await create_terminal(
         "kiro_cli",
         "developer",

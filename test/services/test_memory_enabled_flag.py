@@ -392,3 +392,92 @@ class TestMcpToolsDisabledSurface:
         assert result["success"] is False
         assert result["disabled"] is True
         assert result["error"] == srv.MEMORY_DISABLED_MESSAGE
+
+
+# ---------------------------------------------------------------------------
+# MCP write tools with a remote owner — the caller's switch decides (#1087)
+# ---------------------------------------------------------------------------
+
+
+class TestMcpWriteToolsRemoteOwner:
+    """``memory_store`` and ``memory_forget`` honor the local switch before
+    reaching a remote owner, the way ``memory_recall`` already does."""
+
+    OWNER = "http://memory-owner:9889"
+
+    @pytest.fixture
+    def owner_post(self, monkeypatch: pytest.MonkeyPatch) -> Any:
+        from datetime import datetime, timezone
+        from unittest.mock import Mock
+
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.models.memory import Memory
+        from cli_agent_orchestrator.services import memory_gateway
+        from cli_agent_orchestrator.services.memory_service import ForgetResult
+
+        monkeypatch.setenv("CAO_MEMORY_API_URL", self.OWNER)
+        monkeypatch.setattr(srv, "_get_terminal_context_from_env", lambda: _ctx())
+
+        async def run_inline(function: Any, *args: Any) -> Any:
+            return function(*args)
+
+        monkeypatch.setattr(memory_gateway.asyncio, "to_thread", run_inline)
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        now = datetime.now(timezone.utc)
+        stored = Memory(
+            id="m1",
+            key="k",
+            memory_type="project",
+            scope="global",
+            file_path="/owner/mem/k.md",
+            created_at=now,
+            updated_at=now,
+            content="x",
+        )
+        response.json.return_value = {
+            "memory": stored.model_dump(mode="json"),
+            "action": "created",
+            "deleted": ForgetResult("deleted", "native", "/owner/mem/k.md").__dict__,
+        }
+        with patch.object(memory_gateway.requests, "post", return_value=response) as post:
+            yield post
+
+    @staticmethod
+    def _call(tool: str) -> Any:
+        from cli_agent_orchestrator.mcp_server.server import memory_forget, memory_store
+
+        if tool == "store":
+            return _run(
+                memory_store(content="x", scope="global", memory_type="project", key="k", tags="")
+            )
+        return _run(memory_forget(key="k", scope="global"))
+
+    @pytest.mark.parametrize("tool", ["store", "forget"])
+    def test_switch_off_never_reaches_the_owner(
+        self, tool: str, owner_post: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli_agent_orchestrator.mcp_server import server as srv
+
+        monkeypatch.setenv("CAO_MEMORY_ENABLED", "false")
+
+        result = self._call(tool)
+
+        assert result == {
+            "success": False,
+            "disabled": True,
+            "error": srv.MEMORY_DISABLED_MESSAGE,
+        }
+        owner_post.assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["store", "forget"])
+    def test_switch_on_still_reaches_the_owner(
+        self, tool: str, owner_post: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CAO_MEMORY_ENABLED", "true")
+
+        result = self._call(tool)
+
+        assert result["success"] is True
+        owner_post.assert_called_once()
+        assert owner_post.call_args.args[0] == f"{self.OWNER}/internal/memory/{tool}"

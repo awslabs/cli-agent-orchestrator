@@ -1,8 +1,11 @@
 """AG-UI event-stream adapter for CAO.
 
 
-AG-UI clients (CopilotKit, the AG-UI Dojo, or a plain ``EventSource``) consume
-``GET /agui/v1/stream`` as an SSE stream of AG-UI typed events.
+This module is the per-record mapping behind the **legacy framing** of
+``GET /agui/v1/stream`` (``?framing=cao-legacy``): named ``event:`` frames with
+snake_case data. The default, AG-UI 1.0 conformant stream
+(``services/agui/ambient_run.py``) reuses its generative-UI extraction and its
+``to_agui_event`` mapping for ``RAW`` frames.
 
 Semantic event vocabulary
 =========================
@@ -33,6 +36,10 @@ Primitive → AG-UI map (L1):
 | file_mod             | STATE_DELTA                      | (RFC-6902 patch: see note)|
 | error                | RUN_ERROR                        |                           |
 | other / unknown      | RAW                              | reducer dispatches on kind|
+
+An agent-authored UI intent (``ui.component``, checked before the table above)
+maps to ``CUSTOM`` with ``name="cao.generative_ui"`` when the component is on
+the allow-list, and to ``RAW`` with ``rejected_component`` when it is not.
 
 Backward compatibility: a legacy envelope shape ``{"type": "session.created",
 "payload": {...}}`` (an earlier SSE bus shape emitted dotted names) is still
@@ -73,8 +80,16 @@ AGUI_TOOL_CALL_END = "TOOL_CALL_END"
 AGUI_TOOL_CALL_RESULT = "TOOL_CALL_RESULT"
 AGUI_STATE_DELTA = "STATE_DELTA"
 AGUI_STATE_SNAPSHOT = "STATE_SNAPSHOT"
-AGUI_GENERATIVE_UI = "GENERATIVE_UI"
+AGUI_CUSTOM = "CUSTOM"
 AGUI_RAW = "RAW"
+
+# The ``CUSTOM`` event ``name`` that carries an allow-listed generative-UI
+# component. AG-UI 1.0 defines no generative-UI event type, and a producer
+# "MUST NOT emit an event type the protocol does not describe" (spec 1.0,
+# processing: "CUSTOM and RAW exist for that"). Both the ambient stream and the
+# run plane (``services/agui/run_plane.py``) carry it under this one name, with
+# ``value`` = ``{component, props, event_id, terminal_id, ...}``.
+CAO_GENERATIVE_UI_EVENT_NAME = "cao.generative_ui"
 
 # ---------------------------------------------------------------------------
 # Generative UI — the safety allow-list
@@ -112,6 +127,20 @@ _PRIMITIVE_KINDS = frozenset(
 )
 
 
+# The ``detail`` key the EventLogPublisher stamps a session record with: that
+# session's AG-UI ``subagentRunId`` (a hash, never the raw incarnation id), so the
+# conformant stream attributes a replayed record to the incarnation it was logged
+# under (``services/agui/ambient_run.py``). It is for that stream only: every
+# mapping here drops it, which keeps the legacy framing byte-identical.
+SESSION_SUBAGENT_RUN_ID_KEY = "session_subagent_run_id"
+
+
+def _without_stamp(detail: Dict[str, Any]) -> Dict[str, Any]:
+    if SESSION_SUBAGENT_RUN_ID_KEY not in detail:
+        return detail
+    return {k: v for k, v in detail.items() if k != SESSION_SUBAGENT_RUN_ID_KEY}
+
+
 def _base(event: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, Any]:
     """Common envelope fields carried on every primitive-path AG-UI event."""
     return {
@@ -127,7 +156,7 @@ def _base(event: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, Any]:
 def _from_primitive(event: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     """Map a normalized event record (by ``kind``) to AG-UI."""
     kind = event.get("kind", "other")
-    detail: Dict[str, Any] = event.get("detail") or {}
+    detail: Dict[str, Any] = _without_stamp(event.get("detail") or {})
     event_type = detail.get("event_type", "")
     is_session = event.get("terminal_id") is None
     data = _base(event, detail)
@@ -297,7 +326,11 @@ def _extract_ui_intent(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _from_generative_ui(event: Dict[str, Any], ui: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    """Map an agent-authored UI intent to a safe AG-UI GENERATIVE_UI frame.
+    """Map an agent-authored UI intent to a safe AG-UI ``CUSTOM`` frame.
+
+    An allow-listed component becomes ``CUSTOM`` with
+    ``name=CAO_GENERATIVE_UI_EVENT_NAME`` and ``value={component, props, ...}``.
+    The frame body is a spec-valid ``CustomEvent`` (it carries ``type``).
 
     Safety is the whole point (see GENERATIVE_UI_COMPONENTS): only an
     allow-listed component name with JSON props is ever emitted. An unknown
@@ -307,7 +340,7 @@ def _from_generative_ui(event: Dict[str, Any], ui: Dict[str, Any]) -> Tuple[str,
     malformed intent degrades to an empty (harmless) component rather than
     breaking the stream.
     """
-    detail: Dict[str, Any] = event.get("detail") or {}
+    detail: Dict[str, Any] = _without_stamp(event.get("detail") or {})
     component = ui.get("component")
     base = _base(event, detail)
 
@@ -330,7 +363,11 @@ def _from_generative_ui(event: Dict[str, Any], ui: Dict[str, Any]) -> Tuple[str,
             props = {}
 
     base.update(component=component, props=props)
-    return AGUI_GENERATIVE_UI, base
+    return AGUI_CUSTOM, {
+        "type": AGUI_CUSTOM,
+        "name": CAO_GENERATIVE_UI_EVENT_NAME,
+        "value": base,
+    }
 
 
 def to_agui_event(event: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -340,7 +377,8 @@ def to_agui_event(event: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
 
     - **Generative UI first.** If the record carries an agent-authored UI intent
       (``ui.component``, top-level or in ``detail``), map it to a safe,
-      allow-listed ``GENERATIVE_UI`` frame (unknown components are refused).
+      allow-listed ``CUSTOM`` frame named ``cao.generative_ui`` (unknown
+      components are refused as ``RAW``).
     - If the record carries a top-level ``kind`` in the closed six-primitive
       vocabulary (the ``SseBus`` / ``EventLog`` record), it is mapped
       via the primitive path — the normal, re-based path.
@@ -391,6 +429,7 @@ def state_delta_frame(
 
 
 __all__ = [
+    "AGUI_CUSTOM",
     "AGUI_RAW",
     "AGUI_RUN_ERROR",
     "AGUI_RUN_FINISHED",
@@ -398,12 +437,12 @@ __all__ = [
     "AGUI_STATE_DELTA",
     "AGUI_STATE_SNAPSHOT",
     "AGUI_STEP_FINISHED",
-    "AGUI_GENERATIVE_UI",
     "AGUI_STEP_STARTED",
     "AGUI_TEXT_MESSAGE_CONTENT",
     "AGUI_TOOL_CALL_END",
     "AGUI_TOOL_CALL_RESULT",
     "AGUI_TOOL_CALL_START",
+    "CAO_GENERATIVE_UI_EVENT_NAME",
     "GENERATIVE_UI_COMPONENTS",
     "state_delta_frame",
     "state_snapshot_frame",

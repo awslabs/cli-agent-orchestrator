@@ -3,11 +3,11 @@
 # Drive the LIVE AG-UI generative-UI path against a running cao-server.
 #
 # Emits all six allow-listed components via POST /agui/v1/emit_ui (each -> a
-# GENERATIVE_UI frame on the SSE stream) plus one OFF-LIST component (iframe)
+# CUSTOM frame named cao.generative_ui on the SSE stream) plus one OFF-LIST component (iframe)
 # which the server-side allow-list refuses with HTTP 400 — proving an untrusted
 # agent cannot inject arbitrary markup. Meanwhile it tails GET /agui/v1/stream
 # and the PASS gate requires the frames to actually arrive: 6x HTTP 200,
-# 1x HTTP 400, and >=6 GENERATIVE_UI frames captured off the live stream.
+# 1x HTTP 400, and >=6 cao.generative_ui frames captured off the live stream.
 # Doubles as a deployment smoke test (non-zero exit on any miss).
 #
 # Requires: ./run.sh already running (or any cao-server with CAO_AGUI_ENABLED).
@@ -86,15 +86,16 @@ emit iframe '{"src":"https://evil.example"}' 400
 sleep 1
 echo
 echo "[showcase] AG-UI frames captured from ${STREAM}:"
-grep -aE '^event:|rejected_component' "${FRAMES}" | head -40 || true
+grep -a '^data: ' "${FRAMES}" | grep -aoE '"type": *"[A-Z_]+"|"name": *"cao\.[a-z_]+"|rejected_component' | head -40 || true
 
 # The frames are part of the gate, not just display: the six accepted intents
-# must actually traverse the live SSE stream as GENERATIVE_UI frames.
-FRAME_COUNT=$(grep -ac '^event: GENERATIVE_UI' "${FRAMES}" || true)
+# must actually traverse the live SSE stream as CUSTOM cao.generative_ui frames.
+# (AG-UI 1.0 has no generative-UI event type; CAO carries it on CUSTOM.)
+FRAME_COUNT=$(grep -a '^data: ' "${FRAMES}" | grep -cE '"name": *"cao\.generative_ui"' || true)
 
 echo
 if [ "${fail}" -eq 0 ] && [ "${FRAME_COUNT}" -ge 6 ]; then
-    echo "[showcase] PASS: 6 components accepted (HTTP 200), iframe refused (HTTP 400), ${FRAME_COUNT} GENERATIVE_UI frames on the live stream."
+    echo "[showcase] PASS: 6 components accepted (HTTP 200), iframe refused (HTTP 400), ${FRAME_COUNT} cao.generative_ui frames on the live stream."
 else
     echo "[showcase] FAIL: emit_mismatch=${fail}, generative_ui_frames=${FRAME_COUNT} (need 0 mismatches and >=6 frames)." >&2
     exit 1

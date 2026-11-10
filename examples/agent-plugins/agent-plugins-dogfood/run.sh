@@ -54,7 +54,7 @@ export CAO_AGENTS_DIR="$SCRATCH/kiro-agents"  # KIRO_AGENTS_DIR reads this env v
 # to execute without this — the CLI group errors out and the HTTP routes 404 —
 # because hiding a verb from `cao --help` was never an execution gate. A recorder
 # that drives the surface must open the gate explicitly, which also makes the GIF
-# an honest demonstration of how an operator reaches it before M1 lands.
+# an honest demonstration of how an operator reaches it before it graduates (#1244).
 export CAO_AGENT_PLUGINS_ENABLED=1
 KIRO_JSON="$CAO_AGENTS_DIR/dogfood-agent.json"
 OPTIN_JSON="$CAO_AGENTS_DIR/dogfood-optin.json"
@@ -363,6 +363,58 @@ else
     pass "removal is ABSENT on Kiro/Copilot, DISABLED on OpenCode (config-shape substitute)"
 fi
 
+# ── step 6: every other package CAO ships (#1154) ────────────────────────────
+# Steps 1-5 exercise `cao` in depth. This step runs validate, add and remove over
+# every OTHER package in scripts/build_agent_plugin.py's PACKAGES, so a package
+# added there is dog-fooded without editing this script. The allowlist is the
+# authority for which skills must load: reading the names back from the package
+# tree would only prove the tree agrees with itself. Output is one line per
+# package, because the recorder renders only the last 60 lines.
 hdr ""
-hdr "$MARK PASS: dog-food pipeline asserted end to end (validate, add, install x3, remove)."
+hdr "[6] validate, add, remove: every other package in PACKAGES"
+uv run --project "$REPO_ROOT" python - "$REPO_ROOT/scripts/build_agent_plugin.py" \
+    >"$CAP/packages.txt" 2>"$CAP/packages.err" <<'PY' || fail "could not read PACKAGES: $(cat "$CAP/packages.err")"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("build_agent_plugin", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod  # dataclasses resolve their module through sys.modules
+spec.loader.exec_module(mod)
+for package in mod.PACKAGES:
+    if package.name != "cao":
+        print(package.name, ",".join(package.skills))
+PY
+[ -s "$CAP/packages.txt" ] || fail "PACKAGES lists no package besides cao"
+while read -r pkg skills; do
+    dir="$REPO_ROOT/agent-plugin/$pkg"
+    "${CAO[@]}" </dev/null plugin validate "$dir" --json >"$CAP/v-$pkg.json" 2>"$CAP/v-$pkg.err" \
+        || fail "$pkg: validate exited non-zero"
+    "$PY" - "$CAP/v-$pkg.json" "$pkg" "$skills" <<'PY' 2>"$CAP/v-$pkg.chk" || fail "$pkg: validate assertions failed: $(cat "$CAP/v-$pkg.chk")"
+import json, sys
+r, name, want = json.load(open(sys.argv[1])), sys.argv[2], set(sys.argv[3].split(","))
+assert r.get("loadable") is True, f"loadable != true: {r.get('loadable')!r}"
+assert r.get("name") == name, f"manifest name is {r.get('name')!r}"
+got = {s["name"] for s in r.get("skills", [])}
+assert got == want, f"skills {sorted(got)} != allowlist {sorted(want)}"
+assert r.get("findings") == [], f"findings: {[f['code'] for f in r['findings']]}"
+PY
+    "${CAO[@]}" </dev/null plugin add "$dir" >"$CAP/a-$pkg.out" 2>"$CAP/a-$pkg.err" || fail "$pkg: plugin add exited non-zero"
+    for skill in ${skills//,/ }; do
+        link="$CAO_HOME_DIR/skills/$skill"
+        [ -L "$link" ] || fail "$pkg: $skill was not projected as a symlink"
+        case "$(readlink "$link")" in
+            */agent-plugins/"$pkg"/skills/"$skill") : ;;
+            *) fail "$pkg: $skill does not resolve into the plugin store" ;;
+        esac
+    done
+    "${CAO[@]}" </dev/null plugin remove "$pkg" --yes >"$CAP/r-$pkg.out" 2>"$CAP/r-$pkg.err" || fail "$pkg: plugin remove exited non-zero"
+    for skill in ${skills//,/ }; do
+        [ ! -e "$CAO_HOME_DIR/skills/$skill" ] && [ ! -L "$CAO_HOME_DIR/skills/$skill" ] \
+            || fail "$pkg: $skill is still projected after removal"
+    done
+    ok "$pkg: loadable, no findings, skills = allowlist (${skills//,/, }); added, then removed"
+done <"$CAP/packages.txt"
+pass "every package in PACKAGES validates clean, installs and removes"
+
+hdr ""
+hdr "$MARK PASS: dog-food pipeline asserted end to end (validate, add, install x3, remove; every package)."
 exit 0

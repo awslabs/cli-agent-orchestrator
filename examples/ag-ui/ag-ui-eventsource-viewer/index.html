@@ -6,9 +6,11 @@
   This single file is the "a stock browser client renders CAO's stream with zero
   custom code" demonstration for issue #386 / PR #436. No npm, no framework, no
   build step. It consumes GET /agui/v1/stream (Server-Sent Events) and:
+    - reads one AG-UI 1.0 run (unnamed SSE frames, `type` in the JSON data);
     - hydrates a fleet projection from STATE_SNAPSHOT, then applies RFC-6902
       STATE_DELTA patches via a tiny inline JSON-Patch applier;
-    - renders GENERATIVE_UI components from JSON props ONLY, through a
+    - renders generative-UI components (AG-UI CUSTOM events named
+      "cao.generative_ui") from JSON props ONLY, through a
       client-side mirror of the server's frozen allow-list. Rendering uses
       textContent / createElement exclusively — never innerHTML, eval, or
       dangerouslySetInnerHTML. An unknown component becomes an inert labeled
@@ -139,12 +141,14 @@
     progress: true, metric: true, agent_card: true,
   });
 
-  // The named AG-UI events this viewer listens for.
-  var AGUI_EVENTS = [
-    "STATE_SNAPSHOT", "STATE_DELTA", "GENERATIVE_UI",
-    "RUN_STARTED", "RUN_FINISHED", "STEP_STARTED", "STEP_FINISHED",
-    "TOOL_CALL_START", "TOOL_CALL_END", "TEXT_MESSAGE_CONTENT", "RUN_ERROR",
-  ];
+  // The CUSTOM event name that carries a generative-UI component. AG-UI 1.0
+  // has no generative-UI event type, so CAO sends CUSTOM with this name and
+  // the component in `value` (services/agui_stream.py ::
+  // CAO_GENERATIVE_UI_EVENT_NAME).
+  var GENERATIVE_UI_NAME = "cao.generative_ui";
+
+  // AG-UI 1.0 frames are unnamed SSE messages; the event type is the `type`
+  // field of the JSON data, so one onmessage handler dispatches on it.
 
   var els = {
     base: document.getElementById("base"),
@@ -363,10 +367,14 @@
     line.appendChild(el("span", "le", type));
     var desc = "";
     try {
-      if (type === "GENERATIVE_UI") desc = data.component + (data.rejected_component ? " (rejected)" : "");
+      if (type === "CUSTOM") desc = data.name === GENERATIVE_UI_NAME ? (data.value || {}).component : data.name;
       else if (type === "STATE_SNAPSHOT") desc = "snapshot: " + ((data.snapshot && data.snapshot.sessions || []).length) + " session(s)";
       else if (type === "STATE_DELTA") desc = (data.delta || []).length + " patch op(s)";
-      else desc = data.session_name || data.step_name || data.message || data.run_id || "";
+      else if (type === "RUN_FINISHED") desc = "run finished" + (data.outcome ? " (" + data.outcome.type + ")" : "");
+      else {
+        var cao = (data.metadata && data.metadata.cao) || {};
+        desc = cao.sessionName || data.name || data.toolCallName || data.message || data.runId || "";
+      }
     } catch (e) { desc = ""; }
     line.appendChild(el("span", "ld", desc));
     els.log.insertBefore(line, els.log.firstChild);
@@ -376,16 +384,23 @@
   // -----------------------------------------------------------------------
   // Event handling
   // -----------------------------------------------------------------------
-  function handle(type, ev) {
+  function handle(ev) {
     var data;
     try { data = JSON.parse(ev.data); } catch (e) { data = {}; }
+    if (!data || typeof data !== "object") data = {};
+    var type = typeof data.type === "string" ? data.type : "message";
 
-    // Dedup by event id (the SSE `id:` line, surfaced as ev.lastEventId, or
-    // event_id inside the payload). Guards the ?since= replay->live overlap.
-    var id = ev.lastEventId || data.event_id;
-    if (id) {
-      if (seenIds.has(id)) return;
-      seenIds.add(id);
+    // Dedup a CAO record seen twice (the ?since= replay of a reconnect). The key
+    // is the CAO event id in metadata.cao plus what the frame is about, because
+    // one record can become several AG-UI events. ev.lastEventId is NOT used:
+    // EventSource keeps it from the previous frame, so a frame without an `id:`
+    // line would look like a repeat of the one before it.
+    var cao = (data.metadata && data.metadata.cao) || {};
+    var eventId = cao.eventId || (data.value && data.value.event_id);
+    if (eventId) {
+      var key = [eventId, type, data.subagentRunId || data.toolCallId || data.name || ""].join("|");
+      if (seenIds.has(key)) return;
+      seenIds.add(key);
     }
 
     bumpCount(type);
@@ -396,10 +411,11 @@
       renderFleet();
     } else if (type === "STATE_DELTA") {
       if (fleetState) { fleetState = applyPatch(fleetState, data.delta); renderFleet(); }
-    } else if (type === "GENERATIVE_UI") {
+    } else if (type === "CUSTOM" && data.name === GENERATIVE_UI_NAME) {
       // A server-side refusal arrives as RAW with rejected_component; but if a
       // component name reaches us here, still gate it against our own mirror.
-      addComponent(data.component, data.props);
+      var ui = data.value && typeof data.value === "object" ? data.value : {};
+      addComponent(ui.component, ui.props);
     }
   }
 
@@ -453,12 +469,10 @@
       setStatus(es && es.readyState === 1 ? "connected" : "error",
         es && es.readyState === 1 ? "connected" : "reconnecting…");
     };
-    // Register a listener per named AG-UI event.
-    AGUI_EVENTS.forEach(function (type) {
-      es.addEventListener(type, function (ev) { handle(type, ev); });
-    });
-    // Also surface any unnamed/default messages in the log.
-    es.onmessage = function (ev) { logEvent("message", (function () { try { return JSON.parse(ev.data); } catch (e) { return {}; } })()); };
+    // Every AG-UI 1.0 frame arrives as a default (unnamed) SSE message. When the
+    // run ends (RUN_FINISHED cancelled at a server stop or maxSeconds), the
+    // EventSource reconnects on its own and the server opens a new run.
+    es.onmessage = handle;
   }
 
   function disconnect() {

@@ -20,7 +20,8 @@ def _result(action: Callable[[], Any]) -> dict[str, Any]:
 def register_decision_tools(mcp: Any) -> None:
     @mcp.tool
     def decisions_status() -> dict[str, Any]:
-        """Read effective local decision settings."""
+        """Read effective local decision settings, plus each decider's
+        last outcome and its counts by reason over the last 24 hours."""
         return _result(operator.status)
 
     @mcp.tool

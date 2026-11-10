@@ -1,5 +1,6 @@
 """Unit tests for the Cursor CLI provider."""
 
+import json
 import re
 import subprocess
 import sys
@@ -1482,6 +1483,40 @@ class TestProviderManagerRegistration:
 # ---------------------------------------------------------------------------
 # launch.py PROVIDERS_REQUIRING_WORKSPACE_ACCESS
 # ---------------------------------------------------------------------------
+
+
+class TestWritePluginDirServerEnv:
+    """P3-2: Cursor is resolver-routed (``_write_plugin_dir`` calls
+    ``resolve_mcp_server_config``) but was only covered indirectly through the
+    resolver's own unit tests. This proves the provider still routes a bundled
+    entry through the resolver, so a refactor that stops doing so is caught
+    here, not just at the resolver level."""
+
+    def test_bundled_server_gains_this_cao_address(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CAO_TMP_DIR", str(tmp_path))
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        provider = make_provider()
+        plugin_dir = provider._write_plugin_dir(
+            {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        )
+        manifest = json.loads((Path(plugin_dir) / "plugin.json").read_text())
+        env = manifest["mcpServers"]["cao-mcp-server"]["env"]
+        assert env["CAO_API_PORT"] == "9899"
+        assert "CAO_API_HOST" not in env
+
+    def test_default_cao_is_unchanged(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CAO_TMP_DIR", str(tmp_path))
+        for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        provider = make_provider()
+        plugin_dir = provider._write_plugin_dir(
+            {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        )
+        manifest = json.loads((Path(plugin_dir) / "plugin.json").read_text())
+        env = manifest["mcpServers"]["cao-mcp-server"]["env"]
+        assert env == {"CAO_TERMINAL_ID": "test-tid"}
 
 
 class TestWorkspaceAccess:

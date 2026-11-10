@@ -1,0 +1,92 @@
+{
+  "skill_name": "cao-agent-plugin-audit",
+  "trigger_evals": [
+    {
+      "query": "Audit the Agent Plugin at agent-plugin/cao and tell me whether every skill is inside the Agent Skills limits.",
+      "should_trigger": true
+    },
+    {
+      "query": "cao plugin validate says my package is loadable. Does that mean its skills meet the 1024-character description limit?",
+      "should_trigger": true
+    },
+    {
+      "query": "Check this package's plugin.json manifest against the vendored schema and list every finding by severity.",
+      "should_trigger": true
+    },
+    {
+      "query": "Run the skills-limits gate over skills/ and report any skill whose body is over 500 lines.",
+      "should_trigger": true
+    },
+    {
+      "query": "Is this Agent Plugins 1.0.0 package conformant? It has a mcp.json and three skills.",
+      "should_trigger": true
+    },
+    {
+      "query": "Why does cao plugin validate --json exit 1 with nothing on stdout when I audit my package?",
+      "should_trigger": true
+    },
+    {
+      "query": "Does the manifest description of this Agent Plugin line up with the skills it actually ships?",
+      "should_trigger": true
+    },
+    {
+      "query": "Build a CAO event plugin that writes an audit log line every time a message is delivered.",
+      "should_trigger": false
+    },
+    {
+      "query": "How do CAO event plugins hook into status_changed and session_created events?",
+      "should_trigger": false
+    },
+    {
+      "query": "Create a brand-new Agent Plugin with a plugin.json and one skill from an empty directory.",
+      "should_trigger": false
+    },
+    {
+      "query": "Review my client-specific agent plugin before I migrate it to the portable structure.",
+      "should_trigger": false
+    },
+    {
+      "query": "Recall what we stored in CAO memory about the preferred test runner.",
+      "should_trigger": false
+    },
+    {
+      "query": "Send a follow-up message to the running supervisor session.",
+      "should_trigger": false
+    }
+  ],
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Audit agent-plugin/cao-contributor and tell me if it is conformant.",
+      "expected_output": "Runs the bundled validator in package mode with uv run --script, reports its exit status and summary line verbatim, and separately reports CAO's own verdict only when CAO_AGENT_PLUGINS_ENABLED is set inline.",
+      "assertions": [
+        "Runs scripts/validate_agent_plugin.py with the package root as the positional argument",
+        "Reports the exit status and the summary line",
+        "Reports the bundled validator's result and CAO's verdict separately",
+        "States that CAO does not enforce the name pattern, the 1024-character limit or the 500-line limit, and at most warns about them",
+        "Does not claim CAO rejects an over-limit skill"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Check every skill in this repository's skills/ directory against the Agent Skills limits.",
+      "expected_output": "Uses --skills-dir skills/ rather than the positional form, and explains that skills/plugin.json and children without a SKILL.md are ignored in that mode.",
+      "assertions": [
+        "Uses --skills-dir",
+        "Explains that skills/ is not an Agent Plugin root because skills/plugin.json has no $schema",
+        "States that a top-level plugin.json and children without a SKILL.md are ignored",
+        "Interprets exit 0 as no finding above advisory, 1 as findings, and anything else as an audit failure"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "This package's description says it ships three skills but the audit lists one. Did the audit detect a mismatch?",
+      "expected_output": "An explanation that the description listing is an advisory that prints the declared description beside the discovered skills for a human to compare, and that the audit makes no judgement about meaning.",
+      "assertions": [
+        "Identifies manifest.description_listing as ADVISORY",
+        "States that the advisory never changes the exit status",
+        "States that the audit does not judge whether the description and the skills correspond"
+      ]
+    }
+  ]
+}

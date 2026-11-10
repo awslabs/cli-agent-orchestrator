@@ -168,10 +168,13 @@ class TestReviewBIdentityAndSidecar:
         assert "caller_id is required" in response.json()["detail"]
         mock_create.assert_not_called()
 
-    def test_memory_sidecar_is_bounded_by_the_primary_row(self, client):
+    def test_memory_sidecar_is_bounded_by_the_primary_row(self, client, hermetic_kiro_agent_store):
         """Review B F2: the sidecar create carries delegating_terminal_id=primary.id
         so its ceiling is capped by the primary's recorded ceiling."""
         from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+
+        # The sidecar launches on the default provider, kiro_cli (#1074).
+        (hermetic_kiro_agent_store / "memory_manager.json").write_text("{}")
 
         primary = Terminal(
             id="0000a1b2",
@@ -354,6 +357,12 @@ def _primary(profile, tools):
 class TestMemorySidecarVisibility:
     """P3 #1: a refused sidecar must be visible to the operator, not only a log line."""
 
+    @pytest.fixture
+    def kiro_store(self, hermetic_kiro_agent_store):
+        """An empty Kiro agent store. With no ``provider`` the sidecar launches on
+        the default, kiro_cli, whose agent check reads the store (#1074)."""
+        return hermetic_kiro_agent_store
+
     @pytest.mark.parametrize(
         "profile, tools, missing",
         [
@@ -387,7 +396,8 @@ class TestMemorySidecarVisibility:
         assert "cao launch --memory" in outcome["detail"]
         sidecar_create.assert_not_called()
 
-    def test_covering_primary_schedules_the_sidecar(self, client):
+    def test_covering_primary_schedules_the_sidecar(self, client, kiro_store):
+        (kiro_store / "memory_manager.json").write_text("{}")
         with (
             patch(
                 "cli_agent_orchestrator.api.main.session_service.create_session",
@@ -402,6 +412,50 @@ class TestMemorySidecarVisibility:
         assert response.status_code == 201
         assert response.json()["memory_manager"] == {"state": "scheduled", "detail": None}
         assert sidecar_create.call_args.kwargs["delegating_terminal_id"] == "0000a1b2"
+
+    def test_a_kiro_sidecar_not_installed_for_kiro_is_refused_in_the_response(
+        self, client, kiro_store
+    ):
+        """The background create would be refused by its Kiro agent check (#1074);
+        the response says so, with the remedy, instead of ``scheduled``."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.create_session",
+                new=AsyncMock(return_value=_primary("reviewer", ROLE_TOOL_DEFAULTS["reviewer"])),
+            ),
+            patch("cli_agent_orchestrator.api.main.resolve_provider", return_value="kiro_cli"),
+            patch(f"{_TS}.create_terminal", new=AsyncMock()) as sidecar_create,
+        ):
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "reviewer", "memory_manager": "true"},
+            )
+        assert response.status_code == 201, response.text
+        outcome = response.json()["memory_manager"]
+        assert outcome["state"] == "refused"
+        assert "cao install memory_manager --provider kiro_cli" in outcome["detail"]
+        assert "cao launch --memory" in outcome["detail"]
+        sidecar_create.assert_not_called()
+
+    def test_a_sidecar_on_another_provider_is_not_asked_the_kiro_check(self, client, kiro_store):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.create_session",
+                new=AsyncMock(return_value=_primary("reviewer", ROLE_TOOL_DEFAULTS["reviewer"])),
+            ),
+            patch("cli_agent_orchestrator.api.main.resolve_provider", return_value="claude_code"),
+            patch(f"{_TS}.create_terminal", new=AsyncMock()),
+        ):
+            response = client.post(
+                "/sessions",
+                params={
+                    "agent_profile": "reviewer",
+                    "memory_manager": "true",
+                    "provider": "claude_code",
+                },
+            )
+        assert response.status_code == 201, response.text
+        assert response.json()["memory_manager"] == {"state": "scheduled", "detail": None}
 
     def test_no_sidecar_requested_reports_nothing(self, client):
         with patch(

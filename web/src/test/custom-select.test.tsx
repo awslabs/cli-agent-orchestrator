@@ -109,7 +109,7 @@ describe('CustomSelect — invalid prop (red boundary on selects)', () => {
     const trigger = screen.getByRole('button', { name: 'pick' })
     expect(trigger.className).not.toContain('border-red-500')
     rerender(<CustomSelect ariaLabel="pick" value="" onChange={() => {}} options={OPTIONS} invalid />)
-    expect(trigger.className).toContain('!border-red-500')
+    expect(trigger.className).toContain('border-red-500!')
     expect(trigger.className).toContain('ring-red-500/30')
   })
 

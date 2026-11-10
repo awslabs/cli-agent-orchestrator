@@ -78,12 +78,22 @@ class MemoryConfig(BaseModel):
     vault: VaultConfig = Field(default_factory=VaultConfig)
 
 
+class KeepFinishedConfig(BaseModel):
+    """``terminal.keep_finished`` (#1225 phase 1). Validated by settings_service."""
+
+    enabled: bool = False
+    idle_window_minutes: int = 60
+    max_per_session: int = 5
+    on_cap: str = "teardown_oldest"
+
+
 class TerminalConfig(BaseModel):
     backend: str = "tmux"
     herdr_session: str = "cao"
     spawn_mode: str = "window"
     pane_window: str = "cao-agents"
     pane_layout: str = "tiled"
+    keep_finished: KeepFinishedConfig = Field(default_factory=KeepFinishedConfig)
 
 
 class AppsConfig(BaseModel):
@@ -168,6 +178,11 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.spawn_mode": "window",
     "terminal.pane_window": "cao-agents",
     "terminal.pane_layout": "tiled",
+    # #1225 phase 1: the four keys of the keep-finished block, defaults shown.
+    "terminal.keep_finished.enabled": False,
+    "terminal.keep_finished.idle_window_minutes": 60,
+    "terminal.keep_finished.max_per_session": 5,
+    "terminal.keep_finished.on_cap": "teardown_oldest",
     "apps.enabled": False,
     "apps.static_dir": None,
     "auth.jwks_uri": "",
@@ -573,9 +588,34 @@ def _set_value(path: str, value: Any) -> Any:
     if path.startswith("memory."):
         key = path.split(".", 1)[1]
         return settings_service.set_memory_setting(key, value)
+    if path == "terminal" or path.startswith(settings_service.KEEP_FINISHED_SETTING):
+        return _set_keep_finished_value(path, value)
 
     keys = _LEGACY_KEY_MAP.get(path, tuple(path.split(".")))
     _mutate_raw(lambda data: _set_nested(data, keys, value))
+    return value
+
+
+def _set_keep_finished_value(path: str, value: Any) -> Any:
+    """Write a ``terminal.keep_finished`` value only if the whole block stays valid.
+
+    The block is checked as it WOULD be after the write, under the settings lock,
+    and a bad value raises ``KeepFinishedSettingsError`` before anything is
+    published: ``cao config set`` then exits non-zero with the reason and the file
+    is unchanged (#1225: refuse bad values with a clear message).
+    """
+    from cli_agent_orchestrator.services import settings_service
+
+    keys = tuple(path.split("."))
+
+    def update(data: Dict[str, Any]) -> None:
+        _set_nested(data, keys, value)
+        terminal = data.get("terminal")
+        if not isinstance(terminal, dict):
+            raise settings_service.KeepFinishedSettingsError("terminal must be an object")
+        settings_service.parse_keep_finished_block(terminal.get("keep_finished"))
+
+    _mutate_raw(update)
     return value
 
 
@@ -597,8 +637,23 @@ _ALL_PATHS = sorted(
         "memory.flush_threshold",
         "memory.compile_timeout_s",
         "memory.vault",
+        "terminal.keep_finished.enabled",
+        "terminal.keep_finished.idle_window_minutes",
+        "terminal.keep_finished.max_per_session",
+        "terminal.keep_finished.on_cap",
     }
 )
+
+
+def _keep_finished_config() -> KeepFinishedConfig:
+    """The resolved keep-finished block; an invalid one reads as off, as the server does."""
+    from cli_agent_orchestrator.services import settings_service
+
+    try:
+        return KeepFinishedConfig(**settings_service.get_keep_finished_settings()._asdict())
+    except settings_service.KeepFinishedSettingsError as exc:
+        logger.warning("%s; keeping finished agents is off until it is fixed", exc)
+        return KeepFinishedConfig()
 
 
 class ConfigService:
@@ -681,6 +736,7 @@ class ConfigService:
                 spawn_mode=_get_value("terminal.spawn_mode", default="window"),
                 pane_window=_get_value("terminal.pane_window", default="cao-agents"),
                 pane_layout=_get_value("terminal.pane_layout", default="tiled"),
+                keep_finished=_keep_finished_config(),
             ),
             apps=AppsConfig(
                 enabled=_get_value("apps.enabled", default=False),

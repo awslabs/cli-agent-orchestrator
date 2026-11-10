@@ -67,7 +67,13 @@ Every derived path resolves from this value, so one override moves everything �
   },
   "terminal": {
     "backend": "tmux",
-    "herdr_session": "cao"
+    "herdr_session": "cao",
+    "keep_finished": {
+      "enabled": false,
+      "idle_window_minutes": 60,
+      "max_per_session": 5,
+      "on_cap": "teardown_oldest"
+    }
   },
   "apps": {
     "enabled": false,
@@ -85,11 +91,32 @@ Every derived path resolves from this value, so one override moves everything �
   },
   "logging": {
     "level": "INFO"
+  },
+  "ephemeral": {
+    "enabled": false,
+    "allowed_providers": ["claude_code"]
+  },
+  "decisions": {
+    "points": {
+      "model.route": {"state": "off", "decider": "fixed_table"},
+      "effort.route": {"state": "off", "decider": "fixed_table"}
+    },
+    "on_timeout_ms": 1000,
+    "confidence_threshold": 0.7,
+    "retention_days": 90
+  },
+  "model_tiers": {},
+  "kiro": {
+    "v3_allow_unverified_versions": false
   }
 }
 ```
 
 Every top-level key is optional — omit any section/key you don't want to override; `ConfigService` fills in built-in defaults.
+The `ephemeral`, `decisions`, `model_tiers` and `kiro` blocks are read outside `ConfigService`. See
+[Ephemeral agents (`ephemeral`)](#ephemeral-agents-ephemeral) below for every `ephemeral` key,
+[Launch decisions](decisions.md#settings) for `decisions` and `model_tiers`, and
+[Kiro v3 (`kiro`)](#kiro-v3-kiro) for `kiro`.
 
 ## `cao config` CLI
 
@@ -128,20 +155,43 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 
 Creation and creator-owned launches are opt-in. `assign` and `handoff` launch
 creator-owned ephemeral names from the creator terminal.
-Only JSON `true` enables the tool, and agent terminals must restart to see it.
+Only JSON `true` enables the tool. An agent sees it only once its CAO MCP connection
+restarts: reconnect it (in Claude Code, `/mcp`, then reconnect the CAO server) or restart the
+agent's terminal.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `false` | Enable ephemeral creation, claims and owner-only HTTP launch. |
-| `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex is an operator opt-in. |
+| `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex and Kiro (`kiro_cli`) are operator opt-ins. |
 | `max_brief_bytes` | `8192` | Maximum UTF-8 bytes after brief normalization. |
-| `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched. |
-| `claim_lease_seconds` | `60` | Lease from claim to terminal creation. |
+| `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched or swept. |
+| `claim_lease_seconds` | `60` | Lease from claim to terminal creation. With `model_tier`, `effort` or `provider` set to `"auto"` it must be at least `n * decisions.on_timeout_ms / 1000 + 30`, where `n` counts the fields set to `"auto"`, `provider` included. |
 | `max_depth` | `1` | Only integer 1 is supported; ephemeral callers cannot create ephemerals. |
+| `min_tier` | `null` | Optional minimum model tier; must not exceed `max_tier` and needs a `default_tier` at or above it. |
+| `max_tier` | `null` | Maximum model tier; a ceiling requires a default at or below it and mappings for every permitted tier, from the floor up, and allowed provider. |
+| `default_tier` | `null` | Model tier used when the spec omits `model_tier`, resolved once at creation and required to be mapped for every allowed provider. |
+| `min_effort` | `null` | Optional minimum reasoning effort; must not exceed `max_effort` and needs a `default_effort` at or above it. |
+| `max_effort` | `null` | Maximum reasoning effort; a ceiling requires a default at or below it. |
+| `default_effort` | `null` | Reasoning effort used when the spec omits `effort`, resolved once at creation. |
+| `provider_route` | `{"equivalent": []}` | Disjoint sets of providers a decider may choose between for a `provider: "auto"` spec. Each set names two or more supported providers that `provider.route` can route to (not `kiro_cli` yet) and must not mix an advisory provider with a hard or sandboxed one; anything else refuses every create and claim with `policy_config_error:provider_route`. With today's providers no set validates. Provisional (#1099). |
 | `child_may_delegate` | `false` | Permit the existing ephemeral delegation/workflow tools; never permits ephemeral creation by an ephemeral caller. |
+| `max_live_per_session` | `0` | Opt-in cap on the pending, claimed and launched names one session may hold. `0` means no cap; for example, `32` suits a fleet-style supervisor. Collected and expired pending names don't count. |
+| `launch_grace_seconds` | `600` | How long periodic sweeps wait after a bind before collecting a launched name with no terminal row. The startup sweep doesn't wait. Rowless live files must also be this old before any sweep deletes them. |
+| `sweep_interval_seconds` | `300` | Seconds between periodic sweeps, at most one day. |
+| `retention_days` | `14` | Days a collected name's archive and registry row are kept, counted only once its terminal and live files are gone. |
 
-See [Ephemeral agents](ephemeral-agents.md) for policy limits, ignored tier/effort keys,
-and the lifecycle residue warning. Keep the feature disabled outside testing.
+See [Ephemeral agents](ephemeral-agents.md) for policy limits, model tier and effort policy,
+and lifecycle cleanup. Keep the feature disabled outside testing.
+
+### Kiro v3 (`kiro`)
+
+Operator-only, read straight from `settings.json` (no environment override). Provisional (#1167).
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `v3_allow_unverified_versions` | `false` | Only JSON `true` lets a Kiro v3 launch run on a kiro-cli version still *pending operator verification*, so an operator can run the live checklist on it. It admits nothing else: an unlisted version still refuses, and every other v3 check still applies. Each admitted launch logs a warning and carries a `launch_notes` entry. Keep it off otherwise. |
+
+See [Kiro v3 (preview)](kiro-cli.md#pending-versions-operator-only).
 
 ### Skills (`skills`)
 
@@ -160,7 +210,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 |---------|---------|--------------|
 | `mcp_request_timeout` | `30` | Seconds to wait for HTTP calls between the MCP server process and the CAO API. Does not apply to a create the server answers only after provider init (`cao launch` without `--headless`, `cao agent handoff`, the `launch_agent` app gesture, `cao-ops` `launch_session` without a message); those waits are sized from `provider_init_timeout` instead. |
 | `event_bus_max_queue_size` | `1024` | Max events buffered per subscriber queue in the internal event bus. |
-| `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity, Codex) may run; Codex fails initialisation if a trust or update dialog (or a startup modal still mid-redraw after a short ride-out) is on screen when the cap is reached or after the readiness wait. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). Client processes also read this value to size how long they wait for a synchronous create, so set it where the client runs too (not only in `cao-server`'s environment) when the two differ, for example a client pointed at another host through `CAO_API_HOST`; `GET /health` reports the value the server is using. |
+| `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. On Kiro v3 it also sizes the wait for MCP servers to finish loading before the first task — see [How long CAO waits for MCP servers](kiro-cli.md#how-long-cao-waits-for-mcp-servers). Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity, Codex) may run; Codex fails initialisation if a trust or update dialog (or a startup modal still mid-redraw after a short ride-out) is on screen when the cap is reached or after the readiness wait. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). Client processes also read this value to size how long they wait for a synchronous create, so set it where the client runs too (not only in `cao-server`'s environment) when the two differ, for example a client pointed at another host through `CAO_API_HOST`; `GET /health` reports the value the server is using. |
 | `startup_prompt_handler_timeout` | `20` | Idle gap, in seconds, between consecutive startup prompts (e.g. workspace trust / bypass dialogs, Kimi's upgrade dialog, Antigravity's trust/survey dialogs, Codex's trust and update dialogs). The handler polls and resets this timer each time it answers a prompt; it only starts counting once the FIRST prompt has been handled, so a first dialog arriving later than this value (e.g. a cold/containerized start) is still caught — before any prompt is seen, only `provider_init_timeout` bounds the wait. Once at least one prompt has been handled, the handler exits after this many seconds pass with no further prompt. |
 | `state_buffer_max` | `32768` | Bytes of raw terminal output `StatusMonitor` keeps per terminal for raw-path status detection and `GET /terminals/{id}/output` (`mode=full`). Not unbounded scrollback — a long, chatty session is truncated to this trailing window; raise it if a still-pending prompt is getting evicted before it's read back. |
 
@@ -245,6 +295,14 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 - `pane_layout`: how that window is re-arranged after each spawn — `"tiled"`
   (default), `"even-vertical"`, `"even-horizontal"`, or `"none"`. See
   [Choosing a layout](#choosing-a-layout).
+- `keep_finished`: keep finished child agents open so you can see what they did,
+  for workshops and debugging. Off by default; turn it on with
+  `cao config set terminal.keep_finished.enabled true`. Its four keys (`enabled`,
+  `idle_window_minutes`, `max_per_session`, `on_cap`), the reaper that cleans kept
+  agents up, and what stays unchanged are in
+  [Keep finished agents](terminal-lifecycle.md#keep-finished-agents-for-workshops-and-debugging).
+  A bad value is refused by `cao config set`, and logged and treated as off when it
+  is already in the file. It has no environment variable.
 
 Select a backend for a single run without touching `settings.json`:
 
@@ -457,13 +515,16 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 
 ### Launch decisions
 
-`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_ON_TIMEOUT_MS` and
+`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_PROVIDER_ROUTE`,
+`CAO_DECISION_TASK_FEATURES`, `CAO_DECISION_ON_TIMEOUT_MS` and
 `CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision settings loader, not through
 `ConfigService`, and override the `decisions` block of `settings.json`. The chain above does not
 apply as written: `cao-server --decision <point>=<state>` sets the matching point-state variable
-(`CAO_DECISION_MODEL_ROUTE` or `CAO_DECISION_EFFORT_ROUTE`), so the flag and that variable are one
-layer, and the server keeps the values it started with until it restarts.
-See [Launch decisions](decisions.md#settings).
+(`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_PROVIDER_ROUTE` or
+`CAO_DECISION_TASK_FEATURES`), so the flag and that variable are one layer, and the server keeps
+the values it started with until it restarts. `decisions.match`, the local model catalog, has no
+environment override. See [Launch decisions](decisions.md#settings) and
+[Matching helpers to models](decisions.md#matching-helpers-to-models).
 
 ### Not yet routed through ConfigService
 

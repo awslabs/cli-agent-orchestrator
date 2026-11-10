@@ -1,11 +1,13 @@
 """Provider manager as module singleton with direct terminal_id → provider mapping."""
 
 import logging
+import os
 from typing import Dict, List, Optional, Type
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers import kiro_launch_home
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
@@ -19,8 +21,8 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     KimiDialect,
     UnsupportedKimiError,
 )
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_launch_home import KiroLaunch
 from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.omp import OmpProvider
@@ -68,11 +70,29 @@ class ProviderManager:
         allowed_tools: Optional[List[str]] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
         engine: Optional[KiroEngine] = None,
         resume_session_id: Optional[str] = None,
         provider_variant: Optional[str] = None,
+        session_id: Optional[str] = None,
+        kiro_launch: Optional[KiroLaunch] = None,
+        ephemeral: bool = False,
     ) -> BaseProvider:
-        """Create and store provider instance."""
+        """Create and store provider instance.
+
+        ``session_id`` (issue #1082): a CAO-generated id for a FRESH claude_code
+        launch, distinct from ``resume_session_id`` (which resumes a PRIOR one).
+        Supported only by claude_code, same restriction as ``resume_session_id``.
+
+        ``kiro_launch`` is an ephemeral Kiro helper's per-launch home and
+        kiro-cli (#1167 Phase 2); only ``kiro_cli`` accepts it.
+
+        ``ephemeral`` marks an ephemeral Claude Code helper's launch: the caller
+        sets it from the launch's ephemeral binding, the fact that marks the
+        terminal ephemeral, never from the profile text. Only
+        ``claude_code`` accepts it; Kiro helpers are told apart by ``kiro_launch``
+        and Codex helpers launch as before.
+        """
         try:
             provider: BaseProvider
             if resume_session_id and provider_type != ProviderType.CLAUDE_CODE.value:
@@ -80,12 +100,19 @@ class ProviderManager:
                     "resume_session_id is only supported by the claude_code provider "
                     f"(got provider '{provider_type}')"
                 )
+            if session_id and provider_type != ProviderType.CLAUDE_CODE.value:
+                raise ValueError(
+                    "session_id is only supported by the claude_code provider "
+                    f"(got provider '{provider_type}')"
+                )
+            if kiro_launch is not None and provider_type != ProviderType.KIRO_CLI.value:
+                raise ValueError("a per-launch Kiro home is only for the kiro_cli provider")
+            if ephemeral and provider_type != ProviderType.CLAUDE_CODE.value:
+                raise ValueError("the ephemeral helper cut is only for the claude_code provider")
             if provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
                 resolved_engine = resolve_kiro_engine(persisted=engine)
-                if resolved_engine == KiroEngine.KAS:
-                    raise KiroPhase0KASError(profile_has_v2_policy=False)
                 provider = KiroCliProvider(
                     terminal_id,
                     tmux_session,
@@ -94,6 +121,7 @@ class ProviderManager:
                     allowed_tools,
                     engine=resolved_engine,
                     model=model,
+                    launch=kiro_launch,
                 )
             elif provider_type == ProviderType.CLAUDE_CODE.value:
                 provider = ClaudeCodeProvider(
@@ -104,7 +132,10 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    effort=effort,
                     resume_session_id=resume_session_id,
+                    session_id=session_id,
+                    ephemeral=ephemeral,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(
@@ -115,6 +146,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    effort=effort,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(
@@ -146,6 +178,8 @@ class ProviderManager:
                     allowed_tools,
                     model=model,
                 )
+                if provider_variant is not None:
+                    provider.restore_runtime_variant(provider_variant)
             elif provider_type == ProviderType.OMP.value:
                 provider = OmpProvider(
                     terminal_id,
@@ -243,11 +277,6 @@ class ProviderManager:
         # Check if already exists
         provider = self._providers.get(terminal_id)
         if provider:
-            if (
-                isinstance(provider, KiroCliProvider)
-                and getattr(provider, "_engine", None) == KiroEngine.KAS
-            ):
-                raise KiroPhase0KASError(profile_has_v2_policy=False)
             return provider
 
         # Try to create on-demand from database metadata
@@ -260,8 +289,6 @@ class ProviderManager:
             if metadata["provider"] == ProviderType.KIRO_CLI.value
             else None
         )
-        if persisted_engine == KiroEngine.KAS:
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
 
         # Kimi's two CLI families share one public provider id but disagree on
         # spinner/composer/transcript semantics.  A row created before variant
@@ -288,6 +315,12 @@ class ProviderManager:
             engine=persisted_engine,
             provider_variant=metadata.get("provider_variant"),
         )
+        if isinstance(provider, OpenCodeCliProvider) and not metadata.get("provider_variant"):
+            try:
+                provider.restore_runtime_variant(None)
+            except Exception:
+                self._providers.pop(terminal_id, None)
+                raise
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since
         # launched — mark the provider as initialized so KiroCliProvider's
@@ -328,6 +361,14 @@ class ProviderManager:
             # home containing generated MCP config, so instantiate the small
             # cleanup-only adapter rather than leaking that directory.
             metadata = get_terminal_metadata(terminal_id)
+            if metadata is None or metadata.get("provider") == ProviderType.KIRO_CLI.value:
+                # An ephemeral Kiro helper's per-launch home (#1167 Phase 2). A
+                # failed create rolls back through here before (or without) its
+                # provider and row, and a restart loses the provider; the home
+                # still has its deterministic path. Installed Kiro rows have none.
+                if not self._cleanup_kiro_home(terminal_id, metadata):
+                    logger.warning("Cleanup deferred for Kiro home of terminal: %s", terminal_id)
+                    return False
             if metadata and metadata.get("provider") == ProviderType.GROK_CLI.value:
                 restored_grok_provider = GrokCliProvider(
                     terminal_id,
@@ -395,6 +436,26 @@ class ProviderManager:
         except Exception as e:
             logger.error(f"Failed to cleanup provider for terminal {terminal_id}: {e}")
             return False
+
+    @staticmethod
+    def _cleanup_kiro_home(terminal_id: str, metadata: Optional[dict]) -> bool:
+        """Remove a per-launch Kiro home with no live provider; False to retry later.
+
+        A home is removed only with proof that CAO prepared it: the prepared
+        home this process holds, the archive's record, or an ephemeral Kiro
+        terminal row (written only after the home was prepared). An entry at
+        the path without proof is left alone.
+        """
+        from cli_agent_orchestrator.clients.database import is_ephemeral_terminal
+        from cli_agent_orchestrator.services import ephemeral_service
+
+        if not kiro_launch_home.valid_terminal_id(terminal_id):
+            return True
+        if not os.path.lexists(kiro_launch_home.kiro_home_path(terminal_id)):
+            kiro_launch_home.discard_launch_home(terminal_id)
+            return True
+        row_proof = metadata is not None and is_ephemeral_terminal(terminal_id)
+        return ephemeral_service.remove_kiro_home(terminal_id, row_proof=row_proof)
 
     def list_providers(self) -> Dict[str, str]:
         """List all active providers (for debugging)."""

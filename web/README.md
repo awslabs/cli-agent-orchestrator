@@ -21,10 +21,8 @@ it is not an official fixed release or a scanner exemption. See
 [Dependency Security](../SECURITY.md#full-dependency-gate) for full-graph CI
 coverage, the strict HIGH/CRITICAL gate, and the separate mitigation status.
 
-The lockfile also includes `source-map-js` 1.2.2 and overrides
-`postcss-selector-parser` to `^7.1.6`, since its v6 consumer ranges have no fixed
-release for CVE-2026-104844. Keep the Tailwind/PostCSS build checks when updating
-this override; see [upstream security releases](../SECURITY.md#additional-upstream-security-releases).
+The lockfile also includes `source-map-js` 1.2.2; see
+[upstream security releases](../SECURITY.md#additional-upstream-security-releases).
 
 ## Architecture
 
@@ -59,7 +57,7 @@ this override; see [upstream security releases](../SECURITY.md#additional-upstre
 
 | Layer | Technology |
 |-------|-----------|
-| UI Framework | React 18 |
+| UI Framework | React 19 |
 | State Management | Zustand |
 | Styling | Tailwind CSS |
 | Terminal Emulator | xterm.js |

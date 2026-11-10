@@ -28,7 +28,7 @@ build-backend = "hatchling.build"
 name = "my-cao-plugin"
 version = "0.1.0"
 description = "Short one-line description"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     # REQUIRED: gives access to CaoPlugin, @hook, and event dataclasses.
     "cli-agent-orchestrator",

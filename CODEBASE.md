@@ -50,7 +50,7 @@ to use.
 | `src/cao_workflow/` | Standalone workflow authoring/runtime package shipped by the project |
 | `web/` | React browser UI source and build configuration |
 | `cao_mcp_apps/` | MCP App React views and build tooling |
-| `agent-plugin/` | CAO's own Agent Plugins 1.0.0 packages (`cao`, `cao-contributor`), generated and checked by `make check-agent-plugin` |
+| `agent-plugin/` | CAO's own Agent Plugins 1.0.0 packages (`cao`, `cao-contributor`, `cao-agent-plugin-lifecycle`), generated and checked by `make check-agent-plugin` |
 | `test/` | Unit, API, CLI, documentation, and integration tests |
 
 ## Request and service flow
@@ -95,6 +95,8 @@ contract supplies the operation.
 messages, and related state. Paths and defaults are centralized in
 `constants.py`; unified runtime configuration is resolved by
 `services/config_service.py` and `services/settings_service.py`.
+`services/keep_service.py` manages `kept_terminals` marks and the once-a-minute
+reaper for finished children.
 
 Terminal output and status changes flow through services such as
 `fifo_reader.py`, `status_monitor.py`, `event_bus.py`, `sse_bus.py`, and

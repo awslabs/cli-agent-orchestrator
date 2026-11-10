@@ -71,13 +71,13 @@ def _resolve_live(terminal_id: str, task_description: str) -> str:
     Deliberately the SAME call ``terminal_service.inject_memory_context`` makes, including the 200
     character task-description slice: this unit changes WHEN memory is resolved, never WHAT
     resolution means. A separate resolution path here would make a replayed run's context differ from
-    a live one for reasons unrelated to freezing.
+    a live one for reasons unrelated to freezing. This includes errors: this function does not catch
+    anything a remote owner can raise, because its caller, ``frozen_memory_for``, wraps the call in the
+    same try/except the live path already applies before persisting or returning.
     """
-    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.memory_gateway import memory_context_for_terminal
 
-    return MemoryService().get_curated_memory_context(
-        terminal_id, task_description=task_description[:200]
-    )
+    return memory_context_for_terminal(terminal_id, task_description=task_description[:200])
 
 
 def frozen_memory_for(
@@ -87,12 +87,14 @@ def frozen_memory_for(
 
     ``None`` means the caller should pass nothing to ``send_input`` and let today's live path run —
     which is the correct answer for a non-workflow terminal, for a YAML run, or for a run with no
-    readable manifest. ``""`` means a known script run has lost its row, or a manifest existed but
-    its memory block could not be persisted; the caller must supply that empty block to prevent
-    the terminal's live-memory fallback.
+    readable manifest. ``""`` means a known script run has lost its row, its journal read failed, the
+    local memory switch is off, its memory block could not be persisted, or resolving memory through
+    the owner failed (unreachable, an HTTP error, or memory disabled on the owner); the caller must
+    supply that empty block to prevent the terminal's live-memory fallback.
 
-    TOTAL: never raises. A workflow step must not fail because a memory block could not be frozen;
-    the worst outcome here is a run that proceeds without memory, which is visible in the manifest.
+    TOTAL: never raises. A workflow step must not fail because a memory block could not be frozen or
+    because the remote owner it must ask could not answer; the worst outcome here is a run that
+    proceeds without memory, which is visible in the manifest.
     """
     if not run_id:
         # Not a workflow terminal. Today's behaviour, untouched — C-1.
@@ -101,6 +103,11 @@ def frozen_memory_for(
     try:
         row = workflow_journal.get_run(run_id)
     except Exception as e:  # noqa: BLE001 — a journal fault must not fail the step
+        from cli_agent_orchestrator.services.workflow_service import run_registry
+
+        if getattr(run_registry.get(run_id), "tier", None) == "script":
+            logger.warning("frozen memory: could not read run '%s'; memory withheld: %s", run_id, e)
+            return ""
         logger.warning("frozen memory: could not read run '%s' (resolving live): %s", run_id, e)
         return None
 
@@ -132,7 +139,28 @@ def frozen_memory_for(
             # hash is always populated even before the lazy fill, so neither can identify a fill.
             return envelope.memory.content
 
-        resolved = _resolve_live(terminal_id, task_description)
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        if not is_memory_enabled():
+            # The operator's local kill switch binds this path too (terminal_service.py:455).
+            # Withhold the owner's block without ever calling it — an unused block is sensitive
+            # text kept for no reason — and fall through to the normal persist path below, which
+            # is what the local curator does (`memory_service.py:4842`).
+            resolved = ""
+        else:
+            try:
+                resolved = _resolve_live(terminal_id, task_description)
+            except (
+                Exception
+            ) as e:  # noqa: BLE001 — TOTAL: a resolution fault must not fail the step
+                logger.warning(
+                    "frozen memory: could not resolve memory for run '%s'; the run proceeds with NO "
+                    "memory: %s",
+                    run_id,
+                    e,
+                )
+                return ""
+
         filled = execution_manifest.with_memory(
             envelope, content=resolved, source=MEMORY_SOURCE_CURATED
         )

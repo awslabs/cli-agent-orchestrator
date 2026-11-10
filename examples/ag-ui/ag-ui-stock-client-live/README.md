@@ -26,13 +26,34 @@ verifies, then everything is cleaned up.
 
 ## What the run plane returns
 
-A successful connection produces this frame sequence:
+A successful run produces this frame sequence, and the body ends after the
+last frame:
 
 ```
 RUN_STARTED        -> echo threadId/runId
 STATE_SNAPSHOT     -> current fleet state
-[live frames...]   -> STATE_DELTA, STEP_STARTED/FINISHED, TOOL_CALL_*, CUSTOM
 RUN_FINISHED       -> outcome: {type: "success"} or {type: "interrupt", ...}
+```
+
+The run plane does not stream live fleet frames (`STATE_DELTA`,
+`SUBAGENT_*`, `TOOL_CALL_*`, `CUSTOM`). Those are on the ambient plane,
+`GET`/`POST /agui/v1/stream`.
+
+## The ambient stream (`verify-ambient.mjs`)
+
+`run.sh` then checks the ambient stream with the same pinned SDK's
+`verifyEvents`, the check every stock AG-UI client applies to what it receives:
+
+1. A self-test: one upstream corpus stream that must fail and one that must pass,
+   so a verifier that accepts everything cannot report green.
+2. Every stream the conformance tests write when `CAO_AGUI_CAPTURE_DIR` is set
+   (`test/api/test_agui_stream_conformance.py`).
+3. A live `HttpAgent` run against `POST /agui/v1/stream` with
+   `forwardedProps.cao.maxSeconds: 5`, which must echo the `runId` and end
+   `RUN_FINISHED` with outcome `cancelled`.
+
+```sh
+node verify-ambient.mjs --captures "$CAO_AGUI_CAPTURE_DIR" --live http://localhost:9889
 ```
 
 ## Stock client code (minimal — `client.mjs`)

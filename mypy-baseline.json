@@ -4,7 +4,7 @@
   "targets": [
     "src/"
   ],
-  "total_errors": 175,
+  "total_errors": 174,
   "files": {
     "src/cli_agent_orchestrator/api/main.py": {
       "call-arg": 1
@@ -20,8 +20,7 @@
     },
     "src/cli_agent_orchestrator/mcp_server/server.py": {
       "arg-type": 10,
-      "call-arg": 4,
-      "union-attr": 1
+      "call-arg": 4
     },
     "src/cli_agent_orchestrator/providers/kimi_cli.py": {
       "no-any-return": 1

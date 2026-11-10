@@ -23,7 +23,8 @@ From GitHub, without cloning:
 cao plugin add https://github.com/awslabs/cli-agent-orchestrator --subdir agent-plugin/cao
 ```
 
-Any Agent-Plugins-compatible client can install this directory the same way.
+Any [Agent-Plugins-compatible](https://agent-plugins.org/specification) client can install this directory
+the same way.
 
 ## Contents
 
@@ -34,5 +35,5 @@ Version `2.5.3`, synced from CAO's package metadata.
 - `cao-supervisor-protocols`
 - `cao-worker-protocols`
 
-See [docs/agent-plugins.md](../../docs/agent-plugins.md) for the prerequisites
-and the localhost-only posture.
+See [docs/agent-plugins.md](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/agent-plugins.md) for the prerequisites and
+the localhost-only posture.

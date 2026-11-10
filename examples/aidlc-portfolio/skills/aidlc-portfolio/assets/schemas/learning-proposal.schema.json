@@ -12,8 +12,7 @@
     "heading",
     "rule",
     "evidence",
-    "source",
-    "baseRevision"
+    "source"
   ],
   "additionalProperties": false,
   "properties": {
@@ -46,31 +45,26 @@
         "stage": { "type": "string", "minLength": 1 }
       }
     },
-    "baseRevision": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
-    },
-    "status": { "enum": ["pending", "applied", "rejected"] },
+    "status": { "enum": ["pending", "promoted", "rejected"] },
     "createdAt": { "type": "string", "minLength": 1 },
     "updatedAt": { "type": "string", "minLength": 1 },
-    "appliedAt": { "type": "string", "minLength": 1 },
-    "rejectedAt": { "type": "string", "minLength": 1 },
-    "rejectionReason": { "type": "string", "minLength": 1 },
-    "reconciliations": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["note", "reconciledAt", "previousRevision"],
-        "additionalProperties": false,
-        "properties": {
-          "note": { "type": "string", "minLength": 1 },
-          "reconciledAt": { "type": "string", "minLength": 1 },
-          "previousRevision": {
-            "type": "string",
-            "pattern": "^[a-f0-9]{64}$"
-          }
+    "promotedAt": { "type": "string", "minLength": 1 },
+    "promotedBy": { "type": "string", "minLength": 1 },
+    "memory": {
+      "type": "object",
+      "required": ["scope", "memoryType", "key"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": { "type": "string", "minLength": 1 },
+        "memoryType": { "type": "string", "minLength": 1 },
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "maxLength": 60
         }
       }
-    }
+    },
+    "rejectedAt": { "type": "string", "minLength": 1 },
+    "rejectionReason": { "type": "string", "minLength": 1 }
   }
 }

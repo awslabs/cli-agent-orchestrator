@@ -17,6 +17,7 @@ Four carry the unit's load:
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock
 
 import pytest
 
@@ -394,3 +395,221 @@ def test_missing_row_never_selects_live_memory_for_known_script(
         else:
             assert caplog.records == []
     assert resolves == []
+
+
+def test_remote_memory_resolution_uses_gateway_not_local_service(
+    journalled_run, monkeypatch, mocker
+):
+    """F5: the frozen path must select the same remote owner as live terminals."""
+    from cli_agent_orchestrator.services import memory_gateway, memory_service
+
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner.invalid")
+    gateway = mocker.patch.object(
+        memory_gateway, "memory_context_for_terminal", return_value="REMOTE BLOCK"
+    )
+    local_service = mocker.patch.object(memory_service, "MemoryService")
+    task = "x" * 500
+
+    assert (
+        frozen_run_memory.frozen_memory_for(journalled_run, "term-remote", task) == "REMOTE BLOCK"
+    )
+    gateway.assert_called_once_with("term-remote", task_description=task[:200])
+    local_service.assert_not_called()
+    stored = execution_manifest.parse(workflow_journal.get_run(journalled_run).manifest_json)
+    assert stored.memory.content == "REMOTE BLOCK"
+    assert (
+        frozen_run_memory.frozen_memory_for(journalled_run, "term-replay", "later")
+        == "REMOTE BLOCK"
+    )
+    gateway.assert_called_once()
+
+
+def test_remote_gateway_freezes_owner_context_without_local_curator(
+    journalled_run, monkeypatch, mocker
+):
+    """Exercise the real gateway branch, stubbing only context lookup and HTTP."""
+    from cli_agent_orchestrator.services import memory_gateway
+
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner.invalid")
+    context = {"terminal_id": "term-remote", "cwd": "/project"}
+    mocker.patch.object(memory_gateway.MemoryService, "_get_terminal_context", return_value=context)
+    local_curator = mocker.patch.object(
+        memory_gateway.MemoryService, "get_curated_memory_context", return_value="STALE LOCAL"
+    )
+    post = mocker.patch.object(memory_gateway, "_post", return_value={"context": "OWNER BLOCK"})
+    gateway = mocker.spy(memory_gateway, "memory_context_for_terminal")
+
+    assert (
+        frozen_run_memory.frozen_memory_for(journalled_run, "term-remote", "task") == "OWNER BLOCK"
+    )
+    gateway.assert_called_once_with("term-remote", task_description="task")
+    local_curator.assert_not_called()
+    post.assert_called_once_with(
+        "/internal/memory/context", {"terminal_context": context, "budget_chars": 3000}
+    )
+
+
+@pytest.mark.parametrize("tier, expected", [("script", ""), ("yaml", None), (None, None)])
+def test_journal_read_failure_withholds_only_known_script_memory(
+    monkeypatch, resolves, caplog, tier, expected
+):
+    """F2 prime: a journal read fault must not select live memory for a known script."""
+    import logging
+    from types import SimpleNamespace
+
+    from cli_agent_orchestrator.services import workflow_service
+
+    def fail_read(_run_id):
+        raise RuntimeError("journal unavailable")
+
+    monkeypatch.setattr(workflow_journal, "get_run", fail_read)
+    monkeypatch.setattr(
+        workflow_service, "run_registry", {"read-fault": SimpleNamespace(tier=tier)} if tier else {}
+    )
+    with caplog.at_level(logging.WARNING, logger=frozen_run_memory.logger.name):
+        block = frozen_run_memory.frozen_memory_for("read-fault", "term", "task")
+    assert block == expected
+    assert resolves == []
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    assert "read-fault" in caplog.text
+    assert "journal unavailable" in caplog.text
+    if tier == "script":
+        assert "memory withheld" in caplog.text
+        assert "resolving live" not in caplog.text
+    else:
+        assert "resolving live" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# A remote owner's failure must not escape `frozen_memory_for` (#828)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def remote_gateway(monkeypatch, mocker):
+    """Route resolution through the real gateway, with only HTTP and terminal-context lookup stubbed."""
+    from cli_agent_orchestrator.services import memory_gateway, memory_service
+
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner.invalid")
+    context = {"terminal_id": "term-remote", "session_name": "s", "cwd": "/project"}
+    mocker.patch.object(memory_service.MemoryService, "_get_terminal_context", return_value=context)
+    curator = mocker.patch.object(
+        memory_service.MemoryService, "get_curated_memory_context", return_value="STALE LOCAL"
+    )
+    return memory_gateway, curator
+
+
+def _http_error_response(status_code):
+    import requests
+
+    response = Mock(status_code=status_code)
+    response.json.return_value = {"detail": "error"}
+    response.raise_for_status.side_effect = requests.HTTPError(f"{status_code} error")
+    return response
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["owner_404", "connection_error"],
+)
+def test_remote_owner_failure_withholds_memory_without_raising(
+    journalled_run, remote_gateway, mocker, caplog, failure
+):
+    """A 404 (memory disabled on the owner) or a connection failure must not escape, and must
+    not fall back to the local curator — the owner must not be called a second time (#828)."""
+    import logging
+
+    import requests
+
+    memory_gateway, curator = remote_gateway
+    if failure == "owner_404":
+        mocker.patch.object(memory_gateway.requests, "post", return_value=_http_error_response(404))
+    else:
+        mocker.patch.object(
+            memory_gateway.requests, "post", side_effect=requests.ConnectionError("refused")
+        )
+
+    with caplog.at_level(logging.WARNING, logger=frozen_run_memory.logger.name):
+        block = frozen_run_memory.frozen_memory_for(journalled_run, "term-remote", "task")
+
+    assert block == ""
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    assert journalled_run in caplog.text
+    curator.assert_not_called()
+    stored = execution_manifest.parse(workflow_journal.get_run(journalled_run).manifest_json)
+    assert stored.memory.source == ""
+    assert stored.memory.content == ""
+
+
+# ---------------------------------------------------------------------------
+# The local kill switch must bind the frozen remote path too (#828)
+# ---------------------------------------------------------------------------
+
+
+def test_local_switch_off_withholds_remote_memory_without_calling_owner(
+    journalled_run, monkeypatch, mocker
+):
+    from cli_agent_orchestrator.services import memory_gateway, memory_service, settings_service
+
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner.invalid")
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    post = mocker.patch.object(memory_gateway, "_post")
+    context_lookup = mocker.patch.object(memory_service.MemoryService, "_get_terminal_context")
+
+    block = frozen_run_memory.frozen_memory_for(journalled_run, "term-off", "task")
+
+    assert block == ""
+    post.assert_not_called()
+    context_lookup.assert_not_called()
+    stored = execution_manifest.parse(workflow_journal.get_run(journalled_run).manifest_json)
+    assert stored.memory.content == ""
+    assert stored.memory.source == frozen_run_memory.MEMORY_SOURCE_CURATED
+
+
+# ---------------------------------------------------------------------------
+# End to end: a remote-owner failure must not fail the step or leak its terminal
+# ---------------------------------------------------------------------------
+
+
+def test_e2e_run_agent_step_completes_on_remote_owner_404(journalled_run, remote_gateway, mocker):
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from cli_agent_orchestrator.models.terminal import TerminalStatus
+    from cli_agent_orchestrator.services import agent_step
+
+    memory_gateway, _ = remote_gateway
+    mocker.patch.object(memory_gateway.requests, "post", return_value=_http_error_response(404))
+    term = MagicMock()
+    term.id = "abc12345"
+    mocker.patch.object(
+        agent_step.terminal_service, "create_terminal", new=AsyncMock(return_value=term)
+    )
+    send = mocker.patch.object(agent_step.terminal_service, "send_input", return_value=True)
+    delete = mocker.patch.object(agent_step.terminal_service, "delete_terminal", return_value=True)
+    mocker.patch.object(agent_step.terminal_service, "get_output", return_value="the answer")
+    mocker.patch.object(agent_step.terminal_service, "exit_terminal_cli", return_value=None)
+    mocker.patch.object(agent_step.terminal_service, "get_working_directory", return_value=None)
+    mocker.patch.object(agent_step, "wait_until_status", new=AsyncMock(return_value=True))
+    mocker.patch.object(
+        agent_step.status_monitor, "get_status", return_value=TerminalStatus.COMPLETED
+    )
+    mocker.patch.object(agent_step.launch_guard, "check", return_value=None)
+
+    result = asyncio.run(
+        agent_step.run_agent_step(
+            "kiro_cli",
+            "dev",
+            "x",
+            env_vars={"CAO_WORKFLOW_RUN_ID": journalled_run, "CAO_WORKFLOW_GENERATION": "1"},
+        )
+    )
+
+    assert result.last_message == "the answer"
+    send.assert_called_once()
+    assert send.call_args.kwargs.get("frozen_memory") == ""
+    delete.assert_called_once()
+    stored = execution_manifest.parse(workflow_journal.get_run(journalled_run).manifest_json)
+    assert stored.memory.source == ""

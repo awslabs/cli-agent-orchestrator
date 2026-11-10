@@ -282,9 +282,9 @@ describe('ProfileCreateModal — template flow (stage 3)', () => {
     await act(() => vi.advanceTimersByTimeAsync(PREVIEW_DEBOUNCE_MS + 10))
 
     // Missing required field: thick red boundary with NO user input given
-    expect(screen.getByRole('textbox', { name: 'queue_url' }).className).toContain('!border-red-500')
+    expect(screen.getByRole('textbox', { name: 'queue_url' }).className).toContain('border-red-500!')
     // Bad-value field: also outlined
-    expect(screen.getByRole('spinbutton', { name: 'poll_interval_seconds' }).className).toContain('!border-red-500')
+    expect(screen.getByRole('spinbutton', { name: 'poll_interval_seconds' }).className).toContain('border-red-500!')
   })
 
   it('create is disabled without a preview, and ENABLES once preview + name exist', async () => {
@@ -473,10 +473,10 @@ describe('ProfileCreateModal — from-scratch flow (stage 3)', () => {
     await act(async () => {})
 
     // The named fields carry the red boundary; an untouched field does not
-    expect(screen.getByRole('textbox', { name: 'provider' }).className).toContain('!border-red-500')
+    expect(screen.getByRole('textbox', { name: 'provider' }).className).toContain('border-red-500!')
     expect(screen.getByRole('textbox', { name: 'provider' }).className).toContain('border-2')
-    expect(screen.getByRole('textbox', { name: 'Profile name' }).className).toContain('!border-red-500')
-    expect(screen.getByRole('textbox', { name: 'description' }).className).not.toContain('!border-red-500')
+    expect(screen.getByRole('textbox', { name: 'Profile name' }).className).toContain('border-red-500!')
+    expect(screen.getByRole('textbox', { name: 'description' }).className).not.toContain('border-red-500!')
     // And the findings render as a bulleted list, one per finding
     const list = screen.getByTestId('validation-findings')
     expect(within(list).getAllByRole('listitem')).toHaveLength(2)
@@ -503,7 +503,7 @@ describe('ProfileCreateModal — from-scratch flow (stage 3)', () => {
 
     // The dotted path roots at mcpServers: section auto-opens, field is red
     const field = screen.getByRole('textbox', { name: 'mcpServers' })
-    expect(field.className).toContain('!border-red-500')
+    expect(field.className).toContain('border-red-500!')
   })
 
   it('a 400 write rejection renders findings AND marks the named field red', async () => {
@@ -528,7 +528,7 @@ describe('ProfileCreateModal — from-scratch flow (stage 3)', () => {
     const list = screen.getByTestId('validation-findings')
     expect(within(list).getByText('is not valid')).toBeInTheDocument()
     expect(within(list).getByText('provider')).toBeInTheDocument()
-    expect(screen.getByRole('textbox', { name: 'provider' }).className).toContain('!border-red-500')
+    expect(screen.getByRole('textbox', { name: 'provider' }).className).toContain('border-red-500!')
   })
 })
 

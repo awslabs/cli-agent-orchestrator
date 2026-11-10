@@ -345,7 +345,7 @@ class TestCodexBuildCommand:
         mock_profile.codexProfile = None
         mock_load_profile.return_value = mock_profile
         # Simulate the resolver returning a PATH-independent absolute path.
-        mock_resolve.side_effect = lambda cfg: {
+        mock_resolve.side_effect = lambda cfg, **kwargs: {
             **cfg,
             "command": "/home/u/.local/bin/cao-mcp-server",
             "args": [],
@@ -373,7 +373,7 @@ class TestCodexBuildCommand:
         mock_profile.codexProfile = None
         mock_load_profile.return_value = mock_profile
         # Simulate a resolved path containing a backslash and a quote.
-        mock_resolve.side_effect = lambda cfg: {
+        mock_resolve.side_effect = lambda cfg, **kwargs: {
             **cfg,
             "command": r'/tmp/we"ird\path/cao-mcp-server',
             "args": [],
@@ -1511,7 +1511,10 @@ class TestMcpKeyValidation:
         assert tomllib.loads(f"x = {match.group(1)}")["x"] == {"": "value"}
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
-    def test_accepts_normal_names_and_env_keys(self, mock_load):
+    def test_accepts_normal_names_and_env_keys(self, mock_load, monkeypatch):
+        # A set CAO_HOME_DIR is forwarded into the bundled server's env and
+        # would add a second key to the exact table asserted below.
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
         mock_load.return_value = self._profile_with(
             {"cao-mcp-server": {"command": "cmd", "args": [], "env": {"API_KEY": "v"}}}
         )
@@ -1519,6 +1522,63 @@ class TestMcpKeyValidation:
         command = provider._build_codex_command()
         assert "mcp_servers.cao-mcp-server.command=" in command
         assert 'mcp_servers.cao-mcp-server.env={ "API_KEY" = "v" }' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_bundled_server_is_told_this_cao_address(self, mock_load, monkeypatch):
+        """Codex inherits only the names in env_vars, so the port must travel in env."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        mock_load.return_value = self._profile_with(
+            {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_bundled_server_default_cao_is_unchanged(self, mock_load, monkeypatch):
+        """A default CAO (none of the three address vars set) writes exactly the
+        same command as before this fix: no ``.env=`` override for the bundled
+        server beyond what ``env_vars`` already adds."""
+        for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        mock_load.return_value = self._profile_with(
+            {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert "mcp_servers.cao-mcp-server.env=" not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_uvx_launched_entry_named_cao_mcp_server_gets_the_address(self, mock_load, monkeypatch):
+        """#1075 P3-1: an entry started through ``uvx`` is still the CAO server
+        when its own entry name is ``cao-mcp-server``, even though ``command``
+        is ``uvx`` rather than the bare console script."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        mock_load.return_value = self._profile_with(
+            {
+                "cao-mcp-server": {
+                    "command": "uvx",
+                    "args": ["--from", "cli-agent-orchestrator", "cao-mcp-server"],
+                }
+            }
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_non_cao_server_never_gets_the_address(self, mock_load, monkeypatch):
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        mock_load.return_value = self._profile_with(
+            {"my-server": {"command": "uvx", "args": ["--from", "pkg", "my-server"]}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert "mcp_servers.my-server.env=" not in command
 
 
 class TestCodexProviderCodexConfig:
@@ -1622,6 +1682,77 @@ class TestCodexProviderCodexConfig:
         assert "--model gpt-5.5" in command
         assert "mcp_servers.cao-mcp-server.command=" in command
         assert 'model_reasoning_effort="xhigh"' in command
+
+    # A decided per-launch effort (#1068 C, #1083 ruling): merged into a copy of codexConfig,
+    # so it wins on a key conflict and is emitted even when codexConfig is empty, giving
+    # exactly one model_reasoning_effort override. Never written back to the profile.
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_wins_over_codex_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"model_reasoning_effort": "medium", "service_tier": "fast"}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_codex_command()
+
+        parts = shlex.split(command)
+        assert parts.count('model_reasoning_effort="high"') == 1
+        assert not any("model_reasoning_effort=" in p and "medium" in p for p in parts)
+        # Other codexConfig keys are kept, in order.
+        assert 'service_tier="fast"' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_no_per_launch_effort_falls_back_to_codex_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"model_reasoning_effort": "medium"}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", effort=None)
+        command = provider._build_codex_command()
+
+        parts = shlex.split(command)
+        assert parts.count('model_reasoning_effort="medium"') == 1
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_is_emitted_when_codex_config_is_none(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_codex_command()
+
+        parts = shlex.split(command)
+        assert parts.count('model_reasoning_effort="high"') == 1
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_a_per_launch_effort_is_emitted_when_codex_config_is_empty(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_codex_command()
+
+        parts = shlex.split(command)
+        assert parts.count('model_reasoning_effort="high"') == 1
 
 
 class TestCodexProviderStatusDetection:

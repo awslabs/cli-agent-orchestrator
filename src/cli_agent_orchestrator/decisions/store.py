@@ -2,7 +2,9 @@
 
 import json
 import logging
-from datetime import datetime, timezone
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +22,89 @@ from cli_agent_orchestrator.decisions.hashing import (
 )
 
 logger = logging.getLogger(__name__)
+STATUS_WINDOW_HOURS = 24
+# #1199: JSON-list columns, and the columns update_match may write.
+_LIST_COLUMNS = ("options", "match_needs", "match_covered")
+MATCH_COLUMNS = (
+    "match_rule",
+    "match_needs",
+    "match_covered",
+    "match_tiebreak",
+    "match_from",
+    "match_pick",
+    "catalog_version",
+    "catalog_hash",
+)
+# A transient value: the canonical catalog text, hashed here and never stored.
+CATALOG_TEXT = "catalog_canonical"
+
+
+def _count_label(reason: str | None, decision_status: str | None) -> str:
+    if reason is not None:
+        return reason
+    if decision_status in ("pending", "interrupted"):
+        return decision_status
+    return "answer"
+
+
+def read_decider_status(
+    database_file: Path | None = None, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """Each decider's last outcome and its counts by reason over the last 24 hours.
+
+    The database is opened read-only, so a missing one is reported, never created, and an
+    old one is never migrated. Only labels are selected: no hash, message size or profile.
+    """
+    from cli_agent_orchestrator import constants
+
+    current = database.as_utc(now) or datetime.now(timezone.utc)
+    since = current - timedelta(hours=STATUS_WINDOW_HOURS)
+    result: dict[str, Any] = {
+        "window_hours": STATUS_WINDOW_HOURS,
+        "since": since.isoformat(),
+        "available": False,
+        "deciders": {},
+    }
+    path = database_file if database_file is not None else constants.DATABASE_FILE
+    deciders: dict[str, dict[str, Any]] = {}
+    try:
+        uri = path.resolve().as_uri() + "?mode=ro"
+        # isolation_level=None: autocommit, so the explicit BEGIN below starts the only
+        # transaction on this connection; nothing it does is a write.
+        with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as db:
+            # One read transaction, so `last` and `counts` come from the same snapshot.
+            db.execute("BEGIN")
+            for name, point, outcome, reason, decision_status, created_at in db.execute(
+                "SELECT decider, point, outcome, reason, decision_status, created_at "
+                "FROM decision_records WHERE id IN (SELECT MAX(id) FROM decision_records "
+                "WHERE decider IS NOT NULL GROUP BY decider)"
+            ):
+                try:
+                    created_at = datetime.fromisoformat(created_at).isoformat()
+                except (TypeError, ValueError):
+                    pass
+                last = {
+                    "point": point,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "decision_status": decision_status,
+                }
+                deciders[name] = {"last": {**last, "created_at": created_at}, "counts": {}}
+            # Compare in the stored format, as the ORM does for `cao decisions list --since`.
+            for name, reason, decision_status, count in db.execute(
+                "SELECT decider, reason, decision_status, COUNT(*) FROM decision_records "
+                "WHERE decider IS NOT NULL AND created_at >= ? "
+                "GROUP BY decider, reason, decision_status",
+                (since.strftime("%Y-%m-%d %H:%M:%S.%f"),),
+            ):
+                counts = deciders.setdefault(name, {"last": None, "counts": {}})["counts"]
+                label = _count_label(reason, decision_status)
+                counts[label] = counts.get(label, 0) + count
+    except (sqlite3.Error, OSError, RuntimeError):
+        # Missing, locked, foreign or pre-decision databases report as unavailable.
+        return result
+    result.update(available=True, deciders=deciders)
+    return result
 
 
 class DecisionStore:
@@ -50,6 +135,10 @@ class DecisionStore:
                 data["message_bytes"] = len(message.encode("utf-8"))
             if isinstance(data.get("probabilities"), dict):
                 data["probabilities"] = json.dumps(data["probabilities"])
+            # #1099: provider.route's per-launch options, as a JSON list; #1199: the match's
+            # needs and covered needs, the same way.
+            self._lists(data)
+            self._catalog_hash(data)
             with self.sessions() as db:
                 row = database.DecisionRecordModel(**data)
                 db.add(row)
@@ -74,6 +163,19 @@ class DecisionStore:
             return None
 
     @staticmethod
+    def _lists(data: dict[Any, Any]) -> None:
+        for key in _LIST_COLUMNS:
+            if isinstance(data.get(key), (list, tuple)):
+                data[key] = json.dumps(list(data[key]))
+
+    def _catalog_hash(self, data: dict[Any, Any]) -> None:
+        """#1199: replace the transient catalog text with its keyed hash, never storing it."""
+        text = data.pop(CATALOG_TEXT, None)
+        if isinstance(text, str):
+            data["catalog_hash"], key_id = self._key.digest(text)
+            data.setdefault("hash_key_id", key_id)
+
+    @staticmethod
     def _dict(row: Any) -> dict[str, Any]:
         data = {
             column.name: getattr(row, column.name)
@@ -81,6 +183,9 @@ class DecisionStore:
         }
         if data["probabilities"] is not None:
             data["probabilities"] = json.loads(data["probabilities"])
+        for key in _LIST_COLUMNS:
+            if data[key] is not None:
+                data[key] = json.loads(data[key])
         for key in ("created_at", "updated_at"):
             if isinstance(data[key], datetime):
                 data[key] = data[key].isoformat()
@@ -115,6 +220,42 @@ class DecisionStore:
                         self._shadow_rows.discard(record_id)
         except Exception:
             logger.warning("Decision record update failed")
+
+    def update_match(self, record_ids: tuple[int, ...], values: dict[str, Any]) -> None:
+        """#1199: write a match's columns onto rows no match has written yet.
+
+        Only the match columns are written, and only where match_rule is still NULL, so a
+        shadow feature job can add its would-be match to rows already finished at launch,
+        and nothing ever overwrites one. Records only; nothing is emitted.
+
+        A row's one hash_key_id names the key of its message hash and its catalog hash. The
+        catalog hash is computed here under the current key, so it is written only onto a row
+        whose hash_key_id names that key, or that has none yet and gets it. A row hashed under
+        a key rotated since (``cao decisions purge --rotate-key``) is left without a match.
+        """
+        try:
+            data: dict[Any, Any] = dict(values)
+            self._catalog_hash(data)
+            self._lists(data)
+            if set(data) - set(MATCH_COLUMNS) - {"hash_key_id"}:
+                raise ValueError("update_match writes the match columns only")
+            key_id = data.pop("hash_key_id", None)
+            data["updated_at"] = datetime.now(timezone.utc)
+            model = database.DecisionRecordModel
+            with self.sessions() as db:
+                for record_id in record_ids:
+                    query = db.query(model).filter(
+                        model.id == record_id, model.match_rule.is_(None)
+                    )
+                    if key_id is None:
+                        query.update(data)
+                    else:
+                        query.filter(
+                            or_(model.hash_key_id == key_id, model.hash_key_id.is_(None))
+                        ).update({**data, "hash_key_id": key_id})
+                db.commit()
+        except Exception:
+            logger.warning("Decision match update failed")
 
     def bind(
         self,

@@ -63,7 +63,11 @@ portable and make profile listings useful.
   authenticates. An entry defining neither is invalid. For a worked example
   of a remote-URL MCP server that authenticates with a header and keeps the
   key out of the committed profile, see
-  [examples/serply-research](../examples/serply-research/README.md).
+  [examples/serply-research](../examples/serply-research/README.md); for a
+  keyless one, see
+  [examples/deed-page-publisher](../examples/deed-page-publisher/README.md); for
+  a worker that provisions resources and reports back to a supervisor, see
+  [examples/cohesivity-backend](../examples/cohesivity-backend/README.md).
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
   provider tool configuration. `tools` is the provider's own tool catalog and
   is passed through to it; it is not the CAO allowlist and does not restrict
@@ -77,8 +81,9 @@ portable and make profile listings useful.
   is accepted on input only); unset means `false`.
 - `model` (string): provider model selection.
 - `engine` (string): Kiro CLI engine selection, either `v2` (the default) or
-  `kas`. Valid only for the `kiro_cli` provider; an explicit `--engine` at
-  launch must agree with this value. See [Kiro CLI](kiro-cli.md).
+  `v3` (`kas` is accepted as an alias and read as `v3`). Valid only for the
+  `kiro_cli` provider; an explicit `--engine` at launch must agree with this
+  value. See [Kiro CLI](kiro-cli.md).
 - `permissionMode` (string): Claude Code permission mode.
 - `native_agent` (string): Claude Code native-agent name.
 - `codexProfile` (string): named Codex configuration profile.
@@ -87,6 +92,9 @@ portable and make profile listings useful.
   "<low|medium|high|xhigh>"}` maps to `--effort <level>` and
   `{"fallback_model": "<model>"}` to `--fallback-model <model>`. The Claude
   analog of `codexConfig`; the top-level `model` field still maps to `--model`.
+- `kiroConfig` (object): Kiro CLI launch knobs; `{"effort": "<level>"}` is the
+  `--effort <level>` a Kiro v3 launch passes, probed from the wrapper's help
+  first. An ephemeral Kiro helper carries its effort here.
 - `hermesProfile` (string): Hermes profile wrapper command.
 - `grokNativeWorkflows` (boolean): explicit Grok Build-native worker/workflow
   opt-in; defaults to `false`.

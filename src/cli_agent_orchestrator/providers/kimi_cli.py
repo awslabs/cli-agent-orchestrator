@@ -1884,7 +1884,9 @@ class KimiCliProvider(BaseProvider):
 
                         # Resolve the bundled cao-mcp-server console script to a
                         # PATH-independent invocation.
-                        mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
+                        mcp_config[server_name] = resolve_mcp_server_config(
+                            mcp_config[server_name], name=server_name
+                        )
 
                         # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                         # can identify the current terminal for handoff/assign operations.

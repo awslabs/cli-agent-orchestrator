@@ -118,7 +118,7 @@ class TestInvalidDecision:
 
     def test_edit_without_text(self, approval_bridge):
         construct = approval_bridge.construct
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         resp = client.post(
             f"/agui/v1/interrupts/{interrupt.id}/resume",
             json={"decision": "edit"},
@@ -128,7 +128,7 @@ class TestInvalidDecision:
 
     def test_edit_with_too_long_text(self, approval_bridge):
         construct = approval_bridge.construct
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         resp = client.post(
             f"/agui/v1/interrupts/{interrupt.id}/resume",
             json={"decision": "edit", "edited_text": "x" * 4001},
@@ -171,7 +171,7 @@ class TestSuccessfulResume:
 
     def test_edit(self, approval_bridge):
         construct = approval_bridge.construct
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         resp = client.post(
             f"/agui/v1/interrupts/{interrupt.id}/resume",
             json={"decision": "edit", "edited_text": "custom command"},
@@ -301,7 +301,7 @@ class TestDeliveryOnResume:
     def test_edit_delivers_translated_text_once(self, delivery_bridge):
         bridge, deliveries = delivery_bridge
         interrupt = bridge.construct.on_provider_waiting(
-            "t-edit", "claude_code", "\u2191/\u2193 to navigate"
+            "t-edit", "kiro_cli", "Allow this action? [y/n/t]:"
         )
 
         resp = client.post(
@@ -370,7 +370,7 @@ def test_leading_newline_edit_returns_422(client, monkeypatch):
     monkeypatch.setattr("cli_agent_orchestrator.security.auth.is_auth_enabled", lambda: False)
 
     construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
-    interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+    interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
     bridge = ApprovalBridge(construct=construct)
     app.state.approval_bridge = bridge
 

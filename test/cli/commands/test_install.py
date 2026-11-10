@@ -68,6 +68,7 @@ class TestInstallCommand:
             "developer",
             "kiro_cli",
             {"API_TOKEN": "secret-token"},
+            engine=None,
         )
 
     def test_install_without_provider_flag_passes_none_and_echoes_resolved_provider(
@@ -96,7 +97,7 @@ class TestInstallCommand:
 
         assert result.exit_code == 0
         assert "copilot_cli agent: /tmp/copilot/developer.agent.md" in result.output
-        mock_install.assert_called_once_with("developer", None, None)
+        mock_install.assert_called_once_with("developer", None, None, engine=None)
 
     def test_install_help_documents_provider_precedence(self, runner: CliRunner) -> None:
         """--provider help text should document flag > frontmatter > default."""
@@ -168,7 +169,7 @@ class TestInstallCommand:
         assert "Agent 'local' installed successfully" in result.output
         # Service sees the validated stem and the text, never the full user path.
         mock_install.assert_called_once_with(
-            "local", "kiro_cli", None, profile_content=source_profile.read_text()
+            "local", "kiro_cli", None, profile_content=source_profile.read_text(), engine=None
         )
         # The CLI does not write the store; that is the service's job, after the guard.
         assert not (local_store / "local.md").exists()
@@ -212,15 +213,44 @@ class TestInstallCommand:
         mock_install.assert_not_called()
 
     def test_install_failure_prints_error(self, runner: CliRunner) -> None:
-        """Service failures should be surfaced as CLI errors without raising."""
+        """A service failure is a CLI error: exit 1, the message on stderr (#1270)."""
         with patch(
             "cli_agent_orchestrator.cli.commands.install.install_agent",
             return_value=InstallResult(success=False, message="Source not found: missing"),
         ):
             result = runner.invoke(install, ["missing"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error: Source not found: missing" in result.output
+
+    def test_a_failed_install_exits_1_with_the_error_on_stderr(self, runner: CliRunner) -> None:
+        """#1270: a script must be able to tell a failed install from a good one."""
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=InstallResult(success=False, message="Agent profile not found: nope"),
+        ):
+            result = runner.invoke(install, ["nope", "--provider", "opencode_cli"])
+
+        assert result.exit_code == 1
+        assert result.stderr.strip() == "Error: Agent profile not found: nope"
+        assert result.stdout == ""
+
+    def test_a_successful_install_still_exits_0(self, runner: CliRunner) -> None:
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=InstallResult(
+                success=True,
+                message="ok",
+                agent_name="developer",
+                context_file="/ctx/developer.md",
+            ),
+        ):
+            result = runner.invoke(install, ["developer"])
+
+        assert result.exit_code == 0, result.output
+        assert "Agent 'developer' installed successfully" in result.stdout
+        assert result.stderr == ""
 
     def test_install_invalid_env_format_returns_click_error(self, runner: CliRunner) -> None:
         """Assignments without '=' should fail validation with a user-friendly error."""
@@ -286,4 +316,4 @@ def test_install_omp_provider_is_accepted_by_cli():
         result = runner.invoke(install, ["developer", "--provider", "omp"])
 
     assert result.exit_code == 0
-    mock_install.assert_called_once_with("developer", "omp", None)
+    mock_install.assert_called_once_with("developer", "omp", None, engine=None)

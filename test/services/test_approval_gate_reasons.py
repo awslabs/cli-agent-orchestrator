@@ -49,7 +49,7 @@ def test_reason_set_is_closed():
 
 
 def test_internal_freeze_failure_logs_only_reason(monkeypatch, caplog, tmp_path):
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError(f"private error at {tmp_path}")
 
     monkeypatch.setattr(manifest_freeze, "derive_baseline", fail)

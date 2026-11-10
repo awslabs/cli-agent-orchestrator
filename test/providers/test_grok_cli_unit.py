@@ -2257,6 +2257,29 @@ def test_cleanup_refuses_symlinked_managed_ancestor(tmp_path, symlinked_ancestor
     assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
+def test_bundled_server_gains_this_cao_address(monkeypatch):
+    """P3-2: Grok is resolver-routed (``_render_mcp_config`` calls
+    ``resolve_mcp_server_config``) but was only covered through the resolver's
+    own unit tests, not at the provider level."""
+    monkeypatch.setenv("CAO_API_PORT", "9899")
+    monkeypatch.delenv("CAO_API_HOST", raising=False)
+    monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+    rendered = make_provider()._render_mcp_config(
+        {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+    )
+    assert 'CAO_API_PORT" = "9899"' in rendered
+
+
+def test_default_cao_mcp_config_is_unchanged(monkeypatch):
+    for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    rendered = make_provider()._render_mcp_config(
+        {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+    )
+    assert "CAO_API_PORT" not in rendered
+    assert "CAO_HOME_DIR" not in rendered
+
+
 def test_url_mcp_rejects_unknown_transport():
     with pytest.raises(ProviderError, match="unsupported URL transport"):
         make_provider()._render_mcp_config(

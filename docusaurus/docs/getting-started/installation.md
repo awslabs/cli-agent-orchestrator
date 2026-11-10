@@ -6,7 +6,7 @@ sidebar_position: 1
 
 ## Prerequisites
 
-- **Python 3.10+**
+- **Python 3.11+**
 - **tmux** — a terminal multiplexer that runs each agent in its own isolated terminal window. CAO uses tmux to manage agent sessions without requiring multiple terminal tabs.
 - **At least one supported AI CLI agent** installed on your machine:
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`npm install -g @anthropic-ai/claude-code`) — requires Anthropic API key

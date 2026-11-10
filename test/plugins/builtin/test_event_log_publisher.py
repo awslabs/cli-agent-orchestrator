@@ -263,3 +263,48 @@ class TestAguiEnablement:
         assert history[0]["kind"] == "launch"
         assert history[0]["terminal_id"] == "t1"
         assert relayed == history
+
+
+class TestSessionSubagentRunIdStamp:
+    """#1193: the publisher stamps the session's hashed AG-UI id at log time."""
+
+    INCARNATION = "3f2c9a1e-0000-4000-8000-1234567890ab"
+    LOOKUP = "cli_agent_orchestrator.clients.database.get_session_incarnation"
+
+    @pytest.mark.asyncio
+    async def test_stamp_is_the_hash_appended_after_existing_keys(self, wired_publisher) -> None:
+        from cli_agent_orchestrator.services.agui.attribution import subagent_run_id_for_session
+
+        publisher, log, relayed = wired_publisher
+        with patch(self.LOOKUP, return_value=self.INCARNATION):
+            await publisher.on_post_create_session(PostCreateSessionEvent(session_name="cao-demo"))
+        detail = log.history()[0]["detail"]
+        assert list(detail) == ["event_type", "session_name", "session_subagent_run_id"]
+        assert detail["session_subagent_run_id"] == subagent_run_id_for_session(self.INCARNATION)
+        assert self.INCARNATION not in str(log.history()[0])  # the raw id never leaves
+        assert relayed == log.history()
+
+    @pytest.mark.asyncio
+    async def test_no_pointer_means_no_stamp(self, wired_publisher) -> None:
+        publisher, log, _ = wired_publisher
+        with patch(self.LOOKUP, return_value=None):
+            await publisher.on_post_kill_session(PostKillSessionEvent(session_name="cao-demo"))
+        assert "session_subagent_run_id" not in log.history()[0]["detail"]
+
+    @pytest.mark.asyncio
+    async def test_lookup_failure_still_records_the_event(self, wired_publisher) -> None:
+        publisher, log, _ = wired_publisher
+        with patch(self.LOOKUP, side_effect=RuntimeError("db down")):
+            await publisher.on_post_create_session(PostCreateSessionEvent(session_name="cao-demo"))
+        assert len(log.history()) == 1
+        assert "session_subagent_run_id" not in log.history()[0]["detail"]
+
+    @pytest.mark.asyncio
+    async def test_no_session_means_no_lookup(self, wired_publisher) -> None:
+        publisher, log, _ = wired_publisher
+        with patch(self.LOOKUP) as lookup:
+            await publisher.on_post_kill_terminal(
+                PostKillTerminalEvent(terminal_id="t1", agent_name="dev")
+            )
+        lookup.assert_not_called()
+        assert "session_subagent_run_id" not in log.history()[0]["detail"]

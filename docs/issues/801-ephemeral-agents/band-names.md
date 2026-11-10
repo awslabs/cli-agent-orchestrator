@@ -183,8 +183,8 @@ an objective classifier. These exceptions make that limitation reviewable.
 | Suicidal Tendencies | Log-safety: self-harm term |
 | Butthole Surfers | Log-safety: sexual/vulgar content |
 | Soft Cell | Log-safety: defining album title ("Non-Stop Erotic Cabaret") is sexual-content-adjacent; excluded out of caution even though the band name itself is neutral |
-| L.A. Guns | Log-safety (maintainer, 2026-09-30): the normalized form reads as weapons in logs/dashboards |
-| Joy Division | Log-safety (maintainer, 2026-09-30): the name refers to a Nazi-era forced-prostitution unit |
+| L.A. Guns | Log-safety: the normalized form reads as weapons in logs/dashboards |
+| Joy Division | Log-safety: the name refers to a Nazi-era forced-prostitution unit |
 | Pat Benatar | Not a rock band (rule 1): solo artist |
 | Run-D.M.C. | Not a rock band (rule 1): hip hop |
 | Beastie Boys | Not a rock band (rule 1): hip hop |

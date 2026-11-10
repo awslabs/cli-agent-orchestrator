@@ -10,7 +10,7 @@ import {
 } from '../components/workflow/SyncedTerminalPane'
 import { DeleteRunButton } from '../components/workflow/DeleteRunButton'
 import { WorkflowsPanel } from '../components/WorkflowsPanel'
-import { RunDetail } from '../components/workflow/RunDetail'
+import { RunDetail, RUN_REFRESH_MS } from '../components/workflow/RunDetail'
 import { api } from '../api'
 import { useStore } from '../store'
 import type { RunSummaryRow, WorkflowEvent, GapMarker } from '../api'
@@ -500,6 +500,76 @@ describe('RunDetail — terminal state is observed from the polled run list (#52
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+})
+
+// The selected run's snapshot must not go stale: script-tier runs emit no events,
+// so neither the header nor the steps could move until the run was re-selected
+// (a Resume left the header on "Cancelled" while the list said completed).
+describe('RunDetail — keeps the selected run snapshot current', () => {
+  const snapshot = (state: string, steps: any[] = []) => ({
+    run_id: 'run-abc-123',
+    workflow_name: 'my-workflow',
+    state,
+    started_at: '2026-07-27T00:00:00Z',
+    finished_at: null,
+    tier: 'script',
+    steps,
+  }) as any
+  const listRow = (state: string): RunSummaryRow => ({ ...sampleRun, state, tier: 'script' })
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, body: null })))
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    cleanup()
+  })
+
+  it('shows the polled list state in the header, not the stale snapshot', () => {
+    vi.spyOn(api, 'inspectWorkflowRun').mockResolvedValue(snapshot('completed'))
+    useStore.setState({ selectedRunId: 'run-abc-123', selectedRun: snapshot('cancelled') })
+    render(<RunDetail run={snapshot('cancelled')} allRuns={[listRow('completed')]} />)
+    expect(screen.queryByText('Cancelled')).toBeNull()
+    expect(screen.getAllByText('Completed').length).toBeGreaterThan(0)
+  })
+
+  it('re-reads the inspection once when the list reports a new state', async () => {
+    const fresh = snapshot('completed', [{ id: 'review', state: 'completed', attempts: 1 }])
+    const inspect = vi.spyOn(api, 'inspectWorkflowRun').mockResolvedValue(fresh)
+    useStore.setState({ selectedRunId: 'run-abc-123', selectedRun: snapshot('cancelled') })
+    render(<RunDetail run={snapshot('cancelled')} allRuns={[listRow('completed')]} />)
+    await waitFor(() => expect(useStore.getState().selectedRun).toBe(fresh))
+    expect(inspect).toHaveBeenCalledWith('run-abc-123')
+  })
+
+  it('polls the inspection while the run is live, and stops once it is terminal', async () => {
+    vi.useFakeTimers()
+    const inspect = vi.spyOn(api, 'inspectWorkflowRun').mockResolvedValue(snapshot('running'))
+    useStore.setState({ selectedRunId: 'run-abc-123', selectedRun: snapshot('running') })
+    const { rerender } = render(<RunDetail run={snapshot('running')} allRuns={[listRow('running')]} />)
+    expect(inspect).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(RUN_REFRESH_MS)
+    expect(inspect).toHaveBeenCalledTimes(1)
+    rerender(<RunDetail run={snapshot('completed')} allRuns={[listRow('completed')]} />)
+    inspect.mockClear()
+    await vi.advanceTimersByTimeAsync(RUN_REFRESH_MS * 3)
+    expect(inspect).not.toHaveBeenCalled()
+  })
+
+  it('refreshSelectedRun keeps the pane and ignores a response for a run no longer selected', async () => {
+    let resolve: (v: any) => void = () => {}
+    vi.spyOn(api, 'inspectWorkflowRun').mockReturnValue(new Promise(r => { resolve = r }))
+    const current = snapshot('running')
+    useStore.setState({ selectedRunId: 'run-abc-123', selectedRun: current })
+    const pending = useStore.getState().refreshSelectedRun()
+    expect(useStore.getState().selectedRun).toBe(current) // not blanked while loading
+    useStore.setState({ selectedRunId: 'other-run' })
+    resolve(snapshot('completed'))
+    await pending
+    expect(useStore.getState().selectedRun).toBe(current)
   })
 })
 

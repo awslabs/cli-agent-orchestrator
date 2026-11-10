@@ -11,8 +11,20 @@ identity indeterminate — ``git`` missing, an unreadable directory, or a hung p
 so the approval path fails closed.
 
 COMMIT AND WORKTREE STATE IDENTIFY REPOSITORIES, WITH NO PATH. Identical repository state on two
-machines remains the same plan. For a directory outside Git, its canonical path is the only identity
-available; record that root, without claiming to fingerprint the directory's contents.
+machines remains the same plan. For a directory outside Git, there is no content identity to record, so
+the root is identified by its canonical path AND by the filesystem's own identity for that directory
+(``st_dev``/``st_ino``, :func:`root_identity`, issue #827 criterion 2), without claiming to fingerprint
+the directory's contents.
+
+THE DEVICE/INODE PAIR IS RECORDED ONLY FOR A NON-GIT ROOT, and that asymmetry is the design rather
+than an omission. A path is not an identity: a directory moved away and replaced by a different
+directory at the same path keeps the path, so a path-only baseline hands the replacement the original's
+approval. For a GIT root the identity is the commit and the worktree digest — content, not location —
+so a different directory at the same path already produces a different baseline, and binding the inode
+there would instead destroy the property this module exists to provide: two checkouts in the same state
+are ONE plan, on one machine or two (pinned by
+``test_git_baseline.py::test_captures_no_branch_and_no_path``). The pair is therefore added exactly
+where the identity was otherwise path-only.
 
 ON THE DUPLICATION WITH ``worktree_service._run_git``. That function already has this module's exact
 never-raises contract, and it is private to a service whose purpose (worktree management) is unrelated to
@@ -51,6 +63,66 @@ UNAVAILABLE_REASONS = frozenset(
 def normalize_unavailable_reason(reason: Optional[str]) -> str:
     """Keep diagnostics in the closed vocabulary; never echo an unknown reason."""
     return reason if reason is not None and reason in UNAVAILABLE_REASONS else "internal"
+
+
+ROOT_IDENTITY_UNBOUND_REASONS = frozenset(
+    {
+        "root_identity_unsupported",
+        "root_identity_unreadable",
+    }
+)
+"""Why a non-Git root could not be identified by device and inode. DELIBERATELY NOT IN
+:data:`UNAVAILABLE_REASONS`.
+
+That set is the vocabulary ``approval_gate`` turns into a 503 that REFUSES the run. Failing a freeze
+because a network mount reports no usable inode would make every script run on such a mount
+unapprovable, which is a worse outcome than the path-only identity those runs already have today. So an
+unbindable root falls back to today's behaviour — and the fallback is RECORDED rather than skipped: the
+unbound marker is part of the baseline, therefore part of ``plan_id``, so "identified by device and
+inode" and "could not be identified" are two different plans and an operator reading the manifest can
+see which one they approved.
+"""
+
+
+def root_identity(path: str) -> Dict[str, Any]:
+    """The filesystem's own identity for the directory at ``path``. Never raises (issue #827).
+
+    ``{"bound": True, "device": "<st_dev>", "inode": "<st_ino>"}`` when the filesystem supplies a
+    usable pair, otherwise ``{"bound": False, "reason": <closed reason>}``.
+
+    DECIMAL STRINGS, NOT INTEGERS. These values are hashed into ``plan_id`` through
+    ``plan_identifier._structure``, which renders an ``int`` leaf as ``str(value)`` anyway. Writing the
+    strings here means the stored identity does not depend on that normalisation continuing to exist,
+    and an inode above 2**53 cannot be mangled by a JSON reader that parses numbers as doubles.
+
+    ``os.stat`` AND NOT ``os.lstat``: the baseline's root is ``os.path.realpath(cwd)``, so the identity
+    must be the directory the run actually executes in, not a symlink pointing at it. The existing
+    alias test (``test_non_git_roots_and_aliases_have_directory_identity``) pins that a symlinked root
+    and its target are one plan.
+
+    TWO FALLBACKS, BOTH RECORDED:
+
+    * ``st_ino == 0`` — some network filesystems, container overlay mounts and FUSE drivers report a
+      zero inode, and on Windows ``st_ino`` is 0 where the file index is unavailable. Zero is not an
+      identity: every directory would share it, so comparing it would prove nothing while reading as a
+      successful binding. Reason ``root_identity_unsupported``.
+    * ``OSError`` — the directory cannot be stat'd at all. Reason ``root_identity_unreadable``.
+
+    NO PLATFORM BRANCH. The module has none today and this function adds none: Python populates
+    ``st_dev`` and ``st_ino`` on Windows (volume serial and file index) and the ``st_ino == 0`` arm
+    covers the filesystems there that do not supply an index, so the same two arms handle Windows,
+    network mounts and containers without naming any of them.
+
+    NO PATH IN THE RETURN VALUE and none in a log line: the caller already records the root path
+    separately when it is appropriate to, and this module's diagnostics stay path-free.
+    """
+    try:
+        info = os.stat(path)
+    except OSError:
+        return {"bound": False, "reason": "root_identity_unreadable"}
+    if info.st_ino == 0:
+        return {"bound": False, "reason": "root_identity_unsupported"}
+    return {"bound": True, "device": str(info.st_dev), "inode": str(info.st_ino)}
 
 
 # Bounded so a hung git process cannot delay run start. Generous relative to the work — two local
@@ -304,12 +376,19 @@ def _git_marker_state(cwd: str) -> Optional[bool]:
         return None
 
 
-def derive_baseline(cwd: str) -> Dict[str, Any]:
+def derive_baseline(cwd: str, *, identity: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The repository baseline for a run starting in ``cwd``. Never raises.
 
     Returns ``{"available": False}`` when no verifiable baseline could be read,
-    ``{"available": True, "repository": False, "root": <realpath>}`` for non-repositories,
-    and ``{"available": True, "commit": <sha>, "worktree_state": <state>}`` for repositories.
+    ``{"available": True, "repository": False, "root": <realpath>, "root_identity": <identity>}`` for
+    non-repositories, and ``{"available": True, "commit": <sha>, "worktree_state": <state>}`` for
+    repositories.
+
+    ``identity`` is the :func:`root_identity` value the caller ALREADY TOOK for ``cwd``, mirroring
+    ``launch_guard.capture(profile_set=...)``: ``manifest_freeze`` hands the per-run launch guard the
+    same pair it folded into ``plan_id``, so the stat behind the identifier and the stat behind the
+    guard are ONE stat and a root replaced between them cannot be recorded as the approved one
+    (the P3-3 window, PR #1000). ``None`` takes it here, for callers with no freeze.
 
     A successfully read commit may accompany ``available: False`` when the worktree snapshot itself
     was unavailable. The commit alone is not a complete baseline and cannot identify an approvable plan.
@@ -320,6 +399,9 @@ def derive_baseline(cwd: str) -> Dict[str, Any]:
     not have to infer which one a missing key meant.
     """
     environment = _git_environment()
+    # Taken BEFORE the git probes, so the identity describes the directory the probes then classified
+    # rather than whatever is at the path after two subprocess round-trips.
+    identity = root_identity(cwd) if identity is None else identity
     marker_before = _git_marker_state(cwd)
     if marker_before is None:
         return {"available": False, "reason": "git_unavailable"}
@@ -346,7 +428,12 @@ def derive_baseline(cwd: str) -> Dict[str, Any]:
     if probe.returncode != 0:
         marker_after = _git_marker_state(cwd)
         if marker_before is False and marker_after is False:
-            return {"available": True, "repository": False, "root": os.path.realpath(cwd)}
+            return {
+                "available": True,
+                "repository": False,
+                "root": os.path.realpath(cwd),
+                "root_identity": identity,
+            }
         return {
             "available": False,
             "reason": "git_unavailable" if marker_after is None else "repository_unreadable",

@@ -279,7 +279,9 @@ closed" like the enabled positive control — i.e. it is strictly worse than
   now-dangling command line. This is cosmetic, but a user inspecting their MCP
   servers will see leftover CAO/plugin entries accumulate across install/remove
   cycles. Follow-up Option 1 (record delivered names, prune them) or Option 2
-  (`x-cao-plugin` marker + prune) is still the eventual cleanup path.
+  (`x-cao-plugin` marker + prune) is still the eventual cleanup path. #1154
+  implemented the recording half of Option 1 (a fingerprint per delivered entry
+  in `cao-grants.json`); pruning is still not done.
 
 - **Correctness constraint for the implementer: write a JSON boolean `false`,
   never a string/number.** The gate is strict `enabled === false`. `"false"`,

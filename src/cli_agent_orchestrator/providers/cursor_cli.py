@@ -528,7 +528,7 @@ class CursorCliProvider(BaseProvider):
                 servers[server_name] = server_config.model_dump(exclude_none=True)
             # Resolve the bundled cao-mcp-server console script to a
             # PATH-independent invocation.
-            servers[server_name] = resolve_mcp_server_config(servers[server_name])
+            servers[server_name] = resolve_mcp_server_config(servers[server_name], name=server_name)
             env = servers[server_name].get("env", {})
             if "CAO_TERMINAL_ID" not in env:
                 env["CAO_TERMINAL_ID"] = self.terminal_id

@@ -26,6 +26,7 @@ import os
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -45,23 +46,37 @@ from cli_agent_orchestrator.backends.registry import get_backend
 # ``fmt: skip`` stops black from wrapping it, which would move both pragmas off the name.
 from cli_agent_orchestrator.clients.database import delete_terminals_by_session  # noqa: F401  # isort: skip  # fmt: skip
 from cli_agent_orchestrator.clients.database import (
+    LAUNCH_TARGET_KINDS,
+    close_open_edges_for_terminal,
     count_runtime_allocated_terminals,
     create_inbox_message,
 )
+from cli_agent_orchestrator.clients.database import create_launch_record as db_create_launch_record
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_idempotency_key
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
+    finalize_launch_record_if_terminal_gone as db_finalize_launch_record_if_terminal_gone,
+)
+from cli_agent_orchestrator.clients.database import (
+    finalize_launch_records as db_finalize_launch_records,
+)
+from cli_agent_orchestrator.clients.database import (
     get_idempotency_record,
+    get_kept_terminal,
     get_session_incarnation,
     get_terminal_metadata,
     list_pending_deferred_init_external_owner_terminal_ids,
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    mark_assign_edges_delivered,
+    mark_terminal_identity_verified,
+    terminal_id_in_use,
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
+    update_terminal_deferred_init_runtime_reclaimed,
     update_terminal_description,
     update_terminal_group,
     update_terminal_initial_delivery,
@@ -80,8 +95,13 @@ from cli_agent_orchestrator.constants import (
     TURN_START_CONFIRM_SECONDS,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.delegation import EdgeState
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
+from cli_agent_orchestrator.models.kiro_engine import (
+    KiroEngine,
+    canonical_kiro_engine,
+    resolve_kiro_engine,
+)
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     ProviderExitedInputBlockedError,
@@ -97,18 +117,39 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
+from cli_agent_orchestrator.providers import kiro_launch_home
 from cli_agent_orchestrator.providers.base import (
     BaseProvider,
     OutputExtractionError,
     OutputExtractionRejected,
 )
 from cli_agent_orchestrator.providers.kiro_capabilities import (
+    MISSING_FLAG_REMEDY,
     KiroCapabilities,
     KiroCapabilityError,
-    KiroPhase0KASError,
+    KiroV3LaunchError,
+    kiro_effort,
+    kiro_effort_value,
+    missing_flag_message,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
+from cli_agent_orchestrator.providers.kiro_cli import KiroAttestation, KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+from cli_agent_orchestrator.providers.kiro_launch_home import (
+    KiroGlobalHome,
+    KiroLaunch,
+    KiroLaunchHome,
+    KiroLaunchRefusal,
+    ResolvedKiroCli,
+)
+from cli_agent_orchestrator.providers.kiro_v3_schema import (
+    KiroV3EngineSchema,
+    KiroV3Refusal,
+    KiroV3UnsupportedVersionError,
+    KiroV3UnverifiedVersionError,
+)
+from cli_agent_orchestrator.providers.kiro_workspace import check_kiro_helper_workspace
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
 from cli_agent_orchestrator.services import ephemeral_service, worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
@@ -117,9 +158,15 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.install_service import (
+    installed_kiro_agent_is_universal,
     installed_kiro_tools,
     installed_opencode_permission,
     kiro_install_predates_native_enforcement,
+    require_kiro_agent_resolves,
+)
+from cli_agent_orchestrator.services.kiro_v3_launch import (
+    require_kiro_v3_admissible,
+    require_kiro_v3_launchable,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
     memory_context_for_terminal,
@@ -151,6 +198,7 @@ from cli_agent_orchestrator.utils.enforcement import (
     enforcement_for,
     native_providers,
 )
+from cli_agent_orchestrator.utils.ephemeral_capabilities import capability_for
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.paths import (
     ensure_working_directory,
@@ -229,26 +277,60 @@ _DEFERRED_INIT_COMPLETE_FALLBACK_SUFFIX = ".deferred-init-complete"
 _DEFERRED_INIT_SIDECAR_LOCK = threading.RLock()
 
 
-class IdempotencyKeyConflict(Exception):
-    """An idempotency key was reused for a DIFFERENT request.
+class IdempotencyKeyNotFound(Exception):
+    """A ``lookup_only`` create found no live terminal for its idempotency key.
 
-    Review on PR #634, issue #616. Surfaced as HTTP 409 by both create
-    endpoints -- the same shape Stripe and AWS use
-    (``IdempotentParameterMismatch``) rather than silently serving the first
-    call's result to a caller who asked for something else.
-
-    Subclasses ``Exception`` and NOT ``ValueError``, deliberately. Every
-    ``ValueError`` out of ``create_terminal`` is already spoken for by the
-    endpoints: ``create_session`` maps it to 400 and
-    ``create_terminal_in_session`` maps it to 404, and in ``create_session``
-    that arm sits FIRST -- so a ``ValueError`` subclass would be swallowed
-    into a 400 before any 409 arm could see it, and a later reorder could
-    silently re-break it. As a plain ``Exception`` the only ordering
-    requirement is that its arm precede the catch-all 500, which no reorder
-    of the ``ValueError``-family arms can violate. This also matches the
-    dominant convention in this repo (``WorktreeError(Exception)``,
-    ``ProviderError(Exception)``).
+    Review on PR #773. Surfaced as HTTP 404 by both create endpoints. Since
+    issue #944 this also covers a key that IS in use but by a different request:
+    keys are scoped by request fingerprint (see ``_scoped_idempotency_key``), so
+    an unused key and a key held by someone else are the same empty slot and
+    answer the same 404. Not a ``ValueError``: ``create_session`` maps
+    ``ValueError`` to 400 and ``create_terminal_in_session`` maps it to 404, and
+    in ``create_session`` that arm sits FIRST, so a ``ValueError`` subclass would
+    be swallowed into a 400 before this exception's own arm could see it.
     """
+
+
+class IdempotentCreateFailed(Exception):
+    """A replay found that the original create for its key failed to initialize.
+
+    Review on PR #773. Surfaced as HTTP 424 by both create endpoints, so a
+    caller can tell "the create you are replaying failed, here is why" from an
+    ordinary server error and report that cause instead of retrying. The failed
+    create has already been rolled back; this allocates nothing.
+
+    ``terminal_id`` is set when that rollback kept the failed terminal's row
+    because its provider deferred cleanup (issue #943): the row is then the
+    only handle an operator has to find and delete it.
+    """
+
+    def __init__(self, message: str, terminal_id: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.terminal_id = terminal_id
+
+
+def _failed_replay_error(
+    terminal_id: str, idempotency_key: str, error: BaseException
+) -> IdempotentCreateFailed:
+    """Build the replay's error for a failed original, naming a retained row.
+
+    The waiter settles only after the original's rollback, so a row that still
+    exists here was kept on purpose (a deferred provider cleanup) and is
+    surfaced so it can be removed (issue #943).
+    """
+    message = (
+        f"terminal {terminal_id!r} for idempotency_key "
+        f"{idempotency_key!r} failed to initialize: {error}"
+    )
+    try:
+        get_terminal(terminal_id)
+    except ValueError:
+        return IdempotentCreateFailed(message)
+    return IdempotentCreateFailed(
+        f"{message}; its terminal record was retained because provider cleanup was "
+        "deferred: delete it using this terminal_id",
+        terminal_id=terminal_id,
+    )
 
 
 class TerminalRecordCorruptError(Exception):
@@ -291,15 +373,140 @@ def _bind_decision_launch(plan: "LaunchPlan | None", **values: Any) -> None:
             logger.warning("Decision launch bind failed", exc_info=True)
 
 
+def _classify_launch_target_kind(
+    source: "agent_profiles.ProfileSource", env_vars: Optional[dict] = None
+) -> str:
+    """Issue #1082's target_kind vocabulary (installed/ephemeral/workflow).
+
+    Deliberately independent of ``decisions/targets.py``'s ``TargetKind``,
+    which still has no ``workflow`` member at #1076 (merged at 2192bd43): it
+    labels a workflow step's own decision record with the bare string
+    ``"workflow"``, outside the enum. For installed/ephemeral the two stay
+    equivalent by construction -- both resolve from the same reserved-name
+    check (``routes_to_ephemeral_store``) -- but this function reuses only
+    the already-resolved profile ``source`` the launch path computed for
+    itself, rather than re-deriving it from the name.
+
+    This function's ``"workflow"`` is WIDER than #1076's: it fires on any
+    terminal launched with ``CAO_WORKFLOW_RUN_ID`` in its env, which also
+    covers YAML engine steps (``services/workflow_service.py``), not only a
+    live script run's own step (``launch_owner("run_step", ...)`` ->
+    ``script_step_of``). The two vocabularies are not merged; this is a
+    provisional choice for issue #1082, which leaves the question open.
+
+    The result is always a member of ``LAUNCH_TARGET_KINDS``; callers that
+    write it still check that against the database module's tuple rather
+    than trusting this function's return type, so a future change to this
+    classifier that drifted from that vocabulary would fail closed instead
+    of writing silently.
+    """
+    if env_vars and env_vars.get("CAO_WORKFLOW_RUN_ID"):
+        return "workflow"
+    if source is agent_profiles.ProfileSource.EPHEMERAL:
+        return "ephemeral"
+    return "installed"
+
+
+# Issue #1082, provisional: the end reason of a launch whose terminal row a
+# teardown removed before the launch record existed. That teardown had nothing
+# to stamp and its own reason is no longer known, so CAO closes the record as
+# its own cleanup of state nobody owns any more.
+_UNSTAMPED_TEARDOWN_END_REASON = "stale_cleanup"
+
+
+def _record_launch_best_effort(**values: Any) -> Optional[int]:
+    """Write issue #1082's content-free launch record. Never raises or blocks.
+
+    Returns the new record's id, or None if nothing was written. A failure
+    here must never fail or alter the launch it describes.
+    ``db_create_launch_record`` already swallows its own exceptions; this
+    wrapper additionally protects against a bad caller-side value (e.g. a
+    non-JSON-serializable ``record_ids``) blowing up before that function's
+    own try/except is reached.
+
+    Also the one place that checks ``target_kind`` against
+    ``LAUNCH_TARGET_KINDS`` before it reaches the row. An unknown value fails
+    closed: it is logged and the row is written with no kind (``None``)
+    rather than with a value the vocabulary does not recognize.
+    """
+    target_kind = values.get("target_kind")
+    if target_kind is not None and target_kind not in LAUNCH_TARGET_KINDS:
+        logger.warning(
+            f"Launch record target_kind {target_kind!r} is not one of "
+            f"LAUNCH_TARGET_KINDS {LAUNCH_TARGET_KINDS}; recording no kind"
+        )
+        values["target_kind"] = None
+    try:
+        record_id = db_create_launch_record(**values)
+    except Exception:
+        logger.warning("Launch record create failed", exc_info=True)
+        return None
+    return record_id if isinstance(record_id, int) else None
+
+
+def _close_launch_if_row_gone_best_effort(record_id: int) -> None:
+    """Close a just-written launch record whose row a teardown removed first.
+
+    Issue #1082. ``db_finalize_launch_record_if_terminal_gone`` already
+    swallows its own exceptions; this second layer matters because the call
+    sits inside the create's ``try``, where any exception would roll back a
+    launch that succeeded.
+    """
+    try:
+        db_finalize_launch_record_if_terminal_gone(
+            record_id, end_reason=_UNSTAMPED_TEARDOWN_END_REASON
+        )
+    except Exception:
+        logger.warning("Launch record finalize failed for record %s", record_id, exc_info=True)
+
+
+def _finalize_launch_best_effort(terminal_id: str, *, end_reason: str) -> None:
+    """Finalize a launch record outside a row delete (issue #1082).
+
+    ``db_finalize_launch_records`` already swallows its own exceptions; this
+    second layer keeps a bad value from failing the caller, as
+    ``_record_launch_best_effort`` does for the write.
+    """
+    try:
+        db_finalize_launch_records([terminal_id], end_reason)
+    except Exception:
+        logger.warning("Launch record finalize failed for %s", terminal_id, exc_info=True)
+
+
+def resolve_launch_provider(launch_plan: "LaunchPlan | None", provider: str) -> str:
+    """Resolve the CLI this launch runs on (#1099).
+
+    Only the engine sets ``launch_plan.provider``, for a claimed ephemeral launch that a
+    ``provider.route`` answer routed. The request's provider stays the claim's identity: the
+    idempotency fingerprint, the ephemeral launch checks and the bind compare it unchanged.
+    """
+    return launch_plan.provider if launch_plan and launch_plan.provider else provider
+
+
 def resolve_launch_model(
     model: Optional[str], profile: Optional[AgentProfile], launch_plan: "LaunchPlan | None" = None
 ) -> Optional[str]:
     """Resolve the model CAO passes to a provider for this launch."""
+    if launch_plan is not None and launch_plan.provider is not None:
+        # #1099: a routed launch's profile names the fallback provider's model id, so only
+        # the plan can name the model the decided provider runs.
+        return model or launch_plan.model
     return (
         model
         or (launch_plan.model if launch_plan else None)
         or (profile.model if profile else None)
     )
+
+
+def resolve_launch_effort(launch_plan: "LaunchPlan | None" = None) -> Optional[str]:
+    """Resolve the effort CAO passes to a provider for this launch (#1068 C, #1083).
+
+    Unlike the model, effort is never a per-call override or a profile-level default read
+    here: a provider falls back to its own profile config (``claudeConfig.effort``,
+    ``codexConfig.model_reasoning_effort``) when this is ``None``. A decided effort reaches
+    the provider only through the plan, never through a rewritten live profile.
+    """
+    return launch_plan.effort if launch_plan else None
 
 
 # Track terminals that have already received memory injection (first message only).
@@ -414,6 +621,72 @@ def _is_deferred_init_external_owner_active(terminal_id: str) -> bool:
         return terminal_id in _active_deferred_init_external_owner_ids
 
 
+# Kiro terminals whose initialize() and identity-marker write are running in THIS
+# process (#1074). While a kiro_cli row still reads identity_verified=False, input
+# to it is refused either way; this set only decides whether the refusal is
+# transient (init still running here, so the inbox keeps the message pending) or
+# permanent (init ended without the record). Added at the same pre-insert fence
+# as the external-owner set above, for both the synchronous and the deferred
+# path, and released after the marker write or whenever that init ends.
+_identity_check_in_flight_ids: set[str] = set()
+_identity_check_in_flight_lock = threading.RLock()
+
+
+def _mark_identity_check_in_flight(terminal_id: str) -> None:
+    with _identity_check_in_flight_lock:
+        _identity_check_in_flight_ids.add(terminal_id)
+
+
+def _clear_identity_check_in_flight(terminal_id: str) -> None:
+    with _identity_check_in_flight_lock:
+        _identity_check_in_flight_ids.discard(terminal_id)
+
+
+def _is_identity_check_in_flight(terminal_id: str) -> bool:
+    with _identity_check_in_flight_lock:
+        return terminal_id in _identity_check_in_flight_ids
+
+
+class _SyncInitWaiter:
+    """Settles when a synchronous create's ``provider.initialize()`` finishes.
+
+    Review on PR #773: an idempotent replay used to return the moment the key's
+    terminal row existed, which a keyed synchronous create commits BEFORE it
+    awaits ``provider.initialize()``. A caller recovering from its own client
+    timeout therefore got the terminal back while the provider was still
+    starting, and then sent input into it. The original request only ever
+    returns a READY terminal, so a replay of it must not return anything
+    earlier: it waits on this until the original initialization settles.
+    """
+
+    def __init__(self) -> None:
+        self.settled = asyncio.Event()
+        self.error: Optional[BaseException] = None
+
+    def settle(self, error: Optional[BaseException] = None) -> None:
+        if not self.settled.is_set():
+            self.error = error
+            self.settled.set()
+
+
+# terminal_id -> waiter, only for keyed synchronous creates whose row is
+# committed but whose initialization has not settled yet. create_terminal's
+# finally block removes the entry once the create call exits; a replay that
+# arrives afterwards sees either a ready terminal (success) or no row at all
+# (failed create, rolled back).
+_pending_sync_inits: Dict[str, _SyncInitWaiter] = {}
+
+# True when the most recent create_terminal call in this context returned a
+# terminal that an EARLIER call created (an idempotent replay or a lookup),
+# so a caller that publishes "created" events can skip them for it.
+_last_create_was_replay: ContextVar[bool] = ContextVar("_last_create_was_replay", default=False)
+
+
+def last_create_was_replay() -> bool:
+    """Whether the latest ``create_terminal`` here returned an existing terminal."""
+    return _last_create_was_replay.get()
+
+
 def inject_memory_context(
     first_message: str, terminal_id: str, frozen_memory: str | None = None
 ) -> str:
@@ -470,6 +743,10 @@ def inject_memory_context(
 
     try:
         if remote_memory_url():
+            # The operator's local kill switch (#1071) is enforced inside
+            # memory_context_for_terminal itself, which is the single choke
+            # point shared by this call, the frozen-replay path, and the
+            # three provider memory plugins — so there is nothing to check here.
             context = memory_context_for_terminal(
                 terminal_id,
                 task_description=first_message[:200],
@@ -703,7 +980,7 @@ def _roll_back_cancelled_create(
                 session_name, window_name, created_session=created_session
             )
         try:
-            db_delete_terminal(terminal_id)
+            db_delete_terminal(terminal_id, end_reason="launch_failed")
         except Exception:
             logger.exception(
                 f"Rollback: failed to delete registry row {terminal_id} " "after a cancelled create"
@@ -815,6 +1092,7 @@ def _roll_back_failed_create(
     """
     if terminal_id is not None:
         _clear_deferred_init_external_owner_active(terminal_id)
+        _clear_identity_check_in_flight(terminal_id)
         try:
             fifo_manager.stop_reader(terminal_id)
         except Exception:
@@ -853,7 +1131,7 @@ def _roll_back_failed_create(
             ephemeral_service.release(terminal_id, "launch_failed")
         try:
             if terminal_id is not None:
-                db_delete_terminal(terminal_id)
+                db_delete_terminal(terminal_id, end_reason="launch_failed")
         except Exception:
             pass  # Ignore cleanup errors
     elif terminal_id is not None:
@@ -974,12 +1252,13 @@ def _request_fingerprint(
     had before the fields existed. Both are hashed because each decides the
     created terminal's recorded ceiling, i.e. a privilege, exactly as
     ``allowed_tools`` does: two keyed creates that differ only in the bounding
-    terminal must collide (409), not resolve to the first one's terminal.
+    terminal must not resolve to the first one's terminal.
 
-    Review on PR #634, issue #616. Stored alongside the key so a later call
-    presenting the same key can be told apart: same fingerprint is a RETRY
-    (return the existing terminal), different fingerprint is a COLLISION
-    (raise ``IdempotencyKeyConflict``).
+    Review on PR #634, issue #616. A later call presenting the same key is a
+    RETRY only if its fingerprint matches. Since issue #944 the fingerprint is
+    part of the stored key itself (``_scoped_idempotency_key``), so a call with
+    the same key but a different fingerprint never sees the first call's
+    mapping at all: it lands in its own, empty slot.
 
     REQUESTED values, not resolved ones, and that is load-bearing. The key
     check runs before ``create_terminal`` resolves the working directory,
@@ -989,14 +1268,15 @@ def _request_fingerprint(
     requested-vs-requested is the comparison that matches, and fingerprinting
     resolved values would spuriously conflict a legitimate retry issued from
     a different process cwd (whose ``working_directory=None`` resolves
-    differently) -- a false 409 on the exact case this feature serves.
+    differently) -- a lost replay (a second worker) on the exact case this
+    feature serves.
 
     ``caller_id`` is one of the fields, which is what makes a CROSS-CALLER
     collision a mismatch rather than a silent hand-off of someone else's
-    worker: two supervisors reusing ``job-1`` fingerprint differently and the
-    second gets a loud 409. It is deliberately NOT additionally scoped in the
-    primary key -- see the accepted residuals in ``create_terminal``'s
-    docstring for the one case this cannot separate.
+    worker: two supervisors reusing ``job-1`` fingerprint differently, so each
+    gets its own terminal under its own scoped key (issue #944). See the
+    accepted residuals in ``create_terminal``'s docstring for the one case this
+    cannot separate.
 
     ``env_vars`` and ``resume_session_id`` are hashed for the same reason, and
     ``env_vars`` has the sharpest precedent of any field here: ``RunStepRequest``
@@ -1056,11 +1336,13 @@ def _request_fingerprint(
       cannot yield materially different terminals. Same-shaped question as
       ``allowed_tools``, opposite verified answer -- which is why the resolver
       has to be read rather than the pattern matched.
-    - ``engine`` normalises through ``KiroEngine.value`` because the parameter
-      accepts the enum OR a plain string -- ``api/main.py`` forwards a query
-      string while ``parse_kiro_engine`` returns the member, and the same
-      logical request arriving by those two routes must produce ONE digest or
-      a legitimate retry 409s.
+    - ``engine`` normalises through ``canonical_kiro_engine`` because the
+      parameter accepts the enum OR a plain string -- ``api/main.py`` forwards
+      a query string while ``parse_kiro_engine`` returns the member, and the
+      same logical request arriving by those two routes must produce ONE digest
+      or a legitimate retry misses its replay. The ``kas`` alias canonicalises to ``v3`` for
+      the same reason: a retry spelled ``kas`` and one spelled ``v3`` are one
+      request (#1167).
 
     sha256 hexdigest rather than the joined text: the column stays a bounded
     64 chars regardless of path length, and filesystem paths and profile names
@@ -1083,6 +1365,8 @@ def _request_fingerprint(
     # decide whether that request is acceptable; the engine is validated below,
     # on the path that owns that decision. An invalid engine simply hashes as
     # itself and mismatches, which is all this function needs to be correct.
+    # `canonical_kiro_engine` is the pure half: it maps the `kas` alias to `v3`
+    # and leaves every other string as it is, so it validates nothing.
     # `KiroEngine` is a `str` Enum so joining a member happens to work, but
     # `.value` is the documented contract (`step_fingerprint`: "a KiroEngine
     # member's repr is not stable across versions") and an explicit branch
@@ -1094,7 +1378,7 @@ def _request_fingerprint(
     elif isinstance(engine, KiroEngine):
         engine_value = engine.value
     else:
-        engine_value = str(engine)
+        engine_value = canonical_kiro_engine(str(engine)) or ""
 
     # `None` and `{}` share one encoding, and that is VERIFIED rather than
     # assumed -- the opposite answer to `allowed_tools` above. Every use of
@@ -1116,8 +1400,9 @@ def _request_fingerprint(
     # scheduling. Unhashed, seeding a key for task A and retrying the otherwise
     # identical request with task B handed back A's terminal and discarded B
     # entirely: no conflict, no delivery, no log line. Hashed, that second call
-    # is a 409, which is what both the endpoint's "exact request" contract and
-    # the CLI's own help text already promise.
+    # is a different request with its own terminal (issue #944), which is what
+    # both the endpoint's "exact request" contract and the CLI's own help text
+    # already promise: a key replays only the exact request that claimed it.
     #
     # The orchestration type rides along because it selects HOW the message is
     # delivered, so the same text under a different type is a different
@@ -1128,7 +1413,7 @@ def _request_fingerprint(
     # AFTER creation by `_send_direct_input_handoff`/`_run_step_and_build_result`
     # rather than passed here -- `initial_message` is None on both attempts, so
     # a handoff retry still reuses its worker. That asymmetry is the honest one:
-    # these endpoints own delivery and can therefore conflict on it; the handoff
+    # these endpoints own delivery and can therefore distinguish on it; the handoff
     # path does not, and deduplicating ITS submission needs the durable run
     # record tracked separately (#715), not this fingerprint.
     if initial_message_orchestration_type is None:
@@ -1168,11 +1453,299 @@ def _request_fingerprint(
     ).hexdigest()
 
 
+def _scoped_idempotency_key(idempotency_key: str, request_fingerprint: str) -> str:
+    """Return the storage key for ``idempotency_key`` under ``request_fingerprint``.
+
+    Issue #944. The caller's key alone used to be the stored key, and a create
+    whose fingerprint differed from the stored one was refused with 409 while an
+    unused key answered 404 (``lookup_only``) or 201 (keyed create). The
+    difference told any WRITE-scoped caller whether some other request had
+    claimed a key, without allocating anything. Scoping the stored key by the
+    fingerprint removes the signal at its source: a mismatched request finds no
+    mapping, exactly as for an unused key. A keyed create then creates its own
+    terminal (idempotent for its own retries), and a ``lookup_only`` answers 404.
+
+    The fingerprint is a fixed-width sha256 hexdigest and comes FIRST, so the
+    caller-controlled key cannot forge the boundary between the two parts.
+    """
+    return f"{request_fingerprint}:{idempotency_key}"
+
+
+# A single 32-bit draw is already unlikely to repeat; ten fresh draws after a
+# collision are effectively conclusive. The cap matters for a broken generator
+# (or a test double pinned to one value): fail with a clear error instead of
+# spinning, and before any backend resource is allocated against the id.
+_TERMINAL_ID_ALLOCATION_ATTEMPTS = 10
+
+
+def _allocate_terminal_id() -> str:
+    """Draw a terminal id no live terminal or retained record still references.
+
+    ``generate_terminal_id`` alone is not enough (issue #1088): an id is only
+    unique among CURRENT registry rows, and both idempotency mappings and
+    inbox messages outlive a deleted terminal by ``RETENTION_DAYS``. Reusing
+    one of those ids misroutes a retry or a queued message into the new
+    terminal, so redraw before any resource is keyed off it.
+    """
+    for _ in range(_TERMINAL_ID_ALLOCATION_ATTEMPTS):
+        candidate = generate_terminal_id()
+        if not terminal_id_in_use(candidate):
+            return candidate
+        logger.warning(
+            "Terminal id %s is still referenced by a live or retained record; redrawing",
+            candidate,
+        )
+    raise RuntimeError(
+        "Could not allocate a terminal id after "
+        f"{_TERMINAL_ID_ALLOCATION_ATTEMPTS} attempts; the generator keeps returning "
+        "ids that live terminals, idempotency mappings, or inbox messages still reference"
+    )
+
+
 @dataclass
 class _EphemeralLaunchState:
     """What the create body bound, for the caller's compensation."""
 
     bound_terminal_id: Optional[str] = None
+    # A prepared per-launch Kiro home no provider owns yet (#1167 Phase 2).
+    kiro_home: Optional[KiroLaunchHome] = None
+
+
+def _ephemeral_kiro_refusal(
+    agent_profile: str, caller_id: Optional[str], error: KiroV3Refusal
+) -> "ephemeral_service.EphemeralPolicyError":
+    """A pre-window Kiro helper refusal as the ephemeral policy error the API reports.
+
+    Its rule is the refusal's own code (#1167 Phase 2); the detail carries no
+    server path. Logged and counted in the name's archive like every refusal.
+    """
+    if isinstance(error, KiroLaunchRefusal):
+        detail = error.detail
+    else:
+        text = str(error)
+        detail = text.split(": ", 1)[1] if text.startswith(f"{error.code}: ") else text
+    policy = ephemeral_service.EphemeralPolicyError(error.code, detail)
+    ephemeral_service.report_launch_refusal(agent_profile, caller_id, policy)
+    return policy
+
+
+#: A helper runs only on v3 (``kiro_ephemeral_engine:v2``), so its version and
+#: wrapper refusals name these in place of "retry with engine 'v2'" (#1167 Phase 2).
+_HELPER_SUPPORTED_CLI = "Use a supported kiro-cli version: a Kiro helper runs only on engine 'v3'."
+_HELPER_VERIFIED_CLI = (
+    "Use a verified kiro-cli version, or have the operator opt in with "
+    "kiro.v3_allow_unverified_versions: a Kiro helper runs only on engine 'v3'."
+)
+
+
+def _helper_v3_refusal(error: KiroV3Refusal) -> KiroV3Refusal:
+    """A version refusal with the helper's remedy and the same code; any other as it is."""
+    if isinstance(error, KiroV3UnverifiedVersionError):
+        return KiroV3UnverifiedVersionError(error.version, remedy=_HELPER_VERIFIED_CLI)
+    if isinstance(error, KiroV3UnsupportedVersionError):
+        return KiroV3UnsupportedVersionError(error.version, remedy=_HELPER_SUPPORTED_CLI)
+    return error
+
+
+def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
+    """The probe's version or missing-flag refusal with the helper's remedy, same kind.
+
+    Other probe messages stay intact here. The launch path wraps only the final
+    helper failure as a structured, archived policy refusal after model fallback.
+    """
+    if error.kind == KiroV3UnsupportedVersionError.code:
+        message = str(KiroV3UnsupportedVersionError(error.version, remedy=_HELPER_SUPPORTED_CLI))
+    elif (
+        error.kind == "unsupported_capability"
+        and error.capability
+        and str(error)
+        == missing_flag_message(error.engine, error.capability, error.version, MISSING_FLAG_REMEDY)
+    ):
+        message = missing_flag_message(
+            error.engine, error.capability, error.version, _HELPER_SUPPORTED_CLI
+        )
+    else:
+        return error
+    return KiroCapabilityError(
+        error.kind, error.engine, message, capability=error.capability, version=error.version
+    )
+
+
+def _helper_engine(
+    agent_profile: str, caller_id: Optional[str], engine: Any, profile: Optional[AgentProfile]
+) -> KiroEngine:
+    """An ephemeral Kiro helper runs on v3 (#1167 Phase 2).
+
+    No engine, ``v3`` and ``kas`` resolve to v3; ``v2`` refuses before bind with
+    ``kiro_ephemeral_engine:v2``. An explicit engine and the profile's must
+    still agree, as for every Kiro launch. Provisional (#1167).
+    """
+    profile_engine = getattr(profile, "engine", None)
+    if engine is None and profile_engine is None:
+        return KiroEngine.V3
+    resolved = resolve_kiro_engine(explicit=engine, profile=profile_engine)
+    if resolved != KiroEngine.V3:
+        raise _ephemeral_kiro_refusal(
+            agent_profile,
+            caller_id,
+            KiroLaunchRefusal(
+                "kiro_ephemeral_engine:v2",
+                "an ephemeral Kiro helper runs on the v3 engine only; omit the engine, or "
+                "pass v3",
+            ),
+        )
+    return resolved
+
+
+def _helper_stage_a(
+    agent_profile: str, caller_id: Optional[str], env_vars: Optional[dict[str, str]]
+) -> Tuple[ResolvedKiroCli, Path, KiroGlobalHome]:
+    """Stage A of a Kiro helper launch, before the probe and before bind (#1167 Phase 2).
+
+    First the legacy-copy guard: the probe home and its placeholders, then
+    what Kiro would copy from ``~/.kiro`` (stat only). Then the kiro-cli to run,
+    and the forwarded-home and herdr-path refusals. A refusal returns the
+    claim. Blocking I/O: callers to_thread it.
+    """
+    from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend, herdr_arg_is_safe
+
+    try:
+        probe_home = kiro_launch_home.ensure_probe_home()
+        global_home = kiro_launch_home.check_kiro_global_home(probe_home)
+        kiro_cli = kiro_launch_home.resolve_kiro_cli()
+        if env_vars and kiro_launch_home.KIRO_HOME_ENV in env_vars:
+            raise KiroLaunchRefusal(
+                "kiro_home_invalid:forwarded",
+                "an ephemeral Kiro helper runs from its own CAO-owned KIRO_HOME; "
+                "do not forward one in env_vars",
+            )
+        sample = kiro_launch_home.kiro_home_path("0" * 8)
+        if isinstance(get_backend(), HerdrBackend) and not herdr_arg_is_safe(
+            f"{kiro_launch_home.KIRO_HOME_ENV}={sample}"
+        ):
+            raise KiroLaunchRefusal(
+                "kiro_home_invalid:unsafe_path",
+                "the CAO home path has characters herdr cannot pass to a pane",
+            )
+    except KiroLaunchRefusal as exc:
+        raise _ephemeral_kiro_refusal(agent_profile, caller_id, exc) from None
+    return kiro_cli, probe_home, global_home
+
+
+def _check_helper_workspace(
+    agent_profile: str, caller_id: Optional[str], cwd: str, user_home: str
+) -> None:
+    """Phase 1's workspace check for a helper, plus ``HOME``'s own rule; refuses before bind."""
+    try:
+        check_kiro_helper_workspace(cwd, user_home)
+    except KiroV3Refusal as exc:
+        raise _ephemeral_kiro_refusal(agent_profile, caller_id, exc) from None
+
+
+def _remove_unowned_kiro_home(prepared: KiroLaunchHome) -> None:
+    """Remove a prepared Kiro home no provider owns; the sweep retries a failure."""
+    try:
+        if not ephemeral_service.remove_kiro_home(prepared.terminal_id):
+            logger.warning("Kiro home for terminal %s retained for a retry", prepared.terminal_id)
+    except Exception:  # noqa: BLE001 - cleanup must not replace the launch's own error
+        logger.exception("Removing the Kiro home for terminal %s failed", prepared.terminal_id)
+
+
+def _prepare_kiro_launch(
+    agent_profile: str,
+    caller_id: Optional[str],
+    profile: AgentProfile,
+    allowed_tools: List[str],
+    terminal_id: str,
+    working_directory: str,
+    kiro_cli: ResolvedKiroCli,
+    global_home: KiroGlobalHome,
+    model: Optional[str],
+    effort: Optional[str],
+    version: Optional[str],
+    schema: KiroV3EngineSchema,
+) -> KiroLaunch:
+    """Stage B of a Kiro helper launch, after bind and before the window (#1167 Phase 2).
+
+    Renders the helper's universal agent file from the profile Step 0 verified,
+    creates and seeds the home with its sentinel and placeholders, checks both
+    agent files from disk with CAO's v3 validator for this grant and the
+    probed schema, runs the workspace check again on the final cwd (a worktree
+    included), and seals the home. Any refusal removes the home again.
+    Blocking I/O: callers to_thread it.
+    """
+    prepared: Optional[KiroLaunchHome] = None
+    try:
+        grant = kiro_launch_home.kiro_helper_grant(allowed_tools)
+        payload = kiro_launch_home.render_helper_agent(agent_profile, profile, grant, terminal_id)
+        prepared = kiro_launch_home.create_launch_home(
+            terminal_id, agent_profile, payload, global_home
+        )
+        kiro_launch_home.verify_launch_home(prepared, sealed=False)
+        kiro_launch_home.check_helper_files(prepared, grant, schema)
+        check_kiro_helper_workspace(working_directory, global_home.user_home)
+        kiro_launch_home.seal_launch_home(prepared)
+        ephemeral_service.record_kiro_event(
+            terminal_id,
+            "kiro_home_prepared",
+            home=str(prepared.home),
+            hashes=prepared.hashes(),
+            placeholder=prepared.powers.record(),
+            global_home=global_home.record(),
+            kiro_cli=kiro_cli.path,
+            kiro_cli_target=kiro_cli.target,
+            kiro_version=version,
+            schema=schema.engine,
+        )
+    except KiroV3Refusal as exc:
+        if prepared is not None:
+            _remove_unowned_kiro_home(prepared)
+        raise _ephemeral_kiro_refusal(agent_profile, caller_id, exc) from None
+    except BaseException:
+        if prepared is not None:
+            _remove_unowned_kiro_home(prepared)
+        raise
+    return KiroLaunch(
+        home=prepared,
+        kiro_cli=kiro_cli,
+        grant=tuple(grant),
+        working_directory=working_directory,
+        model=model,
+        effort=effort,
+        version=version,
+        schema=schema.engine,
+    )
+
+
+def _add_kiro_home_to_window_env(env: Dict[str, str], kiro_launch: Optional[KiroLaunch]) -> None:
+    """Put the per-launch home in the window's own env, never in ``env_vars``.
+
+    Kiro's shell integration runs ``kiro-cli init`` and ``pre-cmd`` in the pane
+    with the pane's ``KIRO_HOME``; ``env_vars`` would persist into the session
+    and reach every later window in it. The command assigns it as well, so an
+    rc file's export cannot change it. On a new session the window's env is
+    also the backend's session env, so ``_keep_kiro_home_out_of_session``
+    replaces it there once the session exists.
+    """
+    if kiro_launch is not None:
+        env[kiro_launch_home.KIRO_HOME_ENV] = str(kiro_launch.home.home)
+
+
+def _keep_kiro_home_out_of_session(session_name: str, kiro_launch: Optional[KiroLaunch]) -> None:
+    """Give a session this launch just created back its own KIRO_HOME (#1167 Phase 2).
+
+    tmux's ``new-session -e`` makes the first window's env the session's own, so
+    every later window in the session would start with this helper's
+    ``KIRO_HOME``, and the release would stop those windows' processes as owners
+    of the home. The session gets back the ``KIRO_HOME`` it would have had
+    without the launch (the server's own, if CAO forwards one), and the first
+    pane keeps its value. Called inside the create's rollback guard: when the
+    backend cannot put it back, the session is torn down and the launch fails.
+    """
+    if kiro_launch is not None:
+        get_backend().restore_session_env(
+            session_name, kiro_launch_home.KIRO_HOME_ENV, str(kiro_launch.home.home)
+        )
 
 
 async def create_terminal(
@@ -1196,6 +1769,7 @@ async def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
     create_working_directory: bool = False,
@@ -1271,6 +1845,17 @@ async def create_terminal(
         metadata: Free-form JSON describing what this terminal is doing.
             Also updatable later by the running agent via the
             ``update_metadata`` MCP tool.
+        lookup_only: Review on PR #773. Resolve ``idempotency_key`` to the
+            terminal a prior call committed and return it at once -- without
+            waiting for that call's provider initialization and without ever
+            allocating. Raises ``IdempotencyKeyNotFound`` when the key maps to
+            no live terminal. The same fingerprint check as any other replay
+            applies, so this is not a fingerprint-blind lookup. The returned
+            terminal may still be initializing: it is an identity for
+            inspection and cleanup, not permission to send input. A key that
+            is unused and a key claimed by a DIFFERENT request both raise
+            ``IdempotencyKeyNotFound`` (issue #944), so a lookup cannot tell
+            whether someone else is using a key.
         idempotency_key: Review on PR #634, issue #616. When given and a PRIOR
             call already created a terminal for the SAME KEY **and the same
             request**, that terminal is returned as-is and nothing else in
@@ -1285,12 +1870,15 @@ async def create_terminal(
 
             The key does NOT identify the request on its own -- it is matched
             together with a fingerprint of ELEVEN fields (see
-            ``_request_fingerprint``). Presenting a key that a DIFFERENT
-            request already claimed raises ``IdempotencyKeyConflict``
-            (HTTP 409) rather than handing back a terminal that answers
-            someone else's question. A key whose terminal no longer exists is
-            treated as stale and simply creates fresh -- that is not a
-            conflict.
+            ``_request_fingerprint``), and the pair is the stored key (see
+            ``_scoped_idempotency_key``, issue #944). Presenting a key that a
+            DIFFERENT request already claimed therefore creates a fresh
+            terminal for THIS request, idempotent for its own retries, rather
+            than handing back a terminal that answers someone else's question.
+            It is deliberately not refused: a 409 there, against a 201 or 404
+            for an unused key, told a caller whether the key was in use. A key
+            whose terminal no longer exists is treated as stale and simply
+            creates fresh.
 
             THE FIELD SET IS CLOSED BY ENUMERATION, not by however many review
             rounds happened to run. Every caller-reachable parameter of BOTH
@@ -1375,30 +1963,15 @@ async def create_terminal(
             A first call carrying an invalid engine raises before any terminal
             or key row is written, so a key hit implies the STORED engine was
             valid -- and any later differing engine now mismatches the
-            fingerprint and is refused.
+            fingerprint, misses the replay, and reaches the validator itself.
 
-            ACCEPTED MISATTRIBUTION, recorded rather than left silent. Two
-            cases, only one of which is this change's:
-
-            - USED key + invalid engine: was 200 (the bypass above), now 409
-              "this key was already used for a different request". So the
-              operator is told to change their KEY when their ENGINE is what
-              is wrong. Accepted rather than fixed, because reaching the real
-              validator means loading the agent profile and running the Kiro
-              capability probe -- a ``subprocess.run`` -- which is exactly the
-              work this short-circuit exists to skip; paying it on every retry
-              would trade away the property the feature is FOR in exchange for
-              a better message. The request is refused either way; only the
-              stated reason is imprecise.
-            - FRESH key + invalid engine: 404 on
-              ``POST /sessions/{name}/terminals`` (400 on ``POST /sessions``),
-              because the validator raises a BARE ``ValueError`` -- not a
-              ``KiroCapabilityError`` -- so it falls past that route's 400 arm
-              to its generic "not found" arm. That is PRE-EXISTING, is
-              unchanged by this change, and is deliberately not fixed here --
-              correcting it means reworking error mapping this change does not
-              own. Noted only so the 409 above is not mistaken for a
-              regression from a 400 that never existed.
+            A USED key + invalid engine is therefore rejected exactly as a
+            FRESH key + invalid engine is: 404 on
+            ``POST /sessions/{name}/terminals`` (400 on ``POST /sessions``),
+            because the validator raises a BARE ``ValueError`` -- not a
+            ``KiroCapabilityError`` -- so it falls past that route's 400 arm to
+            its generic "not found" arm. That mapping is PRE-EXISTING and
+            deliberately not fixed here.
 
             This resolves an apparent tension with the commit directly beneath
             this one, which stopped ``engine`` being forwarded to a non-Kiro
@@ -1450,8 +2023,8 @@ async def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         WorkingDirectoryError: If ``create_working_directory`` is set and the
             directory is refused by the path policy or cannot be created.
-        IdempotencyKeyConflict: If ``idempotency_key`` was already used for a
-            different request (surfaced as HTTP 409 by both create endpoints)
+        IdempotencyKeyNotFound: If ``lookup_only`` and no terminal is
+            recorded for this key AND this request (HTTP 404)
         TerminalRecordCorruptError: If the terminal a key maps to has a stored
             row that does not satisfy the ``Terminal`` model (HTTP 500)
         TerminalLimitError: If the node's tracked-terminal cap (CAO_MAX_TERMINALS /
@@ -1482,6 +2055,7 @@ async def create_terminal(
             metadata=metadata,
             description=description,
             idempotency_key=idempotency_key,
+            lookup_only=lookup_only,
             claim_id=claim_id,
             create_working_directory=create_working_directory,
             launch_plan=launch_plan,
@@ -1495,6 +2069,10 @@ async def create_terminal(
                 ephemeral_service.end_claim(agent_profile, claim_id)
         elif isinstance(exc, asyncio.CancelledError):
             ephemeral_service.release(state.bound_terminal_id, "launch_failed")
+            if state.kiro_home is not None:
+                # Prepared after bind, before any provider took it over (#1167
+                # Phase 2); the sweep retries if this cannot finish.
+                _remove_unowned_kiro_home(state.kiro_home)
         raise
 
 
@@ -1519,6 +2097,7 @@ async def _create_terminal_unguarded(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
     create_working_directory: bool = False,
@@ -1535,10 +2114,14 @@ async def _create_terminal_unguarded(
     # retry on a full node -- the one case this feature exists to make safe.
     # The cap still precedes every actual allocation (worktree, tmux window, DB
     # row, provider process), which is all its own placement-guard needs.
+    _last_create_was_replay.set(False)
+    if lookup_only and not idempotency_key:
+        raise ValueError("lookup_only requires an idempotency_key")
     from cli_agent_orchestrator.utils.description import normalize_description
 
     description = normalize_description(description, truncate=True)
     request_fingerprint: Optional[str] = None
+    storage_key: Optional[str] = None
     if idempotency_key:
         request_fingerprint = _request_fingerprint(
             provider,
@@ -1559,7 +2142,11 @@ async def _create_terminal_unguarded(
             caller_ceiling=caller_ceiling,
             delegating_terminal_id=delegating_terminal_id,
         )
-        existing_record = get_idempotency_record(idempotency_key)
+        # Issue #944: look up, store and delete under the fingerprint-scoped
+        # key, never the bare one. A different request under the same key
+        # finds nothing here, the same as a key nobody has used.
+        storage_key = _scoped_idempotency_key(idempotency_key, request_fingerprint)
+        existing_record = get_idempotency_record(storage_key)
         existing_terminal_id = existing_record.terminal_id if existing_record else None
         if existing_terminal_id is not None:
             # Only the LOOKUP is guarded. `Terminal(**row)` is deliberately
@@ -1576,6 +2163,18 @@ async def _create_terminal_unguarded(
             try:
                 row = get_terminal(existing_terminal_id)
             except ValueError:
+                # A failed original deletes its row during rollback before it
+                # removes its waiter (review on PR #773). A replay that lands in
+                # that window must report the original's failure, keeping the
+                # mapping, rather than read the missing row as stale and start a
+                # second worker for the key.
+                waiter = _pending_sync_inits.get(existing_terminal_id)
+                if waiter is not None and not lookup_only:
+                    await waiter.settled.wait()
+                    if waiter.error is not None:
+                        raise _failed_replay_error(
+                            existing_terminal_id, idempotency_key, waiter.error
+                        ) from waiter.error
                 # The key's mapping outlived the terminal it pointed to (e.g.
                 # a completed-and-torn-down handoff, retried long after the
                 # fact) -- there is nothing left to recover, so fall through
@@ -1592,7 +2191,7 @@ async def _create_terminal_unguarded(
                 # if a concurrent caller already replaced the mapping, this
                 # deletes nothing and this attempt's own insert below is the
                 # one that raises IntegrityError instead.
-                delete_idempotency_key(idempotency_key, existing_terminal_id)
+                delete_idempotency_key(storage_key, existing_terminal_id)
                 logger.info(
                     "idempotency_key %r maps to terminal %r, which no longer exists; "
                     "creating a new terminal",
@@ -1600,33 +2199,33 @@ async def _create_terminal_unguarded(
                     existing_terminal_id,
                 )
             else:
-                # Reached ONLY once the mapped terminal is confirmed to still
-                # exist, and that ordering is the whole point: the stale-key
-                # branch above already fell through, so a key whose terminal is
-                # gone is never compared and never conflicts. Checking the
-                # fingerprint first would 409 the legitimate case this feature
-                # was built for -- an operator reusing a key from a job that
-                # already finished.
-                if existing_record is not None and (
-                    existing_record.request_fingerprint != request_fingerprint
-                ):
-                    # A different request under the same key is operator error,
-                    # not a retry, and returning the stored terminal here is not
-                    # a merely-wrong return value: _handoff_impl feeds it
-                    # straight into reuse_terminal_id, so this caller's prompt
-                    # would be delivered into the OTHER caller's running worker,
-                    # in that worker's session, under its tool restrictions --
-                    # and this caller's teardown would then delete it.
-                    raise IdempotencyKeyConflict(
-                        f"idempotency_key {idempotency_key!r} was already used for a "
-                        "different request; use a distinct key"
-                    )
+                # The mapped terminal still exists. No fingerprint comparison is
+                # needed: the storage key already includes the fingerprint, so
+                # only this same request can have produced this mapping.
                 # A genuine retry: same key, same request. Return the terminal
                 # the first call produced without doing any real work -- the
-                # property haofeif signed off on, unchanged by the check above.
+                # property haofeif signed off on.
+                #
+                # If that first call is a synchronous create still inside
+                # provider.initialize(), wait for it first: the replay must
+                # give back what the original would, a READY terminal, not one
+                # whose provider is still starting (review on PR #773). The
+                # replay's own defer_init does not matter here: it is not part
+                # of the request fingerprint, and only a synchronous original
+                # registers a waiter, so a waiter means the original promised
+                # a ready terminal. lookup_only is the one explicit way to get
+                # the identity without waiting.
+                waiter = _pending_sync_inits.get(existing_terminal_id)
+                if waiter is not None and not lookup_only:
+                    await waiter.settled.wait()
+                    if waiter.error is not None:
+                        raise _failed_replay_error(
+                            existing_terminal_id, idempotency_key, waiter.error
+                        ) from waiter.error
+                    row = get_terminal(existing_terminal_id)
                 try:
                     _bind_decision_launch(launch_plan, launch_status="not_launched")
-                    return Terminal(**row)
+                    terminal = Terminal(**row)
                 except ValidationError as exc:
                     # Re-raised as a non-ValueError so a corrupt STORED row is
                     # reported as a 500 rather than being blamed on the caller
@@ -1636,6 +2235,16 @@ async def _create_terminal_unguarded(
                         f"idempotency_key {idempotency_key!r} but its stored row does "
                         f"not satisfy the Terminal model: {exc}"
                     ) from exc
+                _last_create_was_replay.set(True)
+                return terminal
+
+    if lookup_only:
+        # The key maps to no live terminal. A lookup never allocates: it exists
+        # so a caller whose bounded wait expired can recover the identity of
+        # work that IS committed, not start new work (review on PR #773).
+        raise IdempotencyKeyNotFound(
+            f"no terminal is recorded for idempotency_key {idempotency_key!r}"
+        )
 
     # Per-node terminal cap (one-agent-per-pod k8s topology; worker pods set
     # CAO_MAX_TERMINALS=1). Checked FIRST, before any resource (worktree, tmux
@@ -1654,6 +2263,7 @@ async def _create_terminal_unguarded(
             )
 
     terminal_id: Optional[str] = None
+    sync_init_waiter: Optional[_SyncInitWaiter] = None
     created_terminal_facts: Optional[Dict[str, Any]] = None
     # The window name the failure handler rolls back. ``window_name`` itself is
     # first bound inside the try, so a failure before that point (capability
@@ -1677,7 +2287,7 @@ async def _create_terminal_unguarded(
     worktree_repo_root: Optional[str] = None
     try:
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
-        # resource. A KAS request must probe then fail closed with no window,
+        # resource. A v3 request must probe then fail closed with no window,
         # database row, FIFO, Herdr registration, or provider process.
         source = agent_profiles.ProfileSource.INSTALLED
         try:
@@ -1695,19 +2305,53 @@ async def _create_terminal_unguarded(
         # accepting arbitrary attributes as configuration.
         if profile is not None and not isinstance(profile, AgentProfile):
             profile = None
+        if (
+            launch_plan is not None
+            and launch_plan.provider is not None
+            and (source is not agent_profiles.ProfileSource.EPHEMERAL or claim_id is None)
+        ):
+            # #1099: only the engine routes, and only a claimed ephemeral launch. Anything
+            # else is a bug, refused here before any resource is allocated.
+            raise RuntimeError("a launch plan routed a launch that is not a claimed ephemeral")
+        if (
+            launch_plan is not None
+            and launch_plan.provider is not None
+            and not capability_for(launch_plan.provider).routable
+        ):
+            # A routed Kiro helper would drop its planned effort and escape the sweep's
+            # home retry, so it is refused before any resource or Kiro step (#1167).
+            raise RuntimeError(
+                f"a launch plan routed a launch to {launch_plan.provider}, "
+                "which provider.route cannot route to yet"
+            )
+        # The request's provider stays the claim's identity: the fingerprint and the ephemeral
+        # launch checks above used it, and the bind below compares it. Everything else that
+        # depends on which CLI runs uses the launch provider (#1099).
+        requested_provider = provider
+        provider = resolve_launch_provider(launch_plan, provider)
         decision_not_honored = False
         launch_model = resolve_launch_model(model, profile, launch_plan)
+        launch_effort = resolve_launch_effort(launch_plan)
         model_honored = ProviderManager.provider_class(provider).honors_model(
             agent_profile=agent_profile,
             profile=profile,
             requested_model=launch_model,
         )
 
+        kiro_v3_admission = None
+        # An ephemeral Kiro helper (#1167 Phase 2): stage A's kiro-cli and the
+        # ~/.kiro snapshot, then the launch stage B prepares after bind.
+        kiro_helper: Optional[Tuple[ResolvedKiroCli, KiroGlobalHome]] = None
+        kiro_launch: Optional[KiroLaunch] = None
+        helper = source is agent_profiles.ProfileSource.EPHEMERAL
         if provider == ProviderType.KIRO_CLI.value:
-            resolved_engine = resolve_kiro_engine(
-                explicit=engine,
-                profile=getattr(profile, "engine", None),
-            )
+            if helper:
+                resolved_engine = _helper_engine(agent_profile, caller_id, engine, profile)
+            else:
+                resolved_engine = resolve_kiro_engine(
+                    explicit=engine,
+                    profile=getattr(profile, "engine", None),
+                )
             if allowed_tools is None and profile is not None:
                 from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
                 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
@@ -1722,29 +2366,101 @@ async def _create_terminal_unguarded(
             # Mirror the launch-time precedence (`model or profile.model`, see
             # _get_profile_model): probing the profile snapshot alone would let an
             # explicit override launch --model on a wrapper never probed for it.
+            # A v3 launch also passes an effort as --effort (#1167), so the probe
+            # asks for that flag too; v2's request is unchanged.
+            # #1083: the plan's effort first, as for every provider (resolve_launch_effort),
+            # then the profile's kiroConfig.effort; v2 takes no effort.
+            planned_effort = launch_effort
+            launch_effort = None
+            if resolved_engine == KiroEngine.V3:
+                try:
+                    launch_effort = (
+                        kiro_effort_value(planned_effort)
+                        if planned_effort is not None
+                        else kiro_effort(profile)
+                    )
+                except ValueError as exc:
+                    # A coded refusal, so every create route answers 400 (the
+                    # in-session and run-step routes map a bare ValueError to 404).
+                    raise KiroV3LaunchError(
+                        "kiro_v3_bad_effort",
+                        f"{exc}. Fix the profile's kiroConfig.effort, or retry with engine 'v2'.",
+                    ) from None
             requested = requested_kiro_capabilities(
                 resolved_engine,
                 model=launch_model,
                 yolo=True,
+                effort=launch_effort,
             )
-            probe = kiro_capability_probe or probe_kiro_capabilities
+            probe: Callable[..., KiroCapabilities] = (
+                kiro_capability_probe or probe_kiro_capabilities
+            )
+            if helper:
+                # Stage A (#1167 Phase 2), before the probe: nothing Kiro would
+                # copy from ~/.kiro, an absolute kiro-cli, no forwarded KIRO_HOME;
+                # then the probe runs that same binary under the probe home.
+                resolved_cli, kiro_probe_home, global_home = await asyncio.to_thread(
+                    _helper_stage_a, agent_profile, caller_id, env_vars
+                )
+                kiro_helper = (resolved_cli, global_home)
+                probe = functools.partial(
+                    probe,
+                    executable=resolved_cli.path,
+                    env=kiro_launch_home.kiro_env(kiro_probe_home),
+                )
             try:
-                await asyncio.to_thread(probe, resolved_engine, requested)
-            except KiroCapabilityError:
-                if model or launch_plan is None or launch_plan.model is None:
+                try:
+                    capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
+                except KiroCapabilityError:
+                    # A routed launch is refused, never relaunched on the profile's model, which
+                    # is the fallback provider's (#1099).
+                    if (
+                        model
+                        or launch_plan is None
+                        or launch_plan.model is None
+                        or launch_plan.provider is not None
+                    ):
+                        raise
+                    launch_model = resolve_launch_model(model, profile)
+                    requested = requested_kiro_capabilities(
+                        resolved_engine, model=launch_model, yolo=True, effort=launch_effort
+                    )
+                    capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
+                    decision_not_honored = True
+                    model_honored = ProviderManager.provider_class(provider).honors_model(
+                        agent_profile=agent_profile, profile=profile, requested_model=launch_model
+                    )
+            except KiroCapabilityError as exc:
+                if not helper:
                     raise
-                launch_model = resolve_launch_model(model, profile)
-                requested = requested_kiro_capabilities(
-                    resolved_engine, model=launch_model, yolo=True
-                )
-                await asyncio.to_thread(probe, resolved_engine, requested)
-                decision_not_honored = True
-                model_honored = ProviderManager.provider_class(provider).honors_model(
-                    agent_profile=agent_profile, profile=profile, requested_model=launch_model
-                )
-            if resolved_engine == KiroEngine.KAS:
-                raise KiroPhase0KASError(
-                    bool(profile and (profile.allowedTools or profile.toolsSettings))
+                error = _helper_capability_error(exc)
+                # Convert once, after #1099's decided-model fallback. Keep the
+                # rule in its field and remove its duplicate from the detail.
+                detail = str(error).removeprefix(f"{error.kind}: ")
+                raise _ephemeral_kiro_refusal(
+                    agent_profile, caller_id, KiroLaunchRefusal(error.kind, detail)
+                ) from None
+            if resolved_engine == KiroEngine.V3:
+                # #1167: the probed version must be allow-listed and verified
+                # (or pending, with the operator's opt-in), and the policy
+                # restricted.
+                try:
+                    kiro_v3_admission = require_kiro_v3_admissible(capabilities, allowed_tools)
+                except KiroV3Refusal as exc:
+                    if not helper:
+                        raise
+                    raise _ephemeral_kiro_refusal(
+                        agent_profile, caller_id, _helper_v3_refusal(exc)
+                    ) from None
+            if kiro_helper is not None and not use_worktree:
+                # A5: the request's cwd, before bind. With a worktree the cwd does
+                # not exist yet; stage B checks the final cwd either way.
+                await asyncio.to_thread(
+                    _check_helper_workspace,
+                    agent_profile,
+                    caller_id,
+                    _resolve_working_directory(working_directory),
+                    kiro_helper[1].user_home,
                 )
         else:
             if engine is not None:
@@ -1882,22 +2598,32 @@ async def _create_terminal_unguarded(
         # unrestricted delegator (ceiling ``*``) and operator launches keep the
         # launch-time warning instead: nothing the creator may not delegate can
         # leak there, and the launch prompt already says what runs.
+        #
+        # A Kiro helper has no installed file: its policy is the per-launch
+        # file, checked against this launch's grant in stage B, bounded or not
+        # (#1167 Phase 2).
         if (
             provider == ProviderType.KIRO_CLI.value
+            and not helper
             and parent_ceiling is not None
             and "*" not in parent_ceiling
             and allowed_tools is not None
             and "*" not in allowed_tools
         ):
-            from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
+            from cli_agent_orchestrator.utils.tool_mapping import (
+                kiro_agent_tools,
+                kiro_universal_tools,
+            )
 
             installed = installed_kiro_tools(agent_profile)
             if installed is None:
                 # No readable agent file with a `tools` list: on Kiro the installed
                 # file IS the policy, so the server cannot say what this launch
                 # would run. A bounded create fails closed here rather than
-                # skipping the check; the operator path is untouched (Kiro would
-                # fail to start the agent anyway, this just names the reason).
+                # skipping the check. Kiro itself would NOT fail on a missing
+                # agent: it starts its built-in kiro_default with every built-in
+                # tool (#1074). Unbounded and operator launches are covered by
+                # Step 1c's agent check and the provider's header identity check.
                 raise InstalledPolicyExceedsAllowlistError(
                     f"Delegation refused: no installed Kiro agent file with a `tools` list "
                     f"was found for '{agent_profile}', so the policy this bounded launch "
@@ -1908,7 +2634,14 @@ async def _create_terminal_unguarded(
                     child_profile=agent_profile,
                 )
             else:
-                permitted = set(kiro_agent_tools(allowed_tools))
+                # A v3-enabled install's universal file lists v3 tool ids next
+                # to the v2 names, so it is compared with the universal map, or
+                # those ids would read as wider than the row (#1167).
+                permitted = set(
+                    kiro_universal_tools(allowed_tools)
+                    if installed_kiro_agent_is_universal(agent_profile)
+                    else kiro_agent_tools(allowed_tools)
+                )
                 wider = [tool for tool in installed if tool not in permitted]
                 if wider:
                     raise InstalledPolicyExceedsAllowlistError(
@@ -1987,16 +2720,22 @@ async def _create_terminal_unguarded(
                     )
 
         # Step 1: Generate unique identifiers
-        terminal_id = generate_terminal_id()
+        terminal_id = _allocate_terminal_id()
+        # Registered BEFORE the row (and this key's mapping) can be committed,
+        # so there is no window in which a replay finds the row but no waiter.
+        if idempotency_key and not defer_init:
+            sync_init_waiter = _SyncInitWaiter()
+            _pending_sync_inits[terminal_id] = sync_init_waiter
         if source is agent_profiles.ProfileSource.EPHEMERAL:
             ephemeral_service.bind_ephemeral_agent(
                 agent_profile,
                 terminal_id,
                 caller_id,
-                provider,
+                requested_provider,
                 claim_id,
                 allowed_tools,
                 idempotency_key,
+                launched_provider=provider,
             )
             ephemeral_state.bound_terminal_id = terminal_id
 
@@ -2060,6 +2799,63 @@ async def _create_terminal_unguarded(
             # directory behind.
             resolved_working_directory = validate_working_directory(working_directory)
 
+        # Step 1c: a Kiro launch must name an agent kiro-cli will load. kiro-cli
+        # does not refuse an unknown --agent; it starts its built-in kiro_default
+        # with every built-in tool (#1074). Refused here, before any window or
+        # row exists, from the launch cwd (workspace agents live under it). The
+        # provider re-checks the pane header before any task is typed.
+        # Provisional (#1074): installed launches refuse rather than warn.
+        #
+        # A Kiro helper replaces this check (#1167 Phase 2): it has no installed
+        # file, and Kiro reads its agents from the per-launch home. Stage B
+        # prepares that home instead, after bind and before the window.
+        if provider == ProviderType.KIRO_CLI.value and kiro_helper is not None:
+            assert profile is not None and allowed_tools is not None
+            assert kiro_v3_admission is not None
+            kiro_launch = await asyncio.to_thread(
+                _prepare_kiro_launch,
+                agent_profile,
+                caller_id,
+                profile,
+                allowed_tools,
+                terminal_id,
+                resolved_working_directory,
+                kiro_helper[0],
+                kiro_helper[1],
+                launch_model,
+                launch_effort,
+                capabilities.version,
+                kiro_v3_admission.schema,
+            )
+            ephemeral_state.kiro_home = kiro_launch.home
+        elif provider == ProviderType.KIRO_CLI.value:
+            # A window joining an existing session launches with the session env
+            # under the per-launch env (Step 3c), so a forwarded KIRO_HOME there
+            # counts here too. Off the loop: a miss parses every agent file.
+            check_env = (
+                env_vars if new_session else {**get_session_env(session_name), **(env_vars or {})}
+            )
+            if kiro_v3_admission is not None:
+                # #1167: from the same cwd and env, a v3 launch needs the default
+                # Kiro home, an installed agent file that passes the validator
+                # for this launch's grant, and a workspace whose .kiro/ v3 would
+                # not load as configuration. First, so a missing file refuses
+                # with the v3 install remedy rather than the v2 resolver's.
+                from cli_agent_orchestrator.services import install_service
+
+                await asyncio.to_thread(
+                    require_kiro_v3_launchable,
+                    agent_profile,
+                    resolved_working_directory,
+                    check_env,
+                    list(allowed_tools or []),
+                    kiro_v3_admission.schema,
+                    Path(install_service.KIRO_AGENTS_DIR),
+                )
+            await asyncio.to_thread(
+                require_kiro_agent_resolves, agent_profile, resolved_working_directory, check_env
+            )
+
         # Normalize the session name BEFORE anything keys off it: the lifecycle
         # lock below is per session NAME, so it must be taken on the SAME string
         # the tmux create and the registry row use, or a create and a teardown of
@@ -2095,6 +2891,7 @@ async def _create_terminal_unguarded(
             )
         elif (
             provider == ProviderType.KIRO_CLI.value
+            and kiro_launch is None
             and agent_profile
             and kiro_install_predates_native_enforcement(agent_profile, allowed_tools)
         ):
@@ -2204,6 +3001,7 @@ async def _create_terminal_unguarded(
 
                     # Create new tmux session with initial window
                     effective_env = dict(env_vars or {})
+                    _add_kiro_home_to_window_env(effective_env, kiro_launch)
                     get_backend().create_session(
                         session_name,
                         window_name,
@@ -2232,6 +3030,7 @@ async def _create_terminal_unguarded(
                     # CAO_WORKFLOW_RUN_ID must reach the window even when it
                     # joins an existing session (issue #408).
                     effective_env = {**get_session_env(session_name), **(env_vars or {})}
+                    _add_kiro_home_to_window_env(effective_env, kiro_launch)
                     if create_working_directory:
                         # Point of use, as in the new-session branch above.
                         ensure_working_directory(resolved_working_directory)
@@ -2255,6 +3054,15 @@ async def _create_terminal_unguarded(
                         # mistakes this process's live initialization for a
                         # crash-stranded row from the previous process.
                         _mark_deferred_init_external_owner_active(terminal_id)
+                if provider == ProviderType.KIRO_CLI.value:
+                    # Same fence, both paths (#1074): the row becomes visible
+                    # reading identity_verified=False, and until this process
+                    # records the check (or the init ends) an input to it is
+                    # refused as pending, not as failed. The id was already
+                    # allocated and checked against live and retained records
+                    # (Step 1, #1088), so this never marks a candidate the
+                    # allocator rejects, nor one another terminal still holds.
+                    _mark_identity_check_in_flight(terminal_id)
 
                 # From here the backend resource EXISTS, so every remaining step
                 # is guarded: on failure the resource is rolled back under this
@@ -2263,6 +3071,7 @@ async def _create_terminal_unguarded(
                 # caller's `except`.
                 try:
                     if created_session:
+                        _keep_kiro_home_out_of_session(session_name, kiro_launch)
                         # Drop rows a previous incarnation of this session name
                         # left behind. Inside the lock, so it can never race the
                         # row write of a concurrent create for the same name.
@@ -2301,10 +3110,17 @@ async def _create_terminal_unguarded(
                             defer_init and deferred_delete_on_failure is False
                         ),
                         session_incarnation_id=session_incarnation_id,
-                        idempotency_key=idempotency_key,
+                        idempotency_key=storage_key,
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
                         delegate_tools=delegate_tools,
+                        # Written False with every Kiro row, in this same INSERT
+                        # (#1074): no write is needed later to refuse input to a
+                        # pane whose identity check never passed. Other providers
+                        # store NULL.
+                        identity_verified=(
+                            False if provider == ProviderType.KIRO_CLI.value else None
+                        ),
                         # The initial message is ACCEPTED the moment this row is
                         # visible, so its outcome starts life as pending in the same
                         # transaction (#566): a restart between here and the deferred
@@ -2318,6 +3134,7 @@ async def _create_terminal_unguarded(
                     )
                 except BaseException:
                     _clear_deferred_init_external_owner_active(terminal_id)
+                    _clear_identity_check_in_flight(terminal_id)
                     _roll_back_backend_create_locked(
                         session_name,
                         created_window_name,
@@ -2354,6 +3171,7 @@ async def _create_terminal_unguarded(
                     # ORIGINAL cancellation is re-raised below either way.
                     pass
             _clear_deferred_init_external_owner_active(terminal_id)
+            _clear_identity_check_in_flight(terminal_id)
             raise
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -2398,6 +3216,30 @@ async def _create_terminal_unguarded(
         # the skill catalog here; Kiro (skill:// resources) and OpenCode
         # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
         # Copilot gets the catalog baked at install time.
+        #
+        # Issue #1082 (provisional): a fresh (non-resume) Claude Code launch
+        # gets a CAO-generated session id, stored on the launch record so a
+        # later usage adapter can join provider-native session logs to this
+        # terminal without CAO reading any transcript itself. Only Claude Code
+        # exposes a caller-chosen session id today; every other provider's
+        # stored id stays None.
+        fresh_claude_session_id: Optional[str] = (
+            str(uuid.uuid4())
+            if provider == ProviderType.CLAUDE_CODE.value and not resume_session_id
+            else None
+        )
+        # Only a Kiro helper passes its launch, and only a Claude Code helper the
+        # ephemeral flag, so every other call is unchanged. The flag is the bind
+        # above, the fact that marks this terminal ephemeral, never the profile
+        # text, and it keys on the provider that actually runs.
+        provider_launch_options: dict[str, Any] = (
+            {"kiro_launch": kiro_launch} if kiro_launch is not None else {}
+        )
+        if (
+            provider == ProviderType.CLAUDE_CODE.value
+            and ephemeral_state.bound_terminal_id == terminal_id
+        ):
+            provider_launch_options["ephemeral"] = True
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,
@@ -2407,9 +3249,14 @@ async def _create_terminal_unguarded(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=launch_model,
+            effort=launch_effort,
             engine=resolved_engine,
             resume_session_id=resume_session_id,
+            session_id=fresh_claude_session_id,
+            **provider_launch_options,
         )
+        # The provider owns the helper's home now: its cleanup removes it.
+        ephemeral_state.kiro_home = None
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
@@ -2437,16 +3284,30 @@ async def _create_terminal_unguarded(
                 registry,
                 initial_caller_id=caller_id,
                 delete_on_failure=deferred_delete_on_failure,
+                provider=provider,
                 **launch_options,
             )
             # A handful of unit/integration seams patch the private scheduler
             # with a non-Task mock. Production always returns an asyncio.Task;
-            # if the seam replaced it, release the pre-insert fence here so one
+            # if the seam replaced it, release the pre-insert fences here so one
             # test cannot leak process-local recovery state into another.
-            if deferred_delete_on_failure is False and not isinstance(deferred_task, asyncio.Task):
-                _clear_deferred_init_external_owner_active(terminal_id)
+            if not isinstance(deferred_task, asyncio.Task):
+                _clear_identity_check_in_flight(terminal_id)
+                if deferred_delete_on_failure is False:
+                    _clear_deferred_init_external_owner_active(terminal_id)
         else:
-            await provider_instance.initialize()
+            try:
+                await provider_instance.initialize()
+                if provider == ProviderType.KIRO_CLI.value:
+                    # Before the create returns and before anything else is
+                    # written for it: the row reads False until this succeeds,
+                    # and a failure here fails the create (#1074).
+                    await _record_kiro_identity_verified(terminal_id, provider_instance)
+                    await _audit_kiro_attestation(terminal_id, provider_instance)
+            finally:
+                # Init has ended in this process, verified or not: any later
+                # refusal of an unverified row is permanent.
+                _clear_identity_check_in_flight(terminal_id)
 
             # Persist shell_command baseline if the provider captured one
             shell_command = provider_instance.shell_baseline
@@ -2489,6 +3350,9 @@ async def _create_terminal_unguarded(
             session_incarnation_id=session_incarnation_id,
             status=initial_status,
             last_active=datetime.now(timezone.utc),
+            launch_notes=(
+                kiro_v3_admission.launch_notes if kiro_v3_admission is not None else None
+            ),
         )
 
         logger.info(
@@ -2522,6 +3386,33 @@ async def _create_terminal_unguarded(
             launch_status="launched",
             not_honored=decision_not_honored,
         )
+        # Issue #1082: on the synchronous path the provider is up by now; on
+        # the deferred path init is only scheduled, and a failed init later
+        # finalizes this record as ``launch_failed``. Deliberately not
+        # offloaded with ``to_thread``: no await may separate scheduling the
+        # deferred init from this write, or a fast init failure could finalize
+        # before the record exists and leave it open for good.
+        launch_record_id = _record_launch_best_effort(
+            terminal_id=terminal.id,
+            session_name=session_name,
+            provider=provider,
+            target_name=agent_profile,
+            target_kind=_classify_launch_target_kind(source, env_vars),
+            launched_model=launch_model,
+            model_honored=model_honored,
+            provider_session_id=resume_session_id or fresh_claude_session_id,
+            record_ids=launch_plan.record_ids if launch_plan is not None else (),
+            caller_id=caller_id,
+        )
+        # A teardown does not wait for a create: one that deleted the row
+        # before the record existed (during init, or between the row commit
+        # and this write) had nothing to stamp. Re-read the row once the
+        # record exists and close the record if the row is gone. A teardown
+        # after this check finds the record and stamps its own reason.
+        if launch_record_id is not None:
+            _close_launch_if_row_gone_best_effort(launch_record_id)
+        if sync_init_waiter is not None:
+            sync_init_waiter.settle()
         return terminal
 
     except Exception as e:
@@ -2543,16 +3434,29 @@ async def _create_terminal_unguarded(
         # backend rollback was its own ``await`` inside this handler, so a
         # cancellation landing there unwound the handler with the row,
         # provider registration and worktree still in place.
-        await _await_uncancellable(
-            _roll_back_failed_create,
-            terminal_id,
-            session_name,
-            rollback_window_name,
-            session_created=session_created,
-            window_created=window_created,
-            worktree_repo_root=worktree_repo_root,
-        )
+        #
+        # The waiter settles only once the rollback is done (issue #943), so a
+        # replay that wakes on the failure sees whether the row was retained.
+        try:
+            await _await_uncancellable(
+                _roll_back_failed_create,
+                terminal_id,
+                session_name,
+                rollback_window_name,
+                session_created=session_created,
+                window_created=window_created,
+                worktree_repo_root=worktree_repo_root,
+            )
+        finally:
+            if sync_init_waiter is not None:
+                sync_init_waiter.settle(e)
         raise
+    finally:
+        # Every exit, including cancellation, settles the waiter so no replay
+        # can wait forever on a create that is no longer running.
+        if sync_init_waiter is not None and terminal_id is not None:
+            sync_init_waiter.settle(RuntimeError("terminal creation did not complete"))
+            _pending_sync_inits.pop(terminal_id, None)
 
 
 def _notify_cross_node_caller(terminal_id: str, session_name: str, message: str) -> bool:
@@ -2672,12 +3576,19 @@ def _notify_caller_of_deferred_failure(
             terminal_id,
         )
 
+    # The caller has just been told the worker failed. Close its edges here so
+    # neither a forward nor a second worker-ended notice follows.
+    try:
+        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        logger.warning("Deferred-init failure: could not close edges for %s: %s", terminal_id, exc)
+
     ephemeral_service.release(terminal_id, "launch_failed")
     if delete_worker:
         try:
             # Pass registry so post_kill_terminal hooks fire — parity with the
             # DELETE endpoint and agent_step teardown.
-            delete_terminal(terminal_id, registry=registry)
+            delete_terminal(terminal_id, registry=registry, end_reason="launch_failed")
         except Exception as exc:  # noqa: BLE001 — teardown is best-effort
             logger.warning(
                 "Deferred-init failure: teardown of worker %s failed (zombie "
@@ -2802,6 +3713,81 @@ def get_deferred_init_failure(terminal_id: str, candidate: Any = None) -> dict[s
     return _read_deferred_failure_fallback(terminal_id)
 
 
+def terminal_input_refusal(
+    terminal_id: str, metadata: dict[str, Any]
+) -> TerminalInputBlockedError | None:
+    """The refusal for typed input to this terminal, or None to accept it (#1074).
+
+    Provisional (#1074): a ``kiro_cli`` terminal takes input only when its row
+    records that its identity check passed (``identity_verified`` True). CAO
+    grants that trust from the positive record; it never infers it from a
+    missing failure record. So a pane still initializing, one whose init timed
+    out or was interrupted by a server restart before its header was read, and
+    one whose every failure record was lost all stay refused. The refusal is
+    transient (``IDENTITY_PENDING``) only while this process is still
+    initializing the terminal and no failure is recorded, and permanent
+    (``INIT_FAILED``) otherwise. Trust moves only from False to True, so a pane
+    verified before it failed (a restart during its initial delivery) accepts
+    the re-send.
+
+    A v2 row from before the column (``identity_verified`` None) is grandfathered
+    unless it carries a durable failure, in the DB or the fallback sidecar.
+    Provisional (#1074): main never verified a Kiro pane, so refusing these
+    would break every Kiro worker running across an upgrade.
+
+    ``metadata`` is the caller's read of the row, which can be older than the
+    record: ``_record_kiro_identity_verified`` commits True and only then
+    releases the in-flight mark. So before a permanent refusal the row is read
+    again, and a row that now records a passed check is accepted, as any
+    verified row is; otherwise a delivery racing the record would fail for good.
+
+    Never decides on the failure's ``exception_type``, ``kind`` or
+    ``untrusted_runtime``; ``kind`` only names the failure in the message.
+    Other providers are not gated here. Reads the fallback sidecar and, on the
+    permanent path, the row, so it is blocking I/O: async callers to_thread it.
+    """
+    if metadata.get("provider") != ProviderType.KIRO_CLI.value:
+        return None
+    verified = metadata.get("identity_verified")
+    if verified is True:
+        return None
+    failure = get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
+    if failure is None:
+        # Grandfathering is for v2 rows older than the column. No v3 row can
+        # predate it (v3 never launched before #1167), so an unset value on a
+        # v3 row is not trust.
+        if verified is None and canonical_kiro_engine(metadata.get("engine")) != "v3":
+            return None
+        if _is_identity_check_in_flight(terminal_id):
+            return TerminalInputBlockedError(
+                f"Terminal {terminal_id} has not passed its Kiro identity check yet. "
+                "Retry when it is ready.",
+                reason=TerminalInputBlockedReason.IDENTITY_PENDING,
+            )
+        kind = "identity_unverified"
+    else:
+        kind = failure.get("kind") or "unknown"
+    if _identity_verified_now(terminal_id):
+        return None
+    return ProviderExitedInputBlockedError(
+        f"Terminal {terminal_id} failed deferred initialization ({kind}). "
+        "Refusing to deliver input.",
+        reason=TerminalInputBlockedReason.INIT_FAILED,
+    )
+
+
+def _identity_verified_now(terminal_id: str) -> bool:
+    """True when a fresh read of the row records a passed Kiro identity check (#1074)."""
+    try:
+        fresh = get_terminal_metadata(terminal_id)
+    except Exception as exc:  # noqa: BLE001 - an unread row is not trust
+        logger.warning(
+            "Terminal %s: could not re-read its row before refusing input: %s", terminal_id, exc
+        )
+        return False
+    return fresh is not None and fresh.get("identity_verified") is True
+
+
 def _delete_deferred_failure_fallback(terminal_id: str) -> None:
     try:
         _deferred_failure_fallback_path(terminal_id).unlink(missing_ok=True)
@@ -2900,7 +3886,7 @@ def _purge_stale_session_rows_for_recreate(session_name: str) -> None:
                 session_name,
             )
             continue
-        delete_terminal_row(terminal_id, metadata, registry=None)
+        delete_terminal_row(terminal_id, metadata, registry=None, end_reason="stale_cleanup")
 
 
 def _resolve_existing_session_incarnation_locked(session_name: str) -> str:
@@ -3069,6 +4055,86 @@ async def _clear_deferred_init_external_owner(terminal_id: str) -> None:
     await asyncio.to_thread(_publish_deferred_init_complete_fallback, terminal_id)
 
 
+class KiroIdentityNotRecordedError(RuntimeError):
+    """CAO could not durably record that a Kiro runtime passed its identity check (#1074).
+
+    The create fails: a pane CAO cannot record as verified is not trusted with
+    input, so there is no fallback record for the positive marker.
+    """
+
+
+async def _audit_kiro_attestation(terminal_id: str, provider_instance: Any) -> None:
+    """Record what a Kiro helper's /tools and /mcp list panels showed (#1167 Phase 2).
+
+    The header's model is audited, not refused, when it differs from the
+    ``--model`` CAO launched.
+    """
+    attestation = getattr(provider_instance, "attestation", None)
+    launch = getattr(provider_instance, "_launch", None)
+    if not isinstance(attestation, KiroAttestation) or not isinstance(launch, KiroLaunch):
+        return
+    if launch.model is not None and attestation.model != launch.model:
+        logger.warning(
+            "Kiro terminal %s shows model %r in its header; CAO launched --model %r",
+            terminal_id,
+            attestation.model,
+            launch.model,
+        )
+    await asyncio.to_thread(
+        ephemeral_service.record_kiro_event,
+        terminal_id,
+        "kiro_attested",
+        tags=list(attestation.tags),
+        mcp_tools=dict(attestation.mcp_tools),
+        model=attestation.model,
+        launched_model=launch.model,
+        kiro_version=launch.version,
+        schema=launch.schema,
+    )
+
+
+async def _record_kiro_identity_verified(terminal_id: str, provider_instance: Any) -> None:
+    """Write ``identity_verified`` True once the provider's header check passed (#1074).
+
+    The evidence is the provider's own ``identity_verified`` flag, which only
+    its header check sets; ``initialize()`` returning is not evidence. The
+    write is retried as ``_clear_deferred_init_external_owner`` retries; if the
+    row is gone or the retries run out, this raises and the create fails. On
+    success the terminal leaves the in-flight set.
+    """
+    if getattr(provider_instance, "identity_verified", False) is not True:
+        raise KiroIdentityNotRecordedError(
+            f"Terminal {terminal_id}: kiro-cli started, but its provider did not report "
+            "a passed agent identity check, so CAO does not trust it. No task was sent."
+        )
+    for attempt in range(1, _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS + 1):
+        try:
+            recorded = await asyncio.to_thread(mark_terminal_identity_verified, terminal_id)
+        except Exception as exc:  # noqa: BLE001 — retry a transient DB failure
+            logger.warning(
+                "Kiro identity record attempt %d/%d for %s failed: %s",
+                attempt,
+                _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS,
+                terminal_id,
+                exc,
+            )
+        else:
+            if not recorded:
+                # The query succeeded and the row is gone: a concurrent DELETE.
+                raise KiroIdentityNotRecordedError(
+                    f"Terminal {terminal_id} was deleted before its Kiro identity "
+                    "check could be recorded."
+                )
+            _clear_identity_check_in_flight(terminal_id)
+            return
+        if attempt < _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS:
+            await asyncio.sleep(0.05 * attempt)
+    raise KiroIdentityNotRecordedError(
+        f"Terminal {terminal_id}: its Kiro agent identity check passed, but CAO could not "
+        "record it, so it does not trust the pane. No task was sent."
+    )
+
+
 async def recover_interrupted_deferred_init_external_owners() -> bool:
     """Turn restart-stranded external deferred inits into durable failures.
 
@@ -3118,6 +4184,8 @@ async def recover_interrupted_deferred_init_external_owners() -> bool:
         if _has_deferred_init_complete_fallback(terminal_id):
             await _clear_deferred_init_external_owner(terminal_id)
             continue
+        # The reclaim decision is read from the row (#1074): a Kiro row that
+        # never recorded its identity check is reclaimed like a refusal.
         await _surface_deferred_init_failure(
             terminal_id,
             kind="interrupted_init",
@@ -3128,6 +4196,7 @@ async def recover_interrupted_deferred_init_external_owners() -> bool:
             exception_type="ServerRestart",
             registry=None,
             delete_on_failure=False,
+            provider_hint=metadata.get("provider"),
         )
     return complete_scan
 
@@ -3232,6 +4301,20 @@ async def recover_interrupted_initial_deliveries() -> bool:
             )
             if not settled:
                 continue
+            # The task will never be delivered, so its assign edges would never
+            # be armed: never swept, and holding the caller's own forward back
+            # as nested work for good. Each is closed with a notice queued for
+            # its caller, which the inbox reconciliation sweep delivers.
+            try:
+                from cli_agent_orchestrator.services import delegation_callback_service
+
+                await asyncio.to_thread(
+                    delegation_callback_service.handle_task_never_delivered, terminal_id
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort, like the notice paths
+                logger.warning(
+                    "Could not close delegation edges of interrupted %s: %s", terminal_id, exc
+                )
             metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
             if not metadata:
                 continue
@@ -3239,13 +4322,21 @@ async def recover_interrupted_initial_deliveries() -> bool:
                 get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
                 is None
             ):
-                await asyncio.to_thread(
+                # The same decision _surface_deferred_init_failure makes, from
+                # this row (#1074). This sweep still neither notifies nor deletes.
+                untrusted = _runtime_untrusted_from_row(metadata)
+                persisted = await asyncio.to_thread(
                     _persist_deferred_init_failure,
                     terminal_id,
                     kind="interrupted_init",
                     message=message,
                     exception_type="ServerRestart",
+                    untrusted_runtime=untrusted,
                 )
+                if persisted is not None and untrusted:
+                    # After the failure is on the row, so the window is closed by
+                    # exact terminal identity, never by its reusable name.
+                    await asyncio.to_thread(_reclaim_deferred_failure_runtime, terminal_id)
         except Exception as exc:  # noqa: BLE001 — retry on the next pass
             complete = False
             logger.warning(
@@ -3259,21 +4350,128 @@ def _persist_deferred_init_failure(
     *,
     kind: str,
     message: str,
+    untrusted_runtime: bool,
     exception_type: str | None = None,
+    rule: str | None = None,
 ) -> dict[str, Any] | None:
-    """Persist one server-owned deferred-init failure outside consumer metadata."""
+    """Persist one server-owned deferred-init failure outside consumer metadata.
 
-    failure = {
+    ``untrusted_runtime`` records the reclaim decision (#1074) for clients; the
+    input gate reads the terminal's ``identity_verified``, never this field.
+    ``rule`` is a Kiro refusal's machine string when the failure was one.
+    """
+
+    failure: dict[str, Any] = {
         "phase": "deferred_init",
         "kind": str(kind),
         "message": _sanitize_deferred_failure_message(message),
+        "untrusted_runtime": bool(untrusted_runtime),
     }
     if exception_type:
         failure["exception_type"] = str(exception_type)
+    if rule:
+        failure["rule"] = str(rule)
     if not update_terminal_deferred_init_failure(terminal_id, failure):
         return None
     _delete_deferred_failure_fallback(terminal_id)
     return failure
+
+
+def _kiro_refusal_rule(exc: BaseException) -> str | None:
+    """The machine string of a Kiro refusal, for the persisted failure (provisional, #1167).
+
+    Phase 1's and the helper's refusals carry ``code``; the identity check's
+    carries ``kind``.
+    """
+    if isinstance(exc, KiroV3Refusal):
+        return exc.code
+    if isinstance(exc, KiroAgentIdentityError):
+        return exc.kind
+    return None
+
+
+def _runtime_untrusted_from_row(metadata: dict[str, Any]) -> bool:
+    """The reclaim decision for a failure on this row (#1074).
+
+    True for a ``kiro_cli`` runtime whose row records that its identity check
+    has not passed (``identity_verified`` False): CAO wrote that row, and did
+    not verify which agent the pane is running. A row from before the column
+    (``identity_verified`` None) keeps its window, as live legacy rows are
+    grandfathered; once it carries a failure, input to it is still refused.
+    A v3 row is never grandfathered: none can predate the column (#1167).
+    Provisional (#1074).
+    """
+    verified = metadata.get("identity_verified")
+    return metadata.get("provider") == ProviderType.KIRO_CLI.value and (
+        verified is False
+        or (verified is None and canonical_kiro_engine(metadata.get("engine")) == "v3")
+    )
+
+
+def _deferred_failure_runtime_untrusted(terminal_id: str, provider_hint: str | None) -> bool:
+    """Decide once, before a failure is persisted, whether its runtime is untrusted.
+
+    From the row (``_runtime_untrusted_from_row``). When the row cannot be read,
+    the caller's provider hint stands in and the identity counts as not
+    verified. Blocking DB I/O: callers to_thread it.
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+    except Exception as exc:  # noqa: BLE001 — a DB outage must not trust the runtime
+        logger.warning(
+            "Deferred-init failure %s: could not read its row for the reclaim decision: %s",
+            terminal_id,
+            exc,
+        )
+        metadata = None
+    if metadata:
+        return _runtime_untrusted_from_row(metadata)
+    return provider_hint == ProviderType.KIRO_CLI.value
+
+
+def _reclaim_deferred_failure_runtime(terminal_id: str) -> bool:
+    """Close a failed deferred-init terminal's window and runtime; keep its row.
+
+    The tombstone reclaim the herdr reconciler runs for a pane that already
+    ended, with the window close included. The row carries its failure or the
+    creation-time external-owner bit, so ``dismantle_terminal_runtime`` closes
+    the window by exact terminal identity, never by its reusable name. On
+    success the row is marked ``deferred_init_runtime_reclaimed`` and stays as
+    the durable failure surface. Blocking tmux/DB I/O: callers to_thread it.
+
+    Returns False when the runtime could not be proven gone; the row is then
+    left unmarked, so a later delete retries the close, and ``dispatch_input``
+    refuses input to it meanwhile.
+    """
+    try:
+        # As the CAO-owned path does (_notify_caller_of_deferred_failure), release
+        # any ephemeral binding with the failure's reason first: the first
+        # release wins. Then snapshot the scrollback while the pane exists, and
+        # dismantle.
+        ephemeral_service.release(terminal_id, "launch_failed")
+        metadata = capture_terminal_snapshot(terminal_id)
+        if not metadata:
+            # The row is gone: a concurrent DELETE owns the teardown now.
+            return False
+        if not dismantle_terminal_runtime(terminal_id, metadata, kill_window=True):
+            logger.warning(
+                "Deferred-init failure %s: runtime reclaim deferred; its row is retained "
+                "and input to it is refused",
+                terminal_id,
+            )
+            return False
+        if not update_terminal_deferred_init_runtime_reclaimed(terminal_id, True):
+            return False
+    except Exception as exc:  # noqa: BLE001 — the failure record must survive a failed reclaim
+        logger.warning(
+            "Deferred-init failure %s: runtime reclaim failed; its row is retained and "
+            "input to it is refused: %s",
+            terminal_id,
+            exc,
+        )
+        return False
+    logger.info("Deferred-init failure %s: window closed, failure record retained", terminal_id)
+    return True
 
 
 async def _surface_deferred_init_failure(
@@ -3284,12 +4482,25 @@ async def _surface_deferred_init_failure(
     registry: PluginRegistry | None,
     exception_type: str | None = None,
     delete_on_failure: bool | None = None,
+    provider_hint: str | None = None,
+    rule: str | None = None,
 ) -> bool:
     """Persist/notify one init failure and apply lifecycle ownership.
 
     Returns True when CAO owns teardown, False when an external observer owns
     the retained terminal. Failure metadata is written before either branch so
     GET /terminals can remain an authoritative error surface across restarts.
+
+    A Kiro runtime whose identity CAO did not durably verify must not outlive
+    its failure even when an external observer owns the row (#1074): it may be
+    kiro-cli's kiro_default fallback, with every built-in tool and its
+    trust-all-tools consent accepted. That decision is made once, here, from the
+    row (``provider_hint`` stands in when the row cannot be read), and recorded
+    in the failure as ``untrusted_runtime``. Such a runtime has its window
+    closed and its runtime dismantled, and only the failure row is retained.
+    CAO-owned teardown already closes the window. Provisional (#1074): a Kiro
+    pane verified before it failed, and every other provider's failure, keep
+    their runtime for the owner, as before.
     """
 
     delete_worker = (
@@ -3297,15 +4508,21 @@ async def _surface_deferred_init_failure(
         if delete_on_failure is not None
         else await asyncio.to_thread(_deferred_failure_delete_worker, terminal_id)
     )
+    untrusted = await asyncio.to_thread(
+        _deferred_failure_runtime_untrusted, terminal_id, provider_hint
+    )
     persisted = False
     terminal_missing = False
-    failure_payload = {
+    failure_payload: dict[str, Any] = {
         "phase": "deferred_init",
         "kind": str(kind),
         "message": _sanitize_deferred_failure_message(message),
+        "untrusted_runtime": untrusted,
     }
     if exception_type:
         failure_payload["exception_type"] = str(exception_type)
+    if rule:
+        failure_payload["rule"] = str(rule)
     for attempt in range(1, _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS + 1):
         try:
             failure = await asyncio.to_thread(
@@ -3314,6 +4531,8 @@ async def _surface_deferred_init_failure(
                 kind=kind,
                 message=message,
                 exception_type=exception_type,
+                rule=rule,
+                untrusted_runtime=untrusted,
             )
             persisted = failure is not None
             if persisted:
@@ -3346,6 +4565,12 @@ async def _surface_deferred_init_failure(
             await asyncio.to_thread(
                 _publish_deferred_failure_fallback, terminal_id, failure_payload
             )
+    # Close an untrusted runtime first, now that the row carries the failure (or
+    # the creation-time external-owner bit) and so is closed by exact terminal
+    # identity, never by its reusable name.
+    reclaimed: bool | None = None
+    if untrusted and not delete_worker and not terminal_missing:
+        reclaimed = await asyncio.to_thread(_reclaim_deferred_failure_runtime, terminal_id)
     # The initial message (if this terminal had one) is now known not to have
     # been delivered; settle its durable outcome alongside the failure marker
     # so a client waiting on initial_delivery stops with the reason (#566).
@@ -3353,9 +4578,31 @@ async def _surface_deferred_init_failure(
         await asyncio.to_thread(
             _persist_initial_delivery, terminal_id, "failed", kind=kind, message=message
         )
+    if not terminal_missing:
+        # Issue #1082: the launch ended here, whoever owns the row's teardown.
+        # A retained external-owner tombstone (or a deferred Grok cleanup)
+        # would otherwise keep the record open until some later delete stamped
+        # an unrelated reason. First reason wins, so the CAO-owned teardown
+        # below cannot overwrite it.
+        await asyncio.to_thread(
+            _finalize_launch_best_effort, terminal_id, end_reason="launch_failed"
+        )
     notification = _sanitize_deferred_failure_message(message)
     if delete_worker:
         notification += " The failed worker terminal will be torn down."
+    elif reclaimed:
+        notification += (
+            " CAO had not verified its Kiro agent identity when initialization ended, so "
+            "its window was closed; the failure record is retained for its external "
+            "lifecycle owner."
+        )
+    elif reclaimed is False:
+        notification += (
+            " CAO had not verified its Kiro agent identity when initialization ended, and "
+            "closing its window could not be confirmed; input to it is refused. The "
+            "failure record is retained for its external lifecycle owner; deleting the "
+            "terminal closes the window."
+        )
     else:
         notification += " The failed worker terminal is retained for its external lifecycle owner."
     await asyncio.to_thread(
@@ -3909,9 +5156,16 @@ def _schedule_deferred_init(
     initial_caller_id: Optional[str] = None,
     delete_on_failure: bool | None = None,
     launch_plan: "LaunchPlan | None" = None,
+    provider: Optional[str] = None,
 ) -> asyncio.Task | None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via dispatch_input.
+
+    ``provider`` is the terminal's provider type (create_terminal passes it).
+    For ``kiro_cli`` the passed identity check is recorded on the row right
+    after ``initialize()`` returns and before the initial message is typed
+    (#1074). A direct caller that leaves it out gets the same for a
+    ``KiroCliProvider`` instance.
 
     Runs as an asyncio task on the running event loop so it doesn't block
     the caller. Because assign() has already returned success=True by the
@@ -3925,6 +5179,13 @@ def _schedule_deferred_init(
     answerable via answer_user_prompt, so we leave it in place and only log.
     """
 
+    is_kiro = (
+        provider == ProviderType.KIRO_CLI.value
+        if provider is not None
+        else isinstance(provider_instance, KiroCliProvider)
+    )
+    provider_hint = ProviderType.KIRO_CLI.value if is_kiro else provider
+
     async def _run() -> None:
         caller_id: Optional[str] = initial_caller_id
         # Whether the first dispatch_input() returned, i.e. the task was pasted
@@ -3935,6 +5196,12 @@ def _schedule_deferred_init(
         task_dispatched = False
         try:
             await provider_instance.initialize()
+            if is_kiro:
+                # Before anything else is written for this terminal and before
+                # the initial dispatch_input: until this succeeds the row reads
+                # False and no input reaches the pane (#1074).
+                await _record_kiro_identity_verified(terminal_id, provider_instance)
+                await _audit_kiro_attestation(terminal_id, provider_instance)
             shell_command = provider_instance.shell_baseline
             if isinstance(shell_command, str) and shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
@@ -4124,6 +5391,10 @@ def _schedule_deferred_init(
                 # in-memory mask lifts in ``finally`` so a client that reads
                 # delivered never sees an unmasked status first (#566).
                 await asyncio.to_thread(_persist_initial_delivery, terminal_id, "delivered")
+                # The task is in the worker now, so its waiting callers may be
+                # owed a forward once it goes idle. Before this point an idle
+                # worker has not seen the task and must not trigger one.
+                await asyncio.to_thread(mark_assign_edges_delivered, terminal_id)
             await _clear_deferred_init_external_owner(terminal_id)
         except ProviderExitedInputBlockedError as e:
             # Caught BEFORE the TerminalInputBlockedError branch below, whose
@@ -4219,6 +5490,12 @@ def _schedule_deferred_init(
                 e,
                 exc_info=True,
             )
+            # Whether the runtime is reclaimed is decided from the row, not from
+            # this exception's class (#1074): a Kiro pane whose identity check
+            # never passed (a refusal, a timeout before the header was read, a
+            # failed marker write) is untrusted whatever ended its init. Only
+            # this path passes the provider hint, for a row that cannot be read:
+            # the other failures above happen after the check was recorded.
             await _surface_deferred_init_failure(
                 terminal_id,
                 kind="provider_init_error",
@@ -4226,6 +5503,8 @@ def _schedule_deferred_init(
                 exception_type=type(e).__name__,
                 registry=registry,
                 delete_on_failure=delete_on_failure,
+                provider_hint=provider_hint,
+                rule=_kiro_refusal_rule(e),
             )
         finally:
             # The single release point for every path, and on the happy path the
@@ -4240,12 +5519,16 @@ def _schedule_deferred_init(
             # to see it), the worker never starting after all resubmits, or the
             # loop being torn down. Idempotent, so double-clearing is harmless.
             _clear_initial_delivery_pending(terminal_id)
+            # Init has ended in this process: an unverified Kiro row is now
+            # refused permanently, not as pending (#1074).
+            _clear_identity_check_in_flight(terminal_id)
 
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
         _clear_deferred_init_external_owner_active(terminal_id)
+        _clear_identity_check_in_flight(terminal_id)
         return None
     # Mirrors _run's own ``if initial_message`` condition: defer_init is also used
     # with no message at all (see the create_terminal call site), and there is
@@ -4291,23 +5574,34 @@ def _schedule_deferred_init(
         # call does not own.
         if initial_message:
             _clear_initial_delivery_pending(terminal_id)
+        _clear_identity_check_in_flight(terminal_id)
         raise
     if delete_on_failure is False:
         # Direct callers of this private scheduler may not have come through
         # create_terminal's pre-insert fence. Marking again is idempotent.
         _mark_deferred_init_external_owner_active(terminal_id)
+    if is_kiro:
+        # The same for the identity check, so a direct caller's input during
+        # init is refused as pending. Idempotent.
+        _mark_identity_check_in_flight(terminal_id)
     _deferred_init_tasks.add(task)
 
     def _on_done(done_task: asyncio.Task) -> None:
         _deferred_init_tasks.discard(done_task)
         _clear_deferred_init_external_owner_active(terminal_id)
+        # A task cancelled before its first step never reaches _run's finally.
+        _clear_identity_check_in_flight(terminal_id)
 
     task.add_done_callback(_on_done)
     return task
 
 
 def memory_sidecar_refusal(
-    primary: Terminal, *, provider: str, sidecar_profile: str = "memory_manager"
+    primary: Terminal,
+    *,
+    provider: str,
+    sidecar_profile: str = "memory_manager",
+    working_directory: Optional[str] = None,
 ) -> Optional[str]:
     """Why the ``memory_manager`` sidecar would be refused under ``primary``, or ``None``.
 
@@ -4323,7 +5617,31 @@ def memory_sidecar_refusal(
     also when the primary's ceiling is not readable from the response (no
     ``delegate_tools`` and no ``allowed_tools``): then the create itself decides
     and logs, exactly as before.
+
+    On ``kiro_cli`` the create's Step 1c agent check is asked too, from the
+    sidecar's ``working_directory`` and the primary session's env, as the create
+    would run it (#1074). Blocking file I/O: callers to_thread it.
     """
+    refusal = _memory_sidecar_ceiling_refusal(primary, sidecar_profile)
+    if refusal is None and provider == ProviderType.KIRO_CLI.value:
+        try:
+            require_kiro_agent_resolves(
+                sidecar_profile,
+                _resolve_working_directory(working_directory),
+                get_session_env(primary.session_name),
+            )
+        except KiroAgentIdentityError as exc:
+            refusal = (
+                f"{exc} The memory_manager sidecar (`cao launch --memory`, "
+                "memory_manager=true) was not launched."
+            )
+        except Exception:  # noqa: BLE001  (an unusable cwd is the create's problem)
+            return None
+    return refusal
+
+
+def _memory_sidecar_ceiling_refusal(primary: Terminal, sidecar_profile: str) -> Optional[str]:
+    """The delegation-ceiling half of ``memory_sidecar_refusal``."""
     ceiling = (
         primary.delegate_tools if primary.delegate_tools is not None else primary.allowed_tools
     )
@@ -4442,6 +5760,14 @@ def get_terminal(terminal_id: str) -> Dict:
             else:
                 status = reported_status(terminal_id, observed_status).value
 
+        # #1225: a kept child (terminal.keep_finished) shows when its window ends.
+        # Best-effort: an unreadable keep mark must not fail a status read.
+        try:
+            kept = get_kept_terminal(terminal_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("get_terminal: keep mark of %s unreadable: %s", terminal_id, exc)
+            kept = None
+
         return {
             "id": metadata["id"],
             "name": metadata["tmux_window"],
@@ -4465,6 +5791,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "status": status,
             "status_generation": status_generation,
             "output_generation": output_generation,
+            "kept": kept is not None,
+            "kept_until": kept["kept_until"] if kept is not None else None,
             "last_active": metadata["last_active"],
         }
 
@@ -4724,11 +6052,14 @@ def dispatch_input(
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        if (
-            metadata.get("provider") == ProviderType.KIRO_CLI.value
-            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
-        ):
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
+        # A Kiro terminal is typed into only once its row records that its
+        # identity check passed (#1074). Until then the pane may be kiro-cli's
+        # kiro_default fallback, with every built-in tool and trust-all-tools
+        # accepted, sitting at a perfectly ordinary IDLE. This reads the durable
+        # row, not the monitor's in-memory status. See terminal_input_refusal.
+        refusal = terminal_input_refusal(terminal_id, metadata)
+        if refusal is not None:
+            raise refusal
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = _orchestration_value(orchestration_type)
@@ -4926,6 +6257,13 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        # The same gate as dispatch_input (#1074): a special key is still typed
+        # input (``/key`` accepts single characters, Space and Enter), and
+        # ``/key``, MCP answer_user_prompt and the AG-UI path all reach here.
+        refusal = terminal_input_refusal(terminal_id, metadata)
+        if refusal is not None:
+            raise refusal
 
         # Arm StatusMonitor stickiness: special keys (Enter on a permission
         # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
@@ -5612,6 +6950,8 @@ def delete_terminal_row(
     terminal_id: str,
     metadata: Optional[Dict],
     registry: PluginRegistry | None = None,
+    *,
+    end_reason: str,
 ) -> bool:
     """Drop a terminal's registry row and emit ``post_kill_terminal``.
 
@@ -5627,17 +6967,29 @@ def delete_terminal_row(
     that no third-party plugin ever runs inside its critical section; the
     single-terminal ``delete_terminal`` path holds no such lock and passes its
     registry straight through.
+
+    ``end_reason`` (one of ``database.LAUNCH_END_REASONS``) is stamped on the
+    terminal's launch record (issue #1082); the caller names why it ended.
     """
     # Serialize row deletion with fallback publication. Otherwise a deferred
     # init task can exhaust DB retries, a concurrent DELETE can remove the row
     # and existing sidecars, and then the background task can publish a new
     # orphan sidecar after DELETE has already returned.
     with _DEFERRED_INIT_SIDECAR_LOCK:
-        deleted = db_delete_terminal(terminal_id)
+        deleted = db_delete_terminal(terminal_id, end_reason=end_reason)
         # Sidecars are keyed by terminal id and are safe to remove even when the
         # DB row was already deleted by another lifecycle owner.
         _delete_deferred_failure_fallback(terminal_id)
         _delete_deferred_init_complete_fallback(terminal_id)
+    # Close every delegation edge still open on this terminal, without a
+    # notice. ``delete_terminal`` has already told waiting callers; session
+    # teardown, retention cleanup and the stale-row purge come straight here,
+    # and an edge they left open would stay armed with no terminal behind it,
+    # re-evaluated by every sweep. Runs even when another owner deleted the row.
+    try:
+        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+    except Exception as exc:  # noqa: BLE001 - best-effort; the row is already gone
+        logger.warning("Could not close delegation edges of %s: %s", terminal_id, exc)
     if deleted:
         ephemeral_service.release(terminal_id, "terminal_gone")
     logger.info(f"Deleted terminal: {terminal_id}")
@@ -5654,7 +7006,9 @@ def delete_terminal_row(
     return deleted
 
 
-def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
+def delete_terminal(
+    terminal_id: str, registry: PluginRegistry | None = None, *, end_reason: str
+) -> bool:
     """Delete terminal and kill its tmux window.
 
     Single-terminal teardown: all three thirds back to back, in the order they
@@ -5663,7 +7017,16 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
 
     Returns False when the teardown was deferred (see
     ``dismantle_terminal_runtime``), leaving the row in place for a retry.
+    ``end_reason`` is passed through to ``delete_terminal_row``.
     """
+    # Tell any caller waiting on this worker before teardown starts. Imported
+    # here because delegation_callback_service imports this module.
+    try:
+        from cli_agent_orchestrator.services import delegation_callback_service
+
+        delegation_callback_service.handle_worker_ended(terminal_id, "was deleted", registry)
+    except Exception as exc:  # noqa: BLE001 - deletion must proceed
+        logger.warning("delete_terminal: delegation notice failed for %s: %s", terminal_id, exc)
     try:
         metadata = capture_terminal_snapshot(terminal_id)
         if not dismantle_terminal_runtime(terminal_id, metadata):
@@ -5671,7 +7034,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
             )
             return False
-        return delete_terminal_row(terminal_id, metadata, registry=registry)
+        return delete_terminal_row(terminal_id, metadata, registry=registry, end_reason=end_reason)
 
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")

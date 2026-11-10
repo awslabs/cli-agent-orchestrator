@@ -261,6 +261,45 @@ class TestResumeEndpoint:
         resp = client.post("/workflows/runs/runX/resume")
         assert resp.status_code == 500
 
+    def test_a_replaced_working_root_maps_to_409_plan_inputs_changed(self, client, monkeypatch):
+        """Ask 3's boundary half on PR #1051: this route had NO arm for this error.
+
+        Resume's gate 7 refuses a run whose working-directory root is no longer the one that was
+        approved (#827 criterion 2). ``PlanInputsChangedError`` is deliberately not a ``ValueError``,
+        so the trailing 400 arm cannot claim it -- it would have escaped the handler entirely as a
+        kind-less 500. The code and the ``kind`` must match what ``/terminals/run-step`` already
+        returns for the same refusal about the same record, so a client needs no new branch.
+        """
+        from cli_agent_orchestrator.services import script_runner, workflow_journal
+        from cli_agent_orchestrator.services.launch_guard import PlanInputsChangedError
+
+        row = workflow_journal.RunRow(
+            run_id="runX",
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state="failed",
+            current_step_id=None,
+            started_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            tier="script",
+        )
+        monkeypatch.setattr(workflow_journal, "get_run", lambda rid: row)
+
+        async def _raise(run_id, **kwargs):
+            raise PlanInputsChangedError(
+                "This run's working directory is no longer the directory that was approved: its "
+                "path is unchanged, but the directory at that path has been replaced; start a new "
+                "run."
+            )
+
+        monkeypatch.setattr(script_runner, "resume_script_run", _raise)
+        resp = client.post("/workflows/runs/runX/resume")
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["kind"] == "plan_inputs_changed"
+        assert "has been replaced" in detail["message"]
+
     def test_success_returns_result(self, client, monkeypatch):
         from cli_agent_orchestrator.models.workflow_runtime import (
             RunState,

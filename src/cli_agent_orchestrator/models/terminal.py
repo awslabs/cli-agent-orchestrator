@@ -32,6 +32,15 @@ class TerminalInputBlockedReason(str, Enum):
 
     PROVIDER_ERROR = "provider_error"
     WAITING_USER_ANSWER = "waiting_user_answer"
+    # The terminal's deferred initialization failed durably, or a Kiro terminal's
+    # init ended without CAO recording that its identity check passed (#1074): a
+    # refused Kiro identity, an init timeout before the header was read, a server
+    # restart mid-init. Permanent, like PROVIDER_ERROR.
+    INIT_FAILED = "init_failed"
+    # A Kiro terminal this server is still initializing has not passed its identity
+    # check yet (#1074). Transient, like WAITING_USER_ANSWER: the inbox keeps the
+    # message pending and delivers it once the check has passed.
+    IDENTITY_PENDING = "identity_pending"
 
 
 class TerminalInputBlockedError(Exception):
@@ -63,6 +72,9 @@ class TerminalInputBlockedError(Exception):
        WAITING_USER_ANSWER was NOT refused here; it was pasted straight into the live prompt.
        Raised with ``reason=TerminalInputBlockedReason.WAITING_USER_ANSWER``. Transient: the
        dialog will close, so inbox_service keeps the batch PENDING for the next sweep.
+    The Kiro identity gate (``terminal_service.terminal_input_refusal``, #1074) raises it
+    with ``reason=TerminalInputBlockedReason.IDENTITY_PENDING`` while this server is still
+    initializing a Kiro terminal whose identity check has not passed yet. Transient too.
     No provider raises this from initialize() today (providers/claude_code.py's init timeout
     raises a bare TimeoutError on purpose); ``reason`` defaults to ``None`` only so a caller
     outside this tree can still construct the exception without classifying it.
@@ -82,7 +94,10 @@ class ProviderExitedInputBlockedError(TerminalInputBlockedError):
 
     Raised by ``services/terminal_service.py``'s delivery guards when the
     terminal's status is ERROR or its pane's foreground process is the shell that
-    was running before the CLI launched (#1018). Still a
+    was running before the CLI launched (#1018), and with
+    ``reason=TerminalInputBlockedReason.INIT_FAILED`` for a Kiro terminal whose
+    init ended without a durable record that its identity check passed, or that
+    carries a durable deferred-init failure without one (#1074). Still a
     ``TerminalInputBlockedError`` so every existing handler keeps its answer --
     409 at ``/terminals/{id}/input``, 504 at ``run_step``, FAILED in the inbox --
     but the deferred-init path catches this subclass FIRST and tears the worker
@@ -165,6 +180,18 @@ class Terminal(BaseModel):
         ),
     )
     description: Optional[str] = None
+    kept: bool = Field(
+        default=False,
+        description=(
+            "True when this finished child is being KEPT instead of torn down "
+            "(terminal.keep_finished, issue #1225). CAO tears it down the normal way "
+            "after kept_until, unless it is working; an operator delete removes it now."
+        ),
+    )
+    kept_until: Optional[datetime] = Field(
+        default=None,
+        description="End of a kept child's idle window (UTC); None when not kept",
+    )
     metadata: Optional[Dict[str, Any]] = Field(
         None, description="Free-form, consumer-defined JSON describing what this terminal is doing"
     )
@@ -173,6 +200,16 @@ class Terminal(BaseModel):
         description=(
             "CAO-owned durable deferred-initialization failure metadata. "
             "Separate from consumer metadata so clients cannot overwrite lifecycle truth."
+        ),
+    )
+    launch_notes: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Notes on how this launch was admitted, for the operator. Today only a Kiro "
+            "v3 launch on a kiro-cli version still pending operator verification, "
+            "admitted by the operator opt-in kiro.v3_allow_unverified_versions "
+            "(#1167, provisional). Response-only, never persisted; None when there is "
+            "nothing to note."
         ),
     )
     memory_manager: Optional[Dict[str, Any]] = Field(
@@ -255,3 +292,6 @@ class AgentStepResult(BaseModel):
     terminal_id: str
     last_message: str
     status: TerminalStatus
+    # True only when run_agent_step itself deleted the worker terminal it created
+    # (issue #1203). False for reused terminals, teardown=False, and a failed delete.
+    torn_down: bool = False

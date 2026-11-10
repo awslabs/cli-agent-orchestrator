@@ -34,6 +34,15 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
 
+# herdr's four resolvable agent states. Shared by ``get_native_status`` (a
+# poll) and ``HerdrInboxService`` (the event stream) so both read one mapping.
+HERDR_AGENT_STATUS_TO_TERMINAL_STATUS: Dict[str, TerminalStatus] = {
+    "working": TerminalStatus.PROCESSING,
+    "blocked": TerminalStatus.WAITING_USER_ANSWER,
+    "done": TerminalStatus.COMPLETED,
+    "idle": TerminalStatus.IDLE,
+}
+
 # Herdr CLI subcommands that _run_herdr is allowed to invoke.
 _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
     {
@@ -68,6 +77,11 @@ _HERDR_ALLOWED_FLAGS = frozenset(
         "--workspace",
     }
 )
+
+
+def herdr_arg_is_safe(value: str) -> bool:
+    """True when ``value`` passes the herdr argument sanitizer (``_SAFE_ARG_RE``)."""
+    return _SAFE_ARG_RE.fullmatch(value) is not None
 
 
 def _sanitize_herdr_args(args: List[str]) -> List[str]:
@@ -345,6 +359,18 @@ class HerdrBackend(TerminalBackend):
 
         logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
         return window_name
+
+    def restore_session_env(self, session_name: str, key: str, launch_value: str) -> None:
+        """Nothing to restore: herdr's ``--env`` reaches only the pane it launches.
+
+        Measured on herdr 0.9.3 (#1074, provisional): a workspace created with
+        ``--env KEY=…`` gives ``KEY`` to its root pane only. Later tabs, with or
+        without an ``--env`` of their own, and a split of that root pane start
+        without it. herdr keeps no workspace environment, so a later tab gets
+        exactly what it would have had without ``launch_value``: its own
+        ``--env`` (``_build_env_args``) over the herdr server's environment.
+        """
+        logger.debug(f"restore_session_env({key}) is a no-op for herdr (session={session_name})")
 
     def session_exists(self, session_name: str) -> bool:
         """Check if a workspace with the given label exists."""
@@ -751,10 +777,12 @@ class HerdrBackend(TerminalBackend):
         args = ["pane", "read", pane_id]
         if visible_only:
             # herdr has no viewport/scrollback split; approximate the "current
-            # screen" contract with a small bounded recent read. In practice this
-            # arm is unreachable from the one visible_only caller (the stale-
-            # PROCESSING capture fallback): event-inbox backends return from
-            # get_status() before that fallback is reached.
+            # screen" contract with a small bounded recent read. The Kiro
+            # identity check reads the TUI header through this arm
+            # (KiroCliProvider._verify_agent_identity, #1074), so the header must
+            # be within these 50 lines. The stale-PROCESSING capture fallback
+            # never reaches it: event-inbox backends return from get_status()
+            # before that fallback.
             args.extend(["--source", "recent", "--lines", "50"])
         elif full_history:
             # Ask for herdr's read ceiling explicitly. A flagless `pane read`
@@ -902,16 +930,11 @@ class HerdrBackend(TerminalBackend):
         except (json.JSONDecodeError, AttributeError):
             return None
 
-        if agent_status == "working":
-            return TerminalStatus.PROCESSING
-        if agent_status == "blocked":
-            return TerminalStatus.WAITING_USER_ANSWER
-        if agent_status == "done":
-            return TerminalStatus.COMPLETED
-        if agent_status == "idle":
-            return TerminalStatus.IDLE
-        # "unknown" and any unrecognized value: unresolvable at backend level.
-        return None
+        # "unknown" and any unrecognized (or non-string) value: unresolvable at
+        # backend level.
+        if not isinstance(agent_status, str):
+            return None
+        return HERDR_AGENT_STATUS_TO_TERMINAL_STATUS.get(agent_status)
 
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve CAO terminal_id to herdr pane_id.
@@ -1102,10 +1125,24 @@ class HerdrBackend(TerminalBackend):
         whereas the tmux backend accepts such values. This is an intentional,
         safety-conservative divergence; operator env values on herdr must be
         sanitizer-safe.
+
+        The running CAO's own address and home (``cao_server_env``) come first.
+        A pane otherwise inherits the herdr server's environment, which belongs
+        to whatever process started that server, not necessarily this CAO.
         """
         from cli_agent_orchestrator.clients.tmux import TmuxClient
+        from cli_agent_orchestrator.utils.mcp_resolution import cao_server_env
 
         env: Dict[str, str] = {}
+        for key, value in cao_server_env().items():
+            if not _SAFE_ARG_RE.fullmatch(f"{key}={value}"):
+                logger.warning(
+                    "Dropping this CAO's %s from herdr pane env -- value contains "
+                    "characters the herdr arg sanitizer rejects",
+                    key,
+                )
+                continue
+            env[key] = value
         for key, value in (extra_env or {}).items():
             if TmuxClient._is_blocked_env_key(key):
                 logger.warning("Dropping forwarded env var with blocked key: %s", key)

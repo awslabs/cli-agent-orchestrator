@@ -11,7 +11,12 @@ Interrupt lifecycle:
   ``interrupt`` outcome and closes the stream.
 - If ``resume[]`` is provided in RunAgentInput, each entry is resolved through
   the idempotent approval registry before streaming begins.
-- Uncovered/expired open interrupts after resume processing produce RUN_ERROR.
+- A resume entry for an unknown or expired interrupt is skipped with a
+  server-side warning and the run proceeds; RUN_FINISHED lists it in
+  ``result.skippedResume``. A resume that fails (ambiguous
+  payload, delivery failure) produces RUN_ERROR. Interrupts still open after
+  resume processing end the run with the ``interrupt`` outcome; none left ends
+  it with ``success``. The body closes right after RUN_FINISHED or RUN_ERROR.
 """
 
 from __future__ import annotations
@@ -21,7 +26,10 @@ import json
 import logging
 import os
 import uuid
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
+from cli_agent_orchestrator.services.agui.attribution import subagent_run_id_for_terminal
+from cli_agent_orchestrator.services.agui_stream import CAO_GENERATIVE_UI_EVENT_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +40,11 @@ logger = logging.getLogger(__name__)
 AG_UI_AVAILABLE = False
 
 try:
+    # The SDK's own declaration of the spec version it was generated from
+    # ("1.0" for ag-ui-protocol 1.0.x). AG-UI 1.0 requires a producer to send
+    # it on RUN_STARTED, and the SDK leaves RunStartedEvent.protocol_version
+    # unset by default, so the run plane passes it explicitly.
+    from ag_ui.core import PROTOCOL_VERSION
     from ag_ui.core.events import (
         CustomEvent,
     )
@@ -66,7 +79,7 @@ _AGUI_STEP_STARTED = "STEP_STARTED"
 _AGUI_STEP_FINISHED = "STEP_FINISHED"
 _AGUI_TOOL_CALL_START = "TOOL_CALL_START"
 _AGUI_TOOL_CALL_END = "TOOL_CALL_END"
-_AGUI_GENERATIVE_UI = "GENERATIVE_UI"
+_AGUI_CUSTOM = "CUSTOM"
 _AGUI_TEXT_MESSAGE_CONTENT = "TEXT_MESSAGE_CONTENT"
 _AGUI_RAW = "RAW"
 _AGUI_RUN_STARTED = "RUN_STARTED"
@@ -82,13 +95,17 @@ _AGUI_RUN_ERROR = "RUN_ERROR"
 def _map_resume_payload(payload: Any) -> Optional[str]:
     """Map a resume entry payload to an ApprovalDecision string.
 
-    Mapping rules:
-    - {approved: true} or {approved: True} -> "approve"
-    - {approved: false} or {approved: False} -> "deny"
-    - {editedArgs: ...} or any dict with an "editedArgs"/"edited_args" key -> "edit"
-    - Non-dict payloads or dicts without an explicit boolean ``approved``
-      key and without ``editedArgs`` -> None (ambiguous; caller should treat
-      as an error).
+    ``approved`` decides, as the per-interrupt ``responseSchema`` documents
+    (``approved`` required, ``editedArgs`` an optional string). Mapping rules,
+    checked in this order:
+    - {approved: false, ...} -> "deny", whatever ``editedArgs`` holds
+    - non-blank ``editedArgs``/``edited_args`` -> "edit"; this covers
+      {approved: true, editedArgs: "..."} and the legacy bare
+      {editedArgs: "..."} with no ``approved`` key
+    - {approved: true} (``editedArgs`` absent or blank) -> "approve"
+    - Non-dict payloads, or dicts with no boolean ``approved`` and no
+      non-blank ``editedArgs`` -> None (ambiguous; caller should treat as an
+      error).
 
     Returns:
         Decision string ("approve", "deny", "edit") or None when the payload
@@ -97,16 +114,16 @@ def _map_resume_payload(payload: Any) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
 
-    if "editedArgs" in payload or "edited_args" in payload:
-        return "edit"
-
     approved = payload.get("approved")
-    if approved is True:
-        return "approve"
     if approved is False:
         return "deny"
+    edited = _extract_edited_text(payload)
+    if edited is not None and edited.strip():
+        return "edit"
+    if approved is True:
+        return "approve"
 
-    # No explicit boolean ``approved`` and no editedArgs -- ambiguous payload.
+    # No explicit boolean ``approved`` and no non-blank editedArgs -- ambiguous.
     return None
 
 
@@ -120,6 +137,44 @@ def _extract_edited_text(payload: Any) -> Optional[str]:
     if isinstance(text, dict):
         return json.dumps(text)
     return None
+
+
+def _skipped_result(skipped: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Keyword arguments that put skipped resume entries on ``RUN_FINISHED``.
+
+    AG-UI 1.0 ``interrupt-resume.mdx`` asks the producer to "surface a warning"
+    for an entry it cannot use, without naming a channel. CAO logs it and also
+    lists it here, as ``result = {"skippedResume": [{"interruptId", "reason"}]}``
+    (``reason`` is ``"unknown"`` or ``"expired"``; an evicted id is
+    ``"unknown"``, because the registry no longer holds it). ``result`` is the
+    spec's optional return value. Metadata only: ids and reasons, never prompt
+    text. With nothing skipped this returns no keyword at all, so the frame is
+    unchanged.
+    """
+    if not skipped:
+        return {}
+    return {"result": {"skippedResume": list(skipped)}}
+
+
+def _response_schema(options: List[str]) -> Dict[str, Any]:
+    """Build one interrupt's ``responseSchema`` from the options it offers.
+
+    Follows ag-ui ``docs/concepts/interrupts.mdx``: ``approved`` is required,
+    and the presence of ``editedArgs`` is the capability signal that a client
+    may offer edit UI, so it appears only when the interrupt offers ``edit``.
+    For CAO, ``editedArgs`` is the edited answer text typed into the agent's
+    prompt in place of a yes/no answer, not replacement tool arguments, so it
+    is a string.
+    """
+    properties: Dict[str, Any] = {
+        "approved": {"type": "boolean", "description": "true=approve, false=deny"},
+    }
+    if "edit" in options:
+        properties["editedArgs"] = {
+            "type": "string",
+            "description": "edited answer text, typed into the agent's prompt in place of yes/no",
+        }
+    return {"type": "object", "properties": properties, "required": ["approved"]}
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +254,14 @@ async def run_plane_stream(
         type="RUN_STARTED",
         thread_id=thread_id,
         run_id=run_id,
+        protocol_version=PROTOCOL_VERSION,
     )
     yield _emit(run_started)
+
+    # Resume entries skipped because they could not be answered (unknown or
+    # evicted id, or an answer to an expired interrupt). Reported on
+    # RUN_FINISHED.result so the client sees the warning in-band too.
+    skipped_resume: List[Dict[str, str]] = []
 
     # ── 2. Process resume[] entries ─────────────────────────────────────
     if run_input.resume and approval_construct is not None:
@@ -213,19 +274,32 @@ async def run_plane_stream(
             interrupt_id = entry.interrupt_id
             interrupt = approval_construct.get_interrupt(interrupt_id)
             if interrupt is None:
-                # Unknown interrupt -> RUN_ERROR
-                err = RunErrorEvent(
-                    type="RUN_ERROR",
-                    thread_id=thread_id,
-                    run_id=run_id,
-                    message=f"Unknown interrupt: {interrupt_id}",
+                # AG-UI 1.0 interrupt-resume.mdx, "An unrecognised entry": the
+                # run SHOULD proceed without the entry, and the producer SHOULD
+                # surface a warning rather than fail the run. This also covers
+                # an interrupt CAO raised that has since been purged from the
+                # registry. Whatever is still pending is re-reported below.
+                logger.warning(
+                    "run_plane: ignoring resume entry for unknown interrupt %s "
+                    "(never raised, or no longer retained)",
+                    interrupt_id,
                 )
-                yield _emit(err)
-                finished = True
-                return
+                skipped_resume.append({"interruptId": interrupt_id, "reason": "unknown"})
+                continue
 
             if interrupt.resolved:
-                # Already resolved (idempotent), skip
+                # An expired interrupt can no longer be answered (same page,
+                # "Resuming"), so an answer for it is dropped with a warning. It
+                # can still be abandoned (status "cancelled"), which is how a
+                # thread moves past it and needs no warning. Any other resolved
+                # interrupt is an idempotent re-send and is skipped quietly.
+                if interrupt.outcome == "expired" and entry.status != "cancelled":
+                    logger.warning(
+                        "run_plane: ignoring resume entry for expired interrupt %s; "
+                        "an expired interrupt can no longer be answered",
+                        interrupt_id,
+                    )
+                    skipped_resume.append({"interruptId": interrupt_id, "reason": "expired"})
                 continue
 
             # Map payload to decision
@@ -236,8 +310,6 @@ async def run_plane_stream(
             if decision_str is None:
                 err = RunErrorEvent(
                     type="RUN_ERROR",
-                    thread_id=thread_id,
-                    run_id=run_id,
                     message=(
                         f"Ambiguous resume payload for interrupt {interrupt_id}: "
                         f"payload must include 'approved' (boolean) or 'editedArgs'"
@@ -251,7 +323,7 @@ async def run_plane_stream(
 
             try:
                 decision_enum = ApprovalDecision(decision_str)
-                await approval_construct.resume(
+                answered = await approval_construct.resume(
                     interrupt_id=interrupt_id,
                     decision=decision_enum,
                     edited_text=edited_text,
@@ -259,8 +331,6 @@ async def run_plane_stream(
             except (KeyError, ValueError) as e:
                 err = RunErrorEvent(
                     type="RUN_ERROR",
-                    thread_id=thread_id,
-                    run_id=run_id,
                     message=f"Resume failed for interrupt {interrupt_id}: {e}",
                 )
                 yield _emit(err)
@@ -272,13 +342,26 @@ async def run_plane_stream(
                 # finishing the run as a success (P1).
                 err = RunErrorEvent(
                     type="RUN_ERROR",
-                    thread_id=thread_id,
-                    run_id=run_id,
                     message=f"Delivery failed for interrupt {interrupt_id} (retryable): {e}",
                 )
                 yield _emit(err)
                 finished = True
                 return
+
+            if answered.outcome == "expired" and entry.status != "cancelled":
+                # The interrupt was pending when checked above, but expired while
+                # its delivery was queued behind a sibling delivery on the same
+                # terminal (a status flap can expire one interrupt and open the
+                # next while the first is still being typed). Expiry won with zero
+                # keystrokes, so this answer was not used: warn and list it, the
+                # same as an answer that arrived after expiry. Abandoning it
+                # (status "cancelled") stays quiet, as it does in the pre-check.
+                logger.warning(
+                    "run_plane: ignoring resume entry for expired interrupt %s; "
+                    "an expired interrupt can no longer be answered",
+                    interrupt_id,
+                )
+                skipped_resume.append({"interruptId": interrupt_id, "reason": "expired"})
 
     # ── 3. Check for open interrupts ────────────────────────────────────
     if approval_construct is not None:
@@ -290,8 +373,6 @@ async def run_plane_stream(
                     snapshot = snapshot_fn()
                     snap_evt = StateSnapshotEvent(
                         type="STATE_SNAPSHOT",
-                        thread_id=thread_id,
-                        run_id=run_id,
                         snapshot=snapshot,
                     )
                     yield _emit(snap_evt)
@@ -300,8 +381,8 @@ async def run_plane_stream(
 
             # Convert CAO Interrupts to ag-ui Interrupts. The interior metadata
             # is camelCased (terminalId/sessionName) to match the stock ag-ui
-            # wire dialect, and response_schema advertises the accepted resume[]
-            # payload shape so a client knows how to answer (approve/deny/edit).
+            # wire dialect, and response_schema is built per interrupt from the
+            # options it offers, so a client knows how to answer it.
             ag_interrupts = []
             for p in pending:
                 meta = p.metadata or {}
@@ -311,24 +392,26 @@ async def run_plane_stream(
                     "sessionName": meta.get("session_name"),
                     "options": list(p.options),
                 }
+                # #1193: name the terminal subagent that raised the prompt, with
+                # the id the ambient stream gives that terminal. Omitted (never
+                # null) when the interrupt has no terminal.
+                attribution: Dict[str, Any] = {}
+                if meta.get("terminal_id"):
+                    attribution["subagent_run_id"] = subagent_run_id_for_terminal(
+                        str(meta["terminal_id"])
+                    )
                 ag_intr = AgUiInterrupt(
                     id=p.id,
                     reason=p.reason,
                     message=p.message,
                     metadata=ag_meta,
-                    response_schema={
-                        "type": "object",
-                        "properties": {
-                            "approved": {
-                                "type": "boolean",
-                                "description": "true=approve, false=deny",
-                            },
-                            "editedArgs": {
-                                "type": "object",
-                                "description": "edited answer (only if 'edit' is offered)",
-                            },
-                        },
-                    },
+                    response_schema=_response_schema(p.options),
+                    **attribution,
+                    # AG-UI 1.0 Interrupt.expiresAt, ISO 8601 by convention. CAO
+                    # expires an interrupt when its terminal leaves the waiting
+                    # state, so most interrupts have no deadline known ahead of
+                    # time; the key is sent only when one is set.
+                    expires_at=p.expires_at,
                 )
                 ag_interrupts.append(ag_intr)
 
@@ -342,6 +425,7 @@ async def run_plane_stream(
                 thread_id=thread_id,
                 run_id=run_id,
                 outcome=outcome,
+                **_skipped_result(skipped_resume),
             )
             yield _emit(run_finished)
             finished = True
@@ -353,8 +437,6 @@ async def run_plane_stream(
             snapshot = snapshot_fn()
             snap_evt = StateSnapshotEvent(
                 type="STATE_SNAPSHOT",
-                thread_id=thread_id,
-                run_id=run_id,
                 snapshot=snapshot,
             )
             yield _emit(snap_evt)
@@ -400,12 +482,19 @@ async def run_plane_stream(
                 frame = _translate_live_frame(ftype, fdata, thread_id, run_id, encoder)
                 if frame is not None:
                     yield frame
+                    if ftype == _AGUI_RUN_ERROR:
+                        # lifecycle.mdx: "A producer MUST NOT emit anything after
+                        # RUN_ERROR except RUN_STARTED." The run ends here: no
+                        # further live frames, no closers, no RUN_FINISHED.
+                        finished = True
+                        break
 
-        # Close any remaining open tool calls
-        for ftype, fdata in tracker.close_all():
-            frame = _translate_live_frame(ftype, fdata, thread_id, run_id, encoder)
-            if frame is not None:
-                yield frame
+        # Close any remaining open tool calls (not after a RUN_ERROR)
+        if not finished:
+            for ftype, fdata in tracker.close_all():
+                frame = _translate_live_frame(ftype, fdata, thread_id, run_id, encoder)
+                if frame is not None:
+                    yield frame
 
     # ── 6. RUN_FINISHED (success) ───────────────────────────────────────
     if not finished:
@@ -415,8 +504,35 @@ async def run_plane_stream(
             thread_id=thread_id,
             run_id=run_id,
             outcome=outcome,
+            **_skipped_result(skipped_resume),
         )
         yield _emit(run_finished)
+
+
+# AG-UI 1.0 steps define only ``stepName``; the open ``metadata`` object is where
+# integration-specific detail belongs (the ``ag-ui`` key is reserved for the
+# protocol). CAO's own fields live under ONE nested ``cao`` object with camelCase
+# keys, the same shape the ambient stream uses, so both planes agree.
+_CAO_METADATA_KEY = "cao"
+
+
+def _terminal_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"metadata": {"cao": {"terminalId": ...}}}`` when the frame names a terminal."""
+    terminal_id = data.get("step_id") or data.get("terminal_id")
+    if not terminal_id:
+        return {}
+    return {"metadata": {_CAO_METADATA_KEY: {"terminalId": terminal_id}}}
+
+
+def _fallback_step_name(data: Dict[str, Any]) -> Optional[str]:
+    """A per-terminal step name for a STEP_* frame that carries none.
+
+    lifecycle.mdx: "A producer MUST NOT open a step whose name is already open".
+    A shared constant would collide across terminals, so the fallback names the
+    terminal; STEP_FINISHED derives the same name, so it closes its own step.
+    """
+    terminal_id = data.get("step_id") or data.get("terminal_id")
+    return f"step-{terminal_id}" if terminal_id else None
 
 
 def _translate_live_frame(
@@ -429,6 +545,12 @@ def _translate_live_frame(
     """Translate a CAO internal AG-UI frame into a stock SDK event and encode it.
 
     Returns the encoded SSE string or None if the frame type is not mappable.
+
+    ``thread_id`` and ``run_id`` are not put on the events: AG-UI 1.0 lets only
+    ``RUN_STARTED`` and ``RUN_FINISHED`` carry them, and "A producer MUST emit
+    only what the schema defines" (``architecture.mdx``). The SDK models accept
+    extra keys silently, so passing them here would put undescribed fields on
+    the wire. The parameters stay for the callers' signature.
     """
     if not AG_UI_AVAILABLE:  # pragma: no cover - optional [agui] extra absent
         return None
@@ -439,8 +561,6 @@ def _translate_live_frame(
             snapshot_value = data.get("snapshot") or data
             evt = StateSnapshotEvent(
                 type="STATE_SNAPSHOT",
-                thread_id=thread_id,
-                run_id=run_id,
                 snapshot=snapshot_value,
             )
             return encoder.encode(evt)
@@ -449,33 +569,32 @@ def _translate_live_frame(
             delta = data.get("delta") or data.get("ops") or []
             evt = StateDeltaEvent(
                 type="STATE_DELTA",
-                thread_id=thread_id,
-                run_id=run_id,
                 delta=delta,
             )
             return encoder.encode(evt)
 
         elif agui_type == _AGUI_STEP_STARTED:
-            step_id = data.get("step_id") or data.get("terminal_id") or str(uuid.uuid4())
-            step_name = data.get("step_name") or data.get("provider") or "step"
+            step_name = (
+                data.get("step_name") or _fallback_step_name(data) or f"step-{uuid.uuid4().hex}"
+            )
             evt = StepStartedEvent(
                 type="STEP_STARTED",
-                thread_id=thread_id,
-                run_id=run_id,
-                step_id=step_id,
                 step_name=step_name,
+                **_terminal_metadata(data),
             )
             return encoder.encode(evt)
 
         elif agui_type == _AGUI_STEP_FINISHED:
-            step_id = data.get("step_id") or data.get("terminal_id") or "unknown"
-            step_name = data.get("step_name") or "step"
+            step_name = data.get("step_name") or _fallback_step_name(data)
+            if not step_name:
+                # lifecycle.mdx: a producer "MUST NOT finish a step that was
+                # never opened"; with no name and no terminal there is nothing
+                # this frame could close.
+                return None
             evt = StepFinishedEvent(
                 type="STEP_FINISHED",
-                thread_id=thread_id,
-                run_id=run_id,
-                step_id=step_id,
                 step_name=step_name,
+                **_terminal_metadata(data),
             )
             return encoder.encode(evt)
 
@@ -484,8 +603,6 @@ def _translate_live_frame(
             tool_call_name = data.get("tool_call_name") or "unknown"
             evt = ToolCallStartEvent(
                 type="TOOL_CALL_START",
-                thread_id=thread_id,
-                run_id=run_id,
                 tool_call_id=tool_call_id,
                 tool_call_name=tool_call_name,
             )
@@ -495,27 +612,24 @@ def _translate_live_frame(
             tool_call_id = data.get("tool_call_id") or "unknown"
             evt = ToolCallEndEvent(
                 type="TOOL_CALL_END",
-                thread_id=thread_id,
-                run_id=run_id,
                 tool_call_id=tool_call_id,
             )
             return encoder.encode(evt)
 
-        elif agui_type == _AGUI_GENERATIVE_UI:
+        elif agui_type == _AGUI_CUSTOM:
+            # Already a CUSTOM frame (the ambient mapping's generative-UI frame,
+            # ``name=CAO_GENERATIVE_UI_EVENT_NAME``): re-wrap it for this run
+            # with its own name and value, so the value is not nested twice.
             evt = CustomEvent(
                 type="CUSTOM",
-                thread_id=thread_id,
-                run_id=run_id,
-                name="cao.generative_ui",
-                value=data,
+                name=data.get("name") or CAO_GENERATIVE_UI_EVENT_NAME,
+                value=data.get("value"),
             )
             return encoder.encode(evt)
 
         elif agui_type == _AGUI_TEXT_MESSAGE_CONTENT:
             evt = CustomEvent(
                 type="CUSTOM",
-                thread_id=thread_id,
-                run_id=run_id,
                 name="cao.message_delivery",
                 value=data,
             )
@@ -524,8 +638,6 @@ def _translate_live_frame(
         elif agui_type == _AGUI_RAW:
             evt = CustomEvent(
                 type="CUSTOM",
-                thread_id=thread_id,
-                run_id=run_id,
                 name="cao.raw",
                 value=data,
             )
@@ -535,8 +647,6 @@ def _translate_live_frame(
             message = data.get("message") or "unknown error"
             evt = RunErrorEvent(
                 type="RUN_ERROR",
-                thread_id=thread_id,
-                run_id=run_id,
                 message=message,
             )
             return encoder.encode(evt)
@@ -545,8 +655,6 @@ def _translate_live_frame(
             # Unmapped type -> custom event with the raw data
             evt = CustomEvent(
                 type="CUSTOM",
-                thread_id=thread_id,
-                run_id=run_id,
                 name=f"cao.{agui_type.lower()}",
                 value=data,
             )

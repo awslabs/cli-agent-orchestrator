@@ -45,8 +45,10 @@ unaffected.
 ### Events and AG-UI
 
 - `/events` and `/events/history` expose server events.
-- `/agui/v1/stream` and `/agui/v1/emit_ui` provide the AG-UI stream and
-  generative UI input.
+- `GET`/`POST /agui/v1/stream` serve the fleet as an AG-UI 1.0 run, and
+  `/agui/v1/emit_ui` takes generative UI input. `POST /agui/v1/run` is the run
+  plane for approval interrupts, and `GET /agui/v1/capabilities` returns its
+  AG-UI 1.0 `AgentCapabilities`.
 
 See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 
@@ -56,7 +58,8 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 - `POST /ephemeral-agents/{name}/claim?caller_id=<creator-terminal-id>` claims it under a lease,
   rechecks policy and finalizes the profile. Its body accepts optional `idempotency_key`,
   `claim_id` and `model`; per-call models refuse. It returns the claim, provider and stored tools,
-  or a matching launched terminal with `replayed: true`.
+  and `provider_auto` (whether the spec declared `provider: "auto"`), or a matching launched
+  terminal with `replayed: true`.
 - `POST /sessions/{session}/terminals` launches it with `agent_profile`, `caller_id`, `provider`
   and optional `claim_id` query parameters. Claims are 32 lowercase hexadecimal characters.
   `POST /sessions` has no caller or claim parameter and refuses a created, pending ephemeral
@@ -219,7 +222,11 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   sidecar's outcome on the response as `memory_manager`
   (`{"state": "scheduled" | "refused", "detail"}`); a primary whose ceiling does
   not cover the sidecar's `@cao-mcp-server, fs_read, fs_list` gets `refused` and
-  no sidecar. `POST /sessions` and `POST /terminals/run-step` accept
+  no sidecar. A create's response may carry `launch_notes`, a list of strings for
+  the operator; today only a Kiro v3 launch that the operator's
+  `kiro.v3_allow_unverified_versions` opt-in admitted on a kiro-cli version still
+  pending verification (provisional, #1167). It is never persisted and is `null`
+  otherwise. `POST /sessions` and `POST /terminals/run-step` accept
   `caller_ceiling` in the JSON body for a caller on another node (remote
   `assign`/`handoff`); it is rejected together with a local `caller_id`, it is
   required when the body's `env_vars` carry `CAO_CALLBACK_TERMINAL_ID` (the
@@ -229,6 +236,14 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   tracked in [#965](https://github.com/awslabs/cli-agent-orchestrator/issues/965)); see
   [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance) for what
   that does and does not guarantee.
+- `POST /sessions`, `POST /sessions/{session_name}/terminals` and
+  `POST /sessions/{session_name}/terminals:operator` accept an optional `engine` query
+  parameter, and `POST /terminals/run-step` an optional `engine` body field: the Kiro
+  engine, `v2` or `v3` (`kas` is accepted as an alias of `v3`). It is valid only with
+  the `kiro_cli` provider, and must agree with the profile's `engine`, if the profile
+  sets one. Omitted, the profile's engine applies, else `v2`. An ephemeral Kiro helper
+  runs on v3 only: an explicit `v2` is refused with `kiro_ephemeral_engine:v2`; omit
+  the engine, or use `v3` (`kas`). See [Kiro v3 (preview)](kiro-cli.md#kiro-v3-preview).
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
   rolling buffer (most recent `state_buffer_max` bytes of streamed output —
   server setting, 32KB by default, see [Configuration](configuration.md)),
@@ -343,6 +358,39 @@ description participates in the request fingerprint: omitting it is not
 equivalent to supplying a nonempty description on a retry. Normalization applies
 to new inputs and edits; existing rows and stored fingerprints are not migrated.
 
+#### Delegation body fields
+
+Three JSON bodies carry delegation-decision fields for the decision points
+(see [Launch decisions](decisions.md#points-and-states)): `CreateTerminalBody`
+(`POST /sessions/{session_name}/terminals`), `CreateSessionBody` (`POST /sessions`),
+and `RunStepRequest` (`POST /terminals/run-step`).
+
+- `delegation_message: string | null` (default `null`) is accepted by all three
+  bodies. If supplied, an empty string returns `422`; otherwise it must be a
+  nonempty string or omitted entirely. On `CreateTerminalBody`/`CreateSessionBody`
+  it is the only source the delegation decision reads — the decision runs only
+  when it is present. On `RunStepRequest` it substitutes for `prompt` as the
+  decision's input when supplied, and falls back to `prompt` when it is not.
+- `delegation_kind: "handoff" | null` (default `null`) is accepted by
+  `CreateTerminalBody` and `CreateSessionBody` only. Only the literal `"handoff"`
+  is accepted; any other value returns `422`. Setting it requires
+  `delegation_message` to also be set and `initial_message` to be absent, or the
+  request returns `422` ("delegation_kind requires delegation_message and no
+  initial_message"). Setting `delegation_message` without `delegation_kind`
+  instead requires `initial_message` to be set with
+  `initial_message_orchestration_type` equal to `"assign"`, or the request
+  returns `422` ("delegation_message requires delegation_kind or an ASSIGN
+  initial_message").
+- `orchestration_type: "handoff" | null` (default `null`) is `RunStepRequest`'s
+  equivalent of `delegation_kind` — this body has no `delegation_kind` field.
+  `orchestration_type` and `delegation_message` must be supplied together or
+  both omitted, or the request returns `422` ("orchestration_type and
+  delegation_message must travel together"). That check runs first, so
+  supplying only one of the two fields alongside `reuse_terminal_id` returns
+  the "must travel together" `422`, not the one below. Both fields combined
+  with `reuse_terminal_id` return `422` ("delegation fields cannot be combined
+  with reuse_terminal_id").
+
 ### Durable handoff results
 
 - `POST /terminals/run-step` runs one agent step and accepts an optional
@@ -351,7 +399,10 @@ to new inputs and edits; existing rows and stored fingerprints are not migrated.
   behaves exactly as before, with no persistence overhead.
 - A step-level `detail.kind` distinguishes worker failures (`error` -> 502),
   in-band provider refusals (`provider_error` -> 502), and timeouts (`timeout` ->
-  504); callers branch on `kind`, not the numeric status alone.
+  504); callers branch on `kind`, not the numeric status alone. A reused Kiro
+  terminal (`reuse_terminal_id`) whose identity check is still running answers
+  `identity_pending` -> 409 with `retryable: true`: nothing was typed, so retry
+  the same call once it is ready.
 - `GET /handoff-results/{job_id}` retrieves the persisted record for that
   `job_id`. `state` is one of `running` (step still in progress), `completed`
   (result in `last_message`), or `error` (failure in `error_message`). `404`
@@ -418,6 +469,14 @@ The spec-route scope checks apply when authentication is enabled.
   assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
   run — not only a finished one. No run-level `output` field is returned (run-level output
   is not journaled); per-step outputs are on `steps[].output`.
+- `GET /workflows/runs/{run_id}/artifacts` lists the run's string inputs that name a report
+  file the web UI can show: `{run_id, artifacts: [{input, path, available, size}]}`.
+  `GET /workflows/runs/{run_id}/artifacts/{input_name}` returns that file as
+  `{run_id, input, path, size, content}`. The caller names an **input**, never a path:
+  the recorded value must resolve (symlinks followed) to a regular `.md` file directly in
+  the system temp dir and be at most 256 KiB. Unknown run 404; undeclared or non-string
+  input 400; a path outside that directory or not `.md` 403; no such file 404; too large
+  413 (refused, never truncated).
 - `POST /workflows/runs/{run_id}/cancel` cooperatively cancels a run;
   `POST /workflows/runs/{run_id}/resume` re-drives a crashed/failed one.
 - `POST /workflows/runs/{run_id}/steps/{step_id}:replay` re-executes **one** recorded step
@@ -463,6 +522,23 @@ that check is inert.
 
 See [Workflows](workflows.md).
 
+### Fleet
+
+Read-only views of a CAO cluster's workers, reached through the fleet's worker broker
+(`CAO_ELASTIC_BROKER_URL` / `CAO_ELASTIC_BROKER_TOKEN` in cao-server's environment). No
+broker configured, unreachable, or erroring is a `503` carrying the broker's message.
+Releasing workers and shutting the fleet down stay CLI actions (`cao worker release`,
+`cao fleet shutdown`).
+
+- `GET /fleet/status` mirrors `cao fleet status`: `{broker, live, cleanup_pending, states}`.
+- `GET /fleet/workers` mirrors `cao worker list` (`?all=true` for `--all`):
+  `{broker, workers: [{worker_id, state, reason, agent_profile, provider, age_seconds,
+  workload_present, cleanup_pending, lease_tracked}]}`. Only those fields are returned.
+- `GET /fleet/workers/{worker_id}` mirrors `cao worker status`:
+  `{worker_id, lease, terminal, terminal_error, last_output}`. `terminal` carries
+  `{id, name, session_name, agent_profile, provider, status}`; `last_output` is capped at
+  4000 characters. A malformed id is `400`; no lease and no answering worker is `404`.
+
 ### Memory and graph
 
 - `/settings/memory` reports memory enablement (including `learning_enabled`).
@@ -479,6 +555,18 @@ See [Workflows](workflows.md).
   "disabled" internally, and reporting that as 404 would tell the caller a
   configuration story about a filesystem fault. These are the routes the
   `report_outcome` / `list_outcomes` MCP tools call.
+  `POST /outcomes` also takes an optional `launch_terminal_id` (the MCP
+  tool's `terminal_id`), which links the outcome to that terminal's launch
+  record. The link is checked against the stored record before anything is
+  written: only a self-report (`source_terminal_id` equals
+  `launch_terminal_id`) or the launch's direct creator (the record's
+  `caller_id`) may link. The route answers **403** and writes nothing when
+  records exist for that id and none is bound to the reporter, or when
+  `launch_terminal_id` comes without a `source_terminal_id`. When
+  `launch_terminal_id` is sent, the response carries `launch_linked`: `true`
+  if the outcome was joined to a launch record, and `false` if it was written
+  without a link (no record for the id, a self-report on a launch that has
+  already ended, or a link that could not be read or written).
 - `/internal/memory/*` serves the memory tools on a node that does not own the
   database (`CAO_MEMORY_API_URL`). Its `key` is validated leniently and then
   normalised, matching what the tools have always done in-process — the strict
