@@ -142,6 +142,29 @@ native_agent: my-native-agent
 ---
 ```
 
+## How CAO knows Claude Code has started
+
+CAO types the `claude` command into the new pane, answers the startup dialogs it knows
+(bypass permissions, workspace trust, the Bedrock model-upgrade nudge), and then waits
+for the agent to be ready. Each wait is capped by `provider_init_timeout` (60 seconds by
+default).
+
+- **A fresh start** is ready once the `Claude Code v…` banner is on screen.
+- **A resumed conversation** (`cao launch --resume-session-id`) is ready once the empty
+  input box is on screen. Claude Code shows a resumed conversation full-screen, with no
+  scrollback, so after a long conversation the banner is no longer on screen. Before
+  this was recognised, every resumed launch waited the full `provider_init_timeout`
+  first.
+- **A supervisor that is already working when the wait runs out** still counts as
+  started if its status is processing **and** there is evidence that real work began:
+  CAO saw it ready earlier in this start and you have typed into it since, or it has
+  already made a CAO call that the server recorded (an `assign`, a `handoff` or a
+  `create_ephemeral_agent`). CAO logs a warning and finishes the launch. The deadline is
+  not extended. Without that evidence the launch fails as before.
+
+If a launch does fail, the agents it already started are kept. See
+[When a launch fails while it starts](terminal-lifecycle.md#when-a-launch-fails-while-it-starts).
+
 ## Implementation Notes
 
 - **Prompt patterns**: `IDLE_PROMPT_PATTERN` matches both old `>` and new `❯` prompt styles, including non-breaking space (`\xa0`)

@@ -797,11 +797,105 @@ def _resolve_working_directory(working_directory: Optional[str]) -> str:
     )
 
 
+def _peer_terminal_ids_locked(session_name: str, terminal_id: str) -> Optional[List[str]]:
+    """Other live rows in ``terminal_id``'s session incarnation. CALLER HOLDS the lock.
+
+    A peer is any other terminal row registered under ``session_name`` in the
+    CURRENT incarnation (the one the caller has already proven ``terminal_id``
+    owns), except a retained deferred-init failure tombstone, whose runtime is
+    already gone. Rows of an older incarnation of the same name are not peers:
+    their backend session no longer exists. Returns None when the registry
+    cannot be read, which the caller must treat as "there may be peers".
+    """
+    try:
+        incarnation = get_session_incarnation(session_name)
+        rows = list_terminals_by_session(session_name)
+    except Exception:
+        logger.exception(f"Rollback: could not list the terminals of {session_name}")
+        return None
+    return [
+        str(row["id"])
+        for row in rows
+        if str(row["id"]) != terminal_id
+        and row.get("session_incarnation_id") == incarnation
+        and not row.get("deferred_init_failure")
+    ]
+
+
+def _roll_back_creator_window_keeping_peers_locked(
+    session_name: str, window_name: str, peers: Optional[List[str]]
+) -> None:
+    """Remove only the failed creator's window; the session stays for its peers.
+
+    CALLER HOLDS the lifecycle lock. The forwarded env stays with the session,
+    which still serves later windows. If the backend reports the session gone
+    after the window kill (tmux drops a session with its last window, e.g. when
+    the only peer's pane had already exited), the env is cleared then, so a
+    secret never outlives the session it was forwarded to. Best-effort, never
+    raises.
+    """
+    logger.warning(
+        "Rollback: session %s has other terminals (%s); removing only the failed "
+        "creator's window %s and keeping the session (#1277)",
+        session_name,
+        ", ".join(peers) if peers else "the registry could not be read",
+        window_name or "<unknown>",
+    )
+    if window_name:
+        try:
+            if not get_backend().kill_window(session_name, window_name):
+                logger.warning(
+                    f"Rollback: kill_window({session_name}:{window_name}) did not confirm "
+                    "the kill; the window may still be live"
+                )
+        except Exception:
+            logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
+    try:
+        session_gone = not get_backend().session_exists(session_name)
+    except Exception:
+        logger.exception(f"Rollback: could not check whether {session_name} still exists")
+        return
+    if session_gone:
+        try:
+            clear_session_env(session_name)
+        except Exception:
+            logger.exception(f"Rollback: failed to clear session env for {session_name}")
+
+
+def _delete_rows_killed_with_session_locked(session_name: str, terminal_id: str) -> None:
+    """Record the rows a creator's ``kill_session`` took with it. CALLER HOLDS the lock.
+
+    The creator's rollback kills the whole session only after
+    ``_peer_terminal_ids_locked`` found no other row in it, so normally there is
+    nothing here. A row that is here anyway joined after that check without this
+    process's lifecycle lock (the cross-process gap documented on
+    ``list_terminals_by_session``), and its pane is now gone with the session.
+    Delete it with ``end_reason="creator_rollback"`` so its launch record names
+    the cause, instead of leaving it for herdr's ``workspace.closed`` to stamp
+    ``pane_closed`` or a sweep to stamp ``stale_cleanup``. The failed creator's
+    own row is left to the caller, which deletes it as ``launch_failed``.
+    Best-effort, never raises.
+    """
+    peers = _peer_terminal_ids_locked(session_name, terminal_id)
+    for peer_id in peers or ():
+        logger.warning(
+            "Rollback: terminal %s joined %s after the peer check and was killed with "
+            "the session; recording end_reason=creator_rollback",
+            peer_id,
+            session_name,
+        )
+        try:
+            db_delete_terminal(peer_id, end_reason="creator_rollback")
+        except Exception:
+            logger.exception(f"Rollback: failed to delete killed peer row {peer_id}")
+
+
 def _roll_back_backend_create_locked(
     session_name: str,
     window_name: str,
     *,
     created_session: bool,
+    terminal_id: Optional[str] = None,
 ) -> None:
     """Undo the backend resource a create just made. CALLER MUST HOLD the
     lifecycle lock for ``session_name``.
@@ -813,7 +907,15 @@ def _roll_back_backend_create_locked(
 
     * ``created_session=True`` -- this call created the whole session, so kill the
       session and drop any forwarded env stashed for the name, so secrets don't
-      linger in memory or bleed into a future reuse of the name.
+      linger in memory or bleed into a future reuse of the name. EXCEPT when
+      other terminals have joined the session since (#1277): a supervisor's pane
+      is live during its own provider init and can ``assign`` workers into its
+      session, so when ``terminal_id`` (the failed creator's committed row) is
+      given and other rows share its incarnation, only the creator's window goes
+      (``_roll_back_creator_window_keeping_peers_locked``), for the same reason as
+      the window arm below. Killing the session there destroyed working peers.
+      With no ``terminal_id`` (the in-closure rollback, before the row exists, in
+      the same locked section that created the session) there can be no peers.
     * ``created_session=False`` -- this call only added a WINDOW to a session that
       already existed (``new_session=False``: every MCP spawn/assign-into-an-
       existing-session call). Kill ONLY that window, so the pre-existing session
@@ -831,6 +933,13 @@ def _roll_back_backend_create_locked(
     Best-effort and never raises: it runs while an exception is already in
     flight, and that original failure is the one the caller must see.
     """
+    if created_session and terminal_id is not None:
+        peers = _peer_terminal_ids_locked(session_name, terminal_id)
+        if peers is None or peers:
+            # An unreadable registry counts as "there may be peers": killing
+            # live work is the irreversible mistake, an empty session is not.
+            _roll_back_creator_window_keeping_peers_locked(session_name, window_name, peers)
+            return
     if created_session:
         # `finally`, not a following statement: the env mapping must be dropped
         # however the kill turns out -- including when it raises a BaseException
@@ -856,6 +965,8 @@ def _roll_back_backend_create_locked(
                 clear_session_env(session_name)
             except Exception:
                 logger.exception(f"Rollback: failed to clear session env for {session_name}")
+        if terminal_id is not None:
+            _delete_rows_killed_with_session_locked(session_name, terminal_id)
     else:
         try:
             if not get_backend().kill_window(session_name, window_name):
@@ -928,7 +1039,10 @@ def _roll_back_cancelled_create(
     with session_lifecycle_lock(session_name):
         if _still_owns_incarnation(session_name, terminal_id):
             _roll_back_backend_create_locked(
-                session_name, window_name, created_session=created_session
+                session_name,
+                window_name,
+                created_session=created_session,
+                terminal_id=terminal_id,
             )
         try:
             db_delete_terminal(terminal_id, end_reason="launch_failed")
@@ -970,7 +1084,10 @@ def _roll_back_backend_create_if_still_ours(
         if not _still_owns_incarnation(session_name, terminal_id):
             return
         _roll_back_backend_create_locked(
-            session_name, window_name or "", created_session=created_session
+            session_name,
+            window_name or "",
+            created_session=created_session,
+            terminal_id=terminal_id,
         )
 
 
@@ -1025,7 +1142,10 @@ def _roll_back_failed_create(
        (``new_session=False``, every MCP spawn/assign-into-existing-session
        call) has no session-level teardown to fall back on, and without it a
        provider init timeout rolled back the row and stopped the reader but
-       left the pane running, invisible to list/tree, forever.
+       left the pane running, invisible to list/tree, forever. The session arm
+       kills the session only when no other terminal has joined it (#1277);
+       otherwise it removes just this terminal's window, so workers a
+       supervisor assigned during its own init keep running.
     3. Provider -- AFTER the process-owning session/window is stopped, because
        a provider releasing private on-disk state must not race a process
        still writing it (Grok's updater can still be writing ``$GROK_HOME``

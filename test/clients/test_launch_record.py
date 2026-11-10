@@ -307,6 +307,8 @@ def test_end_reason_vocabulary():
         # #1225: a kept child reaped after its window, or evicted for the cap.
         "kept_expired",
         "kept_evicted",
+        # #1277: killed with a session another terminal's failed create rolled back.
+        "creator_rollback",
     }
 
 
