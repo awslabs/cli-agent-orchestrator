@@ -19,6 +19,11 @@ from cli_agent_orchestrator.utils.paths import WorkingDirectoryError
 
 _TS = "cli_agent_orchestrator.services.terminal_service"
 
+# ``kiro_cli`` is a stand-in provider here and "developer" is not an installed
+# Kiro agent; the agent-store check main added (#1074) runs after the path is
+# resolved and is covered by test_kiro_agent_identity_launch.
+pytestmark = pytest.mark.usefixtures("kiro_agent_store_not_under_test")
+
 
 class _StopAtBackendCreate(Exception):
     """Raised by the mocked backend create so the test can prove the directory

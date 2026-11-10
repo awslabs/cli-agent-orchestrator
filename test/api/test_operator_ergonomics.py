@@ -602,6 +602,11 @@ class TestCreationIsPerRequest:
             patch(f"{ts}.generate_terminal_id", return_value="test1234"),
             patch(f"{ts}.agent_profiles.load_agent_profile") as load_profile,
             kiro_probe,
+            # "developer" is not an installed Kiro agent. The agent-store check
+            # main added (#1074) runs AFTER the path is resolved, so it never
+            # masks the refusals under test; it would only stop the creating
+            # cases before they reach the backend.
+            patch(f"{ts}.require_kiro_agent_resolves"),
         ):
             load_profile.return_value = AgentProfile(name="developer", description="Developer")
             backend.session_exists.return_value = False
