@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Local assigns only; `target_host` and elastic workers are not covered (#1246). A forward waits
   until the worker has started on the last message delivered to it; a worker that shows no sign of
   work for `CAO_DELEGATION_PICKUP_TIMEOUT_SECONDS` (default 300) after a delivery is forwarded with
-  a header saying the message may not have been picked up.
+  a header saying the message may not have been picked up. With `CAO_EAGER_INBOX_DELIVERY=true`, a
+  message can reach a worker in the middle of a turn, and the forward can then send the answer of
+  that turn.
 
 - **Keep finished child agents open, for workshops and debugging** (#1225 phase 1). A new
   machine-wide setting, `terminal.keep_finished`, off by default
