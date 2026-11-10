@@ -64,7 +64,9 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.cli.commands.agent_plugin import UNTRUSTED_CONTENT_WARNING
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
+    create_delegation_edge,
     create_inbox_message,
+    find_any_edge,
     get_handoff_result,
     get_inbox_messages,
     get_terminal_metadata,
@@ -118,6 +120,7 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
 from cli_agent_orchestrator.graph.sinks import get_sink
+from cli_agent_orchestrator.models.delegation import EdgeReason, EdgeSource
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
@@ -160,6 +163,7 @@ from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
     approval_store,
+    delegation_callback_service,
     ephemeral_service,
     flow_service,
     keep_service,
@@ -282,6 +286,10 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
             await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
         except Exception:
             logger.exception("Inbox reconciliation daemon error")
+        try:
+            await asyncio.to_thread(delegation_callback_service.sweep, registry)
+        except Exception:
+            logger.exception("Delegation callback sweep error")
 
 
 async def ephemeral_sweep_daemon() -> None:
@@ -1778,6 +1786,7 @@ async def lifespan(app: FastAPI):
     status_monitor_task = asyncio.create_task(status_monitor.run())
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
+    delegation_callback_task = asyncio.create_task(delegation_callback_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
     # Start ApprovalBridge when AG-UI surface is enabled
@@ -1865,6 +1874,7 @@ async def lifespan(app: FastAPI):
     status_monitor_task.cancel()
     log_writer_task.cancel()
     inbox_service_task.cancel()
+    delegation_callback_task.cancel()
     # Cancel approval bridge on shutdown
     if approval_bridge_task is not None:
         approval_bridge_task.cancel()
@@ -1880,6 +1890,7 @@ async def lifespan(app: FastAPI):
             status_monitor_task,
             log_writer_task,
             inbox_service_task,
+            delegation_callback_task,
             daemon_task,
             return_exceptions=True,
         )
@@ -4757,6 +4768,8 @@ async def create_terminal_in_session(
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
     lookup_only: bool = False,
+    expect_callback: bool = False,
+    worker_can_reply: bool = True,
     claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -4921,6 +4934,21 @@ async def create_terminal_in_session(
             claim_id=claim_id,
             **_launch_options(launch_plan),
         )
+        # Written before the response so the caller cannot go idle before the
+        # server knows it is waiting on this worker. An idempotent replay returns
+        # the worker the first attempt created, whose edge already exists. Any
+        # edge counts, closed ones too: a replay after the first edge closed
+        # would otherwise write an edge that is never armed (the task was
+        # delivered once already) and would stay OPEN for good.
+        if expect_callback:
+            existing_edge = await asyncio.to_thread(find_any_edge, caller_id, result.id)
+            if existing_edge is None:
+                reason = (
+                    EdgeReason.NO_CALLBACK if worker_can_reply else EdgeReason.NO_SEND_MESSAGE_TOOL
+                )
+                await asyncio.to_thread(
+                    create_delegation_edge, caller_id, result.id, EdgeSource.ASSIGN, reason
+                )
         _set_launch_note(response, launch_plan)
         return result
     except HTTPException:
@@ -9512,6 +9540,7 @@ async def create_inbox_message_endpoint(
     receiver_id: TerminalId,
     sender_id: str,
     message: str,
+    expect_reply: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
@@ -9528,6 +9557,20 @@ async def create_inbox_message_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create inbox message: {str(e)}",
         )
+
+    # Edge bookkeeping is best-effort: the message is already stored, so a
+    # failure here must not turn a successful send into an error the sender
+    # would retry (which would deliver the message twice).
+    try:
+        await asyncio.to_thread(
+            delegation_callback_service.on_send_message,
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            message_id=inbox_msg.id,
+            expect_reply=expect_reply,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Delegation edge update failed for {sender_id} -> {receiver_id}: {e}")
 
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.

@@ -18,19 +18,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`--resume-session-id`) is ready as soon as its input box shows, instead of always waiting the
   full `provider_init_timeout`. A supervisor that is processing at the deadline counts as started
   when it was seen ready first or has already made a recorded CAO call.
+- **`assign` guarantees a callback by default.** If a worker goes idle without calling
+  `send_message`, the server forwards its last response to the caller, labelled as auto-forwarded;
+  if the worker is deleted or errors first, the caller is told, and if a message or the task cannot
+  be delivered (including a restart before the task was delivered), the caller gets a
+  `[CAO delivery failed]` notice. Opt out per call with
+  `expect_callback=False`. `send_message` gains `expect_reply` for terminals you did not assign.
+  Local assigns only; `target_host` and elastic workers are not covered (#1246). A forward waits
+  until the worker has started on the last message delivered to it; a worker that shows no sign of
+  work for `CAO_DELEGATION_PICKUP_TIMEOUT_SECONDS` (default 300) after a delivery is forwarded with
+  a header saying the message may not have been picked up. With `CAO_EAGER_INBOX_DELIVERY=true`, a
+  message can reach a worker in the middle of a turn, and the forward can then send the answer of
+  that turn.
+
 - **A hung FIFO-writer test fails in 10 seconds instead of holding CI** (#1251 follow-up).
   `test_stdin_closing_before_any_reader_ends_the_writer` called the writer in-process, so a
   regression to a blocking `open()` would have hung the pytest worker; it now runs the writer in
-  a daemon thread joined with a timeout. The Unit Tests job also gains `timeout-minutes: 60`, so
-  any hung test ends the job within an hour instead of GitHub's default of six.
+  a daemon thread joined with a timeout. The Unit Tests job and the CAO MCP Apps job, whose backend
+  coverage step runs the same suite, also gain `timeout-minutes: 60`, so any hung test ends the
+  job within an hour instead of GitHub's default of six.
 - **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
   the sidecar beside `opencode.json` could not be read as a grant record, `cao install
   --provider opencode_cli` started from an empty record and wrote it back, dropping every other
-  agent's recorded grants. It now leaves the file as it is, logs a warning that names it, and
-  does not record this agent's grants. The install still completes. Until the sidecar is
-  repaired and the agent reinstalled, a plugin server's grant is withdrawn by plugin-store
-  containment, and a profile server's grant (`cao-mcp-server*`, say) is left in place, the
-  conservative direction.
+  agent's recorded grants. It now leaves the file as it is, logs a warning that names it and
+  says to repair it by hand (deleting it drops every agent's recorded grants), and does not
+  record this agent's grants. The install still completes. A plugin server's grant
+  is still withdrawn by plugin-store containment. A reinstall after the sidecar is repaired
+  records the servers the profile then names; a profile server's grant (`cao-mcp-server*`,
+  say) that was added while the sidecar was damaged, and that the profile no longer names,
+  stays until you remove it by hand.
 - **`cao install` exits 1 when the install fails** (#1270). It printed `Error: <message>` and
   exited 0, so a script or CI step could not tell a failed install from a successful one. It
   now exits 1 with the same message on stderr, like the rest of the CLI. A script that relied

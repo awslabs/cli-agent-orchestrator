@@ -2,6 +2,7 @@
 
 import asyncio
 import textwrap
+import threading
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -9,7 +10,11 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
-from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS, INBOX_RECONCILE_INTERVAL
+from cli_agent_orchestrator.constants import (
+    INBOX_RECONCILE_GRACE_SECONDS,
+    INBOX_RECONCILE_INTERVAL,
+    INBOX_SWEEP_FANOUT,
+)
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
@@ -2189,3 +2194,177 @@ class TestDialogGuardCoversSubmitRecovery:
 
         assert pastes == ["paste"]
         assert enters, "a non-blocking provider must still get its swallowed Enter re-sent"
+
+
+class TestDelegationEdgeArming:
+    """A successful delivery arms the send_message edges its messages opened."""
+
+    @pytest.fixture(autouse=True)
+    def _no_submit_confirmation(self):
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False
+        ):
+            yield
+
+    @patch("cli_agent_orchestrator.services.inbox_service.mark_message_edges_delivered")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_successful_delivery_arms_message_edges(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update, mock_arm
+    ):
+        mock_get.return_value = [_make_message(id=5), _make_message(id=6)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        InboxService().deliver_pending("term-1", num_messages=0)
+
+        mock_arm.assert_called_once_with([5, 6])
+
+    @patch("cli_agent_orchestrator.services.inbox_service.mark_message_edges_delivered")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_failed_delivery_does_not_arm_edges(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update, mock_arm
+    ):
+        mock_get.return_value = [_make_message(id=5)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.dispatch_input.side_effect = RuntimeError("tmux error")
+
+        InboxService().deliver_pending("term-1")
+
+        mock_arm.assert_not_called()
+
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.mark_message_edges_delivered",
+        side_effect=RuntimeError("database unavailable"),
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_arming_failure_leaves_delivered_batch_delivered(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update, _mock_arm
+    ):
+        mock_get.return_value = [_make_message(id=5)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        InboxService().deliver_pending("term-1")
+
+        mock_term_svc.dispatch_input.assert_called_once()
+        statuses = [c.args[1] for c in mock_update.call_args_list]
+        assert MessageStatus.FAILED not in statuses
+
+
+class TestDelegationEdgeArmingAfterConfirmation:
+    """Edges are armed after the submit confirmation, whatever its outcome."""
+
+    @pytest.fixture
+    def delivery(self):
+        order = []
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", True),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.mark_message_edges_delivered",
+                side_effect=lambda ids: order.append(("arm", ids)),
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service"),
+            patch("cli_agent_orchestrator.services.inbox_service.get_backend") as backend,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message(id=5)],
+            ),
+        ):
+            backend.return_value.supports_event_inbox.return_value = False
+            monitor.get_status.return_value = TerminalStatus.IDLE
+            yield order
+
+    @pytest.mark.parametrize("confirmed", [True, False])
+    def test_armed_after_the_confirmation_returns(self, delivery, confirmed):
+        def confirm(*_args, **_kwargs):
+            delivery.append(("confirm", None))
+            return confirmed
+
+        with patch.object(InboxService, "_confirm_submitted", side_effect=confirm):
+            InboxService().deliver_pending("term-1")
+
+        assert delivery == [("confirm", None), ("arm", [5])]
+
+
+class TestHoldDeliveryIfIdle:
+    def test_held_when_no_delivery_runs(self):
+        service = InboxService()
+        with service.hold_delivery_if_idle("term-1") as held:
+            assert held is True
+            assert service._delivery_lock("term-1").locked() is True
+        assert service._delivery_lock("term-1").locked() is False
+
+    def test_not_held_while_a_delivery_runs(self):
+        service = InboxService()
+        seen = []
+
+        def dispatch(terminal_id, *_args, **_kwargs):
+            with service.hold_delivery_if_idle(terminal_id) as held:
+                seen.append(held)
+            return 0
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False),
+            patch("cli_agent_orchestrator.services.inbox_service.mark_message_edges_delivered"),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as ts,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message(id=5)],
+            ),
+        ):
+            monitor.get_status.return_value = TerminalStatus.IDLE
+            ts.dispatch_input.side_effect = dispatch
+            service.deliver_pending("term-1")
+
+        assert seen == [False]
+        assert service._delivery_lock("term-1").locked() is False
+
+
+class TestDeliverPendingInBackground:
+    def test_runs_on_the_shared_pool_with_the_registry(self):
+        service = InboxService()
+        registry = MagicMock()
+        seen = []
+
+        def deliver(terminal_id, registry=None):
+            seen.append((terminal_id, registry, threading.current_thread().name))
+
+        with patch.object(service, "deliver_pending", side_effect=deliver):
+            service.deliver_pending_in_background("term-1", registry=registry).result(5)
+            service.deliver_pending_in_background("term-2").result(5)
+
+        assert [(t, r) for t, r, _ in seen] == [("term-1", registry), ("term-2", None)]
+        assert all(name.startswith("cao-deliver") for _, _, name in seen)
+        assert service._background_pool._max_workers == INBOX_SWEEP_FANOUT
+
+    def test_failure_is_logged_not_raised(self, caplog):
+        service = InboxService()
+        with patch.object(service, "deliver_pending", side_effect=RuntimeError("pane gone")):
+            service.deliver_pending_in_background("term-1").result(5)
+
+        assert "Background delivery to term-1 failed: pane gone" in caplog.text
+
+
+class TestShortReason:
+    def test_names_the_exception_on_one_line(self):
+        from cli_agent_orchestrator.services.inbox_service import _short_reason
+
+        assert _short_reason(RuntimeError("tmux\n  error")) == "RuntimeError: tmux error"
+        assert _short_reason(RuntimeError()) == "RuntimeError"
+
+    def test_long_reasons_are_cut(self):
+        from cli_agent_orchestrator.services.inbox_service import _short_reason
+
+        reason = _short_reason(RuntimeError("x" * 500))
+        assert len(reason) == 200 and reason.endswith("...")
