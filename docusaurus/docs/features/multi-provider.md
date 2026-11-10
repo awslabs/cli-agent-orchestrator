@@ -113,7 +113,7 @@ When the supervisor calls `handoff("developer", "Implement login page")`, CAO re
 Each provider preserves its native capabilities inside CAO:
 
 - **Claude Code** -- sub-agents, `--permission-mode`, native agent routing, MCP config injection
-- **Kiro CLI** -- custom agents (`~/.kiro/agents/`), skill resources, legacy and TUI mode
+- **Kiro CLI** -- custom agents (`~/.kiro/agents/`), skill resources, the default TUI on the v2 engine, with the v3 engine in preview ([Kiro v3](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/kiro-cli.md#kiro-v3-preview))
 - **Codex** -- named profiles (`--profile`), inline config overrides (`-c key=value`)
 - **Hermes** -- profile aliases, structured approval prompts (`answer_user_prompt`)
 - **Copilot CLI** -- baked-in `.agent.md` skill delivery
