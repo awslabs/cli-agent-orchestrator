@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Remote worker status polling no longer overruns `--timeout` by up to 60s.** (#1059)
   `FleetClient.terminal_status` now defaults its read timeout to 5.0s (matching the local
   terminal poll ceiling in `wait_until_terminal_status`) instead of inheriting the module-wide
-  60s read timeout, keeping stalled broker responses bounded within the caller's poll budget.
+  60s read timeout. Each status read now stops after 5s to connect and 5s without data, so a
+  stalled broker can overrun `--timeout` by about 6s instead of about 60s.
 - **A hung FIFO-writer test fails in 10 seconds instead of holding CI** (#1251 follow-up).
   `test_stdin_closing_before_any_reader_ends_the_writer` called the writer in-process, so a
   regression to a blocking `open()` would have hung the pytest worker; it now runs the writer in
