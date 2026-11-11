@@ -5,7 +5,18 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+    cast,
+)
 
 from sqlalchemy import (
     Boolean,
@@ -21,6 +32,7 @@ from sqlalchemy import (
     exists,
     func,
     literal_column,
+    or_,
     text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -50,9 +62,16 @@ else:
     from sqlalchemy import Column
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
+from cli_agent_orchestrator.models.delegation import (
+    DelegationEdge,
+    EdgeReason,
+    EdgeSource,
+    EdgeState,
+)
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.kiro_engine import canonical_kiro_engine
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +322,65 @@ class TerminalModel(Base):
     # terminal's spawn parent; it is not worth its price as a sort key.
 
 
+class KeptTerminalModel(Base):
+    """A finished child terminal CAO is keeping instead of tearing down (#1225).
+
+    Only written while ``terminal.keep_finished.enabled`` is on, so with the setting
+    off this table stays empty and no ``terminals`` row changes. Content-free on
+    purpose: ids, the session, two times and a reason label. A separate table rather
+    than columns on ``terminals`` so the migration is additive (``create_all`` makes
+    it) and the terminal rows themselves stay byte-identical.
+
+    The row is deleted in the same transaction as its terminal row by every
+    database teardown function below, so a reused terminal id can never inherit a
+    stale keep. ``kept_until`` is the end of the keep window; the reaper moves it
+    forward while the child is busy.
+    """
+
+    __tablename__ = "kept_terminals"
+
+    terminal_id = Column(String, primary_key=True)
+    session_name = Column(String, nullable=False)
+    kept_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    kept_until = Column(UTCDateTime, nullable=False)
+    reason = Column(String, nullable=False)  # one of KEEP_REASONS
+    __table_args__ = (Index("ix_kept_terminals_session_name", "session_name"),)
+
+
+# What made CAO keep a terminal (#1225 phase 1).
+KEEP_REASONS = ("handoff", "delete_terminal")
+
+
+class KeptMark(NamedTuple):
+    """What ``mark_terminal_kept`` did (#1225).
+
+    ``written`` is False when the terminal was already marked, in which case nothing
+    was evicted and ``kept_until`` is the existing mark's. ``evicted`` names only the
+    marks this call really removed.
+    """
+
+    written: bool
+    kept_until: datetime
+    evicted: Tuple[str, ...]
+
+
+def _with_kept_until(terminal_query: Any) -> List[Tuple[Any, Optional[datetime]]]:
+    """Run a terminal selection with each row's ``kept_until`` (#1225), in the SAME query.
+
+    An outer join on the keep table's primary key adds no rows and keeps the
+    selection's own ORDER BY, so the listing readers stay at one terminal SELECT
+    (plus the ephemeral membership one) however many terminals they return.
+    """
+    rows = (
+        terminal_query.outerjoin(
+            KeptTerminalModel, KeptTerminalModel.terminal_id == TerminalModel.id
+        )
+        .add_columns(KeptTerminalModel.kept_until)
+        .all()
+    )
+    return [(row[0], as_utc(row[1])) for row in rows]
+
+
 class InboxModel(Base):
     """SQLAlchemy model for inbox messages."""
 
@@ -314,6 +392,23 @@ class InboxModel(Base):
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(UTCDateTime, default=_utcnow)
+
+
+class DelegationEdgeModel(Base):
+    """A caller -> worker delegation that expects a callback (assign-callback-guarantee)."""
+
+    __tablename__ = "delegation_edges"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    caller_id = Column(String, nullable=False, index=True)
+    worker_id = Column(String, nullable=False, index=True)
+    source = Column(String, nullable=False)  # EdgeSource value
+    state = Column(String, nullable=False, index=True)  # EdgeState value
+    reason = Column(String, nullable=False)  # EdgeReason value
+    message_id = Column(Integer, nullable=True)  # inbox id that opened a send_message edge
+    created_at = Column(UTCDateTime, default=_utcnow)
+    delivered_at = Column(UTCDateTime, nullable=True)
+    closed_at = Column(UTCDateTime, nullable=True)
 
 
 class DecisionRecordModel(Base):
@@ -357,6 +452,19 @@ class DecisionRecordModel(Base):
     options = Column(Text, nullable=True)
     fallback_enforcement = Column(String, nullable=True)
     applied_enforcement = Column(String, nullable=True)
+    # #1199 (provisional): the local match, on the provider.route and model.route rows it
+    # touches; NULL on every other row. Closed vocabularies and a keyed hash only: the rule,
+    # the needs and the needs covered (JSON lists of feature names), the tie-break step, the
+    # size before the match (model.route rows), the pick ("<provider>/<tier>"), and the
+    # catalog's version and HMAC (under the message hash's key, hash_key_id).
+    match_rule = Column(String, nullable=True)
+    match_needs = Column(Text, nullable=True)
+    match_covered = Column(Text, nullable=True)
+    match_tiebreak = Column(String, nullable=True)
+    match_from = Column(String, nullable=True)
+    match_pick = Column(String, nullable=True)
+    catalog_version = Column(Integer, nullable=True)
+    catalog_hash = Column(String, nullable=True)
     __table_args__ = (
         Index("ix_decision_records_created_at", "created_at"),
         Index("ix_decision_records_terminal_id", "terminal_id"),
@@ -385,12 +493,22 @@ LAUNCH_TARGET_KINDS = ("installed", "ephemeral", "workflow")
 # ``session_teardown`` (session delete or flow recycle). Every teardown
 # function that finalizes takes one as a required keyword, so a new call site
 # has to choose.
+# ``kept_expired`` and ``kept_evicted`` (#1225) are a kept child torn down by the
+# keep reaper after its idle window, and a kept child torn down to make room under
+# ``terminal.keep_finished.max_per_session``.
+# ``creator_rollback`` (#1277) is a terminal whose session was killed by the
+# rollback of ANOTHER terminal's failed create: the create that made the session
+# failed and, seeing no other row in it, killed the session. A row that joined
+# it anyway (written without this process's lifecycle lock) died with it.
 LAUNCH_END_REASONS = (
     "launch_failed",
     "deleted",
     "pane_closed",
     "stale_cleanup",
     "session_teardown",
+    "kept_expired",
+    "kept_evicted",
+    "creator_rollback",
 )
 
 
@@ -442,7 +560,9 @@ class LaunchStatusEventModel(Base):
     """Status transitions for a launch, used to compute busy time (issue #1082).
 
     Content-free: just the status label and when it was observed. tmux
-    terminals get one row per detected change (``StatusMonitor._apply_detection``);
+    terminals get one row per detected change (``StatusMonitor._apply_detection``
+    and the two ``get_status`` latch changes, the native-swarm revoke and the
+    stale-capture recovery);
     herdr terminals get one row per change in the ``agent_status`` herdr
     reports for a managed pane (``HerdrInboxService``). Rows carry only the
     terminal id; ``compute_busy_seconds`` attributes them to one launch by time.
@@ -693,6 +813,40 @@ def get_launch_record(terminal_id: str) -> Optional[Dict[str, Any]]:
             .first()
         )
         return None if row is None else _launch_record_dict(row)
+
+
+def terminal_has_recorded_cao_call(terminal_id: str, since: datetime) -> bool:
+    """Did ``terminal_id`` make a CAO call the server recorded at or after ``since``?
+
+    Read-only evidence that a terminal still counted as initializing is in fact
+    up and working (#1277): a launch record naming it as the caller (its
+    ``assign``/``handoff`` reached the server and created a worker) or an
+    ephemeral profile it owns (its ``create_ephemeral_agent`` call). ``since``
+    is when this terminal's init began, so a row left by an earlier terminal that
+    reused the 8-hex id never counts. Raises on a genuine DB error; the caller
+    treats that as "no evidence".
+    """
+    with SessionLocal() as db:
+        launched = (
+            db.query(LaunchRecordModel.id)
+            .filter(
+                LaunchRecordModel.caller_id == terminal_id,
+                LaunchRecordModel.created_at >= since,
+            )
+            .first()
+        )
+        if launched is not None:
+            return True
+        owned = (
+            db.query(EphemeralAgentModel.name)
+            .filter(
+                EphemeralAgentModel.owner_kind == "terminal",
+                EphemeralAgentModel.owner_id == terminal_id,
+                EphemeralAgentModel.created_at >= since,
+            )
+            .first()
+        )
+        return owned is not None
 
 
 def compute_busy_seconds(record_id: int) -> float:
@@ -1243,6 +1397,8 @@ def init_db() -> None:
     _migrate_decision_records_target_kind()
     # Appended LAST (issue #1099). Three nullable decision_records columns, no backfill.
     _migrate_decision_records_provider_route()
+    # Appended LAST (issue #1199). Eight nullable decision_records columns, no backfill.
+    _migrate_decision_records_match()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1289,7 +1445,7 @@ def _migrate_add_handoff_results() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS handoff_results (
                     job_id TEXT PRIMARY KEY,
@@ -1319,7 +1475,7 @@ def _migrate_decision_records_target_kind() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(decision_records)")
             columns = {row[1] for row in cursor.fetchall()}
             if columns and "target_kind" not in columns:
@@ -1349,7 +1505,7 @@ def _migrate_decision_records_provider_route() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(decision_records)")
             columns = {row[1] for row in cursor.fetchall()}
             if not columns:
@@ -1361,6 +1517,46 @@ def _migrate_decision_records_provider_route() -> None:
     except Exception as e:
         # Records cannot be written without the columns, so this is louder than debug.
         logger.warning(f"Migration check for decision_records provider.route columns failed: {e}")
+
+
+_MATCH_COLUMNS = {
+    "match_rule": "ALTER TABLE decision_records ADD COLUMN match_rule TEXT",
+    "match_needs": "ALTER TABLE decision_records ADD COLUMN match_needs TEXT",
+    "match_covered": "ALTER TABLE decision_records ADD COLUMN match_covered TEXT",
+    "match_tiebreak": "ALTER TABLE decision_records ADD COLUMN match_tiebreak TEXT",
+    "match_from": "ALTER TABLE decision_records ADD COLUMN match_from TEXT",
+    "match_pick": "ALTER TABLE decision_records ADD COLUMN match_pick TEXT",
+    "catalog_version": "ALTER TABLE decision_records ADD COLUMN catalog_version INTEGER",
+    "catalog_hash": "ALTER TABLE decision_records ADD COLUMN catalog_hash TEXT",
+}
+
+
+def _migrate_decision_records_match() -> None:
+    """Add the local match's eight nullable decision_records columns if missing (issue #1199).
+
+    Idempotent, like ``_migrate_decision_records_provider_route``: PRAGMA table_info gate, one
+    ALTER TABLE ADD COLUMN per missing column, nothing without the table. Fresh DBs already
+    have them from ``Base.metadata.create_all``. Existing rows keep NULL: no match touched
+    them. There is no down migration, as for every decision_records column: older code
+    selects only its own columns.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
+            cursor = conn.execute("PRAGMA table_info(decision_records)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if not columns:
+                return
+            for column, statement in _MATCH_COLUMNS.items():
+                if column not in columns:
+                    conn.execute(statement)
+                    logger.info(f"Migration: added {column} column to decision_records")
+    except Exception as e:
+        # Records cannot be written without the columns, so this is louder than debug.
+        logger.warning(f"Migration check for decision_records match columns failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -1379,7 +1575,7 @@ def _migrate_project_aliases_schema() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             row = conn.execute(
                 "SELECT name FROM sqlite_master " "WHERE type='table' AND name='project_aliases'"
             ).fetchone()
@@ -1405,7 +1601,7 @@ def _migrate_memory_indexes() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_metadata (scope, scope_id)"
             )
@@ -1432,7 +1628,7 @@ def _migrate_memory_source_kind() -> None:
 
     expected_unique_columns = ("key", "scope", "scope_id", "source_kind")
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             table_exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_metadata'"
             ).fetchone()
@@ -1520,7 +1716,7 @@ def _migrate_add_access_count() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(memory_metadata)")
             columns = {row[1] for row in cursor.fetchall()}
             if "access_count" not in columns:
@@ -1547,7 +1743,7 @@ def _migrate_add_last_compiled_at() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(memory_metadata)")
             columns = {row[1] for row in cursor.fetchall()}
             if "last_compiled_at" not in columns:
@@ -1571,7 +1767,7 @@ def _migrate_add_related_keys() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             cursor = conn.execute("PRAGMA table_info(memory_metadata)")
             columns = {row[1] for row in cursor.fetchall()}
             if "related_keys" not in columns:
@@ -1600,7 +1796,7 @@ def _migrate_memory_relationships() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS memory_relationships ("
                 "id TEXT PRIMARY KEY, "
@@ -1685,7 +1881,7 @@ def _migrate_workflow_plan_approval() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_plan_approval ("
                 "plan_id TEXT PRIMARY KEY, "
@@ -1772,7 +1968,7 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
                             "index is absent from sqlite_master"
                         )
             return
-        with sqlite3.connect(target) as conn:
+        with closing_transaction(sqlite3.connect(target)) as conn:
             duplicates = conn.execute(
                 "SELECT key, scope, source_kind, COUNT(*) FROM memory_metadata "
                 "WHERE scope_id IS NULL GROUP BY key, scope, source_kind HAVING COUNT(*) > 1"
@@ -1822,7 +2018,7 @@ def _migrate_vault_exclusions() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS vault_exclusion ("
                 "vault_id VARCHAR NOT NULL, "
@@ -1864,7 +2060,7 @@ def _migrate_vault_migration_receipts() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             columns = conn.execute("PRAGMA table_info(vault_migration_receipt)").fetchall()
             if columns:
                 return
@@ -1897,7 +2093,7 @@ def _migrate_vault_key_provenance() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             for table in ("vault_note", "vault_exclusion"):
                 table_exists = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -2057,7 +2253,7 @@ def _migrate_workflow_index() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             row = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_index'"
             ).fetchone()
@@ -2141,7 +2337,7 @@ def _migrate_workflow_run() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_run ("
                 "run_id TEXT PRIMARY KEY, "
@@ -2253,7 +2449,7 @@ def _migrate_workflow_run_step() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_run_step ("
                 "run_id TEXT NOT NULL, "
@@ -2310,7 +2506,7 @@ def _migrate_workflow_outcome_indexes() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_outcome_session "
                 "ON workflow_outcomes (session_name, created_at)"
@@ -2347,7 +2543,7 @@ def _migrate_workflow_run_event() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_run_event ("
                 "run_id TEXT NOT NULL, "
@@ -2396,7 +2592,7 @@ def _migrate_workflow_run_seq() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_run_seq ("
                 "run_id TEXT PRIMARY KEY, "
@@ -2430,7 +2626,7 @@ def _migrate_workflow_run_indexes() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_workflow_run_started_at "
                 "ON workflow_run (started_at)"
@@ -2449,98 +2645,99 @@ def _migrate_terminals_schema() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        conn = sqlite3.connect(str(DATABASE_FILE))
-        cursor = conn.execute("PRAGMA table_info(terminals)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "description" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN description TEXT")
-            conn.commit()
-            logger.info("Migration: added description column to terminals table")
-        if "allowed_tools" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
-            conn.commit()
-            logger.info("Migration: added allowed_tools column to terminals table")
-        if "shell_command" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
-            conn.commit()
-            logger.info("Migration: added shell_command column to terminals table")
-        if "caller_id" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
-            conn.commit()
-            logger.info("Migration: added caller_id column to terminals table")
-        if "engine" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN engine TEXT")
-            conn.commit()
-            logger.info("Migration: added engine column to terminals table")
-        if "provider_variant" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN provider_variant TEXT")
-            conn.commit()
-            logger.info("Migration: added provider_variant column to terminals table")
-        if "group" not in columns:
-            # "group" is a SQL reserved word in some dialects but not SQLite;
-            # quoted defensively so this ALTER survives if that ever changes.
-            conn.execute('ALTER TABLE terminals ADD COLUMN "group" TEXT')
-            conn.commit()
-            logger.info("Migration: added group column to terminals table")
-        if "metadata" not in columns:
-            conn.execute('ALTER TABLE terminals ADD COLUMN "metadata" TEXT')
-            conn.commit()
-            logger.info("Migration: added metadata column to terminals table")
-        if "working_directory" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
-            conn.commit()
-            logger.info("Migration: added working_directory column to terminals table")
-        if "deferred_init_failure" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN deferred_init_failure TEXT")
-            conn.commit()
-            logger.info("Migration: added deferred_init_failure column to terminals table")
-        if "initial_delivery" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN initial_delivery TEXT")
-            conn.commit()
-            logger.info("Migration: added initial_delivery column to terminals table")
-        if "deferred_init_external_owner" not in columns:
-            conn.execute(
-                "ALTER TABLE terminals ADD COLUMN deferred_init_external_owner "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-            conn.commit()
-            logger.info("Migration: added deferred_init_external_owner column to terminals table")
-        if "deferred_init_runtime_reclaimed" not in columns:
-            conn.execute(
-                "ALTER TABLE terminals ADD COLUMN deferred_init_runtime_reclaimed "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-            conn.commit()
-            logger.info(
-                "Migration: added deferred_init_runtime_reclaimed column to terminals table"
-            )
-        if "session_incarnation_id" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN session_incarnation_id TEXT")
-            conn.commit()
-            logger.info("Migration: added session_incarnation_id column to terminals table")
-        if "model" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN model TEXT")
-            conn.commit()
-            logger.info("Migration: added model column to terminals table")
-        if "model_honored" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
-            conn.commit()
-            logger.info("Migration: added model_honored column to terminals table")
-        if "delegate_tools" not in columns:
-            # Nullable on purpose: rows from before the column have no recorded
-            # ceiling and read back as None, which create_terminal treats as
-            # "bounded by its own allowed_tools" (utils/delegation.ceiling_from_row).
-            conn.execute("ALTER TABLE terminals ADD COLUMN delegate_tools TEXT")
-            conn.commit()
-            logger.info("Migration: added delegate_tools column to terminals table")
-        if "identity_verified" not in columns:
-            # Nullable with no default (#1074): existing rows read back NULL, a
-            # legacy row, never False, so a Kiro pane running across the upgrade
-            # is not mistaken for one this version created and failed to verify.
-            conn.execute("ALTER TABLE terminals ADD COLUMN identity_verified BOOLEAN")
-            conn.commit()
-            logger.info("Migration: added identity_verified column to terminals table")
-        conn.close()
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
+            cursor = conn.execute("PRAGMA table_info(terminals)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "description" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN description TEXT")
+                conn.commit()
+                logger.info("Migration: added description column to terminals table")
+            if "allowed_tools" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
+                conn.commit()
+                logger.info("Migration: added allowed_tools column to terminals table")
+            if "shell_command" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
+                conn.commit()
+                logger.info("Migration: added shell_command column to terminals table")
+            if "caller_id" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
+                conn.commit()
+                logger.info("Migration: added caller_id column to terminals table")
+            if "engine" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN engine TEXT")
+                conn.commit()
+                logger.info("Migration: added engine column to terminals table")
+            if "provider_variant" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN provider_variant TEXT")
+                conn.commit()
+                logger.info("Migration: added provider_variant column to terminals table")
+            if "group" not in columns:
+                # "group" is a SQL reserved word in some dialects but not SQLite;
+                # quoted defensively so this ALTER survives if that ever changes.
+                conn.execute('ALTER TABLE terminals ADD COLUMN "group" TEXT')
+                conn.commit()
+                logger.info("Migration: added group column to terminals table")
+            if "metadata" not in columns:
+                conn.execute('ALTER TABLE terminals ADD COLUMN "metadata" TEXT')
+                conn.commit()
+                logger.info("Migration: added metadata column to terminals table")
+            if "working_directory" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
+                conn.commit()
+                logger.info("Migration: added working_directory column to terminals table")
+            if "deferred_init_failure" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN deferred_init_failure TEXT")
+                conn.commit()
+                logger.info("Migration: added deferred_init_failure column to terminals table")
+            if "initial_delivery" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN initial_delivery TEXT")
+                conn.commit()
+                logger.info("Migration: added initial_delivery column to terminals table")
+            if "deferred_init_external_owner" not in columns:
+                conn.execute(
+                    "ALTER TABLE terminals ADD COLUMN deferred_init_external_owner "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.commit()
+                logger.info(
+                    "Migration: added deferred_init_external_owner column to terminals table"
+                )
+            if "deferred_init_runtime_reclaimed" not in columns:
+                conn.execute(
+                    "ALTER TABLE terminals ADD COLUMN deferred_init_runtime_reclaimed "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.commit()
+                logger.info(
+                    "Migration: added deferred_init_runtime_reclaimed column to terminals table"
+                )
+            if "session_incarnation_id" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN session_incarnation_id TEXT")
+                conn.commit()
+                logger.info("Migration: added session_incarnation_id column to terminals table")
+            if "model" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN model TEXT")
+                conn.commit()
+                logger.info("Migration: added model column to terminals table")
+            if "model_honored" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
+                conn.commit()
+                logger.info("Migration: added model_honored column to terminals table")
+            if "delegate_tools" not in columns:
+                # Nullable on purpose: rows from before the column have no recorded
+                # ceiling and read back as None, which create_terminal treats as
+                # "bounded by its own allowed_tools" (utils/delegation.ceiling_from_row).
+                conn.execute("ALTER TABLE terminals ADD COLUMN delegate_tools TEXT")
+                conn.commit()
+                logger.info("Migration: added delegate_tools column to terminals table")
+            if "identity_verified" not in columns:
+                # Nullable with no default (#1074): existing rows read back NULL, a
+                # legacy row, never False, so a Kiro pane running across the upgrade
+                # is not mistaken for one this version created and failed to verify.
+                conn.execute("ALTER TABLE terminals ADD COLUMN identity_verified BOOLEAN")
+                conn.commit()
+                logger.info("Migration: added identity_verified column to terminals table")
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
@@ -2789,6 +2986,38 @@ def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
         )
         db.commit()
         return deleted > 0
+
+
+def terminal_exists(terminal_id: str) -> bool:
+    """Whether ``terminal_id`` names a terminal CAO currently has a row for.
+
+    A plain, quiet existence check (``get_terminal_metadata`` logs a warning on a
+    miss). The AG-UI ambient stream uses it so that a sender label such as
+    ``"operator"`` is never announced as a subagent.
+    """
+    if not terminal_id:
+        return False
+    with SessionLocal() as db:
+        return (
+            db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first() is not None
+        )
+
+
+def get_terminal_label(terminal_id: str) -> Optional[Dict[str, Optional[str]]]:
+    """The ``agent_profile`` and ``provider`` of a terminal CAO has a row for, or ``None``.
+
+    Quiet, like ``terminal_exists``. The AG-UI ambient stream names a terminal it
+    first meets mid-replay from this, instead of the generic name "terminal".
+    """
+    if not terminal_id:
+        return None
+    with SessionLocal() as db:
+        row = (
+            db.query(TerminalModel.agent_profile, TerminalModel.provider)
+            .filter(TerminalModel.id == terminal_id)
+            .first()
+        )
+        return None if row is None else {"agent_profile": row[0], "provider": row[1]}
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
@@ -3264,7 +3493,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
             .filter(TerminalModel.tmux_session == tmux_session)
             .order_by(literal_column("terminals.rowid"))
         )
-        terminals = terminal_query.all()
+        terminals_kept = _with_kept_until(terminal_query)
         ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
@@ -3288,9 +3517,11 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # #1225: end of the keep window for a kept child, else None.
+                "kept_until": kept_until,
                 "last_active": t.last_active,
             }
-            for t in terminals
+            for t, kept_until in terminals_kept
         ]
 
 
@@ -3370,7 +3601,7 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
             .filter(TerminalModel.tmux_session.in_(tmux_sessions))
             .order_by(literal_column("terminals.rowid"))
         )
-        terminals = terminal_query.all()
+        terminals_kept = _with_kept_until(terminal_query)
         ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
@@ -3394,9 +3625,11 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # #1225: end of the keep window for a kept child, else None.
+                "kept_until": kept_until,
                 "last_active": t.last_active,
             }
-            for t in terminals
+            for t, kept_until in terminals_kept
         ]
 
 
@@ -3404,7 +3637,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
     """List all terminals."""
     with SessionLocal() as db:
         terminal_query = db.query(TerminalModel)
-        terminals = terminal_query.all()
+        terminals_kept = _with_kept_until(terminal_query)
         ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
@@ -3428,9 +3661,11 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # #1225: end of the keep window for a kept child, else None.
+                "kept_until": kept_until,
                 "last_active": t.last_active,
             }
-            for t in terminals
+            for t, kept_until in terminals_kept
         ]
 
 
@@ -3533,6 +3768,124 @@ def _finalize_launch_records_best_effort(terminal_ids: List[str], end_reason: st
         logger.warning(f"Launch record finalize failed for {terminal_ids}: {e}")
 
 
+def _delete_kept_rows(db: Any, terminal_ids: List[str]) -> None:
+    """Drop the keep marks of terminals deleted in the caller's transaction (#1225)."""
+    if terminal_ids:
+        db.query(KeptTerminalModel).filter(
+            KeptTerminalModel.terminal_id.in_(list(terminal_ids))
+        ).delete(synchronize_session=False)
+
+
+def mark_terminal_kept(
+    terminal_id: str,
+    session_name: str,
+    *,
+    kept_until: datetime,
+    reason: str,
+    evict: Sequence[str] = (),
+) -> Optional[KeptMark]:
+    """Record ``terminal_id`` as kept until ``kept_until`` (#1225).
+
+    ``evict`` names kept terminals whose marks are removed in the SAME
+    transaction, so a session at its cap never shows one keep more than allowed,
+    not even between two commits. Only marks that exist are removed, and only those
+    are reported in ``KeptMark.evicted``; ``terminal_id`` itself is never evicted.
+
+    Returns None, writing nothing (and evicting nothing), when the terminal row no
+    longer exists: a child deleted between its keep decision and this write must
+    not leave a mark behind or cost another child its keep. An existing mark is
+    left as it is (the first keep wins) and nothing is evicted.
+    """
+    if reason not in KEEP_REASONS:
+        raise ValueError(f"unknown keep reason {reason!r}")
+    with SessionLocal() as db:
+        if not db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first():
+            return None
+        existing = db.get(KeptTerminalModel, terminal_id)
+        if existing is not None:
+            return KeptMark(False, cast(datetime, as_utc(existing.kept_until)), ())
+        removed = tuple(
+            tid
+            for tid in dict.fromkeys(evict)
+            if tid != terminal_id and db.get(KeptTerminalModel, tid) is not None
+        )
+        _delete_kept_rows(db, list(removed))
+        db.add(
+            KeptTerminalModel(
+                terminal_id=terminal_id,
+                session_name=session_name,
+                kept_at=_utcnow(),
+                kept_until=kept_until,
+                reason=reason,
+            )
+        )
+        db.commit()
+        return KeptMark(True, kept_until, removed)
+
+
+def unmark_terminal_kept(terminal_id: str) -> bool:
+    """Remove a keep mark without touching the terminal. True when one was removed."""
+    with SessionLocal() as db:
+        removed = (
+            db.query(KeptTerminalModel)
+            .filter(KeptTerminalModel.terminal_id == terminal_id)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+    return removed > 0
+
+
+def get_kept_terminal(terminal_id: str) -> Optional[Dict[str, Any]]:
+    """The keep mark of one terminal, or None."""
+    with SessionLocal() as db:
+        row = db.get(KeptTerminalModel, terminal_id)
+        return _kept_row_dict(row) if row is not None else None
+
+
+def list_kept_terminals(session_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Keep marks, oldest keep first, optionally for one session."""
+    with SessionLocal() as db:
+        query = db.query(KeptTerminalModel)
+        if session_name is not None:
+            query = query.filter(KeptTerminalModel.session_name == session_name)
+        rows = query.order_by(KeptTerminalModel.kept_at, KeptTerminalModel.terminal_id).all()
+        return [_kept_row_dict(row) for row in rows]
+
+
+def extend_kept_until(terminal_id: str, kept_until: datetime) -> bool:
+    """Move a kept terminal's window end to ``kept_until``. False when not kept."""
+    with SessionLocal() as db:
+        row = db.get(KeptTerminalModel, terminal_id)
+        if row is None:
+            return False
+        row.kept_until = kept_until
+        db.commit()
+        return True
+
+
+def delete_orphan_kept_rows() -> int:
+    """Drop keep marks whose terminal row is gone. Returns how many."""
+    with SessionLocal() as db:
+        live = db.query(TerminalModel.id)
+        removed = (
+            db.query(KeptTerminalModel)
+            .filter(~KeptTerminalModel.terminal_id.in_(live))
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+    return removed
+
+
+def _kept_row_dict(row: Any) -> Dict[str, Any]:
+    return {
+        "terminal_id": row.terminal_id,
+        "session_name": row.session_name,
+        "kept_at": as_utc(row.kept_at),
+        "kept_until": as_utc(row.kept_until),
+        "reason": row.reason,
+    }
+
+
 def delete_terminal(terminal_id: str, *, end_reason: str) -> bool:
     """Delete terminal metadata.
 
@@ -3543,6 +3896,7 @@ def delete_terminal(terminal_id: str, *, end_reason: str) -> bool:
     """
     with SessionLocal() as db:
         deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
+        _delete_kept_rows(db, [terminal_id])
         db.commit()
     if deleted:
         _finalize_launch_records_best_effort([terminal_id], end_reason)
@@ -3568,6 +3922,7 @@ def delete_terminals_by_session(tmux_session: str, *, end_reason: str) -> int:
         deleted = (
             db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
         )
+        _delete_kept_rows(db, ids)
         db.commit()
     if ids:
         _finalize_launch_records_best_effort(ids, end_reason)
@@ -3589,15 +3944,33 @@ def delete_terminals_by_ids(terminal_ids: List[str], *, end_reason: str) -> int:
     it again could close an older launch left open under the same id. Each id
     is deleted on its own so its row count says who deleted it; see
     ``delete_terminal`` for why the finalize runs after commit.
+
+    Every delegation edge still open on one of the ids, in either direction, is
+    closed as worker_ended in the same commit, without a notice, as
+    ``terminal_service.delete_terminal_row`` does for a single row: an edge left
+    open would stay armed with no terminal behind it and be re-evaluated by
+    every sweep. Like there, this covers ids whose row another owner deleted.
     """
     if not terminal_ids:
         return 0
+    ids = list(dict.fromkeys(terminal_ids))
     with SessionLocal() as db:
         deleted_ids = [
             terminal_id
-            for terminal_id in dict.fromkeys(terminal_ids)
+            for terminal_id in ids
             if db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
         ]
+        _delete_kept_rows(db, deleted_ids)
+        db.query(DelegationEdgeModel).filter(
+            DelegationEdgeModel.state == EdgeState.OPEN.value,
+            or_(DelegationEdgeModel.worker_id.in_(ids), DelegationEdgeModel.caller_id.in_(ids)),
+        ).update(
+            {
+                DelegationEdgeModel.state: EdgeState.WORKER_ENDED.value,
+                DelegationEdgeModel.closed_at: _utcnow(),
+            },
+            synchronize_session=False,
+        )
         db.commit()
     if deleted_ids:
         _finalize_launch_records_best_effort(deleted_ids, end_reason)
@@ -3870,6 +4243,266 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
             db.commit()
             return True
         return False
+
+
+# Delegation edge functions (assign-callback-guarantee)
+
+
+def _edge_from_row(row: DelegationEdgeModel) -> DelegationEdge:
+    return DelegationEdge(
+        id=row.id,
+        caller_id=row.caller_id,
+        worker_id=row.worker_id,
+        source=EdgeSource(row.source),
+        state=EdgeState(row.state),
+        reason=EdgeReason(row.reason),
+        message_id=row.message_id,
+        created_at=row.created_at,
+        delivered_at=row.delivered_at,
+        closed_at=row.closed_at,
+    )
+
+
+def create_delegation_edge(
+    caller_id: str,
+    worker_id: str,
+    source: EdgeSource,
+    reason: EdgeReason = EdgeReason.NO_CALLBACK,
+    message_id: Optional[int] = None,
+) -> DelegationEdge:
+    """Insert an OPEN, unarmed edge caller -> worker."""
+    with SessionLocal() as db:
+        row = DelegationEdgeModel(
+            caller_id=caller_id,
+            worker_id=worker_id,
+            source=source.value,
+            state=EdgeState.OPEN.value,
+            reason=reason.value,
+            message_id=message_id,
+        )
+        db.add(row)
+        # Read the edge back from the flushed row, before commit expires it. A
+        # reload after commit raised ObjectDeletedError in test runs and would
+        # turn a stored edge into a failed create.
+        db.flush()
+        edge = _edge_from_row(row)
+        db.commit()
+        return edge
+
+
+def mark_assign_edges_delivered(worker_id: str) -> int:
+    """Arm open, unarmed assign edges into ``worker_id`` (initial task delivered)."""
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.worker_id == worker_id,
+                DelegationEdgeModel.source == EdgeSource.ASSIGN.value,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+                DelegationEdgeModel.delivered_at.is_(None),
+            )
+            .update({DelegationEdgeModel.delivered_at: _utcnow()}, synchronize_session=False)
+        )
+        db.commit()
+        return count
+
+
+def mark_message_edges_delivered(message_ids: List[int]) -> int:
+    """Arm open send_message edges opened by any of ``message_ids``."""
+    if not message_ids:
+        return 0
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.message_id.in_(message_ids),
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+                DelegationEdgeModel.delivered_at.is_(None),
+            )
+            .update({DelegationEdgeModel.delivered_at: _utcnow()}, synchronize_session=False)
+        )
+        db.commit()
+        return count
+
+
+def list_open_message_edges(message_ids: List[int]) -> List[DelegationEdge]:
+    """OPEN send_message edges opened by any of ``message_ids``, armed or not."""
+    if not message_ids:
+        return []
+    with SessionLocal() as db:
+        rows = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.message_id.in_(message_ids),
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .order_by(DelegationEdgeModel.id)
+            .all()
+        )
+        return [_edge_from_row(r) for r in rows]
+
+
+def list_unarmed_assign_edges(worker_id: str) -> List[DelegationEdge]:
+    """OPEN assign edges into ``worker_id`` whose task was never delivered."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.worker_id == worker_id,
+                DelegationEdgeModel.source == EdgeSource.ASSIGN.value,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+                DelegationEdgeModel.delivered_at.is_(None),
+            )
+            .order_by(DelegationEdgeModel.id)
+            .all()
+        )
+        return [_edge_from_row(r) for r in rows]
+
+
+def close_delegation_edge(edge_id: int, state: EdgeState) -> bool:
+    """Close an edge only if it is still OPEN. True when this call closed it.
+
+    The conditional UPDATE is the claim: the status-event consumer and the
+    sweep can evaluate the same terminal concurrently, and only the caller that
+    wins the claim may forward, so a result is never forwarded twice.
+    """
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.id == edge_id,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .update(
+                {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return count > 0
+
+
+def close_delegation_edge_with_message(
+    edge_id: int, state: EdgeState, sender_id: str, receiver_id: str, message: str
+) -> bool:
+    """Close an OPEN edge and queue ``message`` for ``receiver_id`` in one commit.
+
+    True when this call closed the edge; only then is the message queued, as
+    PENDING. Doing both in one transaction leaves no moment where the edge is
+    closed and the message not yet queued. In that gap an evaluator of the
+    receiver would see no open edge out of it and no pending message, and
+    could forward the receiver's previous answer before it had read this one.
+    The message is skipped when the receiver row no longer exists.
+    """
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.id == edge_id,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .update(
+                {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},
+                synchronize_session=False,
+            )
+        )
+        if count and db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
+            db.add(
+                InboxModel(
+                    sender_id=sender_id,
+                    receiver_id=receiver_id,
+                    message=message,
+                    status=MessageStatus.PENDING.value,
+                )
+            )
+        db.commit()
+        return count > 0
+
+
+def list_open_edges_into(worker_id: str, armed_only: bool = False) -> List[DelegationEdge]:
+    """Open edges where ``worker_id`` is the worker someone is waiting on."""
+    with SessionLocal() as db:
+        query = db.query(DelegationEdgeModel).filter(
+            DelegationEdgeModel.worker_id == worker_id,
+            DelegationEdgeModel.state == EdgeState.OPEN.value,
+        )
+        if armed_only:
+            query = query.filter(DelegationEdgeModel.delivered_at.isnot(None))
+        return [_edge_from_row(r) for r in query.order_by(DelegationEdgeModel.id).all()]
+
+
+def list_open_edges_out_of(caller_id: str) -> List[DelegationEdge]:
+    """Open edges where ``caller_id`` is itself waiting on other terminals."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.caller_id == caller_id,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .order_by(DelegationEdgeModel.id)
+            .all()
+        )
+        return [_edge_from_row(r) for r in rows]
+
+
+def find_any_edge(caller_id: str, worker_id: str) -> Optional[DelegationEdge]:
+    """The oldest edge caller -> worker in any state, open or closed."""
+    with SessionLocal() as db:
+        row = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.caller_id == caller_id,
+                DelegationEdgeModel.worker_id == worker_id,
+            )
+            .order_by(DelegationEdgeModel.id)
+            .first()
+        )
+        return _edge_from_row(row) if row else None
+
+
+def find_open_edge(caller_id: str, worker_id: str) -> Optional[DelegationEdge]:
+    with SessionLocal() as db:
+        row = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.caller_id == caller_id,
+                DelegationEdgeModel.worker_id == worker_id,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .order_by(DelegationEdgeModel.id)
+            .first()
+        )
+        return _edge_from_row(row) if row else None
+
+
+def list_armed_worker_ids() -> List[str]:
+    """Distinct workers with at least one armed OPEN edge into them (sweep input)."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(DelegationEdgeModel.worker_id)
+            .filter(
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+                DelegationEdgeModel.delivered_at.isnot(None),
+            )
+            .distinct()
+            .all()
+        )
+        return sorted(r[0] for r in rows)
+
+
+def close_open_edges_for_terminal(terminal_id: str, state: EdgeState) -> List[DelegationEdge]:
+    """Close every OPEN edge touching ``terminal_id``; return the inbound ones closed.
+
+    Inbound edges (someone waits on this terminal) need a notice; outbound
+    edges (this terminal waited on others) are closed silently because their
+    replies have no live receiver.
+    """
+    inbound = list_open_edges_into(terminal_id)
+    closed = [e for e in inbound if close_delegation_edge(e.id, state)]
+    for edge in list_open_edges_out_of(terminal_id):
+        close_delegation_edge(edge.id, state)
+    return closed
 
 
 # Flow database functions

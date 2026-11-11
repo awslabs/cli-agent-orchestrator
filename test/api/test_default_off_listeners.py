@@ -46,5 +46,17 @@ def test_agui_surface_defaults_off():
     """No flags => the AG-UI routes 404 (byte-identical default posture)."""
     with TestClient(app, base_url="http://localhost") as client:
         assert client.get("/agui/v1/stream").status_code == 404
+        # The POST binding of the same run (fanhongy's #1232 review): checked
+        # before the body is read, so even a valid RunAgentInput gets the 404.
+        # maxSeconds bounds the run, so a route that lost its guard serves a
+        # one-second stream and this fails, instead of reading a stream that
+        # never ends.
+        run_input = {
+            "threadId": "t",
+            "runId": "r",
+            "messages": [],
+            "forwardedProps": {"cao": {"maxSeconds": 1}},
+        }
+        assert client.post("/agui/v1/stream", json=run_input).status_code == 404
         resp = client.post("/agui/v1/emit_ui", json={"component": "progress", "props": {}})
         assert resp.status_code == 404

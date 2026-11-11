@@ -26,6 +26,10 @@ jobs:
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # Bounds a hung test (#1251). The job takes 25-40 min on main (3.11 is the
+    # slower leg), so 60 is 1.5x the slowest recent run. Unbounded, a hang held
+    # the runner for GitHub's default of 360 min.
+    timeout-minutes: 60
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
@@ -35,7 +39,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -166,7 +170,7 @@ jobs:
       # place its whole-directory wheel assertion can cover THAT root rather than skipping it.
       # =================================================================================
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -230,6 +234,11 @@ jobs:
   cao-mcp-apps:
     name: CAO MCP Apps
     runs-on: ubuntu-latest
+    # Bounds a hung test (#1273 review). "Backend coverage" below runs the same
+    # pytest suite as Unit Tests; over 60 runs this job took a mean of 33.3 min
+    # and a max of 37.9, so 60 matches Unit Tests and is 1.6x the slowest.
+    # Unbounded, a hang held the runner for GitHub's default of 360 min.
+    timeout-minutes: 60
 
     # Per-tier test timing budgets (Requirement 20.3), surfaced as env so the
     # vitest tiers (Phase II+) and CI can enforce them:
@@ -250,7 +259,7 @@ jobs:
           node-version: "20"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Set up Python
         run: uv python install 3.12
@@ -353,7 +362,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -409,7 +418,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -461,7 +470,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -512,7 +521,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -567,7 +576,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -593,6 +602,70 @@ jobs:
         # Non-zero exit fails the job; the script cleans up the server on exit.
         run: ./examples/ag-ui/ag-ui-stock-client-live/run.sh
 
+  ag-ui-operator-dashboard:
+    name: AG-UI operator dashboard
+    runs-on: ubuntu-latest
+    # Bounds a hung e2e: the job normally takes a few minutes.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: examples/ag-ui/ag-ui-operator-dashboard
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The keyless e2e drives real mock_cli terminals, which need tmux.
+      # Explicit, so the job does not depend on the runner image shipping tmux (ubuntu-latest, now ubuntu-26.04, does).
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (cao-server + agui run plane)
+        working-directory: .
+        run: uv sync --locked --all-extras --dev
+
+      # Node 22: the e2e runs e2e/e2e.ts with --experimental-strip-types.
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: examples/ag-ui/ag-ui-operator-dashboard/package-lock.json
+
+      - name: Install app dependencies (exact pins, install scripts off)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Dependency checks
+        run: npm run test:dependencies
+
+      - name: Type check
+        run: npm run typecheck
+
+      # Codecov ingests only the Python coverage.xml, so it never sees this
+      # TypeScript. vite.config.ts holds core/ to 100% lines, branches,
+      # functions and statements; a drop fails this step.
+      - name: Unit tests with coverage floor
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+      # A private cao-server (temp HOME, own tmux server, port 9896) with mock_cli
+      # terminals. SIMULATED: an agent showing a prompt. The harness types the
+      # marker "APPROVAL_REQUIRED: <text>" into a pane without Enter, standing in
+      # for a CLI that prints a permission prompt and waits. COVERED FOR REAL: the
+      # approval bridge, classification, the run plane, resume and key delivery.
+      # See examples/ag-ui/ag-ui-operator-dashboard/e2e/README.md.
+      - name: Keyless e2e (cao-server + mock_cli terminals)
+        run: ./e2e/run.sh
   # =======================================================================================
   # RUST TUI (issue #321, unit `rust-ci`). THE FIRST JOB IN ci.yml THAT INSPECTS THE RUST
   # CRATE AT ALL — measured before this change: `cargo` appeared in only
@@ -731,7 +804,7 @@ jobs:
       # without it, so `uv sync` would fail with `uv: command not found`. Caught by comparing every
       # job's setup-uv presence against its uv usage rather than assuming the toolchain was there.
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -841,7 +914,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Generate requirements.txt for scanning
         run: |
@@ -895,7 +968,7 @@ jobs:
           skip-setup-trivy: true
 
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v3
         # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL/HIGH
         # finding would fail the gate step and SKIP the upload, hiding the very finding that
         # failed the build from the Security tab.

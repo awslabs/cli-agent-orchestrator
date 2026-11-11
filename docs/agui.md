@@ -61,7 +61,9 @@ There are two ways in:
 - **`POST /agui/v1/stream`** (the AG-UI binding). The body is a `RunAgentInput`;
   `RUN_STARTED` and `RUN_FINISHED` echo its `threadId` and `runId`. CAO options
   ride in `forwardedProps.cao`: `since` (ISO-8601) and `maxSeconds` (1 to 3600).
-  A body that is not a valid `RunAgentInput` gets `422`. A `protocolVersion`
+  A body that is not a valid `RunAgentInput` gets `422`. A `threadId` outside
+  the GET rule below (letters, digits and `._:-`, up to 128 characters) gets
+  `400`, as on GET. A `protocolVersion`
   with a different major version gets `400`; a newer minor version, or a value
   CAO cannot parse, is served with a server-side warning. Only the published
   `MAJOR.MINOR` form is parsed, so `"2"`, `"2.0.0"` and `"draft"` are served
@@ -83,7 +85,7 @@ There are two ways in:
 |---|---|
 | session launch | `SUBAGENT_STARTED` for the session |
 | terminal launch | `SUBAGENT_STARTED` for the terminal, `parentSubagentRunId` = its session |
-| handoff / assign / `a2a_delegation` | `TOOL_CALL_START` attributed to the sender; `TOOL_CALL_END` when the receiver finishes or the call is closed. No `TOOL_CALL_RESULT`: CAO never sees the result |
+| handoff / assign / `a2a_delegation` | `TOOL_CALL_START` attributed to the sending terminal (see below); `TOOL_CALL_END` when the receiver finishes or the call is closed. No `TOOL_CALL_RESULT`: CAO never sees the result |
 | `send_message` (or no orchestration type) | `CUSTOM` `cao.message_dispatched` (sender, receiver; never the body) |
 | terminal killed | `TOOL_CALL_END` for that terminal's open calls, then `SUBAGENT_FINISHED` with `metadata.cao.endReason: "killed"` |
 | session killed | the row above for each of its terminals, then `SUBAGENT_FINISHED` for the session |
@@ -112,6 +114,24 @@ connection and replay, a relaunched session under the same name gets a new
 one, and the internal incarnation id is not exposed. The id is computed when a
 record is logged and kept with it, so a replayed record keeps the id of the
 incarnation it belongs to. The ids are opaque; clients must not parse them.
+
+**Who owns an event.** When an event names a terminal it has not seen, the
+stream checks whether CAO still has that terminal. The event is tagged with the
+terminal's `subagentRunId` only when the terminal is open on the run, or when
+CAO knows it and its invocation has not finished on this run (it is then
+announced first). A sender that is not a terminal, such as the `operator` the
+MCP Apps operator tools send or the `supervisor` that `cao-mcp-server` sends
+without `CAO_TERMINAL_ID`, an id CAO does not know (for example an `emit_ui`
+`terminal_id`), or a terminal that has already finished, never becomes a
+subagent and never reuses a finished id: the event is tagged with the record's
+open session invocation, or left untagged. The raw sender stays in
+`metadata.cao.sender`. A terminal's own kill or error record is the exception:
+CAO writes it about that terminal, so it still announces an unseen terminal
+before closing it or reporting its error (for a kill the check could not succeed
+anyway, because CAO has already removed the row). In a replay, a terminal that
+has since been deleted can't be told apart from a label, so its earlier events
+stay on the session, and its kill record still announces and closes it under the
+generic name.
 
 One case is not exact. A record logged while the incarnation lookup failed has
 no stored id, so the stream derives one from the session's *current*

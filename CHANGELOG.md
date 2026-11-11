@@ -7,6 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **A failed supervisor launch no longer kills the workers in its session** (#1277). While
+  `cao launch` waits for its supervisor to start, the pane is already live, so the supervisor
+  can assign workers into its own session. When the start then timed out, the rollback killed
+  the whole session, workers included, and their launch records said `pane_closed`. Now, if
+  other terminals have joined the session, only the failed terminal's window and record are
+  removed (on tmux and herdr alike). A session with no other terminals is still removed
+  completely. A terminal that dies anyway because another terminal's failed create removed its
+  session ends with the new `end_reason` `creator_rollback`. On Claude Code, a resumed launch
+  (`--resume-session-id`) is ready as soon as its input box shows, instead of always waiting the
+  full `provider_init_timeout`. A supervisor that is processing at the deadline counts as started
+  when it was seen ready first or has already made a recorded CAO call.
+- **`assign` guarantees a callback by default.** If a worker goes idle without calling
+  `send_message`, the server forwards its last response to the caller, labelled as auto-forwarded;
+  if the worker is deleted or errors first, the caller is told, and if a message or the task cannot
+  be delivered (including a restart before the task was delivered), the caller gets a
+  `[CAO delivery failed]` notice. Opt out per call with
+  `expect_callback=False`. `send_message` gains `expect_reply` for terminals you did not assign.
+  Local assigns only; `target_host` and elastic workers are not covered (#1246). A forward waits
+  until the worker has started on the last message delivered to it; a worker that shows no sign of
+  work for `CAO_DELEGATION_PICKUP_TIMEOUT_SECONDS` (default 300) after a delivery is forwarded with
+  a header saying the message may not have been picked up. With `CAO_EAGER_INBOX_DELIVERY=true`, a
+  message can reach a worker in the middle of a turn, and the forward can then send the answer of
+  that turn.
+
+- **A hung FIFO-writer test fails in 10 seconds instead of holding CI** (#1251 follow-up).
+  `test_stdin_closing_before_any_reader_ends_the_writer` called the writer in-process, so a
+  regression to a blocking `open()` would have hung the pytest worker; it now runs the writer in
+  a daemon thread joined with a timeout. The Unit Tests job and the CAO MCP Apps job, whose backend
+  coverage step runs the same suite, also gain `timeout-minutes: 60`, so any hung test ends the
+  job within an hour instead of GitHub's default of six.
+- **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
+  the sidecar beside `opencode.json` could not be read as a grant record, `cao install
+  --provider opencode_cli` started from an empty record and wrote it back, dropping every other
+  agent's recorded grants. It now leaves the file as it is, logs a warning that names it and
+  says to repair it by hand (deleting it drops every agent's recorded grants), and does not
+  record this agent's grants. The install still completes. A plugin server's grant
+  is still withdrawn by plugin-store containment. A reinstall after the sidecar is repaired
+  records the servers the profile then names; a profile server's grant (`cao-mcp-server*`,
+  say) that was added while the sidecar was damaged, and that the profile no longer names,
+  stays until you remove it by hand.
+- **`cao install` exits 1 when the install fails** (#1270). It printed `Error: <message>` and
+  exited 0, so a script or CI step could not tell a failed install from a successful one. It
+  now exits 1 with the same message on stderr, like the rest of the CLI. A script that relied
+  on exit 0 after a failed install must change.
+- **Keep finished child agents open, for workshops and debugging** (#1225 phase 1). A new
+  machine-wide setting, `terminal.keep_finished`, off by default
+  (`cao config set terminal.keep_finished.enabled true`). While it is on, a successful
+  `handoff` leaves its worker open instead of sending the exit command and deleting it (the
+  result says "kept until …" where it would say "was torn down", with `torn_down: false`), and
+  an agent's `delete_terminal` on an idle worker whose pane is live keeps it and says so. A
+  failed create's retained record (a 424 replay) is never kept. Anyone can then open the
+  pane and see what the child did and which tools it called. A reaper tears each kept child
+  down the normal way (scrollback and snapshot first, then exit and delete; launch-record end
+  reason `kept_expired`) once it has been idle for `idle_window_minutes` (default 60), and never
+  while it is working. `max_per_session` (default 5) caps how many a session keeps; `on_cap`
+  chooses between tearing down the oldest idle one (`teardown_oldest`, the default;
+  `kept_evicted`) and not keeping the new one (`dont_keep`). Operator deletes
+  (`cao agent cancel --delete`, `cao shutdown`, the web UI, the API) still delete at once.
+  Only the agent side asks for a keep: the `delete_terminal` tool and `cao agent handoff`'s
+  own post-success delete send the new `DELETE /terminals/{id}` query flag `keep_if_enabled`
+  (always; the server ignores it while the setting is off), and the `handoff` tool asks
+  through its run-step request. Workflows, flows, remote workers and the timeout/error paths
+  are unchanged. Terminal bodies gain two additive fields, `kept` and `kept_until`, and session
+  terminal rows gain `kept_until`; handoff and agent-delete responses can include `keep_note`
+  explaining the keep or eviction outcome. The kept fields are `false`/`null` unless a terminal
+  is kept, also while the setting is off. `cao session status --workers` shows a `KEPT UNTIL` column only when
+  something is kept. With the setting off, every path behaves as before, and only those
+  additive fields and the ignored flag differ on the wire. See
+  `docs/terminal-lifecycle.md`, which also now says retention is 14 days (it said 7), lists
+  flow recycling (no snapshot), and gives the real snapshot directory.
+
+- **Ephemeral assign and handoff relay Kiro launch refusal rules and remedies (#1240).**
+  Helper probe refusals are structured and counted in the refusal archive.
+  Structured policy messages are bounded and stripped of control characters.
+  Other launch failures after a claim return a generic message. Installed-profile
+  launches keep their existing errors.
+
+- **Accept kiro-cli 3.1.0 and 2.37.1 as pending v3 versions (#1167).** 3.1.0 maps to
+  the statically reviewed `KAS_0_66_91`; 2.37.1 reuses `KAS_0_66_70`. Every agent and
+  helper render stays byte-identical. Both remain refused at launch unless the operator
+  enables `kiro.v3_allow_unverified_versions`, until the operator checklist
+  (OC1–OC19, #1167) passes.
+  3.1.0 has captured-help probe coverage; 2.37.1 has schema and launch coverage
+  only because no help capture is available.
+
+- **The ambient stream attributes events only to real terminals** (#1232 review). A sender that
+  is not a terminal (`operator`, `supervisor`), an `emit_ui` `terminal_id` CAO does not know, or a
+  terminal whose invocation already finished no longer becomes a subagent or reuses a finished
+  `subagentRunId`; the event stays on the record's session invocation, or is untagged, and keeps
+  the sender in `metadata.cao.sender`. `clients.database.terminal_exists` is added for the check.
+- **Direct SQLite connections are now closed when their block ends.** `with sqlite3.connect(...) as conn:`
+  only commits or rolls back; it does not close, and the connection is in a reference cycle with its
+  statement cache, so each such block held a file descriptor on the database until a full garbage
+  collection ran. That covered the workflow journal and its event log, the spec index, the approval
+  store and the SQLite migrators: 47 descriptors per three-step workflow run with the GC disabled. A
+  new `utils.sqlite_connection.closing_transaction` keeps the commit-or-rollback behaviour and then
+  closes the connection; every such block in `src/` uses it. Isolation levels, pragmas and timeouts
+  are unchanged.
+- **A pipe-pane writer no longer outlives its pane when no reader is attached.**
+  `utils/fifo_writer.py` opened the FIFO with a blocking `open()`, which never returns while
+  nothing has the read end open and never reads stdin meanwhile. A writer started while its
+  reader thread had not opened yet, or had exited on an error, therefore survived its pane and
+  its tmux server as an orphan. The open is now non-blocking and retried, and while it waits the
+  writer exits as soon as tmux closes its stdin. Output written before a late reader attaches is
+  still delivered.
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different
   request already claimed gets its own slot. On `POST /sessions` and
@@ -131,6 +236,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does a stored effort, and a launch it refuses is not retried on the stored effort, so keep
   `min_effort` and `max_effort` to levels your Kiro models accept. Installed Kiro agents are unchanged.
 
+- **Ephemeral helpers can be matched to your models from task features** (#1199, off by default,
+  provisional). A decider can size a helper but can't tell which of your models suits the task.
+  With the new `task.features` switch on, CAO asks a decider that declares them four fixed yes/no
+  questions about the task (`task.long_context`, `task.deep_reasoning`, `task.read_only` and the
+  advisory `task.needs_network`), in one request beside `model.route`'s, with the same task text
+  and nothing new. CAO then matches the answers locally to the models you declare under
+  `decisions.match` in `settings.json`, which is never sent anywhere. The match may raise a
+  helper's tier up to `ephemeral.max_tier`, never below the decider's size answer, and, with
+  `provider.route` bound to the built-in `match` answerer, pick the CLI within your declared
+  equivalence set. It never widens the options, never takes a model outside `model_tiers`, and
+  never touches tools. #810's rule is amended for this, for the tier only: a decider still can't
+  raise a tier, providers or tools, and CAO's own match may raise only the tier, to a declared
+  model and up to `ephemeral.max_tier`. `needs_network` only adds a hint to the delegation note. Any
+  doubt runs today's choice. Shadow records the would-be match. Records gain eight nullable
+  `match_*` and `catalog_*` columns (an additive migration), and the new
+  `cao decisions match show`, `check` and `explain` explain every pick. With today's capability
+  table no equivalence set validates, so only the tier half routes until a second `hard` or
+  `sandboxed` CLI is available. See
+  [Matching helpers to models](docs/decisions.md#matching-helpers-to-models).
+
 - **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
   API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one
   universal agent file with v3 tool exclusions and deny rules. A v3 launch is refused before
@@ -139,8 +264,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.kiro/agents`, and the workspace's `.kiro/` holds no configuration; after the header, CAO
   reads `/mcp` until no server is loading, then `/tools`, before any task. **Not yet a
   supported configuration:** v3 support is claimed only once the live operator checklist has passed.
-  A kiro-cli version still pending operator verification (2.36.0, 2.37.0, 3.0.0; each ships the
-  same v3 engine, `@kiro/agent` 0.66.70, as 2.35.1) refuses unless the operator sets
+  A kiro-cli version still pending operator verification (2.36.0, 2.37.0, 2.37.1, 3.0.0 on
+  `@kiro/agent` 0.66.70; 3.1.0 on 0.66.91) refuses unless the operator sets
   `kiro.v3_allow_unverified_versions: true` (provisional, for running the checklist on it); such a
   launch logs a warning and its response carries `launch_notes`.
   Also: `cao launch` now shows the server's refusal reason instead of "Failed to connect", and the

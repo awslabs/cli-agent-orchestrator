@@ -64,6 +64,14 @@ def _format_launch_model(terminal):
     return terminal.get("model") or "provider default", "yes" if honored else "no"
 
 
+def _format_kept_until(value) -> str:
+    """A kept worker's window end (an ISO time from the API) as ``YYYY-MM-DD HH:MM``."""
+    if not value:
+        return "-"
+    text = str(value).replace("T", " ")
+    return text[:16] + (" UTC" if text.endswith(("Z", "+00:00")) else "")
+
+
 @click.group()
 def session():
     """Manage CAO sessions.
@@ -194,6 +202,8 @@ def status(session_name, terminal_id, workers, as_json):
                     "model": t.get("model"),
                     "model_honored": t.get("model_honored"),
                     "status": t.get("status"),
+                    # #1225: only for a kept worker, so the output is unchanged otherwise.
+                    **({"kept_until": t["kept_until"]} if t.get("kept_until") else {}),
                 }
                 for t in all_terminals[1:]
             ]
@@ -222,18 +232,23 @@ def status(session_name, terminal_id, workers, as_json):
     if workers and not terminal_id:
         worker_terminals = all_terminals[1:]
         if worker_terminals:
+            # #1225: a KEPT UNTIL column, only when some worker is kept, so the
+            # table is unchanged while keeping finished agents is off.
+            any_kept = any(t.get("kept_until") for t in worker_terminals)
+            kept_header = f" {'KEPT UNTIL':<20}" if any_kept else ""
             click.echo(
                 f"\n{'ID':<12} {'AGENT':<20} {'PROVIDER':<15} "
-                f"{'MODEL':<20} {'HONORED':<8} {'STATUS':<15}"
+                f"{'MODEL':<20} {'HONORED':<8} {'STATUS':<15}{kept_header}"
             )
-            click.echo("-" * 95)
+            click.echo("-" * (116 if any_kept else 95))
             for t in worker_terminals:
                 worker_model, worker_honored = _format_launch_model(t)
+                kept_cell = f" {_format_kept_until(t.get('kept_until')):<20}" if any_kept else ""
                 click.echo(
                     f"{t['id']:<12} {t.get('agent_profile', 'N/A'):<20} "
                     f"{t.get('provider', 'N/A'):<15} "
                     f"{worker_model:<20} "
-                    f"{worker_honored:<8} {t.get('status', 'N/A'):<15}"
+                    f"{worker_honored:<8} {t.get('status', 'N/A'):<15}{kept_cell}"
                 )
         else:
             click.echo("\nNo worker terminals")

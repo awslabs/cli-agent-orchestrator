@@ -67,7 +67,13 @@ Every derived path resolves from this value, so one override moves everything �
   },
   "terminal": {
     "backend": "tmux",
-    "herdr_session": "cao"
+    "herdr_session": "cao",
+    "keep_finished": {
+      "enabled": false,
+      "idle_window_minutes": 60,
+      "max_per_session": 5,
+      "on_cap": "teardown_oldest"
+    }
   },
   "apps": {
     "enabled": false,
@@ -149,12 +155,14 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 
 Creation and creator-owned launches are opt-in. `assign` and `handoff` launch
 creator-owned ephemeral names from the creator terminal.
-Only JSON `true` enables the tool, and agent terminals must restart to see it.
+Only JSON `true` enables the tool. An agent sees it only once its CAO MCP connection
+restarts: reconnect it (in Claude Code, `/mcp`, then reconnect the CAO server) or restart the
+agent's terminal.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `false` | Enable ephemeral creation, claims and owner-only HTTP launch. |
-| `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex is an operator opt-in. |
+| `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex and Kiro (`kiro_cli`) are operator opt-ins. |
 | `max_brief_bytes` | `8192` | Maximum UTF-8 bytes after brief normalization. |
 | `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched or swept. |
 | `claim_lease_seconds` | `60` | Lease from claim to terminal creation. With `model_tier`, `effort` or `provider` set to `"auto"` it must be at least `n * decisions.on_timeout_ms / 1000 + 30`, where `n` counts the fields set to `"auto"`, `provider` included. |
@@ -202,7 +210,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 |---------|---------|--------------|
 | `mcp_request_timeout` | `30` | Seconds to wait for HTTP calls between the MCP server process and the CAO API. Does not apply to a create the server answers only after provider init (`cao launch` without `--headless`, `cao agent handoff`, the `launch_agent` app gesture, `cao-ops` `launch_session` without a message); those waits are sized from `provider_init_timeout` instead. |
 | `event_bus_max_queue_size` | `1024` | Max events buffered per subscriber queue in the internal event bus. |
-| `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. On Kiro v3 it also sizes the wait for MCP servers to finish loading before the first task — see [How long CAO waits for MCP servers](kiro-cli.md#how-long-cao-waits-for-mcp-servers). Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity, Codex) may run; Codex fails initialisation if a trust or update dialog (or a startup modal still mid-redraw after a short ride-out) is on screen when the cap is reached or after the readiness wait. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). Client processes also read this value to size how long they wait for a synchronous create, so set it where the client runs too (not only in `cao-server`'s environment) when the two differ, for example a client pointed at another host through `CAO_API_HOST`; `GET /health` reports the value the server is using. |
+| `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. On Kiro v3 it also sizes the wait for MCP servers to finish loading before the first task — see [How long CAO waits for MCP servers](kiro-cli.md#how-long-cao-waits-for-mcp-servers). Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity, Codex) may run; Codex fails initialisation if a trust or update dialog (or a startup modal still mid-redraw after a short ride-out) is on screen when the cap is reached or after the readiness wait. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). Client processes also read this value to size how long they wait for a synchronous create, so set it where the client runs too (not only in `cao-server`'s environment) when the two differ, for example a client pointed at another host through `CAO_API_HOST`; `GET /health` reports the value the server is using. When a launch fails this way, CAO keeps any other agents already running in its session ([When a launch fails while it starts](terminal-lifecycle.md#when-a-launch-fails-while-it-starts)). |
 | `startup_prompt_handler_timeout` | `20` | Idle gap, in seconds, between consecutive startup prompts (e.g. workspace trust / bypass dialogs, Kimi's upgrade dialog, Antigravity's trust/survey dialogs, Codex's trust and update dialogs). The handler polls and resets this timer each time it answers a prompt; it only starts counting once the FIRST prompt has been handled, so a first dialog arriving later than this value (e.g. a cold/containerized start) is still caught — before any prompt is seen, only `provider_init_timeout` bounds the wait. Once at least one prompt has been handled, the handler exits after this many seconds pass with no further prompt. |
 | `state_buffer_max` | `32768` | Bytes of raw terminal output `StatusMonitor` keeps per terminal for raw-path status detection and `GET /terminals/{id}/output` (`mode=full`). Not unbounded scrollback — a long, chatty session is truncated to this trailing window; raise it if a still-pending prompt is getting evicted before it's read back. |
 
@@ -287,6 +295,14 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 - `pane_layout`: how that window is re-arranged after each spawn — `"tiled"`
   (default), `"even-vertical"`, `"even-horizontal"`, or `"none"`. See
   [Choosing a layout](#choosing-a-layout).
+- `keep_finished`: keep finished child agents open so you can see what they did,
+  for workshops and debugging. Off by default; turn it on with
+  `cao config set terminal.keep_finished.enabled true`. Its four keys (`enabled`,
+  `idle_window_minutes`, `max_per_session`, `on_cap`), the reaper that cleans kept
+  agents up, and what stays unchanged are in
+  [Keep finished agents](terminal-lifecycle.md#keep-finished-agents-for-workshops-and-debugging).
+  A bad value is refused by `cao config set`, and logged and treated as off when it
+  is already in the file. It has no environment variable.
 
 Select a backend for a single run without touching `settings.json`:
 
@@ -500,13 +516,15 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 ### Launch decisions
 
 `CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_PROVIDER_ROUTE`,
-`CAO_DECISION_ON_TIMEOUT_MS` and `CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision
-settings loader, not through `ConfigService`, and override the `decisions` block of
-`settings.json`. The chain above does not apply as written: `cao-server --decision
-<point>=<state>` sets the matching point-state variable (`CAO_DECISION_MODEL_ROUTE`,
-`CAO_DECISION_EFFORT_ROUTE` or `CAO_DECISION_PROVIDER_ROUTE`), so the flag and that variable are
-one layer, and the server keeps the values it started with until it restarts.
-See [Launch decisions](decisions.md#settings).
+`CAO_DECISION_TASK_FEATURES`, `CAO_DECISION_ON_TIMEOUT_MS` and
+`CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision settings loader, not through
+`ConfigService`, and override the `decisions` block of `settings.json`. The chain above does not
+apply as written: `cao-server --decision <point>=<state>` sets the matching point-state variable
+(`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_PROVIDER_ROUTE` or
+`CAO_DECISION_TASK_FEATURES`), so the flag and that variable are one layer, and the server keeps
+the values it started with until it restarts. `decisions.match`, the local model catalog, has no
+environment override. See [Launch decisions](decisions.md#settings) and
+[Matching helpers to models](decisions.md#matching-helpers-to-models).
 
 ### Not yet routed through ConfigService
 

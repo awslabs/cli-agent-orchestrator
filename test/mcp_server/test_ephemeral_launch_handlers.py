@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.mcp_server import server
-from cli_agent_orchestrator.services import agent_step, terminal_service
+from cli_agent_orchestrator.services import agent_step, inbox_service, terminal_service
 from cli_agent_orchestrator.services.terminal_service import get_output as _real_get_output
 from cli_agent_orchestrator.utils import orchestration
 
@@ -87,6 +87,23 @@ def launch_http(release_runtime, monkeypatch):
 
     monkeypatch.setattr(
         terminal_service.status_monitor, "get_status", lambda _: TerminalStatus.IDLE
+    )
+    # Every terminal reads IDLE and none ever starts, so a delivery into one
+    # (a worker-ended notice when a child is deleted) would otherwise wait out
+    # the whole submit confirmation. The delivery also runs inline here, not
+    # on its own thread: the in-memory store shares one SQLite connection
+    # across threads, and a delivery thread that runs on beside the delete (or
+    # past the test) would interleave its transactions with the test's.
+    # Patched on the class: monkeypatch restores an instance attribute by setting
+    # it to the bound method it read, which would leave the singleton shadowing
+    # the class method (and any later class-level patch) for every later test.
+    monkeypatch.setattr(inbox_service, "INBOX_SUBMIT_CONFIRMATION", False)
+    monkeypatch.setattr(
+        inbox_service.InboxService,
+        "deliver_pending_in_background",
+        lambda self, terminal_id, registry=None: self.deliver_pending(
+            terminal_id, registry=registry
+        ),
     )
     monkeypatch.setattr(terminal_service, "send_input", lambda *a, **kw: None)
     monkeypatch.setattr(terminal_service, "get_output", lambda *a: "done")
@@ -1012,6 +1029,52 @@ async def test_claimed_provider_error_preserves_handoff_and_releases(launch_http
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 409, 424, 499])
+async def test_claimed_run_step_4xx_keeps_structured_worker_for_cleanup(
+    launch_http, monkeypatch, status
+):
+    import requests
+
+    env, name, _, _ = launch_http[0]
+    original = orchestration.requests.post
+
+    def retained_worker_response(url, **kwargs):
+        if not url.endswith("/run-step"):
+            return original(url, **kwargs)
+        # Launch and bind a real worker, then model a future server's structured
+        # 4xx response while that worker remains alive and needs cleanup.
+        kwargs["json"] = {**kwargs["json"], "teardown": False}
+        launched = original(url, **kwargs)
+        assert launched.status_code == 200
+        assert launched.json()["terminal_id"] == CHILD
+        response = requests.Response()
+        response.status_code = status
+        response._content = json.dumps(
+            {
+                "detail": {
+                    "kind": "identity_pending",
+                    "message": "/private/worker identity check pending",
+                    "terminal_id": CHILD,
+                }
+            }
+        ).encode()
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", retained_worker_response)
+    result = await invoke("default", name)
+    assert result["success"] is False
+    assert result["message"] == f"ephemeral launch failed ({status})"
+    assert result["rule"] == "unexpected_failure"
+    assert result["terminal_id"] == CHILD
+    assert database.get_terminal_metadata(CHILD) is not None
+    assert database.get_ephemeral_agent(name)["state"] == "launched"
+    assert orchestration._delete_terminal_impl(result["terminal_id"])["success"]
+    assert database.get_terminal_metadata(CHILD) is None
+    assert_released(env, name, "terminal_deleted")
+    assert database.get_ephemeral_agent(name)["state"] == "gc"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "e2_variant", ["omitted", "explicit", "default", "effort_explicit", "effort_default"]
 )
@@ -1051,3 +1114,166 @@ async def test_A_M1_claim_rule_relay(launch_http, path, fault, rule):
     assert result["message"].startswith("ephemeral policy: " + rule)
     backend.create_window.assert_not_called()
     factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+@pytest.mark.parametrize(
+    "status, body, expected",
+    [
+        (
+            400,
+            {"detail": "kiro_v3_unsupported_version: use a supported version"},
+            "ephemeral launch failed (400)",
+        ),
+        (400, "upstream refused", "ephemeral launch failed (400)"),
+        (
+            400,
+            {"detail": "refused\x00\x1b\n\r\t\x7f\x85\u202e safely"},
+            "ephemeral launch failed (400)",
+        ),
+        (400, {"detail": "x" * 100000}, "ephemeral launch failed (400)"),
+        (503, "y" * 100000, "ephemeral launch failed (503)"),
+        (424, {"detail": "private replay failure"}, "ephemeral launch failed (424)"),
+        (500, {"detail": "private exception"}, "ephemeral launch failed (500)"),
+        (499, {"detail": "refused"}, "ephemeral launch failed (499)"),
+        (400, {"detail": {"message": "private dict failure"}}, "ephemeral launch failed (400)"),
+        (
+            409,
+            {"detail": {"kind": "diverged", "message": "/private/x"}},
+            "ephemeral launch failed (409)",
+        ),
+        (400, {"detail": "\x00" * 5000 + "secret"}, "ephemeral launch failed (400)"),
+        (400, {"detail": ""}, "ephemeral launch failed (400)"),
+        (400, {"detail": "  "}, "ephemeral launch failed (400)"),
+    ],
+    ids=[
+        "legacy-json",
+        "non-json",
+        "controls",
+        "oversized-json",
+        "oversized-text",
+        "replay",
+        "boundary-500",
+        "boundary-499",
+        "dict-detail",
+        "nonpolicy-kind",
+        "bound-before-filter",
+        "empty",
+        "whitespace",
+    ],
+)
+async def test_nonpolicy_claimed_launch_error_text_is_generic(
+    launch_http, monkeypatch, path, status, body, expected
+):
+    import requests
+
+    original = orchestration.requests.post
+
+    def reject_launch(url, **kwargs):
+        if url.endswith("/claim"):
+            return original(url, **kwargs)
+        response = requests.Response()
+        response.status_code = status
+        response._content = (json.dumps(body) if isinstance(body, dict) else body).encode()
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", reject_launch)
+    result = await invoke(path, launch_http[0][1])
+    assert result["success"] is False
+    assert result["rule"] == "unexpected_failure"
+    assert result["message"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+async def test_existing_policy_refusal_output_is_unchanged(launch_http, monkeypatch, path):
+    import requests
+
+    original = orchestration.requests.post
+    message = "ephemeral policy: claim_expired renew the claim"
+
+    def reject_launch(url, **kwargs):
+        if url.endswith("/claim"):
+            return original(url, **kwargs)
+        response = requests.Response()
+        response.status_code = 400
+        response._content = json.dumps(
+            {"detail": {"kind": "ephemeral_policy", "rule": "claim_expired", "message": message}}
+        ).encode()
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", reject_launch)
+    result = await invoke(path, launch_http[0][1])
+    assert result["success"] is False
+    assert result["rule"] == "claim_expired"
+    assert result["message"] == message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        (
+            "ephemeral policy: timeout refused\x00\x1b\u202e safely",
+            "ephemeral policy: timeout refused safely",
+        ),
+        ("x" * 100000, "x" * 4096),
+        ("\x00" * 5000 + "secret", "ephemeral launch failed (400)"),
+        ("line one\n\r\t  line two", "line one line two"),
+    ],
+    ids=["controls", "oversized", "bound-before-filter", "whitespace-runs"],
+)
+async def test_policy_refusal_message_is_bounded_and_control_free(
+    launch_http, monkeypatch, path, message, expected
+):
+    import requests
+
+    original = orchestration.requests.post
+
+    def reject_launch(url, **kwargs):
+        if url.endswith("/claim"):
+            return original(url, **kwargs)
+        response = requests.Response()
+        response.status_code = 400
+        response._content = json.dumps(
+            {"detail": {"kind": "ephemeral_policy", "rule": "timeout", "message": message}}
+        ).encode()
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", reject_launch)
+    result = await invoke(path, launch_http[0][1])
+    assert result["success"] is False
+    assert result["rule"] == "timeout"
+    assert result["message"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+@pytest.mark.parametrize("stage", ["repo-root", "worktree-add"])
+async def test_worktree_error_after_claim_hides_path_and_git_stderr(
+    launch_http, monkeypatch, path, stage
+):
+    import subprocess
+
+    from cli_agent_orchestrator.services import worktree_service
+
+    stderr = "fatal: detected dubious ownership in repository at '/private/fake-repo'"
+
+    def git_result(args, **kwargs):
+        if stage == "worktree-add" and args[0] == "rev-parse":
+            return subprocess.CompletedProcess(args, 0, stdout="/private/fake-repo", stderr="")
+        return subprocess.CompletedProcess(args, 128, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(worktree_service, "_run_git", git_result)
+    result = await invoke(path, launch_http[0][1], use_worktree=True)
+    assert result["success"] is False
+    assert result["rule"] == "unexpected_failure"
+    assert result["message"] == "ephemeral launch failed (400)"
+    assert result["terminal_id"] is None
+    for private in ["/workspace", "/private/fake-repo", "dubious ownership", "git rev-parse"]:
+        assert private not in str(result)
+    assert database.get_terminal_metadata(CHILD) is None
+    launch_http[0][2].create_window.assert_not_called()
+    launch_http[0][3].assert_not_called()

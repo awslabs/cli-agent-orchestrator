@@ -92,6 +92,7 @@ from cli_agent_orchestrator.services.workflow_errors import (
     ReplayDivergenceError as ReplayDivergenceError,
 )
 from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -1514,7 +1515,7 @@ def update_run_generation(run_id: str, generation: str) -> None:
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
-    with sqlite3.connect(str(DATABASE_FILE)) as conn:
+    with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
         conn.execute(
             "UPDATE workflow_run SET generation = ? WHERE run_id = ?",
             (generation, run_id),

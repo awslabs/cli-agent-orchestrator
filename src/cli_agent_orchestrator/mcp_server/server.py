@@ -389,7 +389,9 @@ if ENABLE_WORKING_DIRECTORY:
         5. Return the agent's response
         6. Report the teardown outcome. On success the result states whether the
            worker terminal was torn down. On a timeout or worker error it names the
-           terminal and job and states the terminal was not torn down.
+           terminal and job and states the terminal was not torn down. When the
+           operator has turned on keeping finished agents, a successful worker is
+           kept instead, and the result says until when; CAO tears it down later.
 
         ## Working Directory
 
@@ -507,7 +509,9 @@ else:
         4. Return the agent's response
         5. Report the teardown outcome. On success the result states whether the
            worker terminal was torn down. On a timeout or worker error it names the
-           terminal and job and states the terminal was not torn down.
+           terminal and job and states the terminal was not torn down. When the
+           operator has turned on keeping finished agents, a successful worker is
+           kept instead, and the result says until when; CAO tears it down later.
 
         ## Model
 
@@ -636,6 +640,11 @@ Returns:
 _assign_description = _build_assign_description(
     ENABLE_SENDER_ID_INJECTION, ENABLE_WORKING_DIRECTORY
 )
+_expect_callback_field_desc = (
+    "If true (default), the server guarantees you hear back: if the worker goes idle "
+    "without calling send_message, its last response is forwarded to you, and if it ends "
+    "you are told. Set false for fire-and-forget workers."
+)
 _assign_message_field_desc = (
     "The task message to send to the worker agent."
     if ENABLE_SENDER_ID_INJECTION
@@ -676,6 +685,10 @@ if ENABLE_WORKING_DIRECTORY:
                 description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
             ),
         ] = None,
+        expect_callback: bool = Field(
+            default=True,
+            description=_expect_callback_field_desc,
+        ),
     ) -> Dict[str, Any]:
         denied = _tool_denied_reason("assign")
         if denied:
@@ -689,6 +702,8 @@ if ENABLE_WORKING_DIRECTORY:
             use_worktree=use_worktree,
             target_host=target_host,
             description=description,
+            # A direct call passes the FieldInfo default; only an explicit False opts out.
+            expect_callback=expect_callback is not False,
         )
 
 else:
@@ -722,6 +737,10 @@ else:
                 description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
             ),
         ] = None,
+        expect_callback: bool = Field(
+            default=True,
+            description=_expect_callback_field_desc,
+        ),
     ) -> Dict[str, Any]:
         denied = _tool_denied_reason("assign")
         if denied:
@@ -735,6 +754,8 @@ else:
             use_worktree=use_worktree,
             target_host=target_host,
             description=description,
+            # A direct call passes the FieldInfo default; only an explicit False opts out.
+            expect_callback=expect_callback is not False,
         )
 
 
@@ -943,6 +964,14 @@ async def send_message(
             "this one via handoff/assign (the recorded caller)."
         ),
     ),
+    expect_reply: bool = Field(
+        default=False,
+        description=(
+            "Set true when messaging a terminal you did not assign and you are waiting for "
+            "its reply; the server then forwards its last response if it goes idle without "
+            "replying. Follow-ups to your own workers are tracked automatically."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Send a message to another terminal's inbox.
 
@@ -952,6 +981,11 @@ async def send_message(
     When receiver_id is omitted, the message goes to the recorded caller —
     the terminal that created this one via handoff/assign. This is the
     reliable way to send results back to your supervisor.
+
+    Any message from a worker to the terminal waiting on it counts as the
+    reply and ends that wait, including a progress note or a question; if
+    the worker then goes idle without a final reply, nothing more is
+    forwarded to the caller.
 
     An explicit receiver_id must be one of: a terminal you created via
     assign/handoff, the terminal that created you, or (when your profile
@@ -965,6 +999,10 @@ async def send_message(
     Returns:
         Dict with success status and message details
     """
+    # Called directly (not through FastMCP), the unset default is the FieldInfo
+    # object, which is truthy. Only an explicit True asks for a reply.
+    if expect_reply is True:
+        return _send_message_impl(receiver_id, message, expect_reply=True)
     return _send_message_impl(receiver_id, message)
 
 
@@ -1118,12 +1156,17 @@ def delete_terminal(
     worker, so the node must run a cao-server that reports it (this release
     or later) and must not have restarted since the worker was created.
 
+    When the operator has turned on keeping finished agents for this machine,
+    an idle worker you created is kept instead of deleted, so people can look at
+    what it did afterwards. The result then says ``kept`` and until when; CAO
+    tears it down itself later, so there is nothing more for you to do.
+
     Args:
         terminal_id: The terminal ID to delete
         target_host: Remote CAO node hosting the terminal; omit for local
 
     Returns:
-        Dict with success status and message
+        Dict with success status and message (plus ``kept``/``kept_until`` when kept)
     """
     # Direct (non-MCP) invocation — e.g. existing unit tests calling the
     # function positionally — receives the pydantic FieldInfo object as the
@@ -1137,7 +1180,12 @@ def delete_terminal(
     # a real Optional[str] that needs no laundering.
     if not isinstance(target_host, str) or not target_host.strip():
         target_host = None
-    return _delete_terminal_impl(terminal_id, target_host=target_host)
+    # keep_if_enabled marks this as an AGENT's delete (#1225 phase 1): only this
+    # tool sends it, so every operator delete stays immediate. Remote workers are
+    # out of phase 1, so a target_host delete never asks for a keep.
+    return _delete_terminal_impl(
+        terminal_id, target_host=target_host, keep_if_enabled=target_host is None
+    )
 
 
 @mcp.tool()

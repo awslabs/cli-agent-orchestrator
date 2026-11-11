@@ -112,7 +112,7 @@ Storage layout:
 ```
 ~/.aws/opencode/
 ├── opencode.json          # MCP servers + per-agent tool gating (written by cao install)
-├── cao-grants.json        # CAO's record of which tool grants it wrote (see below)
+├── cao-grants.json        # CAO's record of the tool grants and plugin mcp entries it wrote
 ├── package.json           # written by opencode on first launch
 ├── node_modules/          # ~57 MB, written by opencode on first launch
 └── agents/
@@ -240,8 +240,34 @@ Withdrawing a grant is therefore restricted to keys CAO can *prove* are its own:
   which keeps grants from installs predating the sidecar cleanable
 
 A `<servername>*` key CAO has no record of and cannot place in the agent-plugin store is
-left alone rather than deleted on a guess. Deleting `cao-grants.json` is safe; it
-only costs CAO the first of the two proofs.
+left alone rather than deleted on a guess.
+
+If `cao-grants.json` cannot be read (not valid JSON, not valid UTF-8, not readable, a
+directory, or not a grant record), CAO leaves it as it is, logs a warning that names it,
+and records nothing in it until it is a readable grant record. Repair the file by hand
+rather than deleting it. Deleting it drops the recorded grants of every agent, so CAO
+keeps only the agent-plugin store proof, and a profile server's grant it wrote whose
+server the profile drops before the agent is next installed stays in `opencode.json`
+until you remove it. It also drops the `"mcp"` fingerprints described below: after a
+`CAO_HOME_DIR` move, the fingerprint is the only proof that an entry naming the old
+agent-plugin store is CAO's (`is_cao_owned_mcp_entry`, through
+`is_orphaned_recorded_mcp_entry`). Without it, CAO reports a plugin server of the same
+name as a collision, and neither updates nor disables that entry.
+
+The same two proofs decide which `mcp` entries are CAO's. For every agent-plugin
+server it writes, CAO records a SHA-256 fingerprint of the entry in `cao-grants.json`
+(under `"mcp"`; the fingerprint ignores `enabled`). `~/.aws/opencode` does not follow
+`CAO_HOME_DIR`, so two CAO homes share `opencode.json` and the sidecar. An entry
+inside the current agent-plugin store is CAO's. An entry inside another store is CAO's
+only once that store's plugin directory is gone, for example after `CAO_HOME_DIR`
+moved: CAO then updates it on install and sets `"enabled": false` when no installed
+plugin delivers it. While the other store's plugin directory still exists, another
+live CAO home may be using the entry, so CAO leaves it enabled and unchanged, and
+reports a plugin server of the same name as a collision. An entry you edited no
+longer matches its fingerprint, and is then CAO's only if its paths resolve inside
+the current agent-plugin store.
+Anything else is yours: CAO reports a plugin server of the same name instead of
+overwriting your entry, and never disables it.
 
 One exception to "your tool policy survives", and it predates this behaviour: a
 grant is *re-applied* on every refresh, so setting `"<servername>*": false` by hand

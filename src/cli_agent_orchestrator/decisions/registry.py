@@ -51,6 +51,11 @@ class DeciderRegistry:
         decider = self._cache[name]
         return decider if decider is not None and point in decider.points else None
 
+    def get_all(self, name: str, points: tuple[str, ...]) -> Decider | None:
+        """The decider only if it declares every point of a group request (#1199)."""
+        decider = self.get(name, points[0]) if points else None
+        return decider if decider is not None and set(points) <= decider.points else None
+
     async def close(self) -> None:
         for decider in self._cache.values():
             close = getattr(decider, "close", None)
