@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro v3 helpers can admit unlisted kiro-cli versions with an operator opt-in.**
+  `kiro.v3_admission: "observed"` borrows the newest eligible same-major schema
+  for versions from 2.35.1 to below 4.0.0, with the existing pending-version
+  opt-in still required for pending rows. The v3 capability probe and every
+  live check remain required before task input; each admission logs a WARNING
+  and reports both versions in `launch_notes`. Strict admission stays the default
+  and always applies to installed-agent launches.
+
 - **A reconnect no longer loses a tool call's end, and `toolCallName` is `assign`, not
   `OrchestrationType.ASSIGN`** (#1292). On the ambient AG-UI stream, a client that held an `assign`
   or `handoff` call open, lost its stream (an overflow, or a dropped connection) and reconnected

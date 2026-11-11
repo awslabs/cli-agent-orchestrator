@@ -73,7 +73,7 @@ names.
 
 Before anything is allocated:
 
-- the kiro-cli version is one CAO supports (see below);
+- the kiro-cli version is listed, or qualifies for operator opt-in observed admission (see below);
 - the agent is not unrestricted (`*`);
 - the profile's `kiroConfig.effort`, if set, is a plain level such as `high`;
 - no `KIRO_HOME` other than `~/.kiro` reaches the launch;
@@ -288,14 +288,66 @@ The 3.1.0 probe is tested against captured help. No 2.37.1 help capture is
 available, so its coverage is schema lookup, pending refusal, opt-in admission
 and launch tests; it has no captured-help probe cases.
 
-Any other version refuses v3; v2 is not affected. A new kiro-cli release needs a
-CAO update before v3 runs on it.
+By default, any other version refuses v3; v2 is not affected. An unlisted
+release needs a CAO update or the operator opt-in below before v3 runs on it.
 
 The pending 2.36.0–3.0.0 versions reuse 2.35.1's v3 engine schema. 3.1.0 ships
 a different engine, statically reviewed with equal render-facing fields and tags,
 so CAO renders the same tools and rules. The pending rows are based on static
 review, without running a chat. What a pending version still lacks is a live run
 of the operator checklist.
+
+### Observed admission (operator only)
+
+Observed admission applies only to ephemeral Kiro v3 helpers, whose launch path
+checks the sealed home and operator migration markers as well as the header,
+workspace, `/mcp list` and `/tools` before task input. Installed-agent and other
+non-helper v3 launches remain strict even with this setting.
+
+Strict admission remains the default. Only the exact JSON string `"observed"`
+in the server's `settings.json` enables observed admission; there is no environment
+variable or CLI flag for it. Other strings, types, or an absent/unreadable setting
+retain strict admission.
+
+```json
+{ "kiro": { "v3_admission": "observed" } }
+```
+
+Listed versions keep their existing pending-verification rule. An unlisted version
+must parse as `MAJOR.MINOR.PATCH`, be at least `2.35.1` and below `4.0.0`, and
+advertise `v3` as an accepted `--agent-engine` value. CAO borrows the schema of the
+newest listed row in the **same major** at or below that version, excluding pending
+rows unless `kiro.v3_allow_unverified_versions` is also enabled. With no eligible
+row, the launch refuses. CAO never borrows a schema from another major.
+
+Both listed 3.x rows are pending, so using kiro-cli 3.2.0 currently requires both
+settings below. Until the operator verifies 3.1.0 live, borrowing its schema for
+3.2.0 requires `kiro.v3_allow_unverified_versions` as well as observed admission:
+
+```json
+{ "kiro": { "v3_admission": "observed", "v3_allow_unverified_versions": true } }
+```
+
+Every observed admission carries a `launch_notes` entry and a server-log WARNING
+naming the probed version and the version whose schema it borrowed. All existing
+checks still run before any task: the agent header, workspace, helper home and
+migration markers, and exact grant/server attestation from `/tools` and `/mcp list`.
+An agent file that the engine rejects, an extra tool or server, a missing
+`cao-mcp-server`, or an unreadable panel fails closed and tears down the helper.
+
+Observed admission relies on what `/tools` and `/mcp list` report. It does not attest
+the engine bundle or prove that a future engine enforces deny rules while reporting
+the expected tools. It remains operator opt-in, and the live check on kiro-cli
+3.2.0 is still owed by the operator.
+
+| Refusal code | Condition and remedy |
+|---|---|
+| `kiro_v3_observed_refused` | Unlisted version fails parsing, the floor/ceiling, v3 capability, or same-major predecessor check; use a supported version or qualify a schema, with the pending opt-in when applicable. |
+| `kiro_v3_unsupported_version` | Strict mode finds an unlisted version; use a supported version. |
+| `kiro_v3_unverified_version` | A listed version or all eligible borrowed schema rows are pending; complete the operator checklist or enable the existing pending opt-in for that checklist. |
+
+Live-check refusal codes remain unchanged, including `kiro_v3_tools_mismatch`,
+`kiro_v3_mcp_not_ready`, and the agent-identity and home/marker refusals below.
 
 ### Pending versions (operator only)
 

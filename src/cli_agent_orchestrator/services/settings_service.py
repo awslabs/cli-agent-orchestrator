@@ -157,12 +157,20 @@ def kiro_v3_allow_unverified_versions() -> bool:
     Provisional (#1167). When JSON ``true``, a Kiro v3 launch may run on a
     kiro-cli version whose allow-list entry is still pending operator
     verification, so that the operator can run the live checklist on it.
-    Nothing else is widened: a version absent from the allow-list still
-    refuses, and every other v3 check still applies. No environment override;
+    By itself this never admits an unlisted version; observed admission also
+    uses it to permit pending predecessor rows. Every other v3 check still
+    applies. No environment override;
     an unreadable settings file reads as off.
     """
     block = _load().get("kiro", {})
     return isinstance(block, dict) and block.get("v3_allow_unverified_versions") is True
+
+
+def kiro_v3_observed_admission() -> bool:
+    """Only the exact settings.json string enables observed admission; no env override."""
+    block = _load().get("kiro", {})
+    value = block.get("v3_admission") if isinstance(block, dict) else None
+    return isinstance(value, str) and value == "observed"
 
 
 def _load() -> Dict[str, Any]:

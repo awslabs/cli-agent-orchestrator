@@ -2510,6 +2510,7 @@ async def _create_terminal_unguarded(
                     probe,
                     executable=resolved_cli.path,
                     env=kiro_launch_home.kiro_env(kiro_probe_home),
+                    allow_observed=True,
                 )
             try:
                 try:
@@ -2548,7 +2549,9 @@ async def _create_terminal_unguarded(
                 # (or pending, with the operator's opt-in), and the policy
                 # restricted.
                 try:
-                    kiro_v3_admission = require_kiro_v3_admissible(capabilities, allowed_tools)
+                    kiro_v3_admission = require_kiro_v3_admissible(
+                        capabilities, allowed_tools, allow_observed=helper
+                    )
                 except KiroV3Refusal as exc:
                     if not helper:
                         raise
