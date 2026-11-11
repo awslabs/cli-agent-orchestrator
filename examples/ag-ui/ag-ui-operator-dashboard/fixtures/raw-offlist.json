@@ -1,0 +1,22 @@
+{
+  "type": "RAW",
+  "timestamp": 1794360623128,
+  "metadata": {
+    "cao": {
+      "eventId": "5a5f7064-1e75-4317-bf63-3103e5e2fd2c",
+      "terminalId": "34a10464",
+      "sessionName": "cao-od-e2e-a"
+    }
+  },
+  "subagentRunId": "terminal:34a10464",
+  "event": {
+    "event_id": "5a5f7064-1e75-4317-bf63-3103e5e2fd2c",
+    "terminal_id": "34a10464",
+    "session_name": "cao-od-e2e-a",
+    "timestamp": "2026-11-11T01:30:23.128252+00:00",
+    "cao_kind": "generative_ui",
+    "rejected_component": "iframe_embed.8688ac89",
+    "kind": "other"
+  },
+  "source": "cao"
+}

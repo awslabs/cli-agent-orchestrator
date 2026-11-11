@@ -13,7 +13,7 @@
 
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { realpathSync } from "node:fs";
+import { realpathSync, writeFileSync } from "node:fs";
 import { dirname, sep } from "node:path";
 import { createController, emptyPanel, openAmbient, reduceFrame, ROUTES, ALLOWED_COMPONENTS, type Frame } from "../core/index.ts";
 
@@ -200,8 +200,9 @@ async function main() {
   assert.ok(paneTail(A).some((l) => l.endsWith("MOCK: y")) && paneTail(B).some((l) => l.endsWith("MOCK: n")));
   log("PASS two interrupts: held until both decided, one resume[] with both, A got y and B got n");
 
-  // 6. The six components from real emit_ui calls, and the off-list call's 400, read on both ambient
-  //    transports at once: EventSource on GET (no token), and fetch on POST with a token.
+  // 6. The six components from real emit_ui calls, and the off-list call's 400 and its refusal record
+  //    (#1158), read on both ambient transports at once: EventSource on GET (no token), and fetch on
+  //    POST with a token.
   const esFrames: Frame[] = [];
   const esStatus: string[] = [];
   const ambientEs = openAmbient({
@@ -240,13 +241,17 @@ async function main() {
     const r = await emitUi(component, A.id, { label: `e2e ${component}`, note: "<b>not markup</b>" });
     assert.equal(r.status, 200, `${component}: ${JSON.stringify(r.body)}`);
   }
-  const offList = await emitUi("iframe_embed", A.id, { src: "x" });
+  const PROPS_MARKER = "e2e-offlist-props-marker";
+  const offList = await emitUi("iframe_embed", A.id, { src: PROPS_MARKER });
   assert.equal(offList.status, 400);
   assert.match((offList.body as { detail: string }).detail, /^Unknown UI component 'iframe_embed'/);
   const mineIn = (entries: typeof ctl.panel.entries) =>
     entries.filter((e) => e.kind === "component" && e.owner.sender === A.id && String(e.props.label).startsWith("e2e "));
   await until(() => mineIn(ctl.panel.entries).length >= 6 && mineIn(tokenPanel.entries).length >= 6, "six components on both streams");
-  // Settle: give a refused call time to arrive, were it ever to reach the stream, before asserting it did not.
+  const refusalsIn = (entries: typeof ctl.panel.entries) =>
+    entries.filter((e) => e.kind === "refused" && e.component.startsWith("iframe_embed."));
+  await until(() => refusalsIn(ctl.panel.entries).length >= 1 && refusalsIn(tokenPanel.entries).length >= 1, "the refusal on both streams");
+  // Settle: give a second refusal frame time to arrive, were the server ever to send one.
   await sleep(2000);
   ambientEs.close();
   ambientToken.close();
@@ -255,12 +260,23 @@ async function main() {
     const seen = mineIn(entries).map((e) => (e.kind === "component" ? e.component : "")).sort();
     assert.deepEqual(seen, [...ALLOWED_COMPONENTS], `${name}: ${seen.join(",")}`);
     assert.ok(mineIn(entries).every((e) => e.owner.subagentRunId === `terminal:${A.id}`), `${name}: attribution`);
-    assert.ok(!entries.some((e) => e.component === "iframe_embed"), `${name}: the refused call reached the stream`);
+    assert.ok(!entries.some((e) => e.component === "iframe_embed"), `${name}: the raw off-list name reached the stream`);
+    const refused = refusalsIn(entries);
+    assert.equal(refused.length, 1, `${name}: ${refused.length} refusal entries`);
+    assert.match(refused[0].component, /^iframe_embed\.[0-9a-f]{8}$/, `${name}: refusal name`);
+    assert.equal(refused[0].owner.subagentRunId, `terminal:${A.id}`, `${name}: refusal attribution`);
+  }
+  const rawRefusals = esFrames.filter((f) => f.type === "RAW" && typeof (f.event as { rejected_component?: unknown })?.rejected_component === "string");
+  assert.equal(rawRefusals.length, 1, `EventSource: ${rawRefusals.length} RAW refusal frames`);
+  assert.ok(!("props" in (rawRefusals[0].event as object)), "the refusal frame carries props");
+  assert.ok(!JSON.stringify(esFrames).includes(PROPS_MARKER), "the off-list props reached the stream");
+  if (process.env.CAO_E2E_CAPTURE_OFFLIST) {
+    writeFileSync(process.env.CAO_E2E_CAPTURE_OFFLIST, `${JSON.stringify(rawRefusals[0], null, 2)}\n`);
   }
   assert.deepEqual(tokenStatus, ["connecting", "open", "closed"]);
   log(`PASS six components from real emit_ui calls on the ambient stream, EventSource (${esFrames.length} frames)`);
   log(`PASS the same six on the token POST stream (${tokenFrames} frames; status ${tokenStatus.join(" → ")})`);
-  log('PASS off-list emit_ui: HTTP 400 "Unknown UI component \'iframe_embed\'", and nothing on either stream after a 2s settle');
+  log('PASS off-list emit_ui: HTTP 400 "Unknown UI component \'iframe_embed\'", and exactly one refusal frame, with no props, on each stream after a 2s settle');
 
   // 6b. A token stream that drops replays what it missed (#1248 review, P3-2). The first request
   //     asks the server to end the stream after 2 s (forwardedProps.cao.maxSeconds); the client

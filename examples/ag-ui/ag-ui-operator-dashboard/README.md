@@ -114,6 +114,9 @@ token, the run plane answers 403 and the card says so.
 `dangerouslySetInnerHTML` and no `eval`. A `RAW` frame with
 `event.rejected_component`, or a `CUSTOM` frame naming a component outside the
 six, shows as a refusal with the component name and sender and without props.
+A refusal the server folded others into adds "And N more refused." Refused
+entries are capped apart, at the newest 20 (`MAX_REFUSED_ENTRIES`), so a flood of
+refusals never pushes a real component out.
 The panel has no controls, not even on an `approval_card`. It keeps the newest
 200 entries (`MAX_PANEL_ENTRIES` in `core/genui.ts`), so a long session does not
 grow without limit.

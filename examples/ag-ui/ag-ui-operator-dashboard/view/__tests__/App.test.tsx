@@ -85,7 +85,7 @@ describe("App", () => {
   it("an off-list frame shows a refusal and never its props", async () => {
     const { store } = mount([]);
     // The captured RAW frame carries no props, so add some, as a hostile producer might.
-    const raw = fixtureJson<Frame>("raw-offlist.generated.json");
+    const raw = fixtureJson<Frame>("raw-offlist.json");
     const withProps: Frame = { ...raw, event: { ...(raw.event as object), props: { html: "<b>secret-raw</b>" } } };
     const custom: Frame = {
       type: "CUSTOM",
@@ -99,7 +99,7 @@ describe("App", () => {
     });
     const refused = screen.getAllByRole("article", { name: "refused component" });
     expect(refused.map((r) => r.textContent)).toEqual([
-      expect.stringContaining('Refused: "html_blob" is not on the allow-list'),
+      expect.stringContaining('Refused: "iframe_embed.8688ac89" is not on the allow-list'),
       expect.stringContaining('Refused: "iframe_embed" is not on the allow-list'),
     ]);
     const panel = screen.getByRole("region", { name: "Generative UI" });
@@ -109,7 +109,7 @@ describe("App", () => {
 
   it("a refusal's fold count is shown as text", async () => {
     const { store } = mount([]);
-    const raw = fixtureJson<Frame>("raw-offlist.generated.json");
+    const raw = fixtureJson<Frame>("raw-offlist.json");
     const folded: Frame = { ...raw, event: { ...(raw.event as object), more_refused: 7 } };
     await act(async () => {
       await store.controller.ambient(folded);
