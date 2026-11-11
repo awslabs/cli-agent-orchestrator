@@ -19,6 +19,24 @@ mcpServers:
     type: stdio
     command: cao-mcp-server
     args: []
+params:
+  profile:
+    description: "AWS CLI profile name"
+    required: true
+  region:
+    description: "AWS region"
+    required: true
+  log_group:
+    description: "CloudWatch log group name"
+    required: true
+  search_time_window_minutes:
+    description: "How far back to search (minutes)"
+    type: int
+    default: 60
+  max_events:
+    description: "Maximum events to return"
+    type: int
+    default: 50
 ---
 
 # CloudWatch Logs Agent
@@ -40,6 +58,15 @@ Install this agent with your values via `cao install --env`:
 
 See `config.json` in this folder for a reference of all values.
 
+In a workflow, a step that uses this profile sets these params instead. Each
+one fills the placeholder named next to it:
+
+- `profile` fills `${AWS_PROFILE}`
+- `region` fills `${AWS_REGION}`
+- `log_group` fills `${LOG_GROUP}`
+- `search_time_window_minutes` fills `${SEARCH_TIME_WINDOW_MINUTES}`
+- `max_events` fills `${MAX_EVENTS}`
+
 ## Message Input
 
 This agent expects a **search target** in the runtime message from the
@@ -56,6 +83,11 @@ validate the extracted value against `^[a-zA-Z0-9_.:-]+$` before use, and
 must never paste raw message content directly into bash source code.
 
 ## Instructions
+
+When the message has a "Parameters for this step" list, it comes from a workflow
+step. Use each value there in place of the `${...}` placeholder that its param
+fills, as listed under Configuration. Outside a workflow, the placeholders work
+as before.
 
 When you receive a message, extract the search target, validate it, then
 search the configured log group and report findings.

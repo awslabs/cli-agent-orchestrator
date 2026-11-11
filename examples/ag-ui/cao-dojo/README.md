@@ -76,8 +76,8 @@ pass it in the URL: `index.html?endpoint=http://127.0.0.1:9890`. The page accept
 | Transport | Request | Used for |
 |---|---|---|
 | Live (`EventSource`) | `GET /agui/v1/stream?since=<10 min ago>` | Fleet state and `CUSTOM` `cao.generative_ui` frames. `since` replays a card raised before the page opened. |
-| Run (`fetch`, SSE body) | `POST /agui/v1/run` with a `RunAgentInput` | Collects open approvals. Ends `RUN_FINISHED` with outcome `interrupt` (and the interrupts) or `success`. |
-| Run, resuming | same, plus `resume: [{interruptId, status: "resolved", payload: {approved: true \| false}}]` | Answers one approval. Ends `RUN_FINISHED` once CAO has delivered it: outcome `success` when nothing else is waiting, or `interrupt` listing the approvals still open. Ends `RUN_ERROR` for a resume CAO cannot process (for example a bad payload or a failed delivery). An entry for an interrupt CAO did not raise, or one that has expired, is skipped with a server-side warning and the run proceeds. It is listed in `RUN_FINISHED.result.skippedResume`, and the page shows that card as `skipped` ("answer not used — this prompt was no longer pending"), not approved or rejected. |
+| Run (`fetch`, SSE body) | `POST /agui/v1/run` with a `RunAgentInput` that declares `protocolVersion: "1.0"` | Collects open approvals. Ends `RUN_FINISHED` with outcome `interrupt` (and the interrupts) or `success`. |
+| Run, resuming | same, plus `resume: [{interruptId, status: "resolved", payload: {approved: true \| false}}, …]` | Answers the approvals of the last interrupted run. AG-UI 1.0 says the resume list MUST cover every interrupt of the run it continues, so when that run listed several, the page holds each decided card (`decided — waiting for your answer to N other prompt(s)`) and sends one resume once all of them have an answer. It never abandons a prompt for you: on CAO an abandoned entry is a deny. The resume goes on the interrupted run's `threadId`; a run that only collects starts a fresh thread, so it never continues past an interrupt it does not answer. Ends `RUN_FINISHED` once CAO has delivered it: outcome `success` when nothing else is waiting, or `interrupt` listing the approvals still open. Ends `RUN_ERROR` for a resume CAO cannot process (for example a bad payload or a failed delivery). An entry for an interrupt CAO did not raise, or one that has expired, is skipped with a server-side warning and the run proceeds. It is listed in `RUN_FINISHED.result.skippedResume`, and the page shows that card as `skipped` ("answer not used — this prompt was no longer pending"), not approved or rejected. |
 
 The run list can also show two results that are not AG-UI events, both raised by the
 page itself:
@@ -112,8 +112,12 @@ On either, or on `RUN_ERROR`, a card you just answered goes back to pending.
   reconnect replays it, a patch with a failing op changes nothing, a new connection
   clears the old server's state, a non-finite progress value is not shown, a
   transient stream error reads "reconnecting", and fleet snapshots and deltas still
-  apply after a reconnect while a re-sent record is dropped, and a run that lists a
-  card's answer in `result.skippedResume` leaves it skipped, not approved or rejected.
+  apply after a reconnect while a re-sent record is dropped, a run that lists a
+  card's answer in `result.skippedResume` leaves it skipped, not approved or rejected,
+  every run input declares `protocolVersion: "1.0"`, with two interrupts open one
+  resume covering both is sent only after both are decided, on the interrupted run's
+  thread, and a collecting run sent while a decision is held starts a fresh thread and
+  keeps only the decisions its new interrupt list still names.
   Run it alone with
   `node examples/ag-ui/cao-dojo/tools/e2e-local.mjs page`;
 

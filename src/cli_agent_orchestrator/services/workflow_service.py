@@ -57,7 +57,7 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     WorkflowRunResult,
 )
 from cli_agent_orchestrator.providers.base import OutputExtractionError
-from cli_agent_orchestrator.services import workflow_journal
+from cli_agent_orchestrator.services import step_params, workflow_journal
 from cli_agent_orchestrator.services.agent_step import (
     StepCancelledError,
     StepExecutionError,
@@ -92,6 +92,7 @@ from cli_agent_orchestrator.services.workflow_errors import (
     ReplayDivergenceError as ReplayDivergenceError,
 )
 from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -551,6 +552,37 @@ def _substitute(template: str, record: RunRecord) -> str:
     return _PLACEHOLDER_RE.sub(_resolve, template)
 
 
+def _build_step_prompt(
+    step: WorkflowStep, record: RunRecord, template: Optional[str] = None
+) -> str:
+    """Return the prompt the engine sends for ``step``: the ONE place it is built.
+
+    Every path that sends a step prompt goes through here: the normal run and its
+    retries (``_run_step``), the reprompt (which extends the prompt ``_run_step``
+    built), and ``replay_single_step``. ``template`` replaces ``step.prompt`` for a
+    replay's ``prompt_override``; the step's params still apply.
+
+    The prompt is ``_substitute(template)``, then, only when ``step.params`` is
+    non-empty, a blank line and a parameters block in declaration order::
+
+        <substituted prompt>
+
+        Parameters for this step:
+        - <key>: <value>
+
+    Param values are literal text: they get no ``{{...}}`` substitution, so a value
+    can never pull in an input or another step's output. With no params the prompt
+    is byte-identical to the one the engine sent before params existed.
+
+    Raises ``WorkflowEngineError`` from ``_substitute`` for an unresolvable reference.
+    """
+    prompt = _substitute(step.prompt if template is None else template, record)
+    if not step.params:
+        return prompt
+    lines = "\n".join(f"- {key}: {value}" for key, value in step.params.items())
+    return f"{prompt}\n\nParameters for this step:\n{lines}"
+
+
 def _reprompt_prompt(step: WorkflowStep, prompt: str) -> str:
     """A corrective prompt restating the schema and asking for a valid return (§3)."""
     return (
@@ -675,6 +707,11 @@ async def _collect_structured_output(
 ) -> StepState:
     """Collect the structured return for a COMPLETED step; reprompt once (§3).
 
+    ``prompt`` is the attempt's prompt exactly as ``_build_step_prompt`` built it
+    (substituted, params block included). The reprompt extends that text rather
+    than rebuilding it, so the corrective turn repeats the same instructions and
+    the same parameters.
+
     - No ``output_schema`` -> free-form, trivially ``COMPLETED``.
     - Validated record present -> ``COMPLETED`` (output copied onto the step state).
     - Missing OR invalid record, not yet reprompted -> spend the ONE reprompt on a
@@ -784,7 +821,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             provider=step.provider,
             agent_profile=step.agent,
         )
-        prompt = _substitute(step.prompt, record)  # §4 templating
+        prompt = _build_step_prompt(step, record)  # §4 templating, then the params block
         try:
             result = await run_agent_step(
                 provider=step.provider,
@@ -1170,7 +1207,9 @@ async def start_run(
     Raises ``ValueError`` (-> 400) on a bad run_id / invalid inputs, ``KeyError``
     (-> 409) if the run_id is already registered, actively driving, or journaled
     (a durable row must never be clobbered by a reused id), ``NotBuiltYetError``
-    (-> reserved seam) for a non-sequential mode, ``WorkflowEngineError`` (-> 500)
+    (-> reserved seam) for a non-sequential mode or a reserved step ``call``,
+    ``StepParamError`` (-> 422) when a step's params do not fit the params its
+    profile declares, ``WorkflowEngineError`` (-> 500)
     on an engine-internal invariant violation (e.g. a bad template reference).
     """
     # 1. Validate run_id via the shared key validator (B3-BR-1), then the
@@ -1187,6 +1226,12 @@ async def start_run(
     # sequential (B3-BR-6/B3-BR-10).
     if spec.mode != "sequential":
         _dispatch_reserved_mode(spec)
+    # Likewise a reserved step call type: refused before the RunRecord exists, so
+    # no journal row is written, rather than run as a handoff.
+    _refuse_reserved_calls(spec)
+    # Step params against the params each step's profile declares: refused here too,
+    # before any journal row. Off the loop, since it reads profile files.
+    await asyncio.to_thread(step_params.refuse_step_param_errors, spec)
 
     # 3. Build the RunRecord.
     record = RunRecord(
@@ -1514,7 +1559,7 @@ def update_run_generation(run_id: str, generation: str) -> None:
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
-    with sqlite3.connect(str(DATABASE_FILE)) as conn:
+    with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
         conn.execute(
             "UPDATE workflow_run SET generation = ? WHERE run_id = ?",
             (generation, run_id),
@@ -1568,6 +1613,24 @@ def _dispatch_reserved_mode(spec: WorkflowSpec) -> None:
     # Defensive: grammar restricts ``mode`` to the four literals, so any other
     # non-sequential value still fails loudly rather than running.
     raise NotBuiltYetError(f"workflow mode '{spec.mode}' is reserved (not built yet)")
+
+
+def _refuse_reserved_calls(spec: WorkflowSpec) -> None:
+    """Refuse a spec with a step whose ``call`` the engine does not run (B3-BR-10).
+
+    The engine runs every step as a handoff. ``assign`` and ``send_message``
+    validate as reserved constructs; running one is refused here, on every run path
+    and before any journal row is written, rather than silently run as a handoff.
+    The check is on the call value itself, not on ``is_reserved``: shipping a call
+    type means building its execution here first, not only flipping a unit flag.
+
+    Raises ``NotBuiltYetError`` (-> 501) naming the first such step.
+    """
+    for step in spec.steps:
+        if step.call is not None and step.call != "handoff":
+            raise NotBuiltYetError(
+                f"step '{step.id}' uses call '{step.call}', which is reserved (not built yet)"
+            )
 
 
 async def resume_from_last_completed(
@@ -1814,7 +1877,8 @@ async def replay_single_step(
 
     template = step.prompt if prompt_override is None else prompt_override
     try:
-        prompt = _substitute(template, record)
+        # The same builder the drive uses, so a replay sends the params block too.
+        prompt = _build_step_prompt(step, record, template)
     except WorkflowEngineError as e:
         # In a replay every unresolved reference is a PRECONDITION the caller can
         # act on — a predecessor never produced output, or an override names a step

@@ -47,6 +47,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import delete_terminals_by_session  # noqa: F401  # isort: skip  # fmt: skip
 from cli_agent_orchestrator.clients.database import (
     LAUNCH_TARGET_KINDS,
+    close_open_edges_for_terminal,
     count_runtime_allocated_terminals,
     create_inbox_message,
 )
@@ -62,12 +63,14 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.database import (
     get_idempotency_record,
+    get_kept_terminal,
     get_session_incarnation,
     get_terminal_metadata,
     list_pending_deferred_init_external_owner_terminal_ids,
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    mark_assign_edges_delivered,
     mark_terminal_identity_verified,
     terminal_id_in_use,
     update_last_active,
@@ -92,6 +95,7 @@ from cli_agent_orchestrator.constants import (
     TURN_START_CONFIRM_SECONDS,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.delegation import EdgeState
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import (
     KiroEngine,
@@ -268,9 +272,14 @@ _DEFERRED_INIT_SIDECAR_LOCK = threading.RLock()
 class IdempotencyKeyNotFound(Exception):
     """A ``lookup_only`` create found no live terminal for its idempotency key.
 
-    Review on PR #773. Surfaced as HTTP 404 by both create endpoints. Not a
-    ``ValueError`` for the same reason as ``IdempotencyKeyConflict`` below: the
-    endpoints already give ``ValueError`` other meanings.
+    Review on PR #773. Surfaced as HTTP 404 by both create endpoints. Since
+    issue #944 this also covers a key that IS in use but by a different request:
+    keys are scoped by request fingerprint (see ``_scoped_idempotency_key``), so
+    an unused key and a key held by someone else are the same empty slot and
+    answer the same 404. Not a ``ValueError``: ``create_session`` maps
+    ``ValueError`` to 400 and ``create_terminal_in_session`` maps it to 404, and
+    in ``create_session`` that arm sits FIRST, so a ``ValueError`` subclass would
+    be swallowed into a 400 before this exception's own arm could see it.
     """
 
 
@@ -281,29 +290,39 @@ class IdempotentCreateFailed(Exception):
     caller can tell "the create you are replaying failed, here is why" from an
     ordinary server error and report that cause instead of retrying. The failed
     create has already been rolled back; this allocates nothing.
+
+    ``terminal_id`` is set when that rollback kept the failed terminal's row
+    because its provider deferred cleanup (issue #943): the row is then the
+    only handle an operator has to find and delete it.
     """
 
+    def __init__(self, message: str, terminal_id: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.terminal_id = terminal_id
 
-class IdempotencyKeyConflict(Exception):
-    """An idempotency key was reused for a DIFFERENT request.
 
-    Review on PR #634, issue #616. Surfaced as HTTP 409 by both create
-    endpoints -- the same shape Stripe and AWS use
-    (``IdempotentParameterMismatch``) rather than silently serving the first
-    call's result to a caller who asked for something else.
+def _failed_replay_error(
+    terminal_id: str, idempotency_key: str, error: BaseException
+) -> IdempotentCreateFailed:
+    """Build the replay's error for a failed original, naming a retained row.
 
-    Subclasses ``Exception`` and NOT ``ValueError``, deliberately. Every
-    ``ValueError`` out of ``create_terminal`` is already spoken for by the
-    endpoints: ``create_session`` maps it to 400 and
-    ``create_terminal_in_session`` maps it to 404, and in ``create_session``
-    that arm sits FIRST -- so a ``ValueError`` subclass would be swallowed
-    into a 400 before any 409 arm could see it, and a later reorder could
-    silently re-break it. As a plain ``Exception`` the only ordering
-    requirement is that its arm precede the catch-all 500, which no reorder
-    of the ``ValueError``-family arms can violate. This also matches the
-    dominant convention in this repo (``WorktreeError(Exception)``,
-    ``ProviderError(Exception)``).
+    The waiter settles only after the original's rollback, so a row that still
+    exists here was kept on purpose (a deferred provider cleanup) and is
+    surfaced so it can be removed (issue #943).
     """
+    message = (
+        f"terminal {terminal_id!r} for idempotency_key "
+        f"{idempotency_key!r} failed to initialize: {error}"
+    )
+    try:
+        get_terminal(terminal_id)
+    except ValueError:
+        return IdempotentCreateFailed(message)
+    return IdempotentCreateFailed(
+        f"{message}; its terminal record was retained because provider cleanup was "
+        "deferred: delete it using this terminal_id",
+        terminal_id=terminal_id,
+    )
 
 
 class TerminalRecordCorruptError(Exception):
@@ -781,11 +800,137 @@ def _resolve_working_directory(working_directory: Optional[str]) -> str:
     )
 
 
+def _peer_terminal_ids_locked(session_name: str, terminal_id: str) -> Optional[List[str]]:
+    """Other live rows in ``terminal_id``'s session incarnation. CALLER HOLDS the lock.
+
+    A peer is any other terminal row registered under ``session_name`` in the
+    CURRENT incarnation (the one the caller has already proven ``terminal_id``
+    owns), except a retained deferred-init failure tombstone, whose runtime is
+    already gone. Rows of an older incarnation of the same name are not peers:
+    their backend session no longer exists. Returns None when the registry
+    cannot be read, which the caller must treat as "there may be peers".
+    """
+    try:
+        incarnation = get_session_incarnation(session_name)
+        rows = list_terminals_by_session(session_name)
+    except Exception:
+        logger.exception(f"Rollback: could not list the terminals of {session_name}")
+        return None
+    return [
+        str(row["id"])
+        for row in rows
+        if str(row["id"]) != terminal_id
+        and row.get("session_incarnation_id") == incarnation
+        and not row.get("deferred_init_failure")
+    ]
+
+
+def _roll_back_creator_window_keeping_peers_locked(
+    session_name: str, window_name: str, peers: Optional[List[str]]
+) -> None:
+    """Remove only the failed creator's window; the session stays for its peers.
+
+    CALLER HOLDS the lifecycle lock. The forwarded env stays with the session,
+    which still serves later windows. If the backend reports the session gone
+    after the window kill (tmux drops a session with its last window, e.g. when
+    the only peer's pane had already exited), the env is cleared then, so a
+    secret never outlives the session it was forwarded to.
+
+    That decision uses ``session_exists_strict``, never the lenient probe: the
+    lenient one turns a lookup error into "absent", which would drop a live
+    session's env and leave its workers' later windows without it. A lookup
+    that raises keeps the env. On tmux the strict check raises on a lookup
+    error; on herdr it is the lenient check (``backends/base.py`` default), so
+    there a failed ``workspace list`` still reads as absent. Best-effort, never
+    raises.
+    """
+    logger.warning(
+        "Rollback: session %s has other terminals (%s); removing only the failed "
+        "creator's window %s and keeping the session (#1277)",
+        session_name,
+        ", ".join(peers) if peers else "the registry could not be read",
+        window_name or "<unknown>",
+    )
+    if window_name:
+        try:
+            if not get_backend().kill_window(session_name, window_name):
+                logger.warning(
+                    f"Rollback: kill_window({session_name}:{window_name}) did not confirm "
+                    "the kill; the window may still be live"
+                )
+        except Exception:
+            logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
+    try:
+        session_gone = not get_backend().session_exists_strict(session_name)
+    except Exception:
+        logger.exception(
+            f"Rollback: could not check whether {session_name} still exists; "
+            "keeping its forwarded env"
+        )
+        return
+    if session_gone:
+        try:
+            clear_session_env(session_name)
+        except Exception:
+            logger.exception(f"Rollback: failed to clear session env for {session_name}")
+
+
+def _session_known_gone_locked(session_name: str, kill_confirmed: bool) -> bool:
+    """After a creator's ``kill_session``: is the session known to be gone?
+
+    True for a confirmed kill, or when ``session_exists_strict`` finds it absent
+    (a kill that reported False because the session was reaped in between). A
+    lookup that raises answers False: an unknown session may still hold a live
+    peer. CALLER HOLDS the lock. Never raises.
+    """
+    if kill_confirmed:
+        return True
+    try:
+        return not get_backend().session_exists_strict(session_name)
+    except Exception:
+        logger.exception(
+            f"Rollback: could not confirm {session_name} is gone; leaving its rows alone"
+        )
+        return False
+
+
+def _delete_rows_killed_with_session_locked(session_name: str, terminal_id: str) -> None:
+    """Record the rows a creator's ``kill_session`` took with it. CALLER HOLDS the lock.
+
+    The creator's rollback kills the whole session only after
+    ``_peer_terminal_ids_locked`` found no other row in it, so normally there is
+    nothing here. A row that is here anyway joined after that check without this
+    process's lifecycle lock (the cross-process gap documented on
+    ``list_terminals_by_session``), and its pane is now gone with the session.
+    Delete it with ``end_reason="creator_rollback"`` so its launch record names
+    the cause, instead of leaving it for herdr's ``workspace.closed`` to stamp
+    ``pane_closed`` or a sweep to stamp ``stale_cleanup``. The failed creator's
+    own row is left to the caller, which deletes it as ``launch_failed``.
+    The caller runs this only once the session is known to be gone (a confirmed
+    kill, or a strict lookup that finds it absent): with the kill unconfirmed
+    the peer may still be alive, and deleting its row would orphan it from CAO.
+    Best-effort, never raises.
+    """
+    peers = _peer_terminal_ids_locked(session_name, terminal_id)
+    for peer_id in peers or ():
+        logger.warning(
+            "Rollback: terminal %s joined %s after the peer check and was killed with "
+            "the session; recording end_reason=creator_rollback",
+            peer_id,
+            session_name,
+        )
+        try:
+            db_delete_terminal(peer_id, end_reason="creator_rollback")
+        except Exception:
+            logger.exception(f"Rollback: failed to delete killed peer row {peer_id}")
+
+
 def _roll_back_backend_create_locked(
     session_name: str,
     window_name: str,
     *,
     created_session: bool,
+    terminal_id: Optional[str] = None,
 ) -> None:
     """Undo the backend resource a create just made. CALLER MUST HOLD the
     lifecycle lock for ``session_name``.
@@ -797,7 +942,15 @@ def _roll_back_backend_create_locked(
 
     * ``created_session=True`` -- this call created the whole session, so kill the
       session and drop any forwarded env stashed for the name, so secrets don't
-      linger in memory or bleed into a future reuse of the name.
+      linger in memory or bleed into a future reuse of the name. EXCEPT when
+      other terminals have joined the session since (#1277): a supervisor's pane
+      is live during its own provider init and can ``assign`` workers into its
+      session, so when ``terminal_id`` (the failed creator's committed row) is
+      given and other rows share its incarnation, only the creator's window goes
+      (``_roll_back_creator_window_keeping_peers_locked``), for the same reason as
+      the window arm below. Killing the session there destroyed working peers.
+      With no ``terminal_id`` (the in-closure rollback, before the row exists, in
+      the same locked section that created the session) there can be no peers.
     * ``created_session=False`` -- this call only added a WINDOW to a session that
       already existed (``new_session=False``: every MCP spawn/assign-into-an-
       existing-session call). Kill ONLY that window, so the pre-existing session
@@ -815,6 +968,13 @@ def _roll_back_backend_create_locked(
     Best-effort and never raises: it runs while an exception is already in
     flight, and that original failure is the one the caller must see.
     """
+    if created_session and terminal_id is not None:
+        peers = _peer_terminal_ids_locked(session_name, terminal_id)
+        if peers is None or peers:
+            # An unreadable registry counts as "there may be peers": killing
+            # live work is the irreversible mistake, an empty session is not.
+            _roll_back_creator_window_keeping_peers_locked(session_name, window_name, peers)
+            return
     if created_session:
         # `finally`, not a following statement: the env mapping must be dropped
         # however the kill turns out -- including when it raises a BaseException
@@ -824,8 +984,10 @@ def _roll_back_backend_create_locked(
         # keyed to a session name that is gone and may later be reused.
         # `finally` still lets a BaseException propagate, which is what we want:
         # a Ctrl-C must not be swallowed here.
+        kill_confirmed = False
         try:
-            if not get_backend().kill_session(session_name):
+            kill_confirmed = bool(get_backend().kill_session(session_name))
+            if not kill_confirmed:
                 # Falsy means the backend could not confirm the kill (or found
                 # nothing to kill). Either way the name may still be live, so say
                 # so -- a silent branch here is how an orphan goes unnoticed.
@@ -840,6 +1002,8 @@ def _roll_back_backend_create_locked(
                 clear_session_env(session_name)
             except Exception:
                 logger.exception(f"Rollback: failed to clear session env for {session_name}")
+        if terminal_id is not None and _session_known_gone_locked(session_name, kill_confirmed):
+            _delete_rows_killed_with_session_locked(session_name, terminal_id)
     else:
         try:
             if not get_backend().kill_window(session_name, window_name):
@@ -912,7 +1076,10 @@ def _roll_back_cancelled_create(
     with session_lifecycle_lock(session_name):
         if _still_owns_incarnation(session_name, terminal_id):
             _roll_back_backend_create_locked(
-                session_name, window_name, created_session=created_session
+                session_name,
+                window_name,
+                created_session=created_session,
+                terminal_id=terminal_id,
             )
         try:
             db_delete_terminal(terminal_id, end_reason="launch_failed")
@@ -954,7 +1121,10 @@ def _roll_back_backend_create_if_still_ours(
         if not _still_owns_incarnation(session_name, terminal_id):
             return
         _roll_back_backend_create_locked(
-            session_name, window_name or "", created_session=created_session
+            session_name,
+            window_name or "",
+            created_session=created_session,
+            terminal_id=terminal_id,
         )
 
 
@@ -1009,7 +1179,10 @@ def _roll_back_failed_create(
        (``new_session=False``, every MCP spawn/assign-into-existing-session
        call) has no session-level teardown to fall back on, and without it a
        provider init timeout rolled back the row and stopped the reader but
-       left the pane running, invisible to list/tree, forever.
+       left the pane running, invisible to list/tree, forever. The session arm
+       kills the session only when no other terminal has joined it (#1277);
+       otherwise it removes just this terminal's window, so workers a
+       supervisor assigned during its own init keep running.
     3. Provider -- AFTER the process-owning session/window is stopped, because
        a provider releasing private on-disk state must not race a process
        still writing it (Grok's updater can still be writing ``$GROK_HOME``
@@ -1187,12 +1360,13 @@ def _request_fingerprint(
     had before the fields existed. Both are hashed because each decides the
     created terminal's recorded ceiling, i.e. a privilege, exactly as
     ``allowed_tools`` does: two keyed creates that differ only in the bounding
-    terminal must collide (409), not resolve to the first one's terminal.
+    terminal must not resolve to the first one's terminal.
 
-    Review on PR #634, issue #616. Stored alongside the key so a later call
-    presenting the same key can be told apart: same fingerprint is a RETRY
-    (return the existing terminal), different fingerprint is a COLLISION
-    (raise ``IdempotencyKeyConflict``).
+    Review on PR #634, issue #616. A later call presenting the same key is a
+    RETRY only if its fingerprint matches. Since issue #944 the fingerprint is
+    part of the stored key itself (``_scoped_idempotency_key``), so a call with
+    the same key but a different fingerprint never sees the first call's
+    mapping at all: it lands in its own, empty slot.
 
     REQUESTED values, not resolved ones, and that is load-bearing. The key
     check runs before ``create_terminal`` resolves the working directory,
@@ -1202,14 +1376,15 @@ def _request_fingerprint(
     requested-vs-requested is the comparison that matches, and fingerprinting
     resolved values would spuriously conflict a legitimate retry issued from
     a different process cwd (whose ``working_directory=None`` resolves
-    differently) -- a false 409 on the exact case this feature serves.
+    differently) -- a lost replay (a second worker) on the exact case this
+    feature serves.
 
     ``caller_id`` is one of the fields, which is what makes a CROSS-CALLER
     collision a mismatch rather than a silent hand-off of someone else's
-    worker: two supervisors reusing ``job-1`` fingerprint differently and the
-    second gets a loud 409. It is deliberately NOT additionally scoped in the
-    primary key -- see the accepted residuals in ``create_terminal``'s
-    docstring for the one case this cannot separate.
+    worker: two supervisors reusing ``job-1`` fingerprint differently, so each
+    gets its own terminal under its own scoped key (issue #944). See the
+    accepted residuals in ``create_terminal``'s docstring for the one case this
+    cannot separate.
 
     ``env_vars`` and ``resume_session_id`` are hashed for the same reason, and
     ``env_vars`` has the sharpest precedent of any field here: ``RunStepRequest``
@@ -1273,7 +1448,7 @@ def _request_fingerprint(
       parameter accepts the enum OR a plain string -- ``api/main.py`` forwards
       a query string while ``parse_kiro_engine`` returns the member, and the
       same logical request arriving by those two routes must produce ONE digest
-      or a legitimate retry 409s. The ``kas`` alias canonicalises to ``v3`` for
+      or a legitimate retry misses its replay. The ``kas`` alias canonicalises to ``v3`` for
       the same reason: a retry spelled ``kas`` and one spelled ``v3`` are one
       request (#1167).
 
@@ -1333,8 +1508,9 @@ def _request_fingerprint(
     # scheduling. Unhashed, seeding a key for task A and retrying the otherwise
     # identical request with task B handed back A's terminal and discarded B
     # entirely: no conflict, no delivery, no log line. Hashed, that second call
-    # is a 409, which is what both the endpoint's "exact request" contract and
-    # the CLI's own help text already promise.
+    # is a different request with its own terminal (issue #944), which is what
+    # both the endpoint's "exact request" contract and the CLI's own help text
+    # already promise: a key replays only the exact request that claimed it.
     #
     # The orchestration type rides along because it selects HOW the message is
     # delivered, so the same text under a different type is a different
@@ -1345,7 +1521,7 @@ def _request_fingerprint(
     # AFTER creation by `_send_direct_input_handoff`/`_run_step_and_build_result`
     # rather than passed here -- `initial_message` is None on both attempts, so
     # a handoff retry still reuses its worker. That asymmetry is the honest one:
-    # these endpoints own delivery and can therefore conflict on it; the handoff
+    # these endpoints own delivery and can therefore distinguish on it; the handoff
     # path does not, and deduplicating ITS submission needs the durable run
     # record tracked separately (#715), not this fingerprint.
     if initial_message_orchestration_type is None:
@@ -1383,6 +1559,24 @@ def _request_fingerprint(
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
+
+
+def _scoped_idempotency_key(idempotency_key: str, request_fingerprint: str) -> str:
+    """Return the storage key for ``idempotency_key`` under ``request_fingerprint``.
+
+    Issue #944. The caller's key alone used to be the stored key, and a create
+    whose fingerprint differed from the stored one was refused with 409 while an
+    unused key answered 404 (``lookup_only``) or 201 (keyed create). The
+    difference told any WRITE-scoped caller whether some other request had
+    claimed a key, without allocating anything. Scoping the stored key by the
+    fingerprint removes the signal at its source: a mismatched request finds no
+    mapping, exactly as for an unused key. A keyed create then creates its own
+    terminal (idempotent for its own retries), and a ``lookup_only`` answers 404.
+
+    The fingerprint is a fixed-width sha256 hexdigest and comes FIRST, so the
+    caller-controlled key cannot forge the boundary between the two parts.
+    """
+    return f"{request_fingerprint}:{idempotency_key}"
 
 
 # A single 32-bit draw is already unlikely to repeat; ten fresh draws after a
@@ -1464,8 +1658,8 @@ def _helper_v3_refusal(error: KiroV3Refusal) -> KiroV3Refusal:
 def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
     """The probe's version or missing-flag refusal with the helper's remedy, same kind.
 
-    It stays a capability error (a 400 with a plain-string detail); any other
-    probe failure, which suggests no engine, is returned as it is.
+    Other probe messages stay intact here. The launch path wraps only the final
+    helper failure as a structured, archived policy refusal after model fallback.
     """
     if error.kind == KiroV3UnsupportedVersionError.code:
         message = str(KiroV3UnsupportedVersionError(error.version, remedy=_HELPER_SUPPORTED_CLI))
@@ -1483,18 +1677,6 @@ def _helper_capability_error(error: KiroCapabilityError) -> KiroCapabilityError:
     return KiroCapabilityError(
         error.kind, error.engine, message, capability=error.capability, version=error.version
     )
-
-
-def _helper_probe(probe: Callable[..., KiroCapabilities]) -> Callable[..., KiroCapabilities]:
-    """``probe``, whose refusals carry the helper's remedy."""
-
-    def run(*args: Any, **kwargs: Any) -> KiroCapabilities:
-        try:
-            return probe(*args, **kwargs)
-        except KiroCapabilityError as exc:
-            raise _helper_capability_error(exc) from exc
-
-    return run
 
 
 def _helper_engine(
@@ -1777,7 +1959,10 @@ async def create_terminal(
             no live terminal. The same fingerprint check as any other replay
             applies, so this is not a fingerprint-blind lookup. The returned
             terminal may still be initializing: it is an identity for
-            inspection and cleanup, not permission to send input.
+            inspection and cleanup, not permission to send input. A key that
+            is unused and a key claimed by a DIFFERENT request both raise
+            ``IdempotencyKeyNotFound`` (issue #944), so a lookup cannot tell
+            whether someone else is using a key.
         idempotency_key: Review on PR #634, issue #616. When given and a PRIOR
             call already created a terminal for the SAME KEY **and the same
             request**, that terminal is returned as-is and nothing else in
@@ -1792,12 +1977,15 @@ async def create_terminal(
 
             The key does NOT identify the request on its own -- it is matched
             together with a fingerprint of ELEVEN fields (see
-            ``_request_fingerprint``). Presenting a key that a DIFFERENT
-            request already claimed raises ``IdempotencyKeyConflict``
-            (HTTP 409) rather than handing back a terminal that answers
-            someone else's question. A key whose terminal no longer exists is
-            treated as stale and simply creates fresh -- that is not a
-            conflict.
+            ``_request_fingerprint``), and the pair is the stored key (see
+            ``_scoped_idempotency_key``, issue #944). Presenting a key that a
+            DIFFERENT request already claimed therefore creates a fresh
+            terminal for THIS request, idempotent for its own retries, rather
+            than handing back a terminal that answers someone else's question.
+            It is deliberately not refused: a 409 there, against a 201 or 404
+            for an unused key, told a caller whether the key was in use. A key
+            whose terminal no longer exists is treated as stale and simply
+            creates fresh.
 
             THE FIELD SET IS CLOSED BY ENUMERATION, not by however many review
             rounds happened to run. Every caller-reachable parameter of BOTH
@@ -1882,30 +2070,15 @@ async def create_terminal(
             A first call carrying an invalid engine raises before any terminal
             or key row is written, so a key hit implies the STORED engine was
             valid -- and any later differing engine now mismatches the
-            fingerprint and is refused.
+            fingerprint, misses the replay, and reaches the validator itself.
 
-            ACCEPTED MISATTRIBUTION, recorded rather than left silent. Two
-            cases, only one of which is this change's:
-
-            - USED key + invalid engine: was 200 (the bypass above), now 409
-              "this key was already used for a different request". So the
-              operator is told to change their KEY when their ENGINE is what
-              is wrong. Accepted rather than fixed, because reaching the real
-              validator means loading the agent profile and running the Kiro
-              capability probe -- a ``subprocess.run`` -- which is exactly the
-              work this short-circuit exists to skip; paying it on every retry
-              would trade away the property the feature is FOR in exchange for
-              a better message. The request is refused either way; only the
-              stated reason is imprecise.
-            - FRESH key + invalid engine: 404 on
-              ``POST /sessions/{name}/terminals`` (400 on ``POST /sessions``),
-              because the validator raises a BARE ``ValueError`` -- not a
-              ``KiroCapabilityError`` -- so it falls past that route's 400 arm
-              to its generic "not found" arm. That is PRE-EXISTING, is
-              unchanged by this change, and is deliberately not fixed here --
-              correcting it means reworking error mapping this change does not
-              own. Noted only so the 409 above is not mistaken for a
-              regression from a 400 that never existed.
+            A USED key + invalid engine is therefore rejected exactly as a
+            FRESH key + invalid engine is: 404 on
+            ``POST /sessions/{name}/terminals`` (400 on ``POST /sessions``),
+            because the validator raises a BARE ``ValueError`` -- not a
+            ``KiroCapabilityError`` -- so it falls past that route's 400 arm to
+            its generic "not found" arm. That mapping is PRE-EXISTING and
+            deliberately not fixed here.
 
             This resolves an apparent tension with the commit directly beneath
             this one, which stopped ``engine`` being forwarded to a non-Kiro
@@ -1955,8 +2128,8 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
-        IdempotencyKeyConflict: If ``idempotency_key`` was already used for a
-            different request (surfaced as HTTP 409 by both create endpoints)
+        IdempotencyKeyNotFound: If ``lookup_only`` and no terminal is
+            recorded for this key AND this request (HTTP 404)
         TerminalRecordCorruptError: If the terminal a key maps to has a stored
             row that does not satisfy the ``Terminal`` model (HTTP 500)
         TerminalLimitError: If the node's tracked-terminal cap (CAO_MAX_TERMINALS /
@@ -2051,6 +2224,7 @@ async def _create_terminal_unguarded(
 
     description = normalize_description(description, truncate=True)
     request_fingerprint: Optional[str] = None
+    storage_key: Optional[str] = None
     if idempotency_key:
         request_fingerprint = _request_fingerprint(
             provider,
@@ -2071,7 +2245,11 @@ async def _create_terminal_unguarded(
             caller_ceiling=caller_ceiling,
             delegating_terminal_id=delegating_terminal_id,
         )
-        existing_record = get_idempotency_record(idempotency_key)
+        # Issue #944: look up, store and delete under the fingerprint-scoped
+        # key, never the bare one. A different request under the same key
+        # finds nothing here, the same as a key nobody has used.
+        storage_key = _scoped_idempotency_key(idempotency_key, request_fingerprint)
+        existing_record = get_idempotency_record(storage_key)
         existing_terminal_id = existing_record.terminal_id if existing_record else None
         if existing_terminal_id is not None:
             # Only the LOOKUP is guarded. `Terminal(**row)` is deliberately
@@ -2097,9 +2275,8 @@ async def _create_terminal_unguarded(
                 if waiter is not None and not lookup_only:
                     await waiter.settled.wait()
                     if waiter.error is not None:
-                        raise IdempotentCreateFailed(
-                            f"terminal {existing_terminal_id!r} for idempotency_key "
-                            f"{idempotency_key!r} failed to initialize: {waiter.error}"
+                        raise _failed_replay_error(
+                            existing_terminal_id, idempotency_key, waiter.error
                         ) from waiter.error
                 # The key's mapping outlived the terminal it pointed to (e.g.
                 # a completed-and-torn-down handoff, retried long after the
@@ -2117,7 +2294,7 @@ async def _create_terminal_unguarded(
                 # if a concurrent caller already replaced the mapping, this
                 # deletes nothing and this attempt's own insert below is the
                 # one that raises IntegrityError instead.
-                delete_idempotency_key(idempotency_key, existing_terminal_id)
+                delete_idempotency_key(storage_key, existing_terminal_id)
                 logger.info(
                     "idempotency_key %r maps to terminal %r, which no longer exists; "
                     "creating a new terminal",
@@ -2125,30 +2302,12 @@ async def _create_terminal_unguarded(
                     existing_terminal_id,
                 )
             else:
-                # Reached ONLY once the mapped terminal is confirmed to still
-                # exist, and that ordering is the whole point: the stale-key
-                # branch above already fell through, so a key whose terminal is
-                # gone is never compared and never conflicts. Checking the
-                # fingerprint first would 409 the legitimate case this feature
-                # was built for -- an operator reusing a key from a job that
-                # already finished.
-                if existing_record is not None and (
-                    existing_record.request_fingerprint != request_fingerprint
-                ):
-                    # A different request under the same key is operator error,
-                    # not a retry, and returning the stored terminal here is not
-                    # a merely-wrong return value: _handoff_impl feeds it
-                    # straight into reuse_terminal_id, so this caller's prompt
-                    # would be delivered into the OTHER caller's running worker,
-                    # in that worker's session, under its tool restrictions --
-                    # and this caller's teardown would then delete it.
-                    raise IdempotencyKeyConflict(
-                        f"idempotency_key {idempotency_key!r} was already used for a "
-                        "different request; use a distinct key"
-                    )
+                # The mapped terminal still exists. No fingerprint comparison is
+                # needed: the storage key already includes the fingerprint, so
+                # only this same request can have produced this mapping.
                 # A genuine retry: same key, same request. Return the terminal
                 # the first call produced without doing any real work -- the
-                # property haofeif signed off on, unchanged by the check above.
+                # property haofeif signed off on.
                 #
                 # If that first call is a synchronous create still inside
                 # provider.initialize(), wait for it first: the replay must
@@ -2163,9 +2322,8 @@ async def _create_terminal_unguarded(
                 if waiter is not None and not lookup_only:
                     await waiter.settled.wait()
                     if waiter.error is not None:
-                        raise IdempotentCreateFailed(
-                            f"terminal {existing_terminal_id!r} for idempotency_key "
-                            f"{idempotency_key!r} failed to initialize: {waiter.error}"
+                        raise _failed_replay_error(
+                            existing_terminal_id, idempotency_key, waiter.error
                         ) from waiter.error
                     row = get_terminal(existing_terminal_id)
                 try:
@@ -2348,34 +2506,43 @@ async def _create_terminal_unguarded(
                     _helper_stage_a, agent_profile, caller_id, env_vars
                 )
                 kiro_helper = (resolved_cli, global_home)
-                probe = _helper_probe(
-                    functools.partial(
-                        probe,
-                        executable=resolved_cli.path,
-                        env=kiro_launch_home.kiro_env(kiro_probe_home),
-                    )
+                probe = functools.partial(
+                    probe,
+                    executable=resolved_cli.path,
+                    env=kiro_launch_home.kiro_env(kiro_probe_home),
                 )
             try:
-                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
-            except KiroCapabilityError:
-                # A routed launch is refused, never relaunched on the profile's model, which
-                # is the fallback provider's (#1099).
-                if (
-                    model
-                    or launch_plan is None
-                    or launch_plan.model is None
-                    or launch_plan.provider is not None
-                ):
+                try:
+                    capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
+                except KiroCapabilityError:
+                    # A routed launch is refused, never relaunched on the profile's model, which
+                    # is the fallback provider's (#1099).
+                    if (
+                        model
+                        or launch_plan is None
+                        or launch_plan.model is None
+                        or launch_plan.provider is not None
+                    ):
+                        raise
+                    launch_model = resolve_launch_model(model, profile)
+                    requested = requested_kiro_capabilities(
+                        resolved_engine, model=launch_model, yolo=True, effort=launch_effort
+                    )
+                    capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
+                    decision_not_honored = True
+                    model_honored = ProviderManager.provider_class(provider).honors_model(
+                        agent_profile=agent_profile, profile=profile, requested_model=launch_model
+                    )
+            except KiroCapabilityError as exc:
+                if not helper:
                     raise
-                launch_model = resolve_launch_model(model, profile)
-                requested = requested_kiro_capabilities(
-                    resolved_engine, model=launch_model, yolo=True, effort=launch_effort
-                )
-                capabilities = await asyncio.to_thread(probe, resolved_engine, requested)
-                decision_not_honored = True
-                model_honored = ProviderManager.provider_class(provider).honors_model(
-                    agent_profile=agent_profile, profile=profile, requested_model=launch_model
-                )
+                error = _helper_capability_error(exc)
+                # Convert once, after #1099's decided-model fallback. Keep the
+                # rule in its field and remove its duplicate from the detail.
+                detail = str(error).removeprefix(f"{error.kind}: ")
+                raise _ephemeral_kiro_refusal(
+                    agent_profile, caller_id, KiroLaunchRefusal(error.kind, detail)
+                ) from None
             if resolved_engine == KiroEngine.V3:
                 # #1167: the probed version must be allow-listed and verified
                 # (or pending, with the operator's opt-in), and the policy
@@ -3014,7 +3181,7 @@ async def _create_terminal_unguarded(
                             defer_init and deferred_delete_on_failure is False
                         ),
                         session_incarnation_id=session_incarnation_id,
-                        idempotency_key=idempotency_key,
+                        idempotency_key=storage_key,
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
                         delegate_tools=delegate_tools,
@@ -3132,10 +3299,18 @@ async def _create_terminal_unguarded(
             if provider == ProviderType.CLAUDE_CODE.value and not resume_session_id
             else None
         )
-        # Only a Kiro helper passes its launch, so every other call is unchanged.
+        # Only a Kiro helper passes its launch, and only a Claude Code helper the
+        # ephemeral flag, so every other call is unchanged. The flag is the bind
+        # above, the fact that marks this terminal ephemeral, never the profile
+        # text, and it keys on the provider that actually runs.
         provider_launch_options: dict[str, Any] = (
             {"kiro_launch": kiro_launch} if kiro_launch is not None else {}
         )
+        if (
+            provider == ProviderType.CLAUDE_CODE.value
+            and ephemeral_state.bound_terminal_id == terminal_id
+        ):
+            provider_launch_options["ephemeral"] = True
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,
@@ -3312,8 +3487,6 @@ async def _create_terminal_unguarded(
         return terminal
 
     except Exception as e:
-        if sync_init_waiter is not None:
-            sync_init_waiter.settle(e)
         # A delegation-ceiling refusal (#948, Steps 0c/0d) is raised before
         # anything is allocated: the launch was refused, not attempted.
         _bind_decision_launch(
@@ -3332,15 +3505,22 @@ async def _create_terminal_unguarded(
         # backend rollback was its own ``await`` inside this handler, so a
         # cancellation landing there unwound the handler with the row,
         # provider registration and worktree still in place.
-        await _await_uncancellable(
-            _roll_back_failed_create,
-            terminal_id,
-            session_name,
-            rollback_window_name,
-            session_created=session_created,
-            window_created=window_created,
-            worktree_repo_root=worktree_repo_root,
-        )
+        #
+        # The waiter settles only once the rollback is done (issue #943), so a
+        # replay that wakes on the failure sees whether the row was retained.
+        try:
+            await _await_uncancellable(
+                _roll_back_failed_create,
+                terminal_id,
+                session_name,
+                rollback_window_name,
+                session_created=session_created,
+                window_created=window_created,
+                worktree_repo_root=worktree_repo_root,
+            )
+        finally:
+            if sync_init_waiter is not None:
+                sync_init_waiter.settle(e)
         raise
     finally:
         # Every exit, including cancellation, settles the waiter so no replay
@@ -3466,6 +3646,13 @@ def _notify_caller_of_deferred_failure(
             "Deferred-init failure for %s has no caller_id to notify; failure is " "log-only.",
             terminal_id,
         )
+
+    # The caller has just been told the worker failed. Close its edges here so
+    # neither a forward nor a second worker-ended notice follows.
+    try:
+        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        logger.warning("Deferred-init failure: could not close edges for %s: %s", terminal_id, exc)
 
     ephemeral_service.release(terminal_id, "launch_failed")
     if delete_worker:
@@ -4185,6 +4372,20 @@ async def recover_interrupted_initial_deliveries() -> bool:
             )
             if not settled:
                 continue
+            # The task will never be delivered, so its assign edges would never
+            # be armed: never swept, and holding the caller's own forward back
+            # as nested work for good. Each is closed with a notice queued for
+            # its caller, which the inbox reconciliation sweep delivers.
+            try:
+                from cli_agent_orchestrator.services import delegation_callback_service
+
+                await asyncio.to_thread(
+                    delegation_callback_service.handle_task_never_delivered, terminal_id
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort, like the notice paths
+                logger.warning(
+                    "Could not close delegation edges of interrupted %s: %s", terminal_id, exc
+                )
             metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
             if not metadata:
                 continue
@@ -5261,6 +5462,10 @@ def _schedule_deferred_init(
                 # in-memory mask lifts in ``finally`` so a client that reads
                 # delivered never sees an unmasked status first (#566).
                 await asyncio.to_thread(_persist_initial_delivery, terminal_id, "delivered")
+                # The task is in the worker now, so its waiting callers may be
+                # owed a forward once it goes idle. Before this point an idle
+                # worker has not seen the task and must not trigger one.
+                await asyncio.to_thread(mark_assign_edges_delivered, terminal_id)
             await _clear_deferred_init_external_owner(terminal_id)
         except ProviderExitedInputBlockedError as e:
             # Caught BEFORE the TerminalInputBlockedError branch below, whose
@@ -5626,6 +5831,14 @@ def get_terminal(terminal_id: str) -> Dict:
             else:
                 status = reported_status(terminal_id, observed_status).value
 
+        # #1225: a kept child (terminal.keep_finished) shows when its window ends.
+        # Best-effort: an unreadable keep mark must not fail a status read.
+        try:
+            kept = get_kept_terminal(terminal_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("get_terminal: keep mark of %s unreadable: %s", terminal_id, exc)
+            kept = None
+
         return {
             "id": metadata["id"],
             "name": metadata["tmux_window"],
@@ -5649,6 +5862,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "status": status,
             "status_generation": status_generation,
             "output_generation": output_generation,
+            "kept": kept is not None,
+            "kept_until": kept["kept_until"] if kept is not None else None,
             "last_active": metadata["last_active"],
         }
 
@@ -6837,6 +7052,15 @@ def delete_terminal_row(
         # DB row was already deleted by another lifecycle owner.
         _delete_deferred_failure_fallback(terminal_id)
         _delete_deferred_init_complete_fallback(terminal_id)
+    # Close every delegation edge still open on this terminal, without a
+    # notice. ``delete_terminal`` has already told waiting callers; session
+    # teardown, retention cleanup and the stale-row purge come straight here,
+    # and an edge they left open would stay armed with no terminal behind it,
+    # re-evaluated by every sweep. Runs even when another owner deleted the row.
+    try:
+        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+    except Exception as exc:  # noqa: BLE001 - best-effort; the row is already gone
+        logger.warning("Could not close delegation edges of %s: %s", terminal_id, exc)
     if deleted:
         ephemeral_service.release(terminal_id, "terminal_gone")
     logger.info(f"Deleted terminal: {terminal_id}")
@@ -6866,6 +7090,14 @@ def delete_terminal(
     ``dismantle_terminal_runtime``), leaving the row in place for a retry.
     ``end_reason`` is passed through to ``delete_terminal_row``.
     """
+    # Tell any caller waiting on this worker before teardown starts. Imported
+    # here because delegation_callback_service imports this module.
+    try:
+        from cli_agent_orchestrator.services import delegation_callback_service
+
+        delegation_callback_service.handle_worker_ended(terminal_id, "was deleted", registry)
+    except Exception as exc:  # noqa: BLE001 - deletion must proceed
+        logger.warning("delete_terminal: delegation notice failed for %s: %s", terminal_id, exc)
     try:
         metadata = capture_terminal_snapshot(terminal_id)
         if not dismantle_terminal_runtime(terminal_id, metadata):

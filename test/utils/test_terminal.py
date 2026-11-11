@@ -1,5 +1,6 @@
 """Tests for terminal utilities."""
 
+import itertools
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -188,6 +189,23 @@ class TestWaitForShell:
 
         assert result is False
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wait_for_shell_ignores_wall_clock_jumps(self, mock_monitor):
+        """The wait is measured on the monotonic clock, so a wall-clock step (NTP
+        adjustment, VM resume) must not end it early."""
+        mock_monitor.get_buffer.return_value = "prompt $"
+        wall = itertools.count(0, 3600)  # every wall-clock read jumps an hour ahead
+
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(wall)
+        ):
+            result = await wait_for_shell(
+                "test-terminal", timeout=2.0, stable_duration=0.3, polling_interval=0.1
+            )
+
+        assert result is True
+
 
 class TestWaitForShellEventInbox:
     """wait_for_shell on event-inbox backends (herdr) must read backend history,
@@ -314,6 +332,27 @@ class TestWaitUntilStatus:
         result = await wait_until_status(
             "test-terminal", TerminalStatus.IDLE, timeout=2.0, polling_interval=0.1
         )
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wait_until_status_ignores_wall_clock_jumps(self, mock_monitor):
+        """The wait is measured on the monotonic clock, so a wall-clock step (NTP
+        adjustment, VM resume) must not end it early."""
+        mock_monitor.get_status.side_effect = [
+            TerminalStatus.PROCESSING,
+            TerminalStatus.PROCESSING,
+            TerminalStatus.IDLE,
+        ]
+        wall = itertools.count(0, 3600)  # every wall-clock read jumps an hour ahead
+
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(wall)
+        ):
+            result = await wait_until_status(
+                "test-terminal", TerminalStatus.IDLE, timeout=2.0, polling_interval=0.05
+            )
 
         assert result is True
 

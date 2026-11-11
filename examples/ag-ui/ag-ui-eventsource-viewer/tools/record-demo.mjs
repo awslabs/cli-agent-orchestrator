@@ -127,7 +127,7 @@ async function proveReconnectNoGap(base, emit) {
   };
 
   let dl = Date.now() + 8000;
-  while (Date.now() < dl && !buf1.includes("STATE_SNAPSHOT")) {
+  while (Date.now() < dl && !buf1.includes('"type":"STATE_SNAPSHOT"')) {
     if (!(await readMore1())) break;
   }
 

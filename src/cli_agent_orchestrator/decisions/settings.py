@@ -6,13 +6,15 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from cli_agent_orchestrator.decisions.types import POINTS, PointState
+from cli_agent_orchestrator.decisions.catalog import MatchCatalog, load_catalog
+from cli_agent_orchestrator.decisions.types import POINTS, ROUTE_POINTS, SWITCHES, PointState
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.model_tiers import TIERS, load_model_tiers, valid_model
 
 logger = logging.getLogger(__name__)
-STATE_ENV = {point: "CAO_DECISION_" + point.upper().replace(".", "_") for point in POINTS}
+# #1199: keyed by switch, not by point: the four task.* points share the task.features switch.
+STATE_ENV = {point: "CAO_DECISION_" + point.upper().replace(".", "_") for point in SWITCHES}
 STATES = tuple(state.value for state in PointState)
 # Accepted ranges: `tune` refuses values outside them; loading clamps hand edits and overrides.
 ON_TIMEOUT_MS_RANGE = (50, 5000)
@@ -35,7 +37,7 @@ class PointSettings:
 @dataclass(frozen=True)
 class DecisionSettings:
     points: Mapping[str, PointSettings] = field(
-        default_factory=lambda: {p: PointSettings() for p in POINTS}
+        default_factory=lambda: {p: PointSettings() for p in SWITCHES}
     )
     on_timeout_ms: int = 1000
     confidence_threshold: float = 0.70
@@ -45,6 +47,8 @@ class DecisionSettings:
     shadow_timeout_ms: int = 10000
     deciders: Mapping[str, Any] = field(default_factory=dict)
     model_tiers: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    # #1199: the local model declarations, validated from the same read as model_tiers (D5).
+    match_catalog: MatchCatalog = field(default_factory=MatchCatalog)
 
 
 def _block(value: object) -> dict[str, Any]:
@@ -94,7 +98,7 @@ def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSe
     block = _block(raw.get("decisions"))
     saved = _block(block.get("points"))
     points = {}
-    for point in POINTS:
+    for point in SWITCHES:
         item = _block(saved.get(point))
         state = env.get(STATE_ENV[point], item.get("state", "off"))
         try:
@@ -116,6 +120,7 @@ def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSe
             name = ""
         points[point] = PointSettings(parsed, name, names)
     shadow = _block(block.get("shadow"))
+    model_tiers = load_model_tiers(raw)
     return DecisionSettings(
         points=points,
         on_timeout_ms=resolve_on_timeout_ms(raw, environment=env),
@@ -131,12 +136,13 @@ def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSe
             _number(shadow.get("timeout_ms", 10000), 10000, *SHADOW_TIMEOUT_MS_RANGE)
         ),
         deciders=_block(block.get("deciders")),
-        model_tiers=load_model_tiers(raw),
+        model_tiers=model_tiers,
+        match_catalog=load_catalog(raw, model_tiers),
     )
 
 
 def _point(point: str) -> None:
-    if point not in POINTS:
+    if point not in SWITCHES:
         raise ValueError("unknown decision point")
 
 
@@ -187,7 +193,9 @@ def set_tier(provider: str, tier: str, model: str | None) -> None:
 def set_table(
     point: str, option: str, *, profile: str | None = None, role: str | None = None
 ) -> None:
-    _point(point)
+    # The fixed table answers launch-routing points only, never the task features (#1199).
+    if point not in ROUTE_POINTS:
+        raise ValueError("unknown decision point")
     if option not in POINTS[point].options + ("unsure",) or (profile is None) == (role is None):
         raise ValueError("provide one profile or role and a valid option")
     data = settings_service._load_or_raise()

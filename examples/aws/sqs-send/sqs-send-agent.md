@@ -17,6 +17,21 @@ mcpServers:
     type: stdio
     command: cao-mcp-server
     args: []
+params:
+  profile:
+    description: "AWS CLI profile name"
+    required: true
+  region:
+    description: "AWS region"
+    required: true
+  queue_url:
+    description: "Full SQS queue URL"
+    required: true
+  message_body:
+    description: "JSON message body to send (rendered via heredoc, safe for arbitrary JSON)"
+    required: true
+  message_group_id:
+    description: "Message group ID (required for FIFO queues)"
 ---
 
 # SQS Send Agent
@@ -37,7 +52,21 @@ Install this agent with your values via `cao install --env`:
 
 See `config.json` in this folder for a reference of all values.
 
+In a workflow, a step that uses this profile sets these params instead. Each
+one fills the placeholder named next to it:
+
+- `profile` fills `${AWS_PROFILE}`
+- `region` fills `${AWS_REGION}`
+- `queue_url` fills `${QUEUE_URL}`
+- `message_body` fills `${MESSAGE_BODY}`
+- `message_group_id` fills `${MESSAGE_GROUP_ID}`
+
 ## Instructions
+
+When the message has a "Parameters for this step" list, it comes from a workflow
+step. Use each value there in place of the `${...}` placeholder that its param
+fills, as listed under Configuration. Outside a workflow, the placeholders work
+as before.
 
 When you receive a message, send it to the SQS queue.
 

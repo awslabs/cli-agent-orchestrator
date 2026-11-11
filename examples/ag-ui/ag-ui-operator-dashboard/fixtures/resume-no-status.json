@@ -1,0 +1,23 @@
+{
+  "status": 422,
+  "body": {
+    "detail": [
+      {
+        "type": "missing",
+        "loc": [
+          "body",
+          "resume",
+          0,
+          "status"
+        ],
+        "msg": "Field required",
+        "input": {
+          "interruptId": "cf055aea-ae97-4543-a82c-e902455e5f20",
+          "payload": {
+            "approved": true
+          }
+        }
+      }
+    ]
+  }
+}

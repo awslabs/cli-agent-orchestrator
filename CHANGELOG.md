@@ -7,10 +7,201 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **A reconnect no longer loses a tool call's end, and `toolCallName` is `assign`, not
+  `OrchestrationType.ASSIGN`** (#1292). On the ambient AG-UI stream, a client that held an `assign`
+  or `handoff` call open, lost its stream (an overflow, or a dropped connection) and reconnected
+  with `?since=` or `Last-Event-ID`, never got the call's `TOOL_CALL_END` when the receiver's (or
+  sender's) `completion` was written during the gap: each connection is a fresh run, the call's
+  record was older than the replay, and the run closed only calls it knew. Now, when a
+  `completion` or `error`, replayed or live, closes a terminal on a run that never saw a call that
+  terminal received or sent, the run announces the call from the event log, with its own
+  `toolCallId`, then ends it with `closedBy: "completion"`, as a replayed close of an older
+  subagent already announces the `SUBAGENT_STARTED` first. A second call to a worker likewise
+  announces the first and ends it with `closedBy: "superseded"`. A client that kept the call open
+  dedupes the repeated start by `eventId`, `type` and `toolCallId`. A call an earlier record
+  already ended, or one made after the completion, is not announced. If the call's record has left
+  the 500-record, 24-hour event log, its end is still not recoverable. Wire-visible: the
+  `TOOL_CALL_START` for an `assign` or `handoff` carried `toolCallName: "OrchestrationType.ASSIGN"`
+  (the enum's `str()`); it is now `"assign"` or `"handoff"`, as `metadata.cao.orchestrationType`
+  already was. The `cao-legacy` framing is unchanged: JSON already wrote the enum as `"assign"`
+  there.
+- **`assign` and `handoff` now work when the caller can't read the agent store.** A CLI that
+  sandboxes its MCP servers (for example kiro-cli with `"sandbox": true`, which hides `~/.aws`)
+  made every profile read in `cao-mcp-server` fail with `Permission denied`, so `assign` failed.
+  On an OS-level read error the client now fetches the parsed profile from cao-server
+  (`GET /agents/profiles/{name}`). The child's allowed tools and its pinned `provider` are worked
+  out from that copy exactly as from a local read. Before, a pinned provider could silently fall
+  back to the supervisor's. Not-found and parse errors behave as before. The profile reader also
+  now treats a permission error as an error on every Python version: Python 3.14's
+  `Path.exists()` reports it as "absent", which skipped the fallback.
+- **A failed supervisor launch no longer kills the workers in its session** (#1277). While
+  `cao launch` waits for its supervisor to start, the pane is already live, so the supervisor
+  can assign workers into its own session. When the start then timed out, the rollback killed
+  the whole session, workers included, and their launch records said `pane_closed`. Now, if
+  other terminals have joined the session, only the failed terminal's window and record are
+  removed (on tmux and herdr alike). A session with no other terminals is still removed
+  completely. A terminal that dies anyway because another terminal's failed create removed its
+  session ends with the new `end_reason` `creator_rollback`. On Claude Code, a resumed launch
+  (`--resume-session-id`) is ready as soon as its input box shows, instead of always waiting the
+  full `provider_init_timeout`. A supervisor that is processing at the deadline counts as started
+  when it was seen ready first or has already made a recorded CAO call.
+- **`assign` guarantees a callback by default.** If a worker goes idle without calling
+  `send_message`, the server forwards its last response to the caller, labelled as auto-forwarded;
+  if the worker is deleted or errors first, the caller is told, and if a message or the task cannot
+  be delivered (including a restart before the task was delivered), the caller gets a
+  `[CAO delivery failed]` notice. Opt out per call with
+  `expect_callback=False`. `send_message` gains `expect_reply` for terminals you did not assign.
+  Local assigns only; `target_host` and elastic workers are not covered (#1246). A forward waits
+  until the worker has started on the last message delivered to it; a worker that shows no sign of
+  work for `CAO_DELEGATION_PICKUP_TIMEOUT_SECONDS` (default 300) after a delivery is forwarded with
+  a header saying the message may not have been picked up. With `CAO_EAGER_INBOX_DELIVERY=true`, a
+  message can reach a worker in the middle of a turn, and the forward can then send the answer of
+  that turn.
+
+- **A hung FIFO-writer test fails in 10 seconds instead of holding CI** (#1251 follow-up).
+  `test_stdin_closing_before_any_reader_ends_the_writer` called the writer in-process, so a
+  regression to a blocking `open()` would have hung the pytest worker; it now runs the writer in
+  a daemon thread joined with a timeout. The Unit Tests job and the CAO MCP Apps job, whose backend
+  coverage step runs the same suite, also gain `timeout-minutes: 60`, so any hung test ends the
+  job within an hour instead of GitHub's default of six.
+- **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
+  the sidecar beside `opencode.json` could not be read as a grant record, `cao install
+  --provider opencode_cli` started from an empty record and wrote it back, dropping every other
+  agent's recorded grants. It now leaves the file as it is, logs a warning that names it and
+  says to repair it by hand (deleting it drops every agent's recorded grants), and does not
+  record this agent's grants. The install still completes. A plugin server's grant
+  is still withdrawn by plugin-store containment. A reinstall after the sidecar is repaired
+  records the servers the profile then names; a profile server's grant (`cao-mcp-server*`,
+  say) that was added while the sidecar was damaged, and that the profile no longer names,
+  stays until you remove it by hand.
+- **`cao install` exits 1 when the install fails** (#1270). It printed `Error: <message>` and
+  exited 0, so a script or CI step could not tell a failed install from a successful one. It
+  now exits 1 with the same message on stderr, like the rest of the CLI. A script that relied
+  on exit 0 after a failed install must change.
+- **Keep finished child agents open, for workshops and debugging** (#1225 phase 1). A new
+  machine-wide setting, `terminal.keep_finished`, off by default
+  (`cao config set terminal.keep_finished.enabled true`). While it is on, a successful
+  `handoff` leaves its worker open instead of sending the exit command and deleting it (the
+  result says "kept until …" where it would say "was torn down", with `torn_down: false`), and
+  an agent's `delete_terminal` on an idle worker whose pane is live keeps it and says so. A
+  failed create's retained record (a 424 replay) is never kept. Anyone can then open the
+  pane and see what the child did and which tools it called. A reaper tears each kept child
+  down the normal way (scrollback and snapshot first, then exit and delete; launch-record end
+  reason `kept_expired`) once it has been idle for `idle_window_minutes` (default 60), and never
+  while it is working. `max_per_session` (default 5) caps how many a session keeps; `on_cap`
+  chooses between tearing down the oldest idle one (`teardown_oldest`, the default;
+  `kept_evicted`) and not keeping the new one (`dont_keep`). Operator deletes
+  (`cao agent cancel --delete`, `cao shutdown`, the web UI, the API) still delete at once.
+  Only the agent side asks for a keep: the `delete_terminal` tool and `cao agent handoff`'s
+  own post-success delete send the new `DELETE /terminals/{id}` query flag `keep_if_enabled`
+  (always; the server ignores it while the setting is off), and the `handoff` tool asks
+  through its run-step request. Workflows, flows, remote workers and the timeout/error paths
+  are unchanged. Terminal bodies gain two additive fields, `kept` and `kept_until`, and session
+  terminal rows gain `kept_until`; handoff and agent-delete responses can include `keep_note`
+  explaining the keep or eviction outcome. The kept fields are `false`/`null` unless a terminal
+  is kept, also while the setting is off. `cao session status --workers` shows a `KEPT UNTIL` column only when
+  something is kept. With the setting off, every path behaves as before, and only those
+  additive fields and the ignored flag differ on the wire. See
+  `docs/terminal-lifecycle.md`, which also now says retention is 14 days (it said 7), lists
+  flow recycling (no snapshot), and gives the real snapshot directory.
+
+- **Ephemeral assign and handoff relay Kiro launch refusal rules and remedies (#1240).**
+  Helper probe refusals are structured and counted in the refusal archive.
+  Structured policy messages are bounded and stripped of control characters.
+  Other launch failures after a claim return a generic message. Installed-profile
+  launches keep their existing errors.
+
+- **Accept kiro-cli 3.1.0 and 2.37.1 as pending v3 versions (#1167).** 3.1.0 maps to
+  the statically reviewed `KAS_0_66_91`; 2.37.1 reuses `KAS_0_66_70`. Every agent and
+  helper render stays byte-identical. Both remain refused at launch unless the operator
+  enables `kiro.v3_allow_unverified_versions`, until the operator checklist
+  (OC1–OC19, #1167) passes.
+  3.1.0 has captured-help probe coverage; 2.37.1 has schema and launch coverage
+  only because no help capture is available.
+
+- **The ambient stream attributes events only to real terminals** (#1232 review). A sender that
+  is not a terminal (`operator`, `supervisor`), an `emit_ui` `terminal_id` CAO does not know, or a
+  terminal whose invocation already finished no longer becomes a subagent or reuses a finished
+  `subagentRunId`; the event stays on the record's session invocation, or is untagged, and keeps
+  the sender in `metadata.cao.sender`. `clients.database.terminal_exists` is added for the check.
+- **Direct SQLite connections are now closed when their block ends.** `with sqlite3.connect(...) as conn:`
+  only commits or rolls back; it does not close, and the connection is in a reference cycle with its
+  statement cache, so each such block held a file descriptor on the database until a full garbage
+  collection ran. That covered the workflow journal and its event log, the spec index, the approval
+  store and the SQLite migrators: 47 descriptors per three-step workflow run with the GC disabled. A
+  new `utils.sqlite_connection.closing_transaction` keeps the commit-or-rollback behaviour and then
+  closes the connection; every such block in `src/` uses it. Isolation levels, pragmas and timeouts
+  are unchanged.
+- **A pipe-pane writer no longer outlives its pane when no reader is attached.**
+  `utils/fifo_writer.py` opened the FIFO with a blocking `open()`, which never returns while
+  nothing has the read end open and never reads stdin meanwhile. A writer started while its
+  reader thread had not opened yet, or had exited on an error, therefore survived its pane and
+  its tmux server as an orphan. The open is now non-blocking and retried, and while it waits the
+  writer exits as soon as tmux closes its stdin. Output written before a late reader attaches is
+  still delivered.
+- **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
+  now stored scoped by the request fingerprint, so a request that reuses a key another, different
+  request already claimed gets its own slot. On `POST /sessions` and
+  `POST /sessions/{session_name}/terminals` such a request now creates a fresh terminal (201,
+  idempotent for its own retries) instead of answering 409, and with `lookup_only=true` it answers
+  404, the same as an unused key. Stored key values change, so a keyed retry that spans the
+  upgrade creates a new terminal once instead of replaying.
+- **Breaking: `GET /agui/v1/stream` is now an AG-UI 1.0 conformant run by default, and
+  `POST /agui/v1/stream` is added** (#1193). Each connection is one run: `RUN_STARTED` first,
+  `data:`-only frames with `type` in the JSON (no `event:` lines), schema field names, integer
+  epoch-millisecond timestamps, and a `RUN_FINISHED` `{type: "cancelled"}` close (with
+  `metadata.cao.endReason` `max_seconds`, `server_stop` or `source_ended`) or a `RUN_ERROR` close
+  (`cao.stream_overflow`, `cao.stream_error`). Sessions and terminals are `SUBAGENT_*` invocations
+  (`terminal:<id>`, and `session:` plus a hash of the session incarnation); handoff, assign and
+  `a2a_delegation` are attributed `TOOL_CALL_START`/`END` pairs with no `TOOL_CALL_RESULT`;
+  `send_message` is `CUSTOM` `cao.message_dispatched`; an error with a terminal is
+  `SUBAGENT_ERROR`, one without is `CUSTOM` `cao.error`; a killed terminal or session is
+  `SUBAGENT_FINISHED` with `metadata.cao.endReason: "killed"`. The CAO envelope moves under
+  `metadata.cao`. The POST takes a `RunAgentInput`, echoes `threadId`/`runId`, refuses another
+  protocol major and a non-empty `resume` with `400`, and reads `forwardedProps.cao.since` and
+  `maxSeconds`; the GET takes `threadId` and `maxSeconds`. `?framing=cao-legacy` keeps the old
+  wire byte-for-byte, with `Deprecation` and `Link` headers; `AguiStreamReader` now requests it.
+  A client that listened for named events must switch to `onmessage` and read `type`; the in-tree
+  consumers (the EventSource viewer, the CAO Dojo page and its e2e driver, `showcase.sh` and
+  `record-demo.mjs`) are updated. On SIGINT/SIGTERM `cao-server` now closes open streams with
+  their cancelled close before it waits on connections. A `Last-Event-ID` that names a frame
+  synthesized before its record's own frame replays that record whole instead of the whole
+  buffer. `verify-ambient.mjs` checks the stream with the pinned `@ag-ui/client` `verifyEvents`
+  in the AC3 CI job. Event-log records for a session now carry
+  `detail.session_subagent_run_id` (the hashed session id, never the raw incarnation id), so a
+  replay keeps each record's incarnation; the AG-UI mappings drop it, and it is visible on the
+  MCP Apps `/events` stream as an added key.
+- **Run-plane interrupts name the terminal subagent that raised them** (#1193). Each `Interrupt` in
+  `RUN_FINISHED`'s interrupt outcome carries `subagentRunId: "terminal:<id>"`, the id the ambient
+  stream gives that terminal; it is omitted, never null, when an interrupt has no terminal.
+- **The CAO Dojo page follows the AG-UI 1.0 consumer rules.** Every `RunAgentInput` it sends
+  declares `protocolVersion: "1.0"`. Its resume list covers every interrupt of the run it continues:
+  when that run listed several approvals, a decided card is held until each has an answer, and then
+  one resume answers them all, on that run's `threadId`. A run that only collects starts a fresh
+  thread, so it never continues past an interrupt it does not answer. The page never abandons a
+  prompt on the operator's behalf, because on CAO an abandoned (`cancelled`) entry is a deny.
+- **The run plane passes `Interrupt.expiresAt` through when set.** The AG-UI 1.0 field mirrors
+  CAO's `Interrupt.expires_at` and is omitted when that is unset. Nothing in CAO sets it today: an
+  interrupt expires when its terminal leaves the waiting state, with no deadline known in advance, so
+  the key is absent on every current provider. Anything that sets it must use ISO 8601, the schema's
+  documented convention.
+- **Run-plane events carry only the fields the AG-UI 1.0 schema defines.** `POST /agui/v1/run` no
+  longer puts `threadId`/`runId` on `STATE_SNAPSHOT`, `STATE_DELTA`, `STEP_*`, `TOOL_CALL_*`,
+  `CUSTOM` and `RUN_ERROR`; only `RUN_STARTED` and `RUN_FINISHED` carry them, as the schema says. The
+  undescribed `stepId` on `STEP_STARTED`/`STEP_FINISHED` is gone too: the terminal id now travels as
+  `metadata.cao.terminalId` (one nested `cao` object, the shape the ambient stream uses). A client that read `threadId` or `runId` from those events should take
+  them from the enclosing `RUN_STARTED`.
+- **`GET /agui/v1/capabilities` declares the run plane's AG-UI 1.0 capabilities (#1192).** The body
+  is one `AgentCapabilities` object in the 1.0 schema shape: identity, `transport.streaming`,
+  `tools.clientProvided: false`, `state.snapshots`, and `humanInTheLoop` with `approvals` and
+  `interrupts`. `approveWithEdits` is omitted, because each interrupt's `responseSchema` says whether
+  edit is accepted, and `transport.resumable` is never declared. The route sits behind
+  `CAO_AGUI_ENABLED` at the `cao:read` floor, like `POST /agui/v1/run`.
 - **The ambient AG-UI stream sends generative UI as `CUSTOM` `cao.generative_ui`, not
   `GENERATIVE_UI`.** AG-UI 1.0 has no `GENERATIVE_UI` event type, and its processing rules say a
   producer "MUST NOT emit an event type the protocol does not describe" (`CUSTOM` and `RAW` exist
-  for that). `GET /agui/v1/stream` now sends an allow-listed `emit_ui` component as `event: CUSTOM`
+  for that). `GET /agui/v1/stream` with `?framing=cao-legacy` (the pre-1.0 wire; see the AG-UI 1.0
+  entry above for the default) now sends an allow-listed `emit_ui` component as `event: CUSTOM`
   with a spec `CustomEvent` body, `{"type": "CUSTOM", "name": "cao.generative_ui", "value":
   {component, props, event_id, terminal_id, session_name, timestamp, traceparent}}`, the same name
   and value the run plane already used. There is no compatibility flag. A client that listened for
@@ -30,6 +221,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`agui_stream.AGUI_GENERATIVE_UI` is removed from `__all__`**, and the constant itself is gone,
   because the `GENERATIVE_UI` event type it named is no longer sent. Use `AGUI_CUSTOM` and
   `CAO_GENERATIVE_UI_EVENT_NAME`.
+- **Fix: a Kiro v3 launch no longer refuses every time while `cao-mcp-server` is still
+  connecting** (#1167, #1218). Kiro v3's `/mcp` panel is a snapshot taken when it opens, so
+  reading an already-open panel again could never show a server that connects after that. CAO
+  now closes and reopens `/mcp` while a server is still loading, until every server is running or
+  `provider_init_timeout` has passed since the first open.
 
 - **Kiro ephemeral helpers on v3** (#1167 Phase 2, #1074 phase 5; preview, pending the operator
   checklist). `kiro_cli` can now be listed in `ephemeral.allowed_providers` (an operator opt-in; the
@@ -57,6 +253,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does a stored effort, and a launch it refuses is not retried on the stored effort, so keep
   `min_effort` and `max_effort` to levels your Kiro models accept. Installed Kiro agents are unchanged.
 
+- **Ephemeral helpers can be matched to your models from task features** (#1199, off by default,
+  provisional). A decider can size a helper but can't tell which of your models suits the task.
+  With the new `task.features` switch on, CAO asks a decider that declares them four fixed yes/no
+  questions about the task (`task.long_context`, `task.deep_reasoning`, `task.read_only` and the
+  advisory `task.needs_network`), in one request beside `model.route`'s, with the same task text
+  and nothing new. CAO then matches the answers locally to the models you declare under
+  `decisions.match` in `settings.json`, which is never sent anywhere. The match may raise a
+  helper's tier up to `ephemeral.max_tier`, never below the decider's size answer, and, with
+  `provider.route` bound to the built-in `match` answerer, pick the CLI within your declared
+  equivalence set. It never widens the options, never takes a model outside `model_tiers`, and
+  never touches tools. #810's rule is amended for this, for the tier only: a decider still can't
+  raise a tier, providers or tools, and CAO's own match may raise only the tier, to a declared
+  model and up to `ephemeral.max_tier`. `needs_network` only adds a hint to the delegation note. Any
+  doubt runs today's choice. Shadow records the would-be match. Records gain eight nullable
+  `match_*` and `catalog_*` columns (an additive migration), and the new
+  `cao decisions match show`, `check` and `explain` explain every pick. With today's capability
+  table no equivalence set validates, so only the tier half routes until a second `hard` or
+  `sandboxed` CLI is available. See
+  [Matching helpers to models](docs/decisions.md#matching-helpers-to-models).
+
 - **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
   API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one
   universal agent file with v3 tool exclusions and deny rules. A v3 launch is refused before
@@ -65,12 +281,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.kiro/agents`, and the workspace's `.kiro/` holds no configuration; after the header, CAO
   reads `/mcp` until no server is loading, then `/tools`, before any task. **Not yet a
   supported configuration:** v3 support is claimed only once the live operator checklist has passed.
-  A kiro-cli version still pending operator verification (2.36.0, 2.37.0, 3.0.0; each ships the
-  same v3 engine, `@kiro/agent` 0.66.70, as 2.35.1) refuses unless the operator sets
+  A kiro-cli version still pending operator verification (2.36.0, 2.37.0, 2.37.1, 3.0.0 on
+  `@kiro/agent` 0.66.70; 3.1.0 on 0.66.91) refuses unless the operator sets
   `kiro.v3_allow_unverified_versions: true` (provisional, for running the checklist on it); such a
   launch logs a warning and its response carries `launch_notes`.
   Also: `cao launch` now shows the server's refusal reason instead of "Failed to connect", and the
   memory wiki compiler's Kiro call pins `--agent-engine v2`.
+
+- **Kiro v3 reads a `/tools` list longer than the pane** (#1167). Kiro shows as many rows as fit,
+  the pane's height minus nine (at least five), with `↓ more` below them. A helper with `fs_read`
+  and `@cao-mcp-server` already has 36 tags, so on a pane under 45 rows tall every v3 launch of it
+  was refused with `kiro_v3_tools_mismatch: unrecognized row '↓ more'`. CAO now presses Down, the
+  only key it sends into the panel, once per screen. Each new screen must be the last one moved by
+  exactly one row, and the joined rows must hold every row the title declares, each once, before
+  the grant check. Kiro draws a scrolling panel taller than the pane, so its title sits in the
+  pane's scrollback: every `/tools` read is now the pane plus its recent scrollback (on tmux the
+  pane and 100 lines above it, on herdr the last 100 lines). The read must hold exactly one
+  `/tools` title, with nothing but blank rows below the panel. Nothing is loosened: a skipped,
+  changed or hidden row, a duplicate, a wrong count, a second title, text below the panel or a
+  dialog refuses (no key is ever sent into a dialog). After Escape, CAO now checks on the pane that
+  the empty prompt is back, as after `/mcp`. The read is bounded by `provider_init_timeout`, which
+  it shares with the final prompt wait, so a successful v3 init stays within about 4T+19.5s of
+  waits, plus about 60 backend calls (`utils/init_allowance.py`). Each call is several tmux or herdr
+  processes, about 0.1s idle (estimated) and 0.2s under load (measured), so the proof prices them
+  at 0.25s: the client's
+  wait covers a worst-case successful v3 start only up to a `provider_init_timeout` of about 90s,
+  and above that, on a heavily loaded machine, `cao launch` can report a failure while the server
+  goes on to start the agent (a documented gap; the default 60s has about two minutes spare). A
+  scrolling panel refuses in a herdr
+  pane over about 97 rows, and in a pane under 12 rows: Kiro keeps the old rows above the pane by
+  default, so after one Down the read no longer follows the last screen. The
+  layout, scroll rows and keys are taken from kiro-cli 3.0.0's bundled terminal UI, the same as
+  2.37.0's, and no scrolled panel has been read end to end live yet. See "How CAO reads a long
+  tool list" in `docs/kiro-cli.md`.
 
 - **Kiro's identity check reads headers with effort and thinking columns, and refuses the v3
   `Default` fallback** (#1167). A Kiro header with extra columns between the model and the context

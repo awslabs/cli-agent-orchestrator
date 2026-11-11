@@ -458,6 +458,7 @@ async def run_agent_step(
     launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
+    keep_on_success: Optional[Callable[[str], bool]] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -574,6 +575,15 @@ async def run_agent_step(
             ``terminal_service.create_terminal``'s own docstring for the
             resolution/teardown mechanics. Ignored when reusing a terminal.
             Default False = behavior unchanged.
+        keep_on_success: Optional keep decision for the SUCCESS teardown only
+            (issue #1225 phase 1). Called off the loop with the terminal id once
+            the step has succeeded and its result is persisted; ``True`` means the
+            terminal was kept, so neither the exit command nor the delete runs.
+            Every other teardown in this function (cancellation, extraction
+            failure, provider error) ignores it, and so do the paths that leave
+            the terminal alive on purpose. A hook that raises is logged and read
+            as ``False``. Default None = behavior unchanged; only the run-step
+            route passes one, for a handoff.
         job_id: Optional durable-result key (issue #447). When given, the
             extracted result is persisted via ``upsert_handoff_result`` BETWEEN
             extraction and teardown — before the terminal that carries the only
@@ -886,12 +896,6 @@ async def run_agent_step(
             terminal_id=terminal_id,
         )
 
-    result = AgentStepResult(
-        terminal_id=terminal_id,
-        last_message=last_message,
-        status=TerminalStatus.COMPLETED,
-    )
-
     # Persist BEFORE teardown (issue #447): the terminal about to be destroyed
     # is the only other place this result lives, so a crash during teardown
     # must not be able to lose it. Off the loop (sqlite I/O); best-effort — a
@@ -913,13 +917,32 @@ async def run_agent_step(
                 job_id[:8],
             )
 
+    torn_down = False
     if teardown and created_here:
-        await _best_effort_teardown(terminal_id, registry)
+        kept = False
+        if keep_on_success is not None:
+            try:
+                kept = bool(await asyncio.to_thread(keep_on_success, terminal_id))
+            except Exception as exc:  # noqa: BLE001 — a keep failure falls back to teardown
+                logger.warning(
+                    "run_agent_step: keep decision for terminal %s failed; tearing down: %s",
+                    terminal_id,
+                    exc,
+                )
+        # A kept worker was not torn down, so torn_down stays False (#1203 / #1225):
+        # it reports only a delete that really happened.
+        if not kept:
+            torn_down = await _best_effort_teardown(terminal_id, registry)
 
-    return result
+    return AgentStepResult(
+        terminal_id=terminal_id,
+        last_message=last_message,
+        status=TerminalStatus.COMPLETED,
+        torn_down=torn_down,
+    )
 
 
-async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegistry]) -> None:
+async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegistry]) -> bool:
     """Exit-then-delete a terminal this call created — best-effort (never raises).
 
     Mirrors the old handoff lifecycle: send the provider's graceful exit command
@@ -927,6 +950,9 @@ async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegis
     never turn a settled step (success OR cancellation) into a failure. Shared by
     the success teardown and the cancellation path (issue #409b) so a cancelled
     step reclaims its terminal exactly the way a successful one does.
+
+    Returns True only if ``delete_terminal`` succeeded (issue #1203). A failed
+    graceful exit does not affect the result; only the delete decides it.
     """
     try:
         # Graceful CLI shutdown before kill_window (e.g. "/exit" for Claude Code,
@@ -946,7 +972,7 @@ async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegis
         # Off the loop: delete_terminal does blocking tmux kills, a full-history
         # scrollback snapshot, and DB writes — the exact teardown that wedged the
         # server in issue #382.
-        await asyncio.to_thread(
+        deleted = await asyncio.to_thread(
             terminal_service.delete_terminal,
             terminal_id,
             registry=registry,
@@ -958,3 +984,12 @@ async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegis
             terminal_id,
             exc,
         )
+        return False
+    # delete_terminal returns False (without raising) when cleanup was deferred and
+    # the row kept for a retry. That is not a teardown, so it must not be reported as one.
+    if not deleted:
+        logger.warning(
+            "run_agent_step: teardown of terminal %s was deferred; the terminal was not deleted",
+            terminal_id,
+        )
+    return bool(deleted)

@@ -9,14 +9,12 @@ The Kiro CLI provider enables CLI Agent Orchestrator (CAO) to work with **Kiro C
 ### Prerequisites
 
 1. **AWS Credentials**: Kiro CLI authenticates via AWS
-2. **Kiro CLI**: Install the CLI tool
+2. **Kiro CLI**: Install it by following the official instructions at
+   [kiro.dev](https://kiro.dev/docs/getting-started/installation/)
 3. **tmux**: Required for terminal management
 
 ```bash
-# Install Kiro CLI
-npm install -g @anthropic-ai/kiro-cli
-
-# Verify authentication
+# Check that kiro-cli is installed and on your PATH
 kiro-cli --version
 ```
 
@@ -104,7 +102,8 @@ After kiro-cli starts, and before any task is typed:
   MCP tool must be one the grant names (`@server`, or `@server/tool` for a
   single tool). The tags come from the pinned engine schema: `fs_write` gives
   the `code` tool, which carries `read` as well as `write`, so a write-only
-  grant shows both.
+  grant shows both. A list too long for the pane is read screen by screen (see
+  *How CAO reads a long tool list*).
 
 Only then does the terminal accept input. If any check fails, no task is typed
 and the window is closed.
@@ -137,12 +136,16 @@ panel again would never show a server that has since started. So CAO:
 
 CAO checks the time after each open. If a server is still loading at the first
 check after `provider_init_timeout` has passed since the first open (60 s by
-default), the launch is refused. The open under way finishes first, so the
-refusal comes a few seconds after the timeout (at most about 8 s). The message
-says how long CAO waited and how often it opened `/mcp`, for example:
+default), the launch is refused. On that refusal path the open's close/prompt
+wait does not run (CAO sends a bare Escape and raises). The time after the
+timeout is this open's palette and panel reads, plus the close of the previous
+open if that close was still running when the timeout passed. So the refusal
+comes at most about 7.5 s after the timeout. On a pass, `/tools` is read next,
+with its own bound (see *How CAO reads a long tool list*). The message says how
+long CAO waited and how often it opened `/mcp`, for example:
 
 ```text
-kiro_v3_mcp_not_ready: MCP servers still loading after 62 s (13 opens of /mcp): ['cao-mcp-server']
+kiro_v3_mcp_not_ready: MCP servers still loading after 61.5 s (13 opens of /mcp): ['cao-mcp-server']
 ```
 
 A failed, extra or missing server refuses at once, without another try. So does
@@ -165,6 +168,107 @@ The same setting is also how long CAO waits for the agent prompt at startup
 first open and each server's status. At the default level, `INFO`, these lines
 are left out.
 
+### How CAO reads a long tool list
+
+**Why it matters.** CAO must see every row of `/tools` before it types a task:
+a row it didn't see could be a tool the grant doesn't allow. But a long list
+doesn't fit on one screen. Kiro shows as many rows as fit, which is the pane's
+height minus nine (at least five), and draws `↓ more` below them. A helper with
+just `fs_read` and `@cao-mcp-server` already has 36 tags: `read`, plus the 35
+tools of `cao-mcp-server`.
+
+**Where the panel's top goes.** Kiro draws the panel in place of the input box,
+under the session's notices and with three blank rows kept below it. So once
+the list scrolls, the panel is always two or three rows taller than the pane,
+and its top rows, the title among them, go above the pane's top row into its
+scrollback. A list that doesn't scroll can overflow too: on CAO's 50-row tmux
+panes, more than about 40 tags do. So every `/tools` read is the pane plus its
+recent scrollback:
+- **tmux:** the visible pane and the 100 lines above it (`capture-pane -S -100`);
+- **herdr:** the pane's last 100 lines (`pane read --source recent --lines 100`).
+  A scrolling panel in a herdr pane taller than about 97 rows doesn't fit in
+  that read, and refuses.
+
+Each read must hold exactly one `/tools` title, and nothing but blank rows may
+follow the panel's footer, so the panel CAO reads is the last thing on the pane.
+
+**Old rows above the pane.** By default Kiro keeps the scrollback (its
+`chat.preserveScrollback` setting is on, and CAO leaves it alone). When a frame
+changes, Kiro repaints only the pane's own rows, so rows already above the pane
+keep the text they had when they left it.
+- **On a pane of 12 rows or more,** those rows are only the notices, the title,
+  its divider and the search row, which don't change while the list scrolls. So
+  the read is the whole current panel.
+- **Below 12 rows,** the list's own rows go above the pane too, and after the
+  first Down the read is old rows under the one title. CAO refuses it.
+
+What keeps old rows out is the check that each screen is the last one moved by
+exactly one row: the "one title" rule only catches copies of the panel, as a
+terminal that kept every frame's overflow would leave.
+
+**What CAO does.**
+
+1. It opens `/tools` and reads the first screen.
+2. While that screen ends in `↓ more`, it presses Down once, which moves Kiro's
+   list by one row, and reads the screen again. The new screen must be the old
+   one moved by exactly one row: the same title, the same number of rows, the
+   old rows without the top one, and one new row at the bottom. A screen that
+   hasn't redrawn yet is read again, every 0.5 s for up to about 2.5 s.
+3. At the screen with no `↓ more` left, it joins the rows and presses Escape,
+   then waits for the empty prompt to come back on the pane, as after `/mcp`.
+4. It checks the joined list just as it checks a list that fits: no row twice,
+   exactly as many rows as the title declares (`/tools · 36 tags`), and every
+   tag and MCP tool allowed by the grant.
+
+For example, on a 30-row pane Kiro shows 21 of the 36 tags, so CAO presses Down
+15 times; on a 24-row pane, 21 times. This is the same on tmux and herdr. On a
+pane under 12 rows it refuses after one Down (see above).
+
+Down is the only key CAO sends into the panel. It sends it only when the screen
+it has just read shows the panel with `↓ more` and no dialog. CAO never types
+into the panel's search box. If a dialog appears, CAO refuses without pressing
+anything, not even Escape.
+
+**How long it may take.** The read is bounded by `provider_init_timeout` (60 s
+by default; see *How long CAO waits for MCP servers*), counted from the first
+`/tools` key and checked before each Down, so a refusal on time comes at most
+one screen's wait (about 2.5 s) after it. The read and CAO's final wait for the
+prompt share that one timeout: a long scroll shortens the final wait, down to
+about 2.5 s, instead of adding a timeout of its own.
+
+**When it refuses.** Each of these starts with `kiro_v3_tools_mismatch`, and no
+task is typed:
+
+| The message ends with | What happened | Fix |
+|---|---|---|
+| `the /tools panel did not move down by one row` | a screen skipped a row, didn't redraw within the wait, or showed a change in its rows or its count while CAO read it; or the pane is under 12 rows tall, so the read held old rows above the pane | make the pane at least 12 rows tall; otherwise retry, and if it persists, report it |
+| `the panel declares N tags but M are visible` | some rows the title counts were never shown | report it |
+| `the /tools panel shows [...] more than once` | the same row appeared twice | report it |
+| `the /tools panel shows more rows than the N it declares` | the list went on past the count in its title | report it |
+| `the /tools panel was still scrolling after N s (M of N tags read)` | `provider_init_timeout` passed before the last screen | make the pane taller, or raise `provider_init_timeout` |
+| `no complete /tools panel on screen` | among other causes: the panel's title wasn't in the read (a herdr pane over about 97 rows), or the read held two titles (old frames left in the scrollback) | make the herdr pane shorter; if it persists, report it |
+| `something is drawn below the /tools panel` | the panel wasn't the last thing on the pane | report it, with a screenshot |
+| `a dialog appeared on /tools; it was not answered and nothing more was typed` | a dialog came up while CAO read the list | report it, with a screenshot |
+| `the prompt did not return after /tools` | after Escape, the empty prompt didn't come back within about 2.5 s | retry; if it persists, report it |
+| `a dialog appeared after /tools closed; it was not answered and nothing more was typed` | a dialog came up instead of the prompt | report it, with a screenshot |
+
+A change that keeps the count and touches only rows CAO has already scrolled
+past isn't seen, just as a change made right after a list that fits has been
+read isn't.
+
+**Not yet seen live.** This follows the code of Kiro's own terminal UI in
+kiro-cli 3.0.0, which is the same in 2.37.0. That covers the `↑ more` and
+`↓ more` rows, the one-row Down, the title that counts every row, the three
+rows kept below the panel, and how an overflowing frame is redrawn: by default
+Kiro repaints only the pane and keeps the rows above it as they were (with
+`chat.preserveScrollback` off it clears the scrollback and writes the whole
+frame again instead). A live helper run's herdr history did show the top of an
+open panel, title included, above the pane. But no scrolled `/tools` panel has
+been read end to end on a live run yet, on either backend. If Kiro draws it
+differently, CAO refuses the launch: it never passes a list it didn't read in
+full. With Kiro's icons turned off (`v more`), or in its screen-reader layout,
+the panel is refused too.
+
 ### Supported kiro-cli versions
 
 | kiro-cli | v3 engine | Status |
@@ -172,15 +276,26 @@ are left out.
 | 2.35.1 | `@kiro/agent` 0.66.70 | measured |
 | 2.36.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 | 2.37.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
+| 2.37.1 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 | 3.0.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
+| 3.1.0 | `@kiro/agent` 0.66.91 | pending operator verification: refused at launch unless the operator opts in (below) |
+
+Every version marked pending stays pending until the operator checklist (OC1–OC19,
+[#1167](https://github.com/awslabs/cli-agent-orchestrator/issues/1167)) passes on it.
+Until then, it is admitted only with `kiro.v3_allow_unverified_versions`.
+3.1.0 pins `KAS_0_66_91`; every agent and helper render remains byte-identical.
+The 3.1.0 probe is tested against captured help. No 2.37.1 help capture is
+available, so its coverage is schema lookup, pending refusal, opt-in admission
+and launch tests; it has no captured-help probe cases.
 
 Any other version refuses v3; v2 is not affected. A new kiro-cli release needs a
 CAO update before v3 runs on it.
 
-Every pending version runs the same v3 engine as 2.35.1, so CAO checks it with the
-same rules. Each was added by reading its installed engine and help screens, without
-running a chat. What a pending version still lacks is a live run of the operator
-checklist.
+The pending 2.36.0–3.0.0 versions reuse 2.35.1's v3 engine schema. 3.1.0 ships
+a different engine, statically reviewed with equal render-facing fields and tags,
+so CAO renders the same tools and rules. The pending rows are based on static
+review, without running a chat. What a pending version still lacks is a live run
+of the operator checklist.
 
 ### Pending versions (operator only)
 
@@ -212,7 +327,7 @@ is not checked.
 
 The message never names a path on the server (it may be a shared server); the server log does.
 
-| Message starts with | What it means | Fix |
+| Refusal rule | What it means | Fix |
 |---|---|---|
 | `kiro_v3_unsupported_version` | kiro-cli is a version CAO has no schema for | use a supported version, or `--engine v2` |
 | `kiro_v3_unverified_version` | the version is listed but not yet operator-verified | `--engine v2` until it is verified (operators running the checklist: see *Pending versions*) |
@@ -227,9 +342,17 @@ The message never names a path on the server (it may be a shared server); the se
 | `kiro_v3_workspace_config:<entry>` | the workspace's `.kiro/` (or a parent's) holds configuration v3 would load, an entry CAO does not know, a symlink, or can't be read | remove it, use a worktree without it, or `--engine v2` |
 | `kiro_v3_trust_dialog` | kiro-cli asked to trust the workspace anyway, including when that dialog was declined and Kiro exited | report it; CAO never answers that dialog |
 | `kiro_v3_startup_dialog` | kiro-cli showed a dialog or a selector at startup that CAO doesn't answer: one it has no pattern for, the approval picker, or v2's "Switch to V3" offer | report it with a screenshot |
-| `kiro_v3_tools_mismatch` | `/tools` shows a tag or MCP tool the grant does not allow, shows no tools, or shows a layout CAO can't read (a clipped list too); the `/tools` palette didn't appear; the launch allows every tool; or the agent file is no longer a v3 universal file, or its grant no longer fits the launch | reinstall; if it persists, report it |
+| `kiro_v3_tools_mismatch` | `/tools` shows a tag or MCP tool the grant does not allow, shows no tools, or shows a layout CAO can't read (a clipped list too); a list too long for the pane could not be read in full (see *How CAO reads a long tool list*); the `/tools` palette didn't appear; the launch allows every tool; or the agent file is no longer a v3 universal file, or its grant no longer fits the launch | reinstall; if it persists, report it |
 | `kiro_v3_mcp_not_ready` | `/mcp` shows an extra, failed or missing server, one still loading once `provider_init_timeout` has passed (see *How long CAO waits for MCP servers*), or a layout CAO can't read; the `/mcp` palette didn't appear; a dialog appeared after `/mcp` closed; or the prompt didn't come back after a panel | check that the server starts on its own; for a slow server, raise `provider_init_timeout`; then retry |
 | `kiro_v3_mcp_not_ready` (ungranted servers) | the agent file configures an MCP server its grant doesn't name | `cao install <name> --provider kiro_cli --engine v3` |
+
+### Known limitations
+
+With `provider_init_timeout` above about 90 s, on a heavily loaded machine, a
+successful v3 start can take longer than the client waits for it: `cao launch`,
+or a supervisor's create of the agent, then reports a failure while the server
+goes on to start the agent. At the default 60 s there are about two minutes to
+spare.
 
 ### FAQ
 
@@ -292,7 +415,7 @@ helper's own refusals. The [v3 table above](#when-a-v3-launch-is-refused) applie
 except that a helper is never told to use engine `v2`: the version and wrapper rows below
 replace those.
 
-| Message starts with | What it means | Fix |
+| Refusal rule | What it means | Fix |
 |---|---|---|
 | `kiro_ephemeral_engine:v2` | the request asked for engine `v2`; helpers run on v3 only | omit the engine, or pass `v3` |
 | `kiro_v3_global_home:secrets` | you have a Kiro secret store (`~/.kiro/secrets.json`) that Kiro has not marked as migrated, so Kiro would copy it into the helper's home | use a Claude Code or Codex helper, or an installed Kiro agent; CAO will not touch `~/.kiro` to change this |
@@ -302,7 +425,10 @@ replace those.
 | `kiro_v3_workspace_config:home` | the launch directory is your home folder, or is inside a home folder that is a git repository | launch from a repository folder, or use a worktree |
 | `kiro_v3_unverified_version` | the kiro-cli version is listed but not yet operator-verified | use a verified kiro-cli version; operators running the checklist can opt in (see [Pending versions](#pending-versions-operator-only)) |
 | `kiro_v3_unsupported_version` | kiro-cli is a version CAO has no schema for | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
-| `Kiro engine 'v3' requires wrapper flag` | the kiro-cli on the server's `PATH` doesn't list a flag the helper needs (`--trust-workspace`, or `--model` or `--effort` when asked for) | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
+| `unsupported_capability` | the kiro-cli on the server's `PATH` doesn't list a flag the helper needs (`--trust-workspace`, or `--model` or `--effort` when asked for), or doesn't advertise `v3` as an accepted `--agent-engine` value | use a [supported kiro-cli version](#supported-kiro-cli-versions) |
+| `missing_executable` | the resolved kiro-cli could not be executed by the probe | check that kiro-cli is installed and executable for the server's user |
+| `timeout` | the kiro-cli capability probe timed out before a worker was launched; this is separate from a handoff worker timeout | check that `kiro-cli --help`, `chat --help` and `--version` finish promptly |
+| `malformed_output` | kiro-cli returned output the capability probe could not recognise | use a [supported kiro-cli version](#supported-kiro-cli-versions), or report the probe failure |
 | `kiro_home_invalid:ignored` | Kiro would ignore the helper's `KIRO_HOME` and use `~/.kiro`: the server's `HOME` is the helper's Kiro home (`ephemeral/kiro/<id>` or `ephemeral/kiro-probe` under the CAO home) or a folder inside it | set `HOME`, or `CAO_HOME_DIR`, so that `HOME` is not under `$CAO_HOME_DIR/ephemeral/` |
 | `kiro_home_invalid:forwarded` | the launch forwarded its own `KIRO_HOME` in `env_vars` | don't forward `KIRO_HOME`; each helper has its own |
 | `kiro_home_invalid:unsafe_path` | on herdr, the CAO home path holds characters herdr cannot pass to a pane | use a CAO home path of letters, digits and `-_./` |
@@ -402,7 +528,7 @@ The provider tries legacy extraction first; if no green arrows are found, it fal
 
 ### Permission Prompts
 
-Kiro CLI shows `Allow this action? [y/n/t]:` prompts for sensitive operations (file edits, command execution). The provider detects these as `WAITING_USER_ANSWER` status. Unlike Claude Code, Kiro CLI does not have a trust folder dialog.
+Kiro CLI shows `Allow this action? [y/n/t]:` prompts for sensitive operations (file edits, command execution). The provider detects these as `WAITING_USER_ANSWER` status. On the v2 engine, Kiro CLI shows no workspace-trust dialog. On v3 it can: CAO passes `--trust-workspace` only after its workspace check, never answers that dialog, and refuses the launch with `kiro_v3_trust_dialog` if it appears (see [Workspace trust](#workspace-trust)).
 
 ### Tool Restrictions
 
@@ -433,11 +559,16 @@ The profile name determines the prompt pattern used for status detection. Built-
 
 ### Launch Command
 
-The provider launches using kiro-cli's default UI:
+The provider launches using kiro-cli's default UI. On the v2 engine the command is:
 
 ```
-kiro-cli chat --agent-engine v2 --agent developer
+kiro-cli chat --agent-engine v2 --trust-all-tools [--model m] --agent developer
 ```
+
+`--trust-all-tools` is always passed, so Kiro's approval prompts don't block assign and
+handoff; the agent file's `tools` list is what restricts the agent (see
+[Tool Restrictions](#tool-restrictions)). `--model` comes from the profile's `model`, when
+set. The v3 command is under [What CAO checks](#what-cao-checks).
 
 The provider auto-detects whether the terminal is in legacy or TUI mode and uses the appropriate detection patterns, so both sets of patterns remain supported (a wrapper script may still put the terminal in legacy mode).
 

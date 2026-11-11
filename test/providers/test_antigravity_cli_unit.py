@@ -211,6 +211,95 @@ def test_screen_resolves_stale_processing_footer_regression():
 
 
 # --------------------------------------------------------------------------- #
+# Recorded agy 1.5.0 startups replayed through the real StatusMonitor
+# --------------------------------------------------------------------------- #
+#
+# Both fixtures are the pipe-pane bytes of one agy 1.5.0 startup (workspace-trust
+# picker, banner, the -i acknowledgment, then the idle prompt with
+# "? for shortcuts"), scrubbed of paths, account and host names: every word that
+# is not agy UI chrome is x'd at the same length, so the cursor geometry of the
+# redraw is unchanged. At 8bf6e8f0 both startups timed out in initialize():
+# - agy_init_stale_processing.txt: CAO's status stayed ``processing``.
+# - agy_init_stale_trust_picker.txt: it stayed ``waiting_user_answer`` after
+#   the trust picker had been accepted.
+# On screen agy was idle both times.
+
+
+def _read_raw_fixture(name: str) -> str:
+    # Not read_text(): universal-newline decoding would turn the bare "\r" that
+    # agy's redraw uses for carriage return into "\n".
+    return (FIXTURES_DIR / name).read_bytes().decode("utf-8")
+
+
+def _replay_startup(fixture: str, chunk: int, *, arm_on_trust_picker: bool) -> TerminalStatus:
+    """Feed a recorded startup through StatusMonitor's real ingestion path.
+
+    ``initialize()`` arms the monitor before it sends the agy command, and the
+    startup-dialog handler arms it again when it accepts the trust picker. With
+    the second arm the run-2 shape follows (a later PROCESSING is admitted);
+    without it, the run-1 shape (WAITING_USER_ANSWER is sticky, so a later
+    PROCESSING is refused).
+    """
+    from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+    provider = AntigravityCliProvider("t1", "s", "w")
+    data = _read_raw_fixture(fixture)
+    sm = StatusMonitor()
+    with (
+        patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm,
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.get_server_settings",
+            return_value={"state_buffer_max": 32768},
+        ),
+        patch("cli_agent_orchestrator.services.status_monitor._queue_status_transition"),
+    ):
+        pm.get_provider.return_value = provider
+        sm.notify_input_sent("t1")
+        armed_for_trust = False
+        for i in range(0, len(data), chunk):
+            sm._process_chunk("t1", data[i : i + chunk])
+            if (
+                arm_on_trust_picker
+                and not armed_for_trust
+                and sm._last_status.get("t1") == TerminalStatus.WAITING_USER_ANSWER
+            ):
+                sm.notify_input_sent("t1")
+                armed_for_trust = True
+        return sm._last_status["t1"]
+
+
+@pytest.mark.parametrize("chunk", [64, 512, 4096])
+def test_recorded_startup_with_stale_processing_rows_reaches_idle(chunk):
+    """Run 2: stale "Generating..." / "esc to cancel" rows, agy idle on screen."""
+    data = _read_raw_fixture("agy_init_stale_processing.txt")
+    from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+    tail = strip_terminal_escapes(data)[-2048:]
+    # The premise: the stale processing markers are still inside the tail
+    # window, and the live ready footer was drawn last.
+    assert "esc to cancel" in tail and "Generating..." in tail
+    assert tail.rstrip().endswith("? for shortcuts")
+
+    status = _replay_startup("agy_init_stale_processing.txt", chunk, arm_on_trust_picker=True)
+    assert status == TerminalStatus.IDLE
+
+
+@pytest.mark.parametrize("chunk", [64, 512, 4096])
+def test_recorded_startup_after_trust_picker_reaches_idle(chunk):
+    """Run 1: the trust picker's "↑/↓ Navigate" / "enter Confirm" rows were
+    accepted, then agy reached its idle prompt."""
+    data = _read_raw_fixture("agy_init_stale_trust_picker.txt")
+    from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+    clean = strip_terminal_escapes(data)
+    assert "↑/↓ Navigate" in clean and "enter Confirm" in clean
+    assert clean.rstrip().endswith("? for shortcuts")
+
+    status = _replay_startup("agy_init_stale_trust_picker.txt", chunk, arm_on_trust_picker=False)
+    assert status == TerminalStatus.IDLE
+
+
+# --------------------------------------------------------------------------- #
 # Response extraction
 # --------------------------------------------------------------------------- #
 

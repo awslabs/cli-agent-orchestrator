@@ -1,6 +1,7 @@
 """Tests for launch command."""
 
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1680,6 +1681,69 @@ def test_launch_gate_names_native_enforcement():
     assert result.exit_code == 0
     assert "Enforcement: native" in result.output
     assert "WARNING: this provider does not enforce" not in result.output
+
+
+_DOCS = Path(__file__).resolve().parents[3] / "docs" / "tool-restrictions.md"
+
+# The Blocked line `cao launch` prints for the developer default on Claude Code:
+# only Claude Code's own messaging and agent tools, which every restricted grant
+# loses. It used to read "(none)" while the argv still cut these.
+_DEVELOPER_BLOCKED = (
+    "  Blocked:  CronCreate, CronDelete, CronList, EnterWorktree, ExitWorktree, "
+    "FetchInboxMessage, ListAgents, RemoteTrigger, ScheduleWakeup, SendFile, "
+    "SendMessage, TeamCreate, TeamDelete, Workflow"
+)
+
+
+def _launch_with_tools(provider: str, tools):
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        args = ["--agents", "test-agent", "--provider", provider, "--headless"]
+        for tool in tools:
+            args += ["--allowed-tools", tool]
+        return runner.invoke(launch, args, input="y\n")
+
+
+def _blocked_line(output: str) -> str:
+    lines = [line for line in output.splitlines() if line.startswith("  Blocked:  ")]
+    assert len(lines) == 1, output
+    return lines[0]
+
+
+def _docs_blocked_line(allowed_line: str) -> str:
+    lines = _DOCS.read_text(encoding="utf-8").splitlines()
+    index = lines.index(allowed_line)
+    assert lines[index + 1].startswith("  Blocked:  ")
+    return lines[index + 1]
+
+
+def test_launch_gate_blocked_line_for_the_claude_code_developer_default():
+    tools = ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
+    result = _launch_with_tools("claude_code", tools)
+    assert result.exit_code == 0, result.output
+    assert _blocked_line(result.output) == _DEVELOPER_BLOCKED
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        ["@cao-mcp-server", "fs_read", "fs_list"],
+        ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
+    ],
+)
+def test_launch_gate_blocked_line_matches_the_docs_example(tools):
+    """docs/tool-restrictions.md shows these two prompts; they must stay true."""
+    result = _launch_with_tools("claude_code", tools)
+    assert result.exit_code == 0, result.output
+    assert _blocked_line(result.output) == _docs_blocked_line("  Allowed:  " + ", ".join(tools))
 
 
 def test_launch_gate_warns_when_the_provider_cannot_enforce():

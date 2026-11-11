@@ -68,6 +68,21 @@ class TestRunStepEndpoint:
         assert kwargs["prompt"] == "do it"
         assert kwargs["model"] is None
 
+    @pytest.mark.parametrize("torn_down", [True, False])
+    def test_response_reports_torn_down_from_the_step(self, client, torn_down):
+        """Issue #1203: the response states whether the server deleted the worker."""
+        result = AgentStepResult(
+            terminal_id="abc12345",
+            last_message="all done",
+            status=TerminalStatus.COMPLETED,
+            torn_down=torn_down,
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+
+        assert resp.status_code == 200
+        assert resp.json()["torn_down"] is torn_down
+
     def test_model_forwarded_to_substrate(self, client):
         result = AgentStepResult(
             terminal_id="abc12345", last_message="all done", status=TerminalStatus.COMPLETED

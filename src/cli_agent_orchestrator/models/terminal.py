@@ -180,6 +180,18 @@ class Terminal(BaseModel):
         ),
     )
     description: Optional[str] = None
+    kept: bool = Field(
+        default=False,
+        description=(
+            "True when this finished child is being KEPT instead of torn down "
+            "(terminal.keep_finished, issue #1225). CAO tears it down the normal way "
+            "after kept_until, unless it is working; an operator delete removes it now."
+        ),
+    )
+    kept_until: Optional[datetime] = Field(
+        default=None,
+        description="End of a kept child's idle window (UTC); None when not kept",
+    )
     metadata: Optional[Dict[str, Any]] = Field(
         None, description="Free-form, consumer-defined JSON describing what this terminal is doing"
     )
@@ -280,3 +292,6 @@ class AgentStepResult(BaseModel):
     terminal_id: str
     last_message: str
     status: TerminalStatus
+    # True only when run_agent_step itself deleted the worker terminal it created
+    # (issue #1203). False for reused terminals, teardown=False, and a failed delete.
+    torn_down: bool = False

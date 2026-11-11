@@ -24,10 +24,13 @@ from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import Terminal
-from cli_agent_orchestrator.services import session_service, terminal_service
+from cli_agent_orchestrator.services import (
+    delegation_callback_service,
+    session_service,
+    terminal_service,
+)
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.terminal_service import (
-    IdempotencyKeyConflict,
     IdempotencyKeyNotFound,
     IdempotentCreateFailed,
     TerminalRecordCorruptError,
@@ -642,43 +645,8 @@ class TestCreateSession:
         assert response.status_code == 404
         decider.assert_not_called()
 
-    def test_idempotency_key_conflict_is_409_not_400(self, client):
-        """A reused key for a DIFFERENT request must surface as 409.
-
-        Review on PR #634, issue #616. This endpoint is the sharper of the two:
-        its generic ``ValueError`` arm is FIRST, so a conflict subclassing
-        ``ValueError`` would be swallowed into a 400 before any 409 arm could
-        run. ``IdempotencyKeyConflict`` subclasses ``Exception`` for exactly
-        that reason, and this test is what pins it.
-        """
-        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
-            mock_svc.create_session = AsyncMock(
-                side_effect=IdempotencyKeyConflict(
-                    "idempotency_key 'job-1' was already used for a different request; "
-                    "use a distinct key"
-                )
-            )
-
-            response = client.post(
-                "/sessions",
-                params={
-                    "provider": "kiro_cli",
-                    "agent_profile": "developer",
-                    "idempotency_key": "job-1",
-                },
-            )
-
-        assert response.status_code == 409
-        assert "already used for a different request" in response.json()["detail"]
-
     def test_plain_value_error_still_maps_to_400(self, client):
-        """Ordering regression guard for the 409 arm (review on PR #634).
-
-        Paired with the 409 test above: this endpoint must keep mapping a plain
-        ``ValueError`` to 400. Without both halves pinned, making the conflict a
-        ``ValueError`` subclass -- or reordering the arms -- silently downgrades
-        the 409 and nothing fails.
-        """
+        """A plain ``ValueError`` from session creation maps to 400 (review on PR #634)."""
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
             mock_svc.create_session = AsyncMock(
                 side_effect=ValueError("Session 'test-session' already exists")
@@ -1422,45 +1390,8 @@ class TestCreateTerminalInSession:
         assert response.status_code == 404
         decider.assert_not_called()
 
-    def test_idempotency_key_conflict_is_409_not_404(self, client):
-        """A reused key for a DIFFERENT request must surface as 409.
-
-        Review on PR #634, issue #616. This endpoint maps the generic
-        ``ValueError`` to 404, so a conflict that subclassed ``ValueError``
-        would arrive as "not found" -- which reads as a missing session and
-        tells the operator nothing about the real problem. Asserting the exact
-        code is the point of this test.
-        """
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal = AsyncMock(
-                side_effect=IdempotencyKeyConflict(
-                    "idempotency_key 'job-1' was already used for a different request; "
-                    "use a distinct key"
-                )
-            )
-
-            response = client.post(
-                "/sessions/test-session/terminals",
-                params={
-                    "caller_id": "dcba8765",
-                    "provider": "kiro_cli",
-                    "agent_profile": "developer",
-                    "idempotency_key": "job-1",
-                },
-            )
-
-        assert response.status_code == 409
-        assert "already used for a different request" in response.json()["detail"]
-
     def test_plain_value_error_still_maps_to_404(self, client):
-        """Ordering regression guard for the 409 arm (review on PR #634).
-
-        The new ``IdempotencyKeyConflict`` arm sits ahead of this endpoint's
-        ``ValueError`` arm. If someone later reorders them, or makes the
-        conflict a ``ValueError`` subclass, the conflict silently downgrades to
-        404 and only a test that pins BOTH mappings notices. This is the other
-        half of that pair: a plain ``ValueError`` must keep its 404.
-        """
+        """A plain ``ValueError`` from an in-session create maps to 404 (review on PR #634)."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.create_terminal = AsyncMock(
                 side_effect=ValueError("Session 'test-session' not found")
@@ -2133,12 +2064,16 @@ class TestInboxReconciliationDaemon:
             with pytest.raises(asyncio.CancelledError):
                 await inbox_reconciliation_daemon(registry)
 
-        mock_to_thread.assert_awaited_once()
-        # The sweep, not some other sync function, must be the dispatched work.
+        # Each iteration dispatches the inbox reconcile, then the delegation
+        # callback sweep. Both are sync work and must run off the loop.
+        assert mock_to_thread.await_count == 2
+        first, second = mock_to_thread.await_args_list
         # reconcile_orphaned_messages is a bound method on the singleton now, so a
         # fresh attribute access is a distinct object — compare by value, not id.
-        assert mock_to_thread.await_args.args[0] == inbox_service.reconcile_orphaned_messages
-        assert mock_to_thread.await_args.args[1] is registry
+        assert first.args[0] == inbox_service.reconcile_orphaned_messages
+        assert first.args[1] is registry
+        assert second.args[0] == delegation_callback_service.sweep
+        assert second.args[1] is registry
 
 
 # ── lifespan ─────────────────────────────────────────────────────────

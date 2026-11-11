@@ -1,0 +1,67 @@
+id: evt-01
+event: RUN_STARTED
+data: {"event_id": "evt-01", "terminal_id": null, "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:00.000000+00:00", "traceparent": null, "thread_id": "cao-fleet-demo", "run_id": "cao-fleet-demo"}
+
+id: evt-02
+event: STEP_STARTED
+data: {"event_id": "evt-02", "terminal_id": "aaaa1111", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:01.000000+00:00", "traceparent": null, "step_id": "aaaa1111", "step_name": "supervisor", "provider": "kiro_cli"}
+
+id: evt-03
+event: STEP_STARTED
+data: {"event_id": "evt-03", "terminal_id": "bbbb2222", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:02.000000+00:00", "traceparent": null, "step_id": "bbbb2222", "step_name": "developer", "provider": "kiro_cli"}
+
+id: evt-04
+event: TOOL_CALL_START
+data: {"event_id": "evt-04", "terminal_id": "aaaa1111", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:03.000000+00:00", "traceparent": null, "tool_call_id": "evt-04", "tool_call_name": "handoff", "metadata": {"sender": "aaaa1111", "receiver": "bbbb2222", "orchestration_type": "handoff"}}
+
+id: evt-05
+event: TEXT_MESSAGE_CONTENT
+data: {"event_id": "evt-05", "terminal_id": "aaaa1111", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:04.000000+00:00", "traceparent": null, "message_id": "bbbb2222", "role": "assistant", "delta": "", "metadata": {"sender": "aaaa1111", "receiver": "bbbb2222", "orchestration_type": "send_message"}}
+
+id: evt-06.0
+event: TOOL_CALL_END
+data: {"tool_call_id": "evt-04", "tool_call_name": "handoff", "metadata": {"sender": "aaaa1111", "receiver": "bbbb2222", "orchestration_type": "handoff", "closed_by": "superseded", "disposition": "superseded"}, "timestamp": "2026-11-04T10:00:05.000000+00:00"}
+
+id: evt-06
+event: TOOL_CALL_START
+data: {"event_id": "evt-06", "terminal_id": "aaaa1111", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:05.000000+00:00", "traceparent": null, "tool_call_id": "evt-06", "tool_call_name": "a2a_delegation", "metadata": {"sender": "aaaa1111", "receiver": "bbbb2222", "orchestration_type": "a2a"}}
+
+event: STATE_SNAPSHOT
+data: {"snapshot": {"sessions": [], "terminals": [], "counts": {"sessions": 0, "terminals": 0}, "scopes": ["cao:read", "cao:write", "cao:admin"]}}
+
+id: evt-07
+event: STATE_DELTA
+data: {"event_id": "evt-07", "terminal_id": "bbbb2222", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:06.000000+00:00", "traceparent": null, "delta": [{"op": "add", "path": "/last_file_mod", "value": {"path": "src/app.py", "terminal_id": "bbbb2222", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:06.000000+00:00"}}], "metadata": {"event_type": "file_modified", "path": "src/app.py"}}
+
+id: evt-08
+event: CUSTOM
+data: {"type": "CUSTOM", "name": "cao.generative_ui", "value": {"event_id": "evt-08", "terminal_id": "bbbb2222", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:07.000000+00:00", "traceparent": null, "component": "metric", "props": {"label": "tests", "value": 3}}}
+
+id: evt-09
+event: RAW
+data: {"event_id": "evt-09", "terminal_id": "bbbb2222", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:08.000000+00:00", "traceparent": null, "cao_kind": "generative_ui", "rejected_component": "html_blob"}
+
+id: evt-10
+event: RUN_ERROR
+data: {"event_id": "evt-10", "terminal_id": "bbbb2222", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:09.000000+00:00", "traceparent": null, "message": "provider_error", "metadata": {"event_type": "provider_error"}}
+
+id: evt-11
+event: RAW
+data: {"event_id": "evt-11", "terminal_id": null, "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:10.000000+00:00", "traceparent": null, "cao_kind": "other", "cao_type": "flow_tick", "detail": {"event_type": "flow_tick"}}
+
+id: evt-12.0
+event: STEP_FINISHED
+data: {"event_id": "evt-12", "terminal_id": "bbbb2222", "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:11.000000+00:00", "traceparent": null, "step_id": "bbbb2222", "step_name": "developer"}
+
+id: evt-12.1
+event: TOOL_CALL_RESULT
+data: {"tool_call_id": "evt-06", "result": "", "metadata": {"sender": "aaaa1111", "receiver": "bbbb2222", "orchestration_type": "a2a", "closed_by": "completion"}, "timestamp": "2026-11-04T10:00:11.000000+00:00"}
+
+id: evt-12
+event: TOOL_CALL_END
+data: {"tool_call_id": "evt-06", "tool_call_name": "a2a_delegation", "metadata": {"sender": "aaaa1111", "receiver": "bbbb2222", "orchestration_type": "a2a", "closed_by": "completion"}, "timestamp": "2026-11-04T10:00:11.000000+00:00"}
+
+id: evt-13
+event: RUN_FINISHED
+data: {"event_id": "evt-13", "terminal_id": null, "session_name": "cao-fleet-demo", "timestamp": "2026-11-04T10:00:12.000000+00:00", "traceparent": null, "thread_id": "cao-fleet-demo", "run_id": "cao-fleet-demo", "status": "terminated"}
+

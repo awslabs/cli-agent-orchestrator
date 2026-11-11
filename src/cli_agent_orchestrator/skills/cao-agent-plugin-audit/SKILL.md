@@ -1,16 +1,16 @@
 ---
 name: cao-agent-plugin-audit
-description: Audit an existing Agent Plugins 1.0.0 package - check its plugin.json manifest and mcp.json against CAO's vendored schemas, and mechanically check every Agent Skill it ships against the name pattern, the 64-character name bound, folder-equals-name, the 1024-character description limit and the 500-line body limit, four of which CAO's own validator never checks. Use when the user says "audit this Agent Plugin", "is this package conformant", "check these skills against the Agent Skills limits", "cao plugin validate says loadable, is it really fine", or "run gate 1 over skills/". Its validator script needs no CAO install and opens no network connection itself; its first run needs its three declared dependencies available. Not for authoring a new Agent Plugin (use cao-agent-plugin-creator). Not for CAO event plugins, the Python packages that react to cao-server lifecycle events (use cao-plugin). Not for auditing a client-specific agent plugin before migrating it (use migrate-agent-plugin).
+description: Audit an existing Agent Plugins 1.0.0 package - check its plugin.json manifest and mcp.json against CAO's vendored schemas, and mechanically check every Agent Skill it ships against the name pattern, the 64-character name bound, folder-equals-name, the 1024-character description limit and the 500-line body limit, four of which CAO's validator only warns about. Use when the user says "audit this Agent Plugin", "is this package conformant", "check these skills against the Agent Skills limits", "cao plugin validate says loadable, is it really fine", or "run gate 1 over skills/". Its validator script needs no CAO install and opens no network connection itself; its first run needs its three declared dependencies available. Not for authoring a new Agent Plugin (use cao-agent-plugin-creator). Not for CAO event plugins, the Python packages that react to cao-server lifecycle events (use cao-plugin). Not for auditing a client-specific agent plugin before migrating it (use migrate-agent-plugin).
 ---
 
 # Audit an Agent Plugin
 
 Check an existing Agent Plugins 1.0.0 package against two things: the vendored
 manifest schemas, and the Agent Skills limits. The second half is the reason this
-skill exists. **CAO's own validator does not check four of the five skill rules
-below (the name pattern, the 64-character name bound, the 1024-character
-description limit and the 500-line body limit), and no other artifact CAO ships
-enforces them mechanically.**
+skill exists. **CAO does not enforce four of the five skill rules below (the name
+pattern, the 64-character name bound, the 1024-character description limit and
+the 500-line body limit). `cao plugin validate` reports them only as warnings and
+loads the skill anyway.**
 
 This skill audits a package that already follows the Agent Plugins 1.0.0
 structure. It is not a pre-migration review of a client-specific agent plugin;
@@ -18,30 +18,25 @@ that is `migrate-agent-plugin`'s job.
 
 ## What CAO checks, and what it does not
 
-CAO's package validation (`cao plugin validate`, and the loader behind it) checks
-a skill for exactly three things:
+CAO's skill loader (behind `cao skills add`, the skill catalog and
+`cao plugin add`) skips a skill for exactly three things:
 
-1. frontmatter `name` is present and not blank;
-2. frontmatter `description` is present and not blank
+1. frontmatter `name` is missing or blank;
+2. frontmatter `description` is missing or blank
    (`src/cli_agent_orchestrator/models/skill.py`);
-3. the folder name equals the frontmatter `name`
+3. the folder name differs from the frontmatter `name`
    (`src/cli_agent_orchestrator/utils/skills.py`).
 
-**It does not check the Agent Skills name pattern, the 64-character name bound, the
-1024-character description limit, or the 500-line body limit.** Apart from this
-skill, nothing else CAO ships checks them either.
+**It loads a skill that breaks the Agent Skills name pattern, the 64-character name
+bound, the 1024-character description limit or the 500-line body limit.**
 
-What CAO does with a skill that breaks those limits was at first only inferred
-from `models/skill.py`. It has since been observed, in the over-limit experiment
-run for issue #1153 (task T3) and again when this skill was written: a package
-with one skill whose `description` is 2000 characters, or whose body is 600
-lines, validates as `"loadable": true` with `"findings": []` and exit 0, and the
-skill is loaded. **That observation covers only the two length limits.** T3 did
-not test a skill that breaks the name pattern or the 64-character name bound, so
-what CAO does with one is **inferred, not observed**: it is read from
-`models/skill.py:12-19`, which checks only that `name` and `description` are not
-blank, and `utils/skills.py:66-69`, which checks only that the folder name equals
-`name`. Neither applies the pattern or the bound. Reproduce the length case in a
+`cao plugin validate` reports each of those four as a `WARNING` with the same code
+this skill uses (`skill.name_pattern`, `skill.name_length`,
+`skill.description_length`, `skill.body_length`). A warning leaves the package
+loadable and the exit status at 0, and the skill is still loaded and delivered.
+CAO releases before issue #1154 report nothing for them: the over-limit experiment
+for issue #1153 (task T3) observed `"loadable": true` with `"findings": []` for a
+2000-character description and for a 600-line body. Reproduce the length case in a
 temporary directory:
 
 ```bash
@@ -49,14 +44,15 @@ W=$(mktemp -d); mkdir -p "$W/pkg/skills/long-desc"
 printf '{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"pkg"}' > "$W/pkg/plugin.json"
 printf -- '---\nname: long-desc\ndescription: %s\n---\nbody\n' "$(printf 'x%.0s' $(seq 1 2000))" \
   > "$W/pkg/skills/long-desc/SKILL.md"
-CAO_AGENT_PLUGINS_ENABLED=1 cao plugin validate --json "$W/pkg"   # loadable true, findings [], exit 0
+CAO_AGENT_PLUGINS_ENABLED=1 cao plugin validate --json "$W/pkg"   # loadable true, one skill.description_length warning, exit 0
 rm -rf "$W"
 ```
 
 So a package that passes `cao plugin validate` has not been shown to meet the
-Agent Skills limits. Do not tell anyone CAO rejects an over-limit skill. A skill
-over either length limit is loaded (observed); a skill that breaks only the name
-pattern or the 64-character bound is, by reading the code, loaded too (inferred).
+Agent Skills limits: read its warnings. Do not tell anyone CAO rejects an
+over-limit skill. This skill's validator reports the four limits as `LIMIT`
+findings that make it exit 1, needs no CAO install, and also checks a bare
+`skills/` directory.
 
 ## Prior art: a checklist, by hand
 
@@ -80,13 +76,13 @@ pattern for rule 1 is:
 ^[a-z0-9]+(-[a-z0-9]+)*$
 ```
 
-| # | Rule | Limit | Does CAO check it? |
+| # | Rule | Limit | What `cao plugin validate` does |
 |---|---|---|---|
-| 1 | Name pattern | the pattern above | no |
-| 2 | Name length | at most 64 characters | no |
-| 3 | Folder name equals frontmatter `name` | exact | yes |
-| 4 | Description length | at most 1024 characters | no |
-| 5 | Body length | at most 500 lines | no |
+| 1 | Name pattern | the pattern above | warns, still loads |
+| 2 | Name length | at most 64 characters | warns, still loads |
+| 3 | Folder name equals frontmatter `name` | exact | skips the skill |
+| 4 | Description length | at most 1024 characters | warns, still loads |
+| 5 | Body length | at most 500 lines | warns, still loads |
 
 The full rule set, every finding code and its severity are in
 [references/rules.md](references/rules.md).
@@ -218,7 +214,7 @@ line is a summary with a count per severity and the exit status.
 |---|---|---|
 | `FATAL` | **yes** | CAO would reject the whole package. Almost always the manifest. |
 | `SKIPPED` | no | CAO would drop one skill, or MCP, and load the rest. |
-| `LIMIT` | no | Breaks an Agent Skills limit. CAO does not check these: a skill over a length limit is loaded (observed); one that breaks only the name pattern or the 64-character bound is loaded too, by reading the code (inferred). |
+| `LIMIT` | no | Breaks an Agent Skills limit. CAO loads the skill anyway; `cao plugin validate` reports the same condition only as a `WARNING`. |
 | `WARNING` | no | CAO reports it and loads the package, for example an unrecognized top-level manifest key. |
 | `ADVISORY` | no | Input for a human judgement. Never changes the exit status. |
 
@@ -249,14 +245,15 @@ audit exit non-zero.
 5. Read LIMIT: fix each skill until it is inside the limits.
 6. Read the ADVISORY listing and decide whether the description is accurate.
 7. Run again with `CAO_AGENT_PLUGINS_ENABLED=1` set inline to add CAO's verdict.
-   Report the two validators' results separately.
+   Report the two validators' results separately. Each LIMIT finding also
+   appears there as a `cao.skill.*` WARNING: one condition, seen by both.
 
 ## When you report an audit
 
 - Quote the command and its exit status.
 - Quote the summary line verbatim.
 - Name which validator produced each finding.
-- Say "loadable" only about CAO's verdict, and say which limits it does not check.
+- Say "loadable" only about CAO's verdict, and say that CAO only warns about the four limits.
 - Do not say the package meets the Agent Skills limits unless the bundled
   validator ran and exited 0 or 1 with no LIMIT finding.
 

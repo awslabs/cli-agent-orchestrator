@@ -4,11 +4,16 @@
 // event, degrading gracefully on the null-offset seam), FailureDetail,
 // RunComparison, and the diagnostics/delete actions. Live-follows the SSE
 // stream while the run is non-terminal.
+//
+// The Flow section draws the run with WorkflowFlow. Its step states come from
+// the data this view already follows: the polled inspection and the followed
+// events. The call types come from the workflow's spec, read best effort; when
+// that read fails the edges carry no call label.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Loader2, Radio, Ban, RotateCcw, ShieldCheck } from 'lucide-react'
 import { api } from '../../api'
-import type { RunInspection, RunSummaryRow } from '../../api'
+import type { RunInspection, RunSummaryRow, WorkflowSpecStep } from '../../api'
 import { useStore } from '../../store'
 import { useEventFollow } from './useEventFollow'
 import { StepSummary } from './StepSummary'
@@ -20,6 +25,7 @@ import { RunComparison } from './RunComparison'
 import { DiagnosticsExportButton } from './DiagnosticsExportButton'
 import { DeleteRunButton } from './DeleteRunButton'
 import { RunResultPanel } from './RunResultPanel'
+import { WorkflowFlow, runFlowSteps, runStepStates } from './WorkflowFlow'
 import { runCue } from './stateCues'
 
 interface RunDetailProps {
@@ -118,6 +124,20 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
     if (liveState && liveState !== run.state) refreshSelectedRun()
   }, [liveState, run.state, refreshSelectedRun])
 
+  // The spec supplies each step's call type, agent and provider. Best effort:
+  // a Python workflow has no steps here, and a deleted one is a 404.
+  const [specSteps, setSpecSteps] = useState<WorkflowSpecStep[] | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    setSpecSteps(null)
+    api.getWorkflowSpec(run.workflow_name)
+      .then(spec => { if (!cancelled) setSpecSteps(Array.isArray(spec?.steps) ? spec.steps : null) })
+      .catch(() => { /* no call labels */ })
+    return () => { cancelled = true }
+  }, [run.workflow_name])
+  const flowSteps = useMemo(() => runFlowSteps(run, specSteps), [run, specSteps])
+  const flowStates = useMemo(() => runStepStates(run, events), [run, events])
+
   const cue = runCue(effectiveState)
   const selectedEvent = events[selectedIndex] ?? null
 
@@ -197,6 +217,12 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
 
       <RunResultPanel runId={run.run_id} terminal={isTerminal} state={effectiveState} />
       <RunArtifacts runId={run.run_id} terminal={isTerminal} />
+
+      {/* Flow, with live step states */}
+      <div className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-3">
+        <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Flow</h3>
+        <WorkflowFlow steps={flowSteps} states={flowStates} label="Run flow" />
+      </div>
 
       {/* Steps */}
       <div className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-3">

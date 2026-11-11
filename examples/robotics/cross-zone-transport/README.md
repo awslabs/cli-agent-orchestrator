@@ -1163,7 +1163,10 @@ libraries.
 
 On a remote host, such as a browser IDE, forward the port first: in VS Code or
 code-server use the **Ports** panel, or `ssh -L 8766:127.0.0.1:8766 <host>`. Do
-not publish it on a public interface.
+not publish it on a public interface. The page and its state are sent with
+`Cache-Control: no-store`, and each poll adds a changing query, so a CDN in front
+of the forward, such as the CloudFront address of a browser IDE, cannot keep
+showing an old floor.
 
 The controller accepts only `127.0.0.1`, `localhost`, and `::1` in the `Host`
 header of a request, and refuses a cross-site `Origin`. So a web page cannot

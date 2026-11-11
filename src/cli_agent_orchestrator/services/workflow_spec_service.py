@@ -33,9 +33,10 @@ import os
 import re
 import stat
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Literal, Optional, Union, cast
 
 import yaml
 
@@ -59,11 +60,13 @@ from cli_agent_orchestrator.models.workflow import (
     _default_matches_type,
 )
 from cli_agent_orchestrator.models.workflow import validate_only as _model_validate_only
+from cli_agent_orchestrator.models.workflow import validate_spec_text as _model_validate_spec_text
 from cli_agent_orchestrator.services.script_lint import lint_script
 from cli_agent_orchestrator.utils.atomic_file import (
     LockUnavailableError,
     strict_identity_lock,
 )
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,39 @@ class SpecPathRefusedError(ValueError):
 
 class SafePublicationUnavailableError(OSError):
     """The filesystem cannot provide atomic no-replace spec publication."""
+
+
+class WorkflowWriteConflictError(ValueError):
+    """An update was refused because the files on disk conflict with it.
+
+    Raised when a YAML update names a Python workflow, when a Python update names a
+    YAML workflow, or when both ``<name>.yaml`` and ``<name>.yml`` exist so the YAML
+    target is ambiguous. A ``ValueError`` subclass, mapped to 409 before any bare
+    ``ValueError`` arm, the same way :class:`TierCollisionError` is.
+    """
+
+
+WorkflowTier = Literal["python", "yaml"]
+
+# Ends each refusal that a CLI or MCP caller may get for a YAML workflow. Those clients
+# never send ``tier``, so they cannot follow an answer that only names the tier.
+_PYTHON_ONLY_CLIENTS = "The CLI and the MCP tools write Python only."
+
+
+@dataclass(frozen=True)
+class YamlSpecWrite:
+    """What a YAML create or update wrote.
+
+    ``content_hash`` is the sha256 of exactly the bytes written, which is the
+    value ``get_workflow_document`` reports and ``update_yaml_workflow``
+    compares. ``validation`` is the text-only ``validate_only`` result for those
+    bytes: ``pass`` or ``pass_reserved``, never ``fail``.
+    """
+
+    spec: WorkflowSpec
+    path: str
+    content_hash: str
+    validation: ValidationResult
 
 
 # Mode applied to a NEWLY created spec file (issue #583, Bolt 3, SR-3A2-6).
@@ -560,11 +596,25 @@ def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec
         ValueError: the directory is blocked, the file is unreadable, or the
             spec fails grammar validation.
     """
+    spec, _real_path, _text, _raw = _load_yaml_spec(path, base_dir)
+    return spec
+
+
+def _load_yaml_spec(
+    path: str, base_dir: Optional[str] = None
+) -> tuple[WorkflowSpec, str, str, bytes]:
+    """The body of :func:`load_and_validate`, also returning what it read.
+
+    Returns ``(spec, real_path, text, raw)``. ``get_workflow_document`` needs the
+    file text and its hash next to the parsed spec, and they must all come from
+    the SAME read, or a concurrent edit could pair revision A's fields with
+    revision B's hash.
+    """
     # Resolve + contain + read behind ONE guarded helper: the containment
     # SafeAccessCheck is colocated with the open() sink inside the helper, so no
     # unchecked path reaches a filesystem op here (clears alert 166). The file is
     # read EXACTLY ONCE; the capped bytes feed BOTH validation and construction.
-    _real_path, raw = _read_contained_spec_bytes(path, base_dir)
+    real_path, raw = _read_contained_spec_bytes(path, base_dir)
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)")
     try:
@@ -581,11 +631,27 @@ def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec
         raise ValueError("spec root must be a mapping (YAML object)")
     # WorkflowSpec construction re-runs grammar validation; it cannot fail here
     # because validate_only already passed, but the typed model is the contract.
-    return WorkflowSpec(**data)
+    return WorkflowSpec(**data), real_path, text, raw
 
 
 def validate_only(path: str, base_dir: Optional[str] = None) -> ValidationResult:
     """Read a spec file behind the path guard and validate its grammar (FR-1.3).
+
+    The result of :func:`validate_spec_file`, without the parsed spec.
+
+    Raises:
+        ValueError: the base directory is blocked or the path escapes it.
+    """
+    return validate_spec_file(path, base_dir)[0]
+
+
+def validate_spec_file(
+    path: str, base_dir: Optional[str] = None
+) -> tuple[ValidationResult, Optional[WorkflowSpec]]:
+    """Read a spec file behind the path guard, validate its grammar, and return the spec.
+
+    The spec is ``None`` unless grammar passed. ``POST /workflows/validate`` checks each
+    step's params against its profile on that spec, so the file is read once.
 
     The path is canonicalized + bound to its configured base directory first
     (B2-BR-1) so an out-of-policy path is a ``ValueError`` (-> 400). The file is
@@ -608,13 +674,16 @@ def validate_only(path: str, base_dir: Optional[str] = None) -> ValidationResult
         # FileNotFoundError (missing spec) and any other read error degrade to a
         # ``fail`` result — validate_only NEVER raises for an absent spec.
         logger.debug("validate_only: could not read spec %s: %s", path, exc)
-        return ValidationResult(status="fail", errors=[f"could not read spec: {exc}"])
+        return ValidationResult(status="fail", errors=[f"could not read spec: {exc}"]), None
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
-        return ValidationResult(
-            status="fail",
-            errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
+        return (
+            ValidationResult(
+                status="fail",
+                errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
+            ),
+            None,
         )
-    return _model_validate_only(raw.decode("utf-8", errors="replace"))
+    return _model_validate_spec_text(raw.decode("utf-8", errors="replace"))
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +732,7 @@ def _connect():
         WORKFLOW_SPEC_INDEX_BUSY_TIMEOUT_MS,
     )
 
+    # The caller owns the connection and closes it (closing_transaction).
     conn = sqlite3.connect(str(DATABASE_FILE))
     try:
         conn.execute(f"PRAGMA busy_timeout = {WORKFLOW_SPEC_INDEX_BUSY_TIMEOUT_MS}")
@@ -711,7 +781,7 @@ def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: str) -> Non
         description=description,
         indexed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute(
             "INSERT INTO workflow_index "
             "(name, source_path, mode, step_count, description, indexed_at) "
@@ -750,7 +820,7 @@ def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
         glob.glob(os.path.join(safe_dir, "*.yaml")) + glob.glob(os.path.join(safe_dir, "*.yml"))
     )
     py_paths = sorted(glob.glob(os.path.join(safe_dir, "*.py")))
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         conn.execute("DELETE FROM workflow_index")
         conn.commit()
     rows = 0
@@ -805,7 +875,7 @@ def list_workflows(scan_dir: Optional[str] = None) -> List[WorkflowIndexRow]:
     O(n²) reads. Resolve the spec once and pass it down instead.
     """
     rebuild_index_from_files(scan_dir)
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         cursor = conn.execute(
             "SELECT name, source_path, mode, step_count, description, indexed_at "
             "FROM workflow_index ORDER BY name"
@@ -836,7 +906,7 @@ def _resolve_source_path(name: str, scan_dir: Optional[str] = None) -> str:
     """
     _validate_name(name)
     rebuild_index_from_files(scan_dir)
-    with _connect() as conn:
+    with closing_transaction(_connect()) as conn:
         row = conn.execute(
             "SELECT source_path FROM workflow_index WHERE name = ?", (name,)
         ).fetchone()
@@ -1051,41 +1121,49 @@ def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> S
     )
 
 
-def _validate_write_target(name: str, scan_dir: Optional[str]) -> tuple[str, str]:
+def _validate_write_target(
+    name: str, scan_dir: Optional[str], tier: WorkflowTier = "python"
+) -> tuple[str, str]:
     """Validate a write target and return ``(safe_base, target_path)``.
 
-    Shared preconditions of ``create_workflow`` and ``update_workflow``, in the order
-    the design fixes (issue #583, Bolt 3, unit 3). NOTHING here touches the
+    Shared preconditions of the create and update functions of both tiers, in the
+    order the design fixes (issue #583, Bolt 3, unit 3). NOTHING here touches the
     filesystem for writing, so every rejection below leaves it byte-identical.
 
     ``name`` is a BARE name, never a path (TS-3A3-2): it is what
     ``WORKFLOW_NAME_RE`` constrains, what the index is keyed on, and what the
-    tier-collision check needs. The ``.py`` extension is supplied HERE and never by
-    the caller, which is what makes the Python-only rule enforceable rather than
-    advisory.
+    tier-collision check needs. The extension comes from ``tier`` (``.py`` for
+    ``"python"``, ``.yaml`` for ``"yaml"``) and never from the caller, so a caller
+    cannot write a file type the service did not choose.
 
     Raises:
-        ValueError: the name is invalid, or names a tier this service cannot write.
+        ValueError: the name is invalid or carries an extension, or the tier is unknown.
     """
-    # A name carrying an extension is a caller asking for a tier. Answer that
-    # question explicitly rather than letting _validate_name reject the dot as a
-    # charset error (BR-3A3-2): an agent that reasonably tried YAML should learn the
-    # rule, not debug a message that reads like a typo.
+    # A name that carries an extension is refused with a message that says names are
+    # bare (BR-3A3-2), rather than letting _validate_name reject the dot as a charset
+    # error. The '.py' wording is unchanged from the Python-only service. A Python-tier
+    # request that names a YAML file is most often the CLI or an MCP tool, and neither
+    # can send ``tier``. Telling it only that names are bare would lead it to send the
+    # YAML text again under a bare name and get a Python lint error, so it is told where
+    # YAML is written.
     lowered = name.lower()
-    if lowered.endswith((".yaml", ".yml")):
-        raise ValueError(
-            f"workflow '{name}': YAML specs cannot be created or updated through this "
-            "service (issue #583 scope is Python workflows only). YAML specs remain "
-            "readable, listable and deletable."
-        )
-    if lowered.endswith(".py"):
-        raise ValueError(
-            f"workflow '{name}': pass a bare workflow name without the '.py' extension"
-        )
+    for extension in (".yaml", ".yml", ".py"):
+        if lowered.endswith(extension):
+            if tier == "python" and extension != ".py":
+                raise ValueError(
+                    f"workflow '{name}': YAML workflows are written only in the web UI or over "
+                    f"HTTP with tier 'yaml' and a bare name. {_PYTHON_ONLY_CLIENTS}"
+                )
+            raise ValueError(
+                f"workflow '{name}': pass a bare workflow name without the '{extension}' extension"
+            )
+    if tier not in ("python", "yaml"):
+        raise ValueError(f"workflow tier '{tier}' is invalid (expected 'python' or 'yaml')")
 
     _validate_name(name)  # BR-3A3-1 — never reimplemented
     safe_base = _safe_dir(scan_dir)
-    return safe_base, os.path.join(safe_base, f"{name}.py")
+    suffix = ".yaml" if tier == "yaml" else ".py"
+    return safe_base, os.path.join(safe_base, f"{name}{suffix}")
 
 
 def _validated_script_spec(name: str, source: str, target_path: str) -> ScriptSpec:
@@ -1288,7 +1366,8 @@ def update_workflow(
 
     Raises:
         ValueError: invalid name, unwritable tier, lint errors, or malformed ``INPUTS``.
-        WorkflowNotFoundError: no spec with that name existed at update admission.
+        WorkflowNotFoundError: no Python or YAML workflow has that name.
+        WorkflowWriteConflictError: the workflow is a YAML workflow.
         TierCollisionError: a same-stem sibling exists in the other tier.
         StaleSpecError: the spec changed on disk since ``expected_hash`` was read.
     """
@@ -1296,6 +1375,17 @@ def update_workflow(
     lock_target = _safe_spec_path(target_path, safe_base)
     with strict_identity_lock(_workflow_lock_identity(lock_target, safe_base), Path(lock_target)):
         if not _contained_spec_exists(lock_target, safe_base):
+            # The mirror of update_yaml_workflow's refusal of a Python workflow, so a
+            # caller that edits a builder-made file is told why instead of "not found".
+            for extension in (".yaml", ".yml"):
+                yaml_target = _safe_spec_path(
+                    os.path.join(safe_base, f"{name}{extension}"), safe_base
+                )
+                if _contained_spec_exists(yaml_target, safe_base):
+                    raise WorkflowWriteConflictError(
+                        f"workflow '{name}' is a YAML workflow; update it in the web UI or over "
+                        f"HTTP with tier 'yaml'. {_PYTHON_ONLY_CLIENTS}"
+                    )
             raise WorkflowNotFoundError(f"workflow '{name}' does not exist; use create to add it")
         _check_tier_collision(name, safe_base)
 
@@ -1308,6 +1398,212 @@ def update_workflow(
 
         spec = _validated_script_spec(name, source, target_path)
         return _persist_spec(spec, target_path, safe_base)
+
+
+# ---------------------------------------------------------------------------
+# YAML tier writes (the workflow builder's save path)
+# ---------------------------------------------------------------------------
+def _validated_yaml_spec(name: str, source: str) -> tuple[WorkflowSpec, bytes, ValidationResult]:
+    """Validate YAML ``source`` for workflow ``name`` and return what to write.
+
+    The YAML twin of :func:`_validated_script_spec`. Nothing here touches the
+    filesystem. Returns ``(spec, data, result)``: ``data`` is the exact UTF-8
+    encoding of ``source``, so the bytes validated are the bytes written
+    (BR-3A3-8), and ``result`` is the ``validate_only`` verdict (``pass`` or
+    ``pass_reserved``).
+
+    Checks, in order:
+
+    1. UTF-8 encoding, then ``WORKFLOW_MAX_SPEC_BYTES``, so an oversized source gets
+       the same "spec exceeds N bytes (max)" message the Python tier gives;
+    2. grammar, through the text-only ``models.workflow.validate_only``. A ``fail``
+       lists every error, aggregated;
+    3. the spec's ``name:`` must equal ``name``. The index is keyed by ``spec.name``
+       and the file by ``name``, so a mismatch would index the file under a name
+       its path does not carry.
+
+    Raises:
+        ValueError: not UTF-8, over the cap, a grammar failure, or a name mismatch.
+    """
+    try:
+        data = source.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("workflow source must be valid UTF-8") from None
+    if len(data) > WORKFLOW_MAX_SPEC_BYTES:
+        raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)")
+    result = _model_validate_only(source)  # text only; opens no file (SD-1.2)
+    if result.status == "fail":
+        errors = "; ".join(result.errors) or "spec failed validation"
+        raise ValueError(f"workflow '{name}' is not a valid YAML spec: {errors}")
+    spec = WorkflowSpec(**yaml.safe_load(source))  # validate_only passed, so this parses
+    if spec.name != name:
+        raise ValueError(
+            f"workflow '{name}': the spec declares name '{spec.name}', "
+            "which must match the workflow name"
+        )
+    return spec, data, result
+
+
+def _persist_yaml_spec(
+    spec: WorkflowSpec,
+    data: bytes,
+    validation: ValidationResult,
+    target_path: str,
+    safe_base: str,
+    *,
+    create_only: bool = False,
+) -> YamlSpecWrite:
+    """Write validated YAML bytes through the guarded writer, then index them.
+
+    The YAML twin of :func:`_persist_spec`. ``target_path`` is the UNRESOLVED
+    ``<base>/<name>.<ext>``: the writer's symlink refusal (SR-3A2-2) inspects the
+    named path, so passing a realpath here would let a symlinked name write
+    through to the spec it points at. A failed index upsert is logged and the write
+    still succeeds, for the reason ``_persist_spec`` records (BR-3A3-12).
+    """
+    real_path = _write_contained_spec_bytes(
+        target_path,
+        data,
+        base_dir=safe_base,
+        create_only=create_only,
+    )
+    try:
+        # real_path is passed through UNMODIFIED, as _persist_spec does (BR-3A3-11).
+        upsert_index(spec, real_path)
+    except Exception as exc:
+        logger.warning(
+            "workflow '%s' was written but its index row could not be updated (%s); "
+            "the next list/get will rebuild it from disk",
+            spec.name,
+            exc,
+        )
+    return YamlSpecWrite(
+        spec=spec,
+        path=real_path,
+        content_hash=hashlib.sha256(data).hexdigest(),
+        validation=validation,
+    )
+
+
+def create_yaml_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> YamlSpecWrite:
+    """Create a NEW YAML workflow spec as ``<name>.yaml``, refusing every existing tier.
+
+    The YAML twin of :func:`create_workflow`, with the same ordered preconditions.
+    Every check precedes any write, so a refusal leaves the filesystem
+    byte-identical:
+
+    1. name, with the extension chosen here (``_validate_write_target``);
+    2. no YAML spec of this name exists, as ``<name>.yaml`` or ``<name>.yml``
+       (``FileExistsError``);
+    3. no ``<name>.py`` exists (``TierCollisionError``). Without this check the
+       YAML file would win the index and the Python spec would drop out of every
+       listing;
+    4. text-only grammar validation and the name match (``_validated_yaml_spec``);
+    5. write, then index.
+
+    The lock identity comes from ``<name>.py`` for every writer of this name, as in
+    :func:`delete_workflow`. A YAML create and a Python create of one name
+    therefore serialize, and whichever runs second sees the other's file.
+
+    Raises:
+        ValueError: invalid name, not UTF-8, over the cap, grammar errors, or a
+            ``name:`` that differs from ``name``.
+        FileExistsError: a YAML spec with that name already exists.
+        TierCollisionError: ``<name>.py`` exists.
+    """
+    safe_base, target_path = _validate_write_target(name, scan_dir, tier="yaml")
+    # Resolve + contain every candidate before the lock, as create_workflow does,
+    # so a refused path creates no lock sidecar.
+    lock_target = _safe_spec_path(os.path.join(safe_base, f"{name}.py"), safe_base)
+    yaml_target = _safe_spec_path(target_path, safe_base)
+    yml_target = _safe_spec_path(os.path.join(safe_base, f"{name}.yml"), safe_base)
+    with strict_identity_lock(_workflow_lock_identity(lock_target, safe_base), Path(lock_target)):
+        if _contained_spec_exists(yaml_target, safe_base) or _contained_spec_exists(
+            yml_target, safe_base
+        ):
+            raise FileExistsError(f"workflow '{name}' already exists; use update to change it")
+        if _contained_spec_exists(lock_target, safe_base):
+            raise TierCollisionError(name)  # -> 409
+        spec, data, validation = _validated_yaml_spec(name, source)
+        return _persist_yaml_spec(spec, data, validation, target_path, safe_base, create_only=True)
+
+
+def update_yaml_workflow(
+    name: str, source: str, expected_hash: str, scan_dir: Optional[str] = None
+) -> YamlSpecWrite:
+    """Replace an EXISTING YAML workflow spec at its own path, refusing to create one.
+
+    The YAML twin of :func:`update_workflow`. The target is ``<name>.yaml``, or
+    ``<name>.yml`` when that is the file that exists; an update never renames it.
+    ``expected_hash`` is required and compared under the lock, against the sha256
+    of the current file bytes, which is the same value ``get_workflow_document``
+    reports as ``content_hash``.
+
+    Raises:
+        ValueError: invalid name, not UTF-8, over the cap, grammar errors, or a
+            ``name:`` that differs from ``name``.
+        WorkflowNotFoundError: no YAML or Python workflow has that name.
+        WorkflowWriteConflictError: the workflow is a Python workflow, or both
+            ``<name>.yaml`` and ``<name>.yml`` exist.
+        TierCollisionError: ``<name>.py`` exists beside the YAML spec.
+        StaleSpecError: the spec changed on disk since ``expected_hash`` was read.
+    """
+    safe_base, target_path = _validate_write_target(name, scan_dir, tier="yaml")
+    yml_path = os.path.join(safe_base, f"{name}.yml")
+    lock_target = _safe_spec_path(os.path.join(safe_base, f"{name}.py"), safe_base)
+    yaml_target = _safe_spec_path(target_path, safe_base)
+    yml_target = _safe_spec_path(yml_path, safe_base)
+    with strict_identity_lock(_workflow_lock_identity(lock_target, safe_base), Path(lock_target)):
+        has_yaml = _contained_spec_exists(yaml_target, safe_base)
+        has_yml = _contained_spec_exists(yml_target, safe_base)
+        has_python = _contained_spec_exists(lock_target, safe_base)
+        if not (has_yaml or has_yml):
+            if has_python:
+                raise WorkflowWriteConflictError(
+                    f"workflow '{name}' is a Python workflow; update it with tier 'python'"
+                )
+            raise WorkflowNotFoundError(f"workflow '{name}' does not exist; use create to add it")
+        if has_python:
+            raise TierCollisionError(name)  # -> 409
+        if has_yaml and has_yml:
+            raise WorkflowWriteConflictError(
+                f"workflow '{name}' has both '{name}.yaml' and '{name}.yml'; "
+                "remove one of them before updating"
+            )
+        current_path = target_path if has_yaml else yml_path
+
+        # Same lock-held compare as update_workflow. ``compare_digest`` refuses a
+        # non-ASCII str with TypeError, so a non-ASCII hash is stale, not a 500.
+        actual_hash = _current_source_hash(current_path, safe_base)
+        if not (expected_hash.isascii() and hmac.compare_digest(actual_hash, expected_hash)):
+            raise StaleSpecError(name, expected_hash, actual_hash)
+
+        spec, data, validation = _validated_yaml_spec(name, source)
+        return _persist_yaml_spec(spec, data, validation, current_path, safe_base)
+
+
+def get_workflow_document(name_or_path: str, scan_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Return the ``GET /workflows/{name}`` body for a workflow (both tiers).
+
+    A Python workflow returns ``ScriptSpec.model_dump()``, exactly as before. A YAML
+    workflow returns ``WorkflowSpec.model_dump()`` plus ``path`` (the resolved file
+    path), ``source`` (the file text) and ``content_hash`` (the sha256 of the file
+    bytes, the value :func:`update_yaml_workflow` compares). All of it comes from
+    ONE read of the file. The three fields are added here, not on
+    ``WorkflowSpec``, because that model's JSON is snapshotted into run journals.
+
+    Resolution and errors are those of :func:`get_workflow`.
+    """
+    real_path = _resolve_workflow_path(name_or_path, scan_dir)
+    ext = os.path.splitext(real_path)[1].lower()
+    if ext in (".yaml", ".yml"):
+        spec, read_path, text, raw = _load_yaml_spec(real_path, base_dir=scan_dir)
+        document = spec.model_dump()
+        document["path"] = read_path
+        document["source"] = text
+        document["content_hash"] = hashlib.sha256(raw).hexdigest()
+        return document
+    return _load_by_extension(real_path, scan_dir).model_dump()
 
 
 def get_workflow(
@@ -1324,6 +1620,11 @@ def get_workflow(
     ``FileNotFoundError`` / ``ValueError`` as ``load_and_validate`` does for
     the YAML arm.
     """
+    return _load_by_extension(_resolve_workflow_path(name_or_path, scan_dir), scan_dir)
+
+
+def _resolve_workflow_path(name_or_path: str, scan_dir: Optional[str]) -> str:
+    """Resolve a workflow name or a file path to its source path (shared by both getters)."""
     # A path-like argument is canonicalized + bound to its configured base
     # directory BEFORE the stat (never stat raw user input); a bare name falls
     # through to the index lookup. ``_contained_spec_file`` colocates the
@@ -1333,11 +1634,10 @@ def get_workflow(
     if os.sep in name_or_path or (os.altsep and os.altsep in name_or_path):
         safe_path = _contained_spec_file(name_or_path, scan_dir)
         if safe_path is not None:
-            return _load_by_extension(safe_path, scan_dir)
+            return safe_path
     # The resolved source_path lives under scan_dir (the index was rebuilt from
     # it), so bind containment to that same dir on load.
-    source_path = _resolve_source_path(name_or_path, scan_dir)
-    return _load_by_extension(source_path, scan_dir)
+    return _resolve_source_path(name_or_path, scan_dir)
 
 
 def _load_by_extension(real_path: str, scan_dir: Optional[str]) -> Union[WorkflowSpec, ScriptSpec]:
@@ -1391,10 +1691,10 @@ def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:
         except FileNotFoundError:
             # The index row pointed at a now-missing file. Drop the stale row and
             # surface the unknown name rather than masking it as success.
-            with _connect() as conn:
+            with closing_transaction(_connect()) as conn:
                 conn.execute("DELETE FROM workflow_index WHERE name = ?", (name,))
                 conn.commit()
             raise KeyError(name)
-        with _connect() as conn:
+        with closing_transaction(_connect()) as conn:
             conn.execute("DELETE FROM workflow_index WHERE name = ?", (name,))
             conn.commit()

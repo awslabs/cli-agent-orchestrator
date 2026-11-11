@@ -965,6 +965,7 @@ class HerdrInboxService:
                 self._working_since.pop(terminal_id, None)
                 self._deliver(terminal_id)
                 delivered += 1
+            self._note_activity(terminal_id, pane.get("agent_status"))
             # A transition missed while disconnected surfaces here as the
             # pane's current status (issue #1082 busy time).
             await self._record_agent_status(terminal_id, pane.get("agent_status"), _utcnow())
@@ -1099,7 +1100,22 @@ class HerdrInboxService:
                     if terminal_id not in self._working_since:
                         self._working_since[terminal_id] = time.time()
 
+            self._note_activity(terminal_id, status)
             await self._record_agent_status(terminal_id, status, observed_at)
+
+    @staticmethod
+    def _note_activity(terminal_id: str, agent_status: object) -> None:
+        """Tell the StatusMonitor that herdr saw the agent working or blocked.
+
+        The delegation callback only forwards a terminal that has shown work
+        on its last input (``StatusMonitor.started_on_last_input``). On herdr
+        that evidence exists only here, in herdr's own agent_status reports.
+        """
+        if agent_status not in ("working", "blocked"):
+            return
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        status_monitor.note_native_activity(terminal_id)
 
     def _label_still_live(self, window_name: str) -> Optional[bool]:
         """Return tab liveness, or None when Herdr cannot establish it.

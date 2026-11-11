@@ -23,12 +23,19 @@ SPEC = {"spec_version": 1, "purpose": "log_triage", "brief": "Inspect logs.", "t
 
 
 @pytest.fixture
-def create_store(tmp_path, monkeypatch):
+def create_store(tmp_path, monkeypatch, request):
     from cli_agent_orchestrator.services import ephemeral_service as service
 
-    engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-    )
+    # HTTP tests with a live lifespan opt into independent SQLite connections.
+    if getattr(request, "param", None) == "file":
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'ephemeral.sqlite'}",
+            connect_args={"check_same_thread": False},
+        )
+    else:
+        engine = create_engine(
+            "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+        )
     database.Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine)
     monkeypatch.setattr(database, "SessionLocal", factory)

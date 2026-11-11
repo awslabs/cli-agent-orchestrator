@@ -491,10 +491,14 @@ async function pagePhase() {
         if (this.onopen) this.onopen({});
       }
       // Like a real EventSource, a frame with no id: line reports the last id
-      // seen on this object, across events and reconnects.
+      // seen on this object, across events and reconnects. AG-UI 1.0 frames are
+      // unnamed, so the event type travels in the data: an object payload is
+      // sent as {type, ...data}; a string payload is sent verbatim.
       emit(type, data, id) {
         if (id) this.lastEventId = id;
-        const ev = { data: typeof data === "string" ? data : JSON.stringify(data), lastEventId: this.lastEventId || "" };
+        const body = typeof data === "string" ? data : JSON.stringify({ type, ...data });
+        const ev = { data: body, lastEventId: this.lastEventId || "" };
+        if (this.onmessage) this.onmessage(ev);
         (this.listeners[type] || []).forEach((fn) => fn(ev));
       }
       fail(readyState) {
@@ -522,8 +526,15 @@ async function pagePhase() {
     "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization",
     "Access-Control-Allow-Methods": "POST",
   };
+  // Every POST body the page sent to the stubbed run plane, parsed.
+  const runRequests = [];
   await page.route("http://*.test/agui/v1/run", async (route) => {
     if (route.request().method() === "OPTIONS") return route.fulfill({ status: 204, headers: cors });
+    try {
+      runRequests.push(JSON.parse(route.request().postData() ?? "null"));
+    } catch {
+      runRequests.push(null);
+    }
     if (holdRun) await holdRun;
     return route.fulfill({
       status: 200,
@@ -550,14 +561,21 @@ async function pagePhase() {
   const emit = (type, data, id) =>
     page.evaluate(([t, d, i]) => window.__es.emit(t, d, i), [type, data, id]);
   // A generative-UI frame as cao-server sends it: AG-UI CUSTOM named
-  // cao.generative_ui, the component in `value`. A string is spliced in raw so
-  // a test can send JSON that JSON.stringify cannot produce (e.g. 1e999).
+  // cao.generative_ui, the component in `value`, and the CAO record id in
+  // metadata.cao.eventId (what the page dedupes on). A string is spliced in raw
+  // so a test can send JSON that JSON.stringify cannot produce (e.g. 1e999).
   const emitUi = (ui, id) =>
     emit(
       "CUSTOM",
       typeof ui === "string"
-        ? `{"type":"CUSTOM","name":"cao.generative_ui","value":${ui}}`
-        : { type: "CUSTOM", name: "cao.generative_ui", value: ui },
+        ? `{"type":"CUSTOM","name":"cao.generative_ui","value":${ui}` +
+            (id ? `,"metadata":{"cao":{"eventId":${JSON.stringify(id)}}}` : "") +
+            "}"
+        : {
+            name: "cao.generative_ui",
+            value: ui,
+            ...(id ? { metadata: { cao: { eventId: id } } } : {}),
+          },
       id,
     );
 
@@ -627,6 +645,10 @@ async function pagePhase() {
     await emitUi('{"component":"progress","props":{"label":"p","value":1e999}}', "p1");
     const progress = await page.locator("#components").innerText();
     expect(!/NaN%|Infinity%/.test(progress), "a non-finite progress value is not shown as a percentage");
+    expect(
+      (await page.locator("#components .gcard .gtype", { hasText: "progress" }).count()) === 1,
+      "the raw-string frame still reaches the cards (one progress card)",
+    );
 
     // 7. A transient error after the stream opened says reconnecting.
     await emit("STATE_SNAPSHOT", { snapshot: { sessions: [], terminals: [] } }, "x1");
@@ -635,7 +657,8 @@ async function pagePhase() {
     expect(/reconnecting/i.test(status) && !/no CAO server/.test(status), `a transient error shows reconnecting (got "${status}")`);
 
     // 8. STATE_SNAPSHOT and STATE_DELTA carry no id: line, so they report the
-    // previous record's id. They must never be deduped; records still are.
+    // previous record's id. They must never be deduped; records still are
+    // (on metadata.cao.eventId, across EventSource's own reconnects).
     await connect();
     const record = (n) => ({ component: "metric", props: { label: "rec-" + n, value: n } });
     for (const n of [1, 2, 3]) {
@@ -717,6 +740,111 @@ async function pagePhase() {
     expect(
       /closer-one/.test(logText) && /closer-two/.test(logText),
       "frames without an id: line after a record are logged, not dropped",
+    );
+
+    // 12. AG-UI 1.0 basic/run-input.mdx: "a consumer implementing this version
+    // MUST declare the version it speaks here". Every run body says 1.0.
+    await connect();
+    runRequests.length = 0;
+    runBody = finished({ type: "success" });
+    await page.locator("#send").click();
+    await page.locator('[data-testid="run-result"]').first().waitFor({ timeout: 5_000 }).catch(() => {});
+    expect(
+      runRequests.length === 1 && runRequests[0]?.protocolVersion === "1.0",
+      `the run input declares protocolVersion "1.0" (got ${JSON.stringify(runRequests[0]?.protocolVersion)})`,
+    );
+
+    // 13. basic/patterns/interrupt-resume.mdx: "The resume list MUST cover every
+    // interrupt of the run being continued". With two interrupts open, deciding
+    // one sends nothing; deciding the second sends one resume covering both.
+    await connect();
+    const interrupt = (id) => ({
+      id,
+      reason: "claude-code:permission_request",
+      metadata: { options: ["approve", "deny"], provider: "claude_code", terminalId: "t-" + id },
+    });
+    runBody = finished({ type: "interrupt", interrupts: [interrupt("multi-a"), interrupt("multi-b")] });
+    await page.locator("#send").click();
+    await page
+      .locator('[data-interrupt-id="multi-b"][data-state="pending"]')
+      .waitFor({ timeout: 5_000 })
+      .catch(() => {});
+    const multiThread = runRequests.at(-1)?.threadId;
+    runRequests.length = 0;
+    runBody = finished({ type: "success" });
+    await page.locator('[data-interrupt-id="multi-a"] [data-testid="approval-approve"]').click();
+    await page.waitForTimeout(300);
+    expect(runRequests.length === 0, `deciding one of two interrupts sends nothing yet (sent ${runRequests.length})`);
+    expect((await stateOf("multi-a")) === "held", `the decided card is held (got ${await stateOf("multi-a")})`);
+    await page.locator('[data-interrupt-id="multi-b"] [data-testid="approval-reject"]').click();
+    await page
+      .locator('[data-interrupt-id="multi-b"][data-state="rejected"]')
+      .waitFor({ timeout: 5_000 })
+      .catch(() => {});
+    const sent = runRequests.length === 1 ? runRequests[0].resume : null;
+    expect(
+      JSON.stringify(sent) ===
+        JSON.stringify([
+          { interruptId: "multi-a", status: "resolved", payload: { approved: true } },
+          { interruptId: "multi-b", status: "resolved", payload: { approved: false } },
+        ]),
+      `one resume covers both interrupts, in order (got ${JSON.stringify(runRequests.map((r) => r?.resume))})`,
+    );
+    expect(
+      typeof multiThread === "string" && runRequests[0]?.threadId === multiThread,
+      "the resume continues the interrupted run's thread",
+    );
+    expect(
+      (await stateOf("multi-a")) === "approved" && (await stateOf("multi-b")) === "rejected",
+      `both cards settle as decided (got ${await stateOf("multi-a")}, ${await stateOf("multi-b")})`,
+    );
+
+    // 14. A collecting run sent while a decision is held starts a fresh thread
+    // (it must not continue past the interrupts it does not answer), and when its
+    // interrupt outcome replaces the list, decisions for ids still listed are
+    // kept and the rest dropped; the resume then covers the new list on the new
+    // run's thread.
+    await connect();
+    runRequests.length = 0;
+    runBody = finished({ type: "interrupt", interrupts: [interrupt("keep-a"), interrupt("gone-b")] });
+    await page.locator("#send").click();
+    await page
+      .locator('[data-interrupt-id="gone-b"][data-state="pending"]')
+      .waitFor({ timeout: 5_000 })
+      .catch(() => {});
+    const firstThread = runRequests.at(-1)?.threadId;
+    await page.locator('[data-interrupt-id="keep-a"] [data-testid="approval-approve"]').click();
+    expect((await stateOf("keep-a")) === "held", `the decided card is held (got ${await stateOf("keep-a")})`);
+    runRequests.length = 0;
+    runBody = finished({ type: "interrupt", interrupts: [interrupt("keep-a"), interrupt("new-c")] });
+    await page.locator("#send").click();
+    await page
+      .locator('[data-interrupt-id="new-c"][data-state="pending"]')
+      .waitFor({ timeout: 5_000 })
+      .catch(() => {});
+    const secondThread = runRequests[0]?.threadId;
+    expect(
+      runRequests.length === 1 && !runRequests[0].resume && typeof secondThread === "string" && secondThread !== firstThread,
+      `the collecting run uses a fresh threadId, not the interrupted run's (${secondThread} vs ${firstThread})`,
+    );
+    expect((await stateOf("keep-a")) === "held", `a decision for an id still listed is kept (got ${await stateOf("keep-a")})`);
+    expect((await stateOf("gone-b")) === "settled", `a card the new list dropped is settled (got ${await stateOf("gone-b")})`);
+    runRequests.length = 0;
+    runBody = finished({ type: "success" });
+    await page.locator('[data-interrupt-id="new-c"] [data-testid="approval-reject"]').click();
+    await page
+      .locator('[data-interrupt-id="new-c"][data-state="rejected"]')
+      .waitFor({ timeout: 5_000 })
+      .catch(() => {});
+    expect(
+      runRequests.length === 1 &&
+        runRequests[0].threadId === secondThread &&
+        JSON.stringify(runRequests[0].resume) ===
+          JSON.stringify([
+            { interruptId: "keep-a", status: "resolved", payload: { approved: true } },
+            { interruptId: "new-c", status: "resolved", payload: { approved: false } },
+          ]),
+      `the resume covers the new list on its thread (got ${JSON.stringify(runRequests.map((r) => [r?.threadId, r?.resume]))})`,
     );
   } catch (error) {
     expect(false, `driver error: ${error.message.split("\n")[0]}`);

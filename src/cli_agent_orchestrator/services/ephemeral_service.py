@@ -60,6 +60,7 @@ from cli_agent_orchestrator.utils.private_files import (
     remove_owned,
     write_exclusive,
 )
+from cli_agent_orchestrator.utils.tool_mapping import get_launch_disallowed_tools
 
 logger = logging.getLogger(__name__)
 EPHEMERAL_DIR = CAO_HOME_DIR / "ephemeral"
@@ -1284,6 +1285,11 @@ class EphemeralDecisionInputs:
     description: Optional[str]
     # #1099: CAO's options for a provider "auto" spec; None for every other spec.
     provider_options: Optional[ProviderOptions] = None
+    # #1199 (provisional): the tier resolved at create, which a local match never goes below
+    # without a size answer, and whether the stored grant has web_fetch, for the advisory
+    # needs_network hint. The engine never sends either to a decider.
+    launch_tier: Optional[str] = None
+    network_granted: Optional[bool] = None
 
 
 def _equivalent_set(settings: dict[str, Any], provider: str) -> list[str]:
@@ -1401,7 +1407,15 @@ def decision_inputs(
         # #1099 (provisional): provider.route is asked first; its fallback is the row's.
         states = {"provider.route": "auto", **states}
         options = provider_options(row, spec, settings)
-    return EphemeralDecisionInputs(states, policy, spec.purpose, spec.description, options)
+    return EphemeralDecisionInputs(
+        states,
+        policy,
+        spec.purpose,
+        spec.description,
+        options,
+        launch_tier=row["model_tier"],
+        network_granted="web_fetch" in row["effective_tools"],
+    )
 
 
 @dataclass(frozen=True)
@@ -1876,18 +1890,18 @@ def bind_ephemeral_agent(
                 _finish_gc(row)
             raise _bind_rule(row, caller_id, provider, claim_id)
         assert row is not None
-        _audit_update(
-            row,
-            "bound",
-            terminal_id=terminal_id,
-            effective_tools=tools,
-            # #1099 (provisional): a routed launch's bound event names the provider that ran.
-            **(
-                {"provider": launched_provider}
-                if launched_provider not in (None, row["provider"])
-                else {}
-            ),
-        )
+        bound_facts: dict[str, Any] = {}
+        # #1099 (provisional): a routed launch's bound event names the provider that ran.
+        if launched_provider not in (None, row["provider"]):
+            bound_facts["provider"] = launched_provider
+        # A Claude Code helper's --disallowedTools, computed by the function its
+        # launch command uses, so the record is the list the helper ran with.
+        runs_on = launched_provider if launched_provider is not None else row["provider"]
+        if runs_on == "claude_code":
+            bound_facts["disallowed_tools"] = get_launch_disallowed_tools(
+                "claude_code", tools, ephemeral=True
+            )
+        _audit_update(row, "bound", terminal_id=terminal_id, effective_tools=tools, **bound_facts)
     except EphemeralPolicyError as exc:
         _report_refusal(name, caller_id, row, exc)
         raise

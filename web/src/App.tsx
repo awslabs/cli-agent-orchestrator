@@ -67,7 +67,7 @@ function Snackbar() {
   return (
     <div role="alert" className={`fixed bottom-4 right-4 z-50 px-4 py-3 rounded-lg border shadow-lg flex items-center gap-2 text-white ${colors[snackbar.type]}`}>
       {icons[snackbar.type]}
-      <span className="text-sm">{snackbar.message}</span>
+      <span className="text-sm whitespace-pre-line">{snackbar.message}</span>
     </div>
   )
 }
@@ -96,7 +96,7 @@ export default function App() {
   const navLocked = useStore(s => s.navLockCount > 0)
 
   // Two independent gates, both fail-closed. Memory is a runtime capability
-  // check; Plugins is the build-time M1 gate (Requirement 16.5) and mirrors
+  // check; Plugins is the build-time graduation gate (#1244) and mirrors
   // `hidden=True` on the Click group and `Policy::Hidden` on the TUI rows.
   const fullBleed = tab === 'workspace'
 

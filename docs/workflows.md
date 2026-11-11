@@ -15,7 +15,14 @@ There are two authoring tiers:
   easier to author and lint, but its `parallel` / `pipeline` / `loop` modes are
   **reserved and not yet executable** in the current build (they validate as
   `pass_reserved`, they do not run). Reach for it only for a plain sequential spec; for
-  anything with real control flow, write a script.
+  anything with real control flow, write a script. YAML specs are made and edited in the web
+  UI's workflow builder (see [Workflows in the Web UI](web-ui.md#workflows)), or over HTTP
+  with `tier: "yaml"` on `POST /workflows` and `PUT /workflows/{name}`, behind the same
+  guarded write path as Python specs (see [Workflows in the API overview](api.md#workflows)).
+  The CLI verbs and the MCP authoring tools write Python specs only. They never send `tier`,
+  and a test checks the request bodies the MCP tools send, so FR-10 still holds: no
+  authoring tool asks the user to choose a format. `tier` is not a security boundary,
+  though. Anything that can reach the HTTP routes can send it, and auth is off by default.
 
 When in doubt, write a script.
 
@@ -181,6 +188,112 @@ The CLI coerces `--input` values ergonomically — `true`/`false` → bool, a ba
 int, everything else stays a string — but the engine still validates the coerced value
 against the declared type, so a mismatch surfaces as an error rather than running with
 the wrong value.
+
+## YAML step fields: `call` and `params`
+
+A YAML step can carry two optional fields, `call` and `params`.
+
+```yaml
+name: order-sync-check
+description: Order sync smoke check
+mode: sequential
+inputs:
+  run_label: {type: string, required: true}
+steps:
+  - id: check-ddb-row
+    provider: claude_code
+    agent: ddb-checker
+    call: handoff
+    params:
+      aws-profile-name: "beta"
+      table-name: "example-table"
+    prompt: "Check that the order row for {{workflow.inputs.run_label}} exists. Reply PASS or FAIL."
+```
+
+`call` says how the engine hands the step to its agent. The value is `handoff`, `assign` or
+`send_message`, and a step without `call` is a `handoff`. Only `handoff` runs in this build.
+`assign` and `send_message` are reserved:
+
+- validation reports `pass_reserved`, with a note such as
+  `construct 'assign' is reserved (not built yet)`;
+- a run that uses one is refused with `501` on both `POST /workflows/runs` and
+  `POST /workflows/runs:submit`, before anything is journaled.
+
+`params` is a map of names to string values that the step's agent needs, such as a profile
+name or a table name. The grammar check enforces these rules:
+
+- at most 32 entries per step;
+- each name starts with a letter and has at most 64 characters, using letters, digits,
+  `_`, `.` and `-`;
+- each value is a string of at most 512 characters, on one line, with no `{{...}}`
+  placeholder.
+
+Quote numbers and booleans (`"123456789012"`, `"true"`). An unquoted value parses as a
+number or a boolean, and validation fails with a message that names the step and the param.
+
+The engine adds the params to the end of the step prompt, in the order they are declared:
+
+```text
+Check that the order row for run-7 exists. Reply PASS or FAIL.
+
+Parameters for this step:
+- aws-profile-name: beta
+- table-name: example-table
+```
+
+Values are sent as written. A value that contains a `{{...}}` placeholder fails the grammar
+check, because param values are fixed when the workflow is built:
+
+```text
+step 'check-ddb-row': param 'table-name' contains a {{...}} placeholder. Param values are fixed when the workflow is built.
+```
+
+Single braces, as in a JSON value like `{"a": 1}`, are allowed. The grammar check runs at
+save, validate and run, so such a value fails at each of them. A step without params gets
+exactly the prompt it got before params existed. Retries, the structured-output reprompt
+and `cao workflow step` replays send the same parameters block.
+
+**Params are journaled in plaintext**, with the rest of the spec in the run's snapshot, the
+same as inputs. Never put a secret in a param. Pass the name of a profile or a secret, and
+resolve the value inside the step.
+
+### Params a profile declares
+
+An agent profile can declare the params a step that uses it must fill (see
+[Workflow step params](agent-profile.md#workflow-step-params)). When it does, the server
+checks each step's values against the declaration:
+
+- a required param is set and not empty (an empty string counts as missing);
+- an `int` value is a whole number of at most 18 digits, such as `"25"` or `"-3"`;
+- a `bool` value is exactly `"true"` or `"false"`;
+- a value for a param with an `enum` is one of the enum values, written as a string.
+
+Step values stay quoted strings. A step may also set params the profile does not declare.
+The errors name the step and the param, and never the value:
+
+```text
+step 'read-orders': missing required param 'table_name' (declared by profile 'dynamodb-query-agent')
+step 'read-orders': param 'limit' must be a whole number
+step 'read-orders': param 'partition_key_type' must be one of: S, N, B
+```
+
+The check runs in two places:
+
+- **Validate.** `cao workflow validate` and `POST /workflows/validate`, in both its path
+  form and its source form, run it after the grammar check passes. Each error is added to
+  `errors`, and the result is `fail`.
+- **Run start.** `POST /workflows/runs` and `POST /workflows/runs:submit` refuse the run
+  with `422`, with the errors in `detail`, before anything is journaled. `cao workflow run`
+  prints the errors and exits 1.
+
+It does not run when a workflow is saved, so a workflow can be saved on a machine where its
+profile is not installed. It does not run on resume or replay, which use the run's journaled
+spec. A profile that is not installed, or that fails to load, gives no errors here; the
+step's launch reports it, as before.
+
+Nothing is filled in at run start. A run sends exactly the values in the file. A declared
+default reaches a step only when the workflow builder wrote it into the file, so a later
+change to the profile's default cannot change what a saved workflow sends.
 
 ## Running: submit-and-follow, detach, or block
 
