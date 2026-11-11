@@ -123,7 +123,7 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
 from cli_agent_orchestrator.graph.sinks import get_sink
-from cli_agent_orchestrator.models.delegation import EdgeReason, EdgeSource
+from cli_agent_orchestrator.models.delegation import EdgeSource
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
@@ -4883,7 +4883,6 @@ async def create_terminal_in_session(
     idempotency_key: Optional[str] = None,
     lookup_only: bool = False,
     expect_callback: bool = False,
-    worker_can_reply: bool = True,
     claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -5057,11 +5056,8 @@ async def create_terminal_in_session(
         if expect_callback:
             existing_edge = await asyncio.to_thread(find_any_edge, caller_id, result.id)
             if existing_edge is None:
-                reason = (
-                    EdgeReason.NO_CALLBACK if worker_can_reply else EdgeReason.NO_SEND_MESSAGE_TOOL
-                )
                 await asyncio.to_thread(
-                    create_delegation_edge, caller_id, result.id, EdgeSource.ASSIGN, reason
+                    create_delegation_edge, caller_id, result.id, EdgeSource.ASSIGN
                 )
         _set_launch_note(response, launch_plan)
         return result
