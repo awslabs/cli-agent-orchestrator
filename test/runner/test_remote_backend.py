@@ -1082,3 +1082,62 @@ class TestMalformedHellos:
             ]
         )
         assert parsed == {("s", "a"): "aaaaaaaa", ("s", "b"): None, ("s", "c"): None}
+
+
+class TestTheTokenStaysOutOfDebugLogs:
+    """With CAO_LOG_LEVEL=DEBUG, websockets logs each handshake header, the
+    runner token's Authorization header included. Both processes cap the
+    websockets loggers at INFO (#745)."""
+
+    def test_a_debug_handshake_logs_no_token(self, tmp_path, caplog):
+        import logging
+
+        from cli_agent_orchestrator.runner.protocol import quiet_websockets_logging
+
+        ws_logger = logging.getLogger("websockets")
+        previous = ws_logger.level
+        caplog.set_level(logging.DEBUG)  # the root logger, as CAO_LOG_LEVEL=DEBUG sets it
+        ws_logger.setLevel(logging.NOTSET)
+        try:
+            quiet_websockets_logging()
+            h = RunnerHub(token=TOKEN, host="127.0.0.1", port=0, call_timeout=5)
+            h.start()
+            r = RunnerThread(f"ws://127.0.0.1:{h.port}", "a", str(tmp_path / "a"))
+            try:
+                wait_for(lambda: "a" in h.connected_runners())
+            finally:
+                r.stop()
+                h.stop()
+        finally:
+            ws_logger.setLevel(previous)
+
+        assert caplog.records, "nothing was logged: the check would prove nothing"
+        assert not [rec for rec in caplog.records if TOKEN in rec.getMessage()]
+
+    @pytest.mark.parametrize("entry", ["cao-server", "cao-runner"])
+    def test_both_processes_quiet_websockets_at_debug(self, entry, monkeypatch, tmp_path):
+        import logging
+
+        ws_logger = logging.getLogger("websockets")
+        previous = ws_logger.level
+        ws_logger.setLevel(logging.NOTSET)
+        root = logging.getLogger()
+        root_level = root.level
+        root.setLevel(logging.DEBUG)
+        try:
+            if entry == "cao-server":
+                from cli_agent_orchestrator.utils import logging as cao_logging
+
+                monkeypatch.setattr(cao_logging, "LOG_DIR", tmp_path)
+                monkeypatch.setattr(cao_logging.ConfigService, "get", lambda *a, **k: "DEBUG")
+                cao_logging.setup_logging()
+            else:
+                from cli_agent_orchestrator.runner import agent as agent_mod
+
+                monkeypatch.setenv("CAO_LOG_LEVEL", "DEBUG")
+                with pytest.raises(SystemExit):
+                    agent_mod.main([])  # no --server-url: stops after logging is set up
+            assert ws_logger.getEffectiveLevel() >= logging.INFO
+        finally:
+            ws_logger.setLevel(previous)
+            root.setLevel(root_level)

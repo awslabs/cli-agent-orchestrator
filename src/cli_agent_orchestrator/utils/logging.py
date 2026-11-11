@@ -107,6 +107,10 @@ def setup_logging() -> None:
         format=fmt,
         handlers=[logging.FileHandler(log_file), stderr_handler],
     )
+    # The runner hub's handshake headers carry the runner token (#745).
+    from cli_agent_orchestrator.runner.protocol import quiet_websockets_logging
+
+    quiet_websockets_logging()
 
     print(f"Server logs: {log_file}")
     print("For debug logs: export CAO_LOG_LEVEL=DEBUG && cao-server")

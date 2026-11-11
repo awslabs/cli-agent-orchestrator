@@ -56,6 +56,21 @@ from cli_agent_orchestrator.backends.base import (
 
 PROTOCOL_VERSION = 1
 
+
+def quiet_websockets_logging() -> None:
+    """Keep the ``websockets`` loggers at INFO or above, whatever the root level.
+
+    At DEBUG, ``websockets`` logs every handshake header, including
+    ``Authorization: Bearer <runner token>``: with ``CAO_LOG_LEVEL=DEBUG`` the
+    token would land in the server's log file and in a runner pod's log.
+    """
+    import logging
+
+    ws_logger = logging.getLogger("websockets")
+    if ws_logger.getEffectiveLevel() < logging.INFO:
+        ws_logger.setLevel(logging.INFO)
+
+
 # Close codes in the 4000-4999 private range (RFC 6455 §7.4.2).
 CLOSE_PROTOCOL_MISMATCH = 4400
 CLOSE_BAD_HELLO = 4422

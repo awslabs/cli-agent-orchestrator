@@ -50,6 +50,7 @@ from cli_agent_orchestrator.runner.protocol import (
     TERMINAL_ID_PATTERN,
     TOKEN_HEADER,
     encode_error,
+    quiet_websockets_logging,
 )
 from cli_agent_orchestrator.runner.token import runner_token
 
@@ -988,6 +989,8 @@ def main(argv: Optional[list] = None) -> int:
         level=os.environ.get("CAO_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Its handshake headers carry the runner token.
+    quiet_websockets_logging()
     # Removed from the environment once read: TmuxClient copies CAO_* variables
     # from this process into every pane it creates, and an agent holding the
     # runner token could register itself as a runner.
