@@ -493,7 +493,14 @@ class StatusMonitor:
             if detected == TerminalStatus.WAITING_USER_ANSWER:
                 self._waiting_generation[terminal_id] = self._capture_generation.get(terminal_id, 0)
             changed = self._apply_detection_locked(terminal_id, detected)
-            status_write = _queue_status_transition(terminal_id, detected) if changed else None
+            # While the terminal reads UNKNOWN (its host out of reach, or a gap
+            # in its stream), a detection still updates the detector's state,
+            # but is neither published nor stored: subscribers and the stored
+            # status would otherwise show what get_status() does not (#745).
+            # Clearing the mark publishes and stores the status it then has.
+            masked = terminal_id in self._unreachable or terminal_id in self._stream_gap
+            announce = changed and not masked
+            status_write = _queue_status_transition(terminal_id, detected) if announce else None
             if (
                 not changed
                 and detected == TerminalStatus.PROCESSING
@@ -507,7 +514,7 @@ class StatusMonitor:
                 # turn's completion box and re-parses as the same COMPLETED, and
                 # that is exactly the stale reading a stamp must not refresh.
                 self._status_generation[terminal_id] = self._output_generation.get(terminal_id, 0)
-        if changed:
+        if announce:
             # Publish outside the lock — subscribers must never be able to
             # re-enter StatusMonitor while the latch state is mid-update.
             bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
@@ -1362,8 +1369,19 @@ class StatusMonitor:
                 if terminal_id not in self._unreachable:
                     return
                 self._unreachable.discard(terminal_id)
-                published = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+                published = (
+                    TerminalStatus.UNKNOWN
+                    if terminal_id in self._stream_gap
+                    else self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+                )
+            # Stored as well as published: detections while masked were not.
+            status_write = (
+                _queue_status_transition(terminal_id, published)
+                if not unreachable and published is not TerminalStatus.UNKNOWN
+                else None
+            )
         bus.publish(f"terminal.{terminal_id}.status", {"status": published.value})
+        _wait_for_status_write_off_loop(status_write)
 
     def track_stream_gaps(self, terminal_id: str) -> None:
         """Treat a dropped output event for ``terminal_id`` as a gap in its stream."""
@@ -1432,8 +1450,15 @@ class StatusMonitor:
                 if terminal_id in self._unreachable
                 else self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             )
+            # The detection above was masked by the latch: store what it found.
+            status_write = (
+                _queue_status_transition(terminal_id, published)
+                if published is not TerminalStatus.UNKNOWN
+                else None
+            )
         logger.info(f"output stream of terminal {terminal_id} resynced")
         bus.publish(f"terminal.{terminal_id}.status", {"status": published.value})
+        _wait_for_status_write_off_loop(status_write)
         return True
 
     def clear_terminal(self, terminal_id: str) -> None:

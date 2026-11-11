@@ -294,7 +294,12 @@ class TestResync:
         monitor.on_stream_gap = rb_mod._request_resync
         monitor.mark_stream_gap("rrrrrrrr")
         for _ in range(200):
-            if monitor.stream_gap_generation("rrrrrrrr") is None:
+            # Done means the latch is cleared AND the worker has let go: it
+            # clears the latch (and stores the status) before it leaves.
+            if (
+                monitor.stream_gap_generation("rrrrrrrr") is None
+                and "rrrrrrrr" not in rb_mod._resyncing
+            ):
                 break
             import time
 
@@ -555,3 +560,65 @@ class TestADroppedTailIsReported:
         other = SimpleNamespace(info=SimpleNamespace(runner_id="b"), pending={})
         h._on_frame(other, json.dumps({"type": "gap", "pipe_id": "pa", "through": 5}))
         assert gaps == []
+
+
+# --- detections while UNKNOWN are neither published nor stored ------------------
+
+
+class TestMaskedDetections:
+    """While a terminal reads UNKNOWN, what subscribers and the stored status see
+    must agree with get_status(); clearing the mark announces the status then."""
+
+    @staticmethod
+    def _record(monkeypatch):
+        published, stored = [], []
+        monkeypatch.setattr(
+            status_mod.bus, "publish", lambda topic, data: published.append((topic, data["status"]))
+        )
+        monkeypatch.setattr(
+            status_mod, "_queue_status_transition", lambda tid, st: stored.append((tid, st.value))
+        )
+        return published, stored
+
+    def test_a_gap_masks_later_detections_until_the_resync(self, monitor, monkeypatch):
+        _idle(monitor)
+        published, stored = self._record(monkeypatch)
+        generation = monitor.mark_stream_gap("aaaaaaaa")
+        published.clear()
+
+        monitor._apply_detection("aaaaaaaa", TerminalStatus.PROCESSING)
+        monitor._apply_detection("aaaaaaaa", TerminalStatus.ERROR)
+
+        assert monitor.get_status("aaaaaaaa") is TerminalStatus.UNKNOWN
+        assert published == [] and stored == []
+
+        assert monitor.resync_from_snapshot("aaaaaaaa", "ready>", generation)
+        assert published[-1] == ("terminal.aaaaaaaa.status", "idle")
+        assert stored == [("aaaaaaaa", "idle")]
+
+    def test_an_unreachable_host_masks_detections_until_it_is_back(self, monitor, monkeypatch):
+        _idle(monitor)
+        published, stored = self._record(monkeypatch)
+        monitor.set_unreachable("aaaaaaaa", True)
+        published.clear()
+
+        monitor._apply_detection("aaaaaaaa", TerminalStatus.ERROR)
+        assert monitor._last_status["aaaaaaaa"] is TerminalStatus.ERROR  # applied, not announced
+        assert published == [] and stored == []
+
+        monitor.set_unreachable("aaaaaaaa", False)
+        assert published == [("terminal.aaaaaaaa.status", "error")]
+        assert stored == [("aaaaaaaa", "error")]
+
+    def test_back_in_reach_with_a_gap_still_latched_reads_unknown(self, monitor, monkeypatch):
+        _idle(monitor)
+        published, stored = self._record(monkeypatch)
+        monitor.set_unreachable("aaaaaaaa", True)
+        monitor.mark_stream_gap("aaaaaaaa")
+        published.clear()
+
+        monitor.set_unreachable("aaaaaaaa", False)
+
+        assert published == [("terminal.aaaaaaaa.status", "unknown")]
+        assert stored == []
+        assert monitor.get_status("aaaaaaaa") is TerminalStatus.UNKNOWN
