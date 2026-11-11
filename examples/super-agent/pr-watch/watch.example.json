@@ -1,0 +1,13 @@
+{
+ "_about": "Copy to watch.json and edit. repo: your repo. identities.ours: your GitHub login(s); the loop and the auto-merge gate treat only these as 'ours'. prs/issues: what to watch, keyed by number; owner is {\"session\": ..., \"terminal\": ...} or null for report-only. Your own open PRs that are missing here show up as unwatched_open_prs. See KIT/rules/watcher.md.",
+ "repo": "your-org/your-repo",
+ "identities": {
+  "ours": ["your-login"],
+  "bots": ["copilot-pull-request-reviewer", "github-advanced-security", "github-actions"],
+  "bot_suffixes": ["[bot]"]
+ },
+ "prs": {},
+ "issues": {},
+ "ignore_prs": [],
+ "known_ci_failures": {}
+}
