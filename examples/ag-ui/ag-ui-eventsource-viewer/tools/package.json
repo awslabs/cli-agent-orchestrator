@@ -6,9 +6,10 @@
   "description": "Dev/CI tooling: shift-left demo recorder for the dependency-free AG-UI EventSource viewer. Not required to run the viewer (../index.html has zero dependencies).",
   "scripts": {
     "record": "node record-demo.mjs",
-    "playwright:install": "playwright install --with-deps chromium"
+    "playwright:install": "playwright install chromium"
   },
   "devDependencies": {
-    "@playwright/test": "1.64.1"
+    "@playwright/test": "1.64.1",
+    "ffmpeg-static": "5.3.0"
   }
 }
