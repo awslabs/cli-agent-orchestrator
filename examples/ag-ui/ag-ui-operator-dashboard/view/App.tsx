@@ -190,6 +190,7 @@ function PanelEntry({ entry }: { entry: Entry }) {
       <article aria-label="refused component">
         <h3>Refused: "{entry.component}" is not on the allow-list</h3>
         <p>From {ownerText(entry.owner)}. Props are not shown.</p>
+        {entry.moreRefused ? <p>And {entry.moreRefused} more refused.</p> : null}
       </article>
     );
   }

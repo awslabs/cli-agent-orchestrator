@@ -7,6 +7,7 @@ import {
   emptyPanel,
   entryFor,
   MAX_PANEL_ENTRIES,
+  MAX_REFUSED_ENTRIES,
   MAX_SEEN_EVENT_IDS,
   ownerText,
   propRows,
@@ -153,3 +154,59 @@ describe("bounded panel (Note 3)", () => {
     expect(reduceFrame(panel, metric(300))).toBe(panel);
   });
 });
+
+describe("refused entries are capped apart (#1158)", () => {
+  const metric = (n: number): Frame => ({
+    type: "CUSTOM",
+    name: "cao.generative_ui",
+    value: { component: "metric", props: { n } },
+    metadata: { cao: { eventId: `m${n}` } },
+  });
+  const refusal = (n: number, more?: unknown): Frame => ({
+    type: "RAW",
+    metadata: { cao: { eventId: `r${n}` } },
+    event: { rejected_component: `x${n}.0123abcd`, ...(more === undefined ? {} : { more_refused: more }) },
+  });
+  const kinds = (panel: Panel) => panel.entries.map((e) => e.kind);
+
+  it(`keeps at most ${MAX_REFUSED_ENTRIES} refused entries, the newest`, () => {
+    let panel = emptyPanel();
+    for (let n = 1; n <= 50; n += 1) panel = reduceFrame(panel, refusal(n));
+    expect(panel.entries).toHaveLength(MAX_REFUSED_ENTRIES);
+    expect(panel.entries[0].eventId).toBe(`r${50 - MAX_REFUSED_ENTRIES + 1}`);
+  });
+
+  it("500 refusals, then 200 real components: every real one is there", () => {
+    let panel = emptyPanel();
+    for (let n = 1; n <= 500; n += 1) panel = reduceFrame(panel, refusal(n));
+    for (let n = 1; n <= MAX_PANEL_ENTRIES; n += 1) panel = reduceFrame(panel, metric(n));
+    const real = panel.entries.filter((e) => e.kind === "component").map((e) => e.eventId);
+    expect(real).toEqual(Array.from({ length: MAX_PANEL_ENTRIES }, (_, i) => `m${i + 1}`));
+    expect(panel.entries).toHaveLength(MAX_PANEL_ENTRIES);
+  });
+
+  it("real components, then 500 refusals: the real ones survive", () => {
+    let panel = emptyPanel();
+    for (let n = 1; n <= 100; n += 1) panel = reduceFrame(panel, metric(n));
+    for (let n = 1; n <= 500; n += 1) panel = reduceFrame(panel, refusal(n));
+    expect(kinds(panel).filter((k) => k === "component")).toHaveLength(100);
+    expect(kinds(panel).filter((k) => k === "refused")).toHaveLength(MAX_REFUSED_ENTRIES);
+    expect(panel.entries.at(-1)!.eventId).toBe("r500"); // arrival order is kept
+  });
+
+  it("a full panel of real components drops a refusal before any real one", () => {
+    let panel = emptyPanel();
+    for (let n = 1; n <= 5; n += 1) panel = reduceFrame(panel, refusal(n));
+    for (let n = 1; n <= MAX_PANEL_ENTRIES; n += 1) panel = reduceFrame(panel, metric(n));
+    expect(kinds(panel).filter((k) => k === "component")).toHaveLength(MAX_PANEL_ENTRIES);
+    expect(panel.entries[0].eventId).toBe("m1");
+  });
+
+  it("the server's fold count is kept only as a positive integer", () => {
+    expect(entryFor(refusal(1, 4))).toMatchObject({ kind: "refused", moreRefused: 4 });
+    for (const bad of [0, -1, 1.5, "4", true, null, { n: 1 }]) {
+      expect(entryFor(refusal(1, bad))).not.toHaveProperty("moreRefused");
+    }
+  });
+});
+

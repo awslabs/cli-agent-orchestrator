@@ -107,6 +107,17 @@ describe("App", () => {
     expect(panel.textContent).not.toContain("secret-custom");
   });
 
+  it("a refusal's fold count is shown as text", async () => {
+    const { store } = mount([]);
+    const raw = fixtureJson<Frame>("raw-offlist.generated.json");
+    const folded: Frame = { ...raw, event: { ...(raw.event as object), more_refused: 7 } };
+    await act(async () => {
+      await store.controller.ambient(folded);
+    });
+    const [refused] = screen.getAllByRole("article", { name: "refused component" });
+    expect(refused.textContent).toContain("And 7 more refused.");
+  });
+
   it("a failed reconcile offers a retry, and the retry clears it", async () => {
     const A = interruptsOf("one-interrupt.sse")[0];
     const { calls } = mount([
