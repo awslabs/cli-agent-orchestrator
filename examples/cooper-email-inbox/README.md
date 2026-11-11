@@ -57,6 +57,8 @@ because the server is configured. `grok_cli` permits only MCP servers named in
 
 ## Setup
 
+In zsh, run `setopt interactivecomments` before pasting a block. Oh My Zsh sets it. Without it, zsh runs a `#` line as a command. A `setopt` inside the pasted block does not help.
+
 Requires curl 7.55 or later (for `-H @file`) and jq.
 
 Cooper's sign-up is one HTTP request with no browser step. It returns the
@@ -89,25 +91,27 @@ mkdir -p "$(dirname "$ENV_FILE")" "$(dirname "$ACCOUNT_HDR")"
     curl -sS https://cooperemail.com/api/v1/onboard \
       -H 'content-type: application/json' -d @- -o "$ON"
   if jq -e '.api_key | strings | length > 0' "$ON" > /dev/null; then
-    # Full-access account key: a header file for steps 1-3 only (see step 3)
+    # Full-access account key: a header file for steps 1-3 only. See step 3.
     jq -r '"Authorization: Bearer \(.api_key)"' "$ON" > "$ACCOUNT_HDR"
     # Mint a key that can only list this inbox, read its mail and send from it.
-    # {id} accepts the inbox id, the username or the address; step 2 uses the address too.
+    # id accepts the inbox id, the username or the address. Step 2 uses the address too.
     curl -sS "https://cooperemail.com/api/v1/inboxes/$(jq -r '.inbox.email' "$ON")/keys" \
       -H @"$ACCOUNT_HDR" -H 'content-type: application/json' \
       -d '{"name":"cao-mail-agent","permissions":["inbox_read","message_read","message_send"]}' \
       -o "$KEY"
     if jq -e '.key | strings | length > 0' "$KEY" > /dev/null; then
-      # Leading newline: safe even if the file's last line has no newline
+      # Leading newline: safe even if the last line of the file has no newline
       jq -r '"\nCOOPER_API_KEY=\(.key)"' "$KEY" >> "$ENV_FILE"
-      jq -r '.inbox.email' "$ON"   # prints only the new address
+      # prints only the new address
+      jq -r '.inbox.email' "$ON"
     else
       jq -c '.error // "unexpected response"' "$KEY"
       echo "Inbox $(jq -r '.inbox.email' "$ON") exists; its account key is in $ACCOUNT_HDR." \
         "Nothing was written to .env. Mint the scoped key by hand (see below), then do step 3."
     fi
   else
-    jq -c '.error // "unexpected response"' "$ON"   # no account key; nothing written
+    # no account key and nothing written
+    jq -c '.error // "unexpected response"' "$ON"
   fi
   rm -f "$ON" "$KEY"
 )
@@ -120,18 +124,16 @@ curl -sS -X PATCH "https://cooperemail.com/api/v1/inboxes/$INBOX_NAME@cooperemai
   -H @"$ACCOUNT_HDR" -H 'content-type: application/json' \
   -d '{"send_mode":"approval","screening":"hold"}' -o /dev/null -w '%{http_code}\n'
 
-# 3. Required: move the account key out of every agent's reach. Copy it into
+# 3. Required: move the account key out of reach of every agent. Copy it into
 #    your password manager, then delete the file. rm runs only after the copy
 #    succeeds, so a missing pbcopy does not throw the key away.
-#    Linux, instead of the pbcopy line:
-#    sed 's/^Authorization: Bearer //' "$ACCOUNT_HDR" | xclip -selection clipboard && rm "$ACCOUNT_HDR"
-#    sed 's/^Authorization: Bearer //' "$ACCOUNT_HDR" | wl-copy && rm "$ACCOUNT_HDR"
+#    Linux: use xclip -selection clipboard or wl-copy in place of pbcopy
 sed 's/^Authorization: Bearer //' "$ACCOUNT_HDR" | pbcopy && rm "$ACCOUNT_HDR"
 
 # 4. Install the profile
 cao install examples/cooper-email-inbox/mail_agent.md
 
-# 5. Launch it (refuses while an account key file is still on disk)
+# 5. Launch it. Refuses while an account key file is still on disk.
 KEY_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cooper-email"
 if [ -z "$(find "$KEY_DIR" -name '*.account.hdr' 2>/dev/null)" ]; then
   cao launch --agents mail_agent
@@ -165,7 +167,7 @@ For later admin work (minting or revoking keys, deleting the inbox), paste the
 account key from your password manager instead of writing it to a file:
 
 ```bash
-# Works in bash and zsh. read -p is a coprocess flag in zsh and sends an empty key.
+# The printf prompt below works in bash and in zsh. read -p is a zsh coprocess flag and sends an empty key.
 printf 'Cooper account key: '; IFS= read -rs K; echo
 # Same PATCH as step 2. Replace INBOX with the inbox name.
 printf 'Authorization: Bearer %s\n' "$K" |
@@ -173,9 +175,10 @@ printf 'Authorization: Bearer %s\n' "$K" |
     -H @- -H 'content-type: application/json' \
     -d '{"send_mode":"approval","screening":"hold"}' \
     -o /dev/null -w '%{http_code}\n'
+# example: revoke one key
 printf 'Authorization: Bearer %s\n' "$K" |
   curl -sS -X DELETE "https://cooperemail.com/api/v1/keys/KEY_ID" -H @- \
-    -o /dev/null -w '%{http_code}\n'   # example: revoke one key
+    -o /dev/null -w '%{http_code}\n'
 unset K
 ```
 

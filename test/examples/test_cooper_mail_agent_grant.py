@@ -23,10 +23,12 @@ from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_n
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.utils.delegation import tools_exceeding
 from cli_agent_orchestrator.utils.enforcement import PROMPT, enforcement_for
 from cli_agent_orchestrator.utils.tool_mapping import (
     get_disallowed_tools,
     granted_mcp_servers,
+    mcp_reference_covers,
     resolve_allowed_tools,
 )
 
@@ -83,6 +85,11 @@ def _call(mcp, name):
     return asyncio.run(go())
 
 
+def _covers_denied_cao_tool(entry: str) -> bool:
+    prefix = f"{server.CAO_MCP_SERVER_SELECTOR}/"
+    return any(mcp_reference_covers(entry, prefix + name) for name in DENIED_TO_THE_MAIL_AGENT)
+
+
 def test_the_profile_grants_only_the_inbox_server():
     profile = _profile()
     assert profile.allowedTools == ["@cooper-email"]
@@ -117,9 +124,13 @@ def test_grok_does_not_permit_the_ungranted_cao_server():
 
 @pytest.mark.parametrize("tool", DENIED_TO_THE_MAIL_AGENT)
 def test_the_mail_agent_cannot_write_memory_or_start_agents(tool):
+    allowed = _allowed()
+    # The gate matches the whole-server selector only, so a per-tool grant such
+    # as @cao-mcp-server/memory_store would still be denied below.
+    assert not any(_covers_denied_cao_tool(entry) for entry in allowed)
     mcp = _server([tool])
     with patch.dict(os.environ, BOUND):
-        with patch.object(server, "_get_terminal_context_from_env", return_value=_ctx(_allowed())):
+        with patch.object(server, "_get_terminal_context_from_env", return_value=_ctx(allowed)):
             with pytest.raises(Exception) as excinfo:
                 _call(mcp, tool)
     assert "@cao-mcp-server" in str(excinfo.value)
@@ -133,9 +144,12 @@ def test_an_assigned_mail_agent_can_still_report():
 
 
 def test_a_supervisor_can_still_hand_off_to_the_mail_agent():
-    """The gate checks the caller. A supervisor holding the CAO server may hand off."""
+    """The gate checks the caller. A supervisor ceiling covers this profile."""
     mcp = _server(["handoff"])
     caller = ["@cao-mcp-server", "fs_read", "fs_list"]
     with patch.dict(os.environ, BOUND):
         with patch.object(server, "_get_terminal_context_from_env", return_value=_ctx(caller)):
             assert _call(mcp, "handoff") == {"reached": "handoff"}
+    # ``*`` is the supervisor ceiling. The caller list above has no @cooper-email.
+    assert tools_exceeding(_allowed(), ["*"]) == []
+    assert tools_exceeding(_allowed(), caller) == ["@cooper-email"]
