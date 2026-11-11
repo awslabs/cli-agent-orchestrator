@@ -624,10 +624,10 @@ class TestGrantRecord:
     ):
         """#1283 review: when the sidecar cannot be written, only plugin servers'
         grants fall back to containment; a profile server's grant has no proof.
-        Through ``_record_grants``, the caller that text is about (#1285 review)."""
-        tmp_config.parent.mkdir(parents=True)
+        Through ``upsert_agent_tools``, the caller that text is about (#1285 review)."""
+        write_config({})
         with self._read_only_dir(tmp_config), caplog.at_level(logging.WARNING):
-            cfg_module._record_grants("developer", ["x-server*"])
+            upsert_agent_tools("developer", ["x-server"])
         messages = self._write_failures(caplog)
         assert len(messages) == 1, [r.getMessage() for r in caplog.records]
         message = messages[0]
@@ -635,9 +635,9 @@ class TestGrantRecord:
         assert "A plugin server's grant is still withdrawn by plugin-store containment" in message
         assert (
             "a profile server's grant added now stays if the profile drops that server before"
-            " the agent is next installed with a writable sidecar, and a grant removed now is still recorded"
-            in message
+            " the agent is next installed with a writable sidecar." in message
         )
+        assert "removed now" not in message, "nothing is removed unrecorded any more (#1289)"
         assert "will fall back to plugin-store containment when withdrawing them" not in message
         assert "x-server" not in message, "the warning must not carry a recorded value"
         assert "mcp." not in message, "no mcp fingerprint was being written"
@@ -711,47 +711,252 @@ class TestGrantRecord:
         assert "cao-mcp-server*" not in tools
         assert tools["y-server*"] is True
 
-    def test_a_failed_write_during_a_withdrawal_says_the_removed_grant_is_still_recorded(
+    # -- #1289: a withdrawal is recorded BEFORE the key is removed -----------------------------------------------
+
+    @staticmethod
+    def _tools() -> dict:
+        return read_config().get("agent", {}).get("developer", {}).get("tools", {})
+
+    @staticmethod
+    def _row():
+        return cfg_module.read_grant_record()["agents"].get("developer")
+
+    def test_a_withdrawal_that_cannot_be_recorded_leaves_the_grant_in_place(
         self, tmp_config: Path, caplog
     ):
-        """#1285 review (haofeif, Note 1 and probe P5): a write failing during a WITHDRAWAL logs the
-        same text as one failing during an addition, but nothing was added: the loss is the removal. The old record
-        still lists the key, so the next install with a writable sidecar removes a key of that name even if the user
-        added it by hand. The warning must say so; the code behaviour is tracked in an issue, not changed here, so
-        this test also pins that the claim in the warning is true today."""
+        """#1289 (haofeif's probe P5 on #1285, step 2): the profile drops z-server while the sidecar is read-only.
+        Taking the key out would leave the old row listing a key CAO had removed, so the key stays, and the warning
+        says so."""
         write_config({})
-        upsert_agent_tools("developer", ["z-server"])  # P5 step 1: recorded z-server*
-        assert cfg_module.read_grant_record()["agents"] == {"developer": ["z-server*"]}
+        upsert_agent_tools("developer", ["z-server"])
+        assert self._row() == ["z-server*"]
         with self._read_only_dir(tmp_config), caplog.at_level(logging.WARNING):
-            upsert_agent_tools(
-                "developer", []
-            )  # step 2: the profile drops z-server; the write fails
+            upsert_agent_tools("developer", [])
         messages = self._write_failures(caplog)
         assert len(messages) == 1, [r.getMessage() for r in caplog.records]
         message = messages[0]
-        assert (
-            "a grant removed now is still recorded, so that install removes a key of that name"
-            " even if it was added by hand." in message
-        )
-        assert "Agent developer's recorded grants keep their old value:" in message
-        assert (
-            "go unrecorded" not in message
-        ), "the old row stays recorded; only this change is lost"
+        assert "grants that the profile no longer names were left in opencode.json" in message
+        assert "a grant is not removed while the record would still list it" in message
+        assert "The next install tries again." in message
+        assert "removed now" not in message and "go unrecorded" not in message
         assert "z-server" not in message, "the warning must not carry a recorded value"
-        # The key is gone from opencode.json, but the old record still lists it.
-        assert "z-server*" not in read_config().get("agent", {}).get("developer", {}).get(
-            "tools", {}
-        )
-        assert cfg_module.read_grant_record()["agents"] == {"developer": ["z-server*"]}
-        # Steps 3 and 4: the user adds the key by hand, and the next install removes it. This is what the
-        # warning's claim rests on; if the withdrawal is ever fixed, this assertion and the text change together.
+        assert self._tools() == {"z-server*": True}, "fail closed: the grant stays"
+        assert self._row() == ["z-server*"], "and the record still says it is CAO's"
+
+    def test_after_the_withdrawal_is_finally_recorded_a_key_the_user_adds_stays_alone(
+        self, tmp_config: Path
+    ):
+        """#1289, the end of the issue's story (haofeif's P5). The literal step 3 ("the user adds the key") is a no-op now:
+        after the failed withdrawal the key is still there, so it is CAO's until the record can say otherwise. The next
+        install that can write the record withdraws it, in order, and only after that is recorded is a key the user adds theirs. This
+        passes on main as well (its writable install rewrites the stale row); it guards the end state.
+        """
+        write_config({})
+        upsert_agent_tools("developer", ["z-server"])  # 1: recorded
+        with self._read_only_dir(tmp_config):
+            upsert_agent_tools("developer", [])  # 2: the record cannot be written
+        upsert_agent_tools(
+            "developer", []
+        )  # the next install that can write it withdraws, in order
+        assert "z-server*" not in self._tools()
+        assert self._row() is None, "withdrawn and recorded"
         data = read_config()
-        data.setdefault("agent", {}).setdefault("developer", {}).setdefault("tools", {})[
+        data["agent"]["developer"].setdefault("tools", {})[
             "z-server*"
-        ] = True
+        ] = True  # 3: the user adds it
         write_config(data)
+        upsert_agent_tools("developer", [])  # 4: the next install
+        assert self._tools() == {"z-server*": True}, "the user's key is left alone"
+
+    def test_a_second_read_only_install_does_not_remove_a_key_added_by_hand(
+        self, tmp_config: Path, caplog
+    ):
+        """#1289, haofeif's probe A on #1290 (review 5851860126, P3-1): after a failed withdrawal and a hand-added key,
+        EVERY following install removed it until one could write the record, so a second read-only install was
+        enough. Now the key is CAO's grant until the record can say otherwise: read-only installs keep it, and only
+        the first install that can write the record withdraws it.
+        """
+        write_config({})
+        upsert_agent_tools("developer", ["z-server"])
+        with self._read_only_dir(tmp_config), caplog.at_level(logging.WARNING):
+            upsert_agent_tools("developer", [])
+            data = read_config()
+            data["agent"]["developer"]["tools"][
+                "z-server*"
+            ] = True  # "added by hand": it never left
+            write_config(data)
+            upsert_agent_tools("developer", [])  # the second read-only install
+        assert self._tools() == {"z-server*": True}
+        assert self._row() == ["z-server*"]
+        assert len(self._write_failures(caplog)) == 2, "each failed write warns again"
+
+    def test_remove_agent_tools_records_the_withdrawal_first_too(self, tmp_config: Path, caplog):
+        """#1289, haofeif's probe A2: the install path for an agent with no MCP servers."""
+        write_config({})
+        upsert_agent_tools("developer", ["z-server"])
+        with self._read_only_dir(tmp_config), caplog.at_level(logging.WARNING):
+            remove_agent_tools("developer")
+        assert len(self._write_failures(caplog)) == 1
+        assert self._tools() == {"z-server*": True}
+        assert self._row() == ["z-server*"]
+        remove_agent_tools("developer")
+        assert "developer" not in read_config().get("agent", {}), "withdrawn, entry pruned"
+        assert self._row() is None
+
+    def test_a_mixed_install_adds_the_new_grant_and_holds_the_old_one_back(
+        self, tmp_config: Path, caplog
+    ):
+        write_config({})
+        upsert_agent_tools("developer", ["z-server"])
+        with self._read_only_dir(tmp_config), caplog.at_level(logging.WARNING):
+            upsert_agent_tools("developer", ["a-server"])  # drops z-server, adds a-server
+        assert self._tools() == {"a-server*": True, "z-server*": True}
+        assert self._row() == ["z-server*"]
+        messages = self._write_failures(caplog)
+        assert len(messages) == 2, "two different losses, two different texts"
+        assert "were left in opencode.json" in messages[0]
+        assert "a profile server's grant added now stays" in messages[1]
+        upsert_agent_tools("developer", ["a-server"])  # a writable install converges
+        assert self._tools() == {"a-server*": True}
+        assert self._row() == ["a-server*"]
+
+    def test_when_opencode_json_cannot_be_written_the_old_row_is_put_back(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1289: the record was written first, then opencode.json could not be. The install fails (as it always did),
+        and the old row is put back so the key and its row agree and the next install withdraws it.
+        """
+        write_config({})
+        upsert_agent_tools("developer", ["z-server"])
+
+        def boom(data):
+            raise OSError("disk full")
+
+        with (
+            monkeypatch.context() as patched
+        ):  # scoped: undo() would also undo tmp_config's redirect
+            patched.setattr(cfg_module, "write_config", boom)
+            with pytest.raises(OSError, match="disk full"):
+                upsert_agent_tools("developer", [])
+        assert self._tools() == {"z-server*": True}
+        assert self._row() == ["z-server*"], "restored"
         upsert_agent_tools("developer", [])
-        assert "z-server*" not in read_config()["agent"]["developer"]["tools"]
+        assert "z-server*" not in self._tools()
+        assert self._row() is None
+
+    def test_if_the_old_row_cannot_be_put_back_either_the_warning_says_the_grant_stays(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch, caplog
+    ):
+        """The worst case of #1289, reached for real: the record was written, opencode.json then could not be, and the
+        directory is no longer writable for the restore either. The grant stays without a row, and the warning says so
+        (that is the one state CAO cannot repair: delete the key by hand)."""
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("root writes into a read-only directory")
+        write_config({})
+        upsert_agent_tools("developer", ["z-server"])
+
+        def boom(data):
+            tmp_config.parent.chmod(0o500)  # the restore that follows cannot write the sidecar
+            raise OSError("disk full")
+
+        try:
+            with monkeypatch.context() as patched, caplog.at_level(logging.WARNING):
+                patched.setattr(cfg_module, "write_config", boom)
+                with pytest.raises(OSError, match="disk full"):
+                    upsert_agent_tools("developer", [])
+        finally:
+            tmp_config.parent.chmod(0o700)
+        messages = self._write_failures(caplog)
+        assert len(messages) == 1, [r.getMessage() for r in caplog.records]
+        assert (
+            "could not be put back in the record, so they stay in opencode.json with no row until removed by hand"
+            in messages[0]
+        )
+        assert "z-server" not in messages[0], "the warning must not carry a recorded value"
+        assert self._tools() == {"z-server*": True}
+        assert self._row() is None, "withdrawn in the record, still in the file: the lingering case"
+
+    def test_a_failed_config_write_that_is_not_a_withdrawal_restores_nothing(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        write_config({})
+
+        def boom(data):
+            raise OSError("disk full")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(cfg_module, "write_config", boom)
+            with pytest.raises(OSError, match="disk full"):
+                upsert_agent_tools("developer", ["a-server"])
+        assert self._row() is None, "no row was written for a grant that never landed"
+
+    def test_a_grant_that_only_containment_proves_is_withdrawn_even_when_the_record_cannot_be_written(
+        self, tmp_config: Path, tmp_path: Path, caplog
+    ):
+        """Containment is a proof that does not need the record, so it is not held back."""
+        store_root = tmp_path / "plugins"
+        entry = {"type": "local", "command": [str(store_root / "demo" / "bin" / "srv")]}
+        write_config(
+            {
+                "mcp": {"demo-tools": entry},
+                "agent": {"developer": {"tools": {"demo-tools*": True, "bash": False}}},
+            }
+        )
+        with self._read_only_dir(tmp_config), caplog.at_level(logging.WARNING):
+            upsert_agent_tools("developer", ["cao-mcp-server"], plugin_store_roots=[store_root])
+        assert self._tools() == {"bash": False, "cao-mcp-server*": True}
+        messages = self._write_failures(caplog)
+        assert len(messages) == 1 and "added now stays" in messages[0]
+
+    def test_a_grant_that_the_record_and_containment_both_prove_is_not_held_back(
+        self, tmp_config: Path, tmp_path: Path, caplog
+    ):
+        store_root = tmp_path / "plugins"
+        entry = {"type": "local", "command": [str(store_root / "demo" / "bin" / "srv")]}
+        write_config({"mcp": {"demo-tools": entry}})
+        upsert_agent_tools("developer", ["demo-tools"], plugin_store_roots=[store_root])
+        assert self._row() == ["demo-tools*"]
+        with self._read_only_dir(tmp_config), caplog.at_level(logging.WARNING):
+            upsert_agent_tools("developer", [], plugin_store_roots=[store_root])
+        assert "demo-tools*" not in self._tools()
+        assert not any(
+            "were left in opencode.json" in m for m in self._write_failures(caplog)
+        ), "nothing was held back"
+
+    def test_an_unreadable_sidecar_holds_nothing_back_and_still_warns(
+        self, tmp_config: Path, caplog
+    ):
+        """No readable record, no proof from it: nothing it could vouch for is withdrawn, as before (#1273).
+        Nothing is held back either: with no readable row there is no withdrawal to hold back. The file is
+        left byte-for-byte as it was."""
+        write_config({})
+        upsert_agent_tools("developer", ["z-server"])
+        sidecar = tmp_config.with_name("cao-grants.json")
+        sidecar.write_text("{not json", encoding="utf-8")
+        before = sidecar.read_bytes()
+        with caplog.at_level(logging.WARNING):
+            upsert_agent_tools(
+                "developer", ["a-server"]
+            )  # non-empty, so a lenient writer WOULD write
+        assert self._tools() == {
+            "z-server*": True,
+            "a-server*": True,
+        }, "z unprovable, so left in place"
+        assert sidecar.read_bytes() == before, "the damaged record is not replaced"
+        assert any("grant record" in r.getMessage() for r in caplog.records)
+
+    def test_the_record_functions_report_whether_the_record_was_written(self, tmp_config: Path):
+        """The answer a withdrawal depends on."""
+        write_config({})
+        record = cfg_module._record_grants
+        assert record("developer", ["x*"], lost="l") is True  # written
+        assert record("developer", ["x*"], lost="l") is True  # already says so
+        assert record("developer", [], lost="l") is True  # cleared
+        assert record("developer", [], lost="l") is True  # nothing to clear
+        with self._read_only_dir(tmp_config):
+            assert record("developer", ["y*"], lost="l") is False  # cannot write
+        tmp_config.with_name("cao-grants.json").write_text("{not json", encoding="utf-8")
+        assert record("developer", ["y*"], lost="l") is False  # unreadable
 
     def test_one_plugin_servers_install_logs_two_different_warnings_and_one_names_the_entry(
         self, tmp_config: Path, caplog

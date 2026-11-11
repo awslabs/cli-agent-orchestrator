@@ -259,12 +259,22 @@ warning and installs anyway. A failed write keeps the old record, and the warnin
 that costs. For an agent's grants, a plugin server's grant is still withdrawn by
 plugin-store containment, and a profile server's grant that install adds stays if the
 profile drops that server before the agent is next installed with a writable sidecar;
-grants the old record already has keep their proof. A grant that install **removes** is the
-opposite case: `opencode.json` no longer has it but the old record still lists it, so the
-next install with a writable sidecar removes a key of that name again, even one you added
-by hand in between. For a plugin server's `"mcp"` fingerprint, CAO falls back to the
-containment proof, which does not survive a `CAO_HOME_DIR` move: after one, CAO cannot
-prove the entry is its own.
+grants the old record already has keep their proof.
+
+A grant the profile no longer names is withdrawn only after the record says so: CAO writes
+the record first and removes the key from `opencode.json` second. When the record cannot be
+written, the grant is left in `opencode.json` (the warning says so) and the next install that
+can write the record withdraws it. So the record never lists a key CAO has already removed,
+and a key you add by hand after a withdrawal has been recorded is not taken for CAO's. If `opencode.json`
+cannot be written after the record was, CAO puts the old row back. If CAO is killed between
+the two writes, the grant stays in `opencode.json` with no record row, and CAO will not
+remove it later: delete it by hand. A record that an older CAO left behind after a failed
+withdrawal still lists the key; the first install with this version removes a key of that
+name once, as that older CAO would have, and records the withdrawal; an install that cannot
+write the record keeps the key instead.
+
+For a plugin server's `"mcp"` fingerprint, CAO falls back to the containment proof, which
+does not survive a `CAO_HOME_DIR` move: after one, CAO cannot prove the entry is its own.
 
 The same two proofs decide which `mcp` entries are CAO's. For every agent-plugin
 server it writes, CAO records a SHA-256 fingerprint of the entry in `cao-grants.json`
