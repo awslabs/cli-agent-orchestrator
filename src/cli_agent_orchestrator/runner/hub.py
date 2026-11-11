@@ -657,6 +657,8 @@ class RunnerHub:
                 future.set_result(frame)
         elif kind == "output":
             self._on_output(conn.info.runner_id, frame)
+        elif kind == "gap":
+            self._on_gap(conn.info.runner_id, frame)
         elif kind == "inventory":
             with self._changed:
                 report = self._reconcile_inventory(
@@ -710,6 +712,36 @@ class RunnerHub:
             return
         if data:
             sink.feed(data)
+
+    def _on_gap(self, runner_id: str, frame: Dict[str, Any]) -> None:
+        """The runner dropped this pipe's frames through ``through``: report the loss.
+
+        The next frame after a dropped tail may never come (an idle agent sends
+        nothing more), so the runner says so instead of leaving it to a seq
+        jump. The last seq moves to ``through``, so the frames that follow read
+        as contiguous and the loss is reported once.
+        """
+        pipe_id, through = frame.get("pipe_id"), frame.get("through")
+        if (
+            not isinstance(pipe_id, str)
+            or not isinstance(through, int)
+            or isinstance(through, bool)
+        ):
+            return
+        with self._lock:
+            sink = self._sinks.get(pipe_id)
+            if sink is None or sink.runner_id != runner_id:
+                return
+            last = self._last_seq.get(pipe_id)
+            if last is not None and through <= last:
+                # Those frames were delivered before the drop (a resend).
+                return
+            self._last_seq[pipe_id] = through
+        logger.warning(
+            f"runner {runner_id}: output gap on pipe {pipe_id} "
+            f"(the runner dropped frames through seq {through})"
+        )
+        sink.report_gap()
 
     def _fail_pending(self, conn: _Connection, reason: str) -> None:
         conn.closed = True

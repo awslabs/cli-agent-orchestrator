@@ -401,3 +401,157 @@ def test_a_gapped_terminal_whose_runner_reports_it_again_is_resynced(monitor, mo
     assert asked == ["aaaaaaaa"]  # bbbbbbbb has no gap
     rb_mod._mark_reachability(["aaaaaaaa"], False)
     assert asked == ["aaaaaaaa"]  # going out of reach starts nothing
+
+
+# --- a pipe whose whole tail the runner's outbox dropped ----------------------
+
+
+class TestADroppedTailIsReported:
+    """While disconnected, a busy pipe can push another pipe's last frames out of
+    the runner's outbox. That pipe may send nothing more (an agent that ended
+    its turn waits for input), so no later frame shows a seq jump: the runner
+    sends a ``gap`` frame for it instead."""
+
+    @staticmethod
+    def _setup(monkeypatch, tmp_path):
+        from types import SimpleNamespace
+
+        from cli_agent_orchestrator.runner import agent as agent_mod
+        from cli_agent_orchestrator.runner.agent import Runner
+
+        monkeypatch.setattr(agent_mod, "_OUTBOX_MAX_BYTES", 2048)
+        gaps, fed = [], {"pa": [], "pb": []}
+        h = RunnerHub(token=TOKEN, host="127.0.0.1", port=0)
+        h.bind(stream_gap=gaps.append)
+
+        class Sink:
+            def __init__(self, pipe_id, terminal_id):
+                self.runner_id, self.terminal_id, self.pipe_id = "a", terminal_id, pipe_id
+
+            def feed(self, data):
+                fed[self.pipe_id].append(data)
+
+            def report_gap(self):
+                gaps.append(self.terminal_id)
+
+        h._sinks["pa"] = Sink("pa", "aaaaaaaa")
+        h._sinks["pb"] = Sink("pb", "bbbbbbbb")
+        conn = SimpleNamespace(info=SimpleNamespace(runner_id="a"), pending={})
+        runner = Runner("ws://unused", TOKEN, "a", tmp_dir=str(tmp_path))
+
+        class Socket:
+            """Delivers each frame to the hub, as the connection would."""
+
+            async def send(self, raw):
+                h._on_frame(conn, raw)
+
+        return runner, h, Socket(), gaps, fed
+
+    @staticmethod
+    def _drain(runner, ws):
+        async def run():
+            runner._outbox_ready = asyncio.Event()
+            runner._outbox_ready.set()
+            task = asyncio.create_task(runner._drain_outbox(ws))
+            for _ in range(200):
+                await asyncio.sleep(0)
+                if not runner._outbox and runner._gaps_sent == runner._dropped:
+                    break
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(run())
+
+    def test_the_lost_tail_of_a_quiet_pipe_is_reported(self, monkeypatch, tmp_path):
+        runner, h, ws, gaps, fed = self._setup(monkeypatch, tmp_path)
+        runner._emit("pa", b"working")
+        runner._emit("pb", b"x")
+        self._drain(runner, ws)  # delivered while connected
+        assert gaps == []
+
+        # Disconnected: pa ends its turn, then pb's output fills the outbox.
+        runner._emit("pa", b"ready>")
+        for _ in range(40):
+            runner._emit("pb", b"y" * 200)
+        assert all(e[0] == "pb" for e in runner._outbox)  # pa's last frame is gone
+        self._drain(runner, ws)  # reconnected
+
+        assert "aaaaaaaa" in gaps  # the quiet pipe's loss is reported
+        assert b"ready>" not in fed["pa"]
+
+    def test_a_gap_is_reported_once_and_later_frames_are_contiguous(self, monkeypatch, tmp_path):
+        runner, h, ws, gaps, fed = self._setup(monkeypatch, tmp_path)
+        runner._emit("pa", b"one")
+        self._drain(runner, ws)
+        runner._emit("pa", b"two")
+        for _ in range(40):
+            runner._emit("pb", b"y" * 200)
+        self._drain(runner, ws)
+        runner._emit("pa", b"three")
+        self._drain(runner, ws)
+
+        assert gaps.count("aaaaaaaa") == 1
+        assert fed["pa"] == [b"one", b"three"]
+
+    def test_a_gap_lost_with_its_connection_is_sent_again(self, monkeypatch, tmp_path):
+        """ws.send() returning does not prove the hub read it: resend per connection."""
+        runner, h, ws, gaps, fed = self._setup(monkeypatch, tmp_path)
+        runner._emit("pa", b"working")
+        self._drain(runner, ws)
+        runner._emit("pa", b"ready>")
+        for _ in range(40):
+            runner._emit("pb", b"y" * 200)
+
+        class Lost:
+            """A connection that takes the frames and then resets."""
+
+            async def send(self, raw):
+                pass
+
+        self._drain(runner, Lost())
+        assert gaps == []
+        runner._gaps_sent = {}  # what _session does on the next connection
+        self._drain(runner, ws)
+
+        assert "aaaaaaaa" in gaps
+
+    def test_a_gap_already_seen_is_not_reported_again_on_reconnect(self, monkeypatch, tmp_path):
+        runner, h, ws, gaps, fed = self._setup(monkeypatch, tmp_path)
+        runner._emit("pa", b"one")
+        self._drain(runner, ws)
+        runner._emit("pa", b"two")
+        for _ in range(40):
+            runner._emit("pb", b"y" * 200)
+        self._drain(runner, ws)
+        runner._gaps_sent = {}  # a reconnect
+        self._drain(runner, ws)
+
+        assert gaps.count("aaaaaaaa") == 1
+
+    def test_no_gap_without_a_drop(self, monkeypatch, tmp_path):
+        runner, h, ws, gaps, fed = self._setup(monkeypatch, tmp_path)
+        runner._emit("pa", b"one")
+        runner._emit("pb", b"x")
+        runner._emit("pa", b"two")
+        self._drain(runner, ws)
+        assert gaps == []
+        assert fed["pa"] == [b"one", b"two"]
+
+    def test_a_gap_for_frames_already_delivered_is_ignored(self, monkeypatch, tmp_path):
+        """The frame in flight when it was dropped may have reached the hub."""
+        from types import SimpleNamespace
+
+        runner, h, ws, gaps, fed = self._setup(monkeypatch, tmp_path)
+        runner._emit("pa", b"one")
+        self._drain(runner, ws)
+        conn = SimpleNamespace(info=SimpleNamespace(runner_id="a"), pending={})
+        h._on_frame(conn, json.dumps({"type": "gap", "pipe_id": "pa", "through": 1}))
+        assert gaps == []
+
+    def test_a_gap_from_another_runner_is_refused(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+
+        runner, h, ws, gaps, fed = self._setup(monkeypatch, tmp_path)
+        other = SimpleNamespace(info=SimpleNamespace(runner_id="b"), pending={})
+        h._on_frame(other, json.dumps({"type": "gap", "pipe_id": "pa", "through": 5}))
+        assert gaps == []

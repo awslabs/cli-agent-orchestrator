@@ -134,9 +134,11 @@ and no report writes a row.
    delivery resume.
 2. **Runner reconnect.** A runner that reconnects (same process, after a
    network blip) keeps its pipes and re-sends the output it buffered meanwhile,
-   up to 4 MiB. Beyond that the stream has a gap: the terminal reads `unknown`
-   until a resync (reader ensured, pipe re-armed, fresh snapshot) succeeds. A
-   gap is never filled with a guess from the output that survived.
+   up to 4 MiB for all its pipes together. Beyond that the oldest output is
+   dropped, and the runner reports a gap for each pipe that lost some, even one
+   that sent nothing since: that terminal reads `unknown` until a resync
+   (reader ensured, pipe re-armed, fresh snapshot) succeeds. A gap is never
+   filled with a guess from the output that survived.
 3. **Runner restart.** A restarted runner process whose tmux server survived
    re-adopts the windows tagged with its own id (`@cao_runner_id`, next to
    `@cao_terminal_id`); their status reads `unknown` until they are resynced

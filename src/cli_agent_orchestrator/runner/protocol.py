@@ -33,6 +33,14 @@ Everything is a JSON text frame. Direction and shape:
     same window are refused. ``seq`` starts at 1 and increases by one per frame
     of that pipe: the server drops a replayed frame and logs a gap.
 
+``gap`` (runner -> server)
+    ``{"type": "gap", "pipe_id", "through"}`` — the runner dropped this pipe's
+    queued frames up to seq ``through`` (its outbox overflowed while it was
+    disconnected). Sent before any later frame of that pipe, and again on each
+    new connection until the pipe stops, since a sent frame can be lost with
+    its connection. The server reports the stream gap, so the terminal reads
+    ``unknown`` until a resync, and ignores a gap it has already passed.
+
 A call whose connection drops before its ``result`` arrives fails on the server
 with :class:`RunnerOutcomeUnknown`. The server never resubmits it: a lost
 ``send_keys`` response does not prove the keys were not typed.

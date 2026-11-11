@@ -65,8 +65,10 @@ WindowKey = Tuple[str, str]
 # credential: anything on the tmux socket can set it.
 RUNNER_ID_OPTION = "@cao_runner_id"
 
-# Output held while disconnected. Past this, the oldest chunks are dropped; the
-# server sees the resulting seq jump and logs a gap.
+# Output held while disconnected. Past this, the oldest chunks are dropped, and
+# a ``gap`` frame for each pipe that lost frames goes ahead of that pipe's
+# remaining output: a seq jump alone cannot show a loss when a pipe's whole
+# tail was dropped (an agent's last chunk before it waits for input).
 _OUTBOX_MAX_BYTES = 4 * 1024 * 1024
 _READ_CHUNK = 4096
 _INVENTORY_INTERVAL = 10.0
@@ -179,9 +181,17 @@ class Runner:
         # it while the worker is still creating.
         self._creating: "collections.Counter[str]" = collections.Counter()
         self._seq: Dict[str, int] = {}  # pipe_id -> last seq sent
-        # (pipe_id, frame) so a stopped pipe's undelivered frames can be purged.
-        self._outbox: Deque[Tuple[str, str]] = collections.deque()
+        # (pipe_id, frame, seq) so a stopped pipe's undelivered frames can be
+        # purged and a dropped frame's seq recorded.
+        self._outbox: Deque[Tuple[str, str, int]] = collections.deque()
         self._outbox_bytes = 0
+        # pipe_id -> highest seq ever dropped from the outbox. Kept until the
+        # pipe stops: a send that returned does not prove the hub read it, so
+        # every new connection reports it again (the hub ignores a gap it has
+        # already passed).
+        self._dropped: Dict[str, int] = {}
+        # What this connection has sent of _dropped; reset per connection.
+        self._gaps_sent: Dict[str, int] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._outbox_ready: Optional[asyncio.Event] = None
 
@@ -238,6 +248,8 @@ class Runner:
             backoff = min(backoff * 2, 30.0)
 
     async def _session(self, ws: Any) -> None:
+        with self._lock:
+            self._gaps_sent = {}
         await ws.send(json.dumps(self._hello()))
         welcome = json.loads(await asyncio.wait_for(ws.recv(), timeout=HANDSHAKE_TIMEOUT))
         if welcome.get("type") != "welcome" or welcome.get("protocol") != PROTOCOL_VERSION:
@@ -450,6 +462,7 @@ class Runner:
         while True:
             await self._outbox_ready.wait()
             while True:
+                await self._send_gaps(ws)
                 with self._lock:
                     if not self._outbox:
                         self._outbox_ready.clear()
@@ -462,6 +475,21 @@ class Runner:
                     if self._outbox and self._outbox[0] is entry:
                         self._outbox.popleft()
                         self._outbox_bytes -= len(entry[1])
+
+    async def _send_gaps(self, ws: Any) -> None:
+        """Report each pipe that lost frames, ahead of its remaining output.
+
+        Dropped frames are the oldest, so every frame still queued for a pipe
+        comes after its gap. Each mark is sent once per connection, and again
+        on the next one: a send that returned may still be lost with the
+        connection, and a quiet pipe would then have nothing else to show it.
+        """
+        with self._lock:
+            gaps = {p: t for p, t in self._dropped.items() if self._gaps_sent.get(p) != t}
+        for pipe_id, through in sorted(gaps.items()):
+            await ws.send(json.dumps({"type": "gap", "pipe_id": pipe_id, "through": through}))
+            with self._lock:
+                self._gaps_sent[pipe_id] = through
 
     async def _send_inventory(self, ws: Any) -> None:
         while True:
@@ -489,10 +517,12 @@ class Runner:
                     "data": base64.b64encode(chunk).decode(),
                 }
             )
-            self._outbox.append((pipe_id, frame))
+            self._outbox.append((pipe_id, frame, seq))
             self._outbox_bytes += len(frame)
             while self._outbox_bytes > _OUTBOX_MAX_BYTES and len(self._outbox) > 1:
-                self._outbox_bytes -= len(self._outbox.popleft()[1])
+                lost_pipe, lost_frame, lost_seq = self._outbox.popleft()
+                self._outbox_bytes -= len(lost_frame)
+                self._dropped[lost_pipe] = max(lost_seq, self._dropped.get(lost_pipe, 0))
         loop, ready = self._loop, self._outbox_ready
         if loop is not None and ready is not None and not loop.is_closed():
             loop.call_soon_threadsafe(ready.set)
@@ -568,6 +598,8 @@ class Runner:
             self._outbox_bytes = sum(len(e[1]) for e in kept)
             self._outbox = kept
             self._seq.pop(pipe.pipe_id, None)
+            self._dropped.pop(pipe.pipe_id, None)
+            self._gaps_sent.pop(pipe.pipe_id, None)
 
     def _record(self, session: str, window: str, terminal_id: str) -> None:
         with self._lock:
