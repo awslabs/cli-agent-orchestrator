@@ -232,6 +232,15 @@ class TestFlowEnableCommand:
 class TestFlowRunCommand:
     """Tests for the flow run command."""
 
+    @pytest.fixture(autouse=True)
+    def _local_server(self):
+        """A server on a local backend (or none reachable): the flow runs in this process."""
+        with patch(
+            "cli_agent_orchestrator.cli.commands.schedule.server_terminal_backend_or_absent",
+            return_value=None,
+        ):
+            yield
+
     @pytest.fixture
     def runner(self):
         """Create a CLI test runner."""
@@ -270,6 +279,183 @@ class TestFlowRunCommand:
         result = runner.invoke(schedule, ["run", "nonexistent"])
 
         assert result.exit_code != 0
+
+
+class TestFlowRunOnARemoteServer:
+    """``cao-server --terminal remote``: the CLI's own backend is still tmux (#745).
+
+    Running the flow in the CLI process would put its pre-script and its agent
+    on the server host, so the run goes to ``POST /flows/{name}/run`` instead.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _remote_server(self):
+        with patch(
+            "cli_agent_orchestrator.cli.commands.schedule.server_terminal_backend_or_absent",
+            return_value="remote",
+        ):
+            yield
+
+    @staticmethod
+    def _response(status_code, body):
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.ok = 200 <= status_code < 300
+        resp.json.return_value = body
+        resp.text = str(body)
+        return resp
+
+    @patch("cli_agent_orchestrator.cli.commands.schedule.init_db")
+    @patch("cli_agent_orchestrator.cli.commands.schedule.flow_service")
+    @patch("cli_agent_orchestrator.cli.commands.schedule.api_http")
+    def test_the_server_runs_the_flow_not_this_process(self, mock_http, mock_service, _db):
+        mock_http.post.return_value = self._response(200, {"executed": True})
+        mock_service.execute_flow = AsyncMock(return_value=True)
+
+        result = CliRunner().invoke(schedule, ["run", "nightly"])
+
+        assert result.exit_code == 0, result.output
+        assert "executed successfully" in result.output
+        (url,), _ = mock_http.post.call_args
+        assert url.endswith("/flows/nightly/run")
+        mock_service.execute_flow.assert_not_called()
+
+    @patch("cli_agent_orchestrator.cli.commands.schedule.init_db")
+    @patch("cli_agent_orchestrator.cli.commands.schedule.flow_service")
+    @patch("cli_agent_orchestrator.cli.commands.schedule.api_http")
+    def test_a_refused_pre_script_fails_the_command(self, mock_http, mock_service, _db):
+        mock_http.post.return_value = self._response(
+            409, {"detail": "flow 'pre': its pre-script refused"}
+        )
+        mock_service.execute_flow = AsyncMock(return_value=True)
+
+        result = CliRunner().invoke(schedule, ["run", "pre"])
+
+        assert result.exit_code != 0
+        assert "409" in result.output and "pre-script refused" in result.output
+        mock_service.execute_flow.assert_not_called()
+
+    @patch("cli_agent_orchestrator.cli.commands.schedule.init_db")
+    @patch("cli_agent_orchestrator.cli.commands.schedule.flow_service")
+    @patch("cli_agent_orchestrator.cli.commands.schedule.api_http")
+    def test_a_skipped_flow_says_so(self, mock_http, mock_service, _db):
+        mock_http.post.return_value = self._response(200, {"executed": False})
+
+        result = CliRunner().invoke(schedule, ["run", "nightly"])
+
+        assert result.exit_code == 0
+        assert "skipped" in result.output
+
+
+class TestFlowRunWhenTheServerBackendIsUnknown:
+    """A server that may be remote but does not say so: refuse, never run locally."""
+
+    @patch("cli_agent_orchestrator.cli.commands.schedule.init_db")
+    @patch("cli_agent_orchestrator.cli.commands.schedule.flow_service")
+    @patch("cli_agent_orchestrator.cli.commands.schedule.api_http")
+    def test_an_unanswered_health_check_refuses_the_run(self, mock_http, mock_service, _db):
+        from cli_agent_orchestrator.utils.terminal import ServerBackendUnknown
+
+        mock_service.execute_flow = AsyncMock(return_value=True)
+        with patch(
+            "cli_agent_orchestrator.cli.commands.schedule.server_terminal_backend_or_absent",
+            side_effect=ServerBackendUnknown("cao-server did not answer"),
+        ):
+            result = CliRunner().invoke(schedule, ["run", "pre"])
+
+        assert result.exit_code != 0
+        assert "did not answer" in result.output
+        mock_service.execute_flow.assert_not_called()
+        mock_http.post.assert_not_called()
+
+
+class TestServerTerminalBackendOrAbsent:
+    """Only "nothing listening" reads as no server; every other failure is unknown."""
+
+    @staticmethod
+    def _probe(get):
+        from cli_agent_orchestrator.utils import terminal as terminal_utils
+
+        with patch.object(terminal_utils.api_http, "get", get):
+            return terminal_utils.server_terminal_backend_or_absent()
+
+    def test_a_refused_connection_is_no_server(self):
+        """A real refused connect, as requests raises it, not a synthetic one."""
+        import socket
+
+        from cli_agent_orchestrator.utils import terminal as terminal_utils
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]  # bound, never listening: connect is refused
+            with patch.object(terminal_utils, "API_BASE_URL", f"http://127.0.0.1:{port}"):
+                assert terminal_utils.server_terminal_backend_or_absent() is None
+
+    def test_a_proxy_that_refuses_the_connect_is_not_no_server(self):
+        """The proxy refused, not the server: nested inside is a real refusal."""
+        import requests
+
+        from cli_agent_orchestrator.utils.terminal import ServerBackendUnknown
+
+        try:
+            raise ConnectionRefusedError(111, "Connection refused")
+        except ConnectionRefusedError as refused:
+            error = requests.exceptions.ProxyError(OSError("Unable to connect to proxy", refused))
+        with pytest.raises(ServerBackendUnknown):
+            self._probe(MagicMock(side_effect=error))
+
+    @pytest.mark.parametrize("cause", ["dns", "reset", "tls", "proxy", "bare"])
+    def test_a_connection_error_other_than_refused_is_unknown(self, cause):
+        import socket
+        import ssl
+
+        import requests
+
+        from cli_agent_orchestrator.utils.terminal import ServerBackendUnknown
+
+        inner = {
+            "dns": socket.gaierror(-2, "Name or service not known"),
+            "reset": ConnectionResetError(104, "Connection reset by peer"),
+            "tls": ssl.SSLError("handshake failure"),
+            "proxy": OSError("proxy refused"),
+            "bare": None,
+        }[cause]
+        if cause == "proxy":
+            error = requests.exceptions.ProxyError(inner)
+        elif inner is None:
+            error = requests.exceptions.ConnectionError("connection failed")
+        else:
+            error = requests.exceptions.ConnectionError(inner)
+        with pytest.raises(ServerBackendUnknown):
+            self._probe(MagicMock(side_effect=error))
+
+    @pytest.mark.parametrize(
+        "failure",
+        ["connect-timeout", "read-timeout", "http-503", "no-backend"],
+    )
+    def test_any_other_failure_is_unknown(self, failure):
+        import requests
+
+        from cli_agent_orchestrator.utils.terminal import ServerBackendUnknown
+
+        if failure == "connect-timeout":
+            get = MagicMock(side_effect=requests.exceptions.ConnectTimeout("slow"))
+        elif failure == "read-timeout":
+            get = MagicMock(side_effect=requests.exceptions.ReadTimeout("slow"))
+        else:
+            resp = MagicMock()
+            if failure == "http-503":
+                resp.raise_for_status.side_effect = requests.exceptions.HTTPError("503")
+            else:
+                resp.json.return_value = {"status": "ok"}
+            get = MagicMock(return_value=resp)
+        with pytest.raises(ServerBackendUnknown):
+            self._probe(get)
+
+    def test_a_reported_backend_is_returned(self):
+        resp = MagicMock()
+        resp.json.return_value = {"terminal_backend": "remote"}
+        assert self._probe(MagicMock(return_value=resp)) == "remote"
 
 
 class TestFlowDeprecatedAlias:

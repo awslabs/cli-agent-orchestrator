@@ -436,3 +436,38 @@ def test_a_restarted_server_restores_status_streams_and_inbox_delivery(stack, te
         30,
         what="the message reached the pane",
     )
+
+
+def test_cao_flow_run_does_not_run_a_pre_script_on_the_server_host(stack):
+    """``cao-server --terminal remote`` and nothing else: the CLI's own backend is tmux.
+
+    ``cao flow run`` asks the server for its backend and sends the run there, so
+    the server's refusal applies (409) and the pre-script never runs here.
+    """
+    marker = stack.root / "pre-script-ran"
+    script = stack.root / "pre.sh"
+    script.write_text(
+        f"#!/bin/sh\ntouch '{marker}'\necho '{{\"execute\": true, \"output\": {{}}}}'\n"
+    )
+    script.chmod(0o755)
+    flow = stack.root / "pre.flow.md"
+    flow.write_text(
+        '---\nname: pre\nschedule: "0 0 1 1 *"\nagent_profile: developer\n'
+        f"provider: mock_cli\nscript: {script}\n---\nhello\n"
+    )
+    env = stack._base_env(stack.root / "server")
+    env.update(CAO_API_HOST="127.0.0.1", CAO_API_PORT=str(stack.api_port))
+    cao = str(BIN / "cao")
+    added = subprocess.run(
+        [cao, "flow", "add", str(flow)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert added.returncode == 0, added.stdout + added.stderr
+
+    ran = subprocess.run(
+        [cao, "flow", "run", "pre"], env=env, capture_output=True, text=True, timeout=120
+    )
+
+    assert ran.returncode != 0, ran.stdout + ran.stderr
+    assert "409" in ran.stdout + ran.stderr
+    assert not marker.exists()
+    assert not any(row for row in stack.tmux("list-sessions").stdout.splitlines() if "pre" in row)
