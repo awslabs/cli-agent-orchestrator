@@ -29,6 +29,18 @@ prompts by having `APPROVAL_REQUIRED: <text>` typed into their panes.
 | `resume-no-status.json` | A `resume[]` entry without `status`: HTTP 422 and its body |
 | `ambient.sse` | `GET /agui/v1/stream` for the whole capture (bounded by `maxSeconds`): the six components from A, one `metric` from sender `operator` (no `subagentRunId`), a `metric` with markup in its props, and the construct's `approval_card` frames |
 
+## Session timeline
+
+| File | What it is |
+|---|---|
+| `session-timeline.sse` | `GET /agui/v1/stream` for a supervisor that assigns work to one worker and hands off to another, after which the first worker is closed: a `TOOL_CALL_START` (`assign`, `toolCallId` equal to its `eventId`), a `TOOL_CALL_START` (`handoff`), and a `TOOL_CALL_END` (`closedBy: "completion"`) that closes only the first. The second call stays open. |
+
+| `session-superseded.sse` | `GET /agui/v1/stream` for a supervisor that assigns work to a worker and then assigns that same worker a second task (`POST /terminals/<worker>/input?sender_id=<supervisor>&orchestration_type=assign`), after which the worker is closed: `TOOL_CALL_START` for the first call, `TOOL_CALL_END` with `closedBy: "superseded"` for it when the second call opens, `TOOL_CALL_START` for the second, and `TOOL_CALL_END` (`closedBy: "completion"`) for the second. |
+
+**Source: `cao-server` built at `7fc2f070653242bc01cddf7ff8e337bf2796bf5f`.**
+
+Captured from a private `cao-server` at that commit, with `CAO_AGUI_ENABLED=1`, on a non-default port with a throwaway `HOME` and its own tmux socket. Three `mock_cli` terminals: a supervisor (`POST /sessions`) and two workers created with `POST /sessions/<session>/terminals?caller_id=<supervisor>&defer_init=true` and a body carrying `initial_message` and `initial_message_orchestration_type` (`assign`, then `handoff`). `mock_cli` does not finish on its own, so the first call was closed by deleting its worker (`DELETE /terminals/<id>`): the server closes a call when its receiver's work ends. `session-superseded.sse` comes from the same commit and the same setup, with two `mock_cli` terminals: the supervisor and one worker created the same way with `assign`, then given a second `assign` through `POST /terminals/<worker>/input` with `sender_id` and `orchestration_type`, then deleted. The captures hold metadata only (ids, names and timestamps), with no message text.
+
 ## Generated with that commit's code
 
 No shipped producer can put these on the wire today, so they come from the
