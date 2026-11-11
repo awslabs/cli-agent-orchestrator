@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.agui.handoff_approval import (
@@ -36,7 +36,7 @@ class ApprovalBridge:
     def __init__(
         self,
         construct: AgentHandoffWithApproval,
-        get_output_fn: Optional[object] = None,
+        get_output_fn: Optional[Callable[[str], str]] = None,
         get_provider_fn: Optional[object] = None,
         get_session_fn: Optional[object] = None,
     ) -> None:
@@ -101,14 +101,16 @@ class ApprovalBridge:
         raw_prompt = ""
         if self._get_output_fn:
             try:
-                raw_prompt = self._get_output_fn(terminal_id)
+                raw_prompt = await asyncio.to_thread(self._get_output_fn, terminal_id)
             except Exception:
                 logger.debug("Failed to get output for terminal %s", terminal_id)
         else:
             try:
                 from cli_agent_orchestrator.services import terminal_service
 
-                raw_prompt = terminal_service.get_output(terminal_id)
+                # Off the event loop: on a remote terminal an empty status
+                # buffer means a runner round trip (#745).
+                raw_prompt = await asyncio.to_thread(terminal_service.get_output, terminal_id)
             except Exception:
                 logger.debug("Failed to get output for terminal %s", terminal_id)
 

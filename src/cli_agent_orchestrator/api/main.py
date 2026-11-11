@@ -227,6 +227,7 @@ from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils import delegation, server_lock
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
+from cli_agent_orchestrator.utils.event import snapshot_off_loop
 from cli_agent_orchestrator.utils.execution_host import (
     ServerHostCodeRefused,
     refuse_server_host_code,
@@ -2795,7 +2796,7 @@ async def agui_stream(
             # RFC-6902 STATE_DELTA patches after each fleet event.
             prev_snapshot: Optional[Dict] = None
             try:
-                prev_snapshot = _fleet_snapshot()
+                prev_snapshot = await snapshot_off_loop(_fleet_snapshot)
                 agui_type, data = state_snapshot_frame(prev_snapshot)
                 yield _sse(None, agui_type, data)
             except Exception:
@@ -2835,7 +2836,7 @@ async def agui_stream(
                 # natural follow-up for high event rates (this is the opt-in L2
                 # dashboard surface, not the orchestration hot path).
                 try:
-                    curr = _fleet_snapshot()
+                    curr = await snapshot_off_loop(_fleet_snapshot)
                     if prev_snapshot is not None:
                         delta = state_delta_frame(prev_snapshot, curr)
                         if delta is not None:
@@ -4806,7 +4807,9 @@ async def list_sessions(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     try:
-        return session_service.list_sessions()
+        # Off the event loop: under the remote backend this asks every connected
+        # runner in turn, each call bounded only by the runner call timeout (#745).
+        return await asyncio.to_thread(session_service.list_sessions)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -5308,8 +5311,11 @@ async def list_terminals_in_session(
             list_current_session_terminals,
         )
 
-        return list_current_session_terminals(session_name)
+        return await asyncio.to_thread(list_current_session_terminals, session_name)
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list terminals: {str(e)}",
@@ -5528,7 +5534,9 @@ async def get_terminal_working_directory(
 ) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
-        working_directory = terminal_service.get_working_directory(terminal_id)
+        working_directory = await asyncio.to_thread(
+            terminal_service.get_working_directory, terminal_id
+        )
         return WorkingDirectoryResponse(working_directory=working_directory)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

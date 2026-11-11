@@ -219,3 +219,25 @@ class TestBridgeDisabled:
             await asyncio.wait_for(bridge.run(), timeout=1.0)
             # No interrupts created
             assert len(construct.pending()) == 0
+
+
+class TestBridgeOutputOffTheLoop:
+    """The prompt lookup may be a runner round trip under the remote backend (#745):
+    it must not stop the event loop while it waits."""
+
+    @pytest.mark.asyncio
+    async def test_a_slow_output_lookup_does_not_block_the_loop(self, construct):
+        import time
+
+        def slow_output(tid):
+            time.sleep(1.0)
+            return "Allow? (y/n)"
+
+        bridge = _make_bridge(construct, get_output_fn=slow_output)
+        waiting = asyncio.create_task(bridge._on_waiting("aaaaaaaa"))
+        started = time.monotonic()
+        await asyncio.sleep(0.05)
+        ticked_after = time.monotonic() - started
+        await waiting
+
+        assert ticked_after < 0.5, f"the loop was blocked for {ticked_after:.2f}s"
