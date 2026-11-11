@@ -282,7 +282,7 @@ def read_grant_record() -> Dict[str, Any]:
     return loaded
 
 
-def _write_grant_record(record: Dict[str, Any]) -> None:
+def _write_grant_record(record: Dict[str, Any], *, lost: str) -> None:
     """Persist the grant sidecar atomically (temp file + ``replace``).
 
     Same discipline as ``InstalledPluginStore.write_record``: a torn write here
@@ -291,12 +291,18 @@ def _write_grant_record(record: Dict[str, Any]) -> None:
 
     Best effort, symmetrically with :func:`read_grant_record`. By the time this
     runs ``opencode.json`` has already been updated, so raising would report the
-    install as *failed* after the user-visible half succeeded. A lost sidecar
-    costs CAO the record: plugin servers' grants fall back to the containment
-    proof, the pre-sidecar behaviour, and a profile server's grant it wrote has
-    no proof left, so it stays if the profile drops that server before the agent
-    is next installed with a writable sidecar. An unwritable sidecar must not be
-    worse than an absent one.
+    install as *failed* after the user-visible half succeeded. A failed write
+    keeps the OLD record, so the change this write would have made goes
+    unrecorded, and *lost* is the caller's account of that. For an ADDITION, the
+    new entry has no proof (a grant the old record already has keeps its). For a
+    WITHDRAWAL it is the other way round: ``opencode.json`` no longer has the key
+    but the old record still lists it, so the next install with a writable
+    sidecar removes a key of that name even if the user added it by hand
+    (#1285 review, Note 1; it is tracked as an issue, not changed here). The two
+    callers lose different things (an agent's grant row from
+    :func:`_record_grants`, an ``"mcp"`` fingerprint from
+    :func:`record_mcp_entry`), and one message cannot be true of both. *lost* is
+    required, with no default, so a new caller cannot inherit the wrong one.
     """
     path = _grant_record_path()
     temp_path = path.with_name(f".{path.name}.tmp")
@@ -307,14 +313,7 @@ def _write_grant_record(record: Dict[str, Any]) -> None:
     except OSError as exc:
         # Not GRANT_RECORD_REPAIR_HINT: the file is not damaged, it could not be
         # written (a read-only directory, a full disk), so there is nothing to repair.
-        logger.warning(
-            "Could not record OpenCode tool grants at %s (%s). A plugin server's grant "
-            "is still withdrawn by plugin-store containment; a profile server's grant "
-            "written now has no proof left and stays if the profile drops that server "
-            "before the agent is next installed with a writable sidecar.",
-            path,
-            exc,
-        )
+        logger.warning("Could not write the OpenCode grant record at %s (%s). %s", path, exc, lost)
 
 
 def _recorded_grants(agent_name: str) -> Set[str]:
@@ -356,7 +355,16 @@ def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
                 return
             agents.pop(agent_name)
         record["version"] = 1
-        _write_grant_record(record)
+        _write_grant_record(
+            record,
+            lost=(
+                f"Agent {agent_name}'s recorded grants keep their old value: a profile server's grant "
+                "added now stays if the profile drops that server before the agent is next installed "
+                "with a writable sidecar, and a grant removed now is still recorded, so that install "
+                "removes a key of that name even if it was added by hand. A plugin server's grant is "
+                "still withdrawn by plugin-store containment."
+            ),
+        )
     except GrantRecordUnreadableError as exc:
         logger.warning(
             "opencode grant record is unreadable (%s); leaving it as it is and not "
@@ -434,7 +442,10 @@ def record_mcp_entry(name: str, config: Mapping[str, Any]) -> None:
 
     Fails closed: a sidecar that is present but unreadable is left as it is and
     this entry goes unrecorded, so CAO falls back to the containment proof for
-    it. An install is never failed for this.
+    it. The same holds when the sidecar cannot be written. That proof does not
+    survive a ``CAO_HOME_DIR`` move, where the fingerprint is the only proof the
+    entry is CAO's, and the write-failure warning says so. An install is never
+    failed for this.
     """
     digest = mcp_entry_fingerprint(config)
     try:
@@ -447,7 +458,13 @@ def record_mcp_entry(name: str, config: Mapping[str, Any]) -> None:
         entries[name] = digest
         record["mcp"] = entries
         record["version"] = 1
-        _write_grant_record(record)
+        _write_grant_record(
+            record,
+            lost=(
+                f"mcp.{name} goes unrecorded, so CAO falls back to the containment proof for it; "
+                "after a CAO_HOME_DIR move CAO cannot prove the entry is its own."
+            ),
+        )
     except GrantRecordUnreadableError as exc:
         logger.warning(
             "opencode grant record is unreadable (%s); not recording mcp.%s. %s",
