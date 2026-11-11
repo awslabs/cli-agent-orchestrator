@@ -1,0 +1,36 @@
+name: Robotics policy-driven cell example
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'examples/robotics/policy-driven-cell/**'
+      - '.github/workflows/robotics-policy-cell.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'examples/robotics/policy-driven-cell/**'
+      - '.github/workflows/robotics-policy-cell.yml'
+
+permissions:
+  contents: read
+
+env:
+  UV_LOCKED: "1"
+
+jobs:
+  cell:
+    name: Cell logic, MCP scopes and live view
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: "examples/robotics/policy-driven-cell/uv.lock"
+      # The sim-marked test downloads the Holosoma weights and needs a renderer,
+      # so CI runs the fake-backend tests; run `pytest -m sim` locally.
+      - name: Run cell, MCP boundary and live view tests
+        working-directory: examples/robotics/policy-driven-cell
+        run: uv run --locked --python 3.12 pytest -m "not sim"
