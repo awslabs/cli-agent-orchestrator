@@ -328,3 +328,4 @@ def test_the_known_gates_are_owned_by_the_expected_jobs():
 
     assert f"{ENV_VAR}: ${{{{ matrix.python-version == '3.12' && 'unit' || '' }}}}" in ci
     assert f"{ENV_VAR}: gitleaks" in secret_scan
+    assert f"{ENV_VAR}: agui-node" in ci

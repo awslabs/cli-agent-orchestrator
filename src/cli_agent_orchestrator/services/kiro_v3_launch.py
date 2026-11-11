@@ -3,9 +3,8 @@
 ``create_terminal`` calls these before any window, registry row or FIFO
 exists, in this order:
 
-1. after the capability probe: the probed kiro-cli version must be allow-listed
-   and verified, or pending verification with the operator's
-   ``kiro.v3_allow_unverified_versions`` opt-in on, and the policy must not be
+1. after the capability probe: the probed version must qualify for strict
+   or operator opt-in observed admission, and the policy must not be
    unrestricted (``*``);
 2. at Step 1c, from the final launch directory: no ``KIRO_HOME`` other than the
    default home may reach the launch; the directory ``cao install`` writes
@@ -35,8 +34,11 @@ from cli_agent_orchestrator.providers.kiro_identity import (
     require_kiro_agent_defined,
 )
 from cli_agent_orchestrator.providers.kiro_v3_schema import (
+    SUPPORTED_KIRO_CLI_VERSIONS,
     KiroV3EngineSchema,
+    KiroV3ObservedRefusal,
     KiroV3UnverifiedVersionError,
+    observed_kiro_v3_entry,
     require_launchable_kiro_v3_version,
 )
 from cli_agent_orchestrator.providers.kiro_workspace import check_kiro_workspace
@@ -44,7 +46,10 @@ from cli_agent_orchestrator.services.kiro_v3_validate import (
     KiroV3InvalidAgentError,
     validate_kiro_v3_agent_bytes,
 )
-from cli_agent_orchestrator.services.settings_service import kiro_v3_allow_unverified_versions
+from cli_agent_orchestrator.services.settings_service import (
+    kiro_v3_allow_unverified_versions,
+    kiro_v3_observed_admission,
+)
 from cli_agent_orchestrator.utils.path_validation import flatten_path_separators
 
 logger = logging.getLogger(__name__)
@@ -58,17 +63,35 @@ class KiroV3Admission:
     #: Set when the operator's opt-in admitted a version still pending
     #: operator verification (#1167, provisional); None otherwise.
     unverified_version: Optional[str] = None
+    observed_version: Optional[str] = None
+    borrowed_schema_version: Optional[str] = None
 
     @property
     def launch_notes(self) -> Optional[List[str]]:
         """The note the launch response carries, or None when there is nothing to say."""
-        if self.unverified_version is None:
-            return None
-        return [
-            f"kiro_v3_unverified_version_admitted: kiro-cli {self.unverified_version} is "
-            "pending operator verification; this v3 launch was admitted only by the "
-            "operator opt-in kiro.v3_allow_unverified_versions."
-        ]
+        notes = []
+        if self.observed_version is not None:
+            pending = " (pending operator verification)" if self.unverified_version else ""
+            notes.append(
+                f"kiro_v3_observed_admitted: kiro-cli {self.observed_version} borrowed "
+                f"schema from kiro-cli {self.borrowed_schema_version}{pending} by operator opt-in "
+                "kiro.v3_admission=observed; every live launch check still applies."
+            )
+        if self.unverified_version is not None:
+            if self.observed_version is not None:
+                notes.append(
+                    f"kiro_v3_unverified_version_admitted: kiro-cli {self.observed_version} "
+                    f"runs on the schema of kiro-cli {self.borrowed_schema_version}, which is "
+                    "pending operator verification; this v3 launch was admitted by the "
+                    "operator opt-in kiro.v3_allow_unverified_versions."
+                )
+            else:
+                notes.append(
+                    f"kiro_v3_unverified_version_admitted: kiro-cli {self.unverified_version} is "
+                    "pending operator verification; this v3 launch was admitted only by the "
+                    "operator opt-in kiro.v3_allow_unverified_versions."
+                )
+        return notes or None
 
 
 def reinstall_remedy(agent_profile: str, agent_file: Path) -> str:
@@ -89,24 +112,38 @@ def reinstall_remedy(agent_profile: str, agent_file: Path) -> str:
 
 
 def require_kiro_v3_admissible(
-    capabilities: object, allowed_tools: Optional[List[str]]
+    capabilities: object, allowed_tools: Optional[List[str]], *, allow_observed: bool = False
 ) -> KiroV3Admission:
     """The probed engine's schema, or a refusal for its version or an unrestricted policy.
 
-    A version pending operator verification refuses unless the operator opted
-    in (``kiro.v3_allow_unverified_versions``). The opt-in is read only for
-    such a version, so it never admits an unknown one, and it widens nothing
-    else: every later check still applies. Provisional (#1167).
+    Listed versions keep their pending-verification rule. Unlisted versions
+    require the observed setting, v3 capability, and the newest same-major
+    schema predecessor. Only the sealed-home helper path passes ``allow_observed``;
+    other callers stay strict. Every later check still applies.
     """
     version = capabilities.version if isinstance(capabilities, KiroCapabilities) else None
     unverified: Optional[str] = None
-    try:
-        entry = require_launchable_kiro_v3_version(version)
-    except KiroV3UnverifiedVersionError:
-        if not kiro_v3_allow_unverified_versions():
-            raise
-        entry = require_launchable_kiro_v3_version(version, allow_unverified=True)
-        unverified = entry.cli_version
+    observed = (
+        allow_observed
+        and version not in SUPPORTED_KIRO_CLI_VERSIONS
+        and kiro_v3_observed_admission()
+    )
+    if observed:
+        if not isinstance(capabilities, KiroCapabilities) or "v3" not in capabilities.agent_engines:
+            raise KiroV3ObservedRefusal(version, "--agent-engine does not advertise v3")
+        entry = observed_kiro_v3_entry(
+            version, allow_unverified=kiro_v3_allow_unverified_versions()
+        )
+        if entry.pending_operator_verification:
+            unverified = entry.cli_version
+    else:
+        try:
+            entry = require_launchable_kiro_v3_version(version)
+        except KiroV3UnverifiedVersionError:
+            if not kiro_v3_allow_unverified_versions():
+                raise
+            entry = require_launchable_kiro_v3_version(version, allow_unverified=True)
+            unverified = entry.cli_version
     if allowed_tools is None or "*" in allowed_tools:
         raise KiroV3LaunchError(
             "kiro_v3_unrestricted",
@@ -114,13 +151,36 @@ def require_kiro_v3_admissible(
             "the agent's allowedTools, or retry with engine 'v2'.",
         )
     if unverified is not None:
+        if observed:
+            logger.warning(
+                "Kiro v3 launch admitted: kiro-cli %s runs on the schema of kiro-cli %s, "
+                "which is pending operator verification, by the operator opt-in "
+                "kiro.v3_allow_unverified_versions (#1167). Keep the opt-in off outside "
+                "the operator checklist.",
+                version,
+                entry.cli_version,
+            )
+        else:
+            logger.warning(
+                "Kiro v3 launch admitted on kiro-cli %s, which is pending operator "
+                "verification, by the operator opt-in kiro.v3_allow_unverified_versions "
+                "(#1167). Keep the opt-in off outside the operator checklist.",
+                unverified,
+            )
+    if observed:
         logger.warning(
-            "Kiro v3 launch admitted on kiro-cli %s, which is pending operator "
-            "verification, by the operator opt-in kiro.v3_allow_unverified_versions "
-            "(#1167). Keep the opt-in off outside the operator checklist.",
-            unverified,
+            "Kiro v3 observed admission: kiro-cli %s borrowed schema from kiro-cli %s%s; "
+            "operator opt-in kiro.v3_admission=observed; live checks remain required.",
+            version,
+            entry.cli_version,
+            " (pending operator verification)" if unverified else "",
         )
-    return KiroV3Admission(entry.schema, unverified)
+    return KiroV3Admission(
+        entry.schema,
+        unverified,
+        version if observed else None,
+        entry.cli_version if observed else None,
+    )
 
 
 def _default_kiro_home() -> str:

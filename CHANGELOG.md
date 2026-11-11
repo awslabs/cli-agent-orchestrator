@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal poll ceiling in `wait_until_terminal_status`) instead of inheriting the module-wide
   60s read timeout. Each status read now stops after 5s to connect and 5s without data, so a
   stalled broker can overrun `--timeout` by about 6s instead of about 60s.
+- **Kiro v3 helpers can admit unlisted kiro-cli versions with an operator opt-in.**
+  `kiro.v3_admission: "observed"` borrows the newest same-major schema row
+  at or below the probed version, for versions from 2.35.1 to below 4.0.0. The existing
+  pending-version opt-in is required when that newest row is pending; CAO never falls
+  back to an older verified row. Versions must use canonical ASCII parts of at most six digits.
+  The v3 capability probe and every live check remain required before task input;
+  each admission logs a WARNING and reports both versions in `launch_notes`. Strict admission stays the default
+  and always applies to installed-agent launches.
 - **A reconnect no longer loses a tool call's end, and `toolCallName` is `assign`, not
   `OrchestrationType.ASSIGN`** (#1292). On the ambient AG-UI stream, a client that held an `assign`
   or `handoff` call open, lost its stream (an overflow, or a dropped connection) and reconnected
@@ -167,6 +175,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its tmux server as an orphan. The open is now non-blocking and retried, and while it waits the
   writer exits as soon as tmux closes its stdin. Output written before a late reader attaches is
   still delivered.
+
+- **The CAO Dojo has a recorded, scrubbed AG-UI trace with leak and drift guards** (#1116).
+  `examples/ag-ui/cao-dojo/trace/cao-dojo-trace.ndjson` holds three captures (`none`, `approve`,
+  `reject`) from a real Claude Code permission prompt, recorded by
+  `examples/ag-ui/cao-dojo/tools/record_trace.py` against an isolated `cao-server`. A typed leak
+  rule (L1-L14, each mutation-tested) runs at pre-commit; an offline replay (tier 1: the pinned SDK
+  models plus upstream `enforceEvents`/`verifyEvents`) runs at pre-push (Python) and in CI (Python
+  and node); a keyless `mock_cli` approve/reject/none e2e checks a live recording against the
+  committed shape file in the `AG-UI stock-client live (AC3)` job (tier 2). The release path refuses a missing or stale
+  trace. `mock_cli`'s scripted mode gains `__mock_approval__`, which holds a prompt until it is
+  answered. New `make` targets: `record-agui-trace`, `check-agui-trace`,
+  `check-agui-trace-release`.
+- **A fourth agent-plugin package, `cao-ag-ui-builder`** (#1116; the name is provisional). It
+  ships the `agui-author` skill and no `mcp.json`.
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different
   request already claimed gets its own slot. On `POST /sessions` and

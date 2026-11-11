@@ -9,6 +9,13 @@ Proves:
 
 from __future__ import annotations
 
+import os
+import pty
+import select
+import subprocess
+import time
+from pathlib import Path
+
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -162,3 +169,139 @@ class TestStatusTransitionRoundTrip:
             f"\u276f "
         )
         assert provider.get_status(buffer_answered) == TerminalStatus.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# The real binary: the __mock_approval__ magic (#1116)
+# ---------------------------------------------------------------------------
+#
+# Every test above fakes the buffer. These run the real ``mock_cli`` binary in
+# a pty, so they prove the binary can actually hold the prompt state that
+# scripted mode detects. Before the magic existed, the binary echoed the marker
+# as ``> MOCK: APPROVAL_REQUIRED: ...`` and reprinted the prompt, so a
+# non-blank line always followed the marker and the status could never be
+# WAITING_USER_ANSWER.
+
+MOCK_CLI_BIN = Path(__file__).resolve().parent / "fixtures" / "bin" / "mock_cli"
+
+
+class _LiveMockCli:
+    """The real binary on a pty, with bounded reads."""
+
+    def __init__(self) -> None:
+        self.parent_fd, child_fd = pty.openpty()
+        self.proc = subprocess.Popen(
+            [str(MOCK_CLI_BIN), "--delay-ms", "0"],
+            stdin=child_fd,
+            stdout=child_fd,
+            stderr=child_fd,
+            close_fds=True,
+        )
+        os.close(child_fd)
+        self.buffer = ""
+
+    def read_until(self, needle: str, timeout: float = 5.0) -> str:
+        deadline = time.monotonic() + timeout
+        while needle not in self.buffer and time.monotonic() < deadline:
+            ready, _, _ = select.select([self.parent_fd], [], [], 0.05)
+            if ready:
+                try:
+                    chunk = os.read(self.parent_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self.buffer += chunk.decode("utf-8", "replace").replace("\r\n", "\n")
+        return self.buffer
+
+    def settle(self, quiet: float = 0.3) -> str:
+        """Read until the binary has printed nothing for ``quiet`` seconds."""
+        end = time.monotonic() + 5.0
+        last = time.monotonic()
+        while time.monotonic() < end and time.monotonic() - last < quiet:
+            ready, _, _ = select.select([self.parent_fd], [], [], 0.05)
+            if ready:
+                chunk = os.read(self.parent_fd, 4096)
+                if chunk:
+                    self.buffer += chunk.decode("utf-8", "replace").replace("\r\n", "\n")
+                    last = time.monotonic()
+        return self.buffer
+
+    def ask(self, text: str = "Allow?") -> str:
+        """Raise the scripted prompt; wait for its marker, then for the output to settle.
+
+        Waiting on the marker first bounds the read by content, not by the quiet
+        window alone, so a slow CI runner cannot settle before the prompt prints.
+        """
+        self.send(f"__mock_approval__ {text}")
+        self.read_until(f"{SCRIPTED_PROMPT_MARKER} {text}")
+        return self.settle()
+
+    def send(self, line: str) -> None:
+        os.write(self.parent_fd, (line + "\n").encode("utf-8"))
+
+    def close(self) -> None:
+        try:
+            # Answer a prompt a test left open, so /exit is not read as the answer
+            # and the wait below does not stall. Outside a prompt it is one echo.
+            self.send("n")
+            self.send("/exit")
+            self.proc.wait(timeout=5)
+        except Exception:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        finally:
+            os.close(self.parent_fd)
+
+
+@pytest.fixture
+def live_mock_cli():
+    cli = _LiveMockCli()
+    cli.read_until("\u276f ")
+    yield cli
+    cli.close()
+
+
+class TestMockApprovalMagicOnTheRealBinary:
+    """``__mock_approval__ <text>`` holds WAITING_USER_ANSWER until it is answered y or n."""
+
+    def test_the_magic_holds_the_waiting_state(self, provider, live_mock_cli, monkeypatch):
+        monkeypatch.setenv("CAO_MOCK_CLI_SCRIPTED_PROMPTS", "1")
+        buffer = live_mock_cli.ask()
+
+        assert f"{SCRIPTED_PROMPT_MARKER} Allow?" in buffer
+        assert provider.get_status(buffer) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_an_empty_line_first_does_not_answer_it(self, provider, live_mock_cli, monkeypatch):
+        """CAO's bracketed paste can deliver an empty line before the answer."""
+        monkeypatch.setenv("CAO_MOCK_CLI_SCRIPTED_PROMPTS", "1")
+        live_mock_cli.ask()
+        live_mock_cli.send("")
+        live_mock_cli.send("y")
+        buffer = live_mock_cli.read_until("> MOCK: answered y")
+
+        assert "> MOCK: answered y" in buffer
+
+    @pytest.mark.parametrize("answer", ["y", "n"])
+    def test_answering_clears_to_completed(self, provider, live_mock_cli, monkeypatch, answer):
+        monkeypatch.setenv("CAO_MOCK_CLI_SCRIPTED_PROMPTS", "1")
+        live_mock_cli.ask()
+        live_mock_cli.send(answer)
+        live_mock_cli.read_until(f"> MOCK: answered {answer}")
+        buffer = live_mock_cli.settle()
+
+        assert f"> MOCK: answered {answer}" in buffer
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED
+
+    def test_any_other_answer_is_reported_as_unexpected(self, live_mock_cli):
+        """Only y and n are accepted, so a change in CAO's decision translation shows."""
+        live_mock_cli.ask()
+        live_mock_cli.send("x")
+        buffer = live_mock_cli.read_until("> MOCK: unexpected answer x")
+
+        assert "> MOCK: unexpected answer x" in buffer
+        assert "answered" not in buffer
+
+    def test_the_header_lists_the_magic(self):
+        header = MOCK_CLI_BIN.read_text(encoding="utf-8").split("set -u", 1)[0]
+        assert "__mock_approval__" in header
