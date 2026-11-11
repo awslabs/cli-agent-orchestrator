@@ -2447,6 +2447,9 @@ def _agui_ambient_response(
             since=since,
             terminal_known=lambda terminal_id: _db.terminal_exists(terminal_id),
             terminal_label=lambda terminal_id: _db.get_terminal_label(terminal_id),
+            # A reconnect replays from its cursor, so a call made before it is not in
+            # the replay; the whole ring lets the run close that call (#1292).
+            call_history=lambda: get_event_log().history(),
         )
         try:
             async for frame in ambient_stream(
