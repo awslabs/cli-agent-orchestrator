@@ -33,6 +33,8 @@ Everything else sits behind it, and [CAO](https://github.com/awslabs/cli-agent-o
 
 That's what I mean by a dark factory: a factory that runs with the lights off. I put it to the agent in one line: "This super agent is a piece of art, turn my daily coding work into a code dark-factory."
 
+The whole setup is in the CAO repo as a sample, [`examples/super-agent`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/super-agent): the three agent profiles, their playbooks, the scripts and the poll loop, with my names and paths taken out.
+
 ## 9 November, from my phone
 
 The day started with a handover. The conductor I'd been talking to had passed its work to a new one. A conductor's memory is one long conversation, so a handover has to be a file. The old conductor wrote down everything in it: the open pull requests, who was waiting on whom, and the rules that should follow. The new conductor read it, started its two long-lived helpers, and wrote a short file back to say it had taken over. The old one was watching for exactly that file. Before it left, it had stopped its poll loop, because only one may run at a time.
@@ -175,6 +177,8 @@ You don't need the whole kit to feel the shift. Add one piece at a time:
 1. One conductor profile and one short-lived helper, using CAO's ephemeral agents. See what changes when you only talk to one agent.
 2. Add a pause switch that survives a restart.
 3. Only then add a shepherd or reviewer, and start it in observe mode. [AUTHOR: confirm this order, and which parts of your kit a reader can reuse today.]
+
+Each piece is in [`examples/super-agent`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/super-agent), with a quick start. Its standing OKs ship as placeholders, and the shepherd starts in observe mode.
 
 ## Links
 
