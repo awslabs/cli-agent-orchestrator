@@ -308,14 +308,19 @@ async function main() {
 
   // 6c. A token stream that stops reading overflows the server's per-subscriber queue (256
   //     events; sse_bus.SSE_MAX_QUEUE_SIZE) and is ended with RUN_ERROR cao.stream_overflow. The
-  //     client reconnects with forwardedProps.cao.since. Asserted: a call whose start was dropped
-  //     is recovered by the replay, no call is listed twice, the call held across the gap is
-  //     either "completed" or "unconfirmed" (never lost or doubled), and every flood component
-  //     arrives (counted in frames: the panel keeps only MAX_PANEL_ENTRIES). The replay ring holds
-  //     500 records (event_log_service.RING_CAPACITY) and the records missed here are fewer.
-  //     The client "stops reading" because the fetch it is given holds the first response body
-  //     back: nothing is pulled from the socket until the gate opens, so the server's writes back up.
-  const FLOOD = 450;
+  //     client reconnects with forwardedProps.cao.since. The client "stops reading" because the
+  //     fetch it is given holds the first response body back: nothing is pulled from the socket
+  //     until the gate opens, so the server's writes back up. How much the socket buffers absorb
+  //     before the queue fills depends on the OS (about 340 events of 7 KB on macOS; Linux
+  //     loopback buffers hold several MB), so FILL is sized to overflow on both.
+  //     After the fill, and so after the overflow: the second call (its start is dropped), the
+  //     first worker's end, and MARK markers. The replay ring holds the newest 500 records
+  //     (event_log_service.RING_CAPACITY), so fillers older than that are not replayed; the
+  //     markers and both calls are among the newest and must be. Asserted: the overflow, the
+  //     dropped start recovered, every marker once, no filler or call twice, and the call held
+  //     across the gap listed once as completed or unconfirmed.
+  const FILL = 3000;
+  const MARK = 20;
   let releaseGate: () => void = () => {};
   let gate: Promise<void> = Promise.resolve();
   const overflowBodies: Array<Record<string, unknown>> = [];
@@ -363,32 +368,39 @@ async function main() {
   const workerOne = await callWorker(A.session, A.id, "assign");
   await until(() => flood.timeline.entries.some((e) => e.receiver === workerOne && e.state === "open"), "the first call to reach the client");
   gate = new Promise<void>((resolve) => (releaseGate = resolve)); // from here the client reads nothing
-  const floodPad = "x".repeat(7000);
-  for (let i = 0; i < FLOOD; i += 1) {
-    const r = await emitUi("progress", A.id, { label: `e2e flood ${i}`, note: floodPad });
-    assert.equal(r.status, 200, `flood ${i}: ${JSON.stringify(r.body)}`);
+  const floodPad = "x".repeat(7500); // emit_ui refuses props over 8 KB
+  for (let i = 0; i < FILL; i += 1) {
+    const r = await emitUi("progress", A.id, { label: `e2e fill ${i}`, note: floodPad });
+    assert.equal(r.status, 200, `fill ${i}: ${JSON.stringify(r.body)}`);
   }
-  // After the queue is full: a call whose start the held stream cannot carry, and the end of call 1.
+  // After the queue is full: a call whose start the held stream cannot carry, the end of call 1,
+  // and the markers.
   const workerTwo = await callWorker(A.session, A.id, "handoff");
   await closeWorker(workerOne);
+  for (let i = 0; i < MARK; i += 1) {
+    const r = await emitUi("metric", A.id, { label: `e2e mark ${i}` });
+    assert.equal(r.status, 200, `mark ${i}: ${JSON.stringify(r.body)}`);
+  }
   assert.ok(!floodFrames.some((f) => f.type === "RUN_ERROR"), "nothing has been read yet");
   releaseGate();
-  const floodLabel = (f: Frame) => {
-    const value = f.type === "CUSTOM" ? (f.value as { props?: { label?: unknown } } | undefined) : undefined;
-    const label = value?.props?.label;
-    return typeof label === "string" && label.startsWith("e2e flood ") ? label : null;
-  };
-  const floodSeen = () => new Set(floodFrames.map(floodLabel).filter(Boolean)).size;
-  const floodDone = () => floodReopened > 0 && floodSeen() >= FLOOD && flood.timeline.entries.some((e) => e.receiver === workerTwo);
+  const labelsWith = (prefix: string) =>
+    floodFrames.flatMap((f) => {
+      const value = f.type === "CUSTOM" ? (f.value as { props?: { label?: unknown } } | undefined) : undefined;
+      const label = value?.props?.label;
+      return typeof label === "string" && label.startsWith(prefix) ? [label] : [];
+    });
+  const marksSeen = () => new Set(labelsWith("e2e mark ")).size;
+  const floodDone = () => floodReopened > 0 && marksSeen() >= MARK && flood.timeline.entries.some((e) => e.receiver === workerTwo);
   try {
-    await until(floodDone, "the resync to deliver the dropped start and every flood component", 30_000);
+    await until(floodDone, "the resync to deliver the dropped start and every marker", 60_000);
   } catch (error) {
     const detail = {
       status: floodStatus,
       frames: floodFrames.length,
       runError: floodFrames.find((f) => f.type === "RUN_ERROR"),
       requests: overflowBodies.length,
-      flood: `${floodSeen()}/${FLOOD}`,
+      fill: new Set(labelsWith("e2e fill ")).size,
+      marks: `${marksSeen()}/${MARK}`,
       timeline: flood.timeline.entries.map((e) => [e.receiver, e.orchestrationType, e.state]),
     };
     throw new Error(`${error instanceof Error ? error.message : error}: ${JSON.stringify(detail)}`);
@@ -401,7 +413,11 @@ async function main() {
   const floodSince = (overflowBodies[1]?.forwardedProps as { cao?: { since?: string } } | undefined)?.cao?.since;
   assert.ok(floodSince && !Number.isNaN(Date.parse(floodSince)), `the reconnect carried no since: ${JSON.stringify(overflowBodies[1])}`);
   assert.equal(floodReopened, 1, "the reopen is reported once");
-  assert.equal(floodSeen(), FLOOD, "every flood component arrived");
+  const fills = labelsWith("e2e fill ");
+  assert.equal(new Set(fills).size, fills.length, "a filler arrived twice");
+  const marks = labelsWith("e2e mark ");
+  assert.equal(marks.length, MARK, `every marker once: ${marks.length}`);
+  assert.equal(new Set(marks).size, MARK, "a marker arrived twice");
   const ids = flood.timeline.entries.map((e) => e.toolCallId);
   assert.equal(new Set(ids).size, ids.length, `a call is listed twice: ${ids.join(",")}`);
   const one = flood.timeline.entries.filter((e) => e.receiver === workerOne);
@@ -413,7 +429,7 @@ async function main() {
   const startFrames = floodFrames.filter((f) => f.type === "TOOL_CALL_START").length;
   log(
     `PASS overflow then resync: RUN_ERROR cao.stream_overflow after the held stream was read, the reconnect sent since=${floodSince}, ` +
-      `all ${FLOOD} components arrived (counted in frames), the dropped start was recovered (call 2: ${two[0].state}), ` +
+      `${fills.length}/${FILL} fillers (none twice) and all ${MARK} markers once (counted in frames), the dropped start was recovered (call 2: ${two[0].state}), ` +
       `the held call is listed once as ${one[0].state}, and ${startFrames} TOOL_CALL_START frames gave 2 entries`,
   );
 
