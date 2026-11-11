@@ -201,3 +201,21 @@ def test_folding_keeps_the_buckets_bounded() -> None:
     for i in range(100):
         lim.fold(f"t{i}")
     assert lim.tracked_buckets == 4
+
+
+def test_the_visible_prefix_is_short_and_the_hash_keeps_names_apart() -> None:
+    """#1295 review (P3): the cleaned prefix is caller text and is kept short; the hash keeps
+    names that share a long prefix apart."""
+    from cli_agent_orchestrator.services.agui.refusal import (
+        REFUSAL_NAME_PREFIX_CHARS,
+        refusal_name,
+    )
+
+    long_a = "a" * 300
+    long_b = "a" * 299 + "b"
+    name_a, name_b = refusal_name(long_a), refusal_name(long_b)
+    assert name_a[:REFUSAL_NAME_PREFIX_CHARS] == "a" * REFUSAL_NAME_PREFIX_CHARS
+    assert name_a != name_b  # same visible prefix, different hash
+    assert len(name_a) == REFUSAL_NAME_PREFIX_CHARS + 1 + 8
+    secret = "AKIAIOSFODNN7EXAMPLE" + "x" * 60
+    assert len(refusal_name(secret)) <= 64

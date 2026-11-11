@@ -319,3 +319,113 @@ async def test_a_10k_off_list_flood_loses_no_real_event_and_ends_no_stream(monke
     assert "RUN_ERROR" not in [e["type"] for e in events]
     assert len([e for e in events if e["type"] == "CUSTOM"]) == len(real_ids) == 256
     assert MARKER not in body
+
+
+def _age_ring(hours: float) -> None:
+    """Move every buffered row back by ``hours``, as if it were that old (test only)."""
+    from datetime import datetime, timedelta, timezone
+
+    log = event_log_service.get_event_log()
+    old = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with log._lock:
+        for row in log._buf:
+            row["timestamp"] = old
+
+
+def test_expired_refusals_do_not_keep_the_share_full(monkeypatch) -> None:
+    """#1295 review (P2): 50 off-list calls fill the refusal share of the ring. Once they are
+    older than the 24 h window, history() no longer returns them, so they must not count
+    against the share: another terminal's first refusal must still be published.
+    (The limiter has no window here, so each call is its own window and nothing is folded
+    by it; only the share can stop a publish.)"""
+    from cli_agent_orchestrator.services.agui import refusal
+
+    clock = {"now": 0.0}
+
+    def tick() -> float:
+        clock["now"] += 1.0
+        return clock["now"]
+
+    monkeypatch.setattr(
+        refusal,
+        "_limiter",
+        refusal.RefusalLimiter(
+            window_seconds=0.0, per_bucket=10**6, global_per_window=10**6, clock=tick
+        ),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.terminal_exists",
+        lambda tid: tid == "t-other",
+    )
+    for i in range(50):
+        assert _off_list(f"probe{i}").status_code == 400
+    assert len(_refusals()) == 50
+
+    _age_ring(25)
+    assert _refusals() == []  # the window history() returns is empty
+
+    assert _off_list("first-after-expiry", terminal_id="t-other").status_code == 400
+    fresh = [e for e in _refusals() if e["terminal_id"] == "t-other"]
+    assert len(fresh) == 1, "the first refusal after the share expired must be published"
+
+
+def test_the_share_counts_only_refusal_rows_inside_the_ttl() -> None:
+    """The count the share uses is of the rows history() would return."""
+    from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY, get_event_log
+
+    log = get_event_log()
+    for i in range(50):
+        log.append("other", None, None, {"event_type": "agent_ui_refused", "n": i})
+    assert log.count_event_type("agent_ui_refused") == 50
+    assert log.count_event_type("agent_ui_refused", within_ttl=True) == 50
+    _age_ring(25)
+    assert log.count_event_type("agent_ui_refused") == 50  # the raw ring slots
+    assert log.count_event_type("agent_ui_refused", within_ttl=True) == 0
+    assert RING_CAPACITY == 500
+
+
+def test_a_row_with_an_unparseable_timestamp_is_not_counted_inside_the_ttl() -> None:
+    log = event_log_service.get_event_log()
+    log.append("other", None, None, {"event_type": "agent_ui_refused"})
+    with log._lock:
+        log._buf[-1]["timestamp"] = "not a time"
+    assert log.count_event_type("agent_ui_refused", within_ttl=True) == 0
+
+
+def test_the_share_warning_is_logged_once_per_fill(monkeypatch, caplog) -> None:
+    """#1295 review (P2): when the share fills, operators get one warning, not one per fold."""
+    import logging
+
+    from cli_agent_orchestrator.services.agui import refusal
+
+    clock = {"now": 0.0}
+
+    def tick() -> float:
+        clock["now"] += 1.0
+        return clock["now"]
+
+    monkeypatch.setattr(
+        refusal,
+        "_limiter",
+        refusal.RefusalLimiter(
+            window_seconds=0.0, per_bucket=10**6, global_per_window=10**6, clock=tick
+        ),
+    )
+    refusal._share_full = False
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.services.agui.refusal"):
+        for i in range(50):
+            _off_list(f"w{i}")
+        assert not [r for r in caplog.records if "fill their share" in r.getMessage()]
+        for i in range(5):
+            _off_list(f"over{i}")  # the share is now full: these are folded
+        warnings = [r for r in caplog.records if "fill their share" in r.getMessage()]
+        assert len(warnings) == 1
+        assert len(_refusals()) == 50  # nothing past the share was published
+        _age_ring(25)
+        _off_list("after-expiry")  # the share is free again; the flag clears
+        assert len(_refusals()) == 1
+        for i in range(50):
+            _off_list(f"again{i}")
+        _off_list("over-again")
+    warnings = [r for r in caplog.records if "fill their share" in r.getMessage()]
+    assert len(warnings) == 2, "a second fill is a second warning"

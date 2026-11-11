@@ -2979,6 +2979,7 @@ def _publish_ui_refusal(component: str, claimed_terminal_id: Optional[str]) -> N
     from cli_agent_orchestrator.services.agui.refusal import (
         REFUSAL_EVENT_TYPE,
         get_refusal_limiter,
+        note_ring_share,
         refusal_detail,
         refusal_name,
         ring_share_reached,
@@ -2999,9 +3000,15 @@ def _publish_ui_refusal(component: str, claimed_terminal_id: Optional[str]) -> N
         name = refusal_name(component)
         limiter = get_refusal_limiter()
         log = get_event_log()
-        # Refusals may hold at most a tenth of the ring real events replay from;
-        # past that the refusal is folded into its terminal's count.
-        if ring_share_reached(log.count_event_type(REFUSAL_EVENT_TYPE), RING_CAPACITY):
+        # Refusals may hold at most a tenth of the ring real events replay from, and
+        # only the ones still inside the 24 h window count (the rows history() returns).
+        # Past that the refusal is folded into its terminal's count, and the operator is
+        # told once by a warning.
+        reached = ring_share_reached(
+            log.count_event_type(REFUSAL_EVENT_TYPE, within_ttl=True), RING_CAPACITY
+        )
+        note_ring_share(reached)
+        if reached:
             limiter.fold(terminal_id)
             return
         more = limiter.decide(terminal_id, name)

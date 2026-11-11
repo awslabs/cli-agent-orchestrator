@@ -24,15 +24,20 @@ limiter evicts loses its count.
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import time
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, Set
 
+logger = logging.getLogger(__name__)
+
 REFUSAL_NAME_MAX_BYTES = 64
 REFUSAL_HASH_CHARS = 8
-# The cleaned prefix, a "." and the hash fill at most REFUSAL_NAME_MAX_BYTES.
-_PREFIX_CHARS = REFUSAL_NAME_MAX_BYTES - 1 - REFUSAL_HASH_CHARS
+# The visible, cleaned prefix of the requested name. It is caller text, not redacted,
+# so it is kept short: the hash is what keeps two names apart.
+REFUSAL_NAME_PREFIX_CHARS = 24
+_PREFIX_CHARS = REFUSAL_NAME_PREFIX_CHARS
 _SAFE = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
 
 # The detail's event type. ``agent_ui`` is the on-list record's.
@@ -42,24 +47,50 @@ REFUSAL_EVENT_TYPE = "agent_ui_refused"
 REFUSAL_RING_SHARE = 0.1
 
 
+_share_full = False
+_share_lock = threading.Lock()
+
+
 def ring_share_reached(held: int, capacity: int) -> bool:
     """Whether ``held`` refusal records already fill their share of a ring of ``capacity``.
 
     The event log is shared with real events, and its ring is the horizon a
     ``since`` or ``Last-Event-ID`` replay reaches back to; refusals past their
-    share are folded instead of appended, so they can't cycle the ring.
+    share are folded instead of appended, so they can't cycle the ring. ``held``
+    must count only records still inside the event log's TTL (the window
+    ``history()`` returns), or expired rows would keep refusals folded forever.
     """
     return held >= int(capacity * REFUSAL_RING_SHARE)
+
+
+def note_ring_share(reached: bool) -> None:
+    """Log one warning when refusals start being folded because their share is full.
+
+    Refusals folded this way are not published, so the operator sees no record for
+    them. The warning is the only trace; it is logged once per time the share fills,
+    and the flag clears when live refusal records fall back below the share.
+    """
+    global _share_full
+    with _share_lock:
+        if reached and not _share_full:
+            logger.warning(
+                "refusal records fill their share of the event log (%d%%); further "
+                "off-list emit_ui refusals are folded into a count, not published, until "
+                "refusal records expire from the 24 h window",
+                int(REFUSAL_RING_SHARE * 100),
+            )
+        _share_full = reached
 
 
 def refusal_name(raw: str) -> str:
     """The name a refusal record carries for the requested component ``raw``.
 
     Every character outside ``[A-Za-z0-9_.-]`` is REPLACED by ``_`` (deleting
-    would let ``"metric!"`` become ``"metric"``), the result is cut to 55
-    characters, and ``.`` plus the first 8 hex digits of the SHA-256 of the
-    whole original is always appended. Every replacement is one ASCII byte, so
-    the name is at most 64 bytes.
+    would let ``"metric!"`` become ``"metric"``), the result is cut to
+    ``REFUSAL_NAME_PREFIX_CHARS`` characters, and ``.`` plus the first 8 hex
+    digits of the SHA-256 of the whole original is always appended. The prefix
+    is caller text, not redacted; only the length is bounded. Every replacement
+    is one ASCII byte, so the name is at most 64 bytes.
     """
     digest = hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()[:REFUSAL_HASH_CHARS]
     cleaned = "".join(c if c in _SAFE else "_" for c in raw[:_PREFIX_CHARS])

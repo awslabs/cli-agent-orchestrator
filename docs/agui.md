@@ -336,9 +336,14 @@ data: {"type": "RAW", "source": "cao", "subagentRunId": "terminal:<id>",
 ```
 
 - **The name** has every character outside `[A-Za-z0-9_.-]` replaced by `_`, is
-  cut to 55 characters, and always ends in `.` and 8 hex digits of the SHA-256 of
+  cut to 24 characters, and always ends in `.` and 8 hex digits of the SHA-256 of
   the requested name. It is at most 64 bytes, and it can never equal an
-  allow-listed name, so the stream can never render it as one.
+  allow-listed name, so the stream can never render it as one. The name is
+  caller text, not redacted: the visible part is what the caller sent, cleaned
+  of unsafe characters and cut short, so an agent that puts message text in
+  `component` by mistake exposes up to 24 characters of it to every reader of
+  the `cao:read` stream and the 24-hour event log. The hash keeps names apart;
+  it does not hide the prefix.
 - **Attribution** comes from CAO, not the body: the terminal only if CAO has a
   row for it, its session from that row, and the subagent derived from the
   terminal. Any other terminal id, the body's `session_name` and any other key
@@ -355,7 +360,12 @@ data: {"type": "RAW", "source": "cao", "subagentRunId": "terminal:<id>",
   bucket the limiter evicts (it tracks at most 256 terminals) loses its count.
 - **The event log.** Refusals hold at most a tenth of the event log's 500-record
   ring, which is how far a `since` or `Last-Event-ID` replay of real events
-  reaches back; past that share a refusal is folded instead of recorded.
+  reaches back; past that share a refusal is folded instead of recorded. Only
+  refusal rows still inside the 24-hour window count, the rows `history()`
+  returns, so an expired flood does not keep the share full. When the share
+  fills, the server logs one warning (once per fill) and folds further
+  refusals into a count. A folded refusal is not published, so the operator sees
+  no record for it; the warning in the server log is the only trace.
 - **Delivery.** The record is in the event log, so its SSE id is one a
   `Last-Event-ID` reconnect resumes from. It is published with
   `SseBus.publish_lossy`, which skips a subscriber whose queue is half full or
