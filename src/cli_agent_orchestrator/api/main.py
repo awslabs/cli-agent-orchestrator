@@ -9956,7 +9956,10 @@ def _ws_input_refusal(
 # start of an escape sequence, so it keeps a trailing ``\x1b`` as a partial key
 # until its ``escape-time`` timer expires, and only then sends it to the pane
 # that is active AT THAT TIME. It does the same with a trailing ``\x1b[`` or
-# ``\x1b]`` (Alt+[ and Alt+]), which also start longer sequences. So a frame
+# ``\x1b]`` (Alt+[ and Alt+]), which also start longer sequences, and, in the
+# first seconds after a client attaches, with ``\x1bP`` (Alt+Shift+P): tmux reads
+# it as the start of the reply to one of its own terminal queries, which
+# xterm.js never answers, until that query times out. So a frame
 # that ends in any of these leaves an "Escape hold" on its window: other
 # terminals wait it out before they select a pane. The hold is not ended early
 # by the sender's next frame, because those bytes can extend the partial key
@@ -9969,8 +9972,10 @@ _WEB_INPUT_DRAIN_TIMEOUT_S = 2.0
 _WEB_INPUT_DRAIN_POLL_S = 0.002
 # The Escape hold when the backend cannot say how long its key timer is.
 _WEB_INPUT_ESCAPE_HOLD_FALLBACK_S = 0.55
-# Frame endings tmux keeps as a partial key: Escape, Alt+[ and Alt+].
-_WEB_INPUT_PARTIAL_KEYS = (b"\x1b", b"\x1b[", b"\x1b]")
+# Frame endings tmux keeps as a partial key: Escape, Alt+[, Alt+] and, just
+# after an attach, Alt+Shift+P. Holding on the last one later too costs only a
+# short wait for other terminals.
+_WEB_INPUT_PARTIAL_KEYS = (b"\x1b", b"\x1b[", b"\x1b]", b"\x1bP")
 
 
 class _WebInputWindow:
