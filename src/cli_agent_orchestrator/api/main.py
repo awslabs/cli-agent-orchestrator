@@ -1,5 +1,6 @@
 """Single FastAPI entry point for all HTTP routes."""
 
+import array
 import asyncio
 import fcntl
 import json
@@ -12,6 +13,8 @@ import stat
 import struct
 import subprocess
 import termios
+import time
+import weakref
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -64,7 +67,9 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.cli.commands.agent_plugin import UNTRUSTED_CONTENT_WARNING
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
+    create_delegation_edge,
     create_inbox_message,
+    find_any_edge,
     get_handoff_result,
     get_inbox_messages,
     get_terminal_metadata,
@@ -118,6 +123,7 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
 from cli_agent_orchestrator.graph.sinks import get_sink
+from cli_agent_orchestrator.models.delegation import EdgeReason, EdgeSource
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
@@ -160,6 +166,7 @@ from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
     approval_store,
+    delegation_callback_service,
     ephemeral_service,
     flow_service,
     keep_service,
@@ -282,6 +289,10 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
             await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
         except Exception:
             logger.exception("Inbox reconciliation daemon error")
+        try:
+            await asyncio.to_thread(delegation_callback_service.sweep, registry)
+        except Exception:
+            logger.exception("Delegation callback sweep error")
 
 
 async def ephemeral_sweep_daemon() -> None:
@@ -891,14 +902,16 @@ class WorkflowValidateRequest(BaseModel):
 
     * ``path`` — the original form, unchanged. Extension-based dispatch, ``_safe_spec_path``
       containment, and every existing caller (including ``cao workflow validate``) sends this.
-    * ``source`` — spec TEXT, linted in memory as Python. Added so an **agent can validate a draft
-      before creating it**, which is the validate-then-create order FR-10's sequence wants. A source-only
-      body has no extension to dispatch on and is always treated as Python, which is correct because
-      pass 3A made writes Python-only.
+    * ``source`` — spec TEXT, validated in memory. Added so an **agent can validate a draft
+      before creating it**, which is the validate-then-create order FR-10's sequence wants. A
+      source body has no extension to dispatch on, so ``tier`` says how to read it: ``"python"``
+      (the default) lints it as a script, ``"yaml"`` runs the YAML grammar check.
 
     ``path`` became optional at the model level so ``source`` can stand alone; the handler enforces
     exactly-one, so neither and both are 400s rather than silently preferring one. Making it optional is
-    NOT a relaxation of the old contract — a body carrying only ``path`` behaves identically.
+    NOT a relaxation of the old contract — a body carrying only ``path`` behaves identically. ``tier``
+    applies only to the source form: a path dispatches on its extension, so ``tier`` with ``path`` is a
+    400 rather than a second, conflicting answer to the same question.
     """
 
     path: Optional[str] = Field(
@@ -906,7 +919,11 @@ class WorkflowValidateRequest(BaseModel):
     )
     source: Optional[str] = Field(
         default=None,
-        description="Python spec source text, validated without needing a file on disk",
+        description="Spec source text, validated without needing a file on disk",
+    )
+    tier: Literal["python", "yaml"] = Field(
+        default="python",
+        description="How to validate 'source': 'python' (the default) or 'yaml'. Source form only.",
     )
 
 
@@ -917,10 +934,17 @@ class WorkflowCreateRequest(BaseModel):
     machine or an MCP client elsewhere and only the server may decide where a spec lands — the whole
     point of ADR-583-11. A path here would also be a containment problem the service layer already
     solved for the destination.
+
+    ``tier`` picks the file type, and the service picks the extension from it: ``"python"`` (the
+    default, which the CLI and MCP tools send by omission) writes ``<name>.py``; ``"yaml"`` writes
+    ``<name>.yaml``.
     """
 
     name: str = Field(description="Bare workflow name (no path, no extension)")
-    source: str = Field(description="The Python spec's full source text")
+    source: str = Field(description="The spec's full source text (Python or YAML, per 'tier')")
+    tier: Literal["python", "yaml"] = Field(
+        default="python", description="Spec tier: 'python' (the default) or 'yaml'"
+    )
 
 
 class WorkflowUpdateRequest(BaseModel):
@@ -932,12 +956,16 @@ class WorkflowUpdateRequest(BaseModel):
     concurrent edit between read and write is exactly what would slip through. FR-8's second criterion
     (issue #583), closed by ``stale-update-rejection``.
 
-    The name rides the PATH rather than the body, matching ``DELETE /workflows/{name}``.
+    The name rides the PATH rather than the body, matching ``DELETE /workflows/{name}``. ``tier`` says
+    which tier the caller means to replace; it defaults to ``"python"``.
     """
 
-    source: str = Field(description="The Python spec's full source text")
+    source: str = Field(description="The spec's full source text (Python or YAML, per 'tier')")
     expected_hash: str = Field(
         description="The content_hash the caller believes the spec currently has"
+    )
+    tier: Literal["python", "yaml"] = Field(
+        default="python", description="Spec tier: 'python' (the default) or 'yaml'"
     )
 
 
@@ -1450,10 +1478,25 @@ class ProfileValidationResponse(BaseModel):
     ``valid`` is False only when at least one error-severity finding is
     present. Warnings are advisory and do not invalidate a profile, so a
     client should block a save on errors alone.
+
+    ``params`` is the profile's ``params`` block as the model reads it from the
+    submitted text, in the shape ``GET /agents/profiles/{name}`` returns. It is
+    built from validated declarations, never from the parsed YAML.
     """
 
     valid: bool
     messages: List[ProfileValidationMessage] = Field(default_factory=list)
+    params: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "The params block, in declaration order: each declaration always carries "
+            "type and required, and default, description and enum only when set. An "
+            "empty block is {}. Null when the frontmatter has no params key, when a "
+            "finding is an error at params or below it, when an error stopped the "
+            "checks before they finished the block, or when the block takes more "
+            "than 64 KB as JSON."
+        ),
+    )
 
 
 class ProfileCreateRequest(BaseModel):
@@ -1778,6 +1821,7 @@ async def lifespan(app: FastAPI):
     status_monitor_task = asyncio.create_task(status_monitor.run())
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
+    delegation_callback_task = asyncio.create_task(delegation_callback_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
     # Start ApprovalBridge when AG-UI surface is enabled
@@ -1865,6 +1909,7 @@ async def lifespan(app: FastAPI):
     status_monitor_task.cancel()
     log_writer_task.cancel()
     inbox_service_task.cancel()
+    delegation_callback_task.cancel()
     # Cancel approval bridge on shutdown
     if approval_bridge_task is not None:
         approval_bridge_task.cancel()
@@ -1880,6 +1925,7 @@ async def lifespan(app: FastAPI):
             status_monitor_task,
             log_writer_task,
             inbox_service_task,
+            delegation_callback_task,
             daemon_task,
             return_exceptions=True,
         )
@@ -2404,6 +2450,9 @@ def _agui_ambient_response(
             since=since,
             terminal_known=lambda terminal_id: _db.terminal_exists(terminal_id),
             terminal_label=lambda terminal_id: _db.get_terminal_label(terminal_id),
+            # A reconnect replays from its cursor, so a call made before it is not in
+            # the replay; the whole ring lets the run close that call (#1292).
+            call_history=lambda: get_event_log().history(),
         )
         try:
             async for frame in ambient_stream(
@@ -2910,6 +2959,67 @@ async def agui_stream_post(
     )
 
 
+# A terminal id longer than this is not looked up: no CAO terminal id is near it.
+_REFUSAL_TERMINAL_ID_MAX = 128
+
+
+def _publish_ui_refusal(component: str, claimed_terminal_id: Optional[str]) -> None:
+    """Publish the metadata-only refusal record for an off-list ``emit_ui`` (#1158).
+
+    The record is built from a fixed schema (``services/agui/refusal.py``): the
+    cleaned name and a fold count. The props are never read, and the body's
+    ``session_name`` and any other key are ignored. The terminal is recorded only
+    if CAO has a row for it, and its session is then taken from that row; the
+    stream derives the subagent from the terminal. Otherwise the record is
+    unattributed. It goes into the event log, so its SSE id is one a reconnect
+    can resume from, and onto the bus with ``publish_lossy``, so a flood can't
+    end a stream. Failure-isolated: the caller's 400 never depends on it.
+    """
+    from cli_agent_orchestrator.clients import database as _db
+    from cli_agent_orchestrator.services.agui.refusal import (
+        REFUSAL_EVENT_TYPE,
+        get_refusal_limiter,
+        note_ring_share,
+        refusal_detail,
+        refusal_name,
+        ring_share_reached,
+    )
+    from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY, get_event_log
+    from cli_agent_orchestrator.services.sse_bus import get_bus
+
+    try:
+        terminal_id: Optional[str] = None
+        session_name: Optional[str] = None
+        if (
+            claimed_terminal_id
+            and len(claimed_terminal_id) <= _REFUSAL_TERMINAL_ID_MAX
+            and _db.terminal_exists(claimed_terminal_id)
+        ):
+            terminal_id = claimed_terminal_id
+            session_name = (_db.get_terminal_metadata(terminal_id) or {}).get("tmux_session")
+        name = refusal_name(component)
+        limiter = get_refusal_limiter()
+        log = get_event_log()
+        # Refusals may hold at most a tenth of the ring real events replay from, and
+        # only the ones still inside the 24 h window count (the rows history() returns).
+        # Past that the refusal is folded into its terminal's count, and the operator is
+        # told once by a warning.
+        reached = ring_share_reached(
+            log.count_event_type(REFUSAL_EVENT_TYPE, within_ttl=True), RING_CAPACITY
+        )
+        note_ring_share(reached)
+        if reached:
+            limiter.fold(terminal_id)
+            return
+        more = limiter.decide(terminal_id, name)
+        if more is None:
+            return
+        event = log.append("other", terminal_id, session_name, refusal_detail(name, more))
+        get_bus().publish_lossy(event)
+    except Exception:
+        logger.warning("emit_ui: the refusal record was not published", exc_info=True)
+
+
 class EmitUIRequest(BaseModel):
     """Body for POST /agui/v1/emit_ui — an agent-authored generative-UI intent."""
 
@@ -2932,7 +3042,9 @@ async def agui_emit_ui(
     it to a ``CUSTOM`` frame named ``cao.generative_ui`` on ``/agui/v1/stream``
     (AG-UI 1.0 defines no generative-UI event type). Off-list components
     and oversized/non-serializable props are rejected (400) so a bad intent
-    never reaches the bus. Requires ``cao:write`` when auth is enabled.
+    never renders. For an off-list component the server also publishes a
+    metadata-only refusal record (``_publish_ui_refusal``, #1158), so operators
+    see the refusal. Requires ``cao:write`` when auth is enabled.
     """
     _require_agui_enabled()
 
@@ -2941,6 +3053,7 @@ async def agui_emit_ui(
     from cli_agent_orchestrator.services.sse_bus import get_bus
 
     if body.component not in GENERATIVE_UI_COMPONENTS:
+        _publish_ui_refusal(body.component, body.terminal_id)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -3481,20 +3594,32 @@ async def validate_agent_profile_endpoint(
     Deliberately NOT guarded by ``SCOPE_WRITE``, for the same reason as the
     template validate route: this is a POST only because the profile content
     travels in a JSON body rather than a query string, and it mutates no state.
+
+    The response also carries the ``params`` block it read, so an editor can show
+    the declarations without parsing YAML. The text is validated as submitted, with
+    no ``${VAR}`` resolution, and each declaration is dumped the way the detail
+    route dumps it.
     """
-    from cli_agent_orchestrator.services.profile_validator import validate_profile_text
+    from cli_agent_orchestrator.services.profile_validator import (
+        validate_profile_text_with_params,
+    )
 
     try:
-        findings = validate_profile_text(request.content)
+        result = validate_profile_text_with_params(request.content)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     return ProfileValidationResponse(
-        valid=not any(f.severity == "error" for f in findings),
+        valid=not any(f.severity == "error" for f in result.findings),
         messages=[
             ProfileValidationMessage(severity=f.severity, message=f.message, path=f.path)
-            for f in findings
+            for f in result.findings
         ],
+        params=(
+            None
+            if result.params is None
+            else {name: decl.model_dump(exclude_none=True) for name, decl in result.params.items()}
+        ),
     )
 
 
@@ -3981,9 +4106,9 @@ async def get_skill_content(
 # Agent Plugins (Agent Plugins 1.0.0) — NOT the event-plugin system
 # =============================================================================
 # Added inline next to the /skills and /settings/skill-dirs handlers because
-# api/main.py is flat (no routers package). Naming is unresolved maintainer
-# decision M1; per requirements.md 16.5 this surface must not ship to end users
-# before that is settled, so every route below is gated on
+# api/main.py is flat (no routers package). The naming is decision M1, recorded
+# by the issue author in #573; the surface does not ship to end users until it
+# graduates (#1244), so every route below is gated on
 # CAO_AGENT_PLUGINS_ENABLED (default off) and 404s without it — the routes are
 # constructed but not executable, mirroring the AG-UI gate above. The scope
 # dependencies are authorization, not the gate: they are a no-op when auth is
@@ -4262,6 +4387,8 @@ async def _prepare_delegation(
                 purpose=inputs.purpose,
                 description=inputs.description,
                 provider_options=inputs.provider_options,
+                launch_tier=inputs.launch_tier,
+                network_granted=inputs.network_granted,
             )
         )
         # The operator may have changed the policy while the decider ran: recheck the
@@ -4755,6 +4882,8 @@ async def create_terminal_in_session(
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
     lookup_only: bool = False,
+    expect_callback: bool = False,
+    worker_can_reply: bool = True,
     claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -4919,6 +5048,21 @@ async def create_terminal_in_session(
             claim_id=claim_id,
             **_launch_options(launch_plan),
         )
+        # Written before the response so the caller cannot go idle before the
+        # server knows it is waiting on this worker. An idempotent replay returns
+        # the worker the first attempt created, whose edge already exists. Any
+        # edge counts, closed ones too: a replay after the first edge closed
+        # would otherwise write an edge that is never armed (the task was
+        # delivered once already) and would stay OPEN for good.
+        if expect_callback:
+            existing_edge = await asyncio.to_thread(find_any_edge, caller_id, result.id)
+            if existing_edge is None:
+                reason = (
+                    EdgeReason.NO_CALLBACK if worker_can_reply else EdgeReason.NO_SEND_MESSAGE_TOOL
+                )
+                await asyncio.to_thread(
+                    create_delegation_edge, caller_id, result.id, EdgeSource.ASSIGN, reason
+                )
         _set_launch_note(response, launch_plan)
         return result
     except HTTPException:
@@ -6248,6 +6392,24 @@ _WORKFLOW_AUTHORING_STORAGE_DETAIL = {
 }
 
 
+def _yaml_write_body(written: Any) -> Dict[str, Any]:
+    """The ``POST /workflows`` and ``PUT /workflows/{name}`` body for a YAML write.
+
+    The Python body's four fields (``findings`` is always empty: YAML has no lint
+    findings), plus the grammar verdict so the caller sees ``pass_reserved`` and its
+    notes without a second validate call. ``written`` is a
+    ``workflow_spec_service.YamlSpecWrite``.
+    """
+    return {
+        "name": written.spec.name,
+        "path": written.path,
+        "content_hash": written.content_hash,
+        "findings": [],
+        "status": written.validation.status,
+        "reserved_notes": list(written.validation.reserved_notes),
+    }
+
+
 @app.post("/workflows/validate")
 async def validate_workflow_endpoint(
     body: WorkflowValidateRequest,
@@ -6261,11 +6423,19 @@ async def validate_workflow_endpoint(
     side-effect-free, and collision-check-free like the YAML arm (BR-23b).
     The complete ``ScriptValidationResult`` is returned with ``model_dump()``.
 
-    THE ``source`` FORM (issue #583 Bolt 3, ``authoring-mcp-tools``) lints spec TEXT with no file
-    involved, so an agent can validate a draft BEFORE creating it. It writes no temp file, deliberately:
-    ``lint_script`` accepts a placeholder path, so materialising the source would add a write and a
-    cleanup path to a read-only route for no gain. There is therefore no path to contain on this arm —
-    the containment question does not arise rather than being answered.
+    THE ``source`` FORM (issue #583 Bolt 3, ``authoring-mcp-tools``) validates spec TEXT with no file
+    involved, so an agent can validate a draft BEFORE creating it. ``tier`` picks the check:
+    ``"python"`` (the default) lints the text and returns ``ScriptValidationResult.model_dump()``;
+    ``"yaml"`` runs the text-only ``models.workflow.validate_only`` and returns
+    ``ValidationResult.model_dump()``. Both share the UTF-8 check and the byte cap. It writes no temp
+    file, deliberately: ``lint_script`` accepts a placeholder path, so materialising the source would add
+    a write and a cleanup path to a read-only route for no gain. There is therefore no path to contain
+    on this arm — the containment question does not arise rather than being answered.
+
+    STEP PARAMS. For a YAML spec, in either form, once grammar passes, each step's params are
+    checked against the params its profile declares (``services.step_params``). Each error is added
+    to ``errors`` and makes ``status`` ``fail``. A profile that is missing or fails to load gives no
+    errors. The check only loads profiles by name, so no path is built for it here.
     """
     import os as _os
 
@@ -6286,7 +6456,12 @@ async def validate_workflow_endpoint(
 
     if body.source is not None:
         from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
-        from cli_agent_orchestrator.models.workflow import ScriptValidationResult
+        from cli_agent_orchestrator.models.workflow import (
+            ScriptValidationResult,
+            ValidationResult,
+        )
+        from cli_agent_orchestrator.models.workflow import validate_spec_text as validate_yaml_text
+        from cli_agent_orchestrator.services import step_params
         from cli_agent_orchestrator.services.script_lint import lint_script
 
         try:
@@ -6296,6 +6471,19 @@ async def validate_workflow_endpoint(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="workflow source must be valid UTF-8",
             ) from None
+        if body.tier == "yaml":
+            if source_size > WORKFLOW_MAX_SPEC_BYTES:
+                # The write path's cap and message, so the two cannot disagree about a size.
+                return ValidationResult(
+                    status="fail",
+                    errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
+                ).model_dump()
+            # Text only: the model's validate_spec_text opens no file and never raises.
+            result, spec = validate_yaml_text(body.source)
+            # Then each step's params against its profile, when grammar passed. Off the
+            # loop, since it reads profile files.
+            checked = await asyncio.to_thread(step_params.with_step_param_errors, result, spec)
+            return checked.model_dump()
         if source_size > WORKFLOW_MAX_SPEC_BYTES:
             # The same cap the write path enforces, checked here too so a caller cannot learn the
             # limit only by trying to create. Message names the limit (unit 2's PERF-3 discipline).
@@ -6303,8 +6491,8 @@ async def validate_workflow_endpoint(
                 status="fail",
                 errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
             ).model_dump()
-        # "<draft>" is a placeholder, never opened. Always Python: a source body has no extension to
-        # dispatch on, and pass 3A made writes Python-only.
+        # "<draft>" is a placeholder, never opened. A Python source body has no extension to
+        # dispatch on; ``tier`` (default "python") is what says it is a script.
         return lint_script(body.source, "<draft>").model_dump()
 
     # Bind the narrowed value ONCE rather than re-reading ``body.path`` below. The exactly-one guard
@@ -6322,14 +6510,25 @@ async def validate_workflow_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="supply exactly one of 'path' or 'source'",
         )
+    if "tier" in body.model_fields_set:
+        # The path form dispatches on the file's extension. A tier here would be a second answer
+        # to the same question, so it is refused rather than ignored or preferred.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="tier applies only to the source form",
+        )
 
     ext = _os.path.splitext(spec_path)[1].lower()
     if ext in (".yaml", ".yml"):
+        from cli_agent_orchestrator.services import step_params
+
         try:
-            result = workflow_spec_service.validate_only(spec_path)
+            result, spec = workflow_spec_service.validate_spec_file(spec_path)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-        return result.model_dump()
+        # The same step-params check as the source form, on the spec from that one read.
+        checked = await asyncio.to_thread(step_params.with_step_param_errors, result, spec)
+        return checked.model_dump()
     if ext == ".py":
         from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
         from cli_agent_orchestrator.models.workflow import ScriptValidationResult
@@ -6452,12 +6651,18 @@ async def get_workflow_endpoint(
     return type (BR-7a), so no branch is needed here. ``TierCollisionError``
     (a same-stem cross-tier sibling, BR-2/BR-3) maps to 409, checked BEFORE
     the bare ``ValueError`` arm (it is a ``ValueError`` subclass).
+
+    A YAML spec's body also carries ``path``, ``source`` and ``content_hash``
+    (the sha256 of the file bytes), so an editor can load the file and send
+    ``PUT``'s ``expected_hash``. ``get_workflow_document`` adds them from the
+    same single read; the ``WorkflowSpec`` model itself is unchanged because its
+    JSON is snapshotted into run journals. A Python body is unchanged.
     """
     from cli_agent_orchestrator.models.workflow import TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
-        spec = workflow_spec_service.get_workflow(name)
+        document = workflow_spec_service.get_workflow_document(name)
     except KeyError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown workflow '{name}'"
@@ -6468,7 +6673,7 @@ async def get_workflow_endpoint(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    return spec.model_dump()
+    return document
 
 
 @app.post("/workflows", status_code=status.HTTP_201_CREATED)
@@ -6476,7 +6681,7 @@ async def create_workflow_endpoint(
     body: WorkflowCreateRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Create a NEW Python workflow spec, refusing to overwrite one (issue #583 FR-10).
+    """Create a NEW workflow spec, Python or YAML, refusing to overwrite one (issue #583 FR-10).
 
     THE FIRST NETWORK-REACHABLE SPEC WRITE PATH. ``create_workflow`` shipped in Bolt 3 pass 3A and had
     no caller — this endpoint and its ``PUT`` sibling are what make it reachable, for the CLI verbs and
@@ -6492,11 +6697,19 @@ async def create_workflow_endpoint(
     index upsert all live in ``workflow_spec_service``, whose containment guard carries four
     CodeQL-driven constraints that a second implementation here would not reproduce. This handler maps
     exceptions to statuses and nothing else.
+
+    ``tier`` picks the service function: ``"python"`` (the default) is ``create_workflow``, with its
+    response unchanged; ``"yaml"`` is ``create_yaml_workflow``, whose response adds the validation
+    ``status`` and ``reserved_notes`` (see ``_yaml_write_body``).
     """
     from cli_agent_orchestrator.models.workflow import TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
+        if body.tier == "yaml":
+            return _yaml_write_body(
+                workflow_spec_service.create_yaml_workflow(body.name, body.source)
+            )
         spec = workflow_spec_service.create_workflow(body.name, body.source)
     except FileExistsError as e:
         # 409 rather than 400: the request was well-formed and the caller's next action is to choose
@@ -6533,7 +6746,9 @@ async def update_workflow_endpoint(
     body: WorkflowUpdateRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Update an EXISTING Python workflow spec, refusing to create one (issue #583 FR-10, FR-8).
+    """Update an EXISTING workflow spec, refusing to create one (issue #583 FR-10, FR-8).
+
+    The spec is Python or YAML, as ``tier`` says (below).
 
     ``PUT`` because this replaces the whole spec at a named location, and the name keys the path exactly
     as it does for ``DELETE``.
@@ -6549,11 +6764,21 @@ async def update_workflow_endpoint(
     would transport as 400 — "your request was malformed" — when the true condition is "someone else
     changed this spec", and the caller's next action differs completely. The wrong order produces a
     plausible answer rather than an error, which is why a test asserts the order structurally.
+
+    ``tier`` picks the service function: ``"python"`` (the default) is ``update_workflow``;
+    ``"yaml"`` is ``update_yaml_workflow``, which replaces the YAML file at its own path. Both raise
+    ``WorkflowWriteConflictError`` when the workflow is in the other tier, and the YAML one also when
+    both ``.yaml`` and ``.yml`` are present. It is a ``ValueError`` subclass and maps to 409 ahead of
+    the bare ``ValueError`` arm for the same reason.
     """
     from cli_agent_orchestrator.models.workflow import StaleSpecError, TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
+        if body.tier == "yaml":
+            return _yaml_write_body(
+                workflow_spec_service.update_yaml_workflow(name, body.source, body.expected_hash)
+            )
         spec = workflow_spec_service.update_workflow(name, body.source, body.expected_hash)
     except workflow_spec_service.WorkflowNotFoundError:
         # Only the update admission check maps to 404. A later FileNotFoundError
@@ -6564,6 +6789,8 @@ async def update_workflow_endpoint(
     except StaleSpecError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TierCollisionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except workflow_spec_service.WorkflowWriteConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except workflow_spec_service.SpecPathRefusedError:
         logger.error("workflow update refused unsafe spec path", exc_info=True)
@@ -7108,13 +7335,16 @@ async def start_workflow_run_endpoint(
     (FR-5.1). The script arm pre-checks run_id availability itself (BR-9a —
     ``run_script_workflow`` has no admission gate of its own) before calling
     ``run_script_workflow``; a lint failure maps to 422 with a findings body
-    (BR-10), via the shared ``render_findings`` helper.
+    (BR-10), via the shared ``render_findings`` helper. A YAML step whose params
+    do not fit its profile's declaration is a 422 with the messages in ``detail``,
+    raised by ``start_run`` before any journal row.
     """
     import uuid
 
     from cli_agent_orchestrator.models.workflow import (
         NotBuiltYetError,
         ScriptSpec,
+        StepParamError,
         TierCollisionError,
     )
     from cli_agent_orchestrator.services import (
@@ -7200,6 +7430,9 @@ async def start_workflow_run_endpoint(
         )
     except NotBuiltYetError as e:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+    except StepParamError as e:
+        # Before the ValueError arm: StepParamError is a ValueError subclass.
+        raise HTTPException(status_code=422, detail=str(e))
     except KeyError as e:
         # Duplicate run_id is a conflict, not a 404.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
@@ -7238,8 +7471,9 @@ async def submit_workflow_run_endpoint(
     1. Resolve the spec (same error mapping as the blocking route).
     2. Mint or accept the run id (identical to the blocking route).
     3. Validate + cap inputs BEFORE any create (OR-1, NFR-4) — no row yet.
-    4. Script tier: lint gate -> 422 (OR-2); reserved YAML mode -> 501 (OR-3) —
-       both BEFORE any insert, so a rejected run leaves NO durable row and NO 202.
+    4. Script tier: lint gate -> 422 (OR-2); reserved YAML mode or step call -> 501 (OR-3) —
+       both BEFORE any insert, so a rejected run leaves NO durable row and NO 202. A YAML
+       step whose params do not fit its profile's declaration -> 422, also before it.
     5. The awaited HARD atomic durable insert (INV-1, TR-1) — a ``sqlite3.Error``
        aborts with 500 and NO 202. This is the one deliberate deviation from the
        engines' best-effort write. An ``IntegrityError`` is special-cased FIRST
@@ -7258,12 +7492,14 @@ async def submit_workflow_run_endpoint(
     from cli_agent_orchestrator.models.workflow import (
         NotBuiltYetError,
         ScriptSpec,
+        StepParamError,
         TierCollisionError,
     )
     from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
     from cli_agent_orchestrator.services import (
         launch_guard,
         script_runner,
+        step_params,
         workflow_journal,
         workflow_service,
         workflow_spec_service,
@@ -7469,6 +7705,20 @@ async def submit_workflow_run_endpoint(
                 workflow_service._dispatch_reserved_mode(spec)
             except NotBuiltYetError as e:
                 raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+        # The reserved step-call guard, beside it for the same reason: the blocking
+        # path refuses an ``assign`` / ``send_message`` step in ``start_run``, and this
+        # path must refuse it before the insert below, so no row exists for it.
+        try:
+            workflow_service._refuse_reserved_calls(spec)
+        except NotBuiltYetError as e:
+            raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+        # Step params against the params each step's profile declares, beside the
+        # call guard for the same reason: the blocking path refuses them in
+        # ``start_run``, and this path must refuse them before the insert below.
+        try:
+            await asyncio.to_thread(step_params.refuse_step_param_errors, spec)
+        except StepParamError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         # Step 5 — the awaited HARD ATOMIC durable insert (INV-1, TR-1): the run row
         # AND its seeded step rows commit in ONE transaction, so a failure leaves
         # NEITHER (no phantom RUNNING row). Its failure aborts with 500 + NO 202.
@@ -9510,6 +9760,7 @@ async def create_inbox_message_endpoint(
     receiver_id: TerminalId,
     sender_id: str,
     message: str,
+    expect_reply: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
@@ -9526,6 +9777,20 @@ async def create_inbox_message_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create inbox message: {str(e)}",
         )
+
+    # Edge bookkeeping is best-effort: the message is already stored, so a
+    # failure here must not turn a successful send into an error the sender
+    # would retry (which would deliver the message twice).
+    try:
+        await asyncio.to_thread(
+            delegation_callback_service.on_send_message,
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            message_id=inbox_msg.id,
+            expect_reply=expect_reply,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Delegation edge update failed for {sender_id} -> {receiver_id}: {e}")
 
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
@@ -9677,6 +9942,140 @@ def _ws_input_refusal(
     if not metadata:
         return None, None
     return metadata, terminal_service.terminal_input_refusal(terminal_id, metadata)
+
+
+# Pane spawn mode: several agents are panes of one tmux window, and tmux keeps
+# one active pane per window, not per client, so a browser terminal's keys go
+# to whichever pane is active when tmux reads them. Input for such a window is
+# serialised: a terminal holds its window's lock from selecting its pane until
+# tmux has read every byte it wrote, so no other terminal can move the window's
+# active pane while those bytes are in flight. Windows live only while a
+# connection on that window holds one.
+#
+# Reading is not always delivering. tmux cannot tell a lone Escape from the
+# start of an escape sequence, so it keeps a trailing ``\x1b`` as a partial key
+# until its ``escape-time`` timer expires, and only then sends it to the pane
+# that is active AT THAT TIME. It does the same with a trailing ``\x1b[`` or
+# ``\x1b]`` (Alt+[ and Alt+]), which also start longer sequences. So a frame
+# that ends in any of these leaves an "Escape hold" on its window: other
+# terminals wait it out before they select a pane. The hold is not ended early
+# by the sender's next frame, because those bytes can extend the partial key
+# instead of resolving it (``\x1b`` then ``[``, ``\x1b[`` then ``1``), and
+# tmux's timer keeps running from the first byte. The terminal that sent it
+# does not wait: its own next bytes still go to its own pane.
+# How long a writer waits for tmux to read its input before it lets the window
+# go anyway (tmux stalled), and the poll step while it waits.
+_WEB_INPUT_DRAIN_TIMEOUT_S = 2.0
+_WEB_INPUT_DRAIN_POLL_S = 0.002
+# The Escape hold when the backend cannot say how long its key timer is.
+_WEB_INPUT_ESCAPE_HOLD_FALLBACK_S = 0.55
+# Frame endings tmux keeps as a partial key: Escape, Alt+[ and Alt+].
+_WEB_INPUT_PARTIAL_KEYS = (b"\x1b", b"\x1b[", b"\x1b]")
+
+
+class _WebInputWindow:
+    """The input state that browser terminals on one shared window share."""
+
+    __slots__ = ("lock", "hold_owner", "hold_until", "__weakref__")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.hold_owner: object = None
+        self.hold_until = 0.0
+
+    def _held_against(self, owner: object) -> float:
+        """Seconds left on another terminal's Escape hold; 0 if none."""
+        if self.hold_owner is None or self.hold_owner is owner:
+            return 0.0
+        return max(0.0, self.hold_until - time.monotonic())
+
+    async def wait_for_hold(self, owner: object) -> None:
+        """Wait out an Escape hold left by another terminal.
+
+        Re-checked after each sleep: the owner extends its hold with each
+        further frame that ends in a partial key.
+        """
+        while (remaining := self._held_against(owner)) > 0:
+            await asyncio.sleep(remaining)
+
+    @asynccontextmanager
+    async def turn(self, owner: object):
+        """The window's lock, taken once no other terminal's Escape hold is on.
+
+        The hold is waited out WITHOUT the lock, so the terminal that left it
+        can keep typing to its own pane meanwhile.
+        """
+        while True:
+            await self.wait_for_hold(owner)
+            await self.lock.acquire()
+            if self._held_against(owner) == 0:
+                break
+            self.lock.release()  # a hold appeared while we queued; wait again
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+    def after_write(self, owner: object, raw: bytes, escape_hold_s: float) -> None:
+        """Start or extend ``owner``'s hold if its frame left tmux a partial key.
+
+        Any other frame leaves the hold to run out: it may have resolved the
+        partial key, or extended it, and only tmux's timer tells which.
+        """
+        if raw.endswith(_WEB_INPUT_PARTIAL_KEYS):
+            self.hold_owner = owner
+            self.hold_until = time.monotonic() + escape_hold_s
+
+
+_WEB_INPUT_WINDOWS: "weakref.WeakValueDictionary[str, _WebInputWindow]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _web_input_window(scope: str) -> _WebInputWindow:
+    window = _WEB_INPUT_WINDOWS.get(scope)
+    if window is None:
+        window = _WebInputWindow()
+        _WEB_INPUT_WINDOWS[scope] = window
+    return window
+
+
+def _pty_unread_bytes(slave_path: str) -> int:
+    """Bytes written to the PTY that its reader (the tmux server) has not read.
+
+    A slave that no longer opens has no reader left to misroute anything.
+    """
+    try:
+        fd = os.open(slave_path, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return 0
+    try:
+        buf = array.array("i", [0])
+        fcntl.ioctl(fd, termios.FIONREAD, buf, True)
+        return buf[0]
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+
+
+async def _wait_for_pty_drain(slave_path: str) -> bool:
+    """Wait until tmux has read everything written to ``slave_path``'s PTY.
+
+    The count does not see bytes still on their way into the line discipline,
+    so it must read zero on two polls in a row. False on timeout.
+    """
+    deadline = time.monotonic() + _WEB_INPUT_DRAIN_TIMEOUT_S
+    zeros = 0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(_WEB_INPUT_DRAIN_POLL_S)
+        if _pty_unread_bytes(slave_path) == 0:
+            zeros += 1
+            if zeros >= 2:
+                return True
+        else:
+            zeros = 0
+    return False
 
 
 @app.websocket("/terminals/{terminal_id}/ws")
@@ -9843,14 +10242,57 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4003, reason="Invalid tmux target name")
         return
 
+    # The attach argv and, in pane spawn mode, the pane its input must select
+    # come from one lookup, so they cannot disagree. A lookup that fails, or an
+    # answer of the wrong shape, refuses the attach: input that could not be
+    # routed to its own pane must never be delivered to whichever is active.
     try:
-        attach_command = await asyncio.to_thread(
-            get_backend().prepare_web_attach, session_name, window_name
+        attach_command, input_focus = await asyncio.to_thread(
+            get_backend().prepare_web_attach_input, session_name, window_name
         )
     except TerminalBackendError as e:
         logger.error(f"Web attach failed for terminal {terminal_id}: {e}")
         await websocket.close(code=4004, reason="Failed to attach terminal")
         return
+    if input_focus is not None and not (
+        isinstance(input_focus, tuple)
+        and len(input_focus) == 2
+        and all(isinstance(part, str) and part for part in input_focus)
+    ):
+        logger.error(f"Web attach failed for terminal {terminal_id}: malformed input focus")
+        await websocket.close(code=4004, reason="Failed to attach terminal")
+        return
+
+    input_window = _web_input_window(input_focus[0]) if input_focus is not None else None
+    input_owner = object()
+    escape_hold_s = _WEB_INPUT_ESCAPE_HOLD_FALLBACK_S
+    if input_window is not None:
+        try:
+            answer = await asyncio.to_thread(get_backend().web_input_escape_hold)
+        except Exception as e:  # noqa: BLE001 — the fallback is long enough for tmux defaults
+            logger.warning(f"Could not read the escape delay for terminal {terminal_id}: {e}")
+        else:
+            if isinstance(answer, (int, float)) and not isinstance(answer, bool) and answer >= 0:
+                escape_hold_s = float(answer)
+    focus_failure_logged = False
+    drain_timeout_logged = False
+
+    async def _select_own_pane() -> bool:
+        """Make this terminal's pane the active one; False if it can't be."""
+        nonlocal focus_failure_logged
+        assert input_focus is not None
+        try:
+            await asyncio.to_thread(get_backend().focus_web_input, input_focus[1])
+        except Exception as e:  # noqa: BLE001 — never route input to a pane we could not select
+            if not focus_failure_logged:
+                focus_failure_logged = True
+                logger.warning(
+                    "Dropping WebSocket input for terminal %r: could not focus its pane (%s)",
+                    terminal_id,
+                    e,
+                )
+            return False
+        return True
 
     # Create PTY pair for backend attach
     master_fd, slave_fd = pty.openpty()
@@ -9875,7 +10317,13 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         preexec_fn=os.setsid,
         env=pty_env,
     )
+    slave_path = os.ttyname(slave_fd)
     os.close(slave_fd)
+    # Pane mode: the view shows the whole shared window; select this
+    # terminal's pane so its cursor starts on the right agent.
+    if input_window is not None:
+        async with input_window.turn(input_owner):
+            await _select_own_pane()
 
     # Make master_fd non-blocking for event-driven reads
     flag = fcntl.fcntl(master_fd, fcntl.F_GETFL)
@@ -9950,8 +10398,17 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             )
         return False
 
+    async def _write_input(raw: bytes) -> None:
+        # Write in chunks to avoid overflowing the PTY buffer
+        chunk_size = 1024
+        for i in range(0, len(raw), chunk_size):
+            os.write(master_fd, raw[i : i + chunk_size])
+            if i + chunk_size < len(raw):
+                await asyncio.sleep(0.01)
+
     async def _forward_input():
         """Receive from WebSocket and write to PTY."""
+        nonlocal drain_timeout_logged
         try:
             while not done.is_set():
                 msg = await websocket.receive_text()
@@ -9961,12 +10418,31 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                         # Dropped: zero bytes reach the PTY (#1074).
                         continue
                     raw = payload["data"].encode()
-                    # Write in chunks to avoid overflowing the PTY buffer
-                    chunk_size = 1024
-                    for i in range(0, len(raw), chunk_size):
-                        os.write(master_fd, raw[i : i + chunk_size])
-                        if i + chunk_size < len(raw):
-                            await asyncio.sleep(0.01)
+                    if input_window is None:
+                        await _write_input(raw)
+                        continue
+                    # Pane mode: select this terminal's pane on every frame (an
+                    # operator in a real terminal may have moved it), and hold
+                    # the window until tmux has read the bytes, so a paste's
+                    # later chunks cannot follow another terminal's selection;
+                    # past that, for as long as tmux may still be holding a
+                    # trailing Escape as a partial key.
+                    async with input_window.turn(input_owner):
+                        if not await _select_own_pane():
+                            # Dropped: never deliver keys to another agent's pane.
+                            continue
+                        await _write_input(raw)
+                        drained = await _wait_for_pty_drain(slave_path)
+                        input_window.after_write(input_owner, raw, escape_hold_s)
+                        if not drained:
+                            if not drain_timeout_logged:
+                                drain_timeout_logged = True
+                                logger.warning(
+                                    "tmux did not read WebSocket input for terminal %r "
+                                    "within %.1fs; releasing its window anyway",
+                                    terminal_id,
+                                    _WEB_INPUT_DRAIN_TIMEOUT_S,
+                                )
                 elif payload.get("type") == "resize":
                     rows = payload.get("rows", 24)
                     cols = payload.get("cols", 80)

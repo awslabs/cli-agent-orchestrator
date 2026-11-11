@@ -15,23 +15,26 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:dependencies": "node --test scripts/dependency-security.cjs",
-    "e2e": "./e2e/run.sh"
+    "e2e": "./e2e/run.sh",
+    "playwright:install": "playwright install --with-deps chromium",
+    "e2e:browser": "playwright test -c playwright.config.ts"
   },
   "dependencies": {
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "@testing-library/dom": "10.4.2",
     "@testing-library/react": "16.3.3",
     "@types/node": "26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
-    "@vitejs/plugin-react": "6.1.2",
-    "@vitest/coverage-v8": "5.0.5",
+    "@vitejs/plugin-react": "6.2.1",
+    "@vitest/coverage-v8": "5.1.0",
     "jsdom": "30.1.3",
     "typescript": "7.0.2",
     "vite": "8.3.5",
-    "vitest": "5.0.5"
+    "vitest": "5.1.0"
   }
 }

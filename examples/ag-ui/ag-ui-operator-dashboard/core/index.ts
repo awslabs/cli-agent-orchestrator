@@ -5,5 +5,6 @@ export * from "./runPlane.ts";
 export * from "./controls.ts";
 export * from "./interrupts.ts";
 export * from "./genui.ts";
+export * from "./timeline.ts";
 export * from "./ambient.ts";
 export * from "./controller.ts";

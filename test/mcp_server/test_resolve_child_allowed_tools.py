@@ -12,6 +12,8 @@ parent whose ceiling does not include ``*`` the launch is refused with the
 tools named, rather than silently narrowed.
 """
 
+import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -218,3 +220,282 @@ class TestDoubleNullParent:
         mock_load.return_value = _profile(None, role="developer")
         mock_resolve.return_value = ["*"]
         assert _resolve_child_allowed_tools(None, "developer") is None
+
+
+def _unreadable(name="correctness_reviewer"):
+    """The RuntimeError load_agent_profile raises when the store read hits an OSError."""
+    try:
+        try:
+            raise PermissionError(13, "Permission denied", f"agent-store/{name}.md")
+        except PermissionError as e:
+            raise RuntimeError(f"Failed to load agent profile '{name}': {e}")
+    except RuntimeError as wrapped:
+        return wrapped
+
+
+class TestUnreadableProfileFallsBackToServer:
+    """A sandboxed cao-mcp-server can't read the agent store; cao-server can."""
+
+    @patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=5.0)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_permission_denied_uses_server_profile(self, mock_load, mock_get, _timeout):
+        mock_load.side_effect = _unreadable()
+        mock_get.return_value = MagicMock(
+            json=lambda: {
+                "name": "correctness_reviewer",
+                "description": "d",
+                "role": "reviewer",
+                "allowedTools": ["fs_read", "@cao-mcp-server"],
+            }
+        )
+
+        result = _resolve_child_allowed_tools(
+            parent_allowed_tools=["@cao-mcp-server", "fs_read"],
+            child_profile_name="correctness_reviewer",
+        )
+
+        assert mock_get.call_args.args[0].endswith("/agents/profiles/correctness_reviewer")
+        # Same answer the local read would give: the child's own profile tools.
+        assert result == "fs_read,@cao-mcp-server"
+
+    @patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=5.0)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_server_fallback_failure_raises_original_error(self, mock_load, mock_get, _timeout):
+        original = _unreadable()
+        mock_load.side_effect = original
+        mock_get.side_effect = ConnectionError("cao-server down")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            _resolve_child_allowed_tools(["fs_read"], "correctness_reviewer")
+
+        assert excinfo.value is original
+
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_non_os_error_does_not_fall_back(self, mock_load, mock_get):
+        mock_load.side_effect = RuntimeError("Failed to load agent profile 'x': bad yaml")
+
+        with pytest.raises(RuntimeError):
+            _resolve_child_allowed_tools(["fs_read"], "x")
+
+        mock_get.assert_not_called()
+
+
+class TestResolveChildProviderUnreadableStore:
+    """The provider pin must survive the same sandbox as the allowed-tools read."""
+
+    @patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=5.0)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_unreadable_store_reads_pin_from_server(self, mock_load, mock_get, _timeout):
+        from cli_agent_orchestrator.utils.orchestration import _resolve_child_provider
+
+        mock_load.side_effect = _unreadable("claude_worker")
+        mock_get.return_value = MagicMock(
+            json=lambda: {"name": "claude_worker", "description": "d", "provider": "claude_code"}
+        )
+
+        assert _resolve_child_provider("claude_worker", "kiro_cli") == "claude_code"
+
+    @patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=5.0)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_server_failure_keeps_fallback(self, mock_load, mock_get, _timeout):
+        from cli_agent_orchestrator.utils.orchestration import _resolve_child_provider
+
+        mock_load.side_effect = _unreadable("claude_worker")
+        mock_get.side_effect = ConnectionError("down")
+
+        assert _resolve_child_provider("claude_worker", "kiro_cli") == "kiro_cli"
+
+    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="codex")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_readable_store_defers_to_resolve_provider(self, mock_load, mock_get, mock_rp):
+        from cli_agent_orchestrator.utils.orchestration import _resolve_child_provider
+
+        mock_load.return_value = (MagicMock(), None)
+
+        assert _resolve_child_provider("w", "kiro_cli") == "codex"
+        mock_get.assert_not_called()
+
+
+class TestUnreadableStoreReal:
+    """Anchor the fallback on the real reader, not a hand-built replica of its error."""
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_denied_store_dir_raises_runtime_error_with_os_context(self, tmp_path):
+        from cli_agent_orchestrator.utils import agent_profiles
+
+        store = tmp_path / "agent-store"
+        store.mkdir()
+        (store / "locked_child.md").write_text("---\nname: locked_child\ndescription: d\n---\nx\n")
+        store.chmod(0)
+        try:
+            with patch.object(agent_profiles, "LOCAL_AGENT_STORE_DIR", store):
+                with pytest.raises(RuntimeError) as excinfo:
+                    agent_profiles.load_agent_profile("locked_child")
+        finally:
+            store.chmod(0o755)
+
+        # Python 3.14's Path.exists() would report this as absent (FileNotFoundError),
+        # silently skipping the server fallback; _path_exists keeps the raise.
+        assert isinstance(excinfo.value.__context__, PermissionError)
+
+    def test_path_exists_absent_vs_denied(self, tmp_path):
+        from cli_agent_orchestrator.utils.agent_profiles import _path_exists
+
+        assert _path_exists(tmp_path) is True
+        assert _path_exists(tmp_path / "missing.md") is False
+        with patch.object(Path, "stat", side_effect=PermissionError(13, "denied")):
+            with pytest.raises(PermissionError):
+                _path_exists(tmp_path / "x.md")
+
+
+class TestFallbackPreservesContext:
+    @patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=5.0)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_failed_fallback_keeps_os_error_context(self, mock_load, mock_get, _timeout):
+        from cli_agent_orchestrator.utils.orchestration import _load_child_profile
+
+        mock_load.side_effect = _unreadable()
+        mock_get.side_effect = ConnectionError("cao-server down")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            _load_child_profile("correctness_reviewer")
+
+        assert isinstance(excinfo.value.__context__, PermissionError)
+
+
+def _server_profile(**fields):
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    return AgentProfile(name="pinned_child", description="d", **fields).model_dump(
+        exclude_none=True
+    )
+
+
+def _requests_for(profile_json, metadata=None):
+    """A mocked `requests` module: terminal metadata, server profile copy, create POST."""
+    mock_requests = MagicMock()
+
+    def get(url, *args, **kwargs):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        if "/agents/profiles/" in url:
+            resp.json.return_value = profile_json
+        else:
+            resp.json.return_value = metadata or {
+                "provider": "kiro_cli",
+                "session_name": "cao-session",
+                "allowed_tools": None,
+            }
+        return resp
+
+    mock_requests.get.side_effect = get
+    post = MagicMock()
+    post.raise_for_status.return_value = None
+    post.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+    mock_requests.post.return_value = post
+    return mock_requests
+
+
+class TestCallSitesUseServerPinUnderSandbox:
+    """Reverting any call site to resolve_provider must fail these."""
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
+    )
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_assign_existing_session_sends_pinned_provider(self, mock_load, _tools):
+        from cli_agent_orchestrator.utils import orchestration
+
+        mock_load.side_effect = _unreadable("pinned_child")
+        mock_requests = _requests_for(_server_profile(provider="claude_code"))
+        with (
+            patch.object(orchestration, "requests", mock_requests),
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}),
+        ):
+            _terminal_id, provider = orchestration._create_terminal("pinned_child", "/repo")
+
+        assert provider == "claude_code"
+        assert mock_requests.post.call_args.kwargs["params"]["provider"] == "claude_code"
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_assign_new_session_sends_pinned_provider(self, mock_load):
+        from cli_agent_orchestrator.utils import orchestration
+
+        mock_load.side_effect = _unreadable("pinned_child")
+        mock_requests = _requests_for(_server_profile(provider="claude_code"))
+        env = {k: v for k, v in os.environ.items() if k != "CAO_TERMINAL_ID"}
+        with (
+            patch.object(orchestration, "requests", mock_requests),
+            patch.dict(os.environ, env, clear=True),
+        ):
+            _terminal_id, provider = orchestration._create_terminal("pinned_child", "/repo")
+
+        assert provider == "claude_code"
+        assert mock_requests.post.call_args.kwargs["params"]["provider"] == "claude_code"
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
+    )
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_handoff_inherits_pinned_provider(self, mock_load, _tools):
+        from cli_agent_orchestrator.utils import orchestration
+
+        mock_load.side_effect = _unreadable("pinned_child")
+        mock_requests = _requests_for(_server_profile(provider="claude_code"))
+        with (
+            patch.object(orchestration, "requests", mock_requests),
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}),
+        ):
+            ctx = orchestration._resolve_handoff_provider("pinned_child")
+
+        assert ctx.provider == "claude_code"
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_handoff_outside_terminal_uses_pinned_provider(self, mock_load):
+        from cli_agent_orchestrator.utils import orchestration
+
+        mock_load.side_effect = _unreadable("pinned_child")
+        mock_requests = _requests_for(_server_profile(provider="claude_code"))
+        env = {k: v for k, v in os.environ.items() if k != "CAO_TERMINAL_ID"}
+        with (
+            patch.object(orchestration, "requests", mock_requests),
+            patch.dict(os.environ, env, clear=True),
+        ):
+            ctx = orchestration._resolve_handoff_provider("pinned_child")
+
+        assert ctx.provider == "claude_code"
+
+
+class TestResolveChildProviderOtherErrors:
+    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="codex")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_non_os_runtime_error_defers_without_server_call(self, mock_load, mock_get, _rp):
+        from cli_agent_orchestrator.utils.orchestration import _resolve_child_provider
+
+        mock_load.side_effect = RuntimeError("Failed to load agent profile 'w': bad yaml")
+
+        assert _resolve_child_provider("w", "kiro_cli") == "codex"
+        mock_get.assert_not_called()
+
+    @patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=5.0)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_launch_profile")
+    def test_invalid_server_pin_falls_back(self, mock_load, mock_get, _timeout):
+        from cli_agent_orchestrator.utils.orchestration import _resolve_child_provider
+
+        mock_load.side_effect = _unreadable("pinned_child")
+        mock_get.return_value = MagicMock(
+            json=lambda: {"name": "pinned_child", "description": "d", "provider": "nope"}
+        )
+
+        assert _resolve_child_provider("pinned_child", "kiro_cli") == "kiro_cli"

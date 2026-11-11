@@ -2,7 +2,8 @@
 
 CAO routes normal delegations to installed profiles through `model.route` when
 the caller omits a model. Local and remote assign, elastic assign, handoff and
-CLI handoff use it. Both decision points are **off by default**, so normal
+CLI handoff use it. Every decision point (see [Points and states](#points-and-states)) is
+**off by default**, so normal
 launches keep their existing behavior until an operator enables routing.
 
 An ephemeral agent is routed only when its spec set `model_tier: "auto"`; see
@@ -24,6 +25,7 @@ assign or handoff from inside that step remains an ordinary delegation.
 | `model.route` | `small`, `medium`, `large` | Choose a model size |
 | `effort.route` | `low`, `medium`, `high` | Choose reasoning effort for an ephemeral `effort: "auto"` spec |
 | `provider.route` | CAO provider IDs, narrowed for each launch | Choose the CLI for an ephemeral `provider: "auto"` spec |
+| `task.long_context`, `task.deep_reasoning`, `task.read_only`, `task.needs_network` | `yes`, `no` | Describe an ephemeral task so CAO can match it to a model; one switch, `task.features`, turns all four off, to shadow or on (see [Matching helpers to models](#matching-helpers-to-models)) |
 
 Each point also accepts `unsure`. `off` asks nothing and writes no record.
 `shadow` records what the decider would choose without waiting for it or changing
@@ -65,6 +67,19 @@ assign tool result. CLI handoff includes it when returning early with
 | Capped by policy | `ran on model-medium (auto: large 0.91, capped to medium)` |
 | Fallback | `ran on model-default (auto: fallback, unsure)` |
 | Model cannot be vouched for | `ran on provider default (auto: fallback, not_honored)` |
+| Matched, tier raised | `ran on claude-opus-5-5 (auto: medium 0.90, matched long_context -> large)` |
+| Matched to another CLI | `ran on gpt-5.5-pro (auto: medium 0.90, matched long_context+read_only -> codex large)` |
+| Matched at the decider's size | `ran on gpt-5.5 (auto: medium 0.90, matched read_only)` |
+| Network hint added | `...; the task may need network access, and this helper has no web_fetch` |
+
+A matched note has an arrow only when the match changed something: ` -> <tier>` when the tier
+rose, ` -> <cli> <tier>` when the helper moved to another CLI. A need covered at the decider's
+size on the same CLI adds just `, matched <needs>`.
+
+The note comes from the launch's `model.route` record, so it needs `model.route` on. With
+`provider.route` bound to `match` and `model.route` off, in shadow or given an explicit tier, a
+match that moves the helper to another CLI adds no note: the creator isn't told about the move.
+The helper's `provider.route` record shows it (`outcome` `applied`, `match_pick`).
 
 The note names a model only when the bound terminal records it and the provider
 honors it. Otherwise it says `provider default`. Fallback reasons are fixed
@@ -93,8 +108,8 @@ Settings are read fresh for each call, except the shadow limits
 `shadow.max_concurrent` and `shadow.max_pending`, which the server reads once at
 startup. Point-state precedence is:
 
-1. `CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE` and `CAO_DECISION_PROVIDER_ROUTE`
-   in the server's environment. A repeatable `cao-server --decision model.route=shadow` flag sets
+1. `CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_PROVIDER_ROUTE`
+   and `CAO_DECISION_TASK_FEATURES` in the server's environment. A repeatable `cao-server --decision model.route=shadow` flag sets
    the matching variable for that server process, replacing an inherited value.
 2. `decisions.points.<point>.state` in `settings.json`.
 3. `off`.
@@ -185,6 +200,11 @@ cao decisions tune --on-timeout-ms 1000 --threshold 0.7 --retention-days 90
 cao decisions list --point model.route --since 2026-01-01 --limit 100
 cao decisions purge --before 2026-01-01
 cao decisions purge --all --rotate-key
+cao decisions set task.features shadow --decider <name>
+cao decisions set provider.route on --decider match
+cao decisions match show [--json]
+cao decisions match check
+cao decisions match explain --needs long_context --size medium --tier-auto --fallback claude_code
 ```
 
 The operations stdio MCP server offers `decisions_status`, `decisions_off`, `decisions_set_point`,
@@ -198,6 +218,262 @@ same-user local control, not a privilege boundary: `settings.json` can be edited
 by the same user, including an agent with shell access.
 The same user can also install a decider package. Concurrent settings writers
 can lose updates because the existing settings writer is not atomic.
+
+## Matching helpers to models
+
+### Why
+
+A decider can size an ephemeral helper: with `model_tier: "auto"`, `model.route` answers small,
+medium or large. It can't tell which of *your* models suits the task, though. When we tested the
+hosted Jev decider, it ignored model names, model mappings and hints naming a model entirely; it
+judged every task on its complexity alone, and it did that well.
+
+So CAO splits the job. The decider answers four fixed yes/no questions about **the task**, and CAO
+matches the answers to **your models** locally, from facts you declare in `settings.json`. Your
+model list, costs and windows never leave the machine, and the decider sees the same task text it
+already sees for `model.route`.
+
+| Feature point | Asks | What CAO does with a confident `yes` |
+| --- | --- | --- |
+| `task.long_context` | Must a very large amount of text be held at once? | Prefer a model whose declared window is at least `long_context_tokens` |
+| `task.deep_reasoning` | Does it need long chains of careful reasoning? | Prefer a model declared `good_for` it |
+| `task.read_only` | Will it only read and report? | Prefer a model declared `good_for` it |
+| `task.needs_network` | Does it need the internet? | Nothing to routing. It adds a hint to the delegation note when the helper has no `web_fetch`; tools never change |
+
+It's **off by default**, and every doubt means today's behaviour: no feature flagged, no answer,
+a timeout, a bad catalog or `cao decisions off` all run the helper on the creator's CLI at the
+decider's size.
+
+### Quick start
+
+1. **Declare your models** in `settings.json`, next to the `model_tiers` that map them, and set
+   `ephemeral.max_tier`: it's the highest tier a match may raise a helper to. There is no CLI to
+   write the catalog yet; edit the file.
+
+   ```json
+   {
+     "model_tiers": {
+       "claude_code": {"medium": "claude-sonnet-5-5", "large": "claude-opus-5-5"}
+     },
+     "ephemeral": {"min_tier": "medium", "default_tier": "medium", "max_tier": "large"},
+     "decisions": {
+       "match": {
+         "version": 1,
+         "long_context_tokens": 500000,
+         "models": {
+           "claude_code": {
+             "claude-sonnet-5-5": {"context_tokens": 200000, "cost": "medium"},
+             "claude-opus-5-5": {"context_tokens": 1000000, "cost": "high", "good_for": ["deep_reasoning"]}
+           }
+         }
+       }
+     }
+   }
+   ```
+
+   The windows and costs are your declarations; CAO doesn't verify them. Without
+   `ephemeral.max_tier` the tier never rises, so a need only the large model covers gets
+   `no_cover`. A helper with `model_tier: "auto"` needs `ephemeral.min_tier` and `max_tier`,
+   and `default_tier` must be set with `max_tier`; every tier from `min_tier` to `max_tier`
+   must be in `model_tiers`.
+
+   To see what a launch would get, without asking a decider:
+   `cao decisions match explain --needs long_context --size medium --options claude_code --tier-auto`
+   picks `claude_code/large` (`rule: covered`).
+
+2. **Check the declarations:** `cao decisions match check`. It names any declaration that
+   `model_tiers` doesn't map, mapped models you haven't declared, and what covers `long_context`.
+
+3. **Start in shadow.** Bind the features to a decider package that declares all four feature
+   points, and keep `model.route` on:
+
+   ```bash
+   cao decisions set model.route on --decider <name>
+   cao decisions set task.features shadow --decider <name>
+   ```
+
+   Helpers launch exactly as before. Each launch records the four answers
+   (`cao decisions list --point task.long_context`) and the match it *would* have made, on its
+   `model.route` record (`match_rule`, `match_pick`).
+
+4. **Turn it on** when the shadow records look right:
+   `cao decisions set task.features on --decider <name>`.
+
+### An example with Claude Code and Codex
+
+A Claude Code supervisor creates a helper with `provider: "auto"`, `model_tier: "auto"` and
+`tools: ["fs_read", "fs_list"]`. Its task: *"Read the whole payments service and map every
+external caller of the charge API. Report only."* The decider answers `long_context` yes 0.88,
+`read_only` yes 0.97, the other two no, and `model.route` medium 0.90.
+
+**With Claude Code alone** (today's realistic case), the match picks the tier on the creator's
+CLI. Medium's model has a 200,000-token window and large's has 1,000,000, so `long_context` is
+covered only at `large`. The tier rises from medium to large, within `max_tier`:
+
+```text
+ran on claude-opus-5-5 (auto: medium 0.90, matched long_context -> large)
+```
+
+**With Codex as a second option**, the match can also move the helper between CLIs, but only
+within an `ephemeral.provider_route.equivalent` set you declared. On today's capability table
+Claude Code is `hard` and Codex `advisory`, so a set naming both is refused, and the CLI half of
+the match routes nothing yet. It applies once a second `hard` or `sandboxed` CLI can be routed
+to, such as the contained Codex launch, or Kiro once CAO can route to it (Kiro helpers are
+already `hard`, but `provider.route` can't choose Kiro yet). Then, with `provider.route` bound
+to the built-in matcher (`cao decisions set provider.route on --decider match`) and these
+declarations:
+
+```json
+"codex": {
+  "gpt-5.5":     {"context_tokens": 256000,  "cost": "low",    "good_for": ["read_only"]},
+  "gpt-5.5-pro": {"context_tokens": 2000000, "cost": "medium", "good_for": ["read_only"]}
+}
+```
+
+Once Codex is `sandboxed`, `cao decisions match explain` prints:
+
+```text
+$ cao decisions match explain --needs long_context,read_only --size medium --tier-auto --options claude_code,codex
+catalog v1 · hash hmac:9f2c… · long_context_tokens 500000
+options: claude_code (hard), codex (sandboxed) · tiers: medium..large (size medium, ceiling large) · fallback claude_code
+
+candidate           model              context  cost    long_context  read_only
+claude_code/medium  claude-sonnet-5-5  200000   medium  -             -
+claude_code/large   claude-opus-5-5    1000000  high    yes           -
+codex/medium        gpt-5.5            256000   low     -             yes
+codex/large         gpt-5.5-pro        2000000  medium  yes           yes        ◄ pick
+
+rule: covered (long_context, read_only) · tie-break: only · pick: codex/large
+```
+
+The helper then runs `codex --model gpt-5.5-pro` inside Codex's sandbox class (read-only or
+workspace-write, no network), where tool atoms are advisory and Codex always has a confined shell;
+the note says
+`ran on gpt-5.5-pro (auto: medium 0.90, matched long_context+read_only -> codex large)`.
+
+**Today** the same command prints `codex (advisory)` and
+`rule: rejected · runs the default: claude_code/medium`, because Codex is `advisory` and the match
+never pairs an advisory CLI with a hard one.
+
+### The catalog: `decisions.match`
+
+| Key | Meaning | Rules |
+| --- | --- | --- |
+| `version` | the schema version | must be `1` |
+| `long_context_tokens` | what "very large" means to you | an integer from 1,000 to 100,000,000; default 500,000 |
+| `ignore_features` | routing features the match won't use (they're still asked and recorded) | a list of distinct `long_context`, `deep_reasoning`, `read_only`; default `[]` |
+| `models.<provider>.<model_id>` | one model you run on that CLI | the provider is a CAO provider ID; the model ID follows the model-ID rules |
+| `context_tokens` | its window | required; an integer from 1 to 100,000,000 |
+| `cost` | your relative cost | required; `low`, `medium` or `high` |
+| `good_for` | the features it suits | optional; distinct `deep_reasoning` and `read_only`. `long_context` comes from `context_tokens`, and `needs_network` never routes, so neither is accepted |
+
+No other key is accepted, and no field takes free text. A declaration never adds a model: a model
+ID that no `model_tiers` tier maps is **unreachable**. It's kept and warned about, and never used.
+
+| Problem | Effect |
+| --- | --- |
+| The block is absent | An empty catalog: nothing covers any need, so every helper runs as today |
+| Not an object; `version` missing or not 1; `models` not an object; an unknown top-level key; a bad `long_context_tokens` or `ignore_features` | **Matching is off for every launch** (`match_rule: catalog_invalid`), and helpers run as today |
+| An unknown provider; a bad model ID; a declaration with a bad value, a missing key or an unknown key | **That entry is dropped**, with a warning that names its key path |
+
+### How the match picks
+
+1. **Needs.** The routing features answered `yes` at or above `confidence_threshold`, minus
+   `ignore_features`. With none, the helper runs as today (`none_needed`).
+2. **Candidates.** Every CLI in the launch's options, at every tier in the band, that
+   `model_tiers` maps. The options are `provider.route`'s (#1099): the creator's CLI plus the
+   members of its equivalence set that pass every policy rule. The band runs from the decider's
+   size (never below it) up to `max_tier`, but only when `model.route` is on and its answer was
+   applied or capped. Otherwise the band is the helper's own tier, and only the CLI can change.
+3. **Best cover.** The candidates covering the most important need first (`long_context`,
+   then `deep_reasoning`, then `read_only`). If none covers any need, the helper runs as today
+   (`no_cover`).
+4. **Ties.** The lower declared cost, then the lower tier, then the creator's CLI, then the
+   capability table's order. The record names the step that decided.
+
+The match never widens anything: no CLI outside the options, no tier outside the band, no model
+outside `model_tiers`, and the tools are never read or changed. A defensive check refuses a pick
+that would pair an `advisory` CLI with a `hard` or `sandboxed` one (`rejected`).
+
+**What may rise (#810).** #810's rule is amended for the match, and only for the tier. A decider
+still can never raise a helper's tier, providers or tools. CAO's own local match may raise a
+helper's tier, but only to a model you declared in `decisions.match` and only up to
+`ephemeral.max_tier`. It never raises providers or tools.
+
+| `task.features` | `provider.route` | `model.route` | What happens |
+| --- | --- | --- | --- |
+| off | bound to `match` | any | Exactly today. The `provider.route` record says `no_features`. |
+| shadow | any | any | The features are asked in the background. The would-be match is recorded, and nothing is applied. |
+| on | on, bound to `match` | on | The match picks the CLI and the tier |
+| on | on, bound to `match` | off, shadow or an explicit tier | The match picks the CLI at the helper's tier. No raise. |
+| on | off, shadow, one option or another decider | on | The CLI is decided as before; the match picks the tier on it, which can rise |
+| on | off | off | Nothing is matched, but each launch still makes one feature call and records the four answers. Only the network hint can come of it. |
+
+### Records of a match
+
+Each feature point gets an ordinary record: `point` (`task.long_context` and so on), the decider,
+`answer`, `probabilities`, `confidence`, and `outcome` `applied`, `fallback` with a reason
+(`unsure`, `low_confidence`, `timeout`, `error`, `invalid_answer`, `no_answer`,
+`decider_unavailable`) or `shadow`.
+
+The `provider.route` and `model.route` records a match touches get these columns. They're null
+everywhere else, and an upgrade doesn't backfill them.
+
+| Column | Value |
+| --- | --- |
+| `match_rule` | `none_needed`, `covered`, `no_cover`, `no_features`, `catalog_invalid` or `rejected` |
+| `match_needs`, `match_covered` | JSON lists of feature names: the needs, and the needs the pick covers |
+| `match_tiebreak` | `only`, `cost`, `tier`, `fallback` or `order` |
+| `match_from` | on `model.route` records, the size before the match; `applied_value` holds the tier that ran |
+| `match_pick` | `<provider>/<tier>`; in shadow, what `on` would have run |
+| `catalog_version`, `catalog_hash` | `1`, and an HMAC of the validated catalog under `decision-hash.key` |
+
+A `provider.route` record answered by the matcher names `decider: match` and
+`decider_version: match-1`. When applied, its `answer` and `applied_value` are the chosen CLI, with
+`probabilities` `{CLI: 1.0}`. Otherwise its outcome is `fallback` with the reason `no_match`.
+Records never hold the catalog itself, and telemetry gains only a `cao.decision.match_rule` label.
+
+### What can go wrong
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Every feature record says `decider_unavailable` | The decider bound to `task.features` doesn't declare all four feature points | Install a package release that declares them, or bind another decider |
+| `match_rule: no_features` | The features are off, or the feature request timed out or failed (see the feature records' `reason`) | JevK5 answers the four questions one after another, so raise `on_timeout_ms` or keep `task.features` in shadow |
+| `match_rule: none_needed` | No feature was answered `yes` at or above `confidence_threshold` | Usually correct. Check the feature records' `confidence`, or tune the threshold for your decider |
+| `match_rule: no_cover` | No reachable, declared model in the options and band covers the need | `cao decisions match check`; declare the model; map it in `model_tiers`; check `max_tier` |
+| `match_rule: catalog_invalid` | A structural error in `decisions.match` | `cao decisions match show` names it |
+| The tier never rises | `model.route` isn't on, its answer was unsure or low-confidence, or the size is already `max_tier` | Turn `model.route` on, or raise `max_tier` |
+| The CLI never changes | The launch has one option: no valid equivalence set, or `provider.route` isn't bound to `match` | Expected on today's capability table; see the example above |
+| The note ends with the network hint | The decider said the task needs the network, and the helper has no `web_fetch` | Grant `web_fetch` in the spec if it really needs it. The hint never changes tools |
+
+### FAQ
+
+**Does my model list leave the machine?** No. The decider gets the same task text and
+description as `model.route`'s request, with four fixed questions. The request is checked by a
+test that compares it with `model.route`'s.
+
+**Can the match run a model I haven't mapped?** No. The model always comes from `model_tiers`;
+a declaration only describes it.
+
+**Can task text steer it?** Yes, as it can steer `model.route`. The effect is bounded by your
+options, `max_tier` and the decider's own size answer. The worst case is the costliest allowed
+model on an allowed CLI. Use shadow first.
+
+**Why never below the decider's size?** The size is the decider's judgement of the task's
+complexity, which it's good at. The match only adds a capability the size can't express.
+
+**Jev or JevK5?** CAO's side is identical: the same questions, request, matching and records. Tune
+`confidence_threshold` and `on_timeout_ms` for the decider you bind. One of them answering a
+feature poorly is what `ignore_features` is for. Bind `task.features` only to a decider package
+that declares all four `task.*` feature points; with one that doesn't, every feature record says
+`decider_unavailable`. Check the package's own README for the points it declares.
+
+**How do I see why a helper ran where it did?** Its `model.route` and `provider.route` records,
+and `cao decisions match explain` with the recorded `match_needs`, the size (`match_from`), the
+`options` and the creator's CLI. It prints the same pick, rule, tie-break and hash.
+
+**Installed (non-ephemeral) launches?** Not in this version. Only ephemeral helpers ask the
+features.
 
 ## Records and telemetry
 
@@ -213,7 +489,9 @@ the applied provider (`applied_enforcement`); these three columns are null on
 every other record. On a `provider.route` record, `provider` is the provider the
 launch runs on and `fallback_value` is the creator's; the same launch's
 `model.route` and `effort.route` records name the provider it runs on. The
-upgrade adds the three columns and does not backfill them.
+upgrade adds the three columns and does not backfill them. The local matcher adds eight more
+nullable columns to the `provider.route` and `model.route` records it touches; see
+[Records of a match](#records-of-a-match).
 `cao decisions list` prints every column as JSON. `target_kind` is
 `installed`, `ephemeral` or `workflow`; `workflow` marks a script workflow's own
 step. Records written before the column existed keep `target_kind` null: the
@@ -464,6 +742,14 @@ need an interactive terminal. CAO's own agent-facing tools offer no consent.
 - Elastic decision records stay on the remote node and are lost with it.
 - Effort routing has no normal delegation consumer: installed launches never ask `effort.route`, and only an ephemeral `effort: "auto"` launch applies a decided effort.
 - A decider that blocks the event loop cannot be preempted by an asynchronous timeout.
+- The task features are asked only for ephemeral helpers. With today's capability table no
+  equivalence set validates, so the local match can raise a helper's tier on the creator's CLI but
+  can't move it to another CLI. `cao decisions match` has no `declare` or `forget` verbs yet;
+  edit `decisions.match` in `settings.json`.
+- The match meets the most important need first, not the most needs. With all three routing
+  needs, a model covering only `long_context` beats one covering `deep_reasoning` and
+  `read_only`; `match_covered` names what the pick covers. A rule that covers the most needs is a
+  follow-up.
 - Terminal records expose the launched model and whether it was honored, independently of decision state; decision fields stay in operator records.
 - If a policy tightens between a launch and `create_terminal`'s own idempotent retry, the retry can be refused before replaying the existing terminal. This does not occur with an identity policy. Each replayed delegation create writes its own `not_launched` row; in shadow or on the decider is asked again.
 - A direct API delegation to a reserved ephemeral name without a claim, carrying a per-call model, is refused at the delegation site with HTTP 400 "set the tier in the spec instead of a per-call model". The response names no reason code and no decision record is written. The ephemeral launch policy never sees the request, so it does not log the refusal either. Assign and handoff refuse reserved names before sending any request. A claimed launch with a per-call model asks no decider and is refused, and logged, by the ephemeral policy itself.

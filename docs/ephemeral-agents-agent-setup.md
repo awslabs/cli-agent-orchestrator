@@ -166,7 +166,7 @@ Pick a pattern with the user:
 
 | Pattern | Command | Survives a CAO upgrade? | Touches CAO itself? |
 | --- | --- | --- | --- |
-| A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | Only for a plain PyPI install upgraded with `uv tool upgrade`. For a git install, `cao update` drops it (see below). | Yes: CAO is reinstalled and may move to a newer version |
+| A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | Only for an unpinned PyPI install upgraded with `uv tool upgrade`. For a git or version-pinned install, `cao update` drops it (see below). | Yes: CAO is reinstalled and may move to a newer version |
 | B: add it to the tool's environment | `uv pip install --python "$CAO_PY" "cao-decider-jev @ <source>"` | **No.** The receipt never records it, so any CAO upgrade silently drops it | Not CAO's own package, but it can change dependencies CAO shares (such as `httpx`). Run it with `--dry-run` first and show the user the changes |
 
 **For pattern A, copy the source and the extras from the receipt.** The `cli-agent-orchestrator`
@@ -210,6 +210,9 @@ often it won't:
 
 - `cao update` on a git install runs `uv tool install <git source> --upgrade --reinstall` without
   any `--with`, so it removes the decider even after pattern A;
+- `cao update` on a version-pinned PyPI install (a receipt entry with a `specifier`) runs
+  `uv tool install cli-agent-orchestrator@latest --upgrade`, also without `--with`, so it removes
+  the decider too. An unpinned PyPI install runs `uv tool upgrade`, which keeps it;
 - on a local install, `cao update` changes nothing and prints a reinstall command that has no
   `--with` either;
 - after pattern B, any upgrade removes it.
@@ -304,7 +307,7 @@ executable on `PATH`. `enable` ends with:
 
 ```text
 Consent granted; effective states:
-{"effort.route": "off", "model.route": "shadow", "provider.route": "off"}
+{"effort.route": "off", "model.route": "shadow", "provider.route": "off", "task.features": "off"}
 ```
 
 The exact list of points can grow with CAO versions; what matters is `"model.route": "shadow"`.
@@ -320,6 +323,13 @@ For another decider, use that package's own key-check and status commands. Don't
 environment variable name, and don't use `cao env list`: it prints values. Jev's own README is
 the authority for its key, consent and revoke commands.
 
+A decider's key may be stored once per OS user, and so shared by every CAO install on the
+machine; Jev's current version does this. The agent never runs `key set`, `key delete` or
+`key check --auth` — those are always the user's steps. On a second install, first run
+`"$(dirname "$CAO_PY")/cao-decider-jev" key check` (the check above); if it reports the key
+present, tell the user they can skip `key set`. Check the decider's README for where it keeps
+its key.
+
 ## 6. Restart the server and reconnect your MCP
 
 `cao-server` only looks for deciders when it starts. Get the user's OK, then restart it the way
@@ -331,16 +341,29 @@ step 2 found it running:
   (`-k` stops the running instance first; without it, kickstart leaves a running job alone).
 
 Find the process by its port, never by matching command-line text: your own shell can match that
-text too. Then check the restart:
+text too. Then check the restart. The block waits for the server, trying once a second: about
+30 s if nothing listens, or up to about 90 s if a server accepts the connection but never
+answers.
 
 ```bash
 PORT="${CAO_API_PORT:-9889}"
-curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null && echo "server answers"
-PID="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -n 1)"
-ps -o pid,lstart,etime -p "$PID"                   # the start time must be after your install
-ps -o args= -p "$PID"                              # must match the ps line you saw in step 2
-"$(dirname "$CAO_PY")/cao" decisions status | "$CAO_PY" -c "import json,sys; print([d['name'] for d in json.load(sys.stdin)['installed_deciders']])"
+UP=""
+for i in $(seq 1 30); do
+  if curl -sf --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null; then UP=1; break; fi
+  sleep 1
+done
+if [ -n "$UP" ]; then
+  echo "server answers"
+  PID="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -n 1)"
+  ps -o pid,lstart,etime -p "$PID"                   # the start time must be after your install
+  ps -o args= -p "$PID"                              # must match the ps line you saw in step 2
+  "$(dirname "$CAO_PY")/cao" decisions status | "$CAO_PY" -c "import json,sys; print([d['name'] for d in json.load(sys.stdin)['installed_deciders']])"
+else
+  echo "no answer on port $PORT after 30 tries: stop and report"
+fi
 ```
+
+If it prints `no answer`, the restart failed: stop and report it to the user.
 
 The `ps` line must be the same command as in step 2, so the server still runs the Python you
 installed into. Compare it with step 2's `ps` line, not with `"$CAO_PY"`: when step 2 used the
@@ -425,8 +448,10 @@ every time.
 - **Kiro v3** refuses unsupported `kiro-cli` versions with `kiro_v3_unsupported_version` and
   pending, unverified versions with `kiro_v3_unverified_version`; the creating agent receives
   the specific rule and its remedy. Use a supported version for an unsupported refusal, or a
-  verified version for an unverified refusal. `kiro-cli` 3.1.0 is pending: it is refused by
-  default and only the operator can admit it with `kiro.v3_allow_unverified_versions`. Older
+  verified version for an unverified refusal. Which versions are verified or pending is listed
+  only in [Supported kiro-cli versions](kiro-cli.md#supported-kiro-cli-versions). A pending
+  version is refused by default, and only the operator can admit it with
+  `kiro.v3_allow_unverified_versions`. Older
   CAO builds returned a bare `unexpected_failure`, with the real reason only in the server log.
 
 ## 9. Undo
@@ -454,7 +479,9 @@ Each of these writes settings or restarts the server, so get the user's OK.
 These are **the user's** steps:
 
 - revoke consent, with `cao decisions disable jev`;
-- delete the key, with `cao-decider-jev key delete`;
+- delete the key, with `cao-decider-jev key delete` — tell the user first that this removes
+  the key for every CAO install on the machine (the key is shared per OS user), not just this
+  one;
 - uninstall the package: run pattern A again without the decider's `--with`, or
   `uv pip uninstall --python "$CAO_PY" cao-decider-jev` for pattern B.
 

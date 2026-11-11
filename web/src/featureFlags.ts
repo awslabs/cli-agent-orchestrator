@@ -8,12 +8,12 @@
 /**
  * Whether the agent-plugins ("Plugins") tab is offered.
  *
- * **OFF by default.** Maintainer decision M1 has not settled the naming of the
- * agent-plugin surfaces, and Requirement 16.5 forbids shipping them to end users
- * until it does — a visible tab is exactly such a surface. The panel, its API
- * client, and the `/plugins/*` endpoints are all built and tested; once M1 lands,
- * flipping this constant is the web UI's half of the release, alongside defaulting
- * the server-side `CAO_AGENT_PLUGINS_ENABLED` gate to on.
+ * **OFF by default.** The agent-plugin surfaces do not ship to end users until
+ * they graduate (#1244), and a visible tab is exactly such a surface. Their verb is
+ * decision M1, recorded by the issue author in #573. The panel, its API client,
+ * and the `/plugins/*` endpoints are all built and tested; when the surface
+ * graduates, flipping this constant is the web UI's half of the release, alongside
+ * defaulting the server-side `CAO_AGENT_PLUGINS_ENABLED` gate to on.
  *
  * Typed `boolean` rather than left as the literal `false` so switching it does
  * not change the constant's type and does not make the `filter` below look like

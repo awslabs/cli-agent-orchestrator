@@ -346,29 +346,170 @@ class TestKillReachesThePane:
         pane.kill.assert_not_called()
 
 
-class TestAttachCommand:
-    def test_selects_the_window_before_the_pane(self, tmux):
-        """select-pane alone does not move the active window."""
+class TestWebViewAttachCommand:
+    def test_links_the_panes_window_without_selecting_a_pane(self, tmux):
+        """The WebSocket handler selects the pane (one active pane per window,
+        not per client), so the chain carries no pane target that could fail
+        after the view exists."""
         pane = marked_pane("coder-3", "%4")
         pane.window.window_id = "@2"
         tmux.server.sessions.get.return_value = session_with(panes=[pane])
 
-        argv = tmux.attach_command("ses", "coder-3")
+        argv = tmux.web_view_attach_command("ses", "coder-3")
 
-        assert argv.index("select-window") < argv.index("select-pane")
-        assert argv[argv.index("select-window") + 2] == "@2"
-        assert argv[argv.index("select-pane") + 2] == "%4"
+        assert argv[argv.index("link-window") + 2] == "@2"
+        assert "select-pane" not in argv and "%4" not in argv
 
-    def test_window_terminal_attaches_as_before(self, tmux):
+    def test_window_terminal_links_its_window(self, tmux):
         tmux.server.sessions.get.return_value = session_with(window=MagicMock())
 
-        assert tmux.attach_command("ses", "win") == [
-            "tmux",
-            "-u",
-            "attach-session",
-            "-t",
-            "ses:win",
-        ]
+        argv = tmux.web_view_attach_command("ses", "win")
+
+        assert argv[argv.index("link-window") + 2] == "ses:win"
+        assert "select-pane" not in argv
+
+
+class TestWebViewAttachPlan:
+    def test_a_pane_terminal_links_the_window_it_names_for_focus(self, tmux):
+        """Argv and focus come from one lookup, so they cannot disagree."""
+        pane = marked_pane("coder-3", "%4")
+        pane.window.window_id = "@2"
+        tmux.server.sessions.get.return_value = session_with(panes=[pane])
+
+        argv, focus = tmux.web_view_attach_plan("ses", "coder-3")
+
+        assert focus == ("@2", "%4")
+        assert argv[argv.index("link-window") + 2] == "@2"
+        assert tmux.server.sessions.get.call_count == 1
+
+    def test_a_window_terminal_needs_no_focus(self, tmux):
+        tmux.server.sessions.get.return_value = session_with(window=MagicMock())
+
+        argv, focus = tmux.web_view_attach_plan("ses", "win")
+
+        assert focus is None
+        assert argv[argv.index("link-window") + 2] == "ses:win"
+
+    def test_an_unreadable_listing_raises_instead_of_needing_no_focus(self, tmux):
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
+        tmux.server.sessions.get.side_effect = ValueError("not enough values to unpack")
+
+        with pytest.raises(TmuxLookupError):
+            tmux.web_view_attach_plan("ses", "coder-3")
+
+    def test_the_plain_command_still_degrades_to_the_window_target(self, tmux):
+        tmux.server.sessions.get.side_effect = ValueError("not enough values to unpack")
+
+        argv = tmux.web_view_attach_command("ses", "coder-3")
+
+        assert argv[argv.index("link-window") + 2] == "ses:coder-3"
+
+    def test_select_pane_targets_the_pane(self, tmux):
+        tmux.server.cmd.return_value = MagicMock(returncode=0, stderr=[])
+
+        tmux.select_pane("%4")
+
+        tmux.server.cmd.assert_called_once_with("select-pane", "-t", "%4")
+
+    @pytest.mark.parametrize("bad", ["4", "%4; kill-server", "ses:win", "", "%"])
+    def test_select_pane_refuses_anything_but_a_pane_id(self, tmux, bad):
+        with pytest.raises(ValueError):
+            tmux.select_pane(bad)
+        tmux.server.cmd.assert_not_called()
+
+    def test_select_pane_failure_raises(self, tmux):
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
+        tmux.server.cmd.return_value = MagicMock(returncode=1, stderr=["can't find pane: %4"])
+
+        with pytest.raises(TmuxLookupError):
+            tmux.select_pane("%4")
+
+
+class TestWebViewArgv:
+    def test_view_is_private_and_tagged_with_its_owner(self):
+        from cli_agent_orchestrator.clients.tmux import web_view_attach_argv
+
+        argv = web_view_attach_argv("cao-s", "cao-s:w", view_name="caoweb-x")
+
+        assert argv[argv.index("attach-session") + 2] == "caoweb-x"
+        assert argv[argv.index("@cao_web_view_of") + 1] == "cao-s"
+        # The placeholder window is gone before anything attaches.
+        assert argv.index("kill-window") < argv.index("attach-session")
+        # destroy-unattached only after attaching: set earlier it kills the view.
+        assert argv.index("destroy-unattached") > argv.index("attach-session")
+
+    @pytest.mark.parametrize(
+        "option,value",
+        [
+            # create_session sets mouse on agent sessions (#546); a view starts
+            # from tmux's global default (off), and xterm.js then turns wheel
+            # ticks into Up/Down keys sent to the agent.
+            ("mouse", "on"),
+            # The client exits when the view is destroyed, whatever tmux.conf says.
+            ("detach-on-destroy", "on"),
+        ],
+    )
+    def test_view_sets_session_options_before_attaching(self, option, value):
+        from cli_agent_orchestrator.clients.tmux import web_view_attach_argv
+
+        argv = web_view_attach_argv("cao-s", "cao-s:w", view_name="caoweb-x")
+
+        at = argv.index(option)
+        assert argv[at - 3 : at + 2] == ["set-option", "-t", "caoweb-x", option, value]
+        assert at < argv.index("attach-session")
+
+    def test_web_view_owner_maps_only_views(self):
+        from cli_agent_orchestrator.clients.tmux import web_view_owner
+
+        owners = {"caoweb-x": "cao-s"}
+        assert web_view_owner("caoweb-x", owners.get) == "cao-s"
+        assert web_view_owner("caoweb-gone", owners.get) is None
+        assert web_view_owner("cao-s", owners.get) == "cao-s"
+        assert web_view_owner(None, owners.get) is None
+
+    def test_view_names_never_look_like_cao_sessions(self):
+        from cli_agent_orchestrator.clients.tmux import web_view_attach_argv
+        from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+        argv = web_view_attach_argv("cao-s", "cao-s:w")
+        view = argv[argv.index("attach-session") + 2]
+        assert view.startswith("caoweb-") and not view.startswith(SESSION_PREFIX)
+        assert web_view_attach_argv("cao-s", "cao-s:w") != argv  # fresh name each time
+
+
+class TestWebViewCleanup:
+    def test_kill_session_kills_its_views_first_and_only_its_own(self, tmux):
+        listing = MagicMock(
+            returncode=0,
+            stdout=[
+                "caoweb-a|cao-s",
+                "caoweb-b|cao-other",
+                "caoweb-c|",
+                "personal|cao-s",
+            ],
+        )
+        tmux.server.cmd.return_value = listing
+        tmux.server.sessions.get.return_value = None  # session itself already gone
+
+        tmux.kill_session("cao-s")
+
+        kills = [c.args for c in tmux.server.cmd.call_args_list if c.args[0] == "kill-session"]
+        assert kills == [("kill-session", "-t", "=caoweb-a")]
+
+    def test_view_listing_failure_does_not_block_teardown(self, tmux):
+        tmux.server.cmd.side_effect = RuntimeError("socket gone")
+        tmux.server.sessions.get.return_value = None
+
+        assert tmux.kill_session("cao-s") is False  # absent, not an exception
+
+    def test_unhinted_identity_scan_skips_views(self, tmux):
+        real, view = MagicMock(), MagicMock()
+        real.name, view.name = "cao-s", "caoweb-1"
+        tmux.server.sessions = [real, view]
+
+        assert tmux._sessions_for_identity_scan(None) == [real]
 
 
 # ── captions ─────────────────────────────────────────────────────────
@@ -516,3 +657,30 @@ class TestPaneCaptions:
             tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
 
         assert BORDER_STATUS_OPTION in str(window.set_option.call_args_list)
+
+
+class TestEscapeTime:
+    def test_reads_the_server_option(self, tmux):
+        tmux.server.cmd.return_value = MagicMock(returncode=0, stdout=["500"], stderr=[])
+
+        assert tmux.escape_time_ms() == 500
+        tmux.server.cmd.assert_called_once_with("show-options", "-sv", "escape-time")
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            MagicMock(returncode=1, stdout=[], stderr=["no server running"]),
+            MagicMock(returncode=0, stdout=[], stderr=[]),
+            MagicMock(returncode=0, stdout=["ten"], stderr=[]),
+        ],
+        ids=["failed", "empty", "not-a-number"],
+    )
+    def test_an_unreadable_answer_is_none(self, tmux, result):
+        tmux.server.cmd.return_value = result
+
+        assert tmux.escape_time_ms() is None
+
+    def test_a_server_error_is_none(self, tmux):
+        tmux.server.cmd.side_effect = LibTmuxException("no server running")
+
+        assert tmux.escape_time_ms() is None

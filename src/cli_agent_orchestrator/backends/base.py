@@ -7,7 +7,7 @@ Core services depend only on this ABC, never on a concrete backend directly.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -447,6 +447,35 @@ class TerminalBackend(ABC):
             TerminalBackendError: If the backend cannot prepare the attachment
         """
         ...
+
+    def prepare_web_attach_input(
+        self, session_name: str, window_name: str
+    ) -> Tuple[List[str], Optional[Tuple[str, str]]]:
+        """``prepare_web_attach`` plus what the browser terminal's input must focus.
+
+        Returns ``(argv, focus)``. ``focus`` is ``(scope, target)``: ``scope``
+        names what several terminals share (their input is serialised per
+        scope), ``target`` is what this terminal must focus before each input.
+        None means the attach alone routes input to the right agent, the
+        default. A backend that has to look the target up must take argv and
+        focus from the same lookup, and raise ``TerminalBackendError`` rather
+        than return None when the lookup fails.
+        """
+        return self.prepare_web_attach(session_name, window_name), None
+
+    def web_input_escape_hold(self) -> float:
+        """Seconds a trailing Escape may wait inside the backend before delivery.
+
+        A terminal client that cannot tell a lone Escape from the start of an
+        escape sequence holds it until a timer expires, then delivers it to
+        whatever is focused then. Only consulted when ``prepare_web_attach_input``
+        returned a focus; 0 means input is delivered as it is read.
+        """
+        return 0.0
+
+    def focus_web_input(self, target: str) -> None:
+        """Focus ``target`` (from ``prepare_web_attach_input``) so input reaches it."""
+        return None
 
     # --- Pipe-pane (logging) ---
 

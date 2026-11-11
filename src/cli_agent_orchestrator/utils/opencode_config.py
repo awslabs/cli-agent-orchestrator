@@ -9,10 +9,12 @@ No file locking is applied; concurrent ``cao install --provider opencode_cli``
 invocations are not a supported scenario.
 """
 
+import hashlib
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Set
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
@@ -37,6 +39,13 @@ _SCHEMA = "https://opencode.ai/config.json"
 #: server the *profile* declares — ``cao-mcp-server*`` above all — whose ``mcp``
 #: entry never resolves inside the store and so can never be proven CAO's from
 #: the config bytes alone.
+#:
+#: The same sidecar records ``mcp`` entry ownership (#1154), under a top-level
+#: ``"mcp"`` map of ``{"<server>": "sha256:<hex>"}``: one fingerprint of each
+#: plugin-derived entry CAO wrote. A grant key is a bare name, so the name is the
+#: record; an ``mcp`` entry has content, so the record is a digest of the content,
+#: which also notices a user rewriting an entry CAO once wrote. The key is
+#: additive, so a ``version`` 1 reader that knows only ``agents`` keeps it intact.
 GRANT_RECORD_FILENAME = "cao-grants.json"
 
 _EMPTY_GRANT_RECORD: Dict[str, Any] = {"version": 1, "agents": {}}
@@ -233,6 +242,14 @@ def _grant_record_path() -> Path:
     return OPENCODE_CONFIG_FILE.with_name(GRANT_RECORD_FILENAME)
 
 
+# Appended to every warning about a damaged sidecar (#1273 review). Deleting the
+# file is the easy repair and loses every agent's recorded grants, which is the
+# loss failing closed exists to prevent.
+GRANT_RECORD_REPAIR_HINT = (
+    "Repair the file by hand; deleting it drops the recorded grants of every agent."
+)
+
+
 def read_grant_record() -> Dict[str, Any]:
     """Load the grant sidecar, degrading to an empty record.
 
@@ -248,15 +265,24 @@ def read_grant_record() -> Dict[str, Any]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        logger.warning("opencode grant record at %s is unreadable (%s) — ignoring", path, exc)
+        logger.warning(
+            "opencode grant record at %s is unreadable (%s) — ignoring. %s",
+            path,
+            exc,
+            GRANT_RECORD_REPAIR_HINT,
+        )
         return dict(_EMPTY_GRANT_RECORD, agents={})
     if not isinstance(loaded, dict) or not isinstance(loaded.get("agents"), dict):
-        logger.warning("opencode grant record at %s has an unexpected shape — ignoring", path)
+        logger.warning(
+            "opencode grant record at %s has an unexpected shape — ignoring. %s",
+            path,
+            GRANT_RECORD_REPAIR_HINT,
+        )
         return dict(_EMPTY_GRANT_RECORD, agents={})
     return loaded
 
 
-def _write_grant_record(record: Dict[str, Any]) -> None:
+def _write_grant_record(record: Dict[str, Any], *, lost: str) -> bool:
     """Persist the grant sidecar atomically (temp file + ``replace``).
 
     Same discipline as ``InstalledPluginStore.write_record``: a torn write here
@@ -264,11 +290,27 @@ def _write_grant_record(record: Dict[str, Any]) -> None:
     to plugin-store-only ownership, leaking grants.
 
     Best effort, symmetrically with :func:`read_grant_record`. By the time this
-    runs ``opencode.json`` has already been updated, so raising would report the
-    install as *failed* after the user-visible half succeeded — and the cost of a
-    lost sidecar is only that CAO falls back to the containment proof, which is
-    exactly the pre-sidecar behaviour. An unwritable sidecar must not be worse
-    than an absent one.
+    runs ``opencode.json`` has usually been updated already (a withdrawal is recorded
+    BEFORE it; see below), so raising would report the install as *failed* after the
+    user-visible half succeeded. A failed write
+    keeps the OLD record, so the change this write would have made goes
+    unrecorded, and *lost* is the caller's account of that. For an ADDITION, the
+    new entry has no proof (a grant the old record already has keeps its). A
+    WITHDRAWAL is recorded BEFORE the key is removed (#1289): when this returns
+    False, :func:`_reconcile_agent_grants` leaves the key in ``opencode.json``, so
+    the record never lists a key CAO already removed (a key containment also proves
+    is held back the same way, #1294). (Before that, a failed write
+    left the old row listing a removed key, and EVERY later install removed a key
+    of that name, even one the user had added by hand, until one could write the
+    record: #1285 review, Note 1, and #1290 review, P3-1.) The two callers lose
+    different things (an agent's grant row from :func:`_record_grants`, an
+    ``"mcp"`` fingerprint from :func:`record_mcp_entry`), and one message cannot be
+    true of both. *lost* is required, with no default, so a new caller cannot
+    inherit the wrong one.
+
+    Returns whether the record was written, so that a caller that must not act
+    until the record says so (a withdrawal, in :func:`_reconcile_agent_grants`)
+    can tell.
     """
     path = _grant_record_path()
     temp_path = path.with_name(f".{path.name}.tmp")
@@ -277,12 +319,11 @@ def _write_grant_record(record: Dict[str, Any]) -> None:
         temp_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         temp_path.replace(path)
     except OSError as exc:
-        logger.warning(
-            "Could not record OpenCode tool grants at %s (%s); CAO will fall back to "
-            "plugin-store containment when withdrawing them",
-            path,
-            exc,
-        )
+        # Not GRANT_RECORD_REPAIR_HINT: the file is not damaged, it could not be
+        # written (a read-only directory, a full disk), so there is nothing to repair.
+        logger.warning("Could not write the OpenCode grant record at %s (%s). %s", path, exc, lost)
+        return False
+    return True
 
 
 def _recorded_grants(agent_name: str) -> Set[str]:
@@ -294,24 +335,190 @@ def _recorded_grants(agent_name: str) -> Set[str]:
     return {key for key in recorded if isinstance(key, str)}
 
 
-def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
-    """Set (or clear) the sidecar row for *agent_name*, writing only on change."""
-    record = read_grant_record()
-    agents = record.setdefault("agents", {})
-    if not isinstance(agents, dict):  # pragma: no cover - read_grant_record guarantees dict
-        agents = {}
-        record["agents"] = agents
+def _record_grants(agent_name: str, keys: Iterable[str], *, lost: str) -> bool:
+    """Set (or clear) the sidecar row for *agent_name*, writing only on change.
+
+    Returns whether the sidecar now says what was asked: True when it was written
+    or already said so, False when it could not be (an unreadable sidecar, or a
+    write that failed). :func:`_reconcile_agent_grants` needs the answer to a
+    withdrawal, which it must not carry out unless the record can follow (#1289).
+
+    *lost* is the caller's account of what a failed WRITE costs, for the same
+    reason ``_write_grant_record`` takes one: recording a withdrawal and recording
+    additions lose different things. It is required, with no default.
+
+    Fails closed, like :func:`record_mcp_entry` (#1271, GH #737). A sidecar that
+    exists but cannot be read as a grant record is left exactly as it is, with a
+    warning naming it, and this agent's row goes unrecorded. Starting from the
+    empty default instead would publish it over the damaged file and drop every
+    other agent's row. The install still completes: ``opencode.json`` has usually
+    been written by then (not for a withdrawal, which is recorded first). A
+    plugin server's grant is still withdrawn by plugin-store containment. A reinstall after the sidecar is repaired records the servers
+    the profile then names, so a profile server's grant (``cao-mcp-server*``,
+    say) that was added while the sidecar was damaged, and that the profile no
+    longer names, has no proof left and stays until it is removed by hand
+    (#1273 review).
+    """
     desired = sorted(set(keys))
-    if desired:
-        if agents.get(agent_name) == desired:
+    # The write sits inside the try, as in record_mcp_entry, so the handler can
+    # only ever skip it and never publish a fallback (the #737 guard's rule).
+    try:
+        record = _load_grant_record_or_raise()
+        agents = record["agents"]
+        if desired:
+            if agents.get(agent_name) == desired:
+                return True
+            agents[agent_name] = desired
+        else:
+            if agent_name not in agents:
+                return True
+            agents.pop(agent_name)
+        record["version"] = 1
+        return _write_grant_record(record, lost=lost)
+    except GrantRecordUnreadableError as exc:
+        logger.warning(
+            "opencode grant record is unreadable (%s); leaving it as it is and not "
+            "recording the grants of agent %s. A profile server's grant added now "
+            "stays until removed by hand if the profile drops that server before the "
+            "agent is reinstalled over a repaired file. %s",
+            exc,
+            agent_name,
+            GRANT_RECORD_REPAIR_HINT,
+        )
+        return False
+
+
+def mcp_entry_fingerprint(config: Mapping[str, Any]) -> str:
+    """A stable digest of an OpenCode ``mcp`` entry, ignoring ``enabled``.
+
+    ``enabled`` is left out because CAO itself flips it on removal
+    (:func:`disable_mcp_server`) and back on reinstall; an entry CAO disabled is
+    still the entry CAO wrote. Everything else, ``command``, ``environment`` and
+    ``cwd`` included, is part of the digest, so any other edit breaks the match.
+    """
+    material = {key: value for key, value in config.items() if key != "enabled"}
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _recorded_mcp_entries() -> Dict[str, str]:
+    """The ``mcp`` fingerprints the sidecar holds, ignoring malformed rows."""
+    recorded = read_grant_record().get("mcp")
+    if not isinstance(recorded, dict):
+        return {}
+    return {
+        name: digest
+        for name, digest in recorded.items()
+        if isinstance(name, str) and isinstance(digest, str)
+    }
+
+
+class GrantRecordUnreadableError(ValueError):
+    """The grant sidecar exists but cannot be parsed as a grant record."""
+
+
+def _load_grant_record_or_raise() -> Dict[str, Any]:
+    """Load the sidecar for a write: absent is empty, unreadable raises (GH #737).
+
+    :func:`read_grant_record` degrades a corrupt sidecar to an empty record,
+    which is right for a reader. A writer must not do that, because publishing
+    the empty default would drop every row the damaged file still holds.
+    """
+    path = _grant_record_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return dict(_EMPTY_GRANT_RECORD, agents={})
+    except (OSError, UnicodeDecodeError) as exc:
+        # Not valid UTF-8, not readable, or a directory: unreadable like bad JSON,
+        # and refused the same way, naming the file (#1253 review).
+        raise GrantRecordUnreadableError(f"{path}: {exc}") from exc
+    try:
+        loaded = json.loads(raw)
+    except ValueError as exc:
+        raise GrantRecordUnreadableError(f"{path}: {exc}") from exc
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("agents"), dict):
+        raise GrantRecordUnreadableError(f"{path}: unexpected shape")
+    return loaded
+
+
+def record_mcp_entry(name: str, config: Mapping[str, Any]) -> None:
+    """Record that CAO wrote *config* as ``mcp.<name>``, writing only on change.
+
+    Called for plugin-derived servers only. Those are delivered to every
+    CAO-managed agent, which is what lets a recorded entry that has dropped out
+    of an agent's desired set be disabled as withdrawn. A profile-declared
+    server is one agent's, so recording it would let a second agent's install
+    disable a server the first still uses.
+
+    Fails closed: a sidecar that is present but unreadable is left as it is and
+    this entry goes unrecorded, so CAO falls back to the containment proof for
+    it. The same holds when the sidecar cannot be written. That proof does not
+    survive a ``CAO_HOME_DIR`` move, where the fingerprint is the only proof the
+    entry is CAO's, and the write-failure warning says so. An install is never
+    failed for this.
+    """
+    digest = mcp_entry_fingerprint(config)
+    try:
+        record = _load_grant_record_or_raise()
+        entries = record.get("mcp")
+        if not isinstance(entries, dict):
+            entries = {}
+        if entries.get(name) == digest:
             return
-        agents[agent_name] = desired
-    else:
-        if agent_name not in agents:
-            return
-        agents.pop(agent_name)
-    record["version"] = 1
-    _write_grant_record(record)
+        entries[name] = digest
+        record["mcp"] = entries
+        record["version"] = 1
+        _write_grant_record(
+            record,
+            lost=(
+                f"mcp.{name} goes unrecorded, so CAO falls back to the containment proof for it; "
+                "after a CAO_HOME_DIR move CAO cannot prove the entry is its own."
+            ),
+        )
+    except GrantRecordUnreadableError as exc:
+        logger.warning(
+            "opencode grant record is unreadable (%s); not recording mcp.%s. %s",
+            exc,
+            name,
+            GRANT_RECORD_REPAIR_HINT,
+        )
+
+
+def is_recorded_mcp_entry(name: str, config: Mapping[str, Any]) -> bool:
+    """Whether the sidecar records CAO writing exactly *config* as ``mcp.<name>``."""
+    digest = _recorded_mcp_entries().get(name)
+    return digest is not None and digest == mcp_entry_fingerprint(config)
+
+
+def _plugin_root_is_gone(config: Mapping[str, Any]) -> bool:
+    """Whether the plugin root an ``mcp`` entry names no longer exists on disk.
+
+    The mapper sets ``PLUGIN_ROOT`` in every plugin server's environment to that
+    plugin's root in the store it was delivered from. An entry without one, or
+    with a relative one, is never treated as gone. ``lexists`` keeps a dangling
+    symlink counting as present, so an unclear answer leaves the entry alone.
+    """
+    environment = config.get("environment")
+    root = environment.get("PLUGIN_ROOT") if isinstance(environment, dict) else None
+    if not isinstance(root, str) or not root or not os.path.isabs(root):
+        return False
+    return not os.path.lexists(root)
+
+
+def is_orphaned_recorded_mcp_entry(name: str, config: Mapping[str, Any]) -> bool:
+    """Whether the record alone proves CAO may update or disable ``mcp.<name>``.
+
+    Two conditions, both required: the sidecar records CAO writing exactly
+    *config*, AND the plugin root the entry names is gone. The second matters
+    because ``~/.aws/opencode`` does not follow ``CAO_HOME_DIR``: two live CAO
+    homes share one ``opencode.json`` and one sidecar, and the record does not say
+    which home wrote an entry. While the entry's plugin root still exists, another
+    live home may be using it, so this home must neither disable nor rewrite it
+    (#1253 review). An entry whose store is gone, as after a ``CAO_HOME_DIR``
+    move, has no other owner left.
+    """
+    return is_recorded_mcp_entry(name, config) and _plugin_root_is_gone(config)
 
 
 def _reconcile_agent_grants(
@@ -332,6 +539,17 @@ def _reconcile_agent_grants(
       pre-sidecar install, or one whose sidecar was lost, still cleanable).
 
     Everything else in ``tools`` is the user's and is copied through untouched.
+
+    Order matters for a withdrawal (#1289). The record is what lets a LATER install
+    take a key away, so a key the record lists is not removed from ``opencode.json``
+    until the record no longer lists it: the row is written first, then the key goes.
+    That holds whether or not plugin-store containment also proves the key. If the
+    row cannot be written the key is left where it is and the warning names it (fail
+    closed: a grant that stays is mild; a row that still lists a removed key makes
+    every later install delete a key of that name, even one the user added by hand).
+    If ``opencode.json`` then cannot be written, the old row is put back, so the two
+    agree and the next install tries again. A key that containment proves but that
+    no row lists has nothing to disagree with, so it is withdrawn either way.
     """
     roots = list(plugin_store_roots)
     owned_now = {f"{name}*": True for name in mcp_names}
@@ -339,18 +557,21 @@ def _reconcile_agent_grants(
     data = read_config()
     before = json.dumps(data, sort_keys=True)
 
-    owned_before: Set[str] = _recorded_grants(agent_name)
+    recorded: Set[str] = _recorded_grants(agent_name)
+    owned_before: Set[str] = set(recorded)
     if not owned_now and not owned_before and _agent_entry_absent(data, agent_name):
         # Nothing to grant, nothing recorded to withdraw, and no entry to prune.
         # Returning here keeps the removal path a *true* no-op: the reconcile below
         # would otherwise materialise an empty `"agent": {}` section into a config
         # that never had one, which the pre-fix `remove_agent_tools` did not do.
         return
+    contained: Set[str] = set()
     servers = data.get("mcp")
     if isinstance(servers, dict):
         for server_name, entry in servers.items():
             if isinstance(entry, Mapping) and entry_within_roots(entry, roots):
-                owned_before.add(f"{server_name}*")
+                contained.add(f"{server_name}*")
+    owned_before |= contained
 
     agents_section = data.get("agent")
     if not isinstance(agents_section, dict):
@@ -366,8 +587,28 @@ def _reconcile_agent_grants(
     else:
         tools = dict(tools)
 
-    for withdrawn in owned_before - set(owned_now):
-        tools.pop(withdrawn, None)
+    withdrawn = owned_before - set(owned_now)
+    # Every withdrawal the record lists is recorded FIRST, and its key is kept if that fails (#1289). That includes a
+    # grant containment also proves: the row is what a later install trusts, so the row and the key must agree.
+    # A contained key the record does not list has no row to disagree with, so it is withdrawn either way.
+    vouched = recorded & withdrawn
+    held_back: Set[str] = set()
+    withdrawal_recorded = False
+    if vouched:
+        withdrawal_recorded = _record_grants(
+            agent_name,
+            recorded - withdrawn,
+            lost=(
+                f"Agent {agent_name}'s grants that the profile no longer names were left in "
+                f"opencode.json ({', '.join(sorted(vouched))}): a grant is not removed while the record "
+                "would still list it, because a later install would then remove a key of that name even "
+                "if it was added by hand. The next install tries again."
+            ),
+        )
+        if not withdrawal_recorded:
+            held_back = vouched
+    for key in withdrawn - held_back:
+        tools.pop(key, None)
     tools.update(owned_now)
     agent_entry["tools"] = tools
 
@@ -378,8 +619,33 @@ def _reconcile_agent_grants(
         agents_section.pop(agent_name, None)
 
     if json.dumps(data, sort_keys=True) != before:
-        write_config(data)
-    _record_grants(agent_name, owned_now)
+        try:
+            write_config(data)
+        except BaseException:
+            # BaseException, not Exception: a Ctrl-C during the write must still put the row back (#1294 P3-1).
+            if withdrawal_recorded:
+                # The record already says the withdrawal happened, and the keys are still there: put the old
+                # row back (best effort) so the two agree and the next install tries again.
+                _record_grants(
+                    agent_name,
+                    recorded,
+                    lost=(
+                        f"Agent {agent_name}'s grants that opencode.json could not be updated to withdraw "
+                        "could not be put back in the record, so they stay in opencode.json with no row "
+                        "until removed by hand."
+                    ),
+                )
+            raise
+    _record_grants(
+        agent_name,
+        set(owned_now) | held_back,
+        lost=(
+            f"Agent {agent_name}'s recorded grants keep their old value: a profile server's grant "
+            "added now stays if the profile drops that server before the agent is next installed "
+            "with a writable sidecar. A plugin server's grant that the record does not list is still "
+            "withdrawn by plugin-store containment."
+        ),
+    )
 
 
 def upsert_agent_tools(
@@ -448,14 +714,20 @@ def _agent_entry_absent(data: Mapping[str, Any], agent_name: str) -> bool:
 #     user's config. ``is_cao_owned_mcp_entry`` decides whether an existing entry
 #     is safe to overwrite.
 #
-# PROVENANCE IS A HEURISTIC, NOT A FACT. ``opencode.json`` records no owner, so
-# the only signal available without persisted state (install-record / marker
-# key — design.md §10a options 1 and 2, deliberately out of scope here) is that
-# a CAO-delivered plugin server's ``command``/``environment`` were expanded from
-# ``${PLUGIN_ROOT}``/``${PLUGIN_DATA}`` and therefore point INSIDE the plugin
-# store. A *stale* CAO entry written under a different ``CAO_HOME_DIR`` points at
-# the OLD store and is thus indistinguishable from a user's entry; it is treated
-# conservatively (reported as a collision, never overwritten).
+# OWNERSHIP IS RECORDED FIRST, INFERRED SECOND. ``opencode.json`` itself records
+# no owner, so CAO keeps its own record in the ``cao-grants.json`` sidecar: a
+# fingerprint of every plugin-derived entry it writes (#1154), the counterpart of
+# the grant record. An entry whose current bytes match its recorded fingerprint
+# is CAO's, wherever its paths point. That covers the case containment cannot: an
+# entry CAO wrote under a different ``CAO_HOME_DIR`` names the OLD store and used
+# to be indistinguishable from a user's entry.
+#
+# Containment remains as the second proof, for entries written before the record
+# existed or after the sidecar was lost: a CAO-delivered plugin server's
+# ``command``/``environment`` were expanded from ``${PLUGIN_ROOT}``/
+# ``${PLUGIN_DATA}`` and therefore point INSIDE the plugin store. An entry that
+# neither proof covers is treated as the user's (reported on collision, never
+# overwritten, never disabled).
 
 
 def _entry_path_strings(config: Mapping[str, Any]) -> List[str]:
@@ -509,11 +781,21 @@ def is_cao_owned_mcp_entry(
     candidate: Mapping[str, Any],
     *,
     plugin_store_roots: Iterable[Path],
+    name: Optional[str] = None,
 ) -> bool:
     """Whether CAO may overwrite ``existing`` with ``candidate`` without data loss.
 
-    Three ways an existing entry is provably CAO's, and therefore safe to replace:
+    Four ways an existing entry is provably CAO's, and therefore safe to replace:
 
+    0. ``name`` is given, the sidecar records CAO writing exactly ``existing``
+       under it, and the plugin root ``existing`` names is gone
+       (:func:`is_orphaned_recorded_mcp_entry`, #1154). This is the recorded
+       proof, and the only one that holds for an entry CAO wrote under a
+       ``CAO_HOME_DIR`` that no longer exists. While that plugin root exists,
+       another live CAO home may own the entry, so it is not accepted here and
+       a plugin server of the same name is reported as a collision. It is a
+       digest of the content rather than of the name, so a user who rewrote an
+       entry CAO once wrote gets it back as their own.
     1. It is byte-for-byte what CAO would write now (idempotent replay — a
        reinstall/refresh re-writes CAO's own entry every time, and that must not
        be misreported as a user collision or the server could never be delivered
@@ -521,9 +803,9 @@ def is_cao_owned_mcp_entry(
     2. Its command resolves **inside the plugin store**, whatever its
        ``enabled`` state. The plugin store is a CAO-managed directory that only
        CAO ever writes into, so a command rooted there is CAO's own delivery by
-       construction — this is the recorded-ownership signal, derived from the
-       very bytes being compared rather than from a side table that can go stale
-       or be lost while ``opencode.json`` persists.
+       construction. This is the containment proof: it is derived from the very
+       bytes being compared, so unlike the record in item 0 it cannot be lost
+       while ``opencode.json`` persists, but it holds only for the current store.
     3. (Subsumed by 2, kept explicit for readers) a CAO-*disabled* entry inside
        the plugin store — a server CAO delivered and then disabled on a prior
        uninstall. Re-enabling it on reinstall is safe.
@@ -543,6 +825,8 @@ def is_cao_owned_mcp_entry(
     definition do not point into CAO's plugin store.
     """
     if dict(existing) == dict(candidate):
+        return True
+    if name is not None and is_orphaned_recorded_mcp_entry(name, existing):
         return True
     if entry_within_roots(existing, plugin_store_roots):
         return True

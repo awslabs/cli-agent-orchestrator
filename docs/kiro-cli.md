@@ -9,14 +9,12 @@ The Kiro CLI provider enables CLI Agent Orchestrator (CAO) to work with **Kiro C
 ### Prerequisites
 
 1. **AWS Credentials**: Kiro CLI authenticates via AWS
-2. **Kiro CLI**: Install the CLI tool
+2. **Kiro CLI**: Install it by following the official instructions at
+   [kiro.dev](https://kiro.dev/docs/getting-started/installation/)
 3. **tmux**: Required for terminal management
 
 ```bash
-# Install Kiro CLI
-npm install -g @anthropic-ai/kiro-cli
-
-# Verify authentication
+# Check that kiro-cli is installed and on your PATH
 kiro-cli --version
 ```
 
@@ -282,9 +280,9 @@ the panel is refused too.
 | 3.0.0 | `@kiro/agent` 0.66.70 | pending operator verification: refused at launch unless the operator opts in (below) |
 | 3.1.0 | `@kiro/agent` 0.66.91 | pending operator verification: refused at launch unless the operator opts in (below) |
 
-2.37.1 and 3.1.0 remain pending until the operator checklist (OC1–OC19,
-[#1167](https://github.com/awslabs/cli-agent-orchestrator/issues/1167)) passes.
-Until then, they are admitted only with `kiro.v3_allow_unverified_versions`.
+Every version marked pending stays pending until the operator checklist (OC1–OC19,
+[#1167](https://github.com/awslabs/cli-agent-orchestrator/issues/1167)) passes on it.
+Until then, it is admitted only with `kiro.v3_allow_unverified_versions`.
 3.1.0 pins `KAS_0_66_91`; every agent and helper render remains byte-identical.
 The 3.1.0 probe is tested against captured help. No 2.37.1 help capture is
 available, so its coverage is schema lookup, pending refusal, opt-in admission
@@ -530,7 +528,7 @@ The provider tries legacy extraction first; if no green arrows are found, it fal
 
 ### Permission Prompts
 
-Kiro CLI shows `Allow this action? [y/n/t]:` prompts for sensitive operations (file edits, command execution). The provider detects these as `WAITING_USER_ANSWER` status. Unlike Claude Code, Kiro CLI does not have a trust folder dialog.
+Kiro CLI shows `Allow this action? [y/n/t]:` prompts for sensitive operations (file edits, command execution). The provider detects these as `WAITING_USER_ANSWER` status. On the v2 engine, Kiro CLI shows no workspace-trust dialog. On v3 it can: CAO passes `--trust-workspace` only after its workspace check, never answers that dialog, and refuses the launch with `kiro_v3_trust_dialog` if it appears (see [Workspace trust](#workspace-trust)).
 
 ### Tool Restrictions
 
@@ -561,11 +559,16 @@ The profile name determines the prompt pattern used for status detection. Built-
 
 ### Launch Command
 
-The provider launches using kiro-cli's default UI:
+The provider launches using kiro-cli's default UI. On the v2 engine the command is:
 
 ```
-kiro-cli chat --agent-engine v2 --agent developer
+kiro-cli chat --agent-engine v2 --trust-all-tools [--model m] --agent developer
 ```
+
+`--trust-all-tools` is always passed, so Kiro's approval prompts don't block assign and
+handoff; the agent file's `tools` list is what restricts the agent (see
+[Tool Restrictions](#tool-restrictions)). `--model` comes from the profile's `model`, when
+set. The v3 command is under [What CAO checks](#what-cao-checks).
 
 The provider auto-detects whether the terminal is in legacy or TUI mode and uses the appropriate detection patterns, so both sets of patterns remain supported (a wrapper script may still put the terminal in legacy mode).
 

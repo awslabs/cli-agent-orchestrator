@@ -98,7 +98,20 @@ There are two ways in:
 A close for an invocation the run has not announced (its launch is older than
 the replay window) synthesizes the `SUBAGENT_STARTED` first, parent before
 child, so every `SUBAGENT_*` and tool-call event names an invocation the run
-has already opened. Fields use the schema names (`subagentRunId`, `toolCallId`,
+has already opened. The same holds for a tool call: when a `completion` or `error`
+(replayed or live) closes a terminal on a run that never saw a call that terminal
+received or sent, the run announces that call first (`TOOL_CALL_START` with the
+call's own `toolCallId`, `metadata.cao` taken from the call's record, so its
+`eventId` is the call record's) and then ends it (`TOOL_CALL_END`,
+`closedBy: completion`). A call record that gives a worker a second call announces
+the first one the same way and ends it with `closedBy: superseded`. A client that
+held a call open across the reconnect has already seen that `TOOL_CALL_START`; it
+dedupes it by `eventId`, `type` and `toolCallId` (see
+[Ordering and deduplication](#ordering-and-deduplication)) and keeps the
+`TOOL_CALL_END`. A call that an earlier record already ended is not announced
+again, except after a session kill the replay does not hold. The run finds these calls in the event log, so if a call's record has left
+the buffer (500 records, 24 h TTL in `EventLog.history()`), its `TOOL_CALL_END` is
+not recoverable and the client keeps the call open. Fields use the schema names (`subagentRunId`, `toolCallId`,
 `threadId`), and `timestamp` is integer epoch milliseconds. The CAO record's
 own fields (`eventId`, `terminalId`, `sessionName`, `traceparent`) are under
 `metadata.cao`, the same nested object and key names the run plane uses.
@@ -273,7 +286,9 @@ a client that knows CAO's `cao.generative_ui` event renders it the same way
 whichever provider wrote it. The safety model is what makes
 that shippable over *untrusted* agents: an agent may only emit a **closed
 allow-list of named components with JSON props** — no HTML, no script, no
-`eval`, no iframe. An off-list component is **refused, never rendered**.
+`eval`, no iframe. An off-list component is **refused, never rendered**: the
+caller gets a 400, and operators see a metadata-only refusal record on the
+stream (see below).
 
 **Wire path.** An agent calls the `emit_ui` MCP tool (or
 `POST /agui/v1/emit_ui`) → the intent rides a CAO event as a `ui` block
@@ -303,7 +318,62 @@ on the run plane.
 progress, metric, agent_card}`; unknown components are refused (mapped to `RAW`
 with `rejected_component`); props must be JSON-serializable and are size-bounded
 (8 KB), degrading safely. `POST /agui/v1/emit_ui` rejects off-list components and
-oversized/non-serializable props with `400` before anything reaches the bus.
+oversized/non-serializable props with `400`; an oversized or non-serializable
+intent reaches nothing.
+
+**An off-list call never renders: a refusal record with no props is emitted so
+operators see it** (#1158). Alongside the `400`, the server publishes a record it
+builds from a fixed schema (`services/agui/refusal.py`); nothing from the
+request is copied into it except the cleaned name, and the props are never read.
+On the stream it is the `RAW` frame above:
+
+```text
+data: {"type": "RAW", "source": "cao", "subagentRunId": "terminal:<id>",
+       "event": {"cao_kind": "generative_ui", "rejected_component": "iframe.<8 hex>",
+                 "more_refused": 3, "event_id": "...", "terminal_id": "...",
+                 "session_name": "...", "timestamp": "...", "kind": "other"},
+       "metadata": {"cao": {"eventId": "...", "terminalId": "...", "sessionName": "..."}}}
+```
+
+- **The name** has every character outside `[A-Za-z0-9_.-]` replaced by `_`, is
+  cut to 24 characters, and always ends in `.` and 8 hex digits of the SHA-256 of
+  the requested name. It is at most 33 bytes (24 characters, `.`, 8 hex digits), and it can never equal an
+  allow-listed name, so the stream can never render it as one. The name is
+  caller text, not redacted: the visible part is what the caller sent, cleaned
+  of unsafe characters and cut short, so an agent that puts message text in
+  `component` by mistake exposes up to 24 characters of it to every reader of
+  the `cao:read` stream and the 24-hour event log. The hash keeps names apart;
+  it does not hide the prefix.
+- **Attribution** comes from CAO, not the body: the terminal only if CAO has a
+  row for it, its session from that row, and the subagent derived from the
+  terminal. Any other terminal id, the body's `session_name` and any other key
+  are ignored, and the record is unattributed. (An authorised caller can still
+  name another terminal CAO knows, as on the on-list path.)
+- **Scope.** Without `cao:write` (when auth is on), the scope check answers
+  first, with `401` or `403`, and nothing is published. The `400` is the answer
+  to an authorised caller.
+- **Flood control.** A call repeating a (terminal, name) pair within 10 s is
+  folded into `more_refused`. Each terminal publishes at most 5 records per 10 s,
+  and the server 20; the rest are folded too. `more_refused` is a count carried
+  by that terminal's next published record, so it is reported only with the
+  bucket's next refusal: a flood that stops leaves its tail unreported, and a
+  bucket the limiter evicts (it tracks at most 256 terminals) loses its count.
+- **The event log.** Refusals hold at most a tenth of the event log's 500-record
+  ring, which is how far a `since` or `Last-Event-ID` replay of real events
+  reaches back; past that share a refusal is folded instead of recorded. Only
+  refusal rows still inside the 24-hour window count, the rows `history()`
+  returns, so an expired flood does not keep the share full. When the share
+  fills, the server logs one warning (once per fill) and folds further
+  refusals into a count. A folded refusal is not published, so the operator sees
+  no record for it; the warning in the server log is the only trace.
+- **Delivery.** The record is in the event log, so its SSE id is one a
+  `Last-Event-ID` reconnect resumes from. It is published with
+  `SseBus.publish_lossy`, which skips a subscriber whose queue is half full or
+  more. When a real event then meets a full queue, the newest queued refusal is
+  dropped to make room for it, so refusals never cause an overflow (`RUN_ERROR
+  cao.stream_overflow`) that the real events alone would not. A skipped or
+  dropped record is lost to that client; it stays in the log for a later `since`
+  replay.
 
 ### Safety model
 
@@ -311,6 +381,8 @@ oversized/non-serializable props with `400` before anything reaches the bus.
 |---|---|---|
 | Agent emits arbitrary HTML/script | No HTML on the wire — only named components + JSON props | `TestGenerativeUI` |
 | Agent names an off-list component (e.g. `iframe`) | Refused server-side (→ RAW / 400) | `test_off_list_component_is_refused` |
+| Off-list names that clean to an allowed one (`metric!`) | The hash is always appended | `test_a_name_that_cleans_to_an_allowed_name_is_still_a_refusal` |
+| A flood of off-list calls | Deduped, rate-limited and folded; published lossily, and queued refusals give way to real events | `test_a_10k_off_list_flood_loses_no_real_event_and_ends_no_stream` |
 | Agent floods the bus with a huge payload | Props capped at 8 KB → `{_truncated: true}` | `test_oversized_props_are_truncated` |
 | Non-serializable props | Degrade to `{}` | `test_non_serializable_props_degrade_to_empty` |
 | Message-body leakage | Bodies never in the props path (metadata-only contract) | privacy tests |

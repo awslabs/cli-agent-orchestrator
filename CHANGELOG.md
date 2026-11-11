@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **A reconnect no longer loses a tool call's end, and `toolCallName` is `assign`, not
+  `OrchestrationType.ASSIGN`** (#1292). On the ambient AG-UI stream, a client that held an `assign`
+  or `handoff` call open, lost its stream (an overflow, or a dropped connection) and reconnected
+  with `?since=` or `Last-Event-ID`, never got the call's `TOOL_CALL_END` when the receiver's (or
+  sender's) `completion` was written during the gap: each connection is a fresh run, the call's
+  record was older than the replay, and the run closed only calls it knew. Now, when a
+  `completion` or `error`, replayed or live, closes a terminal on a run that never saw a call that
+  terminal received or sent, the run announces the call from the event log, with its own
+  `toolCallId`, then ends it with `closedBy: "completion"`, as a replayed close of an older
+  subagent already announces the `SUBAGENT_STARTED` first. A second call to a worker likewise
+  announces the first and ends it with `closedBy: "superseded"`. A client that kept the call open
+  dedupes the repeated start by `eventId`, `type` and `toolCallId`. A call an earlier record
+  already ended, or one made after the completion, is not announced. If the call's record has left
+  the 500-record, 24-hour event log, its end is still not recoverable. Wire-visible: the
+  `TOOL_CALL_START` for an `assign` or `handoff` carried `toolCallName: "OrchestrationType.ASSIGN"`
+  (the enum's `str()`); it is now `"assign"` or `"handoff"`, as `metadata.cao.orchestrationType`
+  already was. The `cao-legacy` framing is unchanged: JSON already wrote the enum as `"assign"`
+  there.
+- **An off-list `emit_ui` call now shows as refused on the AG-UI stream** (#1158). The caller
+  still gets the same 400, and the component still never renders. The server also publishes a
+  metadata-only refusal record: the requested name with every unsafe character replaced and a
+  short hash always appended (at most 33 bytes, never equal to an allow-listed name), and the
+  terminal only if CAO knows it. The props are never read. Repeats are deduped and
+  rate-limited per terminal and per server, and folded into a `more_refused` count. Refusals
+  hold at most a tenth of the event log, so real events keep their replay horizon; only refusals inside the 24 h window count, and a server warning is logged when that share fills. The visible part of the name is caller text, cut to 24 characters. The record
+  goes into the event log, so a reconnect resumes after it, and onto the bus with a new
+  `publish_lossy`: it is queued only below half a subscriber's queue, and a real event that
+  meets a full queue displaces the newest one, so refusals never cause an overflow
+  (`RUN_ERROR cao.stream_overflow`) that the real events alone would not. The operator
+  dashboard caps refused entries at 20, apart from real ones. `docs/agui.md` describes the
+  record.
+
+- **`assign` and `handoff` now work when the caller can't read the agent store.** A CLI that
+  sandboxes its MCP servers (for example kiro-cli with `"sandbox": true`, which hides `~/.aws`)
+  made every profile read in `cao-mcp-server` fail with `Permission denied`, so `assign` failed.
+  On an OS-level read error the client now fetches the parsed profile from cao-server
+  (`GET /agents/profiles/{name}`). The child's allowed tools and its pinned `provider` are worked
+  out from that copy exactly as from a local read. Before, a pinned provider could silently fall
+  back to the supervisor's. Not-found and parse errors behave as before. The profile reader also
+  now treats a permission error as an error on every Python version: Python 3.14's
+  `Path.exists()` reports it as "absent", which skipped the fallback.
+- **A failed supervisor launch no longer kills the workers in its session** (#1277). While
+  `cao launch` waits for its supervisor to start, the pane is already live, so the supervisor
+  can assign workers into its own session. When the start then timed out, the rollback killed
+  the whole session, workers included, and their launch records said `pane_closed`. Now, if
+  other terminals have joined the session, only the failed terminal's window and record are
+  removed (on tmux and herdr alike). A session with no other terminals is still removed
+  completely. A terminal that dies anyway because another terminal's failed create removed its
+  session ends with the new `end_reason` `creator_rollback`. On Claude Code, a resumed launch
+  (`--resume-session-id`) is ready as soon as its input box shows, instead of always waiting the
+  full `provider_init_timeout`. A supervisor that is processing at the deadline counts as started
+  when it was seen ready first or has already made a recorded CAO call.
+- **`assign` guarantees a callback by default.** If a worker goes idle without calling
+  `send_message`, the server forwards its last response to the caller, labelled as auto-forwarded;
+  if the worker is deleted or errors first, the caller is told, and if a message or the task cannot
+  be delivered (including a restart before the task was delivered), the caller gets a
+  `[CAO delivery failed]` notice. Opt out per call with
+  `expect_callback=False`. `send_message` gains `expect_reply` for terminals you did not assign.
+  Local assigns only; `target_host` and elastic workers are not covered (#1246). A forward waits
+  until the worker has started on the last message delivered to it; a worker that shows no sign of
+  work for `CAO_DELEGATION_PICKUP_TIMEOUT_SECONDS` (default 300) after a delivery is forwarded with
+  a header saying the message may not have been picked up. With `CAO_EAGER_INBOX_DELIVERY=true`, a
+  message can reach a worker in the middle of a turn, and the forward can then send the answer of
+  that turn.
+
+- **A hung FIFO-writer test fails in 10 seconds instead of holding CI** (#1251 follow-up).
+  `test_stdin_closing_before_any_reader_ends_the_writer` called the writer in-process, so a
+  regression to a blocking `open()` would have hung the pytest worker; it now runs the writer in
+  a daemon thread joined with a timeout. The Unit Tests job and the CAO MCP Apps job, whose backend
+  coverage step runs the same suite, also gain `timeout-minutes: 60`, so any hung test ends the
+  job within an hour instead of GitHub's default of six.
+- **A failed write of `cao-grants.json` no longer lets a later install remove a key you added**
+  (#1289). When a profile dropped an MCP server, `cao install --provider opencode_cli` removed
+  the grant from `opencode.json` and then updated the record; if the record could not be
+  written (a read-only directory, a full disk) it still listed the removed key, and every later
+  install removed a key of that name, even one you had added by hand. CAO now writes the record
+  first. If it cannot, the grant is left in `opencode.json` with a warning and withdrawn by the
+  next install that can write the record; if `opencode.json` then cannot be written, the old
+  record row is put back. A grant that the record does not list, but that plugin-store
+  containment proves is CAO's, is still withdrawn at once. If CAO is killed between the two writes, the grant stays in
+  `opencode.json` without a record row; delete it by hand.
+- **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
+  the sidecar beside `opencode.json` could not be read as a grant record, `cao install
+  --provider opencode_cli` started from an empty record and wrote it back, dropping every other
+  agent's recorded grants. It now leaves the file as it is, logs a warning that names it and
+  says to repair it by hand (deleting it drops every agent's recorded grants), and does not
+  record this agent's grants. The install still completes. A plugin server's grant
+  is still withdrawn by plugin-store containment. A reinstall after the sidecar is repaired
+  records the servers the profile then names; a profile server's grant (`cao-mcp-server*`,
+  say) that was added while the sidecar was damaged, and that the profile no longer names,
+  stays until you remove it by hand.
+- **`cao install` exits 1 when the install fails** (#1270). It printed `Error: <message>` and
+  exited 0, so a script or CI step could not tell a failed install from a successful one. It
+  now exits 1 with the same message on stderr, like the rest of the CLI. A script that relied
+  on exit 0 after a failed install must change.
 - **Keep finished child agents open, for workshops and debugging** (#1225 phase 1). A new
   machine-wide setting, `terminal.keep_finished`, off by default
   (`cao config set terminal.keep_finished.enabled true`). While it is on, a successful
@@ -181,6 +276,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the decision record names the reason. kiro-cli checks the decided level against the model, as it
   does a stored effort, and a launch it refuses is not retried on the stored effort, so keep
   `min_effort` and `max_effort` to levels your Kiro models accept. Installed Kiro agents are unchanged.
+
+- **Ephemeral helpers can be matched to your models from task features** (#1199, off by default,
+  provisional). A decider can size a helper but can't tell which of your models suits the task.
+  With the new `task.features` switch on, CAO asks a decider that declares them four fixed yes/no
+  questions about the task (`task.long_context`, `task.deep_reasoning`, `task.read_only` and the
+  advisory `task.needs_network`), in one request beside `model.route`'s, with the same task text
+  and nothing new. CAO then matches the answers locally to the models you declare under
+  `decisions.match` in `settings.json`, which is never sent anywhere. The match may raise a
+  helper's tier up to `ephemeral.max_tier`, never below the decider's size answer, and, with
+  `provider.route` bound to the built-in `match` answerer, pick the CLI within your declared
+  equivalence set. It never widens the options, never takes a model outside `model_tiers`, and
+  never touches tools. #810's rule is amended for this, for the tier only: a decider still can't
+  raise a tier, providers or tools, and CAO's own match may raise only the tier, to a declared
+  model and up to `ephemeral.max_tier`. `needs_network` only adds a hint to the delegation note. Any
+  doubt runs today's choice. Shadow records the would-be match. Records gain eight nullable
+  `match_*` and `catalog_*` columns (an additive migration), and the new
+  `cao decisions match show`, `check` and `explain` explain every pick. With today's capability
+  table no equivalence set validates, so only the tier half routes until a second `hard` or
+  `sandboxed` CLI is available. See
+  [Matching helpers to models](docs/decisions.md#matching-helpers-to-models).
 
 - **Kiro v3 engine, opt-in preview** (#1167). `--engine v3` (alias `kas`) on `cao launch`, the
   API, profiles, flows and workflow steps, and `cao install … --engine v3`, which writes one

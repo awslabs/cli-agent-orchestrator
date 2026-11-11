@@ -26,6 +26,10 @@ jobs:
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # Bounds a hung test (#1251). The job takes 25-40 min on main (3.11 is the
+    # slower leg), so 60 is 1.5x the slowest recent run. Unbounded, a hang held
+    # the runner for GitHub's default of 360 min.
+    timeout-minutes: 60
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
@@ -230,6 +234,11 @@ jobs:
   cao-mcp-apps:
     name: CAO MCP Apps
     runs-on: ubuntu-latest
+    # Bounds a hung test (#1273 review). "Backend coverage" below runs the same
+    # pytest suite as Unit Tests; over 60 runs this job took a mean of 33.3 min
+    # and a max of 37.9, so 60 matches Unit Tests and is 1.6x the slowest.
+    # Unbounded, a hang held the runner for GitHub's default of 360 min.
+    timeout-minutes: 60
 
     # Per-tier test timing budgets (Requirement 20.3), surfaced as env so the
     # vitest tiers (Phase II+) and CI can enforce them:
@@ -655,8 +664,27 @@ jobs:
       # for a CLI that prints a permission prompt and waits. COVERED FOR REAL: the
       # approval bridge, classification, the run plane, resume and key delivery.
       # See examples/ag-ui/ag-ui-operator-dashboard/e2e/README.md.
-      - name: Keyless e2e (cao-server + mock_cli terminals)
+      # Chromium for the timeline screenshot (e2e/timeline.spec.ts). npm ci runs with
+      # install scripts off, so the browser is an explicit step, as in the AG-UI
+      # eventsource viewer's recorder job.
+      - name: Install Playwright browser (chromium)
+        run: npm run playwright:install
+
+      - name: Keyless e2e (cao-server + mock_cli terminals) and the timeline screenshot
         run: ./e2e/run.sh
+
+      # Evidence from the browser step, kept even when the e2e fails. Non-blocking:
+      # the e2e step above is the gate, not this upload.
+      - name: Upload dashboard e2e evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ag-ui-operator-dashboard-e2e-evidence
+          path: |
+            examples/ag-ui/ag-ui-operator-dashboard/e2e/artifacts/
+            examples/ag-ui/ag-ui-operator-dashboard/e2e/test-results/
+          if-no-files-found: warn
+        continue-on-error: true
   # =======================================================================================
   # RUST TUI (issue #321, unit `rust-ci`). THE FIRST JOB IN ci.yml THAT INSPECTS THE RUST
   # CRATE AT ALL — measured before this change: `cargo` appeared in only
@@ -959,7 +987,7 @@ jobs:
           skip-setup-trivy: true
 
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v3
         # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL/HIGH
         # finding would fail the gate step and SKIP the upload, hiding the very finding that
         # failed the build from the Security tab.

@@ -126,6 +126,11 @@ def client_boundary(monkeypatch):
         lambda name, source, expected_hash: spec,
     )
     monkeypatch.setattr(workflow_spec_service, "get_workflow", lambda name: spec)
+    # ``GET /workflows/{name}`` builds its body with ``get_workflow_document`` (which adds the
+    # YAML-only fields). For a Python spec that body is ``spec.model_dump()``, as before.
+    monkeypatch.setattr(
+        workflow_spec_service, "get_workflow_document", lambda name: spec.model_dump()
+    )
     monkeypatch.setattr(workflow_spec_service, "_safe_spec_path", lambda path: path)
     monkeypatch.setattr(workflow_spec_service, "delete_workflow", lambda name: None)
     monkeypatch.setattr(

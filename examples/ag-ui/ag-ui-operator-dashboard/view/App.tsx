@@ -5,11 +5,17 @@ import {
   propRows,
   stateText,
   isOpen,
+  callText,
+  isFinished,
+  stateLabel,
+  timeText,
   type Board,
   type Card,
   type Controller,
   type Entry,
   type Panel,
+  type Timeline,
+  type TimelineEntry,
 } from "../core/index.ts";
 import type { Store } from "./store.ts";
 
@@ -23,7 +29,7 @@ export interface AppProps {
 }
 
 export function App({ store, server, ambientStatus }: AppProps) {
-  const { board, panel } = useSyncExternalStore(store.subscribe, store.getSnapshot);
+  const { board, panel, timeline } = useSyncExternalStore(store.subscribe, store.getSnapshot);
   const { controller } = store;
   const run = (fn: () => Promise<unknown>) => {
     void fn();
@@ -42,6 +48,7 @@ export function App({ store, server, ambientStatus }: AppProps) {
       </header>
       <Approvals board={board} controller={controller} onDone={run} />
       <GenUiPanel panel={panel} />
+      <TimelinePanel timeline={timeline} />
     </main>
   );
 }
@@ -183,6 +190,7 @@ function PanelEntry({ entry }: { entry: Entry }) {
       <article aria-label="refused component">
         <h3>Refused: "{entry.component}" is not on the allow-list</h3>
         <p>From {ownerText(entry.owner)}. Props are not shown.</p>
+        {entry.moreRefused ? <p>And {entry.moreRefused} more refused.</p> : null}
       </article>
     );
   }
@@ -197,6 +205,51 @@ function PanelEntry({ entry }: { entry: Entry }) {
             <dd>{value}</dd>
           </div>
         ))}
+      </dl>
+    </article>
+  );
+}
+
+function TimelinePanel({ timeline }: { timeline: Timeline }) {
+  return (
+    <section aria-label="Session timeline">
+      <h2>Session timeline (ambient stream)</h2>
+      <p>
+        Calls between agents, from the stream's metadata: who called whom, and whether the call is open, completed or ended.
+        A call completes when the receiver's work ends, and ends as superseded when a newer call goes to the same
+        receiver. After a reconnect, a call that was still open is shown as
+        unconfirmed: its end may have happened while the stream was down, and the stream does not resend it. No message
+        text is shown, and this panel has no controls.
+      </p>
+      {timeline.entries.length === 0 ? <p>No calls yet.</p> : null}
+      <ol>
+        {timeline.entries.map((entry) => (
+          <li key={entry.toolCallId}>
+            <TimelineRow entry={entry} />
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+function TimelineRow({ entry }: { entry: TimelineEntry }) {
+  return (
+    <article aria-label={`call ${entry.toolCallId}`}>
+      <h3>{callText(entry)}</h3>
+      <dl>
+        <dt>State</dt>
+        <dd data-testid="call-state">{stateLabel(entry)}</dd>
+        <dt>Attributed to</dt>
+        <dd>{ownerText(entry.owner)}</dd>
+        <dt>Started</dt>
+        <dd>{timeText(entry.startedAt)}</dd>
+        {isFinished(entry) ? (
+          <>
+            <dt>{entry.state === "completed" ? "Completed" : "Ended"}</dt>
+            <dd>{timeText(entry.endedAt)}</dd>
+          </>
+        ) : null}
       </dl>
     </article>
   );
