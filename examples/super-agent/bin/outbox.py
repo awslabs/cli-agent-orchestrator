@@ -354,7 +354,7 @@ def search_hits(search_file, want, login):
         why = bad_comment(c)
         if why:
             return None, f"search file is incomplete: {why}"
-    hits = [c for c in rows if c["user"]["login"] == login
+    hits = [c for c in rows if c["user"]["login"].casefold() == login.casefold()
             and normalise(c["body"]) == want]
     return hits, None
 
@@ -486,6 +486,18 @@ def main(argv=None):
                 if row is not None:
                     print(f"USED {a.key} url={row['url']}")
                     return 1
+                for name in os.listdir(os.path.dirname(entry(a.key, "pending"))):
+                    if not name.endswith(".pending"):
+                        continue
+                    pending_key = name[:-len(".pending")]
+                    try:
+                        pending, _ = pending_state(pending_key)
+                    except SS.StateCorrupt:
+                        print("PENDING (a damaged reservation must be reconciled first)")
+                        return PENDING_EXIT
+                    if pending["pr"] == str(a.pr):
+                        print("PENDING (reconcile this PR before any new attempt)")
+                        return PENDING_EXIT
                 generation = read_generation(a.key) + 1  # before O_EXCL: a corrupt file leaves no .pending
                 token = secrets.token_hex(16)
                 rec = {"key": a.key, "pr": str(a.pr), "kind": a.kind, "head": a.head,

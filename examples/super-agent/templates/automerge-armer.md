@@ -26,6 +26,9 @@ Fill every `{placeholder}` (`{kit}` is the absolute path of your kit copy, `{mai
 the message straight away (the profile expires in about 15 minutes; if the server refuses
 `effort`, drop it).
 
+`{scope_file}` is a fresh JSON file under the task folder, fetched immediately before each
+write; the permission check uses its live PR author and base.
+
 ## Spec
 ```json
 {
@@ -47,7 +50,7 @@ Update the branch of PR #{pr} with main, by merge, under mandate {mandate_ids} (
 
 1. gh pr view {pr} -R your-org/your-repo --json state,isDraft,baseRefName,reviewDecision,mergeStateStatus,headRefOid
    Expect: state OPEN, isDraft false, baseRefName main, reviewDecision APPROVED, headRefOid {head}, mergeStateStatus BEHIND.
-2. R=$(git ls-remote https://github.com/your-org/your-repo refs/pull/{pr}/head | cut -f1); python3 {kit}/bin/check_mandate.py --holder shepherd --action update_branch --pr-author your-login --base main --pr {pr} --expect-policy-version {policy_version} --expect-head {head} --remote-head "$R" {go_args}
+2. gh pr view {pr} -R your-org/your-repo --json author,baseRefName > {scope_file} || exit 1; A=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("author", dict()).get("login") or "")' {scope_file}) || exit 1; B=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("baseRefName") or "")' {scope_file}) || exit 1; R=$(git ls-remote https://github.com/your-org/your-repo refs/pull/{pr}/head | cut -f1); python3 {kit}/bin/check_mandate.py --holder shepherd --action update_branch --pr-author "$A" --base "$B" --pr {pr} --expect-policy-version {policy_version} --expect-head {head} --remote-head "$R" {go_args}
    Expect exit 0 ALLOW. Anything else: STATUS: blocked, stop.
 3. gh pr update-branch {pr} -R your-org/your-repo   (merge update; never --rebase)
 4. sleep 20; gh pr view {pr} -R your-org/your-repo --json headRefOid,mergeStateStatus,reviewDecision,autoMergeRequest --jq '.headRefOid + " " + .mergeStateStatus + " " + .reviewDecision + " armed=" + (.autoMergeRequest != null | tostring)'
@@ -68,7 +71,7 @@ Arm squash auto-merge on PR #{pr} under mandate {mandate_ids} (gate said: {gate_
 
 1. gh pr view {pr} -R your-org/your-repo --json state,isDraft,baseRefName,reviewDecision,mergeStateStatus,headRefOid,autoMergeRequest
    Expect: state OPEN, isDraft false, baseRefName main, reviewDecision APPROVED, headRefOid {head}, autoMergeRequest null, mergeStateStatus CLEAN, HAS_HOOKS or BEHIND.
-2. R=$(git ls-remote https://github.com/your-org/your-repo refs/pull/{pr}/head | cut -f1); python3 {kit}/bin/check_mandate.py --holder shepherd --action arm_automerge --pr-author your-login --base main --pr {pr} --expect-policy-version {policy_version} --expect-head {head} --remote-head "$R" {go_args}
+2. gh pr view {pr} -R your-org/your-repo --json author,baseRefName > {scope_file} || exit 1; A=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("author", dict()).get("login") or "")' {scope_file}) || exit 1; B=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("baseRefName") or "")' {scope_file}) || exit 1; R=$(git ls-remote https://github.com/your-org/your-repo refs/pull/{pr}/head | cut -f1); python3 {kit}/bin/check_mandate.py --holder shepherd --action arm_automerge --pr-author "$A" --base "$B" --pr {pr} --expect-policy-version {policy_version} --expect-head {head} --remote-head "$R" {go_args}
    Expect exit 0 ALLOW. Anything else: STATUS: blocked, stop.
 3. gh pr merge {pr} -R your-org/your-repo --auto --squash --match-head-commit {head}
    (do not pass --subject or --body)

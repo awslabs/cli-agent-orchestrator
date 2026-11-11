@@ -529,7 +529,7 @@ def decide(action, pr, reviews, commits, issue_comments, review_comments, requir
 def load_limits(path, action):
     with open(path) as fh:
         doc = json.load(fh)
-    cap, never, author, repo = DEFAULT_CAP, set(), None, None
+    cap, never, author, repo = None, set(), None, None
     for m in doc.get("mandates") or []:
         if m.get("action") in ACTIONS.values():
             cond = m.get("conditions", {})
@@ -539,16 +539,20 @@ def load_limits(path, action):
             if not isinstance(listed, list) or not all(strict_int(n, 1) for n in listed):
                 raise BadInput(f"never_prs of {m.get('id')} is not a list of PR numbers")
             never |= set(listed)
-            if m.get("action") == "arm_automerge":
-                cap = cond.get("max_changed_lines", DEFAULT_CAP)
-                if not strict_int(cap, 0):
+            active = (m.get("revoked") is False and m.get("granted_by") == "user"
+                      and m.get("holder") == "shepherd")
+            if active and m.get("action") == "arm_automerge":
+                limit = cond.get("max_changed_lines", DEFAULT_CAP)
+                if not strict_int(limit, 0):
                     raise BadInput(f"max_changed_lines of {m.get('id')} is not an integer")
-            if m.get("action") == ACTIONS[action]:
+                cap = limit if cap is None else min(cap, limit)
+            if active and m.get("action") == ACTIONS[action]:
                 author = (m.get("scope") or {}).get("pr_author")
                 repo = (m.get("scope") or {}).get("repo")
     if not author or not isinstance(repo, str) or not repo:
         raise BadInput(f"no mandate scope for {ACTIONS[action]}")
-    return {"cap": cap, "never_prs": never, "pr_author": author, "repo": repo}
+    return {"cap": DEFAULT_CAP if cap is None else cap, "never_prs": never,
+            "pr_author": author, "repo": repo}
 
 
 def load_identities(path):

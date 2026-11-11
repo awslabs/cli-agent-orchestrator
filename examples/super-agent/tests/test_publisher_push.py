@@ -91,14 +91,25 @@ def go(tmp_path, old, new):
 
 
 def step(tmp_path, n, values):
+    # All GitHub reads are fixtures, including the template's fresh PR scope fetch.
+    fake = tmp_path / "fake-bin"
+    fake.mkdir(exist_ok=True)
+    stub = fake / "gh"
+    if not stub.exists():
+        stub.write_text("#!/bin/sh\nprintf '%s\\n' "
+                        "'{\"author\":{\"login\":\"your-login\"},\"baseRefName\":\"main\"}'\n")
+        stub.chmod(0o755)
+    env = git_env(tmp_path)
+    env["PATH"] = str(fake) + ":" + env["PATH"]
     cmd = f"K={values['_bin']}; " + command(n, {k: v for k, v in values.items() if k != "_bin"})
     return subprocess.run(["/bin/bash", "-c", cmd], capture_output=True, text=True,
-                          env=git_env(tmp_path), timeout=60)
+                          env=env, timeout=60)
 
 
 def values(repo, pv):
     return {"worktree": str(repo["wt"]), "branch": BRANCH, "new": repo["b"], "old": repo["a"],
             "pr": PR, "push_action": "ff_fix_push", "policy_version": pv, "go_push": "--go-id w-push",
+            "scope_file": str(repo["wt"].parent / "scope.json"),
             "push_url": str(repo["remote"]), "_bin": str(repo["bin"])}
 
 
@@ -266,4 +277,36 @@ def test_flows_c_and_d_through_the_template_with_the_bound_destination(tmp_path,
     r = step(tmp_path, "4", v)
     assert (r.returncode, r.stdout.strip()) == (4, "PAUSED"), r.stdout + r.stderr
     assert remote_head(tmp_path, repo["remote"]) == repo["b"]
+    assert remote_head(tmp_path, repo["other"]) == repo["a"]
+
+
+@pytest.mark.parametrize("scope,reason", [
+    ({"author": {"login": "colleague"}, "baseRefName": "main"}, "wrong_author"),
+    ({"author": {"login": "your-login"}, "baseRefName": "release/1.x"}, "wrong_base"),
+])
+def test_review_template_uses_fresh_scope_at_write_time(tmp_path, repo, scope, reason):
+    v = values(repo, go(tmp_path, repo["a"], repo["b"]))
+    fake = tmp_path / "fake-bin"
+    fake.mkdir()
+    stub = fake / "gh"
+    stub.write_text("#!/bin/sh\nprintf '%s\\n' '" + json.dumps(scope) + "'\n")
+    stub.chmod(0o755)
+    result = step(tmp_path, "4", v)
+    assert result.returncode == 1 and result.stdout.startswith("DENY " + reason)
+    assert json.loads((tmp_path / "scope.json").read_text()) == scope
+    assert remote_head(tmp_path, repo["remote"]) == repo["a"]
+
+
+def test_review_template_inspects_url_named_remote(tmp_path, repo):
+    url = repo["remote"].as_uri()
+    git(tmp_path, "-C", repo["wt"], "remote", "set-url", "origin", url)
+    data = json.loads((repo["bin"].parent / "mandates.json").read_text())
+    data["push_urls"] = {"your-org/your-repo": url}
+    (repo["bin"].parent / "mandates.json").write_text(json.dumps(data))
+    git(tmp_path, "-C", repo["wt"], "config", f"remote.{url}.url", str(repo["other"]))
+    v = values(repo, go(tmp_path, repo["a"], repo["b"]))
+    v["push_url"] = url
+    result = step(tmp_path, "4", v)
+    assert result.returncode == 1 and result.stdout.startswith("DENY push_remote_name")
+    assert remote_head(tmp_path, repo["remote"]) == repo["a"]
     assert remote_head(tmp_path, repo["other"]) == repo["a"]

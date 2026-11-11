@@ -235,7 +235,8 @@ def test_stacked_base_denied(tmp_path):
 
 def never_mandates(numbers):
     """A mandates doc whose M6 lists never_prs; the sample's code floor is empty."""
-    return {"mandates": [{"id": "M6", "action": "arm_automerge", "scope": SCOPE,
+    return {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False,
+                       "granted_by": "user", "holder": "shepherd", "scope": SCOPE,
                           "conditions": {"never_prs": list(numbers)}}]}
 
 
@@ -267,13 +268,15 @@ SCOPE = {"repo": "your-org/your-repo", "pr_author": "your-login", "base": "main"
 
 
 def test_size_cap_read_from_mandate(tmp_path):
-    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "scope": SCOPE,
+    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False,
+                       "granted_by": "user", "holder": "shepherd", "scope": SCOPE,
                        "conditions": {"max_changed_lines": 30}}]}
     expect(gate(tmp_path, pr(), [review()], mandates=m), ESCALATE, "ESCALATE_SIZE")
 
 
 def test_size_cap_defaults_to_1500_without_condition(tmp_path):
-    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "scope": SCOPE, "conditions": {}}]}
+    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False,
+                       "granted_by": "user", "holder": "shepherd", "scope": SCOPE, "conditions": {}}]}
     expect(gate(tmp_path, pr(additions=1501, deletions=0), [review()], mandates=m), ESCALATE, "ESCALATE_SIZE")
     expect(gate(tmp_path, pr(additions=1500, deletions=0), [review()], mandates=m), ARM, "ARM")
 
@@ -790,6 +793,7 @@ def test_review_on_head_counts_even_with_clock_skew(tmp_path):
 
 def test_scope_star_still_needs_an_ours_author(tmp_path):
     m = {"mandates": [{"id": "M6", "action": "arm_automerge", "conditions": {},
+                       "revoked": False, "granted_by": "user", "holder": "shepherd",
                        "scope": dict(SCOPE, pr_author="*")}]}
     expect(gate(tmp_path, pr(), [review()], mandates=m), ARM, "ARM")
     expect(gate(tmp_path, pr(author={"login": "other-author"}), [review()], mandates=m), DENY, "DENY")
@@ -1265,14 +1269,16 @@ def test_sweep_ill_typed_auto_merge_field_denies(tmp_path, value):
                          ids=["string", "null", "float", "str_item", "bool_item"])
 def test_sweep_ill_typed_never_prs_denies(tmp_path, never):
     """Pre-fix never_prs "101" was read as {1, 2, 5, 9}: PR 101 armed."""
-    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "scope": SCOPE,
+    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False,
+                       "granted_by": "user", "holder": "shepherd", "scope": SCOPE,
                        "conditions": {"never_prs": never}}]}
     out = expect(gate(tmp_path, pr(), [review()], mandates=m), DENY, "DENY")
     assert out.startswith("DENY malformed_input never_prs of M6"), out
 
 
 def test_sweep_never_prs_list_still_denies_and_others_arm(tmp_path):
-    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "scope": SCOPE,
+    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False,
+                       "granted_by": "user", "holder": "shepherd", "scope": SCOPE,
                        "conditions": {"never_prs": [101]}}]}
     assert expect(gate(tmp_path, pr(), [review()], mandates=m), DENY, "DENY") == "DENY never_automerge_pr #101"
     m["mandates"][0]["conditions"]["never_prs"] = [7]
@@ -1281,7 +1287,8 @@ def test_sweep_never_prs_list_still_denies_and_others_arm(tmp_path):
 
 @pytest.mark.parametrize("cap", ["30", None, 30.5, True, -1])
 def test_sweep_ill_typed_size_cap_denies(tmp_path, cap):
-    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "scope": SCOPE,
+    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False,
+                       "granted_by": "user", "holder": "shepherd", "scope": SCOPE,
                        "conditions": {"max_changed_lines": cap}}]}
     out = expect(gate(tmp_path, pr(), [review()], mandates=m), DENY, "DENY")
     assert out.startswith("DENY malformed_input max_changed_lines of M6"), out
@@ -1289,12 +1296,14 @@ def test_sweep_ill_typed_size_cap_denies(tmp_path, cap):
 
 @pytest.mark.parametrize("cond", [None, [], "x"], ids=["null", "list", "string"])
 def test_sweep_ill_typed_conditions_denies(tmp_path, cond):
-    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "scope": SCOPE, "conditions": cond}]}
+    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False,
+                       "granted_by": "user", "holder": "shepherd", "scope": SCOPE, "conditions": cond}]}
     out = expect(gate(tmp_path, pr(), [review()], mandates=m), DENY, "DENY")
     assert out == "DENY malformed_input conditions of M6 is not an object", out
 
 
 def test_sweep_absent_conditions_keep_the_defaults(tmp_path):
-    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "scope": SCOPE}]}
+    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False,
+                       "granted_by": "user", "holder": "shepherd", "scope": SCOPE}]}
     expect(gate(tmp_path, pr(additions=1501, deletions=0), [review()], mandates=m), ESCALATE, "ESCALATE_SIZE")
     expect(gate(tmp_path, pr(), [review()], mandates=m), ARM, "ARM")

@@ -78,7 +78,8 @@ The shepherd's workers are sized to the job and deleted when done: a fixer and a
 ![The user talks to the conductor; the conductor talks to the PR shepherd and the PR reviewer; the shepherd creates short-lived workers; a zero-token poll loop wakes the shepherd](./agents.svg)
 *One conversation for me; everything else reports to the conductor.*
 
-This isn't a demo. From 6 November until early on 9 November (UTC), my account merged 8 pull requests, filed 5 issues, and posted reviews on 6 other people's pull requests.
+This isn't a demo. From 6 November until early on 9 November (UTC), my account merged
+8 pull requests, filed 5 issues, and posted reviews on 5 other people's pull requests.
 
 ## One small pull request, start to finish
 
@@ -158,9 +159,16 @@ Reviewers who hadn't written the kit kept finding real holes in it. The worst on
 
 They went over the kit read-only and reproduced each finding before reporting it. Over 8 and 9 November they returned seven NOT-READY verdicts, then READY. In all: 17 serious (P1) findings, 12 P2s and one P3.
 
-That one worked like this. Before pushing, the kit asked git where `origin` *fetches* from. But a push goes wherever the *push* URL points, and git lets those two differ. A reviewer pointed the push URL at a second scratch repository, and the push landed there. My kit had checked the wrong address and felt safe. The fix compares every push destination with the one URL in my standing OKs, and refuses anything else.
+The worst one worked like this. Before pushing, the kit asked git where `origin` *fetches* from.
+But a push goes wherever the *push* URL points, and git lets those two differ. A reviewer pointed
+the push URL at a second scratch repository, and the push landed there. My kit had checked the
+wrong address and felt safe. The fix compares every push destination with the one URL in my
+standing OKs, and refuses anything else.
 
-If you build guardrails for agents, have someone who didn't write them try to break them. The tests grew with the reviews: 138 kit tests at the first review, 1,291 at the last, plus 100 for the PR watch. I also run mutation tests, which break each gate condition on purpose and check that a test notices.
+If you build guardrails for agents, have someone who didn't write them try to break them.
+The tests grew with the reviews: 138 kit tests at the first review, 1,290 at the last, plus
+101 for the PR watch. I also run mutation tests, which break each gate condition on purpose
+and check that a test notices.
 
 ## What it can't do yet
 

@@ -40,6 +40,7 @@ import argparse
 import fcntl
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -69,7 +70,17 @@ WID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}")
 TERMINAL_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 BRANCH_RE = re.compile(r"(?!-)(?!.*\.\.)[A-Za-z0-9_./-]{1,200}")
-DEFAULT_REPO = "your-org/your-repo"
+
+
+def mandate_repo(doc):
+    """The kit targets exactly one repository; infer it only from the authorised URL map."""
+    urls = doc.get("push_urls") if isinstance(doc, dict) else None
+    if not isinstance(urls, dict) or len(urls) != 1:
+        raise ValueError("a single push_urls repository is required")
+    repo = next(iter(urls))
+    if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise ValueError("invalid push_urls repository")
+    return repo
 
 
 def ledger():
@@ -137,7 +148,8 @@ def main(argv=None):
         a_.add_argument(f, required=True)
     a_.add_argument("--pr")
     a_.add_argument("--branch")
-    a_.add_argument("--repo", default=DEFAULT_REPO)
+    a_.add_argument("--repo", help="default: mandates.json single push_urls repository")
+    a_.add_argument("--mandates", default=os.path.join(KIT, "mandates.json"))
     a_.add_argument("--new-head", help="push actions: the exact commit to publish")
     a_.add_argument("--expires-in", type=int, default=120, help="minutes, 1-1440")
     a_.add_argument("--relayed-by", help="one-offs (--granted-by user): the conductor's id")
@@ -202,6 +214,13 @@ def main(argv=None):
             or (a.branch is not None and not BRANCH_RE.fullmatch(a.branch)):
         print("ERROR bad target: --pr (digits) and/or --branch (a branch name)")
         return 2
+    if a.repo is None:
+        try:
+            with open(a.mandates) as fh:
+                a.repo = mandate_repo(json.load(fh))
+        except (OSError, ValueError):
+            print("ERROR unreadable or ambiguous mandates repository")
+            return 2
     if not REPO_RE.fullmatch(a.repo):
         print("ERROR bad repo (owner/name)")
         return 2

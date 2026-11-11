@@ -131,7 +131,13 @@ shasum -a 256 "$D/clear-<id>.md"
 Send `WOULD <wid>: clear_hold #N item=<kind:id> body_sha256=<hex> policy_version=<v> reason=<one line> body=<that file>`
 (`<wid>` = the output of `python3 KIT/bin/go_ledger.py next-id --pr <N> --action clear_hold --head <the PR head>`, a fresh id per request). The conductor reads the same file, records its GO in
 `KIT/state/go.jsonl` itself, then replies `GO <wid> …`. You never write `go.jsonl`. On that GO,
-run `python3 KIT/bin/holds.py clear --repo your-org/your-repo --pr-author <the PR's author> --base <the PR's base> --pr <N> --item <kind:id> --body-file "$D/clear-<id>.md" --reason "<one line>" --go-id <wid>`
+fetch the live scope immediately before clearing:
+```sh
+gh pr view <N> -R your-org/your-repo --json author,baseRefName > "$D/clear-scope.json" || exit 1
+A=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["author"]["login"])' "$D/clear-scope.json") || exit 1
+B=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefName"])' "$D/clear-scope.json") || exit 1
+python3 KIT/bin/holds.py clear --repo your-org/your-repo --pr-author "$A" --base "$B" --pr <N> --item <kind:id> --body-file "$D/clear-<id>.md" --reason "<one line>" --go-id <wid>
+```
 (it runs the full `check_mandate.py` decision, so a pause, M8's scope or revocation, a policy
 bump, a wrong-repo GO or a GO not written by the conductor refuses; a conductor GO never widens
 the user's standing scope).
@@ -140,7 +146,13 @@ Re-run the gate. If the reviewer edits that body, it holds again and needs a new
 ## 5. Acting outside: pushes, posts, re-runs and arming
 1. **Gate:** `python3 KIT/bin/resource_gate.py`. Obey GO, THROTTLE or STOP. Never take the last
    slot before STOP (keep `live_terminals` + 1 below the STOP line for the user).
-2. **Mandate:** `python3 KIT/bin/check_mandate.py --holder shepherd --action <a> --pr-author your-login --base main`.
+2. **Mandate:** fetch a fresh scope file for this existing PR, then check its author and base:
+   ```sh
+   gh pr view <N> -R your-org/your-repo --json author,baseRefName > "$D/scope.json" || exit 1
+   A=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["author"]["login"])' "$D/scope.json") || exit 1
+   B=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefName"])' "$D/scope.json") || exit 1
+   python3 KIT/bin/check_mandate.py --holder shepherd --action <a> --pr-author "$A" --base "$B"
+   ```
    Actions: `ff_fix_push`, `factual_fix_reply`, `rerun_failed_outage`, `main_merge_push`,
    `update_branch`, `arm_automerge`, `clear_hold` (the last always prints `OBSERVE`: it needs
    the conductor's GO in every mode).

@@ -9,7 +9,7 @@ Usage:
                                                               passes its value; this stays offline)
                    [--branch B --new-head SHA --local-head SHA]  (push actions: the caller
                                                               passes `git rev-parse <branch>`)
-                   [--push-dest URL --push-url "$PU" --fetch-url "$FU" --url-rewrites "$RW"]
+                   [--push-dest URL --push-url "$PU" --fetch-url "$FU" --url-rewrites "$RW" --remote-config "$RC"]
                                                              (push actions: the destination)
                    [--go-id WID (--pr N | --branch B) [--body-file F]] [--go-file PATH]
 
@@ -33,6 +33,8 @@ arm command, with every option, and abort (STATUS: blocked) on anything but ALLO
                                   list must be exactly one URL equal to the authorised one (only a
                                   trailing ".git" is normalised), and there must be no
                                   insteadOf/pushInsteadOf rewrite at all; anything else is refused.
+                                  --remote-config "$(git config --get-regexp '^remote\\.')"
+                                  must include all remote sections; URL-named remotes are refused.
   - observe mode, no GO        -> OBSERVE (not ALLOW: do not write)
   - GO missing or not matching -> DENY go_missing / go_mismatch:<field>
 GO records live in state/go.jsonl (bin/go_ledger.py add). Every row is validated by
@@ -64,7 +66,6 @@ import re
 import sys
 from datetime import datetime, timezone
 
-DEFAULT_REPO = "your-org/your-repo"
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -88,6 +89,17 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 BRANCH_RE = re.compile(r"(?!-)(?!.*\.\.)[A-Za-z0-9_./-]{1,200}")
 
 
+def mandate_repo(doc):
+    """The kit targets exactly one repository; infer it only from the authorised URL map."""
+    urls = doc.get("push_urls") if isinstance(doc, dict) else None
+    if not isinstance(urls, dict) or len(urls) != 1:
+        raise ValueError("a single push_urls repository is required")
+    repo = next(iter(urls))
+    if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise ValueError("invalid push_urls repository")
+    return repo
+
+
 def is_push(action):
     return action.endswith("_push")
 
@@ -107,6 +119,16 @@ def check_destination(doc, repo, extra):
     observed = {"push_url": extra.get("push_url"), "fetch_url": extra.get("fetch_url")}
     if dest is None or rewrites is None or None in observed.values():
         return "push_dest_needs:--push-dest, --push-url, --fetch-url and --url-rewrites"
+    remotes = extra.get("remote_config")
+    if remotes is None:
+        return "push_dest_needs:--remote-config"
+    for line in remotes.splitlines():
+        key = line.split(None, 1)[0] if line.strip() else ""
+        if not key.startswith("remote.") or "." not in key[7:]:
+            return "push_remote_config_malformed"
+        name = key[7:].rsplit(".", 1)[0]
+        if "://" in name or norm_url(name) == norm_url(want):
+            return "push_remote_name (a remote section can redirect the authorised URL)"
     if rewrites.strip():
         return "push_url_rewrite (an insteadOf/pushInsteadOf rule is configured)"
     for name, value in observed.items():
@@ -197,6 +219,9 @@ def decide(doc, holder, action, pr_author, base, repo, extra=None, go_records=()
         return "DENY", "malformed_mandates:forbidden_without_user"
     if doc.get("paused") is not False:
         return "PAUSED", ""
+    if not isinstance(pr_author, str) or not pr_author.strip() \
+            or not isinstance(base, str) or not base.strip():
+        return "DENY", "missing_pr_scope:--pr-author and --base are required"
     reason = check_extra(doc, action, extra, repo)
     if reason:
         return "DENY", reason
@@ -269,9 +294,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Check a standing OK in mandates.json.")
     ap.add_argument("--holder", required=True, choices=["conductor", "shepherd"])
     ap.add_argument("--action", required=True)
-    ap.add_argument("--pr-author", required=True)
-    ap.add_argument("--base", required=True)
-    ap.add_argument("--repo", default=DEFAULT_REPO)
+    ap.add_argument("--pr-author")
+    ap.add_argument("--base")
+    ap.add_argument("--repo", help="default: mandates.json single push_urls repository")
     ap.add_argument("--mandates", default=os.path.join(KIT, "mandates.json"))
     ap.add_argument("--expect-policy-version")
     ap.add_argument("--expect-head")
@@ -287,9 +312,12 @@ def main(argv=None):
     for f in ("--push-url", "--fetch-url"):  # repeated flags are joined: more than one URL refuses
         ap.add_argument(f, action="append", help="push actions: git remote get-url output")
     ap.add_argument("--url-rewrites", action="append", help="push actions: git config --get-regexp '^url\\.'")
+    ap.add_argument("--remote-config", action="append",
+                    help="push actions: git config --get-regexp '^remote\\.'")
     a = ap.parse_args(argv)
     joined = {k: None if v is None else "\n".join(v)
-              for k, v in (("push_url", a.push_url), ("fetch_url", a.fetch_url), ("url_rewrites", a.url_rewrites))}
+              for k, v in (("push_url", a.push_url), ("fetch_url", a.fetch_url), ("url_rewrites", a.url_rewrites),
+                           ("remote_config", a.remote_config))}
     extra = {"expect_policy_version": a.expect_policy_version, "expect_head": a.expect_head,
              "remote_head": a.remote_head, "go_id": a.go_id, "pr": a.pr, "body_sha256": None,
              "branch": a.branch, "new_head": a.new_head, "local_head": a.local_head,
@@ -297,6 +325,7 @@ def main(argv=None):
     try:
         with open(a.mandates) as fh:
             doc = json.load(fh)
+        repo = a.repo if a.repo is not None else mandate_repo(doc)
         if a.body_file:
             with open(a.body_file, "rb") as fh:
                 extra["body_sha256"] = hashlib.sha256(fh.read()).hexdigest()
@@ -306,7 +335,7 @@ def main(argv=None):
     except (OSError, ValueError) as exc:
         word, detail = "DENY", f"unreadable_input:{type(exc).__name__}"
     else:
-        word, detail = decide(doc, a.holder, a.action, a.pr_author, a.base, a.repo, extra, go_records)
+        word, detail = decide(doc, a.holder, a.action, a.pr_author, a.base, repo, extra, go_records)
     print(f"{word} {detail}".rstrip())
     return EXIT[word]
 

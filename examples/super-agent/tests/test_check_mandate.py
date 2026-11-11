@@ -206,7 +206,7 @@ def test_shipped_file_observes_shepherd_actions(tmp_path, action):
 
 H1, H2, H3, H4 = "1" * 40, "2" * 40, "3" * 40, "4" * 40
 FUTURE, PAST = "2999-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00"
-DEST = ("--push-dest", URL, "--push-url", URL, "--fetch-url", URL, "--url-rewrites", "")
+DEST = ("--push-dest", URL, "--push-url", URL, "--fetch-url", URL, "--url-rewrites", "", "--remote-config", "")
 PIN = ("--branch", "fix/x", "--new-head", H3, "--local-head", H3, *DEST)
 
 
@@ -680,9 +680,10 @@ def test_forged_user_oneoff_by_the_shepherd_is_refused(tmp_path):
 
 def dest_check(tmp_path, d=None, **over):
     """An act-mode pre-write push check; over replaces one destination flag's value (None drops it)."""
-    flags = {"--push-dest": URL, "--push-url": URL, "--fetch-url": URL, "--url-rewrites": ""}
+    flags = {"--push-dest": URL, "--push-url": URL, "--fetch-url": URL, "--url-rewrites": "", "--remote-config": ""}
     flags.update({"--" + k.replace("_", "-"): v for k, v in over.items()})
-    args = ["--expect-head", H1, "--remote-head", H1, "--branch", "fix/x", "--new-head", H3, "--local-head", H3]
+    args = ["--repo", REPO, "--expect-head", H1, "--remote-head", H1, "--branch", "fix/x",
+            "--new-head", H3, "--local-head", H3]
     for k, v in flags.items():
         if v is not None:
             args += [k, v]
@@ -766,7 +767,7 @@ def test_f1_destination_is_per_repo(tmp_path):
     path = write_json(tmp_path / "mandates.json", d)
     base = ["--mandates", path, "--holder", "shepherd", "--action", "ff_fix_push", "--pr-author", "your-login",
             "--base", "main", "--repo", "other/x", "--expect-head", H1, "--remote-head", H1,
-            "--branch", "fix/x", "--new-head", H3, "--local-head", H3, "--url-rewrites", ""]
+            "--branch", "fix/x", "--new-head", H3, "--local-head", H3, "--url-rewrites", "", "--remote-config", ""]
     r = run("check_mandate.py", *base, "--push-dest", URL, "--push-url", URL, "--fetch-url", URL,
             env=base_env(tmp_path))
     assert (r.returncode, r.stdout.strip()) == (1, "DENY push_url_mismatch (not the authorised URL for other/x)")

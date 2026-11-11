@@ -30,10 +30,11 @@ filter() {
   REASON="${POLICY#WAKE }"
 }
 emit_wake() {
-  echo "WAKE $FILTER_REPORT ${1:-} :: $REASON"
+  local ARG="${1:-}"
+  echo "WAKE $FILTER_REPORT $ARG :: $REASON"
   # Retire only after emitting the handover; a crash earlier preserves the queue and the wake
   # journal, so the next start replays this WAKE (at most one repeat).
-  "$PYTHON" "$SCRIPT_DIR/digest_store.py" --delivered "$FILTER_REPORT" "${1#*=}" || exit 2
+  "$PYTHON" "$SCRIPT_DIR/digest_store.py" --delivered "$FILTER_REPORT" "${ARG#*=}" || exit 2
   exit 0
 }
 replay() {

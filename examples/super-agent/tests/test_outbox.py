@@ -185,8 +185,8 @@ def test_reserve_rederives_the_key_from_every_field(tmp_path, field):
 def test_sent_appends_jsonl_history(tmp_path):
     k1, k2 = key(tmp_path), key(tmp_path, body="second\n")
     reserve(tmp_path, k1)
-    reserve(tmp_path, k2, body="second\n")
     ob(tmp_path, "sent", k1, "--url", "u1")
+    reserve(tmp_path, k2, body="second\n")
     ob(tmp_path, "sent", k2, "--url", "u2")
     rows = [json.loads(x) for x in (tmp_path / "state" / "outbox.jsonl").read_text().splitlines()]
     assert [r["key"] for r in rows] == [k1, k2] and [r["url"] for r in rows] == ["u1", "u2"]
@@ -375,8 +375,9 @@ def test_d5_gone_owner_can_be_released_with_recorded_evidence(tmp_path):
 
 
 def test_d5_token_is_unique_and_not_stored_in_clear(tmp_path):
-    k1, k2 = key(tmp_path), key(tmp_path, body="other\n")
-    t1, t2 = token_of(reserve(tmp_path, k1)), token_of(reserve(tmp_path, k2, body="other\n"))
+    k1, k2 = key(tmp_path), key(tmp_path, body="other\n", pr=102)
+    t1 = token_of(reserve(tmp_path, k1))
+    t2 = token_of(reserve(tmp_path, k2, body="other\n", pr=102))
     assert t1 != t2
     pend = (tmp_path / "state" / "outbox" / f"{k1}.pending").read_text()
     assert t1 not in pend and json.loads(pend)["owner_terminal"] == OWNER_A
