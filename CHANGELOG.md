@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **`assign` and `handoff` now work when the caller can't read the agent store.** A CLI that
+  sandboxes its MCP servers (for example kiro-cli with `"sandbox": true`, which hides `~/.aws`)
+  made every profile read in `cao-mcp-server` fail with `Permission denied`, so `assign` failed.
+  On an OS-level read error the client now fetches the parsed profile from cao-server
+  (`GET /agents/profiles/{name}`). The child's allowed tools and its pinned `provider` are worked
+  out from that copy exactly as from a local read. Before, a pinned provider could silently fall
+  back to the supervisor's. Not-found and parse errors behave as before. The profile reader also
+  now treats a permission error as an error on every Python version: Python 3.14's
+  `Path.exists()` reports it as "absent", which skipped the fallback.
+- **A failed supervisor launch no longer kills the workers in its session** (#1277). While
+  `cao launch` waits for its supervisor to start, the pane is already live, so the supervisor
+  can assign workers into its own session. When the start then timed out, the rollback killed
+  the whole session, workers included, and their launch records said `pane_closed`. Now, if
+  other terminals have joined the session, only the failed terminal's window and record are
+  removed (on tmux and herdr alike). A session with no other terminals is still removed
+  completely. A terminal that dies anyway because another terminal's failed create removed its
+  session ends with the new `end_reason` `creator_rollback`. On Claude Code, a resumed launch
+  (`--resume-session-id`) is ready as soon as its input box shows, instead of always waiting the
+  full `provider_init_timeout`. A supervisor that is processing at the deadline counts as started
+  when it was seen ready first or has already made a recorded CAO call.
 - **`assign` guarantees a callback by default.** If a worker goes idle without calling
   `send_message`, the server forwards its last response to the caller, labelled as auto-forwarded;
   if the worker is deleted or errors first, the caller is told, and if a message or the task cannot
