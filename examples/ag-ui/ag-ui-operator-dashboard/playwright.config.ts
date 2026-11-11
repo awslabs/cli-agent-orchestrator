@@ -38,9 +38,14 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "npx vite --port 5173 --strictPort",
+    // Bind 127.0.0.1 explicitly. Vite's default host is "localhost", which can resolve
+    // to ::1, and then the 127.0.0.1 readiness check below never gets an answer. Its
+    // output is piped so a failing start shows Vite's own log in the run.
+    command: "npx vite --host 127.0.0.1 --port 5173 --strictPort",
     url: "http://127.0.0.1:5173/",
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,
+    stdout: "pipe",
+    stderr: "pipe",
   },
 });
