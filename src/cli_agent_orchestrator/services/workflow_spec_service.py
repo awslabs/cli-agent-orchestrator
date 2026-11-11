@@ -108,6 +108,10 @@ class WorkflowWriteConflictError(ValueError):
 
 WorkflowTier = Literal["python", "yaml"]
 
+# Ends each refusal that a CLI or MCP caller may get for a YAML workflow. Those clients
+# never send ``tier``, so they cannot follow an answer that only names the tier.
+_PYTHON_ONLY_CLIENTS = "The CLI and the MCP tools write Python only."
+
 
 @dataclass(frozen=True)
 class YamlSpecWrite:
@@ -1137,10 +1141,19 @@ def _validate_write_target(
     """
     # A name that carries an extension is refused with a message that says names are
     # bare (BR-3A3-2), rather than letting _validate_name reject the dot as a charset
-    # error. The '.py' wording is unchanged from the Python-only service.
+    # error. The '.py' wording is unchanged from the Python-only service. A Python-tier
+    # request that names a YAML file is most often the CLI or an MCP tool, and neither
+    # can send ``tier``. Telling it only that names are bare would lead it to send the
+    # YAML text again under a bare name and get a Python lint error, so it is told where
+    # YAML is written.
     lowered = name.lower()
     for extension in (".yaml", ".yml", ".py"):
         if lowered.endswith(extension):
+            if tier == "python" and extension != ".py":
+                raise ValueError(
+                    f"workflow '{name}': YAML workflows are written only in the web UI or over "
+                    f"HTTP with tier 'yaml' and a bare name. {_PYTHON_ONLY_CLIENTS}"
+                )
             raise ValueError(
                 f"workflow '{name}': pass a bare workflow name without the '{extension}' extension"
             )
@@ -1370,7 +1383,8 @@ def update_workflow(
                 )
                 if _contained_spec_exists(yaml_target, safe_base):
                     raise WorkflowWriteConflictError(
-                        f"workflow '{name}' is a YAML workflow; update it with tier 'yaml'"
+                        f"workflow '{name}' is a YAML workflow; update it in the web UI or over "
+                        f"HTTP with tier 'yaml'. {_PYTHON_ONLY_CLIENTS}"
                     )
             raise WorkflowNotFoundError(f"workflow '{name}' does not exist; use create to add it")
         _check_tier_collision(name, safe_base)

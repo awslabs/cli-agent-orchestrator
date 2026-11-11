@@ -395,7 +395,8 @@ def test_python_update_of_a_yaml_workflow_is_409_and_says_so(client, spec_dir):
 
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"] == (
-        "workflow 'yaml-only' is a YAML workflow; update it with tier 'yaml'"
+        "workflow 'yaml-only' is a YAML workflow; update it in the web UI or over HTTP with "
+        "tier 'yaml'. The CLI and the MCP tools write Python only."
     )
     assert _entries(spec_dir) == ["yaml-only.yaml"]
     assert (spec_dir / "yaml-only.yaml").read_text() == _spec_yaml("yaml-only")

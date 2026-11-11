@@ -100,12 +100,23 @@ def test_an_unknown_tier_is_refused(tmp_path: Path) -> None:
 def test_a_name_with_an_extension_is_refused_in_both_tiers(
     tmp_path: Path, name: str, extension: str
 ) -> None:
-    """Names are bare in both tiers. The refusal no longer claims YAML cannot be written."""
-    expected = f"pass a bare workflow name without the '{re.escape(extension)}' extension"
-    with pytest.raises(ValueError, match=expected) as python_refusal:
-        svc.create_workflow(name, PYTHON_SOURCE, scan_dir=str(tmp_path))
-    with pytest.raises(ValueError, match=expected):
+    """Names are bare in both tiers.
+
+    The YAML tier is told only that. The Python tier is what the CLI and the MCP tools send,
+    so for a YAML extension it is also told where YAML is written (review of #1291).
+    """
+    bare = f"pass a bare workflow name without the '{re.escape(extension)}' extension"
+    with pytest.raises(ValueError, match=bare):
         svc.create_yaml_workflow(name, _spec_yaml("thing"), scan_dir=str(tmp_path))
+    with pytest.raises(ValueError) as python_refusal:
+        svc.create_workflow(name, PYTHON_SOURCE, scan_dir=str(tmp_path))
+    if extension == ".py":
+        assert re.search(bare, str(python_refusal.value))
+    else:
+        assert str(python_refusal.value) == (
+            f"workflow '{name}': YAML workflows are written only in the web UI or over HTTP "
+            "with tier 'yaml' and a bare name. The CLI and the MCP tools write Python only."
+        )
     assert "cannot be created" not in str(python_refusal.value)
     assert _entries(tmp_path) == []
 
@@ -386,7 +397,10 @@ def test_python_update_of_a_yaml_workflow_is_a_conflict_that_says_so(
 
     with pytest.raises(
         svc.WorkflowWriteConflictError,
-        match=r"^workflow 'built' is a YAML workflow; update it with tier 'yaml'$",
+        match=(
+            r"^workflow 'built' is a YAML workflow; update it in the web UI or over HTTP with "
+            r"tier 'yaml'\. The CLI and the MCP tools write Python only\.$"
+        ),
     ):
         svc.update_workflow(
             "built", PYTHON_SOURCE, _sha(yaml_file.read_bytes()), scan_dir=str(tmp_path)

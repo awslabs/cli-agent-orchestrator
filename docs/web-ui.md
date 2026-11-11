@@ -102,6 +102,29 @@ The editor normalizes line separators to spaces, removes C0/C1 controls
 See the [terminal description API contract](api.md#terminal-descriptions) for
 creation defaults, clearing, and retry behavior.
 
+### Workflows
+
+The Workflows tab lists the stored workflows. Pick one to validate it, run it,
+and follow its runs. New workflow opens the workflow builder, which makes a
+YAML workflow step by step: pick an agent profile for each step, fill in the
+params the profile declares, and write the prompt. A YAML workflow also gets
+Edit and Delete. The CLI and the MCP tools write Python workflows only, so the
+builder and the HTTP routes are the only ways to write YAML. See
+[CAO Workflows](workflows.md).
+
+A note at the top of the builder says what a YAML workflow cannot do: branch,
+loop, run steps in parallel, pass one step's answer to a later step, or run
+`assign` and `send_message` steps. For those, write a Python workflow. You can
+still pick and save `assign` and `send_message`. The step editor marks them
+"not built yet", the notice after a save says a run is refused until they are
+built, and the run routes refuse them.
+
+The builder opens only a YAML workflow it can save back without losing data.
+For any other workflow it shows the file's path and the fields that block
+editing. Edit that file in a text editor instead. The Workflows tab reads the
+workflow files again each time it lists them, so reopen the tab to see the
+change, and use Validate to check it.
+
 ## Related
 
 - [web/README.md](../web/README.md) — frontend architecture and component details

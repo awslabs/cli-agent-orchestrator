@@ -298,14 +298,30 @@ def test_a_lint_error_refuses_an_update_too(client, spec_dir):
 def test_a_yaml_name_is_refused_without_disclosing_internal_validation_detail(client, spec_dir):
     """A path-free validation message remains actionable at the HTTP boundary.
 
-    YAML is writable with ``tier: "yaml"``, so the refusal now says what is wrong with the request:
-    the name carries an extension, and names are bare in both tiers.
+    A request without ``tier`` is what the CLI and the MCP tools send, and neither can send
+    ``tier``. So the refusal names where YAML is written, as it did before YAML was writable,
+    instead of only saying names are bare: that alone led a CLI user to a Python lint error.
     """
     resp = client.post("/workflows", json={"name": "as-yaml.yaml", "source": GOOD})
 
     assert resp.status_code == 400, resp.text
-    assert "pass a bare workflow name without the '.yaml' extension" in resp.json()["detail"]
+    assert resp.json()["detail"] == (
+        "workflow 'as-yaml.yaml': YAML workflows are written only in the web UI or over HTTP "
+        "with tier 'yaml' and a bare name. The CLI and the MCP tools write Python only."
+    )
     assert str(spec_dir) not in resp.json()["detail"]
+    assert not any(spec_dir.iterdir()), "nothing may be written for a refused name"
+
+
+def test_a_yaml_name_with_tier_yaml_is_told_that_names_are_bare(client, spec_dir):
+    resp = client.post(
+        "/workflows", json={"name": "as-yaml.yaml", "source": "name: as-yaml\n", "tier": "yaml"}
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == (
+        "workflow 'as-yaml.yaml': pass a bare workflow name without the '.yaml' extension"
+    )
     assert not any(spec_dir.iterdir()), "nothing may be written for a refused name"
 
 

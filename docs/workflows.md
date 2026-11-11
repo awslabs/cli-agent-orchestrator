@@ -15,10 +15,14 @@ There are two authoring tiers:
   easier to author and lint, but its `parallel` / `pipeline` / `loop` modes are
   **reserved and not yet executable** in the current build (they validate as
   `pass_reserved`, they do not run). Reach for it only for a plain sequential spec; for
-  anything with real control flow, write a script. YAML specs can be created and updated over
-  HTTP with `tier: "yaml"` on `POST /workflows` and `PUT /workflows/{name}`, behind the same
+  anything with real control flow, write a script. YAML specs are made and edited in the web
+  UI's workflow builder (see [Workflows in the Web UI](web-ui.md#workflows)), or over HTTP
+  with `tier: "yaml"` on `POST /workflows` and `PUT /workflows/{name}`, behind the same
   guarded write path as Python specs (see [Workflows in the API overview](api.md#workflows)).
-  The CLI verbs and MCP authoring tools write Python specs only.
+  The CLI verbs and the MCP authoring tools write Python specs only. They never send `tier`,
+  and a test checks the request bodies the MCP tools send, so FR-10 still holds: no
+  authoring tool asks the user to choose a format. `tier` is not a security boundary,
+  though. Anything that can reach the HTTP routes can send it, and auth is off by default.
 
 When in doubt, write a script.
 

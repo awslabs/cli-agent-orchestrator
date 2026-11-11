@@ -146,18 +146,20 @@ def test_update_rejects_a_trailing_newline_name_without_modifying_its_file(tmp_p
 @pytest.mark.parametrize(
     "yaml_name,extension", [("thing.yaml", ".yaml"), ("thing.yml", ".yml"), ("THING.YAML", ".yaml")]
 )
-def test_refuses_a_yaml_extension_because_names_are_bare(
+def test_refuses_a_yaml_extension_and_says_where_yaml_is_written(
     tmp_path: Path, yaml_name: str, extension: str
 ) -> None:
     """BR-3A3-2 — an agent that put an extension on the name should learn the rule.
 
-    YAML specs are writable now (``tier="yaml"``), so the refusal no longer says they are not.
-    The reason is the same as for ``.py``: names are bare, and the service picks the extension.
+    The Python tier is what the CLI and the MCP tools write, and neither can send ``tier``.
+    So the refusal says where YAML is written, not only that names are bare.
     """
-    with pytest.raises(
-        ValueError, match=f"pass a bare workflow name without the '\\{extension}' extension"
-    ):
+    with pytest.raises(ValueError) as refusal:
         svc.create_workflow(yaml_name, GOOD, scan_dir=str(tmp_path))
+    assert str(refusal.value) == (
+        f"workflow '{yaml_name}': YAML workflows are written only in the web UI or over HTTP "
+        "with tier 'yaml' and a bare name. The CLI and the MCP tools write Python only."
+    )
     assert _entries(tmp_path) == []
 
 
