@@ -89,7 +89,7 @@ def main(argv=None):
             print(f"REFUSE missing_baseline {name}")
             ok = False
         elif got != want:
-            print(f"REFUSE changed {name} got={got[:8]} want={want[:8]}")
+            print(f"REFUSE changed {name}")
             ok = False
         else:
             print(f"MATCH {name} {got[:8]}")
