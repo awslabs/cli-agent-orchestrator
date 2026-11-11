@@ -98,7 +98,20 @@ There are two ways in:
 A close for an invocation the run has not announced (its launch is older than
 the replay window) synthesizes the `SUBAGENT_STARTED` first, parent before
 child, so every `SUBAGENT_*` and tool-call event names an invocation the run
-has already opened. Fields use the schema names (`subagentRunId`, `toolCallId`,
+has already opened. The same holds for a tool call: when a `completion` or `error`
+(replayed or live) closes a terminal on a run that never saw a call that terminal
+received or sent, the run announces that call first (`TOOL_CALL_START` with the
+call's own `toolCallId`, `metadata.cao` taken from the call's record, so its
+`eventId` is the call record's) and then ends it (`TOOL_CALL_END`,
+`closedBy: completion`). A call record that gives a worker a second call announces
+the first one the same way and ends it with `closedBy: superseded`. A client that
+held a call open across the reconnect has already seen that `TOOL_CALL_START`; it
+dedupes it by `eventId`, `type` and `toolCallId` (see
+[Ordering and deduplication](#ordering-and-deduplication)) and keeps the
+`TOOL_CALL_END`. A call that an earlier record already ended is not announced
+again, except after a session kill the replay does not hold. The run finds these calls in the event log, so if a call's record has left
+the buffer (500 records, 24 h TTL in `EventLog.history()`), its `TOOL_CALL_END` is
+not recoverable and the client keeps the call open. Fields use the schema names (`subagentRunId`, `toolCallId`,
 `threadId`), and `timestamp` is integer epoch milliseconds. The CAO record's
 own fields (`eventId`, `terminalId`, `sessionName`, `traceparent`) are under
 `metadata.cao`, the same nested object and key names the run plane uses.
