@@ -23,7 +23,7 @@ When I run many agents, I can follow three to five sessions at once, and that's 
 
 Every agent needs me once in a while: a question here, an approval there. Ten agents meant ten small interruptions, and none of them waited politely. Keeping up with all of them was impossible.
 
-And under all of it was a worry. If I let agents work while I was away, what would they do wrong without me watching? [AUTHOR: one concrete thing an unattended agent did, or nearly did, that made this worry real.]
+And under all of it was a worry. If I let agents work while I was away, what would they do wrong without me watching?
 
 ## One conductor, with CAO behind it
 
@@ -184,7 +184,7 @@ You don't need the whole kit to feel the shift. Add one piece at a time:
 
 1. One conductor profile and one short-lived helper, using CAO's ephemeral agents. See what changes when you only talk to one agent.
 2. Add a pause switch that survives a restart.
-3. Only then add a shepherd or reviewer, and start it in observe mode. [AUTHOR: confirm this order, and which parts of your kit a reader can reuse today.]
+3. Only then add a shepherd or reviewer, and start it in observe mode.
 
 Each piece is in [`examples/super-agent`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/super-agent), with a quick start. Its standing OKs ship as placeholders, and the shepherd starts in observe mode.
 
@@ -193,8 +193,6 @@ Each piece is in [`examples/super-agent`](https://github.com/awslabs/cli-agent-o
 - [CAO on GitHub](https://github.com/awslabs/cli-agent-orchestrator): the orchestrator behind the conductor, the shepherd, the reviewer and their short-lived workers.
 - [CAO's ephemeral-agents docs](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/ephemeral-agents.md): an experimental feature (off by default) that lets an agent create a short-lived helper with a model tier and effort sized to the task.
 - DeepSeek's [super-agent prototype](https://github.com/deepseek-ai/dsh-superagent-prototype) and [design article](https://x.com/DeepSeekHarness/status/2116857257245987236): where several of the ideas above came from.
-
-For the phone half: [herdr-remote](https://github.com/dcolinmorgan/herdr-remote), an open-source (AGPL) dashboard for herdr that carries agent notifications and approvals over Telegram. [AUTHOR: confirm you run CAO's terminals on herdr; if so keep "CAO's agents run inside herdr, so their prompts reach my phone this way." and add it here, otherwise drop this paragraph.]
 
 ## Glossary
 
