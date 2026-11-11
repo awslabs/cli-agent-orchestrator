@@ -1,0 +1,52 @@
+data: {"type":"RUN_STARTED","metadata":{"cao":{"stream":"ambient"}},"threadId":"cao-fleet-265b2621-684e-4f8e-a678-bac0a6fa3f25","runId":"5f145629-a185-4524-befe-f75477e6769a","protocolVersion":"1.0"}
+
+data: {"type":"STATE_SNAPSHOT","snapshot":{"sessions":[],"terminals":[],"counts":{"sessions":0,"terminals":0},"scopes":["cao:read","cao:write","cao:admin"]}}
+
+id: 6806d2ce-ccca-4451-b789-6f9dd32b7b78.0
+data: {"type":"SUBAGENT_STARTED","timestamp":1794358162185,"metadata":{"cao":{"sessionName":"cao-timeline"}},"subagentRunId":"session:dc3cf8af50fccb6d","name":"cao-timeline"}
+
+id: 6806d2ce-ccca-4451-b789-6f9dd32b7b78
+data: {"type":"SUBAGENT_STARTED","timestamp":1794358162185,"metadata":{"cao":{"eventId":"6806d2ce-ccca-4451-b789-6f9dd32b7b78","terminalId":"1dd0761a","sessionName":"cao-timeline","provider":"mock_cli"}},"subagentRunId":"terminal:1dd0761a","name":"dojo-approver","parentSubagentRunId":"session:dc3cf8af50fccb6d"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/counts/sessions","value":1},{"op":"replace","path":"/counts/terminals","value":1},{"op":"replace","path":"/sessions","value":[{"id":"cao-timeline","name":"cao-timeline","status":"detached"}]},{"op":"replace","path":"/terminals","value":[{"id":"1dd0761a","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-b636","status":null,"last_active":"2026-11-11T00:49:18.372293+00:00"}]}]}
+
+id: 4c6d1d7b-450b-4c91-8fb3-b725c1f48a10
+data: {"type":"SUBAGENT_STARTED","timestamp":1794358165353,"metadata":{"cao":{"eventId":"4c6d1d7b-450b-4c91-8fb3-b725c1f48a10","terminalId":"5ac6264b","sessionName":"cao-timeline","provider":"mock_cli"}},"subagentRunId":"terminal:5ac6264b","name":"dojo-approver","parentSubagentRunId":"session:dc3cf8af50fccb6d"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/counts/terminals","value":2},{"op":"replace","path":"/terminals","value":[{"id":"1dd0761a","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-b636","status":null,"last_active":"2026-11-11T00:49:18.372293+00:00"},{"id":"5ac6264b","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-5944","status":null,"last_active":"2026-11-11T00:49:25.266321+00:00"}]}]}
+
+id: 226b40c2-9bc3-451e-b446-b0b25961ff55
+data: {"type":"TOOL_CALL_START","timestamp":1794358170090,"metadata":{"cao":{"eventId":"226b40c2-9bc3-451e-b446-b0b25961ff55","terminalId":"5ac6264b","sessionName":"cao-timeline","sender":"1dd0761a","receiver":"5ac6264b","orchestrationType":"assign"}},"subagentRunId":"terminal:1dd0761a","toolCallId":"226b40c2-9bc3-451e-b446-b0b25961ff55","toolCallName":"OrchestrationType.ASSIGN"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"1dd0761a","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-b636","status":null,"last_active":"2026-11-11T00:49:18.372293+00:00"},{"id":"5ac6264b","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-5944","status":null,"last_active":"2026-11-11T00:49:30.089006+00:00"}]}]}
+
+id: 9ed55222-b831-44bb-85e7-ef0e2b9eae77
+data: {"type":"SUBAGENT_STARTED","timestamp":1794358173461,"metadata":{"cao":{"eventId":"9ed55222-b831-44bb-85e7-ef0e2b9eae77","terminalId":"be17ba90","sessionName":"cao-timeline","provider":"mock_cli"}},"subagentRunId":"terminal:be17ba90","name":"dojo-approver","parentSubagentRunId":"session:dc3cf8af50fccb6d"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/counts/terminals","value":3},{"op":"replace","path":"/terminals","value":[{"id":"1dd0761a","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-b636","status":null,"last_active":"2026-11-11T00:49:18.372293+00:00"},{"id":"5ac6264b","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-5944","status":null,"last_active":"2026-11-11T00:49:30.089006+00:00"},{"id":"be17ba90","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-9498","status":null,"last_active":"2026-11-11T00:49:33.409901+00:00"}]}]}
+
+id: fefed66e-518c-4acf-9cf2-c5609526ef7f
+data: {"type":"TOOL_CALL_START","timestamp":1794358178197,"metadata":{"cao":{"eventId":"fefed66e-518c-4acf-9cf2-c5609526ef7f","terminalId":"be17ba90","sessionName":"cao-timeline","sender":"1dd0761a","receiver":"be17ba90","orchestrationType":"handoff"}},"subagentRunId":"terminal:1dd0761a","toolCallId":"fefed66e-518c-4acf-9cf2-c5609526ef7f","toolCallName":"OrchestrationType.HANDOFF"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"1dd0761a","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-b636","status":null,"last_active":"2026-11-11T00:49:18.372293+00:00"},{"id":"5ac6264b","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-5944","status":null,"last_active":"2026-11-11T00:49:30.089006+00:00"},{"id":"be17ba90","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-9498","status":null,"last_active":"2026-11-11T00:49:38.196061+00:00"}]}]}
+
+id: 47db8414-86a9-496f-8cbe-1cb40f1acaa5.0
+data: {"type":"TOOL_CALL_END","timestamp":1794358181804,"metadata":{"cao":{"closedBy":"completion"}},"subagentRunId":"terminal:1dd0761a","toolCallId":"226b40c2-9bc3-451e-b446-b0b25961ff55"}
+
+id: 47db8414-86a9-496f-8cbe-1cb40f1acaa5
+data: {"type":"SUBAGENT_FINISHED","timestamp":1794358181804,"metadata":{"cao":{"eventId":"47db8414-86a9-496f-8cbe-1cb40f1acaa5","terminalId":"5ac6264b","sessionName":"cao-timeline","endReason":"killed"}},"subagentRunId":"terminal:5ac6264b"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/counts/terminals","value":2},{"op":"replace","path":"/terminals","value":[{"id":"1dd0761a","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-b636","status":null,"last_active":"2026-11-11T00:49:18.372293+00:00"},{"id":"be17ba90","session_name":"cao-timeline","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-9498","status":null,"last_active":"2026-11-11T00:49:38.196061+00:00"}]}]}
+
+:keep-alive
+
+data: {"type":"TOOL_CALL_END","metadata":{"cao":{"closedBy":"stream_closed"}},"subagentRunId":"terminal:1dd0761a","toolCallId":"fefed66e-518c-4acf-9cf2-c5609526ef7f"}
+
+data: {"type":"SUBAGENT_FINISHED","metadata":{"cao":{"terminalId":"1dd0761a","endReason":"server_stop"}},"subagentRunId":"terminal:1dd0761a"}
+
+data: {"type":"SUBAGENT_FINISHED","metadata":{"cao":{"terminalId":"be17ba90","endReason":"server_stop"}},"subagentRunId":"terminal:be17ba90"}
+
+data: {"type":"SUBAGENT_FINISHED","metadata":{"cao":{"sessionName":"cao-timeline","endReason":"server_stop"}},"subagentRunId":"session:dc3cf8af50fccb6d"}
+
+data: {"type":"RUN_FINISHED","metadata":{"cao":{"endReason":"server_stop"}},"threadId":"cao-fleet-265b2621-684e-4f8e-a678-bac0a6fa3f25","runId":"5f145629-a185-4524-befe-f75477e6769a","outcome":{"type":"cancelled"}}
+
