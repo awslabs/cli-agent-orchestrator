@@ -209,7 +209,7 @@ def _inside_ttl(event: Dict, cutoff: datetime) -> bool:
     """Whether ``event``'s timestamp is at or after ``cutoff``, as ``history()`` judges it."""
     try:
         ts = datetime.fromisoformat(event["timestamp"])
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError):  # the same two history() skips
         return False
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)

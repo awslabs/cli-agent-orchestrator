@@ -392,6 +392,19 @@ def test_a_row_with_an_unparseable_timestamp_is_not_counted_inside_the_ttl() -> 
     assert log.count_event_type("agent_ui_refused", within_ttl=True) == 0
 
 
+def test_a_naive_timestamp_inside_the_ttl_is_counted_as_utc() -> None:
+    """history() reads a timestamp without a zone as UTC; the share count must agree."""
+    from datetime import datetime, timedelta, timezone
+
+    log = event_log_service.get_event_log()
+    log.append("other", None, None, {"event_type": "agent_ui_refused"})
+    naive_now = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(tzinfo=None)
+    with log._lock:
+        log._buf[-1]["timestamp"] = naive_now.isoformat()
+    assert log.count_event_type("agent_ui_refused", within_ttl=True) == 1
+    assert [e["timestamp"] for e in log.history()] == [naive_now.isoformat()]
+
+
 def test_the_share_warning_is_logged_once_per_fill(monkeypatch, caplog) -> None:
     """#1295 review (P2): when the share fills, operators get one warning, not one per fold."""
     import logging
