@@ -179,14 +179,24 @@ Re-run the gate. If the reviewer edits that body, it holds again and needs a new
 7. **Before a push:** `gh pr list -R your-org/your-repo --search "<topic> in:title,body" --state open`
    finds no competing PR. The live PR head equals the expected remote head. Main hasn't moved
    in a way that changes the plan.
-8. **Every publisher and armer re-checks right before each write** (the templates do it):
-   `check_mandate.py … --expect-policy-version <v> --expect-head <sha> --remote-head <ls-remote> [--branch <b> --new-head <sha> --local-head <rev-parse> --push-dest <push_url> --push-url "$PU" --fetch-url "$FU" --url-rewrites "$RW"] [--go-id <wid>] [--body-file F]`.
+8. **Every publisher and armer re-checks right before each write** (the templates do it).
+   Read `$A` (author) and `$B` (base) from a fresh `gh pr view --json author,baseRefName`
+   file, as in step 2, then run:
+   ```sh
+   check_mandate.py … --pr-author "$A" --base "$B" \
+     --expect-policy-version <v> --expect-head <sha> --remote-head <ls-remote> \
+     [--branch <b> --new-head <sha> --local-head <rev-parse> --push-dest <push_url> \
+      --push-url "$PU" --fetch-url "$FU" --url-rewrites "$RW" --remote-config "$RC"] \
+     [--go-id <wid>] [--body-file F]
+   ```
    Anything but `ALLOW` is `STATUS: blocked`. A pause, revocation, policy bump, head move,
    local branch move, body change, or a missing or expired GO after dispatch therefore stops
    the write. A push's destination is bound too (F1): `<push_url>` is the repo's entry in
    `mandates.json` `push_urls` (exactly `https://github.com/your-org/your-repo.git`),
    the worktree's fetch and push URLs for origin must each be exactly that one URL, and no
-   `insteadOf`/`pushInsteadOf` rewrite may exist. A push then runs exactly
+   `insteadOf`/`pushInsteadOf` rewrite may exist. Pass every remote section in `$RC` from
+   `git config --get-regexp '^remote\.'` as `--remote-config "$RC"`. URL-named remote sections
+   (names containing `://` or equal to the push URL) are refused. A push then runs exactly
    `git push <push_url> <new_head>:refs/heads/<branch>`, never to the name origin, and
    `ls-remote` reads the same URL.
 9. **Posts:** `outbox.py key …` → `check` (0 UNUSED; 1 USED: done; 4 PENDING: reconcile first) →

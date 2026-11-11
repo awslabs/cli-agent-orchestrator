@@ -2,7 +2,7 @@
 """Is this outside action covered by a standing OK from the user? Pure and offline.
 
 Usage:
-  check_mandate.py --holder shepherd --action ff_fix_push --pr-author your-login --base main
+  check_mandate.py --holder shepherd --action ff_fix_push --pr-author "$A" --base "$B"
                    [--repo your-org/your-repo] [--mandates PATH]
                    [--expect-policy-version V]
                    [--expect-head SHA --remote-head SHA]     (the caller runs ls-remote and
@@ -124,8 +124,10 @@ def check_destination(doc, repo, extra):
         return "push_dest_needs:--remote-config"
     for line in remotes.splitlines():
         key = line.split(None, 1)[0] if line.strip() else ""
-        if not key.startswith("remote.") or "." not in key[7:]:
+        if not key.startswith("remote.") or not key[7:]:
             return "push_remote_config_malformed"
+        if "." not in key[7:]:  # e.g. remote.pushDefault: a variable, not a remote section
+            continue
         name = key[7:].rsplit(".", 1)[0]
         if "://" in name or norm_url(name) == norm_url(want):
             return "push_remote_name (a remote section can redirect the authorised URL)"

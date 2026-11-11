@@ -529,7 +529,7 @@ def decide(action, pr, reviews, commits, issue_comments, review_comments, requir
 def load_limits(path, action):
     with open(path) as fh:
         doc = json.load(fh)
-    cap, never, author, repo = None, set(), None, None
+    cap, never, author, repo = DEFAULT_CAP if action == "update_branch" else None, set(), None, None
     for m in doc.get("mandates") or []:
         if m.get("action") in ACTIONS.values():
             cond = m.get("conditions", {})
@@ -541,7 +541,8 @@ def load_limits(path, action):
             never |= set(listed)
             active = (m.get("revoked") is False and m.get("granted_by") == "user"
                       and m.get("holder") == "shepherd")
-            if active and m.get("action") == "arm_automerge":
+            # A revoked arm cap still restricts updates; revocation must never widen the cap.
+            if (active or action == "update_branch") and m.get("action") == "arm_automerge":
                 limit = cond.get("max_changed_lines", DEFAULT_CAP)
                 if not strict_int(limit, 0):
                     raise BadInput(f"max_changed_lines of {m.get('id')} is not an integer")

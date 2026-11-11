@@ -132,8 +132,15 @@ and after.
 
 ## 5. Reviewer plan approval (mandate M7; only with the optional reviewer)
 1. `python3 KIT/bin/resource_gate.py`: STOP means no. THROTTLE means defer, unless the user is waiting.
-2. `python3 KIT/bin/check_mandate.py --holder conductor --action approve_review_plan --pr-author <author> --base main`
-   must print `ALLOW M7-approve-review-plan`.
+2. Fetch the live author and base into a fresh scope file in your scratch directory `$D`:
+   ```sh
+   gh pr view <N> -R your-org/your-repo --json author,baseRefName > "$D/review-scope.json" || exit 1
+   A=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["author"]["login"])' "$D/review-scope.json") || exit 1
+   B=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefName"])' "$D/review-scope.json") || exit 1
+   python3 KIT/bin/check_mandate.py --holder conductor --action approve_review_plan \
+     --pr-author "$A" --base "$B"
+   ```
+   It must print `ALLOW M7-approve-review-plan`.
 3. The workflow is exactly `pr-review` or `branch-review`.
 4. Read the PR head:
    `gh api repos/your-org/your-repo/pulls/<N> --jq '.head.sha+" "+.base.ref+" "+.state+" "+.user.login'`.
