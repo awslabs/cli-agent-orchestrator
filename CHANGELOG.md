@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **CAO terminals no longer write agent launch commands to your shell history.** Every tmux
+  session, window and pane and every herdr pane that CAO creates now gets `HISTFILE=/dev/null`
+  in its environment, set after operator-forwarded `--env` values, as `CAO_TERMINAL_ID` is. Your
+  shell config is not changed; a shell rc file that assigns `HISTFILE` itself still wins.
 - **`assign` again tells every worker to send its results back with `send_message`** (#1247).
   Since #1247, `assign` left the "send results back to terminal X using send_message" instruction
   out of the task, and returned a note that the worker could not reply, whenever the worker's

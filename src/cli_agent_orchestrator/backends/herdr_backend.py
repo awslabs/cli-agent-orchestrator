@@ -1156,6 +1156,7 @@ class HerdrBackend(TerminalBackend):
         # override them (mirrors TmuxClient, which forces these to win).
         env["CAO_TERMINAL_ID"] = terminal_id
         env["CAO_SESSION_NAME"] = session_name
+        env["HISTFILE"] = "/dev/null"  # agent launch commands are noise
 
         args: List[str] = []
         for key, value in env.items():
