@@ -24,7 +24,11 @@ from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import Terminal
-from cli_agent_orchestrator.services import session_service, terminal_service
+from cli_agent_orchestrator.services import (
+    delegation_callback_service,
+    session_service,
+    terminal_service,
+)
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyNotFound,
@@ -2060,12 +2064,16 @@ class TestInboxReconciliationDaemon:
             with pytest.raises(asyncio.CancelledError):
                 await inbox_reconciliation_daemon(registry)
 
-        mock_to_thread.assert_awaited_once()
-        # The sweep, not some other sync function, must be the dispatched work.
+        # Each iteration dispatches the inbox reconcile, then the delegation
+        # callback sweep. Both are sync work and must run off the loop.
+        assert mock_to_thread.await_count == 2
+        first, second = mock_to_thread.await_args_list
         # reconcile_orphaned_messages is a bound method on the singleton now, so a
         # fresh attribute access is a distinct object — compare by value, not id.
-        assert mock_to_thread.await_args.args[0] == inbox_service.reconcile_orphaned_messages
-        assert mock_to_thread.await_args.args[1] is registry
+        assert first.args[0] == inbox_service.reconcile_orphaned_messages
+        assert first.args[1] is registry
+        assert second.args[0] == delegation_callback_service.sweep
+        assert second.args[1] is registry
 
 
 # ── lifespan ─────────────────────────────────────────────────────────

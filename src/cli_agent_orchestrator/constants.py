@@ -382,6 +382,18 @@ INBOX_SUBMIT_CONFIRM_TIMEOUT = 8.0
 # reconcile sweep is not a second chance here (the message is already DELIVERED).
 INBOX_SUBMIT_MAX_RESUBMITS = 2
 
+# Delegation callback pickup timeout (assign-callback-guarantee). A waiting
+# caller is auto-forwarded a worker's last response only once the worker has
+# shown work on the last message delivered to it: until then its screen still
+# holds the previous answer. A delivery that is never picked up (a lost paste
+# or a swallowed Enter, issue #78) shows no work at all, and pickup itself can
+# lag delivery noticeably. After this many seconds with the worker idle and no
+# sign of work since that delivery, the sweep forwards anyway, with a header
+# saying the message may not have been picked up.
+DELEGATION_PICKUP_TIMEOUT_SECONDS = _env_positive_float(
+    "CAO_DELEGATION_PICKUP_TIMEOUT_SECONDS", 300.0
+)
+
 # How long POST /terminals/{id}/inbox/messages waits for its immediate delivery
 # attempt to reach the pane before answering. The message is already stored
 # when the wait starts and the attempt keeps running in the background, so

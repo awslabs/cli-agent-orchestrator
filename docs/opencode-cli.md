@@ -254,6 +254,18 @@ agent-plugin store is CAO's (`is_cao_owned_mcp_entry`, through
 `is_orphaned_recorded_mcp_entry`). Without it, CAO reports a plugin server of the same
 name as a collision, and neither updates nor disables that entry.
 
+If `cao-grants.json` cannot be written (a read-only directory, a full disk), CAO logs a
+warning and installs anyway. A failed write keeps the old record, and the warning says what
+that costs. For an agent's grants, a plugin server's grant is still withdrawn by
+plugin-store containment, and a profile server's grant that install adds stays if the
+profile drops that server before the agent is next installed with a writable sidecar;
+grants the old record already has keep their proof. A grant that install **removes** is the
+opposite case: `opencode.json` no longer has it but the old record still lists it, so the
+next install with a writable sidecar removes a key of that name again, even one you added
+by hand in between. For a plugin server's `"mcp"` fingerprint, CAO falls back to the
+containment proof, which does not survive a `CAO_HOME_DIR` move: after one, CAO cannot
+prove the entry is its own.
+
 The same two proofs decide which `mcp` entries are CAO's. For every agent-plugin
 server it writes, CAO records a SHA-256 fingerprint of the entry in `cao-grants.json`
 (under `"mcp"`; the fingerprint ignores `enabled`). `~/.aws/opencode` does not follow
