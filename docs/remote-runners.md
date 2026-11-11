@@ -62,7 +62,7 @@ clients to `9889` independently.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `CAO_RUNNER_SERVER_URL` | *(required)* | Hub URL: `wss://host:9891`, or `ws://` (see [Transport](#transport)). |
+| `CAO_RUNNER_SERVER_URL` | *(required)* | Hub URL: `wss://host:9891`, or `ws://` (see [Security](#security)). |
 | `CAO_RUNNER_TOKEN_FILE` / `CAO_RUNNER_TOKEN` | *(one required)* | As on the server; the file wins. |
 | `CAO_RUNNER_CA_FILE` | system trust store | CA bundle the hub's certificate is verified against (`wss://` only). |
 | `CAO_RUNNER_ALLOW_INSECURE` | `0` | `1` allows `ws://` to a host other than loopback. For a local test cluster only. |
@@ -191,12 +191,12 @@ report the server's state as the runner's.
   URL to anything but a loopback address unless `CAO_RUNNER_ALLOW_INSECURE=1`
   is set; trust is never inferred from a cluster-looking hostname. The hub
   logs a warning when it serves cleartext on an address other than loopback.
-  Serve `wss://` (`CAO_RUNNER_TLS_CERT` / `_KEY`, runners verifying it with
-  `CAO_RUNNER_CA_FILE`), or terminate TLS in a service mesh in front of the
-  hub.
+  Elsewhere the hub serves `wss://` itself (`CAO_RUNNER_TLS_CERT` / `_KEY`,
+  runners verifying it with `CAO_RUNNER_CA_FILE`); a service mesh is optional.
 - **Hub port.** Keep `9891` inside the cluster: a ClusterIP Service, no
   Ingress, LoadBalancer or NodePort, and a NetworkPolicy that admits only
-  runner pods (which also reach `9889` for their agents' MCP servers).
+  runner pods (which also reach `9889` for their agents' MCP servers). The
+  NetworkPolicy takes effect only when the cluster's CNI enforces it.
 - **Runner token.** The hub refuses to start without a token, compares it in
   constant time, and rejects a wrong one before the WebSocket is accepted
   (`401`). It is read once, from `CAO_RUNNER_TOKEN_FILE` if set (an unreadable
@@ -212,14 +212,17 @@ report the server's state as the runner's.
   tenants. Per-runner credentials are the follow-up.
 - **The runner trusts the server completely:** the server can type anything
   into any pane it hosts.
-- **API authentication is not supported yet.** With `terminal.backend=remote`,
+- **No API authentication in this phase.** With `terminal.backend=remote`,
   `cao-server` refuses to start when API authentication is configured
-  (`CAO_AUTH_LOCAL_TOKEN` or an identity provider): agents on runners would
-  need a credential for their orchestration calls, and the only one available
-  is the full API token, which every pane on the runner could read. So in this
-  phase remote mode allows no authenticated API use at all, external clients
-  included. Keep the API reachable only from inside the cluster. Terminal-scoped
-  credentials are the follow-up.
+  (`CAO_AUTH_LOCAL_TOKEN` or an identity provider): agents and runners have no
+  credential to send for their orchestration calls yet. With auth off, as is
+  the default, any client that can reach the API port (`9889`) has full
+  control of every terminal, external clients included. So the API must stay
+  inside the cluster: no Ingress, LoadBalancer or NodePort for `9889`, and a
+  NetworkPolicy that admits only runner pods. That NetworkPolicy protects the
+  API only when the cluster's CNI (network provider) enforces NetworkPolicy;
+  without enforcement the objects are accepted and silently ignored. API
+  authentication with runners is a follow-up.
 - **No user code on the server's host.** Python workflow scripts and flow
   pre-scripts would run as subprocesses on the server's host, beside its
   database. Under the remote backend they are refused (`409`) where they would
@@ -233,7 +236,8 @@ report the server's state as the runner's.
   attach, the browser terminal), git worktrees (`use_worktree`), relative or
   server-validated working directories, Python workflow scripts and flow
   pre-scripts.
-- **API authentication:** not supported with remote runners in this phase.
+- **API authentication:** not supported with remote runners in this phase; keep
+  the API inside the cluster (see [Security](#security)).
 - **Restart window:** every runner id ever seen is a member until it expires,
   and an unrouted terminal or session can be proven absent only once every
   member has reported. Runners named after their pods get new ids on each

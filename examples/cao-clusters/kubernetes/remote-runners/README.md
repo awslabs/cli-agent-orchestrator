@@ -53,9 +53,9 @@ What an overlay must decide:
 | runner | public `:443` | the model provider |
 | every pod | cluster DNS | name resolution |
 
-Nothing reaches a runner: it has no inbound interface and no Service. The hub
-port is never exposed outside the cluster (no Ingress, LoadBalancer or
-NodePort); reach the API with `kubectl port-forward`.
+Nothing reaches a runner: it has no inbound interface and no Service. Neither
+the API port (9889) nor the hub port (9891) is exposed outside the cluster: no
+Ingress, LoadBalancer or NodePort. Reach the API with `kubectl port-forward`.
 
 Two cluster requirements. The network plugin must enforce NetworkPolicy, or
 these objects are accepted and silently ignored: kind's default CNI (kindnet)
@@ -77,7 +77,8 @@ other than loopback.
 Elsewhere, serve `wss://`: mount a certificate and key into `cao-server` and
 set `CAO_RUNNER_TLS_CERT` / `CAO_RUNNER_TLS_KEY`, point the runners at
 `wss://cao-server.cao-remote.svc:9891`, and give them the CA with
-`CAO_RUNNER_CA_FILE` (or terminate TLS in a service mesh in front of the hub).
+`CAO_RUNNER_CA_FILE`. The hub terminates TLS itself; a service mesh is
+optional.
 
 ## Credentials
 
@@ -85,11 +86,14 @@ set `CAO_RUNNER_TLS_CERT` / `CAO_RUNNER_TLS_KEY`, point the runners at
   mounted as a file (`CAO_RUNNER_TOKEN_FILE`) into the server and every runner.
   It authenticates runners to the hub, nothing else: it is not an API
   credential, and neither is accepted in place of the other.
-- **No API token in runner pods.** With `terminal.backend=remote`, `cao-server`
-  refuses to start when API authentication is on (phase 1 of #745), because an
-  agent on a runner would need a credential every pane on that runner could
-  read. Keep the API reachable only through the cluster (the NetworkPolicy
-  above) until terminal-scoped credentials land.
+- **No API authentication in this phase.** With `terminal.backend=remote`,
+  `cao-server` refuses to start when API authentication is configured
+  (`CAO_AUTH_LOCAL_TOKEN` or an identity provider), because agents and runners
+  have no credential to send yet. With auth off, any pod that can reach
+  `cao-server:9889` has full control of every terminal. The API must stay
+  inside the cluster, and the NetworkPolicy above is then its only protection:
+  it protects the API only when the cluster's CNI enforces NetworkPolicy (see
+  the cluster requirements above).
 - **Provider credentials** go only to runner pods (the server runs no agent),
   through the optional `cao-provider-env` ConfigMap and
   `cao-provider-credentials` Secret, or a workload identity.
