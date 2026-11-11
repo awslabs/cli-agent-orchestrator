@@ -40,8 +40,11 @@ The harness also calls `POST /agui/v1/emit_ui`, acting as an agent.
   on both transports at once: `EventSource` on `GET`, and fetch on `POST` with a
   token (auth is off on this server, so any token is accepted; the point is the
   `POST` path).
-- An off-list `emit_ui` call: HTTP 400, and nothing reaches either stream within
-  a 2 s settle window.
+- An off-list `emit_ui` call: HTTP 400, and exactly one refusal frame on each
+  stream within a 2 s settle window (#1158), attributed to the terminal, named
+  `iframe_embed.<8 hex>`, with no props; the marker in the call's props never
+  appears in the stream. With `CAO_E2E_CAPTURE_OFFLIST=<file>` it writes that
+  `RAW` frame to the file (`fixtures/raw-offlist.json` was captured this way).
 - A token stream that drops loses nothing: the first request asks the server to
   end it after 2 s (`forwardedProps.cao.maxSeconds`), a component is emitted
   while the client waits to reconnect, and it must arrive after the reconnect,
