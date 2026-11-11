@@ -346,11 +346,14 @@ def test_decision_catalog_help_and_group_order():
 
     text = (ROOT / "tui/src/catalog.rs").read_text()
     rows = re.findall(r"CommandId::Decisions\w+ => Command \{(.*?)\n        \},", text, re.S)
-    assert len(rows) == 12
+    # Twelve `cao decisions` leaves, and #1199's three `cao decisions match` leaves.
+    assert len(rows) == 15
     for row in rows:
+        parent = re.search(r'parent: Some\("([^"]+)"\)', row).group(1)
         leaf = re.search(r'leaf_name: "([^"]+)"', row).group(1)
         summary = re.search(r'summary: "([^"]+)"', row).group(1)
-        assert summary == decisions.commands[leaf].help.splitlines()[0]
+        group = decisions.commands["match"] if parent == "decisions match" else decisions
+        assert summary == group.commands[leaf].help.splitlines()[0]
     display = text.split("pub(crate) const DISPLAY_ORDER:", 1)[1].split("];", 1)[0]
     names = re.findall(r"CommandId::(\w+)", display)
     expected = [
@@ -358,6 +361,9 @@ def test_decision_catalog_help_and_group_order():
         "DecisionsEnable",
         "DecisionsExclude",
         "DecisionsList",
+        "DecisionsMatchCheck",
+        "DecisionsMatchExplain",
+        "DecisionsMatchShow",
         "DecisionsOff",
         "DecisionsPurge",
         "DecisionsSet",

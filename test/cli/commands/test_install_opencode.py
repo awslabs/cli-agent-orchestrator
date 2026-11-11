@@ -675,7 +675,8 @@ class TestAgentIdCollisionGuard:
 
         result = runner.invoke(install, ["slash-named", "--provider", "opencode_cli"])
 
-        assert result.exit_code == 0  # install_agent returns a failure result, not a crash
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output
         # Refused by the name validation, naming the offending value...
         assert "path separator" in result.output, result.output
@@ -717,7 +718,8 @@ class TestAgentIdCollisionGuard:
 
         # Second install (different file, same resolved name) must be refused.
         r2 = runner.invoke(install, ["profile-two", "--provider", "opencode_cli"])
-        assert r2.exit_code == 0  # returns a failure result, not a crash
+        assert r2.exit_code == 1, r2.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(r2.exception, SystemExit), r2.exception
         assert "Error:" in r2.output
         # The error must name both offending profiles and the shared name.
         assert "profile-one" in r2.output
@@ -926,7 +928,8 @@ class TestAgentIdCollisionGuardInstalledProvenance:
         # Now the id IS owned, and the twin's install would clobber it.
         r_a = runner.invoke(install, ["profile-a", "--provider", "opencode_cli"])
 
-        assert r_a.exit_code == 0
+        assert r_a.exit_code == 1, r_a.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(r_a.exception, SystemExit), r_a.exception
         assert "Error:" in r_a.output, r_a.output
         assert "profile-a" in r_a.output
         assert "profile-b" in r_a.output
@@ -955,7 +958,8 @@ class TestAgentIdCollisionGuardInstalledProvenance:
         _write_profile(store / "profile-b.md", name="shared-alias", body="Second profile.")
         r2 = runner.invoke(install, ["profile-b", "--provider", "opencode_cli"])
 
-        assert r2.exit_code == 0
+        assert r2.exit_code == 1, r2.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(r2.exception, SystemExit), r2.exception
         assert "Error:" in r2.output
         assert "profile-a" in r2.output
         assert "profile-b" in r2.output
@@ -975,7 +979,8 @@ class TestAgentIdCollisionGuardInstalledProvenance:
 
         result = runner.invoke(install, ["legacy-source", "--provider", "opencode_cli"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output, result.output
         assert str(legacy_copy) in result.output
         assert (
@@ -1005,7 +1010,8 @@ class TestAgentIdCollisionGuardInstalledProvenance:
         _write_profile(store / "slash-named.md", name="a/b", body="Second profile.")
         result = runner.invoke(install, ["slash-named", "--provider", "opencode_cli"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output
         assert "path separator" in result.output, result.output
         assert "cannot share an OpenCode agent id" not in result.output

@@ -36,7 +36,49 @@ EFFORT_ROUTE = DecisionPoint(
 PROVIDER_ROUTE = DecisionPoint(
     "provider.route", "Which CLI should run this task?", tuple(p.value for p in ProviderType)
 )
-POINTS = {p.name: p for p in (MODEL_ROUTE, EFFORT_ROUTE, PROVIDER_ROUTE)}
+# #1199 (provisional): four task-feature points, each a yes/no question about the task text.
+# They're asked together, as one request with all four points, and only of a decider that
+# declares all four; one settings switch, FEATURES_SWITCH, turns them off, to shadow or on.
+TASK_LONG_CONTEXT = DecisionPoint(
+    "task.long_context", "Must a very large amount of text be held at once?", ("yes", "no")
+)
+TASK_DEEP_REASONING = DecisionPoint(
+    "task.deep_reasoning", "Does it need long chains of careful reasoning?", ("yes", "no")
+)
+TASK_READ_ONLY = DecisionPoint("task.read_only", "Will it only read and report?", ("yes", "no"))
+TASK_NEEDS_NETWORK = DecisionPoint(
+    "task.needs_network", "Does it need the internet?", ("yes", "no")
+)
+POINTS = {
+    p.name: p
+    for p in (
+        MODEL_ROUTE,
+        EFFORT_ROUTE,
+        PROVIDER_ROUTE,
+        TASK_LONG_CONTEXT,
+        TASK_DEEP_REASONING,
+        TASK_READ_ONLY,
+        TASK_NEEDS_NETWORK,
+    )
+}
+# The feature points in wire order.
+FEATURE_POINTS = (
+    TASK_LONG_CONTEXT.name,
+    TASK_DEEP_REASONING.name,
+    TASK_READ_ONLY.name,
+    TASK_NEEDS_NETWORK.name,
+)
+# Each feature point's name in the closed feature vocabulary, as the records and matcher use it.
+FEATURE_NAMES = {point: point.removeprefix("task.") for point in FEATURE_POINTS}
+# The features the matcher may route on, in its fixed order of importance. needs_network is
+# advisory only: it adds a hint to the delegation note and never routes.
+ROUTING_FEATURES = ("long_context", "deep_reasoning", "read_only")
+# The launch-routing points: the only ones a launch may declare as a field.
+ROUTE_POINTS = (MODEL_ROUTE.name, EFFORT_ROUTE.name, PROVIDER_ROUTE.name)
+FEATURES_SWITCH = "task.features"
+# The settings switches: every key `decisions.points` and `cao decisions set` accept. The four
+# feature points share FEATURES_SWITCH, so they are points but not switches.
+SWITCHES = ROUTE_POINTS + (FEATURES_SWITCH,)
 
 
 @dataclass(frozen=True)
@@ -119,3 +161,6 @@ class LaunchPlan:
     # fallback; terminal_service.resolve_launch_provider runs that launch on it, and nothing
     # shared records it (#1099, as for the model and effort).
     provider: str | None = None
+    # #1199 (provisional): advisory hints for the delegation note, from a closed vocabulary
+    # ("needs_network"). They never change the launch.
+    hints: tuple[str, ...] = ()
