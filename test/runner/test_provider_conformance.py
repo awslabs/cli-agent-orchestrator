@@ -32,6 +32,11 @@ launch does on this host, from its own thread and from any work it starts
   that exposes provider areas and other terminals' staged files); a write
   anywhere outside the control plane and the terminal's staging, links and
   moves included, which is also refused so the launch leaves nothing here;
+- the same reads, writes and spawns reached through names no patch covers
+  (``io.FileIO``, ``os.remove``, ``os.truncate``, ``os.utime``,
+  ``sqlite3.connect``, ``os.posix_spawnp``, exec, fork, shutil copies, moves
+  and ``rmtree``...), seen through an interpreter audit hook (PEP 578);
+  ``os.mkfifo`` and ``os.mknod``, which raise no audit event, are patched;
 - a path under the server's HOME, CAO_HOME_DIR (except staged files), working
   directory or temp dir baked into a command the launch sends. A literal ``~`` or ``$HOME``
   is not recorded: the runner's shell expands it to the runner's home.
@@ -62,9 +67,11 @@ these providers anyway, and a ported provider faces the strict check above):
   filesystem; :data:`KNOWN_OUTCOMES` pins where each launch stops, so a stop
   that moves is still seen.
 
-Port order for the refused providers: copilot_cli (its server-side ``--help``
-probe silently drops ``--additional-mcp-config``), codex, kiro_cli, then the
-rest by usage.
+Port order for the refused providers, as agreed on #745: kiro_cli (two
+capability probes and its agent-directory checks, the broadest test of the
+contract), codex, copilot_cli (its server-side ``--help`` probe silently drops
+``--additional-mcp-config``), then the rest by usage. Each port comes with its
+row here and one live run on a runner.
 """
 
 import asyncio
@@ -249,6 +256,99 @@ class _Sandbox:
         text = self._abs(path)
         return text is not None and not self._cao_owned(text, self.writable, op)
 
+    def refuse_write(self, name, path) -> None:
+        self.record("write", f"{name} {os.fspath(path)}")
+        raise PermissionError(f"no writes outside CAO's control plane: {path}")
+
+    def audit(self, event: str, args: tuple) -> None:
+        """Judge an interpreter audit event (see :func:`_audit_hook`).
+
+        The patched functions below catch the common names; this catches the
+        same operations reached any other way (``io.FileIO``, ``os.remove``,
+        ``sqlite3.connect``, ``os.posix_spawnp``, ...). An event a patch has
+        already refused never gets here, and one it recorded is recorded under
+        the same text, so nothing is counted twice.
+        """
+        if event == "open":
+            path, mode, flags = (tuple(args) + (None, None, None))[:3]
+            if path is None or isinstance(path, int):
+                return  # an fd: its open was judged when it was opened
+            writes = (isinstance(mode, str) and any(c in mode for c in "wax+")) or (
+                isinstance(flags, int) and bool(flags & _WRITE_FLAGS)
+            )
+            if writes:
+                if self.host_write(path, "open"):
+                    self.refuse_write("open", path)
+            elif self.host_read(path, "open"):
+                self.record("host read", f"open {os.fspath(path)}")
+        elif event in _AUDITED_PATH_WRITES:
+            path = args[0] if args else None
+            if path is not None and not isinstance(path, int) and self.host_write(path, event):
+                self.refuse_write(event, path)
+        elif event in _AUDITED_DESTINATION_WRITES:
+            if len(args) >= 2 and self.host_write(args[1], event):
+                self.refuse_write(event, args[1])
+        elif event == "sqlite3.connect":
+            database = os.fspath(args[0]) if args else ":memory:"
+            if isinstance(database, bytes):
+                database = database.decode(errors="replace")
+            if database == ":memory:" or database.startswith("file::memory:"):
+                return
+            if self.host_write(database.removeprefix("file:").split("?")[0], event):
+                self.refuse_write(event, database)
+        elif event in _AUDITED_SPAWNS:
+            program = os.path.basename(os.fspath(args[0])) if args and args[0] else ""
+            self.record("spawn", f"{event} {program}".rstrip())
+            raise OSError("no processes on cao-server under the remote backend")
+        elif event == "glob.glob":
+            pattern = args[0] if args else None
+            if isinstance(pattern, (str, bytes)) and self.host_read(
+                os.path.dirname(os.fspath(pattern)) or ".", "os.listdir"
+            ):
+                self.record("host read", f"glob.glob {os.fspath(pattern)}")
+
+
+# Interpreter audit events (PEP 578) the sandbox judges beyond its patches.
+# A path event's first argument is the path written.
+_AUDITED_PATH_WRITES = frozenset(
+    {
+        "os.remove",
+        "os.truncate",
+        "os.utime",
+        "os.chown",
+        "os.chflags",
+        "os.setxattr",
+        "os.removexattr",
+        "shutil.rmtree",
+        "shutil.chown",
+    }
+)
+# (src, dst): the destination is written.
+_AUDITED_DESTINATION_WRITES = frozenset(
+    {"shutil.copyfile", "shutil.copymode", "shutil.copystat", "shutil.copytree", "shutil.move"}
+)
+_AUDITED_SPAWNS = frozenset({"os.posix_spawn", "os.exec", "os.fork", "os.forkpty", "os.spawn"})
+
+# The sandbox the audit hook reports to, or None. A hook cannot be removed once
+# added, so one is added for the process and does nothing while this is None.
+_AUDIT_TARGET: Dict[str, object] = {"sandbox": None}
+_AUDIT_LOCAL = threading.local()
+
+
+def _audit_hook(event: str, args: tuple) -> None:
+    box = _AUDIT_TARGET["sandbox"]
+    if box is None or getattr(_AUDIT_LOCAL, "busy", False):
+        return
+    _AUDIT_LOCAL.busy = True  # judging an event must not judge its own I/O
+    try:
+        if box.watching():  # type: ignore[attr-defined]
+            box.audit(event, args)  # type: ignore[attr-defined]
+    finally:
+        _AUDIT_LOCAL.busy = False
+
+
+sys.addaudithook(_audit_hook)
+
 
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 
@@ -347,9 +447,7 @@ def sandbox(monkeypatch, tmp_path, tmp_path_factory):
     # control plane counts. Writes: anything outside the control plane and this
     # terminal's staging counts (a scratch dir under /tmp is execution-host work
     # too), and is refused so a launch leaves nothing behind on this host.
-    def refuse_write(name, path):
-        box.record("write", f"{name} {os.fspath(path)}")
-        raise PermissionError(f"no writes outside CAO's control plane: {path}")
+    refuse_write = box.refuse_write
 
     def guard_open(name, real, is_write):
         def guarded(path, *args, **kwargs):
@@ -382,7 +480,8 @@ def sandbox(monkeypatch, tmp_path, tmp_path_factory):
     monkeypatch.setattr(os, "open", guard_open("os.open", os.open, flags_write))
     for name in ("stat", "lstat", "listdir", "scandir", "access"):
         monkeypatch.setattr(os, name, guard_open(f"os.{name}", getattr(os, name), never))
-    for name in ("mkdir", "chmod", "unlink", "rmdir"):
+    # mkfifo and mknod raise no audit event, so they are patched like mkdir.
+    for name in ("mkdir", "chmod", "unlink", "rmdir", "mkfifo", "mknod"):
         monkeypatch.setattr(os, name, guard_open(f"os.{name}", getattr(os, name), always))
     # Path.mkdir(exist_ok=True) and os.makedirs(exist_ok=True) swallow an error
     # when the directory already exists here, so a refused os.mkdir alone would
@@ -416,7 +515,12 @@ def sandbox(monkeypatch, tmp_path, tmp_path_factory):
             return _real(src, dst, *args, **kwargs)
 
         monkeypatch.setattr(os, name, move)
-    return box
+    # Everything else the interpreter audits (PEP 578): see _Sandbox.audit.
+    _AUDIT_TARGET["sandbox"] = box
+    try:
+        yield box
+    finally:
+        _AUDIT_TARGET["sandbox"] = None
 
 
 class _FakeRemoteBackend:
@@ -568,6 +672,17 @@ def test_the_sandbox_records_every_primitive_from_every_kind_of_thread(sandbox):
         "Path.symlink_to outside": lambda: (scratch / "ln2").symlink_to(target),
         "os.link outside": lambda: os.link(target, scratch / "hl"),
         "listdir of CAO_HOME_DIR": lambda: os.listdir(sandbox.cao_home),
+        # Reached through names no patch covers; the audit hook sees them.
+        "io.FileIO read": lambda: io.FileIO(target).close(),
+        "io.FileIO write outside": lambda: io.FileIO(scratch / "fio", "w").close(),
+        "os.remove": lambda: os.remove(target + ".nope"),
+        "os.truncate": lambda: os.truncate(target, 0),
+        "os.utime": lambda: os.utime(target),
+        "sqlite3.connect outside": lambda: __import__("sqlite3").connect(scratch / "db").close(),
+        "os.mkfifo outside": lambda: os.mkfifo(scratch / "fifo"),
+        "os.posix_spawnp": lambda: os.posix_spawnp("true", ["true"], dict(os.environ)),
+        "shutil.copyfile outside": lambda: shutil.copyfile(target, scratch / "copy"),
+        "shutil.rmtree outside": lambda: shutil.rmtree(scratch / "nothing-here"),
         "read in the server cwd": lambda: builtins.open(
             os.path.join(sandbox.cwd, "pyproject.toml")
         ).close(),
@@ -742,13 +857,13 @@ KNOWN_VIOLATIONS: Dict[str, List[str]] = {
     "grok_cli": [
         "host read: os.lstat $CAO_HOME/grok",
         "host read: os.lstat $CAO_HOME/grok/terminals",
-        "host read: os.lstat $CAO_HOME/grok/terminals/<terminal>",
         "host read: os.stat $CAO_HOME/grok",
         "host read: os.stat $CAO_HOME/grok/terminals",
         "host read: os.stat $CAO_HOME/grok/terminals/<terminal>",
         "uid: geteuid",
         "which: grok",
         "write: Path.mkdir $CAO_HOME/grok/terminals/<terminal>",
+        "write: shutil.rmtree $CAO_HOME/grok/terminals/<terminal>",
     ],
     "kimi_cli": [
         "host read: os.stat /tmp/cao_kimi_<uid>",
