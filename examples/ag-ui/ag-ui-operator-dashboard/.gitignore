@@ -1,3 +1,5 @@
 node_modules/
 dist/
 coverage/
+e2e/artifacts/
+e2e/test-results/
