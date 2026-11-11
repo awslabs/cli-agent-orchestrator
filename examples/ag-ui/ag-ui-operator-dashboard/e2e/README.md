@@ -99,3 +99,16 @@ real Claude Code permission prompt through `core/` (#1156). It is never run by
 `npm run e2e` or by CI, because it needs a logged-in Claude Code and spends two
 model turns. Its header says what it touches; run `./e2e/live-claude-code.sh
 --dry-run` to see what it would do. The app's README has its usage.
+
+## Timeline screenshot (browser)
+
+After `e2e.ts`, `run.sh` runs `timeline.spec.ts` with Playwright, against the same
+private server. It opens the dashboard at `127.0.0.1:5173` (vite, started by
+`playwright.config.ts`), starts an assign and a handoff from a supervisor
+terminal, and checks that the session timeline panel renders both calls. The
+panel is saved to `e2e/artifacts/timeline-panel.png`. A missing panel fails the
+run. A failing run keeps its screenshot and video under `e2e/test-results/`.
+
+The browser is Chromium from `npm run playwright:install`, which the CI job runs
+as its own step. Locally, set `CAO_E2E_CHROME` to an installed Chromium to reuse
+it. The script never installs a browser.
