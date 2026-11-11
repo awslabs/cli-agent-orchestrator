@@ -105,3 +105,67 @@ def test_a_remote_error_reply_decodes_to_the_502_class():
         raise_remote_error({"kind": "backend_error", "message": "boom"}, "a")
     with pytest.raises(RunnerReportedError):
         raise_remote_error({"kind": "something new"}, "a")
+
+
+@pytest.mark.parametrize("error,expected", ERRORS, ids=["503", "504", "502"])
+def test_session_terminals_maps_runner_errors(client, error, expected):
+    from cli_agent_orchestrator.services import session_service
+
+    with patch.object(session_service, "list_current_session_terminals", side_effect=error):
+        response = client.get("/sessions/cao-remote/terminals")
+    assert response.status_code == expected, response.text
+
+
+@pytest.mark.parametrize("error,expected", ERRORS, ids=["503", "504", "502"])
+def test_flow_run_maps_runner_errors(client, error, expected):
+    from unittest.mock import AsyncMock
+
+    with patch(
+        "cli_agent_orchestrator.api.main.flow_service.execute_flow",
+        new=AsyncMock(side_effect=error),
+    ):
+        response = client.post("/flows/nightly/run")
+    assert response.status_code == expected, response.text
+
+
+@pytest.mark.parametrize("error,expected", ERRORS, ids=["503", "504", "502"])
+def test_flow_run_maps_a_wrapped_runner_error(client, error, expected):
+    from unittest.mock import AsyncMock
+
+    try:
+        raise RuntimeError("could not create the flow's terminal") from error
+    except RuntimeError as wrapped:
+        failure = wrapped
+    with patch(
+        "cli_agent_orchestrator.api.main.flow_service.execute_flow",
+        new=AsyncMock(side_effect=failure),
+    ):
+        response = client.post("/flows/nightly/run")
+    assert response.status_code == expected, response.text
+
+
+def test_flow_run_answers_a_provider_refusal_with_400_not_404(client):
+    """The flow exists; the remote backend cannot run its provider (#745)."""
+    from unittest.mock import AsyncMock
+
+    from cli_agent_orchestrator.services.terminal_service import UnsupportedProviderError
+
+    refusal = UnsupportedProviderError("provider 'kiro_cli' cannot run on remote runners yet")
+    with patch(
+        "cli_agent_orchestrator.api.main.flow_service.execute_flow",
+        new=AsyncMock(side_effect=refusal),
+    ):
+        response = client.post("/flows/nightly/run")
+    assert response.status_code == 400, response.text
+    assert "kiro_cli" in response.json()["detail"]
+
+
+def test_flow_run_still_answers_a_missing_flow_with_404(client):
+    from unittest.mock import AsyncMock
+
+    with patch(
+        "cli_agent_orchestrator.api.main.flow_service.execute_flow",
+        new=AsyncMock(side_effect=ValueError("Flow 'nightly' not found")),
+    ):
+        response = client.post("/flows/nightly/run")
+    assert response.status_code == 404

@@ -216,6 +216,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     IdempotentCreateFailed,
     OutputMode,
     TerminalInputBlockedError,
+    UnsupportedProviderError,
     _notify_elastic_terminal_ended,
 )
 from cli_agent_orchestrator.services.workflow_journal import (
@@ -10708,9 +10709,15 @@ async def run_flow(
         return {"executed": executed}
     except ServerHostCodeRefused as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except UnsupportedProviderError as e:
+        # The flow exists; the backend cannot run its provider (#745).
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to execute flow: {str(e)}",

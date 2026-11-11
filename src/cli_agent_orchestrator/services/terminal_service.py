@@ -211,6 +211,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class UnsupportedProviderError(ValueError):
+    """The active backend cannot run this provider (the remote backend, #745).
+
+    A ``ValueError``, so the routes that answer a bad create request with 400
+    keep doing so; a route whose ``ValueError`` means "not found" tells the
+    two apart.
+    """
+
+
 #: Every orchestration-type value that marks input as machine-originated, derived
 #: from the enum rather than hand-enumerated (#896). The dialog guard in
 #: ``send_input`` used to test ``{ASSIGN, HANDOFF}`` and ``SEND_MESSAGE`` walked
@@ -2443,7 +2453,7 @@ async def _create_terminal_unguarded(
         # Only a string is a refusal: a duck-typed backend may not define the
         # hook at all, and a test double answers it with arbitrary objects.
         if isinstance(reason, str) and reason:
-            raise ValueError(reason)
+            raise UnsupportedProviderError(reason)
 
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
         # resource. A v3 request must probe then fail closed with no window,
