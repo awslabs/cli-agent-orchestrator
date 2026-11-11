@@ -58,11 +58,13 @@ from cli_agent_orchestrator.runner.protocol import (
     CLOSE_REPLACED,
     HANDSHAKE_TIMEOUT,
     MAX_FRAME_BYTES,
+    MAX_REPORT_ENTRIES,
     PING_INTERVAL,
     PING_TIMEOUT,
     PROTOCOL_VERSION,
     RUNNER_ID_PATTERN,
     SEND_TIMEOUT,
+    TERMINAL_ID_PATTERN,
     TOKEN_HEADER,
     RunnerOutcomeUnknown,
     RunnerUnavailable,
@@ -549,16 +551,28 @@ class RunnerHub:
                 refuse = True
             else:
                 refuse = False
+                previous_member = self._members.get(info.runner_id)
                 self._conns[info.runner_id] = conn
                 self._members[info.runner_id] = _Member(
                     claims=info.claims, last_seen=time.time(), reported=True
                 )
-                report = self._replace_runner_routes(
-                    info.runner_id, hello.get("terminals") or [], hello.get("creating") or []
-                )
-                restore = self._streams_to_restore_locked(
-                    info.runner_id, hello.get("pipes"), report
-                )
+                try:
+                    report = self._replace_runner_routes(
+                        info.runner_id, hello.get("terminals") or [], hello.get("creating") or []
+                    )
+                    restore = self._streams_to_restore_locked(
+                        info.runner_id, hello.get("pipes"), report
+                    )
+                except Exception:
+                    # Never leave a registration behind that no connection
+                    # serves: it would refuse the runner's next hello (4409)
+                    # until the server restarts.
+                    del self._conns[info.runner_id]
+                    if previous_member is None:
+                        self._members.pop(info.runner_id, None)
+                    else:
+                        self._members[info.runner_id] = previous_member
+                    raise
                 self._save_state_locked()
                 self._changed.notify_all()
         if refuse:
@@ -622,7 +636,11 @@ class RunnerHub:
         if not isinstance(hello, dict) or hello.get("type") != "hello":
             return None
         runner_id = hello.get("runner_id")
-        if not isinstance(runner_id, str) or not RUNNER_ID_PATTERN.match(runner_id):
+        if not isinstance(runner_id, str) or not RUNNER_ID_PATTERN.fullmatch(runner_id):
+            return None
+        if not RunnerHub._valid_report(
+            hello.get("terminals"), hello.get("creating"), hello.get("pipes")
+        ):
             return None
         claims = hello.get("claims") or []
         max_terminals = hello.get("max_terminals")
@@ -644,6 +662,24 @@ class RunnerHub:
             tmp_dir=tmp_dir,
         )
 
+    @staticmethod
+    def _valid_report(terminals: Any, creating: Any, pipes: Any = None) -> bool:
+        """Whether a hello's or inventory's lists have the shape the hub folds in.
+
+        Each may be absent; present, it is a bounded list of the right kind. A
+        malformed entry inside ``terminals`` is skipped later, but a list that
+        is not a list (a number, a string) would fail half way through
+        registration.
+        """
+        for value, kind in ((terminals, dict), (creating, str), (pipes, str)):
+            if value is None:
+                continue
+            if not isinstance(value, list) or len(value) > MAX_REPORT_ENTRIES:
+                return False
+            if not all(isinstance(v, kind) for v in value):
+                return False
+        return True
+
     def _on_frame(self, conn: _Connection, raw: Any) -> None:
         frame = _decode_frame(raw)
         if frame is None:
@@ -660,6 +696,9 @@ class RunnerHub:
         elif kind == "gap":
             self._on_gap(conn.info.runner_id, frame)
         elif kind == "inventory":
+            if not self._valid_report(frame.get("terminals"), frame.get("creating")):
+                logger.warning(f"runner {conn.info.runner_id}: dropped a malformed inventory")
+                return
             with self._changed:
                 report = self._reconcile_inventory(
                     conn.info.runner_id, frame.get("terminals") or [], frame.get("creating") or []
@@ -900,7 +939,10 @@ class RunnerHub:
             session, window = entry.get("session"), entry.get("window")
             if isinstance(session, str) and isinstance(window, str):
                 terminal_id = entry.get("terminal_id")
-                parsed[(session, window)] = terminal_id if isinstance(terminal_id, str) else None
+                # Only a well-formed id names a terminal: anything else is a
+                # window the runner cannot vouch for, like one with no id.
+                valid = isinstance(terminal_id, str) and TERMINAL_ID_PATTERN.fullmatch(terminal_id)
+                parsed[(session, window)] = terminal_id if valid else None
         return parsed
 
     def _displace_locked(

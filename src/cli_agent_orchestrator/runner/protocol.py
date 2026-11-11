@@ -61,12 +61,20 @@ CLOSE_PROTOCOL_MISMATCH = 4400
 CLOSE_BAD_HELLO = 4422
 CLOSE_REPLACED = 4409
 
+# Each pattern is used with fullmatch(): with match(), "$" also matches before a
+# trailing newline, so "victim\n" would pass for "victim".
+
 # Runner ids become log fields and routing keys; keep them boring.
 RUNNER_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
 # A CAO terminal id (``utils.terminal.generate_terminal_id``), as read back from
 # a tmux window's ``@cao_terminal_id`` when a restarted runner re-adopts it.
 TERMINAL_ID_PATTERN = re.compile(r"^[0-9a-f]{8}$")
+
+# The most windows, creates or pipes one hello or inventory may list. A report
+# is folded in route by route under the hub lock, so an unbounded one would
+# stall every other runner and API call on that hub.
+MAX_REPORT_ENTRIES = 1024
 
 # A staged provider file is addressed by bare name inside the runner's own
 # CAO tmp dir. It must start with the 8-hex terminal id it belongs to and can

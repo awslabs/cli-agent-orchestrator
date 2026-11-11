@@ -144,7 +144,7 @@ class Runner:
         ready_file: Optional[str] = None,
         ca_file: Optional[str] = None,
     ) -> None:
-        if not RUNNER_ID_PATTERN.match(runner_id):
+        if not RUNNER_ID_PATTERN.fullmatch(runner_id):
             raise ValueError(f"invalid runner id {runner_id!r}")
         self.server_url = server_url
         self._token = token
@@ -348,7 +348,7 @@ class Runner:
             if (
                 len(parts) != 4
                 or parts[3] != self.runner_id
-                or not TERMINAL_ID_PATTERN.match(parts[2])
+                or not TERMINAL_ID_PATTERN.fullmatch(parts[2])
             ):
                 continue
             with self._lock:
@@ -651,7 +651,7 @@ class Runner:
         written = 0
         for entry in files:
             name = entry.get("name") if isinstance(entry, dict) else None
-            if not isinstance(name, str) or not STAGED_FILE_PATTERN.match(name):
+            if not isinstance(name, str) or not STAGED_FILE_PATTERN.fullmatch(name):
                 raise ValueError(f"refusing to stage file {name!r}")
             data = base64.b64decode(entry.get("data") or "", validate=True)
             if len(data) > MAX_STAGED_FILE_BYTES:

@@ -983,3 +983,102 @@ class TestReconnectAfterAFailedUpgrade:
             assert isinstance(r.task.exception(), SystemExit)
         finally:
             r.stop()
+
+
+class TestMalformedHellos:
+    """A hello the hub cannot fold in is refused before it registers anything (#745).
+
+    Before, ``"terminals": 5`` passed the hello check, failed half way through
+    registration, and left the runner id registered with no connection: its
+    next, correct hello got 4409 until the server restarted.
+    """
+
+    @staticmethod
+    def _hello(runner_id="victim", **extra):
+        from cli_agent_orchestrator.runner.protocol import PROTOCOL_VERSION
+
+        hello = {
+            "type": "hello",
+            "protocol": PROTOCOL_VERSION,
+            "runner_id": runner_id,
+            "claims": [],
+            "accepts_unclaimed": True,
+            "max_terminals": 1,
+            "tmp_dir": "/tmp/cao-x",
+            "terminals": [],
+            "creating": [],
+            "pipes": [],
+        }
+        hello.update(extra)
+        return hello
+
+    @staticmethod
+    def _exchange(hub, hello):
+        """Send ``hello``; the close code, or "welcome"."""
+        import json
+
+        from websockets.asyncio.client import connect
+        from websockets.exceptions import ConnectionClosed
+
+        async def run():
+            async with connect(
+                f"ws://127.0.0.1:{hub.port}",
+                additional_headers={"Authorization": f"Bearer {TOKEN}"},
+            ) as ws:
+                await ws.send(json.dumps(hello))
+                try:
+                    reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+                except ConnectionClosed as exc:
+                    return exc.rcvd.code if exc.rcvd else None
+                return reply.get("type")
+
+        return asyncio.run(run())
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("terminals", 5),
+            ("terminals", "s:w"),
+            ("terminals", ["s:w"]),
+            ("creating", 7),
+            ("creating", [1]),
+            ("pipes", {"p": 1}),
+            ("terminals", [{"session": "s", "window": str(i)} for i in range(1025)]),
+        ],
+    )
+    def test_a_malformed_report_is_a_bad_hello_and_leaves_no_registration(self, hub, field, value):
+        from cli_agent_orchestrator.runner.protocol import CLOSE_BAD_HELLO
+
+        assert self._exchange(hub, self._hello(**{field: value})) == CLOSE_BAD_HELLO
+        assert "victim" not in hub.connected_runners()
+        assert self._exchange(hub, self._hello()) == "welcome"
+
+    def test_a_runner_id_with_a_trailing_newline_is_refused(self, hub):
+        from cli_agent_orchestrator.runner.protocol import CLOSE_BAD_HELLO
+
+        assert self._exchange(hub, self._hello(runner_id="victim\n")) == CLOSE_BAD_HELLO
+
+    def test_a_failed_registration_is_undone(self, hub, monkeypatch):
+        calls = []
+        original = hub._replace_runner_routes
+
+        def fail_once(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise TypeError("boom")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(hub, "_replace_runner_routes", fail_once)
+        self._exchange(hub, self._hello())
+        assert "victim" not in hub.connected_runners()
+        assert self._exchange(hub, self._hello()) == "welcome"
+
+    def test_a_reported_id_that_is_not_a_terminal_id_names_no_terminal(self):
+        parsed = RunnerHub._parse_terminals(
+            [
+                {"session": "s", "window": "a", "terminal_id": "aaaaaaaa"},
+                {"session": "s", "window": "b", "terminal_id": "aaaaaaaa\n"},
+                {"session": "s", "window": "c", "terminal_id": "../etc"},
+            ]
+        )
+        assert parsed == {("s", "a"): "aaaaaaaa", ("s", "b"): None, ("s", "c"): None}
