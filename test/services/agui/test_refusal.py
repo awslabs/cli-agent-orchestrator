@@ -40,7 +40,7 @@ _VALID = re.compile(r"^[A-Za-z0-9_.-]{0,55}\.[0-9a-f]{8}$")
 )
 def test_a_name_stays_bounded_and_valid(raw: str) -> None:
     name = refusal_name(raw)
-    assert len(name.encode("utf-8")) <= 64
+    assert len(name.encode("utf-8")) <= 33  # 24 visible characters, ".", 8 hex digits
     assert _VALID.match(name), name
     want = hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()[:8]
     assert name.endswith("." + want)
@@ -218,4 +218,4 @@ def test_the_visible_prefix_is_short_and_the_hash_keeps_names_apart() -> None:
     assert name_a != name_b  # same visible prefix, different hash
     assert len(name_a) == REFUSAL_NAME_PREFIX_CHARS + 1 + 8
     secret = "AKIAIOSFODNN7EXAMPLE" + "x" * 60
-    assert len(refusal_name(secret)) <= 64
+    assert len(refusal_name(secret)) == REFUSAL_NAME_PREFIX_CHARS + 1 + 8

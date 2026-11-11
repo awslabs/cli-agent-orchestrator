@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An off-list `emit_ui` call now shows as refused on the AG-UI stream** (#1158). The caller
   still gets the same 400, and the component still never renders. The server also publishes a
   metadata-only refusal record: the requested name with every unsafe character replaced and a
-  short hash always appended (at most 64 bytes, never equal to an allow-listed name), and the
+  short hash always appended (at most 33 bytes, never equal to an allow-listed name), and the
   terminal only if CAO knows it. The props are never read. Repeats are deduped and
   rate-limited per terminal and per server, and folded into a `more_refused` count. Refusals
   hold at most a tenth of the event log, so real events keep their replay horizon; only refusals inside the 24 h window count, and a server warning is logged when that share fills. The visible part of the name is caller text, cut to 24 characters. The record

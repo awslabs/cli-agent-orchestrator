@@ -7,8 +7,8 @@ were folded into it, a count. Nothing else from the request is copied into it,
 and the props are never read.
 
 - :func:`refusal_name` cleans the requested name to ``[A-Za-z0-9_.-]`` and
-  always appends a short hash of the original, so the result is at most 64
-  bytes and can never equal an allow-listed name (none contains a ``.``).
+  always appends a short hash of the original, so the result is at most 33
+  bytes (24 + "." + 8 hex digits) and can never equal an allow-listed name (none contains a ``.``).
 - :class:`RefusalLimiter` decides whether a refusal is published. It dedupes by
   (terminal, name, window), limits each terminal (and, overall, the whole
   server) per window, and folds what it holds back into a count carried by
@@ -32,7 +32,6 @@ from typing import Any, Callable, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
 
-REFUSAL_NAME_MAX_BYTES = 64
 REFUSAL_HASH_CHARS = 8
 # The visible, cleaned prefix of the requested name. It is caller text, not redacted,
 # so it is kept short: the hash is what keeps two names apart.
@@ -90,7 +89,7 @@ def refusal_name(raw: str) -> str:
     ``REFUSAL_NAME_PREFIX_CHARS`` characters, and ``.`` plus the first 8 hex
     digits of the SHA-256 of the whole original is always appended. The prefix
     is caller text, not redacted; only the length is bounded. Every replacement
-    is one ASCII byte, so the name is at most 64 bytes.
+    is one ASCII byte, so the name is at most 33 bytes: 24 + "." + 8 hex digits.
     """
     digest = hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()[:REFUSAL_HASH_CHARS]
     cleaned = "".join(c if c in _SAFE else "_" for c in raw[:_PREFIX_CHARS])

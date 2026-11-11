@@ -337,7 +337,7 @@ data: {"type": "RAW", "source": "cao", "subagentRunId": "terminal:<id>",
 
 - **The name** has every character outside `[A-Za-z0-9_.-]` replaced by `_`, is
   cut to 24 characters, and always ends in `.` and 8 hex digits of the SHA-256 of
-  the requested name. It is at most 64 bytes, and it can never equal an
+  the requested name. It is at most 33 bytes (24 characters, `.`, 8 hex digits), and it can never equal an
   allow-listed name, so the stream can never render it as one. The name is
   caller text, not redacted: the visible part is what the caller sent, cleaned
   of unsafe characters and cut short, so an agent that puts message text in
