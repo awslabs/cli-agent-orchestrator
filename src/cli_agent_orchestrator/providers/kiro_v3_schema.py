@@ -6,7 +6,8 @@ capability set, tag membership. A rule one engine accepts can make another fall
 back to its full-tool ``Default`` agent, and a misspelled capability is dropped
 with only a log line. So CAO does not trust any version that merely advertises
 the flags: each supported kiro-cli version maps to one pinned engine schema, and
-any other version refuses v3 before allocation. v2 is never affected.
+strict mode refuses other versions before allocation. Observed admission may
+borrow an eligible same-major schema by operator opt-in. v2 is never affected.
 
 Each schema records CAO's reading of one engine: the agent-file keys, the MCP
 server fields, the rule keys, effects and capabilities, the selector-to-tool map
@@ -21,6 +22,7 @@ Everything in this module is provisional for #1167 Phase 1.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping, Optional, Tuple
@@ -265,7 +267,7 @@ class KiroCliVersionEntry:
     basis: str
 
 
-#: The kiro-cli versions CAO supports for v3. Any other version refuses v3.
+#: Pinned kiro-cli versions for v3; strict admission refuses any other version.
 SUPPORTED_KIRO_CLI_VERSIONS: Mapping[str, KiroCliVersionEntry] = MappingProxyType(
     {
         "2.35.1": KiroCliVersionEntry(
@@ -440,6 +442,66 @@ def require_launchable_kiro_v3_version(
     if entry.pending_operator_verification and not allow_unverified:
         raise KiroV3UnverifiedVersionError(entry.cli_version)
     return entry
+
+
+class KiroV3ObservedRefusal(KiroV3Refusal):
+    """An unlisted version failed an observed-admission condition."""
+
+    code = "kiro_v3_observed_refused"
+
+    def __init__(self, version: Optional[str], condition: str) -> None:
+        super().__init__(
+            f"{self.code}: kiro-cli {version or 'unknown'}: {condition}. "
+            "Use a supported kiro-cli version, or have the operator qualify its schema "
+            "and configure kiro.v3_allow_unverified_versions for pending rows."
+        )
+        self.version = version
+
+
+def observed_kiro_v3_entry(
+    version: Optional[str], *, allow_unverified: bool = False
+) -> KiroCliVersionEntry:
+    """Borrow the newest same-major predecessor for an unlisted version.
+
+    Listed versions retain their strict launch rules. This selects a schema,
+    never replaces the capability probe or any live launch check.
+    """
+    if version in SUPPORTED_KIRO_CLI_VERSIONS:
+        return require_launchable_kiro_v3_version(version, allow_unverified=allow_unverified)
+    if (
+        not version
+        or re.fullmatch(r"(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})", version)
+        is None
+    ):
+        raise KiroV3ObservedRefusal(version, "version must parse as MAJOR.MINOR.PATCH")
+    try:
+        parsed = tuple(int(part) for part in version.split("."))
+    except ValueError:
+        raise KiroV3ObservedRefusal(version, "version must parse as MAJOR.MINOR.PATCH") from None
+    if parsed < (2, 35, 1):
+        raise KiroV3ObservedRefusal(version, "version is below the 2.35.1 floor")
+    if parsed >= (4, 0, 0):
+        raise KiroV3ObservedRefusal(version, "version reaches the 4.0.0 ceiling")
+    predecessors = [
+        entry
+        for entry in SUPPORTED_KIRO_CLI_VERSIONS.values()
+        if int(entry.cli_version.split(".")[0]) == parsed[0]
+        and tuple(int(part) for part in entry.cli_version.split(".")) <= parsed
+    ]
+    if not predecessors:
+        raise KiroV3ObservedRefusal(version, "no same major schema row at or below this version")
+    newest = max(
+        predecessors, key=lambda entry: tuple(int(part) for part in entry.cli_version.split("."))
+    )
+    if newest.pending_operator_verification and not allow_unverified:
+        raise KiroV3UnverifiedVersionError(
+            newest.cli_version,
+            remedy=(
+                "Use a supported verified kiro-cli version, or enable "
+                "kiro.v3_allow_unverified_versions to admit this borrowed schema."
+            ),
+        )
+    return newest
 
 
 def pinned_kiro_v3_schemas() -> Tuple[KiroV3EngineSchema, ...]:
