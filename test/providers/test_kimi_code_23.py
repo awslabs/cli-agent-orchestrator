@@ -23,7 +23,11 @@ from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 ECHO = " \x1b[38;5;222m❯ Read example.txt.\x1b[39m\n"
 ANSWER = " \x1b[38;5;253m● \x1b[39mThe value is green.\n"
 TOOL = " \x1b[38;5;253m● \x1b[1m\x1b[38;5;111mUsed Read\x1b[0m (example.txt) · 1 line\n"
-FOOTER = "\n ╭────────────╮\n │ >          │\n ╰────────────╯\ncontext: 5% (100/2000)\n"
+FOOTER = (
+    "\n \x1b[38;5;240m╭────────────╮\x1b[39m\n"
+    " \x1b[38;5;240m│\x1b[39m >          \x1b[38;5;240m│\x1b[39m\n"
+    " \x1b[38;5;240m╰────────────╯\x1b[39m\ncontext: 5% (100/2000)\n"
+)
 TRUST = """────────────────────────────────────────────────────
   Trust this folder?
   ↑↓ navigate · Enter select · Esc exit
@@ -279,23 +283,46 @@ def test_legacy_completion_reuses_submission_check_until_next_turn(provider, mon
     assert ready_status(provider) is TerminalStatus.PROCESSING
 
 
-def test_submission_check_discards_snapshot_changed_during_parse(
-    provider, monkeypatch, completion_probe
+@pytest.mark.parametrize("glyph", ["✨", "❯"])
+def test_submission_check_caches_result_during_idle_redraw(
+    provider, monkeypatch, completion_probe, glyph
 ):
     _, backend = completion_probe
-    provider._swarm_stream = io.StringIO(ECHO.replace("❯", "✨") + "⠋ Thinking…\n")
+    provider._swarm_stream = io.StringIO(ECHO.replace("❯", glyph) + "⠋ Thinking…\n")
+    read = Mock(wraps=provider._swarm_stream.read)
+    monkeypatch.setattr(provider._swarm_stream, "read", read)
     classify = kt.classify_lines
 
     with ThreadPoolExecutor(max_workers=1) as writer:
 
-        def classify_after_new_bytes(*args, **kwargs):
-            writer.submit(provider.record_status_chunk, ECHO, 1).result(timeout=2)
+        def classify_after_redraw(*args, **kwargs):
+            writer.submit(provider.record_status_chunk, "\x1b[6G\x1b[?25l", 1).result(timeout=2)
             return classify(*args, **kwargs)
 
         with monkeypatch.context() as patch:
-            patch.setattr(kt, "classify_lines", classify_after_new_bytes)
+            patch.setattr(kt, "classify_lines", classify_after_redraw)
             assert ready_status(provider) is TerminalStatus.UNKNOWN
 
+    backend.get_history.return_value = ECHO.replace("❯", glyph) + ANSWER + FOOTER
+    assert ready_status(provider) is TerminalStatus.COMPLETED
+    read.assert_called_once()
+
+
+def test_submission_check_discards_result_after_new_turn(provider, monkeypatch, completion_probe):
+    _, backend = completion_probe
+    provider._swarm_stream = io.StringIO(ECHO.replace("❯", "✨") + "⠋ Thinking…\n")
+    classify = kt.classify_lines
+
+    def classify_after_reset(*args, **kwargs):
+        begin(provider)
+        provider.record_status_chunk(ECHO + "⠋ Thinking…\n", 1)
+        return classify(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kt, "classify_lines", classify_after_reset)
+        assert ready_status(provider) is TerminalStatus.UNKNOWN
+
+    provider.observe_execution_output(ECHO + "⠋ Thinking…\n", 1, truncated=False)
     backend.get_history.return_value = ECHO + TOOL + FOOTER
     assert ready_status(provider) is TerminalStatus.PROCESSING
 
@@ -331,21 +358,42 @@ def test_completed_answerless_turn_still_refuses_get_output(
         terminal_service.get_output(provider.terminal_id, terminal_service.OutputMode.LAST)
 
 
-@pytest.mark.parametrize("change", ["bytes", "pane", "generation"])
+@pytest.mark.parametrize("change", ["transcript", "generation"])
 def test_completion_settle_restarts_when_evidence_changes(provider, completion_probe, change):
     now, backend = completion_probe
     assert ready_status(provider) is TerminalStatus.PROCESSING
     now.return_value += 2.1
-    if change == "bytes":
-        replay(provider, "\n")
-    elif change == "pane":
-        backend.get_history.return_value = ECHO + TOOL + "\n" + FOOTER
+    if change == "transcript":
+        backend.get_history.return_value = ECHO + TOOL.replace("example.txt", "other.txt") + FOOTER
     else:
         begin(provider)
         replay(provider, ECHO + "⠋ Thinking…\n")
     assert ready_status(provider) is TerminalStatus.PROCESSING
     now.return_value += 2.1
     assert ready_status(provider) is TerminalStatus.COMPLETED
+
+
+@pytest.mark.parametrize("changes_text", [False, True], ids=["cursor-only", "clock"])
+def test_answerless_completion_ignores_idle_status_line(provider, completion_probe, changes_text):
+    now, backend = completion_probe
+    # Kimi puts custom status text between the composer and the context row.
+    assert ready_status(provider) is TerminalStatus.PROCESSING
+    for second in range(1, 4):
+        now.return_value += 1
+        redraw = "\x1b[6G\x1b[?25l"
+        if changes_text:
+            clock_row = f" \x1b[38;5;253m{second}\x1b[39m"
+            redraw = f"\x1b[2B\r\x1b[2K{clock_row}\x1b[2A{redraw}"
+            backend.get_history.return_value = (
+                ECHO + TOOL + FOOTER.replace("context:", f"{clock_row}\ncontext:")
+            )
+        provider.record_status_chunk(redraw, 1)
+        expected = TerminalStatus.PROCESSING if second < 2 else TerminalStatus.COMPLETED
+        assert ready_status(provider) is expected
+    assert (
+        sum(bool(call.kwargs.get("full_history")) for call in backend.get_history.call_args_list)
+        == 1
+    )
 
 
 def test_live_spinner_cannot_age_into_completion(provider, completion_probe):

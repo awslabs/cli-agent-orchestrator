@@ -854,7 +854,7 @@ class KimiCliProvider(BaseProvider):
         self._swarm_revision = 0
         self._swarm_final_floor = 0
         self._code_23_submission: Optional[bool] = None
-        self._code_completion_candidate: Optional[Tuple[int, int, str, float]] = None
+        self._code_completion_candidate: Optional[Tuple[int, str, float]] = None
         self._swarm_stream: Optional[tempfile.SpooledTemporaryFile[str]] = None
         self._swarm_stream_complete = False
         self._swarm_submission_probe_pending = False
@@ -964,8 +964,8 @@ class KimiCliProvider(BaseProvider):
         current tool/spinner rows. A tool finishing is also not the end of the
         assistant turn. Check the real viewport and prefer a publishable
         answer after this turn's latest tool call. A turn may legitimately end
-        without prose; allow that after the ready pane AND generation bytes
-        settle. Output extraction must still refuse private/absent content.
+        without prose; allow that after the transcript above the ready composer
+        settles. Output extraction must still refuse private/absent content.
         """
         # Apply this extra final-answer check to the measured 2.3 submission
         # grammar. Older Code/legacy builds retain their existing readiness
@@ -998,9 +998,15 @@ class KimiCliProvider(BaseProvider):
                     if clean.lstrip().startswith(("✨", "💫")):
                         code_23_submission = False
             with self._swarm_stream_lock:
-                if generation != self._swarm_generation or revision != self._swarm_revision:
+                if generation != self._swarm_generation:
                     return TerminalStatus.UNKNOWN
-                self._code_23_submission = code_23_submission
+                # The echo belongs to the turn. Idle redraws can invalidate
+                # this poll's status, but must not discard the parsed echo.
+                if self._code_23_submission is None:
+                    self._code_23_submission = code_23_submission
+                code_23_submission = self._code_23_submission
+                if revision != self._swarm_revision:
+                    return TerminalStatus.UNKNOWN
         if not code_23_submission:
             return TerminalStatus.COMPLETED
         try:
@@ -1013,28 +1019,40 @@ class KimiCliProvider(BaseProvider):
                 for row in clean_rows[-25:]
             )
             # A draft in the composer does not make the previous turn busy.
-            ready = re.search(NEW_TUI_STATUS_PATTERN, "\n".join(clean_rows)) and any(
-                re.match(r"^\s*[│|]\s*>.*[│|]\s*$", row) for row in clean_rows
+            rows = kt.classify_lines(pane, kt.SpinnerSemantics.CODE)
+            composer_index = next(
+                (
+                    i
+                    for i in range(len(rows) - 1, -1, -1)
+                    if rows[i][2] is kt.KimiLineKind.READY_INPUT_FRAME
+                    and re.match(r"^\s*[│|]\s*>.*[│|]\s*$", rows[i][1])
+                ),
+                None,
+            )
+            ready = composer_index is not None and re.search(
+                NEW_TUI_STATUS_PATTERN, "\n".join(clean_rows)
             )
             dialog = False
-            for _, _, kind in reversed(kt.classify_lines(pane, kt.SpinnerSemantics.CODE)):
+            for _, _, kind in reversed(rows):
                 if kind in (kt.KimiLineKind.USER_INPUT, kt.KimiLineKind.FINAL_BULLET):
                     break  # A historical dialog cannot block a later turn/answer.
                 if kind in (kt.KimiLineKind.TRUST_DIALOG, kt.KimiLineKind.APPROVAL_DIALOG):
                     dialog = True
                     break
-            if busy or dialog or not ready:
+            if busy or dialog or not ready or composer_index is None:
                 with self._swarm_stream_lock:
                     self._code_completion_candidate = None
                 return TerminalStatus.PROCESSING
+            # A custom status line is drawn below the composer. It can repaint
+            # every second even when the conversation above it is unchanged.
+            transcript = "\n".join(raw for raw, _, _ in rows[:composer_index])
             with self._swarm_stream_lock:
                 if generation != self._swarm_generation or revision != self._swarm_revision:
                     return TerminalStatus.UNKNOWN
                 candidate = self._code_completion_candidate
-                if candidate is not None and candidate[:3] == (generation, revision, pane):
-                    # The same refused extraction needs no repeated history
-                    # capture. A byte, pane or generation change starts over.
-                    if time.monotonic() - candidate[3] >= CODE_COMPLETION_SETTLE_SECONDS:
+                if candidate is not None and candidate[:2] == (generation, transcript):
+                    # The same transcript needs no repeated history capture.
+                    if time.monotonic() - candidate[2] >= CODE_COMPLETION_SETTLE_SECONDS:
                         return TerminalStatus.COMPLETED
                     return TerminalStatus.PROCESSING
             history = get_backend().get_history(
@@ -1049,7 +1067,7 @@ class KimiCliProvider(BaseProvider):
                 with self._swarm_stream_lock:
                     if generation != self._swarm_generation or revision != self._swarm_revision:
                         return TerminalStatus.UNKNOWN
-                    self._code_completion_candidate = (generation, revision, pane, time.monotonic())
+                    self._code_completion_candidate = (generation, transcript, time.monotonic())
                 return TerminalStatus.PROCESSING
         except Exception:
             with self._swarm_stream_lock:

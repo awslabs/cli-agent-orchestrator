@@ -153,12 +153,12 @@ state.
 When those readiness checks pass and a publishable final answer is available
 for this turn (after its latest tool call, if any), the turn can become
 **COMPLETED** without an extra delay. A turn can also finish with only tool output
-or reasoning, and no final text. In that case, CAO waits for the visible ready
-pane and the current generation's recorded output to remain unchanged for
-**2 seconds** before reporting **COMPLETED**. New output, a changed pane or a new generation
-restarts the wait; a live spinner, active dialog or non-ready pane cannot age
-into completion. A build that continuously animates its idle pane can therefore
-remain **PROCESSING**. The interval is a readiness check, not a task timeout.
+or reasoning, and no final text. In that case, CAO waits for the visible
+transcript above the ready composer to remain unchanged for **2 seconds**
+before reporting **COMPLETED**. Cursor-only redraws and changes to the custom
+status line below the composer do not restart the wait. A transcript change or
+new generation restarts it, and a live spinner, active dialog or non-ready pane
+cannot age into completion. The interval is a readiness check, not a task timeout.
 
 Completion and answer availability are separate: `get_output` with `mode=last`
 still reports an extraction error when there is no publishable final answer or
