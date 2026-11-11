@@ -43,6 +43,8 @@ path. See [`../README.md`](../README.md) for the full offline-vs-live matrix.
 
 `ffmpeg` is provided by the `ffmpeg-static` npm package (gif-capable), so no
 system ffmpeg install is needed. Override with `FFMPEG_BIN=/path/to/ffmpeg`.
+On Linux or WSL, install Chromium's system libraries once with
+`npx playwright install-deps chromium`.
 
 The GIF is committed under `docs/media/` and re-generated + uploaded as the
 `agent-plugins-dogfood` CI artifact on every run.

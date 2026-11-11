@@ -11,7 +11,7 @@
 // NOTE (authored-but-not-executed locally): the sandbox network mode
 // (COMMON_DEPENDENCIES) blocks the Playwright browser download, so these specs
 // were authored and CI-wired but not run locally. They are structured to pass
-// in CI, where `npx playwright install --with-deps chromium` succeeds.
+// in CI, where the Playwright container image supplies the browser and its system libraries.
 
 import { expect, test } from "@playwright/test";
 
