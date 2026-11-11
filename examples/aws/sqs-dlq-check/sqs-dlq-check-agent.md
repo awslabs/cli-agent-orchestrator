@@ -19,6 +19,22 @@ mcpServers:
     type: stdio
     command: cao-mcp-server
     args: []
+params:
+  profile:
+    description: "AWS CLI profile name"
+    required: true
+  region:
+    description: "AWS region"
+    required: true
+  dlq_url:
+    description: "Full DLQ queue URL"
+    required: true
+  message_group_id:
+    description: "Filter by group (FIFO queues; empty to skip filtering)"
+  max_messages:
+    description: "Max messages to peek"
+    type: int
+    default: 10
 ---
 
 # SQS DLQ Check Agent
@@ -41,7 +57,21 @@ Install this agent with your values via `cao install --env`:
 
 See `config.json` in this folder for a reference of all values.
 
+In a workflow, a step that uses this profile sets these params instead. Each
+one fills the placeholder named next to it:
+
+- `profile` fills `${AWS_PROFILE}`
+- `region` fills `${AWS_REGION}`
+- `dlq_url` fills `${DLQ_URL}`
+- `message_group_id` fills `${MESSAGE_GROUP_ID}`
+- `max_messages` fills `${MAX_MESSAGES}`
+
 ## Instructions
+
+When the message has a "Parameters for this step" list, it comes from a workflow
+step. Use each value there in place of the `${...}` placeholder that its param
+fills, as listed under Configuration. Outside a workflow, the placeholders work
+as before.
 
 When you receive a message, check the DLQ for failed messages.
 

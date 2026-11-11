@@ -4,6 +4,8 @@ import { api, ApiError, TemplateSummary, ProfileValidationMessage, ProviderInfo 
 import { ValidationFindings } from './ValidationFindings'
 import { CustomSelect, SelectOption } from './CustomSelect'
 import { useGeneration } from '../hooks/useGeneration'
+import { ProfileParamsEditor } from './ProfileParamsEditor'
+import { hasParamRowErrors, writeParamsBlock, type ParamRow } from './profileParams'
 import { AlertTriangle, ChevronDown, ChevronRight, Loader2, Package, X } from 'lucide-react'
 
 /** Debounce for the template live preview, matching the search box contract. */
@@ -16,6 +18,15 @@ export const PREVIEW_DEBOUNCE_MS = 300
  * their types always come from `GET /agents/profiles/schema`.
  */
 const PRIMARY_FIELDS = ['name', 'description', 'provider', 'model', 'tags', 'capabilities']
+
+/**
+ * Fields with their own section in the from-scratch form, after System
+ * prompt, instead of a place under Advanced. `params` has the Params editor.
+ */
+const SECTION_FIELDS = ['params']
+
+/** A schema field that renders under Advanced. */
+const isAdvancedField = (k: string) => k !== 'name' && !PRIMARY_FIELDS.includes(k) && !SECTION_FIELDS.includes(k)
 
 /**
  * Datalist suggestions for the `role` field: the built-in tool-bundle roles
@@ -335,6 +346,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   const [scratchValues, setScratchValues] = useState<Record<string, unknown>>({})
   const [jsonDrafts, setJsonDrafts] = useState<Record<string, string>>({})
   const [systemPrompt, setSystemPrompt] = useState('')
+  const [paramRows, setParamRows] = useState<ParamRow[]>([])
   const [advancedOpen, setAdvancedOpen] = useState(false)
 
   // Reset per open so a cancelled create never leaks into the next one.
@@ -355,6 +367,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     setScratchValues({})
     setJsonDrafts({})
     setSystemPrompt('')
+    setParamRows([])
     setAdvancedOpen(false)
     nameTouched.current = false
     // Staleness token: these three fetches are idempotent, but a rapid
@@ -504,8 +517,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   // paint a red boundary nobody can see; expand the section so it is visible.
   useEffect(() => {
     if (!profileSchema || errorFields.size === 0) return
-    const advanced = Object.keys((profileSchema.properties ?? {}) as Record<string, unknown>)
-      .filter(k => k !== 'name' && !PRIMARY_FIELDS.includes(k))
+    const advanced = Object.keys((profileSchema.properties ?? {}) as Record<string, unknown>).filter(isAdvancedField)
     if (advanced.some(k => errorFields.has(k))) setAdvancedOpen(true)
   }, [errorFields, profileSchema])
 
@@ -533,7 +545,9 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   const scratchProps = (profileSchema?.properties ?? {}) as Record<string, JSONSchemaProp>
   const scratchRequired = new Set<string>((profileSchema?.required as string[]) ?? [])
   const primaryKeys = PRIMARY_FIELDS.filter(k => k in scratchProps && k !== 'name')
-  const advancedKeys = Object.keys(scratchProps).filter(k => k !== 'name' && !PRIMARY_FIELDS.includes(k))
+  const advancedKeys = Object.keys(scratchProps).filter(isAdvancedField)
+  // The Params section shows when the server schema declares params.
+  const paramsInSchema = 'params' in scratchProps
 
   // Provider select options from the live registry. Uninstalled providers
   // stay selectable — a profile may target a provider absent on this machine.
@@ -572,7 +586,13 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     for (const [k, draft] of Object.entries(jsonDrafts)) {
       if (draft.trim() !== '' && !jsonErrors[k]) values[k] = JSON.parse(draft)
     }
-    return buildFrontmatter(values) + '\n' + (systemPrompt.trim() ? systemPrompt.trim() + '\n' : '')
+    // The params block goes last, just before the closing ---. buildFrontmatter
+    // always ends with that line.
+    const frontmatter = buildFrontmatter(values)
+    const params = paramsInSchema ? writeParamsBlock(paramRows) : ''
+    const closing = '---\n'
+    return frontmatter.slice(0, frontmatter.length - closing.length) + params + closing +
+      '\n' + (systemPrompt.trim() ? systemPrompt.trim() + '\n' : '')
   }
 
   const canCreate =
@@ -580,7 +600,9 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     !saving &&
     // In template mode the POST body is the preview, so a create mid-debounce
     // would persist a stale render; wait for the in-flight preview to settle.
-    (mode === 'template' ? preview !== null && !previewLoading : Object.keys(jsonErrors).length === 0)
+    (mode === 'template'
+      ? preview !== null && !previewLoading
+      : Object.keys(jsonErrors).length === 0 && !(paramsInSchema && hasParamRowErrors(paramRows)))
 
   const handleCreate = async () => {
     // Ref-based guard: two synchronous clicks before the re-render both
@@ -804,6 +826,15 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
                       placeholder="# You are…"
                     />
                   </div>
+
+                  {paramsInSchema && (
+                    <ProfileParamsEditor
+                      rows={paramRows}
+                      onChange={rows => { clearBlockedSave(); setParamRows(rows) }}
+                      suggestFrom={systemPrompt}
+                      invalid={errorFields.has('params')}
+                    />
+                  )}
 
                   <div className="border border-gray-800 rounded-lg">
                     <button
