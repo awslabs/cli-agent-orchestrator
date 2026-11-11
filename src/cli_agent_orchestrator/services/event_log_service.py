@@ -177,6 +177,22 @@ class EventLog:
         # Id not found among fresh rows: replay everything (client dedupes).
         return fresh
 
+    def count_event_type(self, event_type: str) -> int:
+        """How many buffered rows have ``detail["event_type"] == event_type``.
+
+        A cheap count of the raw ring, under the lock, without the TTL filtering
+        or timestamp parsing that ``history`` does: what it measures is how many
+        of the ring's slots such rows hold.
+        """
+
+        with self._lock:
+            return sum(
+                1
+                for event in self._buf
+                if isinstance(event.get("detail"), dict)
+                and event["detail"].get("event_type") == event_type
+            )
+
     def __len__(self) -> int:
         """Return the current number of buffered events (<= RING_CAPACITY)."""
 

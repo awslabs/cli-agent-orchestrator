@@ -351,6 +351,11 @@ def _from_generative_ui(event: Dict[str, Any], ui: Dict[str, Any]) -> Tuple[str,
         # Refuse: never render an unknown/unsafe component. Preserve the intent
         # under RAW so a client could log/inspect it, but do not treat it as UI.
         base.update(cao_kind="generative_ui", rejected_component=component)
+        # The server's refusal record (#1158) may fold later refusals into one:
+        # carry that count, an integer only, never anything else from the intent.
+        more = ui.get("more_refused")
+        if isinstance(more, int) and not isinstance(more, bool) and more > 0:
+            base["more_refused"] = more
         return AGUI_RAW, base
 
     props = ui.get("props")
