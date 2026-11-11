@@ -409,9 +409,13 @@ tmux 3.5, 500 ms before), in case more of an escape sequence follows, and only
 then delivers them to the pane that is active. So after such a key, other web
 terminals on the same window wait before their next key, and a terminal opened
 on that window in that time selects its pane only afterwards. The wait lasts
-until the sending terminal's next key or until `escape-time` runs out, counted
-as at least 500 ms, so it is at most about half a second with tmux's defaults.
-The terminal that sent the key does not wait. Input whose pane cannot be
+until `escape-time` has run out after the sending terminal's last Escape, Alt+[
+or Alt+], counted as at least 500 ms: about half a second after a single such
+key, and longer while that terminal keeps sending them (Escape held down, for
+example). The sender's next key does not end the wait early: cao-server cannot
+tell whether that key completes the escape sequence or extends it, and tmux's
+timer keeps running from the first byte. The terminal that sent the key
+does not wait. Input whose pane cannot be
 selected is dropped rather than sent to whichever pane is active, and a terminal
 whose pane cannot be found is not attached.
 

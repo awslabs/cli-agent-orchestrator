@@ -9197,9 +9197,11 @@ def _ws_input_refusal(
 # that is active AT THAT TIME. It does the same with a trailing ``\x1b[`` or
 # ``\x1b]`` (Alt+[ and Alt+]), which also start longer sequences. So a frame
 # that ends in any of these leaves an "Escape hold" on its window: other
-# terminals wait it out before they select a pane. The terminal that sent it
-# does not wait: its own next bytes resolve the partial key while its own pane
-# is still the active one.
+# terminals wait it out before they select a pane. The hold is not ended early
+# by the sender's next frame, because those bytes can extend the partial key
+# instead of resolving it (``\x1b`` then ``[``, ``\x1b[`` then ``1``), and
+# tmux's timer keeps running from the first byte. The terminal that sent it
+# does not wait: its own next bytes still go to its own pane.
 # How long a writer waits for tmux to read its input before it lets the window
 # go anyway (tmux stalled), and the poll step while it waits.
 _WEB_INPUT_DRAIN_TIMEOUT_S = 2.0
@@ -9213,14 +9215,12 @@ _WEB_INPUT_PARTIAL_KEYS = (b"\x1b", b"\x1b[", b"\x1b]")
 class _WebInputWindow:
     """The input state that browser terminals on one shared window share."""
 
-    __slots__ = ("lock", "hold_owner", "hold_until", "hold_released", "__weakref__")
+    __slots__ = ("lock", "hold_owner", "hold_until", "__weakref__")
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.hold_owner: object = None
         self.hold_until = 0.0
-        # Set when the current hold ends early, so its waiters wake at once.
-        self.hold_released = asyncio.Event()
 
     def _held_against(self, owner: object) -> float:
         """Seconds left on another terminal's Escape hold; 0 if none."""
@@ -9229,21 +9229,20 @@ class _WebInputWindow:
         return max(0.0, self.hold_until - time.monotonic())
 
     async def wait_for_hold(self, owner: object) -> None:
-        """Wait out an Escape hold left by another terminal, or until it ends."""
+        """Wait out an Escape hold left by another terminal.
+
+        Re-checked after each sleep: the owner extends its hold with each
+        further frame that ends in a partial key.
+        """
         while (remaining := self._held_against(owner)) > 0:
-            released = self.hold_released
-            try:
-                await asyncio.wait_for(released.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                pass
+            await asyncio.sleep(remaining)
 
     @asynccontextmanager
     async def turn(self, owner: object):
         """The window's lock, taken once no other terminal's Escape hold is on.
 
-        The hold is waited out WITHOUT the lock: the terminal that left it
-        must still be able to send its next frame, which resolves tmux's
-        partial key and releases the hold early.
+        The hold is waited out WITHOUT the lock, so the terminal that left it
+        can keep typing to its own pane meanwhile.
         """
         while True:
             await self.wait_for_hold(owner)
@@ -9257,17 +9256,14 @@ class _WebInputWindow:
             self.lock.release()
 
     def after_write(self, owner: object, raw: bytes, escape_hold_s: float) -> None:
-        """Record whether ``owner``'s frame left tmux holding a partial Escape."""
+        """Start or extend ``owner``'s hold if its frame left tmux a partial key.
+
+        Any other frame leaves the hold to run out: it may have resolved the
+        partial key, or extended it, and only tmux's timer tells which.
+        """
         if raw.endswith(_WEB_INPUT_PARTIAL_KEYS):
-            if self.hold_owner is None:
-                self.hold_released = asyncio.Event()
             self.hold_owner = owner
             self.hold_until = time.monotonic() + escape_hold_s
-        elif self.hold_owner is owner:
-            # tmux read the bytes after the Escape with this terminal's pane
-            # active, which resolved the partial key there.
-            self.hold_owner = None
-            self.hold_released.set()
 
 
 _WEB_INPUT_WINDOWS: "weakref.WeakValueDictionary[str, _WebInputWindow]" = (

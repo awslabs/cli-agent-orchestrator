@@ -51,14 +51,18 @@ def _pty_attach(plan):
     ``("drain", fd)`` in the order they happened, so a test can assert the pane
     was selected before its bytes and held until they were read.
     """
-    state = SimpleNamespace(events=[], stamps=[], masters={}, peers=[], first_write=asyncio.Event())
+    state = SimpleNamespace(
+        events=[], stamps=[], masters={}, peers=[], peer_of={}, first_write=asyncio.Event()
+    )
     real_openpty, real_write = os.openpty, os.write
 
     def _openpty():
         master, slave = real_openpty()
         peer = os.dup(slave)
         tty.setraw(peer)
+        os.set_blocking(peer, False)
         state.peers.append(peer)
+        state.peer_of[master] = peer
         state.masters[master] = os.ttyname(slave)
         return master, slave
 
@@ -67,7 +71,15 @@ def _pty_attach(plan):
             state.events.append(("write", fd, bytes(data)))
             state.stamps.append(("write", fd, time.monotonic()))
             state.first_write.set()
-        return real_write(fd, data)
+        written = real_write(fd, data)
+        if fd in state.peer_of:
+            # Consume it, as tmux would: a macOS PTY queues only about 1 KiB.
+            try:
+                while os.read(state.peer_of[fd], 65536):
+                    pass
+            except BlockingIOError:
+                pass
+        return written
 
     async def _drain(slave_path):
         fd = next(m for m, path in state.masters.items() if path == slave_path)
@@ -288,9 +300,11 @@ class TestALoneEscapeHoldsTheWindow:
         assert time.monotonic() - started < 2.0
 
     @pytest.mark.asyncio
-    async def test_the_senders_next_frame_releases_the_hold(self):
+    async def test_the_senders_next_frame_does_not_end_the_hold(self):
+        """haofeif's P3: the next frame may extend tmux's partial key rather
+        than resolve it, so B still waits out the whole hold."""
         with _pty_attach(self._plan) as state:
-            state.backend.web_input_escape_hold.return_value = 5.0
+            state.backend.web_input_escape_hold.return_value = self.HOLD
 
             def a_wrote(n):
                 return lambda: len([e for e in state.events if e[0] == "write"]) >= n
@@ -298,14 +312,15 @@ class TestALoneEscapeHoldsTheWindow:
             async def b_types_after_a_moved_on():
                 await _until(a_wrote(2))
 
-            started = time.monotonic()
             await asyncio.gather(
-                _attach([_input("\x1b"), _input("x")], _TID),
+                _attach([_input("\x1b"), _input("["), lambda: asyncio.sleep(self.HOLD * 2)], _TID),
                 _attach([b_types_after_a_moved_on, _input("b")], _TID_B),
             )
 
-        assert [e[2] for e in state.events if e[0] == "write"] == [b"\x1b", b"x", b"b"]
-        assert time.monotonic() - started < 2.0
+        assert [e[2] for e in state.events if e[0] == "write"] == [b"\x1b", b"[", b"b"]
+        a_fd = next(e[1] for e in state.events if e[0] == "write" and e[2] == b"\x1b")
+        b_select_at = max(s[2] for s in state.stamps if s[0] == "focus" and s[1] == _PANE_B)
+        assert b_select_at - _stamp(state, "write", a_fd) >= self.HOLD
 
     @pytest.mark.parametrize(
         "answer", [MagicMock(), -1, True, "0.1"], ids=["mock", "negative", "bool", "str"]
@@ -374,8 +389,6 @@ class TestWebInputWindow:
 
         window.after_write(a, frame, 5.0)
         assert window.hold_owner is a
-        window.after_write(a, b"x", 5.0)
-        assert window.hold_owner is None
 
     @pytest.mark.asyncio
     async def test_only_the_owner_skips_the_hold(self):
@@ -395,41 +408,61 @@ class TestWebInputWindow:
 
         window.after_write(b, b"b", 5.0)
         assert window.hold_owner is a
-        window.after_write(a, b"x", 5.0)
-        assert window.hold_owner is None
+
+    @pytest.mark.parametrize(
+        "first, then",
+        [
+            (b"\x1b", b"["),
+            (b"\x1b", b"]"),
+            (b"\x1b[", b"1"),
+            (b"\x1b]", b"5"),
+            (b"\x1b", b"x"),
+        ],
+        ids=["esc+[", "esc+]", "alt[+1", "alt]+5", "esc+x"],
+    )
+    @pytest.mark.asyncio
+    async def test_the_owners_next_frame_does_not_end_the_hold(self, first, then):
+        """haofeif's P3: ``then`` may extend the partial key, and tmux's timer
+        runs from its first byte, so the hold runs out in full whatever follows."""
+        window, a, b = main_module._WebInputWindow(), object(), object()
+        held_at = time.monotonic()
+        window.after_write(a, first, 0.2)
+        window.after_write(a, then, 0.2)
+
+        await window.wait_for_hold(b)
+        assert time.monotonic() - held_at >= 0.2
 
     @pytest.mark.asyncio
-    async def test_a_waiter_wakes_as_soon_as_the_owner_releases_the_hold(self):
-        """Not at the end of the hold: the owner's next frame ends it early."""
+    async def test_each_further_escape_extends_the_hold(self):
+        """fanhongy's P3: a waiter waits until the hold after the owner's LAST
+        Escape runs out, not the first one's."""
         window, a, b = main_module._WebInputWindow(), object(), object()
-        window.after_write(a, b"\x1b", 5.0)
+        window.after_write(a, b"\x1b", 0.2)
 
         started = time.monotonic()
         waiter = asyncio.create_task(window.wait_for_hold(b))
-        await asyncio.sleep(0.05)
-        assert not waiter.done()
-        window.after_write(a, b"x", 5.0)
-        await asyncio.wait_for(waiter, timeout=1.0)
-        assert time.monotonic() - started < 1.0
+        await asyncio.sleep(0.15)
+        window.after_write(a, b"\x1b", 0.2)  # about 0.35 s from the start now
+        await asyncio.sleep(0.1)
+        assert not waiter.done()  # past the first hold, inside the second
+        await asyncio.wait_for(waiter, timeout=2.0)
+        assert time.monotonic() - started >= 0.35
 
     @pytest.mark.asyncio
-    async def test_a_new_hold_after_a_release_holds_again(self):
+    async def test_another_terminal_can_hold_once_the_hold_ran_out(self):
         window, a, b = main_module._WebInputWindow(), object(), object()
-        window.after_write(a, b"\x1b", 5.0)
-        window.after_write(a, b"x", 5.0)  # released
-        window.after_write(a, b"\x1b", 0.2)  # a fresh hold, not the set event
+        window.after_write(a, b"\x1b", 0.05)
+        await asyncio.sleep(0.1)  # a's hold ran out
+        window.after_write(b, b"\x1b", 0.2)
+        assert window.hold_owner is b
 
         started = time.monotonic()
-        await window.wait_for_hold(b)
-        assert time.monotonic() - started >= 0.2
+        await window.wait_for_hold(a)
+        assert time.monotonic() - started >= 0.15
 
     @pytest.mark.asyncio
-    async def test_waiting_out_a_new_hold_does_not_starve_the_event_loop(self):
-        """A hold after a release needs a fresh Event: waiting on the old, set
-        one returns at once, and the wait loop would spin without yielding."""
+    async def test_waiting_out_a_hold_does_not_starve_the_event_loop(self):
         window, a, b = main_module._WebInputWindow(), object(), object()
-        window.after_write(a, b"\x1b", 5.0)
-        window.after_write(a, b"x", 5.0)  # released: the Event is set
         window.after_write(a, b"\x1b", 0.2)
 
         ticks = 0
@@ -447,21 +480,6 @@ class TestWebInputWindow:
         finally:
             task.cancel()
         assert ticks >= 5
-
-    @pytest.mark.asyncio
-    async def test_a_second_escape_keeps_the_waiters_event(self):
-        """A repeated Escape extends the hold; it must not orphan the Event a
-        waiter is already on, or the owner's release would not wake it."""
-        window, a, b = main_module._WebInputWindow(), object(), object()
-        window.after_write(a, b"\x1b", 5.0)
-
-        started = time.monotonic()
-        waiter = asyncio.create_task(window.wait_for_hold(b))
-        await asyncio.sleep(0.05)  # b is waiting on the hold's Event
-        window.after_write(a, b"\x1b", 5.0)
-        window.after_write(a, b"x", 5.0)
-        await asyncio.wait_for(waiter, timeout=1.0)
-        assert time.monotonic() - started < 1.0
 
     @pytest.mark.asyncio
     async def test_a_hold_that_starts_while_queued_on_the_lock_is_waited_out(self):
