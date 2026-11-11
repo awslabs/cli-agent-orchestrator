@@ -861,6 +861,79 @@ class TestDeliverPending:
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_an_unavailable_runner_leaves_the_message_pending(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """RunnerUnavailable means nothing was sent: retry later, never FAILED (#745)."""
+        from cli_agent_orchestrator.runner.protocol import RunnerUnavailable
+
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.dispatch_input.side_effect = RunnerUnavailable("runner a is not connected")
+
+        svc = InboxService()
+        with patch.object(svc, "_close_message_edges") as closed:
+            svc.deliver_pending("term-1")
+
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+        closed.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_a_wrapped_unavailable_runner_also_leaves_it_pending(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        from cli_agent_orchestrator.runner.protocol import RunnerUnavailable
+
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        def wrapped(*_a, **_k):
+            try:
+                raise RunnerUnavailable("runner a is not connected")
+            except RunnerUnavailable as e:
+                raise RuntimeError("send failed") from e
+
+        mock_term_svc.dispatch_input.side_effect = wrapped
+
+        InboxService().deliver_pending("term-1")
+
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_an_unknown_runner_outcome_is_not_reported_as_failed(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """RunnerOutcomeUnknown: the input may have arrived. No FAILED, no failure notice,
+        and the message stays DELIVERED so it is not sent twice (#745)."""
+        from cli_agent_orchestrator.runner.protocol import RunnerOutcomeUnknown
+
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.dispatch_input.side_effect = RunnerOutcomeUnknown("no answer")
+
+        svc = InboxService()
+        with (
+            patch.object(svc, "_close_message_edges") as closed,
+            patch.object(svc, "_arm_message_edges") as armed,
+        ):
+            svc.deliver_pending("term-1")
+
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.DELIVERED)
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+        closed.assert_not_called()
+        armed.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_concurrent_delivery_for_one_terminal_sends_exactly_once(
         self, mock_get, mock_monitor, mock_term_svc, mock_update
     ):
