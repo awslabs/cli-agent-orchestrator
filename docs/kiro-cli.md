@@ -314,11 +314,14 @@ retain strict admission.
 ```
 
 Listed versions keep their existing pending-verification rule. An unlisted version
-must parse as `MAJOR.MINOR.PATCH`, be at least `2.35.1` and below `4.0.0`, and
+must parse as canonical ASCII `MAJOR.MINOR.PATCH` (no leading zeros, at most six
+digits per part), be at least `2.35.1` and below `4.0.0`, and
 advertise `v3` as an accepted `--agent-engine` value. CAO borrows the schema of the
-newest listed row in the **same major** at or below that version, excluding pending
-rows unless `kiro.v3_allow_unverified_versions` is also enabled. With no eligible
-row, the launch refuses. CAO never borrows a schema from another major.
+newest listed row in the **same major** at or below that version. If that row is
+pending, its own `kiro.v3_allow_unverified_versions` opt-in is required. Without
+that opt-in, the launch refuses with `kiro_v3_unverified_version`, naming that
+pending row. CAO never falls back to an older verified row or borrows from another
+major. With no same-major predecessor, the launch refuses.
 
 Both listed 3.x rows are pending, so using kiro-cli 3.2.0 currently requires both
 settings below. Until the operator verifies 3.1.0 live, borrowing its schema for
@@ -329,8 +332,11 @@ settings below. Until the operator verifies 3.1.0 live, borrowing its schema for
 ```
 
 Every observed admission carries a `launch_notes` entry and a server-log WARNING
-naming the probed version and the version whose schema it borrowed. All existing
-checks still run before any task: the agent header, workspace, helper home and
+naming the probed version and the version whose schema it borrowed, including
+"(pending operator verification)" when applicable and the existing pending-version
+warning and note. The durable `kiro_home_prepared` event records `admission=observed`,
+`kiro_version`, and `borrowed_from`. All existing checks still run before any task:
+the agent header, workspace, helper home and
 migration markers, and exact grant/server attestation from `/tools` and `/mcp list`.
 An agent file that the engine rejects, an extra tool or server, a missing
 `cao-mcp-server`, or an unreadable panel fails closed and tears down the helper.

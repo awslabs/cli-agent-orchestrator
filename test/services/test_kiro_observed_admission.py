@@ -10,6 +10,7 @@ from test.services.test_kiro_helper_launch import (  # noqa: F401
     assert_refused_before_bind,
     home,
     kiro,
+    kiro_events,
     launch,
     operator_home,
 )
@@ -103,17 +104,114 @@ def test_observed_pending_schema_needs_allow_unverified(monkeypatch):
     assert "pending" in str(err.value)
 
 
-def test_observed_uses_newest_eligible_verified_schema(observed, monkeypatch):
+def test_observed_refuses_newest_pending_even_with_older_verified_schema(monkeypatch):
     table = dict(kiro_v3_schema.SUPPORTED_KIRO_CLI_VERSIONS)
     table["3.0.0"] = replace(table["3.0.0"], pending_operator_verification=False)
     monkeypatch.setattr(kiro_v3_schema, "SUPPORTED_KIRO_CLI_VERSIONS", table)
     monkeypatch.setattr(settings_service, "_load", lambda: {"kiro": {"v3_admission": "observed"}})
-    monkeypatch.setattr(kiro_v3_launch, "kiro_v3_allow_unverified_versions", lambda: False)
+    with pytest.raises(KiroCapabilityError) as err:
+        probe("3.2.0")
+    assert err.value.kind == "kiro_v3_unverified_version"
+    assert "3.1.0" in str(err.value)
+    caps = KiroCapabilities(version="3.2.0", flags=frozenset(), agent_engines=frozenset({"v3"}))
+    with pytest.raises(kiro_v3_schema.KiroV3UnverifiedVersionError) as gate:
+        kiro_v3_launch.require_kiro_v3_admissible(caps, ["fs_read"], allow_observed=True)
+    assert gate.value.version == "3.1.0"
+
+
+@pytest.mark.asyncio
+async def test_observed_only_2380_refuses_newest_pending_row(kiro, monkeypatch):
+    (kiro.fake / "version").write_text("2.38.0")
+    monkeypatch.setattr(settings_service, "_load", lambda: {"kiro": {"v3_admission": "observed"}})
+    with pytest.raises(kiro.service.EphemeralPolicyError) as err:
+        await launch(kiro)
+    assert err.value.rule == "kiro_v3_unverified_version"
+    assert "2.37.1" in err.value.message
+    assert_refused_before_bind(kiro)
+
+
+def test_observed_2380_with_both_settings_borrows_newest_pending_row(observed):
     admission = kiro_v3_launch.require_kiro_v3_admissible(
-        probe("3.2.0"), ["fs_read"], allow_observed=True
+        probe("2.38.0"), ["fs_read"], allow_observed=True
     )
-    assert admission.schema is table["3.0.0"].schema
-    assert "3.0.0" in " ".join(admission.launch_notes)
+    assert admission.borrowed_schema_version == "2.37.1"
+    assert admission.unverified_version == "2.37.1"
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["03.2.0", "3.0.00", "02.35.1", "3." + "9" * 5000 + ".0", "3.1000000.0"],
+    ids=["leading-major", "leading-patch", "leading-listed", "huge-part", "seven-digit-part"],
+)
+def test_observed_odd_version_refusals(version, observed):
+    with pytest.raises(KiroCapabilityError) as err:
+        probe(version)
+    assert err.value.kind == "kiro_v3_observed_refused"
+
+
+def test_observed_parse_value_error_is_typed_refusal(observed, monkeypatch):
+    def invalid_int(part):
+        raise ValueError("invalid version part")
+
+    monkeypatch.setattr(kiro_v3_schema, "int", invalid_int, raising=False)
+    with pytest.raises(KiroCapabilityError) as err:
+        probe("3.2.0")
+    assert err.value.kind == "kiro_v3_observed_refused"
+
+
+@pytest.mark.parametrize("version", ["３.2.0", "3.٢.0", "3.2٢.0"])
+def test_observed_unicode_digits_refused(version, observed):
+    with pytest.raises(KiroCapabilityError) as err:
+        probe(version)
+    assert err.value.kind == "kiro_v3_observed_refused"
+
+
+def test_observed_rows_compare_numerically(observed, monkeypatch):
+    entry = kiro_v3_schema.SUPPORTED_KIRO_CLI_VERSIONS["3.1.0"]
+    table = {
+        v: replace(entry, cli_version=v, pending_operator_verification=False)
+        for v in ("3.9.0", "3.10.0")
+    }
+    monkeypatch.setattr(kiro_v3_schema, "SUPPORTED_KIRO_CLI_VERSIONS", table)
+    admission = kiro_v3_launch.require_kiro_v3_admissible(
+        probe("3.11.0"), ["fs_read"], allow_observed=True
+    )
+    assert admission.borrowed_schema_version == "3.10.0"
+    # A lexical upper bound would also include the future 3.10.0 row here.
+    assert kiro_v3_schema.observed_kiro_v3_entry("3.9.1").cli_version == "3.9.0"
+
+
+def test_observed_setting_rechecked_between_probe_and_gate(observed, monkeypatch):
+    caps = probe("3.2.0")
+    monkeypatch.setattr(settings_service, "_load", lambda: {"kiro": {"v3_admission": "strict"}})
+    with pytest.raises(kiro_v3_schema.KiroV3UnsupportedVersionError):
+        kiro_v3_launch.require_kiro_v3_admissible(caps, ["fs_read"], allow_observed=True)
+
+
+@pytest.mark.asyncio
+async def test_observed_pending_warning_and_notes_preserved(kiro, observed, caplog):
+    (kiro.fake / "version").write_text("3.2.0")
+    with caplog.at_level(logging.WARNING):
+        terminal = await launch(kiro)
+    notes = " ".join(terminal.launch_notes)
+    assert "(pending operator verification)" in notes
+    assert "kiro_v3_unverified_version_admitted" in notes
+    assert "kiro.v3_allow_unverified_versions" in notes
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("3.1.0" in m and "kiro.v3_allow_unverified_versions" in m for m in warnings)
+    assert any(
+        "observed admission" in m and "(pending operator verification)" in m for m in warnings
+    )
+
+
+@pytest.mark.asyncio
+async def test_observed_admission_recorded_in_prepared_event(kiro, observed):
+    (kiro.fake / "version").write_text("3.2.0")
+    await launch(kiro)
+    prepared = kiro_events(kiro)["kiro_home_prepared"]
+    assert prepared["admission"] == "observed"
+    assert prepared["kiro_version"] == "3.2.0"
+    assert prepared["borrowed_from"] == "3.1.0"
 
 
 @pytest.mark.asyncio

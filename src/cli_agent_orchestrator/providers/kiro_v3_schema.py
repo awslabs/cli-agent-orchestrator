@@ -461,16 +461,23 @@ class KiroV3ObservedRefusal(KiroV3Refusal):
 def observed_kiro_v3_entry(
     version: Optional[str], *, allow_unverified: bool = False
 ) -> KiroCliVersionEntry:
-    """Borrow the newest eligible same-major predecessor for an unlisted version.
+    """Borrow the newest same-major predecessor for an unlisted version.
 
     Listed versions retain their strict launch rules. This selects a schema,
     never replaces the capability probe or any live launch check.
     """
     if version in SUPPORTED_KIRO_CLI_VERSIONS:
         return require_launchable_kiro_v3_version(version, allow_unverified=allow_unverified)
-    if not version or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
+    if (
+        not version
+        or re.fullmatch(r"(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})", version)
+        is None
+    ):
         raise KiroV3ObservedRefusal(version, "version must parse as MAJOR.MINOR.PATCH")
-    parsed = tuple(int(part) for part in version.split("."))
+    try:
+        parsed = tuple(int(part) for part in version.split("."))
+    except ValueError:
+        raise KiroV3ObservedRefusal(version, "version must parse as MAJOR.MINOR.PATCH") from None
     if parsed < (2, 35, 1):
         raise KiroV3ObservedRefusal(version, "version is below the 2.35.1 floor")
     if parsed >= (4, 0, 0):
@@ -483,26 +490,18 @@ def observed_kiro_v3_entry(
     ]
     if not predecessors:
         raise KiroV3ObservedRefusal(version, "no same major schema row at or below this version")
-    eligible = [
-        entry
-        for entry in predecessors
-        if allow_unverified or not entry.pending_operator_verification
-    ]
-    if not eligible:
-        pending = max(
-            predecessors,
-            key=lambda entry: tuple(int(part) for part in entry.cli_version.split(".")),
-        )
+    newest = max(
+        predecessors, key=lambda entry: tuple(int(part) for part in entry.cli_version.split("."))
+    )
+    if newest.pending_operator_verification and not allow_unverified:
         raise KiroV3UnverifiedVersionError(
-            pending.cli_version,
+            newest.cli_version,
             remedy=(
                 "Use a supported verified kiro-cli version, or enable "
                 "kiro.v3_allow_unverified_versions to admit this borrowed schema."
             ),
         )
-    return max(
-        eligible, key=lambda entry: tuple(int(part) for part in entry.cli_version.split("."))
-    )
+    return newest
 
 
 def pinned_kiro_v3_schemas() -> Tuple[KiroV3EngineSchema, ...]:

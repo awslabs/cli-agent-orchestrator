@@ -69,19 +69,21 @@ class KiroV3Admission:
     @property
     def launch_notes(self) -> Optional[List[str]]:
         """The note the launch response carries, or None when there is nothing to say."""
+        notes = []
         if self.observed_version is not None:
-            return [
+            pending = " (pending operator verification)" if self.unverified_version else ""
+            notes.append(
                 f"kiro_v3_observed_admitted: kiro-cli {self.observed_version} borrowed "
-                f"schema from kiro-cli {self.borrowed_schema_version} by operator opt-in "
+                f"schema from kiro-cli {self.borrowed_schema_version}{pending} by operator opt-in "
                 "kiro.v3_admission=observed; every live launch check still applies."
-            ]
-        if self.unverified_version is None:
-            return None
-        return [
-            f"kiro_v3_unverified_version_admitted: kiro-cli {self.unverified_version} is "
-            "pending operator verification; this v3 launch was admitted only by the "
-            "operator opt-in kiro.v3_allow_unverified_versions."
-        ]
+            )
+        if self.unverified_version is not None:
+            notes.append(
+                f"kiro_v3_unverified_version_admitted: kiro-cli {self.unverified_version} is "
+                "pending operator verification; this v3 launch was admitted only by the "
+                "operator opt-in kiro.v3_allow_unverified_versions."
+            )
+        return notes or None
 
 
 def reinstall_remedy(agent_profile: str, agent_file: Path) -> str:
@@ -107,7 +109,7 @@ def require_kiro_v3_admissible(
     """The probed engine's schema, or a refusal for its version or an unrestricted policy.
 
     Listed versions keep their pending-verification rule. Unlisted versions
-    require the observed setting, v3 capability, and an eligible same-major
+    require the observed setting, v3 capability, and the newest same-major
     schema predecessor. Only the sealed-home helper path passes ``allow_observed``;
     other callers stay strict. Every later check still applies.
     """
@@ -124,6 +126,8 @@ def require_kiro_v3_admissible(
         entry = observed_kiro_v3_entry(
             version, allow_unverified=kiro_v3_allow_unverified_versions()
         )
+        if entry.pending_operator_verification:
+            unverified = entry.cli_version
     else:
         try:
             entry = require_launchable_kiro_v3_version(version)
@@ -147,10 +151,11 @@ def require_kiro_v3_admissible(
         )
     if observed:
         logger.warning(
-            "Kiro v3 observed admission: kiro-cli %s borrowed schema from kiro-cli %s; "
+            "Kiro v3 observed admission: kiro-cli %s borrowed schema from kiro-cli %s%s; "
             "operator opt-in kiro.v3_admission=observed; live checks remain required.",
             version,
             entry.cli_version,
+            " (pending operator verification)" if unverified else "",
         )
     return KiroV3Admission(
         entry.schema,

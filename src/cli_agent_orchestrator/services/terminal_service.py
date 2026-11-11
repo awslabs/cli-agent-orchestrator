@@ -1772,6 +1772,7 @@ def _prepare_kiro_launch(
     effort: Optional[str],
     version: Optional[str],
     schema: KiroV3EngineSchema,
+    borrowed_schema_version: Optional[str] = None,
 ) -> KiroLaunch:
     """Stage B of a Kiro helper launch, after bind and before the window (#1167 Phase 2).
 
@@ -1804,6 +1805,11 @@ def _prepare_kiro_launch(
             kiro_cli_target=kiro_cli.target,
             kiro_version=version,
             schema=schema.engine,
+            **(
+                {"admission": "observed", "borrowed_from": borrowed_schema_version}
+                if borrowed_schema_version is not None
+                else {}
+            ),
         )
     except KiroV3Refusal as exc:
         if prepared is not None:
@@ -2906,6 +2912,7 @@ async def _create_terminal_unguarded(
                 launch_effort,
                 capabilities.version,
                 kiro_v3_admission.schema,
+                borrowed_schema_version=kiro_v3_admission.borrowed_schema_version,
             )
             ephemeral_state.kiro_home = kiro_launch.home
         elif provider == ProviderType.KIRO_CLI.value:
