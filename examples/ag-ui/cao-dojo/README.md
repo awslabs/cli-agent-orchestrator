@@ -146,8 +146,69 @@ fresh CAO home (so the profile install never reaches your own store) and a priva
 server, and removes both on exit. `E2E_SHOT_DIR`, `E2E_VIDEO_DIR`, `E2E_CAPTION` and
 `E2E_HOLD_MS` record screenshots and video.
 
+## Recorded trace and drift checks
+
+`tools/record_trace.py` records what this page sees on the wire for three
+captures, each produced by construction against its own isolated `cao-server`
+(a fresh `CAO_HOME_DIR`, a private tmux server, loopback only):
+
+| Capture | What happens | Run 1 | Run 2 |
+|---|---|---|---|
+| `none` | nothing is pending | `RUN_FINISHED` success | none |
+| `approve` | an agent raises a permission prompt and the card appears | `RUN_FINISHED` interrupt | resume `approved: true`, `RUN_FINISHED` success |
+| `reject` | the same, in a fresh session | `RUN_FINISHED` interrupt | resume `approved: false`, `RUN_FINISHED` success |
+
+The recording is normalised by `tools/trace_scrub.py` (ids become `id-N`,
+`terminal-N`, `session-N`, `profile-N` and `window-N`; timestamps come from a
+synthetic clock), then checked by the typed leak rule in `tools/trace_leaks.py`
+before anything is written. Run 2 must end clean: a `result.skippedResume`
+fails the recording as the approval bridge's expiry race, never as drift.
+
+| Mode | Agent | Credentials | Where it runs |
+|---|---|---|---|
+| `--live` | Claude Code, `dojo-approver.md` | a logged-in `claude` | local only; writes the published trace |
+| `--mock` | `mock_cli`, `tools/dojo-trace-mock.md`, answering the scripted `__mock_approval__` prompt | none | CI (`AG-UI stock-client live (AC3)`), and locally |
+| `--offline` | none: CAO's own producers, in-process, no server and no tmux | none | the unit tests |
+
+| Gate | Where | Command |
+|---|---|---|
+| Leak rule (L1-L14: a mutation case and a near miss for each) | pre-commit, and the Unit Tests job | `uv run pytest test/examples/test_cao_dojo_trace_leaks.py` |
+| Replay, tier 1 (SDK models, closed shape, lifecycle, cross-plane, upstream controls) | pre-push, and the Unit Tests job | `uv run pytest test/examples/test_cao_dojo_trace_replay.py test/examples/test_cao_dojo_trace_recorder.py` |
+| Replay, tier 1 with upstream `enforceEvents` and `verifyEvents` | CI | `node examples/ag-ui/ag-ui-stock-client-live/verify-trace.mjs <trace.ndjson>...` |
+| Keyless approve/reject/none e2e and tier 2 drift | CI | `uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --mock --check` |
+| Re-record debt | warns on PRs; blocks the release path | `make check-agui-trace-release` |
+
+`make check-agui-trace` runs the offline gates in one command. Tier 2 compares
+a recording with `trace/cao-dojo-trace.shape.json`, which carries no
+provider-specific value, so a contributor without Claude Code credentials can
+clear a deliberate frame change by regenerating it:
+
+```bash
+uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --mock --write-shape
+```
+
+The published trace records the hash of the shape it was recorded against
+(`_meta.shape_sha256`). When the shape moves on, the published trace is stale:
+PRs get a warning and the release path is blocked until someone with Claude Code
+runs `make record-agui-trace`. See [`trace/README.md`](trace/README.md) for the
+current state of the published trace.
+
+The recorder refuses port 9889 and any busy port; pass `--port` (default 19899).
+It removes its isolated directories on success and keeps them, with the server
+log, on failure. It runs tmux only against its own server, named with `-S`, and
+never passes on `TMUX` or `TMUX_PANE`: inside tmux, `TMUX` overrides
+`TMUX_TMPDIR`, so a bare `tmux kill-server` would end the caller's own tmux
+server.
+
+These tools live beside the page they record rather than in `scripts/`. The
+release path depends on one of them, `record_trace.py --check-debt`, which needs
+only the standard library and two committed files. The tests in `test/examples/`
+exercise the tools; the mypy ratchet covers `src/` only, so it does not
+type-check them.
+
 ## Not in this page yet
 
 - A replay mode from a recorded trace, and a docs-site build.
-- A CI gate.
+- A browser test of this page in CI. CI checks the trace the page receives (see
+  the gates above), not the page itself.
 - The "edit" option. CAO offers it, but this page sends only approve and reject.

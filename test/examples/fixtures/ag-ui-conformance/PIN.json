@@ -1,0 +1,21 @@
+{
+  "commit": "08eae9dc13546e91272efb2d0ef863e21acc6ee3",
+  "files": {
+    "first-event-not-run-started-fatal.json": {
+      "sha256": "913b1f8c47e75bb5862fa94c8847749580e054ad2e0a5d1438d58eb4542d2a82"
+    },
+    "nested-run-started-fatal.json": {
+      "sha256": "765216d58b9523faed91eef77e88c1649361b5629d851739d3aa4b8a69775fc9"
+    },
+    "run-finished-interrupt-outcome-accepted.json": {
+      "sha256": "95a4e83c4bbfc430312520e84d86ae5dd310a788ddd769b75a2dc95e53c851ef"
+    }
+  },
+  "license": {
+    "file": "LICENSE",
+    "sha256": "06dcddbb6908a0c6dd4a9e8ec822eea41d5a460a53089fecccc8a68049e99241",
+    "spdx": "MIT"
+  },
+  "path": "spec/1.0/conformance/streams/",
+  "source": "https://github.com/ag-ui-protocol/ag-ui"
+}
