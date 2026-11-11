@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 import frontmatter
 
@@ -177,7 +177,8 @@ def _scan_profile_source(source, profile_name: str) -> "tuple[Dict, bool]":
         return _discovery_fields({}), False
     discovery = _discovery_fields(data.metadata)
     try:
-        meta = dict(data.metadata)
+        # Frontmatter values are whatever YAML parsed; AgentProfile validates them.
+        meta: Dict[str, Any] = dict(data.metadata)
         meta["system_prompt"] = data.content.strip()
         meta.setdefault("name", profile_name)
         meta.setdefault("description", "")
@@ -542,7 +543,8 @@ def profile_set_digest(profile_set: Optional[Mapping[str, ProfileEntry]] = None)
 def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProfile:
     """Parse an AgentProfile from already-resolved markdown text."""
     profile_data = frontmatter.loads(resolved_text)
-    meta = profile_data.metadata
+    # Frontmatter values are whatever YAML parsed; AgentProfile validates them.
+    meta: Dict[str, Any] = profile_data.metadata
     meta["system_prompt"] = profile_data.content.strip()
     # Fill in required fields if missing (Kiro profiles don't have frontmatter)
     if "name" not in meta:

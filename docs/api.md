@@ -58,7 +58,10 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   `reuse_terminal_id` gives 422. Policy refusals use `{kind: "ephemeral_policy", rule, message}`.
   `assign` and `handoff` launch creator-owned ephemeral names from the creator terminal.
 - `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
-  installed profiles.
+  installed profiles. A profile's `params` declarations appear in the detail
+  body: each one always carries `type` and `required`, and carries `default`,
+  `description` and `enum` only when set, in declaration order. See
+  [Workflow step params](agent-profile.md#workflow-step-params).
 - `GET /agents/profiles/search` ranks installed, loadable profiles by capability
   using the same service as `cao profile find`.
 - `GET /agents/profiles/templates` lists public template metadata (`name` and
@@ -75,6 +78,17 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   distinct from `templates/validate`, which checks a template *config* against
   that template's own schema. Findings are severity-tagged (`error` or
   `warning`); only errors clear the `valid` flag, so warnings are advisory.
+  The response also carries `params`, the profile's `params` block as the
+  model reads it, so an editor can show the declarations without parsing
+  YAML. Each declaration has the shape `GET /agents/profiles/{name}` returns,
+  in declaration order. The text is read as written, so a `${VAR}`
+  placeholder comes back as `${VAR}`. An empty block is `{}`. `params` is
+  `null` when the frontmatter has no `params` key, when a finding is an error
+  at `params` or below it, when an error stopped the checks before they
+  finished the block, such as a document past the ceilings below, or when the
+  block takes more than 64 KB as JSON. That limit stops YAML aliases from
+  making the response much larger than the request. The block is built from
+  the validated declarations, never from the parsed YAML.
 - `GET /agents/profiles/schema` returns the agent profile JSON-Schema, so a
   client can render create and edit forms from the server's definition instead
   of duplicating the field list.
@@ -359,18 +373,42 @@ than calling these routes directly.
 ### Workflows
 
 - `/workflows*` creates, updates, deletes, validates and inspects workflow specifications.
-- `POST /workflows` creates a Python spec (`201`); requires `cao:write` or `cao:admin`.
-  Invalid specs or refused paths return `400`, existing names or tier collisions `409`,
-  and storage failures `500`.
-- `PUT /workflows/{name}` replaces a Python spec (`200`) using a required `expected_hash`;
-  requires `cao:write` or `cao:admin`. Unknown names return `404`, stale hashes or tier
-  collisions `409`, invalid specs or refused paths `400`, and storage failures `500`.
+- `POST /workflows` creates a spec (`201`); requires `cao:write` or `cao:admin`. The body is
+  `{name, source, tier}`. `tier` is `"python"` (the default) or `"yaml"`, and the server picks
+  the file extension from it: `<name>.py` or `<name>.yaml`. The name must be bare, with no
+  path and no extension. Invalid specs or refused paths return `400`, existing names or tier
+  collisions `409`, and storage failures `500`.
+  - A YAML create validates the source with the YAML grammar check before writing. It returns
+    `{name, path, content_hash, findings, status, reserved_notes}`, where `findings` is empty,
+    `status` is `pass` or `pass_reserved`, and `content_hash` is the sha256 of the bytes written.
+  - A YAML create returns `400` when the YAML does not parse or fails the grammar check (the
+    detail lists every error), when the spec's `name:` differs from the route name, or when the
+    source is over 256 KiB. It returns `409` when a workflow with that name exists in either
+    tier, as `<name>.yaml`, `<name>.yml` or `<name>.py`.
+- `PUT /workflows/{name}` replaces a spec (`200`) using a required `expected_hash`;
+  requires `cao:write` or `cao:admin`. It takes the same optional `tier`, defaulting to
+  `"python"`. Unknown names return `404`, stale hashes or tier collisions `409`, invalid specs
+  or refused paths `400`, and storage failures `500`.
+  - A YAML update replaces the YAML file at its own path (`<name>.yaml` or `<name>.yml`) and
+    returns the same body as a YAML create. It also returns `409` when the workflow is a Python
+    workflow, and when both `<name>.yaml` and `<name>.yml` exist.
+- `GET /workflows/{name}` returns the parsed spec. For a YAML spec the body also carries `path`,
+  `source` (the file text) and `content_hash` (the sha256 of the file bytes). That hash is the
+  `expected_hash` a YAML `PUT` compares. Each YAML step carries `call` and `params`, which are
+  `null` when the file does not set them. A Python spec's body is unchanged.
 - `DELETE /workflows/{name}` deletes a spec and its index row (`200`); requires `cao:admin`.
   An unknown or already-deleted name returns `404`; invalid paths return `400`.
 - `POST /workflows/validate` accepts exactly one of `path` or `source` (`200`);
-  requires `cao:read`, `cao:write` or `cao:admin`. The `source` form lints a Python draft
-  without writing a file; lint or size failures are reported in the `200` result.
-  Supplying both forms or neither, or source that cannot be encoded as UTF-8, returns `400`.
+  requires `cao:read`, `cao:write` or `cao:admin`. The `source` form validates a draft
+  without writing a file. Its optional `tier` picks the check: `"python"` (the default) lints
+  the source as a script, and `"yaml"` returns the YAML result
+  `{status, reserved_notes, errors}`. Validation or size failures are reported in the `200`
+  result. Supplying both forms or neither, sending `tier` with `path`, or sending source that
+  cannot be encoded as UTF-8 returns `400`.
+  - For a YAML spec, in either form, once the grammar check passes, each step's params are
+    checked against the params its profile declares. Each error is added to `errors` and makes
+    `status` `fail`. A profile that is not installed or fails to load adds no error. See
+    [Params a profile declares](workflows.md#params-a-profile-declares).
 
 The spec-route scope checks apply when authentication is enabled.
 
@@ -386,6 +424,13 @@ The spec-route scope checks apply when authentication is enabled.
   `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
   the background. The `links` map always carries `self`/`status`/`result`/`cancel`;
   `events` appears only on a build that serves the events route, so treat it as optional.
+- Both run routes refuse a YAML workflow that uses a reserved mode, or a step whose `call` is
+  `assign` or `send_message`, with `501`. The refusal comes before the run is journaled, so
+  no run row exists for it.
+- Both run routes refuse a YAML workflow with `422` when a step's params do not fit the
+  params its profile declares. `detail` is a string holding every error, joined by `; `. The
+  refusal comes before the run is journaled. Resume and step replay use the journaled spec and
+  do not check again.
 - `GET /workflows/runs` lists journaled runs newest-first (`?state=`, `?limit=`).
 - `GET /workflows/runs/{run_id}` **inspects** a run: run metadata, current state, and
   each step's durable projection — including the step's full `output_json` and

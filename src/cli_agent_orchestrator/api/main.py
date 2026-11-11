@@ -899,14 +899,16 @@ class WorkflowValidateRequest(BaseModel):
 
     * ``path`` — the original form, unchanged. Extension-based dispatch, ``_safe_spec_path``
       containment, and every existing caller (including ``cao workflow validate``) sends this.
-    * ``source`` — spec TEXT, linted in memory as Python. Added so an **agent can validate a draft
-      before creating it**, which is the validate-then-create order FR-10's sequence wants. A source-only
-      body has no extension to dispatch on and is always treated as Python, which is correct because
-      pass 3A made writes Python-only.
+    * ``source`` — spec TEXT, validated in memory. Added so an **agent can validate a draft
+      before creating it**, which is the validate-then-create order FR-10's sequence wants. A
+      source body has no extension to dispatch on, so ``tier`` says how to read it: ``"python"``
+      (the default) lints it as a script, ``"yaml"`` runs the YAML grammar check.
 
     ``path`` became optional at the model level so ``source`` can stand alone; the handler enforces
     exactly-one, so neither and both are 400s rather than silently preferring one. Making it optional is
-    NOT a relaxation of the old contract — a body carrying only ``path`` behaves identically.
+    NOT a relaxation of the old contract — a body carrying only ``path`` behaves identically. ``tier``
+    applies only to the source form: a path dispatches on its extension, so ``tier`` with ``path`` is a
+    400 rather than a second, conflicting answer to the same question.
     """
 
     path: Optional[str] = Field(
@@ -914,7 +916,11 @@ class WorkflowValidateRequest(BaseModel):
     )
     source: Optional[str] = Field(
         default=None,
-        description="Python spec source text, validated without needing a file on disk",
+        description="Spec source text, validated without needing a file on disk",
+    )
+    tier: Literal["python", "yaml"] = Field(
+        default="python",
+        description="How to validate 'source': 'python' (the default) or 'yaml'. Source form only.",
     )
 
 
@@ -925,10 +931,17 @@ class WorkflowCreateRequest(BaseModel):
     machine or an MCP client elsewhere and only the server may decide where a spec lands — the whole
     point of ADR-583-11. A path here would also be a containment problem the service layer already
     solved for the destination.
+
+    ``tier`` picks the file type, and the service picks the extension from it: ``"python"`` (the
+    default, which the CLI and MCP tools send by omission) writes ``<name>.py``; ``"yaml"`` writes
+    ``<name>.yaml``.
     """
 
     name: str = Field(description="Bare workflow name (no path, no extension)")
-    source: str = Field(description="The Python spec's full source text")
+    source: str = Field(description="The spec's full source text (Python or YAML, per 'tier')")
+    tier: Literal["python", "yaml"] = Field(
+        default="python", description="Spec tier: 'python' (the default) or 'yaml'"
+    )
 
 
 class WorkflowUpdateRequest(BaseModel):
@@ -940,12 +953,16 @@ class WorkflowUpdateRequest(BaseModel):
     concurrent edit between read and write is exactly what would slip through. FR-8's second criterion
     (issue #583), closed by ``stale-update-rejection``.
 
-    The name rides the PATH rather than the body, matching ``DELETE /workflows/{name}``.
+    The name rides the PATH rather than the body, matching ``DELETE /workflows/{name}``. ``tier`` says
+    which tier the caller means to replace; it defaults to ``"python"``.
     """
 
-    source: str = Field(description="The Python spec's full source text")
+    source: str = Field(description="The spec's full source text (Python or YAML, per 'tier')")
     expected_hash: str = Field(
         description="The content_hash the caller believes the spec currently has"
+    )
+    tier: Literal["python", "yaml"] = Field(
+        default="python", description="Spec tier: 'python' (the default) or 'yaml'"
     )
 
 
@@ -1458,10 +1475,25 @@ class ProfileValidationResponse(BaseModel):
     ``valid`` is False only when at least one error-severity finding is
     present. Warnings are advisory and do not invalidate a profile, so a
     client should block a save on errors alone.
+
+    ``params`` is the profile's ``params`` block as the model reads it from the
+    submitted text, in the shape ``GET /agents/profiles/{name}`` returns. It is
+    built from validated declarations, never from the parsed YAML.
     """
 
     valid: bool
     messages: List[ProfileValidationMessage] = Field(default_factory=list)
+    params: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "The params block, in declaration order: each declaration always carries "
+            "type and required, and default, description and enum only when set. An "
+            "empty block is {}. Null when the frontmatter has no params key, when a "
+            "finding is an error at params or below it, when an error stopped the "
+            "checks before they finished the block, or when the block takes more "
+            "than 64 KB as JSON."
+        ),
+    )
 
 
 class ProfileCreateRequest(BaseModel):
@@ -3492,20 +3524,32 @@ async def validate_agent_profile_endpoint(
     Deliberately NOT guarded by ``SCOPE_WRITE``, for the same reason as the
     template validate route: this is a POST only because the profile content
     travels in a JSON body rather than a query string, and it mutates no state.
+
+    The response also carries the ``params`` block it read, so an editor can show
+    the declarations without parsing YAML. The text is validated as submitted, with
+    no ``${VAR}`` resolution, and each declaration is dumped the way the detail
+    route dumps it.
     """
-    from cli_agent_orchestrator.services.profile_validator import validate_profile_text
+    from cli_agent_orchestrator.services.profile_validator import (
+        validate_profile_text_with_params,
+    )
 
     try:
-        findings = validate_profile_text(request.content)
+        result = validate_profile_text_with_params(request.content)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     return ProfileValidationResponse(
-        valid=not any(f.severity == "error" for f in findings),
+        valid=not any(f.severity == "error" for f in result.findings),
         messages=[
             ProfileValidationMessage(severity=f.severity, message=f.message, path=f.path)
-            for f in findings
+            for f in result.findings
         ],
+        params=(
+            None
+            if result.params is None
+            else {name: decl.model_dump(exclude_none=True) for name, decl in result.params.items()}
+        ),
     )
 
 
@@ -6278,6 +6322,24 @@ _WORKFLOW_AUTHORING_STORAGE_DETAIL = {
 }
 
 
+def _yaml_write_body(written: Any) -> Dict[str, Any]:
+    """The ``POST /workflows`` and ``PUT /workflows/{name}`` body for a YAML write.
+
+    The Python body's four fields (``findings`` is always empty: YAML has no lint
+    findings), plus the grammar verdict so the caller sees ``pass_reserved`` and its
+    notes without a second validate call. ``written`` is a
+    ``workflow_spec_service.YamlSpecWrite``.
+    """
+    return {
+        "name": written.spec.name,
+        "path": written.path,
+        "content_hash": written.content_hash,
+        "findings": [],
+        "status": written.validation.status,
+        "reserved_notes": list(written.validation.reserved_notes),
+    }
+
+
 @app.post("/workflows/validate")
 async def validate_workflow_endpoint(
     body: WorkflowValidateRequest,
@@ -6291,11 +6353,19 @@ async def validate_workflow_endpoint(
     side-effect-free, and collision-check-free like the YAML arm (BR-23b).
     The complete ``ScriptValidationResult`` is returned with ``model_dump()``.
 
-    THE ``source`` FORM (issue #583 Bolt 3, ``authoring-mcp-tools``) lints spec TEXT with no file
-    involved, so an agent can validate a draft BEFORE creating it. It writes no temp file, deliberately:
-    ``lint_script`` accepts a placeholder path, so materialising the source would add a write and a
-    cleanup path to a read-only route for no gain. There is therefore no path to contain on this arm —
-    the containment question does not arise rather than being answered.
+    THE ``source`` FORM (issue #583 Bolt 3, ``authoring-mcp-tools``) validates spec TEXT with no file
+    involved, so an agent can validate a draft BEFORE creating it. ``tier`` picks the check:
+    ``"python"`` (the default) lints the text and returns ``ScriptValidationResult.model_dump()``;
+    ``"yaml"`` runs the text-only ``models.workflow.validate_only`` and returns
+    ``ValidationResult.model_dump()``. Both share the UTF-8 check and the byte cap. It writes no temp
+    file, deliberately: ``lint_script`` accepts a placeholder path, so materialising the source would add
+    a write and a cleanup path to a read-only route for no gain. There is therefore no path to contain
+    on this arm — the containment question does not arise rather than being answered.
+
+    STEP PARAMS. For a YAML spec, in either form, once grammar passes, each step's params are
+    checked against the params its profile declares (``services.step_params``). Each error is added
+    to ``errors`` and makes ``status`` ``fail``. A profile that is missing or fails to load gives no
+    errors. The check only loads profiles by name, so no path is built for it here.
     """
     import os as _os
 
@@ -6316,7 +6386,12 @@ async def validate_workflow_endpoint(
 
     if body.source is not None:
         from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
-        from cli_agent_orchestrator.models.workflow import ScriptValidationResult
+        from cli_agent_orchestrator.models.workflow import (
+            ScriptValidationResult,
+            ValidationResult,
+        )
+        from cli_agent_orchestrator.models.workflow import validate_spec_text as validate_yaml_text
+        from cli_agent_orchestrator.services import step_params
         from cli_agent_orchestrator.services.script_lint import lint_script
 
         try:
@@ -6326,6 +6401,19 @@ async def validate_workflow_endpoint(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="workflow source must be valid UTF-8",
             ) from None
+        if body.tier == "yaml":
+            if source_size > WORKFLOW_MAX_SPEC_BYTES:
+                # The write path's cap and message, so the two cannot disagree about a size.
+                return ValidationResult(
+                    status="fail",
+                    errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
+                ).model_dump()
+            # Text only: the model's validate_spec_text opens no file and never raises.
+            result, spec = validate_yaml_text(body.source)
+            # Then each step's params against its profile, when grammar passed. Off the
+            # loop, since it reads profile files.
+            checked = await asyncio.to_thread(step_params.with_step_param_errors, result, spec)
+            return checked.model_dump()
         if source_size > WORKFLOW_MAX_SPEC_BYTES:
             # The same cap the write path enforces, checked here too so a caller cannot learn the
             # limit only by trying to create. Message names the limit (unit 2's PERF-3 discipline).
@@ -6333,8 +6421,8 @@ async def validate_workflow_endpoint(
                 status="fail",
                 errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
             ).model_dump()
-        # "<draft>" is a placeholder, never opened. Always Python: a source body has no extension to
-        # dispatch on, and pass 3A made writes Python-only.
+        # "<draft>" is a placeholder, never opened. A Python source body has no extension to
+        # dispatch on; ``tier`` (default "python") is what says it is a script.
         return lint_script(body.source, "<draft>").model_dump()
 
     # Bind the narrowed value ONCE rather than re-reading ``body.path`` below. The exactly-one guard
@@ -6352,14 +6440,25 @@ async def validate_workflow_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="supply exactly one of 'path' or 'source'",
         )
+    if "tier" in body.model_fields_set:
+        # The path form dispatches on the file's extension. A tier here would be a second answer
+        # to the same question, so it is refused rather than ignored or preferred.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="tier applies only to the source form",
+        )
 
     ext = _os.path.splitext(spec_path)[1].lower()
     if ext in (".yaml", ".yml"):
+        from cli_agent_orchestrator.services import step_params
+
         try:
-            result = workflow_spec_service.validate_only(spec_path)
+            result, spec = workflow_spec_service.validate_spec_file(spec_path)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-        return result.model_dump()
+        # The same step-params check as the source form, on the spec from that one read.
+        checked = await asyncio.to_thread(step_params.with_step_param_errors, result, spec)
+        return checked.model_dump()
     if ext == ".py":
         from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
         from cli_agent_orchestrator.models.workflow import ScriptValidationResult
@@ -6482,12 +6581,18 @@ async def get_workflow_endpoint(
     return type (BR-7a), so no branch is needed here. ``TierCollisionError``
     (a same-stem cross-tier sibling, BR-2/BR-3) maps to 409, checked BEFORE
     the bare ``ValueError`` arm (it is a ``ValueError`` subclass).
+
+    A YAML spec's body also carries ``path``, ``source`` and ``content_hash``
+    (the sha256 of the file bytes), so an editor can load the file and send
+    ``PUT``'s ``expected_hash``. ``get_workflow_document`` adds them from the
+    same single read; the ``WorkflowSpec`` model itself is unchanged because its
+    JSON is snapshotted into run journals. A Python body is unchanged.
     """
     from cli_agent_orchestrator.models.workflow import TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
-        spec = workflow_spec_service.get_workflow(name)
+        document = workflow_spec_service.get_workflow_document(name)
     except KeyError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown workflow '{name}'"
@@ -6498,7 +6603,7 @@ async def get_workflow_endpoint(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    return spec.model_dump()
+    return document
 
 
 @app.post("/workflows", status_code=status.HTTP_201_CREATED)
@@ -6506,7 +6611,7 @@ async def create_workflow_endpoint(
     body: WorkflowCreateRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Create a NEW Python workflow spec, refusing to overwrite one (issue #583 FR-10).
+    """Create a NEW workflow spec, Python or YAML, refusing to overwrite one (issue #583 FR-10).
 
     THE FIRST NETWORK-REACHABLE SPEC WRITE PATH. ``create_workflow`` shipped in Bolt 3 pass 3A and had
     no caller — this endpoint and its ``PUT`` sibling are what make it reachable, for the CLI verbs and
@@ -6522,11 +6627,19 @@ async def create_workflow_endpoint(
     index upsert all live in ``workflow_spec_service``, whose containment guard carries four
     CodeQL-driven constraints that a second implementation here would not reproduce. This handler maps
     exceptions to statuses and nothing else.
+
+    ``tier`` picks the service function: ``"python"`` (the default) is ``create_workflow``, with its
+    response unchanged; ``"yaml"`` is ``create_yaml_workflow``, whose response adds the validation
+    ``status`` and ``reserved_notes`` (see ``_yaml_write_body``).
     """
     from cli_agent_orchestrator.models.workflow import TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
+        if body.tier == "yaml":
+            return _yaml_write_body(
+                workflow_spec_service.create_yaml_workflow(body.name, body.source)
+            )
         spec = workflow_spec_service.create_workflow(body.name, body.source)
     except FileExistsError as e:
         # 409 rather than 400: the request was well-formed and the caller's next action is to choose
@@ -6563,7 +6676,9 @@ async def update_workflow_endpoint(
     body: WorkflowUpdateRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Update an EXISTING Python workflow spec, refusing to create one (issue #583 FR-10, FR-8).
+    """Update an EXISTING workflow spec, refusing to create one (issue #583 FR-10, FR-8).
+
+    The spec is Python or YAML, as ``tier`` says (below).
 
     ``PUT`` because this replaces the whole spec at a named location, and the name keys the path exactly
     as it does for ``DELETE``.
@@ -6579,11 +6694,21 @@ async def update_workflow_endpoint(
     would transport as 400 — "your request was malformed" — when the true condition is "someone else
     changed this spec", and the caller's next action differs completely. The wrong order produces a
     plausible answer rather than an error, which is why a test asserts the order structurally.
+
+    ``tier`` picks the service function: ``"python"`` (the default) is ``update_workflow``;
+    ``"yaml"`` is ``update_yaml_workflow``, which replaces the YAML file at its own path. Both raise
+    ``WorkflowWriteConflictError`` when the workflow is in the other tier, and the YAML one also when
+    both ``.yaml`` and ``.yml`` are present. It is a ``ValueError`` subclass and maps to 409 ahead of
+    the bare ``ValueError`` arm for the same reason.
     """
     from cli_agent_orchestrator.models.workflow import StaleSpecError, TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
+        if body.tier == "yaml":
+            return _yaml_write_body(
+                workflow_spec_service.update_yaml_workflow(name, body.source, body.expected_hash)
+            )
         spec = workflow_spec_service.update_workflow(name, body.source, body.expected_hash)
     except workflow_spec_service.WorkflowNotFoundError:
         # Only the update admission check maps to 404. A later FileNotFoundError
@@ -6594,6 +6719,8 @@ async def update_workflow_endpoint(
     except StaleSpecError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TierCollisionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except workflow_spec_service.WorkflowWriteConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except workflow_spec_service.SpecPathRefusedError:
         logger.error("workflow update refused unsafe spec path", exc_info=True)
@@ -7138,13 +7265,16 @@ async def start_workflow_run_endpoint(
     (FR-5.1). The script arm pre-checks run_id availability itself (BR-9a —
     ``run_script_workflow`` has no admission gate of its own) before calling
     ``run_script_workflow``; a lint failure maps to 422 with a findings body
-    (BR-10), via the shared ``render_findings`` helper.
+    (BR-10), via the shared ``render_findings`` helper. A YAML step whose params
+    do not fit its profile's declaration is a 422 with the messages in ``detail``,
+    raised by ``start_run`` before any journal row.
     """
     import uuid
 
     from cli_agent_orchestrator.models.workflow import (
         NotBuiltYetError,
         ScriptSpec,
+        StepParamError,
         TierCollisionError,
     )
     from cli_agent_orchestrator.services import (
@@ -7230,6 +7360,9 @@ async def start_workflow_run_endpoint(
         )
     except NotBuiltYetError as e:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+    except StepParamError as e:
+        # Before the ValueError arm: StepParamError is a ValueError subclass.
+        raise HTTPException(status_code=422, detail=str(e))
     except KeyError as e:
         # Duplicate run_id is a conflict, not a 404.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
@@ -7268,8 +7401,9 @@ async def submit_workflow_run_endpoint(
     1. Resolve the spec (same error mapping as the blocking route).
     2. Mint or accept the run id (identical to the blocking route).
     3. Validate + cap inputs BEFORE any create (OR-1, NFR-4) — no row yet.
-    4. Script tier: lint gate -> 422 (OR-2); reserved YAML mode -> 501 (OR-3) —
-       both BEFORE any insert, so a rejected run leaves NO durable row and NO 202.
+    4. Script tier: lint gate -> 422 (OR-2); reserved YAML mode or step call -> 501 (OR-3) —
+       both BEFORE any insert, so a rejected run leaves NO durable row and NO 202. A YAML
+       step whose params do not fit its profile's declaration -> 422, also before it.
     5. The awaited HARD atomic durable insert (INV-1, TR-1) — a ``sqlite3.Error``
        aborts with 500 and NO 202. This is the one deliberate deviation from the
        engines' best-effort write. An ``IntegrityError`` is special-cased FIRST
@@ -7288,12 +7422,14 @@ async def submit_workflow_run_endpoint(
     from cli_agent_orchestrator.models.workflow import (
         NotBuiltYetError,
         ScriptSpec,
+        StepParamError,
         TierCollisionError,
     )
     from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
     from cli_agent_orchestrator.services import (
         launch_guard,
         script_runner,
+        step_params,
         workflow_journal,
         workflow_service,
         workflow_spec_service,
@@ -7499,6 +7635,20 @@ async def submit_workflow_run_endpoint(
                 workflow_service._dispatch_reserved_mode(spec)
             except NotBuiltYetError as e:
                 raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+        # The reserved step-call guard, beside it for the same reason: the blocking
+        # path refuses an ``assign`` / ``send_message`` step in ``start_run``, and this
+        # path must refuse it before the insert below, so no row exists for it.
+        try:
+            workflow_service._refuse_reserved_calls(spec)
+        except NotBuiltYetError as e:
+            raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+        # Step params against the params each step's profile declares, beside the
+        # call guard for the same reason: the blocking path refuses them in
+        # ``start_run``, and this path must refuse them before the insert below.
+        try:
+            await asyncio.to_thread(step_params.refuse_step_param_errors, spec)
+        except StepParamError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         # Step 5 — the awaited HARD ATOMIC durable insert (INV-1, TR-1): the run row
         # AND its seeded step rows commit in ONE transaction, so a failure leaves
         # NEITHER (no phantom RUNNING row). Its failure aborts with 500 + NO 202.

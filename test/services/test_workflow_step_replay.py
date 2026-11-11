@@ -761,3 +761,57 @@ async def test_a_normalised_failure_still_releases_its_slot(monkeypatch):
     await ws.replay_single_step(_RUN_ID, "s2")
 
     assert ws.step_output_store._store == {}
+
+
+# ---------------------------------------------------------------------------
+# Step params on replay: the same prompt builder as the drive
+# ---------------------------------------------------------------------------
+def _spec_with_params() -> WorkflowSpec:
+    spec = _spec()
+    spec.steps[1].params = {"table-name": "example-table", "aws-profile-name": "beta"}
+    return spec
+
+
+@pytest.mark.asyncio
+async def test_replay_sends_the_params_block(monkeypatch):
+    _seed_run(spec=_spec_with_params())
+    step_mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", step_mock)
+
+    payload = await ws.replay_single_step(_RUN_ID, "s2")
+
+    expected = (
+        "write about 42 for cats\n"
+        "\n"
+        "Parameters for this step:\n"
+        "- table-name: example-table\n"
+        "- aws-profile-name: beta"
+    )
+    assert payload["prompt"] == expected
+    assert step_mock.await_args.kwargs["prompt"] == expected
+
+
+@pytest.mark.asyncio
+async def test_replay_override_replaces_the_template_and_keeps_the_params(monkeypatch):
+    _seed_run(spec=_spec_with_params())
+    step_mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", step_mock)
+
+    payload = await ws.replay_single_step(
+        _RUN_ID, "s2", prompt_override="redo {{steps.s1.output.answer}}"
+    )
+
+    assert payload["prompt"] == (
+        "redo 42\n\nParameters for this step:\n- table-name: example-table\n- aws-profile-name: beta"
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_of_a_step_without_params_is_unchanged(monkeypatch):
+    _seed_run()
+    step_mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", step_mock)
+
+    payload = await ws.replay_single_step(_RUN_ID, "s2")
+
+    assert payload["prompt"] == "write about 42 for cats"
