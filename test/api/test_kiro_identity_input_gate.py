@@ -197,6 +197,10 @@ def _pty_attach():
     proc = MagicMock()
     proc.poll.return_value = None
     backend = MagicMock()
+    backend.prepare_web_attach_input.side_effect = lambda s, w: (
+        backend.prepare_web_attach(s, w),
+        None,
+    )
     backend.prepare_web_attach.return_value = ["tmux", "attach-session", "-t", "cao-session"]
     state.backend = backend
     with (
