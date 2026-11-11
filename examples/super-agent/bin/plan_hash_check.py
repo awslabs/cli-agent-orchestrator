@@ -8,7 +8,7 @@ For each FILE: sha256 of its bytes (the same as `shasum -a 256 FILE`), compared 
 0 only when every file matches:
   MATCH <name> <sha8>
   REFUSE missing_baseline <name>            no trusted record: the conductor asks the user
-  REFUSE changed <name> got=<8> want=<8>    the script changed: the conductor asks the user
+  REFUSE changed <name>                     the script changed: the conductor asks the user
   REFUSE unreadable <name>
 A corrupt ledger prints REFUSE corrupt_ledger state_corrupt:<file>:<line>:<why> and exits 1:
 every row is validated by bin/state_schema.py (kind baseline or approval, every required field),
