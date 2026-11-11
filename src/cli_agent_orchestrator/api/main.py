@@ -1,5 +1,6 @@
 """Single FastAPI entry point for all HTTP routes."""
 
+import array
 import asyncio
 import fcntl
 import json
@@ -12,6 +13,8 @@ import stat
 import struct
 import subprocess
 import termios
+import time
+import weakref
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -9877,6 +9880,140 @@ def _ws_input_refusal(
     return metadata, terminal_service.terminal_input_refusal(terminal_id, metadata)
 
 
+# Pane spawn mode: several agents are panes of one tmux window, and tmux keeps
+# one active pane per window, not per client, so a browser terminal's keys go
+# to whichever pane is active when tmux reads them. Input for such a window is
+# serialised: a terminal holds its window's lock from selecting its pane until
+# tmux has read every byte it wrote, so no other terminal can move the window's
+# active pane while those bytes are in flight. Windows live only while a
+# connection on that window holds one.
+#
+# Reading is not always delivering. tmux cannot tell a lone Escape from the
+# start of an escape sequence, so it keeps a trailing ``\x1b`` as a partial key
+# until its ``escape-time`` timer expires, and only then sends it to the pane
+# that is active AT THAT TIME. It does the same with a trailing ``\x1b[`` or
+# ``\x1b]`` (Alt+[ and Alt+]), which also start longer sequences. So a frame
+# that ends in any of these leaves an "Escape hold" on its window: other
+# terminals wait it out before they select a pane. The hold is not ended early
+# by the sender's next frame, because those bytes can extend the partial key
+# instead of resolving it (``\x1b`` then ``[``, ``\x1b[`` then ``1``), and
+# tmux's timer keeps running from the first byte. The terminal that sent it
+# does not wait: its own next bytes still go to its own pane.
+# How long a writer waits for tmux to read its input before it lets the window
+# go anyway (tmux stalled), and the poll step while it waits.
+_WEB_INPUT_DRAIN_TIMEOUT_S = 2.0
+_WEB_INPUT_DRAIN_POLL_S = 0.002
+# The Escape hold when the backend cannot say how long its key timer is.
+_WEB_INPUT_ESCAPE_HOLD_FALLBACK_S = 0.55
+# Frame endings tmux keeps as a partial key: Escape, Alt+[ and Alt+].
+_WEB_INPUT_PARTIAL_KEYS = (b"\x1b", b"\x1b[", b"\x1b]")
+
+
+class _WebInputWindow:
+    """The input state that browser terminals on one shared window share."""
+
+    __slots__ = ("lock", "hold_owner", "hold_until", "__weakref__")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.hold_owner: object = None
+        self.hold_until = 0.0
+
+    def _held_against(self, owner: object) -> float:
+        """Seconds left on another terminal's Escape hold; 0 if none."""
+        if self.hold_owner is None or self.hold_owner is owner:
+            return 0.0
+        return max(0.0, self.hold_until - time.monotonic())
+
+    async def wait_for_hold(self, owner: object) -> None:
+        """Wait out an Escape hold left by another terminal.
+
+        Re-checked after each sleep: the owner extends its hold with each
+        further frame that ends in a partial key.
+        """
+        while (remaining := self._held_against(owner)) > 0:
+            await asyncio.sleep(remaining)
+
+    @asynccontextmanager
+    async def turn(self, owner: object):
+        """The window's lock, taken once no other terminal's Escape hold is on.
+
+        The hold is waited out WITHOUT the lock, so the terminal that left it
+        can keep typing to its own pane meanwhile.
+        """
+        while True:
+            await self.wait_for_hold(owner)
+            await self.lock.acquire()
+            if self._held_against(owner) == 0:
+                break
+            self.lock.release()  # a hold appeared while we queued; wait again
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+    def after_write(self, owner: object, raw: bytes, escape_hold_s: float) -> None:
+        """Start or extend ``owner``'s hold if its frame left tmux a partial key.
+
+        Any other frame leaves the hold to run out: it may have resolved the
+        partial key, or extended it, and only tmux's timer tells which.
+        """
+        if raw.endswith(_WEB_INPUT_PARTIAL_KEYS):
+            self.hold_owner = owner
+            self.hold_until = time.monotonic() + escape_hold_s
+
+
+_WEB_INPUT_WINDOWS: "weakref.WeakValueDictionary[str, _WebInputWindow]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _web_input_window(scope: str) -> _WebInputWindow:
+    window = _WEB_INPUT_WINDOWS.get(scope)
+    if window is None:
+        window = _WebInputWindow()
+        _WEB_INPUT_WINDOWS[scope] = window
+    return window
+
+
+def _pty_unread_bytes(slave_path: str) -> int:
+    """Bytes written to the PTY that its reader (the tmux server) has not read.
+
+    A slave that no longer opens has no reader left to misroute anything.
+    """
+    try:
+        fd = os.open(slave_path, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return 0
+    try:
+        buf = array.array("i", [0])
+        fcntl.ioctl(fd, termios.FIONREAD, buf, True)
+        return buf[0]
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+
+
+async def _wait_for_pty_drain(slave_path: str) -> bool:
+    """Wait until tmux has read everything written to ``slave_path``'s PTY.
+
+    The count does not see bytes still on their way into the line discipline,
+    so it must read zero on two polls in a row. False on timeout.
+    """
+    deadline = time.monotonic() + _WEB_INPUT_DRAIN_TIMEOUT_S
+    zeros = 0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(_WEB_INPUT_DRAIN_POLL_S)
+        if _pty_unread_bytes(slave_path) == 0:
+            zeros += 1
+            if zeros >= 2:
+                return True
+        else:
+            zeros = 0
+    return False
+
+
 @app.websocket("/terminals/{terminal_id}/ws")
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
@@ -10041,14 +10178,57 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4003, reason="Invalid tmux target name")
         return
 
+    # The attach argv and, in pane spawn mode, the pane its input must select
+    # come from one lookup, so they cannot disagree. A lookup that fails, or an
+    # answer of the wrong shape, refuses the attach: input that could not be
+    # routed to its own pane must never be delivered to whichever is active.
     try:
-        attach_command = await asyncio.to_thread(
-            get_backend().prepare_web_attach, session_name, window_name
+        attach_command, input_focus = await asyncio.to_thread(
+            get_backend().prepare_web_attach_input, session_name, window_name
         )
     except TerminalBackendError as e:
         logger.error(f"Web attach failed for terminal {terminal_id}: {e}")
         await websocket.close(code=4004, reason="Failed to attach terminal")
         return
+    if input_focus is not None and not (
+        isinstance(input_focus, tuple)
+        and len(input_focus) == 2
+        and all(isinstance(part, str) and part for part in input_focus)
+    ):
+        logger.error(f"Web attach failed for terminal {terminal_id}: malformed input focus")
+        await websocket.close(code=4004, reason="Failed to attach terminal")
+        return
+
+    input_window = _web_input_window(input_focus[0]) if input_focus is not None else None
+    input_owner = object()
+    escape_hold_s = _WEB_INPUT_ESCAPE_HOLD_FALLBACK_S
+    if input_window is not None:
+        try:
+            answer = await asyncio.to_thread(get_backend().web_input_escape_hold)
+        except Exception as e:  # noqa: BLE001 — the fallback is long enough for tmux defaults
+            logger.warning(f"Could not read the escape delay for terminal {terminal_id}: {e}")
+        else:
+            if isinstance(answer, (int, float)) and not isinstance(answer, bool) and answer >= 0:
+                escape_hold_s = float(answer)
+    focus_failure_logged = False
+    drain_timeout_logged = False
+
+    async def _select_own_pane() -> bool:
+        """Make this terminal's pane the active one; False if it can't be."""
+        nonlocal focus_failure_logged
+        assert input_focus is not None
+        try:
+            await asyncio.to_thread(get_backend().focus_web_input, input_focus[1])
+        except Exception as e:  # noqa: BLE001 — never route input to a pane we could not select
+            if not focus_failure_logged:
+                focus_failure_logged = True
+                logger.warning(
+                    "Dropping WebSocket input for terminal %r: could not focus its pane (%s)",
+                    terminal_id,
+                    e,
+                )
+            return False
+        return True
 
     # Create PTY pair for backend attach
     master_fd, slave_fd = pty.openpty()
@@ -10073,7 +10253,13 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         preexec_fn=os.setsid,
         env=pty_env,
     )
+    slave_path = os.ttyname(slave_fd)
     os.close(slave_fd)
+    # Pane mode: the view shows the whole shared window; select this
+    # terminal's pane so its cursor starts on the right agent.
+    if input_window is not None:
+        async with input_window.turn(input_owner):
+            await _select_own_pane()
 
     # Make master_fd non-blocking for event-driven reads
     flag = fcntl.fcntl(master_fd, fcntl.F_GETFL)
@@ -10148,8 +10334,17 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             )
         return False
 
+    async def _write_input(raw: bytes) -> None:
+        # Write in chunks to avoid overflowing the PTY buffer
+        chunk_size = 1024
+        for i in range(0, len(raw), chunk_size):
+            os.write(master_fd, raw[i : i + chunk_size])
+            if i + chunk_size < len(raw):
+                await asyncio.sleep(0.01)
+
     async def _forward_input():
         """Receive from WebSocket and write to PTY."""
+        nonlocal drain_timeout_logged
         try:
             while not done.is_set():
                 msg = await websocket.receive_text()
@@ -10159,12 +10354,31 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                         # Dropped: zero bytes reach the PTY (#1074).
                         continue
                     raw = payload["data"].encode()
-                    # Write in chunks to avoid overflowing the PTY buffer
-                    chunk_size = 1024
-                    for i in range(0, len(raw), chunk_size):
-                        os.write(master_fd, raw[i : i + chunk_size])
-                        if i + chunk_size < len(raw):
-                            await asyncio.sleep(0.01)
+                    if input_window is None:
+                        await _write_input(raw)
+                        continue
+                    # Pane mode: select this terminal's pane on every frame (an
+                    # operator in a real terminal may have moved it), and hold
+                    # the window until tmux has read the bytes, so a paste's
+                    # later chunks cannot follow another terminal's selection;
+                    # past that, for as long as tmux may still be holding a
+                    # trailing Escape as a partial key.
+                    async with input_window.turn(input_owner):
+                        if not await _select_own_pane():
+                            # Dropped: never deliver keys to another agent's pane.
+                            continue
+                        await _write_input(raw)
+                        drained = await _wait_for_pty_drain(slave_path)
+                        input_window.after_write(input_owner, raw, escape_hold_s)
+                        if not drained:
+                            if not drain_timeout_logged:
+                                drain_timeout_logged = True
+                                logger.warning(
+                                    "tmux did not read WebSocket input for terminal %r "
+                                    "within %.1fs; releasing its window anyway",
+                                    terminal_id,
+                                    _WEB_INPUT_DRAIN_TIMEOUT_S,
+                                )
                 elif payload.get("type") == "resize":
                     rows = payload.get("rows", 24)
                     cols = payload.get("cols", 80)

@@ -407,6 +407,50 @@ The name is a label, not an authenticated identity: anything that can reach the
 tmux socket can set the same mark. Agents are not isolated from each other here,
 so this is in line with the rest of the backend rather than a new exposure.
 
+#### Browser terminals in pane mode
+
+A web terminal (the Workspace tab, or the Agents tab overlay) on a pane-mode
+agent shows the **whole** `pane_window`, every agent's pane tiled, with that
+agent's pane selected. Two web terminals on agents of the same window therefore
+show the same tiled window, not one agent each; window mode gives each terminal
+its own window.
+
+**Keys** reach only the agent the terminal belongs to. tmux keeps one active
+pane per window, not per client, so cao-server selects the terminal's pane
+before every input it forwards and holds that window until tmux has read the
+input, so a paste in one terminal and a key in another cannot interleave. Input
+that ends in Escape, Alt+[ or Alt+] holds the window a little longer: tmux keeps
+these as a partial key until its `escape-time` runs out (10 ms by default since
+tmux 3.5, 500 ms before), in case more of an escape sequence follows, and only
+then delivers them to the pane that is active. So after such a key, other web
+terminals on the same window wait before their next key, and a terminal opened
+on that window in that time selects its pane only afterwards. The wait lasts
+until `escape-time` has run out after the sending terminal's last Escape, Alt+[
+or Alt+], counted as at least 500 ms: about half a second after a single such
+key, and longer while that terminal keeps sending them (Escape held down, for
+example). The sender's next key does not end the wait early: cao-server cannot
+tell whether that key completes the escape sequence or extends it, and tmux's
+timer keeps running from the first byte. The terminal that sent the key
+does not wait. Input whose pane cannot be
+selected is dropped rather than sent to whichever pane is active, and a terminal
+whose pane cannot be found is not attached.
+
+**The mouse** works as it does in tmux: a click or the wheel acts on the pane
+under the pointer, even another agent's tile. A click makes that pane the
+active one; your next key goes to your own agent again. The wheel goes to the
+program in the pane under the pointer if that program uses the mouse or (since
+tmux 3.6) is in the alternate screen, as full-screen agent CLIs usually are.
+Otherwise it puts that pane into copy mode, where it reads keys as copy-mode
+commands, so an agent scrolled that way does not see what is typed to it until
+copy mode ends: press `q` in that agent's terminal (or scroll back to the
+bottom).
+
+One case is outside cao-server's reach: selecting another pane by hand, from a
+real terminal attached to the same window, in the instant between cao-server's
+selection and tmux reading the input. Work in a different window, or in window
+mode, if you drive pane-mode agents from a real terminal while typing to them
+from the browser.
+
 ### MCP Apps (`apps`)
 
 Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_agent_orchestrator/ext_apps/apps.py) for the `ui://cao/*` MCP App resource surface this gates.
