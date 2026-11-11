@@ -46,6 +46,18 @@ The harness also calls `POST /agui/v1/emit_ui`, acting as an agent.
   end it after 2 s (`forwardedProps.cao.maxSeconds`), a component is emitted
   while the client waits to reconnect, and it must arrive after the reconnect,
   which carries `forwardedProps.cao.since`. The reopen is reported once.
+- An overflow and its resync, for the session timeline. A supervisor assigns a
+  worker; once the call is listed, the client stops reading its token stream
+  (the fetch it uses holds the response body back) while 450 `emit_ui` events of
+  about 7 KB are published, more than the server's per-subscriber queue of 256
+  holds. Then the supervisor hands off to a second worker and the first worker
+  is closed. The stream ends with `RUN_ERROR cao.stream_overflow`, and the client
+  reconnects with `forwardedProps.cao.since`. Asserted: every flood component
+  arrives once (counted in frames, since the panel keeps only 200), the dropped
+  `handoff` start is recovered, no call is listed twice, and the call held across
+  the gap is listed once as completed or unconfirmed. It does not assert which:
+  today the replay cannot close a call whose start came before the cursor (the
+  end lost across a reconnect gap: #1292).
 - The app requests no route outside `core/routes.ts`.
 
 ## Isolation

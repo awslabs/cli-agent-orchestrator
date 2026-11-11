@@ -77,4 +77,36 @@ describe("Root", () => {
     });
     expect(runCalls.filter((p) => p === "/agui/v1/run").length).toBe(atMount + 1);
   });
+
+  it("#1157: a reopen marks the timeline's open calls unconfirmed", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response('data: {"type":"RUN_FINISHED","outcome":{"type":"success"}}\n\n')));
+    let source: { onopen: ((e: unknown) => void) | null; onmessage: ((e: { data: string }) => void) | null; onerror: ((e: unknown) => void) | null; readyState: number } | undefined;
+    vi.stubGlobal(
+      "EventSource",
+      class {
+        readyState = 1;
+        onopen: ((e: unknown) => void) | null = null;
+        onmessage: ((e: { data: string }) => void) | null = null;
+        onerror: ((e: unknown) => void) | null = null;
+        constructor() {
+          source = this;
+        }
+        close() {}
+      },
+    );
+    await act(async () => {
+      render(<Root choice={{ ok: true, server: "http://127.0.0.1:9889", note: "" }} threadId="t" />);
+    });
+    await act(async () => {
+      source!.onopen!({});
+      source!.onmessage!({ data: JSON.stringify({ type: "TOOL_CALL_START", toolCallId: "a", metadata: { cao: { orchestrationType: "assign" } } }) });
+    });
+    expect(screen.getByTestId("call-state").textContent).toBe("open");
+    await act(async () => {
+      source!.readyState = 0;
+      source!.onerror!({});
+      source!.onopen!({});
+    });
+    expect(screen.getByTestId("call-state").textContent).toBe("open; its end was not seen across a reconnect");
+  });
 });

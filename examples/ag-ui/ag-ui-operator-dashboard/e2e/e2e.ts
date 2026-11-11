@@ -21,7 +21,7 @@ const BASE = process.env.CAO_E2E_BASE ?? "";
 const SOCKET = process.env.CAO_E2E_TMUX_SOCKET ?? "";
 const WORKDIR = process.env.CAO_E2E_WORKDIR ?? "";
 assert.ok(BASE && SOCKET && WORKDIR, "run this through e2e/run.sh");
-assert.ok(!BASE.endsWith(":9889"), "refusing the default fleet port");
+assert.notEqual(new URL(BASE).port, "9889", "refusing the default port 9889");
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const log = (msg: string) => console.log(`[e2e] ${msg}`);
@@ -102,6 +102,25 @@ async function emitUi(component: string, terminalId: string, props: object): Pro
     body: JSON.stringify({ component, terminal_id: terminalId, props }),
   });
   return { status: res.status, body: await res.json() };
+}
+
+/** A worker the supervisor `caller` calls: an `assign` or `handoff` the ambient stream turns into a TOOL_CALL pair. */
+async function callWorker(session: string, caller: string, kind: "assign" | "handoff"): Promise<string> {
+  const q = new URLSearchParams({ agent_profile: "developer", provider: "mock_cli", caller_id: caller, defer_init: "true" });
+  const res = await fetch(`${BASE}/sessions/${session}/terminals?${q}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ initial_message: "Do the assigned task.", initial_message_orchestration_type: kind }),
+  });
+  const text = await res.text();
+  assert.equal(res.status, 201, `create worker: ${res.status} ${text}`);
+  return (JSON.parse(text) as { id: string }).id;
+}
+
+/** mock_cli never finishes by itself: closing the worker ends its call, as the receiver's work ending does. */
+async function closeWorker(id: string) {
+  const res = await fetch(`${BASE}/terminals/${id}`, { method: "DELETE" });
+  assert.equal(res.status, 200, `delete worker ${id}: ${res.status}`);
 }
 
 // ── the app ─────────────────────────────────────────────────────────────────
@@ -286,6 +305,117 @@ async function main() {
   assert.ok(since && !Number.isNaN(Date.parse(since)), `the reconnect body carried no forwardedProps.cao.since: ${JSON.stringify(replayBodies[1])}`);
   assert.equal(reopened, 1);
   log(`PASS the token stream replays across a drop: the reconnect sent forwardedProps.cao.since=${since}, the component emitted during the drop arrived, and the reopen was reported once`);
+
+  // 6c. A token stream that stops reading overflows the server's per-subscriber queue (256
+  //     events; sse_bus.SSE_MAX_QUEUE_SIZE) and is ended with RUN_ERROR cao.stream_overflow. The
+  //     client reconnects with forwardedProps.cao.since. Asserted: a call whose start was dropped
+  //     is recovered by the replay, no call is listed twice, the call held across the gap is
+  //     either "completed" or "unconfirmed" (never lost or doubled), and every flood component
+  //     arrives (counted in frames: the panel keeps only MAX_PANEL_ENTRIES). The replay ring holds
+  //     500 records (event_log_service.RING_CAPACITY) and the records missed here are fewer.
+  //     The client "stops reading" because the fetch it is given holds the first response body
+  //     back: nothing is pulled from the socket until the gate opens, so the server's writes back up.
+  const FLOOD = 450;
+  let releaseGate: () => void = () => {};
+  let gate: Promise<void> = Promise.resolve();
+  const overflowBodies: Array<Record<string, unknown>> = [];
+  const gatedFetch: typeof fetch = async (input, init) => {
+    overflowBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    const res = await appFetch(input, init);
+    if (overflowBodies.length > 1 || !res.body) return res; // only the first stream is held back
+    const reader = res.body.getReader();
+    const held = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          await gate;
+          const chunk = await reader.read();
+          if (chunk.done) controller.close();
+          else controller.enqueue(chunk.value);
+        },
+        cancel: (reason) => reader.cancel(reason),
+      },
+      { highWaterMark: 0 },
+    );
+    return new Response(held, { status: res.status, headers: res.headers });
+  };
+  const flood = createController({ base: BASE, threadId: "operator-dashboard-e2e-overflow", fetchImpl: appFetch });
+  const floodFrames: Frame[] = [];
+  const floodStatus: string[] = [];
+  let floodReopened = 0;
+  const ambientFlood = openAmbient({
+    base: BASE,
+    threadId: "operator-dashboard-e2e-overflow",
+    token: "e2e-token",
+    fetchImpl: gatedFetch,
+    retryMs: 500,
+    onFrame: (f) => {
+      floodFrames.push(f);
+      void flood.ambient(f);
+    },
+    // Wired as view/Root.tsx wires it.
+    onReopen: () => {
+      floodReopened += 1;
+      flood.reconnected();
+    },
+    onStatus: (st) => floodStatus.push(st),
+  });
+  await until(() => floodStatus.includes("open"), "the overflow stream to open");
+  const workerOne = await callWorker(A.session, A.id, "assign");
+  await until(() => flood.timeline.entries.some((e) => e.receiver === workerOne && e.state === "open"), "the first call to reach the client");
+  gate = new Promise<void>((resolve) => (releaseGate = resolve)); // from here the client reads nothing
+  const floodPad = "x".repeat(7000);
+  for (let i = 0; i < FLOOD; i += 1) {
+    const r = await emitUi("progress", A.id, { label: `e2e flood ${i}`, note: floodPad });
+    assert.equal(r.status, 200, `flood ${i}: ${JSON.stringify(r.body)}`);
+  }
+  // After the queue is full: a call whose start the held stream cannot carry, and the end of call 1.
+  const workerTwo = await callWorker(A.session, A.id, "handoff");
+  await closeWorker(workerOne);
+  assert.ok(!floodFrames.some((f) => f.type === "RUN_ERROR"), "nothing has been read yet");
+  releaseGate();
+  const floodLabel = (f: Frame) => {
+    const value = f.type === "CUSTOM" ? (f.value as { props?: { label?: unknown } } | undefined) : undefined;
+    const label = value?.props?.label;
+    return typeof label === "string" && label.startsWith("e2e flood ") ? label : null;
+  };
+  const floodSeen = () => new Set(floodFrames.map(floodLabel).filter(Boolean)).size;
+  const floodDone = () => floodReopened > 0 && floodSeen() >= FLOOD && flood.timeline.entries.some((e) => e.receiver === workerTwo);
+  try {
+    await until(floodDone, "the resync to deliver the dropped start and every flood component", 30_000);
+  } catch (error) {
+    const detail = {
+      status: floodStatus,
+      frames: floodFrames.length,
+      runError: floodFrames.find((f) => f.type === "RUN_ERROR"),
+      requests: overflowBodies.length,
+      flood: `${floodSeen()}/${FLOOD}`,
+      timeline: flood.timeline.entries.map((e) => [e.receiver, e.orchestrationType, e.state]),
+    };
+    throw new Error(`${error instanceof Error ? error.message : error}: ${JSON.stringify(detail)}`);
+  }
+  await sleep(1000); // settle: anything else the replay or the live stream sends arrives first
+  ambientFlood.close();
+  await ambientFlood.done;
+  const overflowError = floodFrames.find((f) => f.type === "RUN_ERROR");
+  assert.equal(overflowError?.code, "cao.stream_overflow", `the held stream was not ended by an overflow: ${JSON.stringify(overflowError)}`);
+  const floodSince = (overflowBodies[1]?.forwardedProps as { cao?: { since?: string } } | undefined)?.cao?.since;
+  assert.ok(floodSince && !Number.isNaN(Date.parse(floodSince)), `the reconnect carried no since: ${JSON.stringify(overflowBodies[1])}`);
+  assert.equal(floodReopened, 1, "the reopen is reported once");
+  assert.equal(floodSeen(), FLOOD, "every flood component arrived");
+  const ids = flood.timeline.entries.map((e) => e.toolCallId);
+  assert.equal(new Set(ids).size, ids.length, `a call is listed twice: ${ids.join(",")}`);
+  const one = flood.timeline.entries.filter((e) => e.receiver === workerOne);
+  const two = flood.timeline.entries.filter((e) => e.receiver === workerTwo);
+  assert.equal(one.length, 1, "the call held across the gap is listed once");
+  assert.ok(["completed", "unconfirmed"].includes(one[0].state), `the held call is ${one[0].state}`);
+  assert.equal(two.length, 1, "the call whose start was dropped is recovered once");
+  assert.equal(two[0].orchestrationType, "handoff");
+  const startFrames = floodFrames.filter((f) => f.type === "TOOL_CALL_START").length;
+  log(
+    `PASS overflow then resync: RUN_ERROR cao.stream_overflow after the held stream was read, the reconnect sent since=${floodSince}, ` +
+      `all ${FLOOD} components arrived (counted in frames), the dropped start was recovered (call 2: ${two[0].state}), ` +
+      `the held call is listed once as ${one[0].state}, and ${startFrames} TOOL_CALL_START frames gave 2 entries`,
+  );
 
   // 7. Routes.
   const allowed = new Set<string>(Object.values(ROUTES));
