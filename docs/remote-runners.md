@@ -57,6 +57,7 @@ clients to `9889` independently.
 | `CAO_RUNNER_PLACEMENT_TIMEOUT` | `60` | Seconds a new terminal waits for a runner with room (`503` after). |
 | `CAO_RUNNER_EXPIRY` | `600` | Seconds a disconnected runner stays a member (see [Restart and reconnect](#restart-and-reconnect)). |
 | `CAO_RUNNER_RESERVED_SESSIONS` | *(none)* | Optional. Session names only a claiming runner may host. |
+| `CAO_MAX_TERMINALS` | *(none)* | The server's own terminal limit. Under this backend it counts every terminal on every runner, so it caps the whole fleet; each runner's own limit is `CAO_RUNNER_MAX_TERMINALS`. |
 
 ### Runner (`cao-runner`)
 
@@ -209,9 +210,12 @@ report the server's state as the runner's.
   API credential; neither is accepted in place of the other.
 - **One trust domain per runner.** Agents run as the runner's user and can read
   whatever it can, including a mounted token file. With the token, an agent
-  could register as a new runner and be given future unclaimed work (it cannot
-  take over an existing terminal; see [Ownership](#ownership)). Do not mix
-  tenants. Per-runner credentials are the follow-up.
+  could register as a new runner and be given future unclaimed work. Under the
+  id of a runner that is connected it is refused, but under the id of one that
+  is disconnected it takes over that runner's terminals: a restarted runner
+  needs exactly that path back (see [Ownership](#ownership)), and the token
+  carries no runner identity. Do not mix tenants. Per-runner credentials are
+  the follow-up.
 - **The runner trusts the server completely:** the server can type anything
   into any pane it hosts.
 - **No API authentication in this phase.** With `terminal.backend=remote`,

@@ -33,6 +33,10 @@ spec:
         - name: cao-server
           image: cao-server
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
           ports:
             - name: http
               containerPort: 9889

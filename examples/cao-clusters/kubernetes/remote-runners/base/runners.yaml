@@ -53,6 +53,10 @@ spec:
         - name: runner
           image: cao-server
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
           command: ["cao-runner"]
           env:
             # ws:// is refused to anything but loopback unless the overlay

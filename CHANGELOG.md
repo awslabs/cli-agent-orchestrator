@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `examples/cao-clusters/kubernetes/remote-runtime/` example. There is no migration path: stop
   any `cao-bridge` runtimes and their terminals before upgrading. A database written by the
   beta keeps its nullable `terminals.runtime_id` column; nothing reads it any more.
+  The EKS image keeps the Wolfi base, and still checks the kiro-cli archive's published
+  sha256 before running its installer. Its entrypoint now refuses `CAO_NODE_MODE=bridge`
+  instead of starting `cao-server` in its place.
 
 - **Remote terminal backend [EXPERIMENTAL]** (#745). With `terminal.backend = "remote"`
   (`CAO_TERMINAL_BACKEND=remote` or `cao-server --terminal remote`), one `cao-server` keeps the

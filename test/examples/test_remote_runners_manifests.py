@@ -123,9 +123,10 @@ def test_runners_and_the_server_keep_the_paths_they_need():
     public = [r for r in egress["egress"] if "ipBlock" in r["to"][0]]
     assert len(public) == 1 and public[0]["to"][0]["ipBlock"]["cidr"] == "0.0.0.0/0"
     assert [p["port"] for p in public[0]["ports"]] == [443]
-    # Public addresses only: never the cluster's own or the metadata service.
+    # Public addresses only: never the cluster's own (private and carrier-grade
+    # NAT ranges, which some clusters give pods) or the metadata service.
     assert sorted(public[0]["to"][0]["ipBlock"]["except"]) == sorted(
-        ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
+        ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"]
     )
     dns = policies["allow-dns"]
     assert dns["podSelector"] == {"matchLabels": {"app.kubernetes.io/part-of": "cao-remote"}}
@@ -140,6 +141,18 @@ def test_runners_and_the_server_keep_the_paths_they_need():
     for workload in _workloads(docs):
         labels = workload["spec"]["template"]["metadata"]["labels"]
         assert labels["app.kubernetes.io/part-of"] == "cao-remote", workload["metadata"]["name"]
+
+
+def test_every_container_drops_privileges():
+    """No container can gain privileges or keeps a Linux capability."""
+    containers = [
+        c for w in _workloads(_base()) for c in w["spec"]["template"]["spec"]["containers"]
+    ]
+    assert containers
+    for container in containers:
+        context = container.get("securityContext") or {}
+        assert context.get("allowPrivilegeEscalation") is False, container["name"]
+        assert context.get("capabilities", {}).get("drop") == ["ALL"], container["name"]
 
 
 def test_service_names_do_not_assume_a_cluster_dns_domain():

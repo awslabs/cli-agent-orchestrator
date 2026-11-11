@@ -50,8 +50,11 @@ What an overlay must decide:
 |---|---|---|
 | runner | `cao-server:9891` | the execution channel; only runner pods may reach it |
 | runner | `cao-server:9889` | the agents' in-session `cao-mcp-server` calling the API |
-| runner | public `:443` | the model provider |
+| runner | public `:443` (not private, carrier-grade NAT `100.64.0.0/10` or link-local addresses) | the model provider |
 | every pod | cluster DNS | name resolution |
+
+Every container runs with `allowPrivilegeEscalation: false` and all Linux
+capabilities dropped; tmux and the provider CLIs need none.
 
 Nothing reaches a runner: it has no inbound interface and no Service. Neither
 the API port (9889) nor the hub port (9891) is exposed outside the cluster: no

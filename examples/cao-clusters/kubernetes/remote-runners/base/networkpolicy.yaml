@@ -82,6 +82,8 @@ spec:
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
-            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+            # Private, carrier-grade NAT (pod ranges on some clusters, e.g. EKS
+            # custom networking) and link-local addresses stay out of reach.
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
       ports:
         - port: 443

@@ -44,6 +44,13 @@
 # layer (AUTH0_DOMAIN / CAO_AUTH_JWKS_URI).
 set -euo pipefail
 
+# The bridge mode went with the #834 execution runtimes. A pod still deployed
+# with it must not quietly become a cao-server listening on 0.0.0.0.
+if [ "${CAO_NODE_MODE:-}" = "bridge" ]; then
+  echo "cao-entrypoint: CAO_NODE_MODE=bridge was removed with cao-bridge; use terminal.backend=remote with cao-runner (see docs/remote-runners.md)" >&2
+  exit 64
+fi
+
 BIND_HOST="${CAO_BIND_HOST:-0.0.0.0}"
 PORT="${CAO_API_PORT:-9889}"
 
