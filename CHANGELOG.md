@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the enum's `str()`); it is now `"assign"` or `"handoff"`, as `metadata.cao.orchestrationType`
   already was. The `cao-legacy` framing is unchanged: JSON already wrote the enum as `"assign"`
   there.
+- **An off-list `emit_ui` call now shows as refused on the AG-UI stream** (#1158). The caller
+  still gets the same 400, and the component still never renders. The server also publishes a
+  metadata-only refusal record: the requested name with every unsafe character replaced and a
+  short hash always appended (at most 33 bytes, never equal to an allow-listed name), and the
+  terminal only if CAO knows it. The props are never read. Repeats are deduped and
+  rate-limited per terminal and per server, and folded into a `more_refused` count. Refusals
+  hold at most a tenth of the event log, so real events keep their replay horizon; only refusals inside the 24 h window count, and a server warning is logged when that share fills. The visible part of the name is caller text, cut to 24 characters. The record
+  goes into the event log, so a reconnect resumes after it, and onto the bus with a new
+  `publish_lossy`: it is queued only below half a subscriber's queue, and a real event that
+  meets a full queue displaces the newest one, so refusals never cause an overflow
+  (`RUN_ERROR cao.stream_overflow`) that the real events alone would not. The operator
+  dashboard caps refused entries at 20, apart from real ones. `docs/agui.md` describes the
+  record.
+
 - **`assign` and `handoff` now work when the caller can't read the agent store.** A CLI that
   sandboxes its MCP servers (for example kiro-cli with `"sandbox": true`, which hides `~/.aws`)
   made every profile read in `cao-mcp-server` fail with `Permission denied`, so `assign` failed.

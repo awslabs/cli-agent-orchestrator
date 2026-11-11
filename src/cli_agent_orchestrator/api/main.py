@@ -2959,6 +2959,67 @@ async def agui_stream_post(
     )
 
 
+# A terminal id longer than this is not looked up: no CAO terminal id is near it.
+_REFUSAL_TERMINAL_ID_MAX = 128
+
+
+def _publish_ui_refusal(component: str, claimed_terminal_id: Optional[str]) -> None:
+    """Publish the metadata-only refusal record for an off-list ``emit_ui`` (#1158).
+
+    The record is built from a fixed schema (``services/agui/refusal.py``): the
+    cleaned name and a fold count. The props are never read, and the body's
+    ``session_name`` and any other key are ignored. The terminal is recorded only
+    if CAO has a row for it, and its session is then taken from that row; the
+    stream derives the subagent from the terminal. Otherwise the record is
+    unattributed. It goes into the event log, so its SSE id is one a reconnect
+    can resume from, and onto the bus with ``publish_lossy``, so a flood can't
+    end a stream. Failure-isolated: the caller's 400 never depends on it.
+    """
+    from cli_agent_orchestrator.clients import database as _db
+    from cli_agent_orchestrator.services.agui.refusal import (
+        REFUSAL_EVENT_TYPE,
+        get_refusal_limiter,
+        note_ring_share,
+        refusal_detail,
+        refusal_name,
+        ring_share_reached,
+    )
+    from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY, get_event_log
+    from cli_agent_orchestrator.services.sse_bus import get_bus
+
+    try:
+        terminal_id: Optional[str] = None
+        session_name: Optional[str] = None
+        if (
+            claimed_terminal_id
+            and len(claimed_terminal_id) <= _REFUSAL_TERMINAL_ID_MAX
+            and _db.terminal_exists(claimed_terminal_id)
+        ):
+            terminal_id = claimed_terminal_id
+            session_name = (_db.get_terminal_metadata(terminal_id) or {}).get("tmux_session")
+        name = refusal_name(component)
+        limiter = get_refusal_limiter()
+        log = get_event_log()
+        # Refusals may hold at most a tenth of the ring real events replay from, and
+        # only the ones still inside the 24 h window count (the rows history() returns).
+        # Past that the refusal is folded into its terminal's count, and the operator is
+        # told once by a warning.
+        reached = ring_share_reached(
+            log.count_event_type(REFUSAL_EVENT_TYPE, within_ttl=True), RING_CAPACITY
+        )
+        note_ring_share(reached)
+        if reached:
+            limiter.fold(terminal_id)
+            return
+        more = limiter.decide(terminal_id, name)
+        if more is None:
+            return
+        event = log.append("other", terminal_id, session_name, refusal_detail(name, more))
+        get_bus().publish_lossy(event)
+    except Exception:
+        logger.warning("emit_ui: the refusal record was not published", exc_info=True)
+
+
 class EmitUIRequest(BaseModel):
     """Body for POST /agui/v1/emit_ui — an agent-authored generative-UI intent."""
 
@@ -2981,7 +3042,9 @@ async def agui_emit_ui(
     it to a ``CUSTOM`` frame named ``cao.generative_ui`` on ``/agui/v1/stream``
     (AG-UI 1.0 defines no generative-UI event type). Off-list components
     and oversized/non-serializable props are rejected (400) so a bad intent
-    never reaches the bus. Requires ``cao:write`` when auth is enabled.
+    never renders. For an off-list component the server also publishes a
+    metadata-only refusal record (``_publish_ui_refusal``, #1158), so operators
+    see the refusal. Requires ``cao:write`` when auth is enabled.
     """
     _require_agui_enabled()
 
@@ -2990,6 +3053,7 @@ async def agui_emit_ui(
     from cli_agent_orchestrator.services.sse_bus import get_bus
 
     if body.component not in GENERATIVE_UI_COMPONENTS:
+        _publish_ui_refusal(body.component, body.terminal_id)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(

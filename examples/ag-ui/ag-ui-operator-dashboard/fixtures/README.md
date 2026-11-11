@@ -41,6 +41,18 @@ prompts by having `APPROVAL_REQUIRED: <text>` typed into their panes.
 
 Captured from a private `cao-server` at that commit, with `CAO_AGUI_ENABLED=1`, on a non-default port with a throwaway `HOME` and its own tmux socket. Three `mock_cli` terminals: a supervisor (`POST /sessions`) and two workers created with `POST /sessions/<session>/terminals?caller_id=<supervisor>&defer_init=true` and a body carrying `initial_message` and `initial_message_orchestration_type` (`assign`, then `handoff`). `mock_cli` does not finish on its own, so the first call was closed by deleting its worker (`DELETE /terminals/<id>`): the server closes a call when its receiver's work ends. `session-superseded.sse` comes from the same commit and the same setup, with two `mock_cli` terminals: the supervisor and one worker created the same way with `assign`, then given a second `assign` through `POST /terminals/<worker>/input` with `sender_id` and `orchestration_type`, then deleted. The captures hold metadata only (ids, names and timestamps), with no message text.
 
+## Captured from a running server at #1158
+
+**Source: this branch's `cao-server`, which publishes a refusal record for an
+off-list `emit_ui` (#1158).** Captured by `e2e/run.sh` (the same isolation as
+above: a private server on a non-default port, a throwaway `HOME`, its own tmux
+socket) with `CAO_E2E_CAPTURE_OFFLIST=<file>`, which makes `e2e/e2e.ts` write
+the one `RAW` refusal frame its step 6 received on the `EventSource` stream.
+
+| File | What it is |
+|---|---|
+| `raw-offlist.json` | The `RAW` frame for a real `POST /agui/v1/emit_ui` with the off-list component `iframe_embed` from terminal A, whose props held a marker string. The frame has no props: only the cleaned name with its hash (`iframe_embed.<8 hex>`), the terminal and session from CAO's own records, and the record's ids. It replaces `raw-offlist.generated.json`, which `AmbientRun.feed()` made in-process when a real call could not produce one. |
+
 ## Generated with that commit's code
 
 No shipped producer can put these on the wire today, so they come from the
@@ -48,7 +60,6 @@ same commit's code run in-process, not from a hand-written shape.
 
 | File | How |
 |---|---|
-| `raw-offlist.generated.json` | `AmbientRun.feed()` on `OFF_LIST_UI` from `test/_support/agui_ambient_records.py`: the `RAW` frame with `event.rejected_component` that the stream emits for an off-list record. `emit_ui` refuses such a call with 400 before the bus, so a real call never produces it. |
 | `edit-offered.generated.sse` | `run_plane_stream()` with an `AgentHandoffWithApproval` holding a Kiro `permission_request` interrupt: a `responseSchema` with `editedArgs`. `mock_cli` never offers edit. |
 
 HTTP 403, 404 and 501 bodies are built in the tests from the route code
