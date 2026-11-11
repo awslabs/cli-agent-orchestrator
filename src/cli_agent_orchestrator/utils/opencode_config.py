@@ -298,7 +298,8 @@ def _write_grant_record(record: Dict[str, Any], *, lost: str) -> bool:
     new entry has no proof (a grant the old record already has keeps its). A
     WITHDRAWAL is recorded BEFORE the key is removed (#1289): when this returns
     False, :func:`_reconcile_agent_grants` leaves the key in ``opencode.json``, so
-    the record never lists a key CAO already removed. (Before that, a failed write
+    the record never lists a key CAO already removed (a key containment also proves
+    is held back the same way, #1294). (Before that, a failed write
     left the old row listing a removed key, and EVERY later install removed a key
     of that name, even one the user had added by hand, until one could write the
     record: #1285 review, Note 1, and #1290 review, P3-1.) The two callers lose
@@ -540,15 +541,15 @@ def _reconcile_agent_grants(
     Everything else in ``tools`` is the user's and is copied through untouched.
 
     Order matters for a withdrawal (#1289). The record is what lets a LATER install
-    take a key away, so a key whose only proof is the record is not removed from
-    ``opencode.json`` until the record no longer lists it: the row is written first,
-    then the key goes. If the row cannot be written the key is left where it is and
-    the warning says so (fail closed: a grant that stays is mild; a row that still
-    lists a removed key makes every later install delete a key of that name, even
-    one the user added by hand). If ``opencode.json`` then cannot be written, the
-    old row is put back, so the two agree and the next install tries again. A key
-    that plugin-store containment proves is CAO's does not need the record and is
-    withdrawn either way.
+    take a key away, so a key the record lists is not removed from ``opencode.json``
+    until the record no longer lists it: the row is written first, then the key goes.
+    That holds whether or not plugin-store containment also proves the key. If the
+    row cannot be written the key is left where it is and the warning names it (fail
+    closed: a grant that stays is mild; a row that still lists a removed key makes
+    every later install delete a key of that name, even one the user added by hand).
+    If ``opencode.json`` then cannot be written, the old row is put back, so the two
+    agree and the next install tries again. A key that containment proves but that
+    no row lists has nothing to disagree with, so it is withdrawn either way.
     """
     roots = list(plugin_store_roots)
     owned_now = {f"{name}*": True for name in mcp_names}
@@ -587,8 +588,10 @@ def _reconcile_agent_grants(
         tools = dict(tools)
 
     withdrawn = owned_before - set(owned_now)
-    # Withdrawals only the record vouches for: record them FIRST, and keep the keys if that fails.
-    vouched = (recorded & withdrawn) - contained
+    # Every withdrawal the record lists is recorded FIRST, and its key is kept if that fails (#1289). That includes a
+    # grant containment also proves: the row is what a later install trusts, so the row and the key must agree.
+    # A contained key the record does not list has no row to disagree with, so it is withdrawn either way.
+    vouched = recorded & withdrawn
     held_back: Set[str] = set()
     withdrawal_recorded = False
     if vouched:
@@ -597,10 +600,9 @@ def _reconcile_agent_grants(
             recorded - withdrawn,
             lost=(
                 f"Agent {agent_name}'s grants that the profile no longer names were left in "
-                "opencode.json: a grant is not removed while the record would still list it, "
-                "because a later install would then remove a key of that name even if it was "
-                "added by hand. The next install tries again. A plugin server's grant is still "
-                "withdrawn by plugin-store containment."
+                f"opencode.json ({', '.join(sorted(vouched))}): a grant is not removed while the record "
+                "would still list it, because a later install would then remove a key of that name even "
+                "if it was added by hand. The next install tries again."
             ),
         )
         if not withdrawal_recorded:
@@ -619,7 +621,8 @@ def _reconcile_agent_grants(
     if json.dumps(data, sort_keys=True) != before:
         try:
             write_config(data)
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: a Ctrl-C during the write must still put the row back (#1294 P3-1).
             if withdrawal_recorded:
                 # The record already says the withdrawal happened, and the keys are still there: put the old
                 # row back (best effort) so the two agree and the next install tries again.
@@ -639,8 +642,8 @@ def _reconcile_agent_grants(
         lost=(
             f"Agent {agent_name}'s recorded grants keep their old value: a profile server's grant "
             "added now stays if the profile drops that server before the agent is next installed "
-            "with a writable sidecar. A plugin server's grant is still withdrawn by plugin-store "
-            "containment."
+            "with a writable sidecar. A plugin server's grant that the record does not list is still "
+            "withdrawn by plugin-store containment."
         ),
     )
 

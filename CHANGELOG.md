@@ -85,8 +85,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   install removed a key of that name, even one you had added by hand. CAO now writes the record
   first. If it cannot, the grant is left in `opencode.json` with a warning and withdrawn by the
   next install that can write the record; if `opencode.json` then cannot be written, the old
-  record row is put back. A grant that plugin-store containment proves is CAO's is still
-  withdrawn either way. If CAO is killed between the two writes, the grant stays in
+  record row is put back. A grant that the record does not list, but that plugin-store
+  containment proves is CAO's, is still withdrawn at once. If CAO is killed between the two writes, the grant stays in
   `opencode.json` without a record row; delete it by hand.
 - **The OpenCode grant writer no longer replaces a damaged `cao-grants.json`** (#1271). When
   the sidecar beside `opencode.json` could not be read as a grant record, `cao install

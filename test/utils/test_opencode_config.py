@@ -632,7 +632,10 @@ class TestGrantRecord:
         assert len(messages) == 1, [r.getMessage() for r in caplog.records]
         message = messages[0]
         assert "Agent developer's recorded grants keep their old value:" in message
-        assert "A plugin server's grant is still withdrawn by plugin-store containment" in message
+        assert (
+            "A plugin server's grant that the record does not list is still withdrawn by plugin-store containment"
+            in message
+        )
         assert (
             "a profile server's grant added now stays if the profile drops that server before"
             " the agent is next installed with a writable sidecar." in message
@@ -739,7 +742,7 @@ class TestGrantRecord:
         assert "a grant is not removed while the record would still list it" in message
         assert "The next install tries again." in message
         assert "removed now" not in message and "go unrecorded" not in message
-        assert "z-server" not in message, "the warning must not carry a recorded value"
+        assert "z-server*" in message, "the warning names the held-back key (#1294 P3-2)"
         assert self._tools() == {"z-server*": True}, "fail closed: the grant stays"
         assert self._row() == ["z-server*"], "and the record still says it is CAO's"
 
@@ -908,9 +911,12 @@ class TestGrantRecord:
         messages = self._write_failures(caplog)
         assert len(messages) == 1 and "added now stays" in messages[0]
 
-    def test_a_grant_that_the_record_and_containment_both_prove_is_not_held_back(
+    def test_a_grant_that_the_record_and_containment_both_prove_is_held_back_too(
         self, tmp_config: Path, tmp_path: Path, caplog
     ):
+        """#1294 P2-1 (fanhongy, haofeif): containment proves the key, but the record LISTS it, so the record-first
+        rule covers it. When the record cannot be written, the key and its row stay, and the warning says so. The
+        next writable install withdraws it, with the row."""
         store_root = tmp_path / "plugins"
         entry = {"type": "local", "command": [str(store_root / "demo" / "bin" / "srv")]}
         write_config({"mcp": {"demo-tools": entry}})
@@ -918,10 +924,58 @@ class TestGrantRecord:
         assert self._row() == ["demo-tools*"]
         with self._read_only_dir(tmp_config), caplog.at_level(logging.WARNING):
             upsert_agent_tools("developer", [], plugin_store_roots=[store_root])
-        assert "demo-tools*" not in self._tools()
-        assert not any(
-            "were left in opencode.json" in m for m in self._write_failures(caplog)
-        ), "nothing was held back"
+        assert self._tools() == {"demo-tools*": True}, "step 2: held back, not removed"
+        assert self._row() == ["demo-tools*"], "step 2: the row still lists the key it keeps"
+        messages = self._write_failures(caplog)
+        assert len(messages) == 1 and "demo-tools*" in messages[0], messages
+        assert "were left in opencode.json" in messages[0]
+        upsert_agent_tools("developer", [], plugin_store_roots=[store_root])  # writable again
+        assert self._tools() == {}, "withdrawn at the first writable install"
+        assert self._row() is None
+
+    def test_fanhongy_four_step_repro_keeps_the_key_and_row_in_step_2(
+        self, tmp_config: Path, tmp_path: Path, caplog
+    ):
+        """#1294 P2-1, fanhongy's repro, step for step. Step 2 is read-only; the key must not be removed while the
+        row still lists it. Step 3 is the user's hand edit: the key is then, by the record's account, still CAO's
+        (a hand-edited value of a key the record lists is withdrawn at the first writable install, as documented),
+        so step 4 withdraws it with its row. The bug was in step 2: the key went, the row stayed."""
+        store_root = tmp_path / "plugins"
+        entry = {"type": "local", "command": [str(store_root / "demo" / "bin" / "srv")]}
+        write_config({"mcp": {"demo-tools": entry}})
+        upsert_agent_tools("developer", ["demo-tools"], plugin_store_roots=[store_root])  # 1
+        assert self._row() == ["demo-tools*"]
+        with self._read_only_dir(tmp_config), caplog.at_level(logging.WARNING):
+            upsert_agent_tools("developer", [], plugin_store_roots=[store_root])  # 2
+        assert self._tools() == {"demo-tools*": True}, "2: the key stays while the row lists it"
+        assert self._row() == ["demo-tools*"]
+        data = read_config()
+        data["mcp"]["demo-tools"] = {"type": "local", "command": ["/usr/local/bin/my-tools"]}
+        data["agent"]["developer"]["tools"][
+            "demo-tools*"
+        ] = True  # 3: pointed elsewhere, key by hand
+        write_config(data)
+        upsert_agent_tools("developer", [], plugin_store_roots=[store_root])  # 4: writable
+        assert self._tools() == {}, "4: withdrawn with its row"
+        assert self._row() is None
+
+    def test_a_keyboard_interrupt_during_the_opencode_json_write_puts_the_old_row_back(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1294 P3-1 (fanhongy): Ctrl-C is not an Exception, so the restore must still run. The row is put back,
+        so the key and its row agree and the next install withdraws it."""
+        write_config({})
+        upsert_agent_tools("developer", ["z-server"])
+
+        def interrupted(data):
+            raise KeyboardInterrupt
+
+        with monkeypatch.context() as patched:
+            patched.setattr(cfg_module, "write_config", interrupted)
+            with pytest.raises(KeyboardInterrupt):
+                upsert_agent_tools("developer", [])
+        assert self._tools() == {"z-server*": True}
+        assert self._row() == ["z-server*"], "restored on Ctrl-C too"
 
     def test_an_unreadable_sidecar_holds_nothing_back_and_still_warns(
         self, tmp_config: Path, caplog
