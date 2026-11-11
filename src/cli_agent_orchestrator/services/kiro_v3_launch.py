@@ -78,11 +78,19 @@ class KiroV3Admission:
                 "kiro.v3_admission=observed; every live launch check still applies."
             )
         if self.unverified_version is not None:
-            notes.append(
-                f"kiro_v3_unverified_version_admitted: kiro-cli {self.unverified_version} is "
-                "pending operator verification; this v3 launch was admitted only by the "
-                "operator opt-in kiro.v3_allow_unverified_versions."
-            )
+            if self.observed_version is not None:
+                notes.append(
+                    f"kiro_v3_unverified_version_admitted: kiro-cli {self.observed_version} "
+                    f"runs on the schema of kiro-cli {self.borrowed_schema_version}, which is "
+                    "pending operator verification; this v3 launch was admitted by the "
+                    "operator opt-in kiro.v3_allow_unverified_versions."
+                )
+            else:
+                notes.append(
+                    f"kiro_v3_unverified_version_admitted: kiro-cli {self.unverified_version} is "
+                    "pending operator verification; this v3 launch was admitted only by the "
+                    "operator opt-in kiro.v3_allow_unverified_versions."
+                )
         return notes or None
 
 
@@ -143,12 +151,22 @@ def require_kiro_v3_admissible(
             "the agent's allowedTools, or retry with engine 'v2'.",
         )
     if unverified is not None:
-        logger.warning(
-            "Kiro v3 launch admitted on kiro-cli %s, which is pending operator "
-            "verification, by the operator opt-in kiro.v3_allow_unverified_versions "
-            "(#1167). Keep the opt-in off outside the operator checklist.",
-            unverified,
-        )
+        if observed:
+            logger.warning(
+                "Kiro v3 launch admitted: kiro-cli %s runs on the schema of kiro-cli %s, "
+                "which is pending operator verification, by the operator opt-in "
+                "kiro.v3_allow_unverified_versions (#1167). Keep the opt-in off outside "
+                "the operator checklist.",
+                version,
+                entry.cli_version,
+            )
+        else:
+            logger.warning(
+                "Kiro v3 launch admitted on kiro-cli %s, which is pending operator "
+                "verification, by the operator opt-in kiro.v3_allow_unverified_versions "
+                "(#1167). Keep the opt-in off outside the operator checklist.",
+                unverified,
+            )
     if observed:
         logger.warning(
             "Kiro v3 observed admission: kiro-cli %s borrowed schema from kiro-cli %s%s; "

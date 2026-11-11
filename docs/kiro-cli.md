@@ -350,7 +350,7 @@ the expected tools. It remains operator opt-in, and the live check on kiro-cli
 |---|---|
 | `kiro_v3_observed_refused` | Unlisted version fails parsing, the floor/ceiling, v3 capability, or same-major predecessor check; use a supported version or qualify a schema, with the pending opt-in when applicable. |
 | `kiro_v3_unsupported_version` | Strict mode finds an unlisted version; use a supported version. |
-| `kiro_v3_unverified_version` | A listed version or all eligible borrowed schema rows are pending; complete the operator checklist or enable the existing pending opt-in for that checklist. |
+| `kiro_v3_unverified_version` | A listed version is pending, or the newest same-major row borrowed by observed admission is pending (even if an older row is verified), without `kiro.v3_allow_unverified_versions`; complete the operator checklist or enable that opt-in for the checklist. |
 
 Live-check refusal codes remain unchanged, including `kiro_v3_tools_mismatch`,
 `kiro_v3_mcp_not_ready`, and the agent-identity and home/marker refusals below.

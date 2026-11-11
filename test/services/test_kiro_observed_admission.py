@@ -20,7 +20,7 @@ import pytest
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
-from cli_agent_orchestrator.providers import kiro_v3_schema
+from cli_agent_orchestrator.providers import kiro_launch_home, kiro_v3_schema
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroCapabilityError,
@@ -195,13 +195,64 @@ async def test_observed_pending_warning_and_notes_preserved(kiro, observed, capl
         terminal = await launch(kiro)
     notes = " ".join(terminal.launch_notes)
     assert "(pending operator verification)" in notes
-    assert "kiro_v3_unverified_version_admitted" in notes
-    assert "kiro.v3_allow_unverified_versions" in notes
+    assert terminal.launch_notes[1] == (
+        "kiro_v3_unverified_version_admitted: kiro-cli 3.2.0 runs on the schema of "
+        "kiro-cli 3.1.0, which is pending operator verification; this v3 launch was "
+        "admitted by the operator opt-in kiro.v3_allow_unverified_versions."
+    )
     warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("3.1.0" in m and "kiro.v3_allow_unverified_versions" in m for m in warnings)
+    assert (
+        "Kiro v3 launch admitted: kiro-cli 3.2.0 runs on the schema of kiro-cli 3.1.0, "
+        "which is pending operator verification, by the operator opt-in "
+        "kiro.v3_allow_unverified_versions (#1167). Keep the opt-in off outside the "
+        "operator checklist."
+    ) in warnings
     assert any(
         "observed admission" in m and "(pending operator verification)" in m for m in warnings
     )
+
+
+def test_listed_pending_warning_and_notes_unchanged(observed, caplog):
+    caps = KiroCapabilities(version="3.1.0", flags=frozenset(), agent_engines=frozenset({"v3"}))
+    with caplog.at_level(logging.WARNING):
+        admission = kiro_v3_launch.require_kiro_v3_admissible(
+            caps, ["fs_read"], allow_observed=True
+        )
+    assert admission.observed_version is None
+    assert admission.borrowed_schema_version is None
+    assert admission.launch_notes == [
+        "kiro_v3_unverified_version_admitted: kiro-cli 3.1.0 is pending operator "
+        "verification; this v3 launch was admitted only by the operator opt-in "
+        "kiro.v3_allow_unverified_versions."
+    ]
+    assert [r.message for r in caplog.records if r.levelno == logging.WARNING] == [
+        "Kiro v3 launch admitted on kiro-cli 3.1.0, which is pending operator "
+        "verification, by the operator opt-in kiro.v3_allow_unverified_versions "
+        "(#1167). Keep the opt-in off outside the operator checklist."
+    ]
+
+
+def test_observed_verified_schema_needs_no_pending_opt_in(monkeypatch, caplog):
+    monkeypatch.setattr(settings_service, "_load", lambda: {"kiro": {"v3_admission": "observed"}})
+    assert not settings_service.kiro_v3_allow_unverified_versions()
+    with caplog.at_level(logging.WARNING):
+        admission = kiro_v3_launch.require_kiro_v3_admissible(
+            probe("2.35.2"), ["fs_read"], allow_observed=True
+        )
+    assert admission.observed_version == "2.35.2"
+    assert admission.borrowed_schema_version == "2.35.1"
+    assert admission.unverified_version is None
+    assert admission.launch_notes == [
+        "kiro_v3_observed_admitted: kiro-cli 2.35.2 borrowed schema from kiro-cli "
+        "2.35.1 by operator opt-in kiro.v3_admission=observed; every live launch "
+        "check still applies."
+    ]
+    assert [r.message for r in caplog.records if r.levelno == logging.WARNING] == [
+        "Kiro v3 observed admission: kiro-cli 2.35.2 borrowed schema from kiro-cli "
+        "2.35.1; operator opt-in kiro.v3_admission=observed; live checks remain required."
+    ]
+    assert "pending" not in " ".join(admission.launch_notes)
+    assert "pending" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -265,6 +316,7 @@ async def test_observed_live_refusal_tears_down_before_task(kiro, observed, monk
     from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
     from cli_agent_orchestrator.providers.manager import ProviderManager
 
+    monkeypatch.setattr(kiro_launch_home, "stop_kiro_home_processes", lambda home: True)
     (kiro.fake / "version").write_text("3.2.0")
     options = {}
     if fault == "extra-tool":
