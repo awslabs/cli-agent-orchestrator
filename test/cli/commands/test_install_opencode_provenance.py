@@ -148,7 +148,8 @@ class TestContextWriteTargetIsRegularFile:
 
         result = _install(runner, "source")
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output, result.output
         _assert_non_regular_context_error(result.output, context_copy)
         assert context_copy.is_symlink()
@@ -169,7 +170,8 @@ class TestContextWriteTargetIsRegularFile:
 
         result = runner.invoke(install, ["source", "--provider", "kiro_cli"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output, result.output
         _assert_non_regular_context_error(result.output, context_copy)
         assert context_copy.is_symlink()
@@ -187,7 +189,8 @@ class TestContextWriteTargetIsRegularFile:
 
         result = _install(runner, "source")
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output, result.output
         _assert_non_regular_context_error(result.output, context_copy)
         assert context_copy.is_dir()
@@ -218,7 +221,8 @@ class TestProblemBLocalStoreCollisionStillRaises:
         # A second, distinct file with the same resolved name appears later.
         _write_profile(store / "two.md", name="dup-name", body="Second body.")
         r2 = _install(runner, "two")
-        assert r2.exit_code == 0  # failure result, not a crash
+        assert r2.exit_code == 1, r2.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(r2.exception, SystemExit), r2.exception
         assert "Error:" in r2.output
         assert "one" in r2.output and "two" in r2.output and "dup-name" in r2.output
         # First install untouched.
@@ -262,7 +266,8 @@ class TestTrapCaseLeftoverInstalledArtifact:
         rB = _install(runner, "beta")
 
         # Must RAISE — not silently overwrite.
-        assert rB.exit_code == 0  # failure result, not a crash
+        assert rB.exit_code == 1, rB.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(rB.exception, SystemExit), rB.exception
         assert "Error:" in rB.output, rB.output
         assert "shared" in rB.output
 
@@ -294,7 +299,8 @@ class TestMissingMarkerPreExistingInstalls:
         _write_profile(store / "new-source.md", name="shared", body="New profile body.")
         result = _install(runner, "new-source")
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output, result.output
         _assert_installed_copy_remedy(result.output, legacy_copy)
         assert legacy_copy.read_text() == first_context
@@ -315,7 +321,8 @@ class TestMissingMarkerPreExistingInstalls:
 
         r = _install(runner, "my-agent")
 
-        assert r.exit_code == 0
+        assert r.exit_code == 1, r.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(r.exception, SystemExit), r.exception
         assert "Error:" in r.output, r.output
         _assert_installed_copy_remedy(r.output, legacy_copy)
         assert legacy_copy.read_text() == first_context
@@ -333,7 +340,8 @@ class TestMissingMarkerPreExistingInstalls:
         _write_profile(store / "new-source.md", name="shared", body="New profile body.")
         result = _install(runner, "new-source")
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output, result.output
         _assert_installed_copy_remedy(result.output, legacy_copy)
         assert legacy_copy.read_text() == first_context
@@ -354,7 +362,8 @@ class TestMissingMarkerPreExistingInstalls:
         _write_profile(store / "new-source.md", name="shared", body="New profile body.")
         result = _install(runner, "new-source")
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output, result.output
         _assert_installed_copy_remedy(result.output, legacy_copy)
         assert legacy_copy.read_text() == first_context
@@ -385,7 +394,8 @@ class TestMissingMarkerPreExistingInstalls:
         _write_profile(store / "slash-named.md", name="a/b")
         r2 = _install(runner, "slash-named")
 
-        assert r2.exit_code == 0  # failure result, not a crash
+        assert r2.exit_code == 1, r2.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(r2.exception, SystemExit), r2.exception
         assert "Error:" in r2.output, r2.output
         assert "path separator" in r2.output, r2.output
         assert "cannot share an OpenCode agent id" not in r2.output
@@ -595,7 +605,8 @@ class TestProvenanceMarkerSpoofRefused:
 
         result = _install(runner, "aaa")
 
-        assert result.exit_code == 0  # failure result, not a crash
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output, result.output
         assert not (context_dir / "shared.md").exists()
         assert not (workspace["agents_dir"] / "shared.md").exists()
@@ -616,7 +627,8 @@ class TestProvenanceMarkerSpoofRefused:
             encoding="utf-8",
         )
         rA = _install(runner, "aaa")
-        assert rA.exit_code == 0
+        assert rA.exit_code == 1, rA.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(rA.exception, SystemExit), rA.exception
         assert "Error:" in rA.output, rA.output
         assert not (agents_dir / "shared.md").exists()
 
@@ -875,7 +887,8 @@ class TestReadOnlyContextDirErrorNamesRealTarget:
         finally:
             os.chmod(context_dir, 0o700)
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error:" in result.output, result.output
         assert str(context_dir / "ro-agent.md") in result.output
         assert ".tmp" not in result.output
@@ -918,7 +931,9 @@ class TestContextDirFollowsConfiguredInstalledDir:
         # the configured directory is what the refusal protected.
         _write_profile(store / "beta.md", name="shared", body="Beta body.")
         rB = _install(runner, "beta")
-        assert rB.exit_code == 0 and "Error:" in rB.output, rB.output
+        assert rB.exit_code == 1, rB.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(rB.exception, SystemExit), rB.exception
+        assert "Error:" in rB.output, rB.output
         assert "alpha" in rB.output and "beta" in rB.output
         assert copy.read_bytes() == alpha_bytes
         assert not (constant_dir / "shared.md").exists()

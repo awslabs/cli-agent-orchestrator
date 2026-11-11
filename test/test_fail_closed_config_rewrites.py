@@ -90,11 +90,6 @@ ALLOWLIST: Dict[str, str] = {
         '{"skipDangerousModePermissionPrompt": true}, discarding the user\'s own '
         "permissions/env/hooks."
     ),
-    "cli_agent_orchestrator/utils/opencode_config.py::_record_grants": (
-        "LIVE #737-class defect, separate issue: read_grant_record() degrades a "
-        "corrupt sidecar to {} and _write_grant_record then publishes it, dropping "
-        "every other agent's recorded grants."
-    ),
 }
 
 _ABSENT_ONLY = {"FileNotFoundError", "NotADirectoryError", "IsADirectoryError"}
