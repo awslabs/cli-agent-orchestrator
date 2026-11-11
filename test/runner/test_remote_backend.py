@@ -925,3 +925,61 @@ class TestThirdReviewRegressions:
         r.stop()
         wait_for(lambda: "a" not in hub.connected_runners())
         assert [s["name"] for s in backend.list_sessions()] == ["s1"]
+
+
+class TestReconnectAfterAFailedUpgrade:
+    """A peer that closes during the HTTP upgrade does not end the runner (#745).
+
+    ``websockets`` raises ``InvalidMessage`` then (a server stopping in a
+    rollout, a proxy that accepts and drops). If ``cao-runner`` exited, its pod
+    would restart and lose every agent on it, so the runner retries.
+    """
+
+    def test_the_runner_retries_after_the_peer_closes_mid_upgrade(self, tmp_path):
+        import socket
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        listener.settimeout(0.2)
+        port = listener.getsockname()[1]
+        accepted = []
+        stop = threading.Event()
+
+        def serve():
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                conn.recv(4096)  # the upgrade request; no response
+                conn.close()
+                accepted.append(1)
+
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        r = RunnerThread(f"ws://127.0.0.1:{port}", "a", str(tmp_path / "a"))
+        try:
+            wait_for(lambda: len(accepted) >= 2, timeout=10)
+            assert r.thread.is_alive()
+            assert not r.task.done()
+        finally:
+            r.stop()
+            stop.set()
+            server.join(timeout=5)
+            listener.close()
+
+    def test_an_invalid_hub_url_is_refused_up_front(self):
+        from cli_agent_orchestrator.runner.agent import hub_url_refusal
+
+        assert "invalid runner hub URL" in hub_url_refusal("ws://127.0.0.1:9891/#frag", False)
+        assert "invalid runner hub URL" in hub_url_refusal("wss://", False)
+        assert hub_url_refusal("wss://cao-server.cao-remote.svc:9891", False) is None
+
+    def test_an_invalid_hub_url_stops_the_runner_instead_of_retrying(self, tmp_path):
+        r = RunnerThread("ws://127.0.0.1:9891/#frag", "a", str(tmp_path / "a"))
+        try:
+            wait_for(lambda: r.task.done(), timeout=5)
+            assert isinstance(r.task.exception(), SystemExit)
+        finally:
+            r.stop()

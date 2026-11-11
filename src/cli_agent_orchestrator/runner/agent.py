@@ -209,7 +209,12 @@ class Runner:
 
     async def run_forever(self) -> None:
         from websockets.asyncio.client import connect
-        from websockets.exceptions import ConnectionClosed, InvalidStatus
+        from websockets.exceptions import (
+            ConnectionClosed,
+            InvalidStatus,
+            InvalidURI,
+            WebSocketException,
+        )
 
         self._loop = asyncio.get_running_loop()
         self._outbox_ready = asyncio.Event()
@@ -244,6 +249,16 @@ class Runner:
                 logger.warning(f"connection to runner hub closed: {exc}")
             except (OSError, asyncio.TimeoutError) as exc:
                 logger.warning(f"cannot reach runner hub at {self.server_url}: {exc}")
+            except InvalidURI as exc:
+                # A configuration fault: no retry can fix it.
+                raise SystemExit(f"invalid runner hub URL: {exc}") from exc
+            except WebSocketException as exc:
+                # Any other handshake or protocol failure, e.g. InvalidMessage
+                # when the peer closes during the HTTP upgrade (a server
+                # stopping mid-rollout, a proxy that accepts and drops). Exiting
+                # would restart the pod and lose every agent on it; only the
+                # close codes above mean retrying cannot help.
+                logger.warning(f"connection to runner hub failed: {exc!r}")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
@@ -888,6 +903,15 @@ def hub_url_refusal(url: str, allow_insecure: bool) -> Optional[str]:
     ``CAO_RUNNER_ALLOW_INSECURE=1`` for a network they fully trust. A host name
     that merely looks cluster-internal is not taken as trusted.
     """
+    from websockets.exceptions import InvalidURI
+    from websockets.uri import parse_uri
+
+    try:
+        # The URI the connection will use: a fault here would otherwise only
+        # show at the first connect, and be retried forever.
+        parse_uri(url)
+    except InvalidURI as exc:
+        return f"invalid runner hub URL: {exc}"
     parsed = urllib.parse.urlsplit(url)
     scheme = parsed.scheme.lower()
     if scheme == "wss":
