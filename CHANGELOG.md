@@ -12,6 +12,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal poll ceiling in `wait_until_terminal_status`) instead of inheriting the module-wide
   60s read timeout. Each status read now stops after 5s to connect and 5s without data, so a
   stalled broker can overrun `--timeout` by about 6s instead of about 60s.
+- **A reconnect no longer loses a tool call's end, and `toolCallName` is `assign`, not
+  `OrchestrationType.ASSIGN`** (#1292). On the ambient AG-UI stream, a client that held an `assign`
+  or `handoff` call open, lost its stream (an overflow, or a dropped connection) and reconnected
+  with `?since=` or `Last-Event-ID`, never got the call's `TOOL_CALL_END` when the receiver's (or
+  sender's) `completion` was written during the gap: each connection is a fresh run, the call's
+  record was older than the replay, and the run closed only calls it knew. Now, when a
+  `completion` or `error`, replayed or live, closes a terminal on a run that never saw a call that
+  terminal received or sent, the run announces the call from the event log, with its own
+  `toolCallId`, then ends it with `closedBy: "completion"`, as a replayed close of an older
+  subagent already announces the `SUBAGENT_STARTED` first. A second call to a worker likewise
+  announces the first and ends it with `closedBy: "superseded"`. A client that kept the call open
+  dedupes the repeated start by `eventId`, `type` and `toolCallId`. A call an earlier record
+  already ended, or one made after the completion, is not announced. If the call's record has left
+  the 500-record, 24-hour event log, its end is still not recoverable. Wire-visible: the
+  `TOOL_CALL_START` for an `assign` or `handoff` carried `toolCallName: "OrchestrationType.ASSIGN"`
+  (the enum's `str()`); it is now `"assign"` or `"handoff"`, as `metadata.cao.orchestrationType`
+  already was. The `cao-legacy` framing is unchanged: JSON already wrote the enum as `"assign"`
+  there.
 - **`assign` and `handoff` now work when the caller can't read the agent store.** A CLI that
   sandboxes its MCP servers (for example kiro-cli with `"sandbox": true`, which hides `~/.aws`)
   made every profile read in `cao-mcp-server` fail with `Permission denied`, so `assign` failed.
