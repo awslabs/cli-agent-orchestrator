@@ -3429,6 +3429,14 @@ async def _create_terminal_unguarded(
             description=description,
             deferred_init_failure=None,
             session_incarnation_id=session_incarnation_id,
+            # What the row holds when this returns (#1131): a synchronous Kiro
+            # create gets here only after its passed check was recorded; a
+            # deferred one was inserted False and is still being checked. Other
+            # providers store NULL. A deferred check that passes meanwhile shows
+            # on the next GET /terminals/{id}.
+            identity_verified=(
+                (not defer_init) if provider == ProviderType.KIRO_CLI.value else None
+            ),
             status=initial_status,
             last_active=datetime.now(timezone.utc),
             launch_notes=(
@@ -5863,6 +5871,9 @@ def get_terminal(terminal_id: str) -> Dict:
             "allowed_tools": metadata.get("allowed_tools"),
             "delegate_tools": metadata.get("delegate_tools"),
             "engine": metadata.get("engine"),
+            # As stored, None included (#1131): None is a non-Kiro or legacy row,
+            # never coerced to False.
+            "identity_verified": metadata.get("identity_verified"),
             "group": metadata.get("group"),
             "metadata": public_metadata,
             "description": metadata.get("description"),

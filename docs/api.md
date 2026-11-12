@@ -187,6 +187,11 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   if you need a different order.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- Terminal responses carry `identity_verified`, whether a `kiro_cli` terminal's
+  identity check has passed: `false` until it has (CAO refuses input to it
+  meanwhile, whatever `status` says), `true` after, `null` for other providers
+  and for Kiro terminals older than the record. See
+  [Kiro CLI](kiro-cli.md).
 - Terminal responses carry `delegate_tools`, the terminal's recorded delegation
   ceiling. `POST /sessions/{session_name}/terminals` requires `caller_id` (403
   without it) and checks the requested `allowed_tools` (client string or profile

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **`GET /terminals/{id}` reports whether a Kiro terminal passed its identity check** (#1131).
+  The terminal now carries `identity_verified`, read from the row the Kiro input gate (#1074)
+  already writes: `false` until the check passes, `true` after it, and `null` for other
+  providers and for Kiro rows older than the column, never coerced to `false`. A client that
+  picks terminals by `status` can now skip a Kiro terminal that reads `idle` but whose input
+  CAO refuses. `GET /sessions/{name}` and `GET /sessions/{name}/terminals` carry it too, read
+  from the rows they already fetch, and so do the create responses (`POST /sessions` and both
+  `POST /sessions/{name}/terminals` routes): `true` for a synchronous Kiro create, which returns
+  only after the check passed, and `false` for a deferred one, still being checked. Read-only:
+  the gate itself is unchanged.
 - **CAO terminals running bash, or zsh set up without its own `HISTFILE`, no longer write
   agent launch commands to your shell history.** Every tmux session, window and pane and every
   herdr pane that CAO creates now gets `HISTFILE=/dev/null` in its environment, set after
