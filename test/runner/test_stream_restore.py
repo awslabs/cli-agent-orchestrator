@@ -39,7 +39,10 @@ def monitor(monkeypatch):
     monkeypatch.setattr(status_mod, "status_monitor", fresh)
     monkeypatch.setattr(status_mod.provider_manager, "get_provider", lambda tid: _Ready())
     monkeypatch.setattr(
-        "cli_agent_orchestrator.backends.registry.get_backend", lambda: _PipeBackend()
+        # The singleton, not get_backend: a module first imported while the
+        # function is patched keeps the patched function for the session.
+        "cli_agent_orchestrator.backends.registry._backend",
+        _PipeBackend(),
     )
     return fresh
 

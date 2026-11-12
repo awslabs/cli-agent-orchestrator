@@ -587,7 +587,7 @@ class _FakeRemoteBackend:
 def _launch(provider_name, monkeypatch, tmp_path, sandbox):
     """Run the provider's real initialize() against the fake remote backend."""
     backend = _FakeRemoteBackend()
-    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry._backend", backend)
     monkeypatch.setattr(
         "cli_agent_orchestrator.backends.registry.current_backend", lambda: backend, raising=False
     )
