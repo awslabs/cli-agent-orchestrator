@@ -23,7 +23,7 @@ When I run many agents, I can follow three to five sessions at once, and that's 
 
 Every agent needs me once in a while: a question here, an approval there. Ten agents meant ten small interruptions, and none of them waited politely. Keeping up with all of them was impossible.
 
-And under all of it was a worry. If I let agents work while I was away, what would they do wrong without me watching?
+And under all of it was a worry. If I let agents work while I was away, what would they do wrong without me watching? [AUTHOR: one concrete thing an unattended agent did, or nearly did, that made this worry real.]
 
 ## One conductor, with CAO behind it
 
@@ -78,8 +78,7 @@ The shepherd's workers are sized to the job and deleted when done: a fixer and a
 ![The user talks to the conductor; the conductor talks to the PR shepherd and the PR reviewer; the shepherd creates short-lived workers; a zero-token poll loop wakes the shepherd](./agents.svg)
 *One conversation for me; everything else reports to the conductor.*
 
-This isn't a demo. From 6 November until early on 9 November (UTC), my account merged
-8 pull requests, filed 5 issues, and posted reviews on 5 other people's pull requests.
+This isn't a demo. From 6 November until early on 9 November (UTC), my account merged 8 pull requests, filed 5 issues, and posted reviews on 6 other people's pull requests.
 
 ## One small pull request, start to finish
 
@@ -159,16 +158,9 @@ Reviewers who hadn't written the kit kept finding real holes in it. The worst on
 
 They went over the kit read-only and reproduced each finding before reporting it. Over 8 and 9 November they returned seven NOT-READY verdicts, then READY. In all: 17 serious (P1) findings, 12 P2s and one P3.
 
-The worst one worked like this. Before pushing, the kit asked git where `origin` *fetches* from.
-But a push goes wherever the *push* URL points, and git lets those two differ. A reviewer pointed
-the push URL at a second scratch repository, and the push landed there. My kit had checked the
-wrong address and felt safe. The fix compares every push destination with the one URL in my
-standing OKs, and refuses anything else.
+That one worked like this. Before pushing, the kit asked git where `origin` *fetches* from. But a push goes wherever the *push* URL points, and git lets those two differ. A reviewer pointed the push URL at a second scratch repository, and the push landed there. My kit had checked the wrong address and felt safe. The fix compares every push destination with the one URL in my standing OKs, and refuses anything else.
 
-If you build guardrails for agents, have someone who didn't write them try to break them.
-The tests grew with the reviews: 138 kit tests at the first review, 1,388 now, plus
-101 for the PR watch. I also run mutation tests, which break each gate condition on purpose
-and check that a test notices.
+If you build guardrails for agents, have someone who didn't write them try to break them. The tests grew with the reviews: 138 kit tests at the first review, 1,291 at the last, plus 100 for the PR watch. I also run mutation tests, which break each gate condition on purpose and check that a test notices.
 
 ## What it can't do yet
 
@@ -184,7 +176,7 @@ You don't need the whole kit to feel the shift. Add one piece at a time:
 
 1. One conductor profile and one short-lived helper, using CAO's ephemeral agents. See what changes when you only talk to one agent.
 2. Add a pause switch that survives a restart.
-3. Only then add a shepherd or reviewer, and start it in observe mode.
+3. Only then add a shepherd or reviewer, and start it in observe mode. [AUTHOR: confirm this order, and which parts of your kit a reader can reuse today.]
 
 Each piece is in [`examples/super-agent`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/super-agent), with a quick start. Its standing OKs ship as placeholders, and the shepherd starts in observe mode.
 
@@ -193,6 +185,8 @@ Each piece is in [`examples/super-agent`](https://github.com/awslabs/cli-agent-o
 - [CAO on GitHub](https://github.com/awslabs/cli-agent-orchestrator): the orchestrator behind the conductor, the shepherd, the reviewer and their short-lived workers.
 - [CAO's ephemeral-agents docs](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/ephemeral-agents.md): an experimental feature (off by default) that lets an agent create a short-lived helper with a model tier and effort sized to the task.
 - DeepSeek's [super-agent prototype](https://github.com/deepseek-ai/dsh-superagent-prototype) and [design article](https://x.com/DeepSeekHarness/status/2116857257245987236): where several of the ideas above came from.
+
+For the phone half: [herdr-remote](https://github.com/dcolinmorgan/herdr-remote), an open-source (AGPL) dashboard for herdr that carries agent notifications and approvals over Telegram. [AUTHOR: confirm you run CAO's terminals on herdr; if so keep "CAO's agents run inside herdr, so their prompts reach my phone this way." and add it here, otherwise drop this paragraph.]
 
 ## Glossary
 
