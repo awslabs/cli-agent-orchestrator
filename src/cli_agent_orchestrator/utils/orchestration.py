@@ -50,7 +50,7 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.delegation import (
     REMOTE_FEATURE,
     DelegationCeilingError,
@@ -212,53 +212,6 @@ def append_sender_suffix(
         if is_structured_prompt_invocation(message, resolved):
             return message
     return message + "\n\n" + template.format(terminal_id=terminal_id)
-
-
-# Providers that add cao-mcp-server to the worker's MCP config themselves,
-# whatever the profile says (copilot_cli, antigravity_cli). opencode_cli is
-# included because its config path also references cao-mcp-server
-# (utils/opencode_config.py); that was not verified against a live run.
-_PROVIDERS_INJECTING_CAO_MCP = frozenset(
-    {
-        ProviderType.COPILOT_CLI.value,
-        ProviderType.ANTIGRAVITY_CLI.value,
-        ProviderType.OPENCODE_CLI.value,
-    }
-)
-
-
-def _declares_cao_mcp(mcp_servers: Optional[Dict[str, Any]]) -> bool:
-    for name, cfg in (mcp_servers or {}).items():
-        if name == "cao-mcp-server":
-            return True
-        if isinstance(cfg, dict):
-            command = cfg.get("command")
-            args = cfg.get("args") or []
-            if isinstance(command, str) and "cao-mcp-server" in command:
-                return True
-            if any(
-                isinstance(a, str)
-                and ("cao-mcp-server" in a or a == "cli_agent_orchestrator.mcp_server.server")
-                for a in args
-            ):
-                return True
-    return False
-
-
-def _worker_can_send_message(agent_profile: str) -> bool:
-    """False only when the worker is confidently known to lack a send_message tool.
-
-    A wrong False costs a misleading warning and a withheld instruction, so any
-    uncertainty (profile unreadable, provider not named by the profile) answers
-    True and leaves the auto-forward path to catch a real miss.
-    """
-    try:
-        profile = load_agent_profile(agent_profile)
-    except Exception:  # noqa: BLE001 - uncertainty answers True, see docstring
-        return True
-    if not profile.provider or profile.provider in _PROVIDERS_INJECTING_CAO_MCP:
-        return True
-    return _declares_cao_mcp(profile.mcpServers)
 
 
 # Terminal count threshold for cleanup nudge
@@ -1110,7 +1063,6 @@ def _create_terminal(
     delegation_kind: Optional[str] = None,
     response_sink: Optional[Callable[[requests.Response], None]] = None,
     expect_callback: bool = False,
-    worker_can_reply: bool = True,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -1256,8 +1208,6 @@ def _create_terminal(
         params["caller_id"] = current_terminal_id
         if expect_callback:
             params["expect_callback"] = "true"
-            if not worker_can_reply:
-                params["worker_can_reply"] = "false"
         if claim is not None and claim.claim_id is not None:
             params["claim_id"] = claim.claim_id
         if working_directory:
@@ -3056,12 +3006,7 @@ def _assign_impl(
         # agent assign`` shell), not on the cao-server side. The helper leaves
         # a kiro-cli ``@<prompt> [args]`` invocation untouched (issue #70) and
         # looks the worker's provider up only when the task leads with ``@``.
-        # An ephemeral claim pins the worker's provider, which the profile does not
-        # show, so a claimed worker is taken to be able to reply.
-        can_reply = (
-            _worker_can_send_message(agent_profile) if expect_callback and claim is None else True
-        )
-        if ENABLE_SENDER_ID_INJECTION and can_reply:
+        if ENABLE_SENDER_ID_INJECTION:
             worker_message = append_sender_suffix(
                 message,
                 ASSIGN_SUFFIX_TEMPLATE,
@@ -3090,7 +3035,6 @@ def _assign_impl(
             delegation_message=canonical_message,
             response_sink=_decision_response_sink(notes),
             expect_callback=expect_callback,
-            worker_can_reply=can_reply,
             **claim_kwargs,
         )
 
@@ -3104,13 +3048,6 @@ def _assign_impl(
                     f"delivered once it is ready. "
                     f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
                     + _get_cleanup_nudge()
-                    + (
-                        " Note: this worker's profile has no cao-mcp-server, so it cannot "
-                        "call send_message; its last response will be auto-forwarded to you "
-                        "when it goes idle."
-                        if expect_callback and not can_reply
-                        else ""
-                    )
                 ),
                 notes,
             ),
