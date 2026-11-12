@@ -10,6 +10,7 @@ import shlex
 import stat
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional
 
@@ -576,6 +577,20 @@ class ClaudeCodeProvider(BaseProvider):
         # conversation. Used to re-open a supervisor conversation inside a
         # new CAO session (durable-orchestra recovery).
         self._resume_session_id = resume_session_id
+        # Set by _handle_startup_prompts when it positively sees the REPL's ready
+        # screen during this init (#1277). CAO sends no input after that point, so
+        # a terminal that is PROCESSING at the readiness deadline after this was
+        # seen is running a turn someone typed into the pane: see initialize().
+        self._startup_ready_seen = False
+        # When this init began (UTC), so only CAO calls made during it count as
+        # evidence of real work (#1277). Set at the top of initialize().
+        self._init_started_at: Optional[datetime] = None
+        # The pane's foreground process before ``claude`` was typed (the shell),
+        # read in initialize(). Private on purpose: it only lets the busy-start
+        # check below tell a live agent from a pane that is back at its shell,
+        # and does not turn on the input-delivery shell guard that the public
+        # ``shell_baseline`` drives for other providers.
+        self._launch_shell: Optional[str] = None
         # Issue #1082 (provisional): a CAO-generated id for a FRESH launch
         # (never set together with ``resume_session_id`` -- the caller only
         # generates one when there is nothing to resume), passed as
@@ -1139,6 +1154,25 @@ class ClaudeCodeProvider(BaseProvider):
             #    wait_until_status() remains the real readiness gate.
             if re.search(r"Welcome to|Claude Code v\d+", clean_output):
                 logger.info("Claude Code started without prompts")
+                self._startup_ready_seen = True
+                return
+
+            # 5) A resumed session's ready screen (#1277). Claude Code draws a
+            #    ``--resume`` conversation in the alternate screen, which has no
+            #    scrollback, so once the conversation is longer than one screen
+            #    the banner above has scrolled off it and never matches: every
+            #    such launch ran to the outer cap. What a resumed REPL does show
+            #    at the bottom is its EMPTY composer box (a rule, a bare prompt
+            #    glyph, a rule; NEW_TUI_BOX_PATTERN), captured live on 2.1.322
+            #    (test/providers/fixtures/claude_code_1277_resumed_ready_*.txt).
+            #    The echoed launch command cannot satisfy it (no rules around a
+            #    bare prompt), and neither can a choice dialog ("❯ No, exit" is
+            #    not an empty prompt); every dialog above is also checked first
+            #    in the same pass. Only a resume uses it: a fresh launch always
+            #    draws the banner, so the narrower rule costs nothing there.
+            if self._resume_session_id and NEW_TUI_BOX_PATTERN.search(clean_output):
+                logger.info("Resumed Claude Code session ready (composer drawn)")
+                self._startup_ready_seen = True
                 return
 
             await asyncio.sleep(1.0)
@@ -1150,12 +1184,20 @@ class ClaudeCodeProvider(BaseProvider):
         # Load the profile once so the per-profile provider_init_timeout override
         # (if any) governs every wait below, and reuse it for the command build
         # so the profile is not read from disk twice.
+        self._init_started_at = datetime.now(timezone.utc)
+        self._startup_ready_seen = False
         profile = self._load_profile()
         init_timeout = self.get_init_timeout(profile)
 
         # Wait for shell prompt to appear in the tmux window
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
+
+        # #1277: remember which process is the shell, so a busy start can be
+        # told apart from a pane whose ``claude`` exited (see
+        # _busy_with_evidence_of_real_work). Best-effort: no reading only means
+        # a busy start is never accepted, the pre-#1277 behaviour.
+        self._launch_shell = await asyncio.to_thread(self._read_pane_command)
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
         # This does blocking file I/O (~/.claude/settings.json read+write)
@@ -1221,7 +1263,18 @@ class ClaudeCodeProvider(BaseProvider):
             # broken/unrecognized launch, rather than leaving an unreapable worker alive in
             # UNKNOWN status that answer_user_prompt would hard-refuse to touch (it only accepts
             # WAITING_USER_ANSWER) and that no watchdog reaps.
-            raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
+            if not await asyncio.to_thread(self._busy_with_evidence_of_real_work):
+                raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
+            # #1277: the supervisor is up and running a turn somebody started in
+            # its pane. Failing init here tore its session down, workers and all.
+            # The deadline is not extended: this is one read at the same deadline.
+            logger.warning(
+                "Claude Code terminal %s is PROCESSING at the %ss init deadline with "
+                "evidence of real work (input after a ready screen, or a recorded CAO "
+                "call); treating it as started instead of failing init",
+                self.terminal_id,
+                init_timeout,
+            )
 
         # The status wait fires as soon as the input box RENDERS, but the Ink
         # renderer drops keystrokes for a beat after that — "box rendered" is
@@ -1231,6 +1284,85 @@ class ClaudeCodeProvider(BaseProvider):
         await self.wait_until_input_ready()
 
         self._initialized = True
+        return True
+
+    def _busy_with_evidence_of_real_work(self) -> bool:
+        """At the readiness deadline: is this a working supervisor, not a failed start?
+
+        True only when BOTH hold (#1277):
+
+        * the terminal's current status is PROCESSING; and
+        * real work demonstrably started:
+          - real input reached the pane: the startup handler saw the REPL's
+            ready screen during this init (``_startup_ready_seen``), and CAO
+            sends nothing after that, so a running turn came from the pane; or
+          - the terminal made a CAO call the server recorded: a launch record
+            naming it as the caller (``assign``/``handoff``) or an ephemeral
+            profile it owns (``create_ephemeral_agent``).
+
+        and ``claude`` is still the pane's foreground process
+        (``_claude_still_in_pane``): a stale PROCESSING screen over a pane that
+        is back at its shell is never accepted.
+
+        PROCESSING alone is not enough: CAO's own launch keystrokes arm the
+        PROCESSING transition. Any failure to read either signal answers False,
+        so the launch fails exactly as it did before. Synchronous (status and DB
+        reads); initialize() runs it through ``asyncio.to_thread``.
+        """
+        from cli_agent_orchestrator.clients.database import terminal_has_recorded_cao_call
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        try:
+            if status_monitor.get_status(self.terminal_id) != TerminalStatus.PROCESSING:
+                return False
+            since = self._init_started_at
+            evidence = self._startup_ready_seen or (
+                since is not None and terminal_has_recorded_cao_call(self.terminal_id, since)
+            )
+            return evidence and self._claude_still_in_pane()
+        except Exception:
+            logger.warning(
+                "Could not check %s for evidence of real work at the init deadline",
+                self.terminal_id,
+                exc_info=True,
+            )
+            return False
+
+    def _read_pane_command(self) -> Optional[str]:
+        """The pane's foreground process name, or None when it cannot be read."""
+        try:
+            command = get_backend().get_pane_current_command(self.session_name, self.window_name)
+        except Exception:
+            logger.warning(
+                "Could not read the foreground process of %s", self.terminal_id, exc_info=True
+            )
+            return None
+        return command if isinstance(command, str) and command else None
+
+    def _claude_still_in_pane(self) -> bool:
+        """Is something other than the pre-launch shell in the pane's foreground?
+
+        The same comparison Codex and Kiro use for their exit-to-shell checks
+        (current foreground command against the shell read before launch). Fails
+        closed: with no pre-launch reading, or no current one, CAO cannot tell
+        ``claude`` from the shell and answers False.
+        """
+        if self._launch_shell is None:
+            logger.warning(
+                "Terminal %s: no pre-launch shell reading; not accepting a busy start",
+                self.terminal_id,
+            )
+            return False
+        current = self._read_pane_command()
+        if current is None or current == self._launch_shell:
+            logger.warning(
+                "Terminal %s: the pane's foreground process is %s (the shell was %s); "
+                "not accepting a busy start",
+                self.terminal_id,
+                current,
+                self._launch_shell,
+            )
+            return False
         return True
 
     async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:

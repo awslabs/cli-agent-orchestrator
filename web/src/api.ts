@@ -58,6 +58,36 @@ export interface ApiError extends Error {
   detailMeta?: Record<string, unknown>
 }
 
+/**
+ * The text of a list `detail`, such as FastAPI's 422 body or a plain list of
+ * messages: each string item, or the `msg` or `message` of each object item,
+ * one per line. Undefined when no item has text.
+ */
+function listDetailText(items: unknown[]): string | undefined {
+  const lines: string[] = []
+  for (const item of items) {
+    const entry = item && typeof item === 'object' ? (item as { msg?: unknown; message?: unknown }) : null
+    const text = typeof item === 'string' ? item : entry ? (entry.msg ?? entry.message) : undefined
+    if (typeof text === 'string' && text !== '') lines.push(text)
+  }
+  return lines.length > 0 ? lines.join('\n') : undefined
+}
+
+/**
+ * The server's explanation of a failed request, for display: `detail`, then
+ * each string in an object detail's `errors` list that `detail` does not
+ * already hold, one per line. Undefined when the server sent neither.
+ */
+export function errorDetailText(err: Pick<ApiError, 'detail' | 'detailMeta'> | null | undefined): string | undefined {
+  const detail = typeof err?.detail === 'string' ? err.detail : ''
+  const listed = err?.detailMeta && !Array.isArray(err.detailMeta) ? err.detailMeta.errors : undefined
+  const extra = Array.isArray(listed)
+    ? listed.filter((e): e is string => typeof e === 'string' && e !== '' && !detail.includes(e))
+    : []
+  const lines = [detail, ...extra].filter(line => line !== '')
+  return lines.length > 0 ? lines.join('\n') : undefined
+}
+
 async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number }): Promise<T> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 10000)
@@ -73,6 +103,8 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
       try {
         const body = await res.json()
         if (body && typeof body.detail === 'string') detail = body.detail
+        // A list detail reads as its messages, not as a bare status.
+        if (body && Array.isArray(body.detail)) detail = listDetailText(body.detail)
         if (body && body.detail && typeof body.detail === 'object') {
           detailMeta = body.detail as Record<string, unknown>
           if (typeof detailMeta.message === 'string') detail = detailMeta.message
@@ -275,6 +307,9 @@ export interface TerminalMeta {
   agent_profile: string | null
   created_at: string | null
   last_active: string | null
+  /** Live status, lowercase (`idle`, `processing`, ...). Set by GET /sessions/{name}
+      from the status monitor; absent on other routes that return terminal rows. */
+  status?: string | null
 }
 
 /**
@@ -312,11 +347,26 @@ export interface ProfileSearchResult {
 }
 
 /**
+ * One entry of a profile's `params` block: a param that a workflow step using
+ * the profile fills in. A missing `type` means `string` and a missing
+ * `required` means `false`. `default`, `description` and `enum` are present
+ * only when the profile sets them. An int default is a number and a bool
+ * default is a boolean.
+ */
+export interface ProfileParamDecl {
+  type?: 'string' | 'int' | 'bool'
+  required?: boolean
+  default?: string | number | boolean
+  description?: string
+  enum?: Array<string | number>
+}
+
+/**
  * Parsed profile from `GET /agents/profiles/{name}`. This response is
  * *resolved* (env-var placeholders substituted) — fine for display, but an
  * editor must load `GET /agents/profiles/{name}/source` instead so a save
- * never persists resolved secrets. Only the fields the detail pane renders
- * are declared; the endpoint returns the full model with nulls excluded.
+ * never persists resolved secrets. Only the fields this client reads are
+ * declared; the endpoint returns the full model with nulls excluded.
  */
 export interface AgentProfileDetail {
   name: string
@@ -326,6 +376,8 @@ export interface AgentProfileDetail {
   role?: string
   tags?: string[]
   capabilities?: string[]
+  /** The params a workflow step must fill, in declaration order. */
+  params?: Record<string, ProfileParamDecl>
 }
 
 /** One scaffold template from `GET /agents/profiles/templates`. `name` is `category/name`. */
@@ -347,6 +399,14 @@ export interface ProfileValidationMessage {
 export interface ProfileValidationResponse {
   valid: boolean
   messages: ProfileValidationMessage[]
+  /**
+   * The params block the validator read from the submitted text, as written
+   * (a `${X}` stays `${X}`), in declaration order. An object, possibly empty,
+   * when the frontmatter has a `params` key and the validator reports no
+   * error for it. null when there is no `params` key, the block has errors,
+   * or the document has an error that stopped the checks.
+   */
+  params?: Record<string, ProfileParamDecl> | null
 }
 
 /**
@@ -795,15 +855,73 @@ export interface WorkflowRunResult {
   failure_envelope?: Record<string, unknown>
 }
 
-/** `GET /workflows/{name}` for a script workflow (server ScriptSpec). YAML specs carry other fields. */
+/** The call a step's orchestrator makes. Only `handoff` runs today; the other two are reserved. */
+export type WorkflowStepCall = 'handoff' | 'assign' | 'send_message'
+
+/** The spec format a write or a source validation targets. The server defaults to `python`. */
+export type WorkflowTier = 'python' | 'yaml'
+
+/** One declared run input (server InputDecl). */
+export interface WorkflowInputDecl {
+  type: 'string' | 'int' | 'bool' | 'path'
+  required?: boolean
+  default?: string | number | boolean | null
+}
+
+/**
+ * One step of a YAML spec as the server parsed it (server WorkflowStep). The
+ * response is a `model_dump()`, so an unset field arrives as null.
+ */
+export interface WorkflowSpecStep {
+  id: string
+  provider: string
+  agent: string
+  prompt: string
+  /** null means handoff. */
+  call?: WorkflowStepCall | null
+  /** Literal strings, appended to the step prompt in declaration order. */
+  params?: Record<string, string> | null
+  retries?: number | null
+  on_failure?: 'halt' | 'continue' | null
+  engine?: string | null
+  output_schema?: Record<string, unknown> | null
+  when?: string | null
+  until?: string | null
+  max_iterations?: number | null
+  on_stall?: string | null
+  on_no_progress?: string | null
+  [key: string]: unknown
+}
+
+/**
+ * `GET /workflows/{name}`. A script workflow is the server's ScriptSpec (path,
+ * source, hash, findings, inputs). A YAML workflow is the parsed WorkflowSpec
+ * (description, mode, inputs, steps) plus `path`, `source` and `content_hash`.
+ */
 export interface WorkflowSpec {
   name: string
+  description?: string
+  mode?: string
   path?: string
   source?: string
   content_hash?: string
   findings?: WorkflowLintFinding[]
-  inputs?: Record<string, unknown>
+  inputs?: Record<string, WorkflowInputDecl>
+  steps?: WorkflowSpecStep[]
   [key: string]: unknown
+}
+
+/**
+ * Result of `POST /workflows` (201) and `PUT /workflows/{name}` (200).
+ * `status` and `reserved_notes` come back for a YAML write only.
+ */
+export interface WorkflowWriteResult {
+  name: string
+  path: string
+  content_hash: string
+  findings: WorkflowLintFinding[]
+  status?: 'pass' | 'pass_reserved'
+  reserved_notes?: string[]
 }
 
 /** A run input that names a report file (`GET /workflows/runs/{id}/artifacts`). */
@@ -1287,6 +1405,44 @@ export const api = {
   // A stored workflow's spec (the `cao workflow get` equivalent): source, hash, findings.
   getWorkflowSpec: (name: string) =>
     fetchJSON<WorkflowSpec>(`/workflows/${encodeURIComponent(name)}`),
+
+  // Workflow authoring, for the builder. `tier` picks the spec format and is
+  // always sent: the server defaults to python. Each write validates the spec
+  // server-side before it lands, so the writes get the same 30s budget as the
+  // profile authoring calls.
+
+  // Create a new workflow. 409 when the name exists in either tier.
+  createWorkflow: (name: string, source: string, tier: WorkflowTier) =>
+    fetchJSON<WorkflowWriteResult>('/workflows', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, source, tier }),
+      timeoutMs: 30000,
+    }),
+
+  // Replace an existing workflow. `expectedHash` is the content_hash read from
+  // GET /workflows/{name}; a stale one is a 409, so a concurrent edit is never
+  // overwritten.
+  updateWorkflow: (name: string, source: string, expectedHash: string, tier: WorkflowTier) =>
+    fetchJSON<WorkflowWriteResult>(`/workflows/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, expected_hash: expectedHash, tier }),
+      timeoutMs: 30000,
+    }),
+
+  // Delete a workflow's file and its index row (needs cao:admin).
+  deleteWorkflow: (name: string) =>
+    fetchJSON<{ success: boolean; name: string }>(`/workflows/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // Validate spec text without saving it (the source form of POST /workflows/validate).
+  validateWorkflowSource: (source: string, tier: WorkflowTier) =>
+    fetchJSON<WorkflowValidation>('/workflows/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, tier }),
+      timeoutMs: 30000,
+    }),
 
   // Report files a run was given as inputs (e.g. report=/tmp/report.md). The
   // server only lists/reads a .md directly in its temp dir; see docs/api.md.

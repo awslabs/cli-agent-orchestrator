@@ -54,7 +54,7 @@ export CAO_AGENTS_DIR="$SCRATCH/kiro-agents"  # KIRO_AGENTS_DIR reads this env v
 # to execute without this — the CLI group errors out and the HTTP routes 404 —
 # because hiding a verb from `cao --help` was never an execution gate. A recorder
 # that drives the surface must open the gate explicitly, which also makes the GIF
-# an honest demonstration of how an operator reaches it before M1 lands.
+# an honest demonstration of how an operator reaches it before it graduates (#1244).
 export CAO_AGENT_PLUGINS_ENABLED=1
 KIRO_JSON="$CAO_AGENTS_DIR/dogfood-agent.json"
 OPTIN_JSON="$CAO_AGENTS_DIR/dogfood-optin.json"

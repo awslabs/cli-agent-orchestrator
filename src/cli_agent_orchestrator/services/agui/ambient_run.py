@@ -13,10 +13,12 @@ The ambient stream is one AG-UI run per connection (spec 1.0 events/lifecycle):
   cancelled outcome; a bus overflow ends it with ``RUN_ERROR``; nothing follows
   either.
 
-This is an EDGE layer. It reads the raw CAO event records and never changes the
-internal ``agui_stream.to_agui_event`` frame or ``ToolCallLifecycleTracker``,
-which the L2 constructs and the run plane's live projection consume. In
-particular, the tracker's synthesized ``TOOL_CALL_RESULT`` for a2a delegations is
+This is an EDGE layer. It reads the raw CAO event records and leaves the internal
+``agui_stream.to_agui_event`` frame and ``ToolCallLifecycleTracker``, which the L2
+constructs and the run plane's live projection consume, as they were, with one
+exception: an ``OrchestrationType`` member in a record's ``orchestration_type`` is
+now its plain value (``"assign"``) in that frame, so no wire name is the enum's
+repr (#1292). In particular, the tracker's synthesized ``TOOL_CALL_RESULT`` for a2a delegations is
 not reproduced here: ``TOOL_CALL_END`` closes the call, and a result MAY never
 arrive in the stream (events/tool-calls), whereas each result would mint a tool
 message in the consumer's history.
@@ -41,6 +43,7 @@ from cli_agent_orchestrator.services.agui.attribution import (
     subagent_run_id_for_session,
     subagent_run_id_for_terminal,
 )
+from cli_agent_orchestrator.services.agui.base import BoundedSeen
 from cli_agent_orchestrator.services.agui_stream import (
     AGUI_CUSTOM,
     CAO_GENERATIVE_UI_EVENT_NAME,
@@ -60,6 +63,57 @@ RUN_ERROR_OVERFLOW = "cao.stream_overflow"
 RUN_ERROR_INTERNAL = "cao.stream_error"
 
 _TOOL_CALL_ORCHESTRATION = ("handoff", "assign")
+
+
+def _plain(value: Any) -> Any:
+    """An enum's value, or the value itself.
+
+    ``OrchestrationType`` is a ``(str, Enum)``, so ``str(member)`` is
+    ``"OrchestrationType.ASSIGN"``. A record can carry the member (the in-process
+    event log keeps what the publisher gave it) or a plain string.
+    """
+    return getattr(value, "value", value)
+
+
+def _is_call_record(rec: Dict[str, Any]) -> bool:
+    kind = rec.get("kind")
+    if kind == "a2a_delegation":
+        return True
+    detail = rec.get("detail") or {}
+    return (
+        kind == "handoff" and _plain(detail.get("orchestration_type")) in _TOOL_CALL_ORCHESTRATION
+    )
+
+
+def _call_sender(rec: Dict[str, Any]) -> Any:
+    return (rec.get("detail") or {}).get("sender") or rec.get("terminal_id")
+
+
+def _open_calls(
+    history: Iterable[Dict[str, Any]], before_id: Optional[str]
+) -> List[Dict[str, Any]]:
+    """The call records still open just before ``before_id``, oldest first.
+
+    Walks ``history`` (oldest first) up to, and not including, the record with id
+    ``before_id``, keeping what the live run would still hold open: a call record
+    opens a call on its receiver and supersedes an older one there, and a
+    ``completion`` or ``error`` of a terminal closes the call it received and every
+    call it sent (the live run ends a call at its receiver's close or its owner's).
+    """
+    open_: Dict[Any, Tuple[int, Dict[str, Any]]] = {}
+    for i, rec in enumerate(history):
+        if before_id is not None and str(rec.get("id")) == before_id:
+            break
+        if _is_call_record(rec):
+            receiver = (rec.get("detail") or {}).get("receiver")
+            open_[receiver or f"id:{rec.get('id')}"] = (i, rec)
+        elif rec.get("kind") in ("completion", "error") and rec.get("terminal_id"):
+            closed = rec["terminal_id"]
+            open_.pop(closed, None)
+            for key in [k for k, (_, call) in open_.items() if _call_sender(call) == closed]:
+                del open_[key]
+    return [rec for _, rec in sorted(open_.values(), key=lambda item: item[0])]
+
 
 Item = Tuple[Optional[str], Any]  # (SSE id or None, SDK event)
 
@@ -256,6 +310,7 @@ class AmbientRun:
         since: Optional[str] = None,
         terminal_known: Optional[Callable[[str], bool]] = None,
         terminal_label: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+        call_history: Optional[Callable[[], Iterable[Dict[str, Any]]]] = None,
     ) -> None:
         self.thread_id = thread_id
         self.run_id = run_id
@@ -267,6 +322,10 @@ class AmbientRun:
         # The ``agent_profile`` and ``provider`` of a known terminal, to name one
         # first met mid-replay, before the snapshot that has the names.
         self._terminal_label = terminal_label
+        # The whole retained event log, oldest first. A reconnect's replay starts at
+        # its cursor, so a call made before it is not in the replay; when the receiver's
+        # completion is, this finds the call so the run can announce it before closing it.
+        self._call_history = call_history
         self._state_baseline_known = state_baseline_known
         self._since = since
         self._snapshot_sent = False
@@ -283,6 +342,12 @@ class AmbientRun:
         self._calls: Dict[str, Dict[str, Any]] = {}
         # receiver terminal id -> tool_call_id (one open call per receiver)
         self._call_by_receiver: Dict[str, str] = {}
+        # Every call id this run has opened, so a call it already opened and ended is
+        # never announced a second time.
+        self._seen_calls = BoundedSeen()
+        # True while a call record read back from the log is being mapped: it must not
+        # itself go looking for the call it superseded.
+        self._recovering = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -404,7 +469,7 @@ class AmbientRun:
             return out
 
         if kind in ("handoff", "a2a_delegation"):
-            orchestration = detail.get("orchestration_type")
+            orchestration = _plain(detail.get("orchestration_type"))
             sender = detail.get("sender") or terminal_id
             receiver = detail.get("receiver")
             cao = _compact(
@@ -418,6 +483,10 @@ class AmbientRun:
             owner = self._owner_for({**record, "terminal_id": sender}, out)
             if kind == "a2a_delegation" or orchestration in _TOOL_CALL_ORCHESTRATION:
                 name = "a2a_delegation" if kind == "a2a_delegation" else str(orchestration)
+                if receiver and receiver not in self._call_by_receiver and not self._recovering:
+                    # A call this run never saw may be open on the receiver: announce it
+                    # so _open_call ends it as superseded, as the live run did.
+                    out.extend(self._announce_unseen_calls(str(record.get("id")), receiver, None))
                 out.extend(self._open_call(str(record.get("id")), name, owner, receiver, cao, ts))
             else:
                 out.append(
@@ -613,14 +682,65 @@ class AmbientRun:
             logger.debug("ambient_run: label lookup failed for %s", terminal_id, exc_info=True)
             return {}
 
+    def _announce_call(self, record: Dict[str, Any]) -> List[Any]:
+        """Map one call record read back from the log, unless the run already holds its id.
+
+        A mapping failure is logged and skipped, so the close that asked for it still
+        ends the calls the run does hold.
+        """
+        rid = str(record.get("id"))
+        if rid in self._seen_calls or rid in self._calls:
+            return []
+        self._recovering = True
+        try:
+            return self._map(record)
+        except Exception:  # a bad historical record must not cost the real close
+            logger.warning("ambient_run: could not map a call record from the log", exc_info=True)
+            return []
+        finally:
+            self._recovering = False
+
+    def _announce_unseen_calls(
+        self, before_id: Optional[str], receiver: Optional[str], sender: Optional[str]
+    ) -> List[Any]:
+        """Announce the calls open before ``before_id`` that involve ``receiver`` or ``sender``.
+
+        The calls' records predate the replay cursor, so this run never opened them and
+        their END would otherwise be lost. Each is mapped as the live path would (owner
+        included), with its own id, so the END that follows has a START to close.
+        """
+        if self._call_history is None:
+            return []
+        try:
+            records = _open_calls(self._call_history(), before_id)
+        except Exception:  # a ring hiccup must not break the stream; close without the START
+            logger.warning("ambient_run: call history lookup failed", exc_info=True)
+            return []
+        out: List[Any] = []
+        for rec in records:
+            if (receiver is not None and (rec.get("detail") or {}).get("receiver") == receiver) or (
+                sender is not None and _call_sender(rec) == sender
+            ):
+                out.extend(self._announce_call(rec))
+        return out
+
+    def _announce_pre_window_call(self, terminal_id: str) -> List[Any]:
+        """Announce what a closing terminal was serving or had sent, when the replay skipped it."""
+        current = (self._current_record or {}).get("id")
+        return self._announce_unseen_calls(
+            None if current is None else str(current), terminal_id, terminal_id
+        )
+
     def _close_calls_for_terminal(self, terminal_id: str, ts: Optional[int]) -> List[Any]:
+        out = self._announce_pre_window_call(terminal_id)
         sid = self._terminals.get(terminal_id, (None, ""))[0]
         ids = [
             cid
             for cid, call in self._calls.items()
             if call["receiver"] == terminal_id or (sid is not None and call["owner"] == sid)
         ]
-        return [self._end_call(cid, ts, "completion") for cid in ids]
+        out.extend(self._end_call(cid, ts, "completion") for cid in ids)
+        return out
 
     def _close_terminal(
         self,
@@ -775,6 +895,7 @@ class AmbientRun:
         if call_id in self._calls:
             return out
         self._calls[call_id] = {"owner": owner, "receiver": receiver, "name": name}
+        self._seen_calls.add(call_id)
         if receiver:
             self._call_by_receiver[receiver] = call_id
         out.append(

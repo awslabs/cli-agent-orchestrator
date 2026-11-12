@@ -71,6 +71,17 @@ ALLOWLIST: Dict[str, str] = {
         "collects the name, the decided event's record ids), which re-reads the archive "
         "itself and skips the write when that read fails."
     ),
+    "cli_agent_orchestrator/utils/opencode_config.py::_reconcile_agent_grants": (
+        "FALSE POSITIVE of the heuristic (#1289): _record_grants() returns a bool, 'was the "
+        "record written', not a loaded document, so there is no fallback value to write. It "
+        "reads the sidecar fail-closed (_load_grant_record_or_raise) and, on an unreadable or "
+        "wrong-shape file, warns and returns False WITHOUT writing, which is the fail-closed "
+        "behaviour this guard asks for. Holding a withdrawal back happens when the record "
+        "cannot be WRITTEN (read-only directory, full disk); an unreadable record vouches "
+        "for nothing, so there is nothing to hold back and the file stays byte-identical. Pinned by test_opencode_config.py's "
+        "test_an_unreadable_sidecar_holds_nothing_back_and_still_warns and "
+        "test_the_record_functions_report_whether_the_record_was_written."
+    ),
     # --- Live instances of the #737 class, found by this guard. Each rewrites the
     # --- same file it read leniently. Recorded, not fixed here: they are separate
     # --- issues (see .sweep/out/guard.md for GH#737).
@@ -89,11 +100,6 @@ ALLOWLIST: Dict[str, str] = {
         "~/.claude/settings.json is swallowed and replaced with "
         '{"skipDangerousModePermissionPrompt": true}, discarding the user\'s own '
         "permissions/env/hooks."
-    ),
-    "cli_agent_orchestrator/utils/opencode_config.py::_record_grants": (
-        "LIVE #737-class defect, separate issue: read_grant_record() degrades a "
-        "corrupt sidecar to {} and _write_grant_record then publishes it, dropping "
-        "every other agent's recorded grants."
     ),
 }
 

@@ -29,6 +29,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
+from urllib.parse import quote
 
 import requests
 
@@ -49,7 +50,7 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.delegation import (
     REMOTE_FEATURE,
     DelegationCeilingError,
@@ -211,6 +212,53 @@ def append_sender_suffix(
         if is_structured_prompt_invocation(message, resolved):
             return message
     return message + "\n\n" + template.format(terminal_id=terminal_id)
+
+
+# Providers that add cao-mcp-server to the worker's MCP config themselves,
+# whatever the profile says (copilot_cli, antigravity_cli). opencode_cli is
+# included because its config path also references cao-mcp-server
+# (utils/opencode_config.py); that was not verified against a live run.
+_PROVIDERS_INJECTING_CAO_MCP = frozenset(
+    {
+        ProviderType.COPILOT_CLI.value,
+        ProviderType.ANTIGRAVITY_CLI.value,
+        ProviderType.OPENCODE_CLI.value,
+    }
+)
+
+
+def _declares_cao_mcp(mcp_servers: Optional[Dict[str, Any]]) -> bool:
+    for name, cfg in (mcp_servers or {}).items():
+        if name == "cao-mcp-server":
+            return True
+        if isinstance(cfg, dict):
+            command = cfg.get("command")
+            args = cfg.get("args") or []
+            if isinstance(command, str) and "cao-mcp-server" in command:
+                return True
+            if any(
+                isinstance(a, str)
+                and ("cao-mcp-server" in a or a == "cli_agent_orchestrator.mcp_server.server")
+                for a in args
+            ):
+                return True
+    return False
+
+
+def _worker_can_send_message(agent_profile: str) -> bool:
+    """False only when the worker is confidently known to lack a send_message tool.
+
+    A wrong False costs a misleading warning and a withheld instruction, so any
+    uncertainty (profile unreadable, provider not named by the profile) answers
+    True and leaves the auto-forward path to catch a real miss.
+    """
+    try:
+        profile = load_agent_profile(agent_profile)
+    except Exception:  # noqa: BLE001 - uncertainty answers True, see docstring
+        return True
+    if not profile.provider or profile.provider in _PROVIDERS_INJECTING_CAO_MCP:
+        return True
+    return _declares_cao_mcp(profile.mcpServers)
 
 
 # Terminal count threshold for cleanup nudge
@@ -643,6 +691,100 @@ def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
         return False
 
 
+def _is_unreadable_store_error(exc: BaseException) -> bool:
+    """True for ``load_agent_profile``'s RuntimeError wrapping an OS-level read error.
+
+    ``load_agent_profile`` wraps without ``from``, so the OSError is on __context__.
+    """
+    return isinstance(exc, RuntimeError) and isinstance(exc.__context__, OSError)
+
+
+def _fetch_profile_from_server(profile_name: str) -> Any:
+    """Fetch a parsed agent profile from cao-server's ``GET /agents/profiles/{name}``."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    response = requests.get(
+        f"{API_BASE_URL}/agents/profiles/{quote(profile_name, safe='')}",
+        headers=_auth_headers() or None,
+        timeout=_mcp_timeout(),
+    )
+    response.raise_for_status()
+    return AgentProfile.model_validate(response.json())
+
+
+def _load_child_profile(child_profile_name: str) -> Any:
+    """Load a child's agent profile, asking cao-server when this process can't read it.
+
+    This runs in the caller's process -- for ``assign``/``handoff`` that is
+    cao-mcp-server, a child of the supervisor's CLI. A sandboxing CLI can hide the
+    agent store from it: kiro-cli with ``"sandbox": true`` gives its MCP children a
+    synthetic ``~/.aws``, so every read failed with ``Permission denied`` and every
+    ``assign`` failed. cao-server reads the same store unsandboxed, so on an OS-level
+    read error fetch the parsed profile from it instead. The intersection below then
+    runs on the same profile it would have read locally. FileNotFoundError and parse
+    errors still propagate unchanged.
+    """
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+    try:
+        return load_agent_profile(child_profile_name)
+    except RuntimeError as exc:
+        if not _is_unreadable_store_error(exc):
+            raise
+        try:
+            return _fetch_profile_from_server(child_profile_name)
+        except Exception as fallback_exc:
+            logger.warning(
+                "Profile '%s' unreadable locally (%s) and cao-server fallback failed: %s",
+                child_profile_name,
+                exc.__context__,
+                fallback_exc,
+            )
+        # Bare raise outside the inner handler: re-raises the original error with its
+        # OSError context intact (raising it inside would chain fallback_exc instead).
+        raise
+
+
+def _resolve_child_provider(agent_profile: str, fallback_provider: str) -> str:
+    """``resolve_provider`` that survives a sandboxed agent store.
+
+    ``resolve_provider`` treats any load failure as "no provider pinned" and
+    returns the fallback (the supervisor's provider), which the client then sends
+    as an explicit ``provider=`` the server honours. Under the same sandbox as
+    ``_load_child_profile``, a child pinned to another CLI would silently launch
+    on the supervisor's. When the local read fails only because the store is
+    unreadable, read the pin from cao-server's copy instead; every other outcome
+    is exactly ``resolve_provider``'s, which re-reads the profile. Reserved
+    ephemeral names never fall back: they fail with FileNotFoundError or
+    EphemeralProfileUnavailable, not an unreadable-store error.
+    """
+    from cli_agent_orchestrator.utils.agent_profiles import (
+        load_launch_profile,
+        provider_from_profile,
+    )
+
+    try:
+        load_launch_profile(agent_profile)
+    except RuntimeError as exc:
+        if _is_unreadable_store_error(exc):
+            try:
+                profile = _fetch_profile_from_server(agent_profile)
+            except Exception as fallback_exc:
+                logger.warning(
+                    "Profile '%s' unreadable locally (%s) and cao-server fallback failed: "
+                    "%s; using provider '%s'",
+                    agent_profile,
+                    exc.__context__,
+                    fallback_exc,
+                    fallback_provider,
+                )
+                return fallback_provider
+            return provider_from_profile(profile, agent_profile, fallback_provider)
+    except Exception:  # noqa: BLE001 - every other outcome is resolve_provider's to judge
+        pass
+    return resolve_provider(agent_profile, fallback_provider=fallback_provider)
+
+
 def _resolve_child_allowed_tools(
     parent_allowed_tools: Optional[list],
     child_profile_name: str,
@@ -668,11 +810,10 @@ def _resolve_child_allowed_tools(
         unrestricted child under an unrestricted parent.
     """
     from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
-    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
     from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
     try:
-        child_profile = load_agent_profile(child_profile_name)
+        child_profile = _load_child_profile(child_profile_name)
         mcp_server_names = grantable_server_names(child_profile)
         child_allowed = resolve_allowed_tools(
             child_profile.allowedTools, child_profile.role, mcp_server_names
@@ -968,6 +1109,8 @@ def _create_terminal(
     delegation_message: Optional[str] = None,
     delegation_kind: Optional[str] = None,
     response_sink: Optional[Callable[[requests.Response], None]] = None,
+    expect_callback: bool = False,
+    worker_can_reply: bool = True,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -1062,7 +1205,9 @@ def _create_terminal(
         provider = (
             claim.provider
             if claim is not None
-            else resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+            else _resolve_child_provider(
+                agent_profile, fallback_provider=terminal_metadata["provider"]
+            )
         )
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
@@ -1109,6 +1254,10 @@ def _create_terminal(
         # Record the creating terminal so send_message can route callbacks
         # structurally instead of parsing IDs out of message text (issue #284).
         params["caller_id"] = current_terminal_id
+        if expect_callback:
+            params["expect_callback"] = "true"
+            if not worker_can_reply:
+                params["worker_can_reply"] = "false"
         if claim is not None and claim.claim_id is not None:
             params["claim_id"] = claim.claim_id
         if working_directory:
@@ -1206,7 +1355,7 @@ def _create_terminal(
             if idempotency_key
             else generate_session_name()
         )
-        provider = resolve_provider(agent_profile, fallback_provider=provider)
+        provider = _resolve_child_provider(agent_profile, fallback_provider=provider)
         params = {
             "provider": provider,
             "agent_profile": agent_profile,
@@ -1372,7 +1521,7 @@ def _resolve_handoff_provider(
     current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
         return HandoffContext(
-            provider=resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
+            provider=_resolve_child_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
             session_name=None,
             caller_id=None,
             allowed_tools=None,
@@ -1394,7 +1543,9 @@ def _resolve_handoff_provider(
             claim.effective_tools,
             claim.claim_id,
         )
-    provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+    provider = _resolve_child_provider(
+        agent_profile, fallback_provider=terminal_metadata["provider"]
+    )
     # Resolve the child's allowed-tools via the same inheritance the old path
     # used; _resolve_child_allowed_tools returns a comma-separated string (or
     # None for unrestricted), which we split into the list the payload expects.
@@ -1516,7 +1667,7 @@ def _receiver_provider(receiver_id: str) -> Optional[str]:
     return None
 
 
-def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
+def _send_to_inbox(receiver_id: str, message: str, expect_reply: bool = False) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
     Cross-node routing (one-agent-per-pod topology): when this terminal was
@@ -1550,6 +1701,8 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         base_url = callback_url
 
     params = {"sender_id": sender_id, "message": message}
+    if expect_reply:
+        params["expect_reply"] = "true"
 
     def _inbox_headers(target_base_url: str) -> Optional[Dict[str, str]]:
         # BOTH header sets, and the union is not a compromise between two merge
@@ -2823,6 +2976,7 @@ def _assign_impl(
     description: Optional[str] = None,
     *,
     delegation_message: Optional[str] = None,
+    expect_callback: bool = True,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -2902,7 +3056,12 @@ def _assign_impl(
         # agent assign`` shell), not on the cao-server side. The helper leaves
         # a kiro-cli ``@<prompt> [args]`` invocation untouched (issue #70) and
         # looks the worker's provider up only when the task leads with ``@``.
-        if ENABLE_SENDER_ID_INJECTION:
+        # An ephemeral claim pins the worker's provider, which the profile does not
+        # show, so a claimed worker is taken to be able to reply.
+        can_reply = (
+            _worker_can_send_message(agent_profile) if expect_callback and claim is None else True
+        )
+        if ENABLE_SENDER_ID_INJECTION and can_reply:
             worker_message = append_sender_suffix(
                 message,
                 ASSIGN_SUFFIX_TEMPLATE,
@@ -2930,6 +3089,8 @@ def _assign_impl(
             use_worktree=use_worktree,
             delegation_message=canonical_message,
             response_sink=_decision_response_sink(notes),
+            expect_callback=expect_callback,
+            worker_can_reply=can_reply,
             **claim_kwargs,
         )
 
@@ -2943,6 +3104,13 @@ def _assign_impl(
                     f"delivered once it is ready. "
                     f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
                     + _get_cleanup_nudge()
+                    + (
+                        " Note: this worker's profile has no cao-mcp-server, so it cannot "
+                        "call send_message; its last response will be auto-forwarded to you "
+                        "when it goes idle."
+                        if expect_callback and not can_reply
+                        else ""
+                    )
                 ),
                 notes,
             ),
@@ -2971,7 +3139,9 @@ def _assign_impl(
 
 
 # Implementation function for send_message
-def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
+def _send_message_impl(
+    receiver_id: Optional[str], message: str, expect_reply: bool = False
+) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
         own_terminal_id = _current_terminal_id()
@@ -3069,7 +3239,7 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
                 provider=lambda: _receiver_provider(receiver),
             )
 
-        return _send_to_inbox(receiver, message)
+        return _send_to_inbox(receiver, message, expect_reply=expect_reply)
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw

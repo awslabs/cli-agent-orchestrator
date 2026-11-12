@@ -3,7 +3,8 @@
 Proves the loop is real end-to-end: an agent-authored UI intent is validated
 server-side against the frozen allow-list, published onto the fleet event bus,
 and maps to a CUSTOM ``cao.generative_ui`` frame via the AG-UI adapter. Off-list components
-are refused at the producer (400) so they never reach the bus.
+are refused at the producer (400) and never render; the server publishes only a
+metadata-only refusal record for them (``test_agui_emit_ui_refusal.py``, #1158).
 """
 
 from __future__ import annotations

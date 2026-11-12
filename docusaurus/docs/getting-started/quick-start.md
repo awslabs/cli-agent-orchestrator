@@ -61,6 +61,7 @@ Run `cao profile list` to see all available profiles.
 | `--session-name` | Name for the session (auto-generated if omitted) |
 | `--headless` | Run detached — don't attach to the tmux window |
 | `--provider` | AI CLI provider. Defaults to the profile's `provider:` field, then `kiro_cli` |
+| `--engine` | Kiro CLI only: `v2` or `v3` ([preview](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/kiro-cli.md#kiro-v3-preview)). Default: the profile's `engine`, else `v2` |
 | `--async` | Send the message and return immediately |
 | `--yolo` | **[DANGEROUS]** Unrestricted tool access, skips all prompts |
 | `--allowed-tools` | Override allowed tools for this session (repeatable) |

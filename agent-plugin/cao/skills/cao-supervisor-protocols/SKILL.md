@@ -1,6 +1,6 @@
 ---
 name: cao-supervisor-protocols
-description: Coordinate, delegate, and split work across CAO worker agents as a supervisor — choose between assign (async fire-and-forget) vs handoff (sync wait-for-result), fan out tasks to parallel specialists, manage idle-based inbox delivery, or debug why worker callbacks aren't arriving. Covers dispatch patterns, result collection, and multi-agent orchestration planning. Not for worker-side task execution, creating skills, managing plugins, or session lifecycle (cao launch/shutdown).
+description: Coordinate, delegate, and split work across CAO worker agents as a supervisor. Use when choosing between assign (async fire-and-forget) and handoff (sync wait-for-result), fanning tasks out to parallel specialists, managing idle-based inbox delivery, or debugging why worker callbacks aren't arriving. Covers dispatch patterns, result collection, and multi-agent orchestration planning. Not for worker-side task execution, creating skills, managing plugins, or session lifecycle (cao launch/shutdown).
 compatibility: Requires cao-server running at localhost:9889 and cao-mcp-server configured on the agent.
 ---
 

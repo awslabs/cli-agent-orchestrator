@@ -18,6 +18,10 @@ import pytest
 
 from cli_agent_orchestrator.utils import fifo_writer
 
+# How long an in-process writer may take before a test calls it hung. The fixed
+# writer returns in milliseconds; this only has to beat the CI job's timeout.
+_WRITER_BOUND = 10.0
+
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="FIFOs and O_NOFOLLOW are POSIX")
 
 
@@ -146,6 +150,14 @@ class TestWaitingForAReader:
     """
 
     def test_stdin_closing_before_any_reader_ends_the_writer(self, tmp_path):
+        """Bounded: a writer that hangs fails this test instead of the whole job (#1251).
+
+        ``run`` is called in a daemon thread and joined with a timeout, as the
+        late-reader test does. A regression to a blocking ``open()`` never
+        returns, and called in-process it would hang the pytest worker until the
+        CI job's own timeout. Here it fails in ``_WRITER_BOUND`` seconds and the
+        daemon thread dies with the process.
+        """
         import time
 
         fifo = tmp_path / "t.fifo"
@@ -153,12 +165,23 @@ class TestWaitingForAReader:
         src_r, src_w = os.pipe()
         os.write(src_w, b"output nobody will read")
         os.close(src_w)  # the pane is gone
-        try:
-            start = time.monotonic()
-            assert fifo_writer.run(str(fifo), src_fd=src_r) == 0
-            assert time.monotonic() - start < 2.0
-        finally:
-            os.close(src_r)
+        got = []
+        writer = threading.Thread(
+            target=lambda: got.append(fifo_writer.run(str(fifo), src_fd=src_r)), daemon=True
+        )
+        start = time.monotonic()
+        writer.start()
+        writer.join(timeout=_WRITER_BOUND)
+        elapsed = time.monotonic() - start
+        if writer.is_alive():
+            # Not closing src_r: the thread may still be blocked on it.
+            pytest.fail(
+                f"fifo_writer.run did not return within {_WRITER_BOUND}s after stdin "
+                "closed with no reader attached; it is blocked, likely in open()"
+            )
+        os.close(src_r)
+        assert got == [0]
+        assert elapsed < 2.0, elapsed
         assert stat.S_ISFIFO(os.stat(fifo).st_mode)
 
     def test_a_late_reader_still_gets_output_written_before_it_attached(self, tmp_path):

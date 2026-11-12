@@ -1,7 +1,9 @@
 """Issue #1082 busy time: a status transition is persisted for BOTH backends --
-tmux via StatusMonitor._apply_detection's sticky-latch pipeline, and herdr via
-the agent_status herdr reports for a managed pane on its event stream
-(HerdrInboxService), never by sampling whoever happens to poll get_status().
+tmux via StatusMonitor._apply_detection's sticky-latch pipeline and the two
+latch changes in StatusMonitor.get_status (native-swarm revoke, stale-capture
+recovery), and herdr via the agent_status herdr reports for a managed pane on
+its event stream (HerdrInboxService), never by sampling whoever happens to poll
+get_status().
 A recording failure must never affect the status either path delivers."""
 
 import asyncio
@@ -251,7 +253,7 @@ class TestGetStatusTransitionsAreRecorded:
     stamped at the transition, as ``_apply_detection`` does."""
 
     @staticmethod
-    def _swarm_revoke(mock_pm, terminal_id, final_read=_direct):
+    def _swarm_revoke(mock_pm, terminal_id, final_read=_direct, drain=True):
         """A native swarm starts another batch while the latch reads COMPLETED:
         get_status revokes the ready status to PROCESSING."""
         provider = MagicMock()
@@ -260,11 +262,14 @@ class TestGetStatusTransitionsAreRecorded:
         sm = StatusMonitor()
         assert sm._apply_detection(terminal_id, TerminalStatus.COMPLETED) is True
         status = final_read(lambda: sm.get_status(terminal_id))
-        _drain_tmux_status_writes()
+        if drain:
+            _drain_tmux_status_writes()
         return status
 
     @staticmethod
-    def _stale_capture_recovery(mock_pm, mock_get_backend, terminal_id, final_read=_direct):
+    def _stale_capture_recovery(
+        mock_pm, mock_get_backend, terminal_id, final_read=_direct, drain=True, before_confirm=None
+    ):
         """The buffer stopped changing while the latch reads PROCESSING, and
         two matching pane captures confirm IDLE: get_status heals to IDLE."""
         provider = MagicMock()
@@ -282,8 +287,11 @@ class TestGetStatusTransitionsAreRecorded:
         sm._buffer_changed_at[terminal_id] = -1000.0  # quiet for good
         assert sm.get_status(terminal_id) == TerminalStatus.PROCESSING  # first read
         sm._last_stale_capture_check[terminal_id] = None  # skip the rate limit
+        if before_confirm is not None:
+            before_confirm(sm)
         status = final_read(lambda: sm.get_status(terminal_id))  # the confirming read
-        _drain_tmux_status_writes()
+        if drain:
+            _drain_tmux_status_writes()
         return status
 
     @staticmethod
@@ -418,6 +426,109 @@ class TestGetStatusTransitionsAreRecorded:
         rows = _rows("t16")
         assert [r.status for r in rows] == ["completed", "processing", "completed"]
         assert [r.created_at for r in rows] == sorted(r.created_at for r in rows)
+
+    @staticmethod
+    def _slow_writes(monkeypatch):
+        from cli_agent_orchestrator.clients import database
+
+        real_write = database.record_launch_status_event
+
+        def slow_write(*args, **kwargs):
+            time.sleep(0.3)
+            real_write(*args, **kwargs)
+
+        monkeypatch.setattr(database, "record_launch_status_event", slow_write)
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_native_swarm_revoke_waits_for_its_row_off_the_loop(
+        self, mock_get_backend, mock_pm, mock_bus, monkeypatch
+    ):
+        """A worker-thread caller returns once the revoke row is written."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        self._slow_writes(monkeypatch)
+        self._swarm_revoke(mock_pm, "t17", drain=False)
+        assert [r.status for r in _rows("t17")] == ["completed", "processing"]
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_stale_capture_recovery_waits_for_its_row_off_the_loop(
+        self, mock_get_backend, mock_pm, mock_bus, monkeypatch
+    ):
+        """A worker-thread caller returns once the recovery row is written."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        self._slow_writes(monkeypatch)
+        self._stale_capture_recovery(mock_pm, mock_get_backend, "t18", drain=False)
+        assert [r.status for r in _rows("t18")] == ["processing", "idle"]
+
+    @staticmethod
+    def _race_on_queue(monkeypatch, sm, terminal_id, at_status):
+        """When the site under test queues ``at_status``, let another thread try
+        ``_apply_detection(COMPLETED)`` first. Queued inside the lock, that
+        thread is held out until the site's row is queued. Returns a list that
+        holds the thread once it has started."""
+        real_queue = status_monitor._queue_status_transition
+        racers = []
+
+        def queue(tid, status):
+            if tid == terminal_id and status == at_status and not racers:
+                racer = threading.Thread(
+                    target=sm._apply_detection, args=(terminal_id, TerminalStatus.COMPLETED)
+                )
+                racers.append(racer)
+                racer.start()
+                racer.join(timeout=0.3)
+            return real_queue(tid, status)
+
+        monkeypatch.setattr(status_monitor, "_queue_status_transition", queue)
+        return racers
+
+    @staticmethod
+    def _finish_racer(racers):
+        """Join the racer, then drain, so its row is queued before the no-op
+        the drain waits on. Row order is fixed at queue time, so the join
+        cannot hide a queue call that moved out of the lock."""
+        assert len(racers) == 1
+        racers[0].join(timeout=10)
+        assert not racers[0].is_alive()
+        _drain_tmux_status_writes()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_revoke_row_is_queued_inside_the_lock(
+        self, mock_get_backend, mock_pm, mock_bus, monkeypatch
+    ):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.has_pending_native_swarm = True
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+        assert sm._apply_detection("t19", TerminalStatus.COMPLETED) is True
+        racers = self._race_on_queue(monkeypatch, sm, "t19", TerminalStatus.PROCESSING)
+        sm.get_status("t19")
+        self._finish_racer(racers)
+        assert [r.status for r in _rows("t19")] == ["completed", "processing", "completed"]
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_capture_recovery_row_is_queued_inside_the_lock(
+        self, mock_get_backend, mock_pm, mock_bus, monkeypatch
+    ):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        started = []
+
+        def race(sm):
+            started.append(self._race_on_queue(monkeypatch, sm, "t20", TerminalStatus.IDLE))
+
+        self._stale_capture_recovery(
+            mock_pm, mock_get_backend, "t20", drain=False, before_confirm=race
+        )
+        self._finish_racer(started[0])
+        assert [r.status for r in _rows("t20")] == ["processing", "idle", "completed"]
 
 
 class TestHerdrBusyTimeFromEvents:
