@@ -153,6 +153,8 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
 from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
 from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
 from cli_agent_orchestrator.runner.protocol import RunnerError
+from cli_agent_orchestrator.runner.token import TOKEN_ENV as RUNNER_TOKEN_ENV
+from cli_agent_orchestrator.runner.token import TOKEN_FILE_ENV as RUNNER_TOKEN_FILE_ENV
 from cli_agent_orchestrator.runner.token import runner_hub_ssl_context, runner_token
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
@@ -1719,8 +1721,16 @@ async def lifespan(app: FastAPI):
     logger.info("Holding server lock %s (pid %d)", server_lock_handle.path, os.getpid())
     # #745: the runner-channel token leaves this process's environment before
     # anything it starts can inherit it (see runner.token).
-    if isinstance(get_backend(), RemoteBackend):
-        runner_token()
+    # Without one the hub cannot start; say what to set rather than fail later
+    # with a traceback. An unreadable token file was already logged by name.
+    if isinstance(get_backend(), RemoteBackend) and runner_token() is None:
+        message = (
+            "refusing to start: terminal.backend=remote requires a runner token; set "
+            f"{RUNNER_TOKEN_FILE_ENV} (preferred) or {RUNNER_TOKEN_ENV}"
+        )
+        logger.error(message)
+        print(message, file=sys.stderr, flush=True)
+        raise SystemExit(1)
     # issue #583 Bolt 3 (``approval-enforcement-default``): report the approval gate's RESOLVED state
     # AND the mechanism that decided it. A malformed settings file fails closed, so the source tells
     # the operator why enforcement remains ON and how to recover. Logs only the boolean and a member

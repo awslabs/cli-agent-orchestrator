@@ -1186,6 +1186,18 @@ class TestToken:
         monkeypatch.setenv(token_mod.TOKEN_FILE_ENV, str(tmp_path / "missing"))
         assert token_mod.runner_token() is None  # never the env fallback
 
+    def test_a_file_that_is_not_utf8_fails_closed_without_logging_it(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        f = tmp_path / "token"
+        f.write_bytes(b"\xfe\xedsecret")
+        monkeypatch.setenv(token_mod.TOKEN_ENV, "from-env")
+        monkeypatch.setenv(token_mod.TOKEN_FILE_ENV, str(f))
+        with caplog.at_level("ERROR", logger=token_mod.__name__):
+            assert token_mod.runner_token() is None  # no traceback, no env fallback
+        assert "not UTF-8" in caplog.text
+        assert "0xfe" not in caplog.text and "secret" not in caplog.text
+
     def test_the_runner_refuses_to_start_without_one(self, monkeypatch):
         with pytest.raises(SystemExit):
             agent_mod.main(["--server-url", "ws://127.0.0.1:1"])

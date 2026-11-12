@@ -56,6 +56,11 @@ def _read() -> Optional[str]:
             # silently replaced by the environment value.
             logger.error("cannot read %s=%s: %s", TOKEN_FILE_ENV, path, exc)
             return None
+        except UnicodeError:
+            # The decode error quotes the offending byte, a byte of the
+            # secret, so it is not logged.
+            logger.error("cannot read %s=%s: not UTF-8 text", TOKEN_FILE_ENV, path)
+            return None
     return value or None
 
 

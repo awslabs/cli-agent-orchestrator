@@ -314,3 +314,36 @@ class TestApiAuth:
                     pass
         assert touched == []
         assert "does not support API authentication" in capsys.readouterr().err
+
+
+class TestRunnerToken:
+    """Without a runner token the server says what to set, not a traceback (#745)."""
+
+    @pytest.mark.asyncio
+    async def test_the_lifespan_refuses_with_a_directed_message(self, remote, capsys):
+        from cli_agent_orchestrator.backends.remote_backend import RemoteBackend
+
+        reached = []
+        with (
+            patch("cli_agent_orchestrator.api.main.setup_logging"),
+            patch("cli_agent_orchestrator.api.main.install_access_log_redaction"),
+            patch("cli_agent_orchestrator.api.main.server_lock.acquire_server_lock"),
+            patch(
+                "cli_agent_orchestrator.api.main.get_backend",
+                return_value=RemoteBackend.__new__(RemoteBackend),
+            ),
+            patch("cli_agent_orchestrator.api.main.runner_token", return_value=None),
+            patch(
+                "cli_agent_orchestrator.api.main.init_db",
+                side_effect=lambda: reached.append("db"),
+            ),
+            patch("cli_agent_orchestrator.api.main.bus.set_loop", new=AsyncMock()),
+        ):
+            with pytest.raises(SystemExit) as exc:
+                async with lifespan(app):
+                    pass
+        assert exc.value.code == 1
+        assert reached == []
+        err = capsys.readouterr().err
+        assert "terminal.backend=remote requires a runner token" in err
+        assert "CAO_RUNNER_TOKEN_FILE" in err and "CAO_RUNNER_TOKEN" in err
