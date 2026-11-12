@@ -357,6 +357,10 @@ class TestALoneEscapeHoldsTheWindow:
 
         assert seen == [main_module._WEB_INPUT_ESCAPE_HOLD_FALLBACK_S]
 
+    def test_the_fallback_hold_covers_tmuxs_500_ms_floor(self):
+        """The fallback tests compare against the constant itself; pin its value."""
+        assert main_module._WEB_INPUT_ESCAPE_HOLD_FALLBACK_S >= 0.5
+
     @pytest.mark.asyncio
     async def test_window_terminals_never_ask_for_the_hold(self):
         with _pty_attach((_ARGV, None)) as state:
@@ -379,12 +383,13 @@ class TestWebInputWindow:
 
     @pytest.mark.parametrize(
         "frame",
-        [b"\x1b[", b"\x1b]", b"abc\x1b[", b"abc\x1b]"],
-        ids=["alt[", "alt]", "x+alt[", "x+alt]"],
+        [b"\x1b[", b"\x1b]", b"abc\x1b[", b"abc\x1b]", b"\x1bP", b"abc\x1bP"],
+        ids=["alt[", "alt]", "x+alt[", "x+alt]", "alt-shift-p", "x+alt-shift-p"],
     )
     @pytest.mark.asyncio
     async def test_a_trailing_alt_bracket_leaves_a_hold(self, frame):
-        """tmux keeps ``\\x1b[`` and ``\\x1b]`` as partial keys too, like a lone Escape."""
+        """tmux keeps ``\\x1b[`` and ``\\x1b]`` as partial keys too, like a lone Escape,
+        and ``\\x1bP`` just after an attach (haofeif's P3 on #1227)."""
         window, a = main_module._WebInputWindow(), object()
 
         window.after_write(a, frame, 5.0)
