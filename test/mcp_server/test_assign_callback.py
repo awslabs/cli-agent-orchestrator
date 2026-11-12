@@ -9,61 +9,11 @@ import pytest
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 ORCH = "cli_agent_orchestrator.utils.orchestration"
+AGENT_PROFILES = "cli_agent_orchestrator.utils.agent_profiles"
 
 
 def _profile(provider=None, mcp_servers=None):
     return AgentProfile(name="dev", description="d", provider=provider, mcpServers=mcp_servers)
-
-
-class TestWorkerCanSendMessage:
-    def test_profile_declares_cao_server(self):
-        from cli_agent_orchestrator.utils.orchestration import _worker_can_send_message
-
-        with patch(
-            f"{ORCH}.load_agent_profile",
-            return_value=_profile("claude_code", {"cao-mcp-server": {"command": "cao-mcp-server"}}),
-        ):
-            assert _worker_can_send_message("dev") is True
-
-    def test_explicit_provider_without_cao_server(self):
-        from cli_agent_orchestrator.utils.orchestration import _worker_can_send_message
-
-        with patch(f"{ORCH}.load_agent_profile", return_value=_profile("claude_code", {})):
-            assert _worker_can_send_message("dev") is False
-
-    def test_server_under_another_name_found_by_its_args(self):
-        from cli_agent_orchestrator.utils.orchestration import _worker_can_send_message
-
-        servers = {
-            "orchestrator": {
-                "command": "uvx",
-                "args": [
-                    "--from",
-                    "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
-                    "cao-mcp-server",
-                ],
-            }
-        }
-        with patch(f"{ORCH}.load_agent_profile", return_value=_profile("claude_code", servers)):
-            assert _worker_can_send_message("dev") is True
-
-    def test_provider_that_injects_cao_server(self):
-        from cli_agent_orchestrator.utils.orchestration import _worker_can_send_message
-
-        with patch(f"{ORCH}.load_agent_profile", return_value=_profile("copilot_cli", {})):
-            assert _worker_can_send_message("dev") is True
-
-    def test_unknown_provider_assumes_yes(self):
-        from cli_agent_orchestrator.utils.orchestration import _worker_can_send_message
-
-        with patch(f"{ORCH}.load_agent_profile", return_value=_profile(None, {})):
-            assert _worker_can_send_message("dev") is True
-
-    def test_unloadable_profile_assumes_yes(self):
-        from cli_agent_orchestrator.utils.orchestration import _worker_can_send_message
-
-        with patch(f"{ORCH}.load_agent_profile", side_effect=FileNotFoundError):
-            assert _worker_can_send_message("dev") is True
 
 
 @pytest.fixture(autouse=True)
@@ -73,37 +23,37 @@ def _no_cleanup_nudge():
 
 
 class TestAssignFlags:
-    @patch(f"{ORCH}._worker_can_send_message", return_value=True)
     @patch(f"{ORCH}._create_terminal", return_value=("w1", "claude_code"))
-    def test_default_expects_callback(self, create, _can):
+    def test_default_expects_callback(self, create):
         from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             result = _assign_impl("developer", "do it")
         assert result["success"] is True
         assert create.call_args.kwargs["expect_callback"] is True
-        assert create.call_args.kwargs["worker_can_reply"] is True
         assert "send results back" in create.call_args.kwargs["initial_message"]
 
-    @patch(f"{ORCH}._worker_can_send_message", return_value=False)
+    # Patch both names: code that imported load_agent_profile into
+    # utils.orchestration never sees the agent_profiles patch alone.
+    @patch(f"{ORCH}.load_agent_profile", return_value=_profile("claude_code", {}), create=True)
+    @patch(f"{AGENT_PROFILES}.load_agent_profile", return_value=_profile("claude_code", {}))
     @patch(f"{ORCH}._create_terminal", return_value=("w1", "claude_code"))
-    def test_worker_without_tool_warns_and_omits_suffix(self, create, _can):
+    def test_profile_without_cao_server_still_gets_suffix(self, create, _load, _orch_load):
+        """A provider can load cao-mcp-server from the user's own MCP config,
+        so a profile that does not list it says nothing about the worker's tools.
+        """
         from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             result = _assign_impl("developer", "do it")
-        assert "cannot call send_message" in result["message"]
-        assert "send results back" not in create.call_args.kwargs["initial_message"]
-        assert create.call_args.kwargs["worker_can_reply"] is False
+        assert result["success"] is True
+        assert "send results back to terminal a1b2c3d4" in (
+            create.call_args.kwargs["initial_message"]
+        )
+        assert "cao-mcp-server" not in result["message"]
 
-    @patch(f"{ORCH}.load_agent_profile", return_value=_profile("claude_code", {}))
     @patch(f"{ORCH}._create_terminal", return_value=("w1", "claude_code"))
-    def test_claimed_worker_is_not_judged_by_its_profile(self, create, _load):
-        """An ephemeral claim pins the provider, which the profile does not show.
-
-        The profile here names claude_code and no cao-mcp-server, so judging the
-        claimed worker by it would wrongly withhold the reply instruction.
-        """
+    def test_claimed_worker_gets_suffix(self, create):
         from cli_agent_orchestrator.utils.orchestration import EphemeralClaim, _assign_impl
 
         claim = EphemeralClaim(provider="claude_code", effective_tools=[], claim_id="claim-1")
@@ -114,9 +64,7 @@ class TestAssignFlags:
             result = _assign_impl("developer", "do it")
         assert result["success"] is True
         assert create.call_args.kwargs["claim"] == claim
-        assert create.call_args.kwargs["worker_can_reply"] is True
         assert "send results back" in create.call_args.kwargs["initial_message"]
-        assert "cannot call send_message" not in result["message"]
 
     @patch(f"{ORCH}._create_terminal", return_value=("w1", "claude_code"))
     def test_opt_out(self, create):
@@ -125,8 +73,7 @@ class TestAssignFlags:
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             _assign_impl("developer", "do it", expect_callback=False)
         assert create.call_args.kwargs["expect_callback"] is False
-        # Opting out keeps today's instruction to reply, so the worker still
-        # gets the callback suffix even when its profile cannot reply.
+        # Opting out of the edge keeps the instruction to reply.
         assert "send results back" in create.call_args.kwargs["initial_message"]
 
 
@@ -154,11 +101,9 @@ class TestCreateTerminalParams:
                 defer_init=True,
                 initial_message="x",
                 expect_callback=True,
-                worker_can_reply=False,
             )
         params = mock_requests.post.call_args.kwargs["params"]
         assert params["expect_callback"] == "true"
-        assert params["worker_can_reply"] == "false"
 
 
 class TestSendMessageFlag:

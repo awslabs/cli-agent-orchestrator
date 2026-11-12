@@ -293,6 +293,36 @@ class TestCreatePane:
 
         assert host_window.split.call_args.kwargs["environment"]["CAO_TERMINAL_ID"] == "tid-42"
 
+    def test_split_pane_sets_histfile_to_dev_null_over_forwarded(self, tmux, tmp_path):
+        """The pane shell must not write agent launch commands to the user's history."""
+        _, host_window = self._session(tmux)
+
+        tmux.create_pane(
+            "ses",
+            "cao-agents",
+            "coder-3",
+            "tid-42",
+            str(tmp_path),
+            extra_env={"HISTFILE": "/tmp/operator_hist"},
+        )
+
+        assert host_window.split.call_args.kwargs["environment"]["HISTFILE"] == "/dev/null"
+
+    def test_first_pane_of_a_new_host_window_sets_histfile_to_dev_null(self, tmux, tmp_path):
+        session = session_with()
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane(
+            "ses",
+            "cao-agents",
+            "coder-3",
+            "tid-42",
+            str(tmp_path),
+            extra_env={"HISTFILE": "/tmp/operator_hist"},
+        )
+
+        assert session.new_window.call_args.kwargs["environment"]["HISTFILE"] == "/dev/null"
+
     def test_refuses_a_name_already_marked(self, tmux, tmp_path):
         """Two panes with one mark would make every later lookup ambiguous."""
         _, host_window = self._session(tmux, existing_marks=["coder-3"])
