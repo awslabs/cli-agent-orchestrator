@@ -166,7 +166,7 @@ wrong address and felt safe. The fix compares every push destination with the on
 standing OKs, and refuses anything else.
 
 If you build guardrails for agents, have someone who didn't write them try to break them.
-The tests grew with the reviews: 138 kit tests at the first review, 1,338 now, plus
+The tests grew with the reviews: 138 kit tests at the first review, 1,388 now, plus
 101 for the PR watch. I also run mutation tests, which break each gate condition on purpose
 and check that a test notices.
 

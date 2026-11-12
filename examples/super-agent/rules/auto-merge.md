@@ -15,7 +15,8 @@ what the gate checks and why.
   every required check is present.
 - `mergeable != CONFLICTING`. A conflicting PR goes to a main-merger, never to this rule.
 - The PR changes no more than `max_changed_lines` (1500 in the shipped mandates; above that the
-  gate says `ESCALATE_SIZE` and the conductor takes a second look).
+  gate says `ESCALATE_SIZE` and the conductor takes a second look). For updates, the cap is
+  `min(1500, every M6 cap, revoked ones included)`.
 - The PR is not listed in the mandate's `never_prs`.
 - The hold-on-findings rule (`hold-on-findings.md`) finds nothing.
 

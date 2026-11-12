@@ -135,8 +135,8 @@ and after.
 2. Fetch the live author and base into a fresh scope file in your scratch directory `$D`:
    ```sh
    gh pr view <N> -R your-org/your-repo --json author,baseRefName > "$D/review-scope.json" || exit 1
-   A=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["author"]["login"])' "$D/review-scope.json") || exit 1
-   B=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefName"])' "$D/review-scope.json") || exit 1
+   A=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("author", dict()).get("login") or "")' "$D/review-scope.json") || exit 1
+   B=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("baseRefName") or "")' "$D/review-scope.json") || exit 1
    python3 KIT/bin/check_mandate.py --holder conductor --action approve_review_plan \
      --pr-author "$A" --base "$B"
    ```

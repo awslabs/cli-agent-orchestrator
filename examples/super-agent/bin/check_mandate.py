@@ -115,7 +115,11 @@ def check_destination(doc, repo, extra):
     want = urls.get(repo) if isinstance(urls, dict) else None
     if not isinstance(want, str) or not want.strip():
         return f"push_url_unbound:{repo} (no mandates.json push_urls entry)"
+    if re.search(r"[\s\x00-\x1f\x7f-\x9f]", want):
+        return "push_url_invalid"
     dest, rewrites = extra.get("push_dest"), extra.get("url_rewrites")
+    if isinstance(dest, str) and re.search(r"[\s\x00-\x1f\x7f-\x9f]", dest):
+        return "push_dest_invalid"
     observed = {"push_url": extra.get("push_url"), "fetch_url": extra.get("fetch_url")}
     if dest is None or rewrites is None or None in observed.values():
         return "push_dest_needs:--push-dest, --push-url, --fetch-url and --url-rewrites"
@@ -126,8 +130,10 @@ def check_destination(doc, repo, extra):
         key = line.split(None, 1)[0] if line.strip() else ""
         if not key.startswith("remote.") or not key[7:]:
             return "push_remote_config_malformed"
-        if "." not in key[7:]:  # e.g. remote.pushDefault: a variable, not a remote section
+        if key.lower() == "remote.pushdefault":
             continue
+        if "." not in key[7:]:
+            return "push_remote_config_malformed"
         name = key[7:].rsplit(".", 1)[0]
         if "://" in name or norm_url(name) == norm_url(want):
             return "push_remote_name (a remote section can redirect the authorised URL)"

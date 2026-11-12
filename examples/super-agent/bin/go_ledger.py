@@ -80,6 +80,9 @@ def mandate_repo(doc):
     repo = next(iter(urls))
     if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise ValueError("invalid push_urls repository")
+    url = urls[repo]
+    if not isinstance(url, str) or not url or re.search(r"[\s\x00-\x1f\x7f-\x9f]", url):
+        raise ValueError("invalid push_urls URL")
     return repo
 
 

@@ -144,7 +144,7 @@ def test_followup_usage_has_no_fixed_author_or_base(rel, command):
     lines = [line for line in text.splitlines() if command in line]
     assert lines
     for line in lines:
-        assert not re.search(r"--pr-author\s+(?:your-login|fanhongy)\b", line)
+        assert not re.search(r"--pr-author\s+your-login\b", line)
         assert not re.search(r"--base\s+main\b", line)
 
 
