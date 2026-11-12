@@ -1089,6 +1089,52 @@ class TestMalformedHellos:
         assert "victim" not in hub.connected_runners()
         assert self._exchange(hub, self._hello()) == "welcome"
 
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("terminals", 5),
+            ("terminals", ["s:w"]),
+            ("creating", [1]),
+            ("terminals", [{"session": "s", "window": str(i)} for i in range(1025)]),
+        ],
+    )
+    def test_a_malformed_inventory_is_dropped_and_the_connection_kept(
+        self, hub, monkeypatch, field, value
+    ):
+        """Unlike a hello, an inventory comes from a runner already registered:
+        it is dropped with a warning, not reconciled, and the next one is."""
+        import json
+
+        from websockets.asyncio.client import connect
+
+        reconciled = []
+        original = hub._reconcile_inventory
+
+        def record(runner_id, terminals, creating):
+            reconciled.append((runner_id, terminals, creating))
+            return original(runner_id, terminals, creating)
+
+        monkeypatch.setattr(hub, "_reconcile_inventory", record)
+        inventory = {"type": "inventory", "terminals": [], "creating": []}
+
+        async def run():
+            async with connect(
+                f"ws://127.0.0.1:{hub.port}",
+                additional_headers={"Authorization": f"Bearer {TOKEN}"},
+            ) as ws:
+                await ws.send(json.dumps(self._hello()))
+                assert json.loads(await asyncio.wait_for(ws.recv(), timeout=5))["type"] == "welcome"
+                await ws.send(json.dumps({**inventory, field: value}))
+                await ws.send(json.dumps(inventory))
+                for _ in range(100):
+                    if reconciled:
+                        break
+                    await asyncio.sleep(0.02)
+                assert "victim" in hub.connected_runners()  # not closed
+
+        asyncio.run(run())
+        assert reconciled == [("victim", [], [])]  # only the well-formed one
+
     def test_a_reported_id_that_is_not_a_terminal_id_names_no_terminal(self):
         parsed = RunnerHub._parse_terminals(
             [
