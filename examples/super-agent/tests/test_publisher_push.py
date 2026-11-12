@@ -68,13 +68,13 @@ def repo(tmp_path):
     git(tmp_path, "init", "-q", "--bare", remote)
     git(tmp_path, "init", "-q", "--bare", other)  # an unauthorised repository
     git(tmp_path, "init", "-q", "-b", BRANCH, wt)
-    git(tmp_path, "-C", wt, "remote", "add", "origin", str(remote))
+    git(tmp_path, "-C", wt, "remote", "add", "origin", remote.as_uri())
     a = commit(tmp_path, wt, "A")
     git(tmp_path, "-C", wt, "push", "-q", "origin", f"{BRANCH}:refs/heads/{BRANCH}")
-    git(tmp_path, "-C", wt, "push", "-q", str(other), f"{BRANCH}:refs/heads/{BRANCH}")
+    git(tmp_path, "-C", wt, "push", "-q", other.as_uri(), f"{BRANCH}:refs/heads/{BRANCH}")
     b = commit(tmp_path, wt, "B")  # the verified, approved commit
     return {"remote": remote, "other": other, "wt": wt, "a": a, "b": b,
-            "bin": kit_copy(tmp_path, str(remote))}
+            "bin": kit_copy(tmp_path, remote.as_uri())}
 
 
 def remote_head(tmp_path, remote):
@@ -110,7 +110,7 @@ def values(repo, pv):
     return {"worktree": str(repo["wt"]), "branch": BRANCH, "new": repo["b"], "old": repo["a"],
             "pr": PR, "push_action": "ff_fix_push", "policy_version": pv, "go_push": "--go-id w-push",
             "scope_file": str(repo["wt"].parent / "scope.json"),
-            "push_url": str(repo["remote"]), "_bin": str(repo["bin"])}
+            "push_url": repo["remote"].as_uri(), "_bin": str(repo["bin"])}
 
 
 def test_template_push_never_names_a_bare_branch():
@@ -173,7 +173,7 @@ def test_go_for_another_commit_is_refused(tmp_path, repo):
 def test_remote_moved_is_refused_and_push_is_never_forced(tmp_path, repo):
     v = values(repo, go(tmp_path, repo["a"], repo["b"]))
     other = tmp_path / "other"
-    git(tmp_path, "clone", "-q", "-b", BRANCH, str(repo["remote"]), other)
+    git(tmp_path, "clone", "-q", "-b", BRANCH, repo["remote"].as_uri(), other)
     x = commit(tmp_path, other, "X")
     git(tmp_path, "-C", other, "push", "-q", "origin", f"{BRANCH}:refs/heads/{BRANCH}")
     r = step(tmp_path, "4", v)
@@ -197,26 +197,26 @@ def refused_before_push(tmp_path, repo, want):
 
 def test_f1_wrong_pushurl_set_before_the_check_is_refused_before_the_push(tmp_path, repo):
     """two bare remotes at A; origin's pushurl points at the other one before the check."""
-    git(tmp_path, "-C", repo["wt"], "config", "remote.origin.pushurl", str(repo["other"]))
+    git(tmp_path, "-C", repo["wt"], "config", "remote.origin.pushurl", repo["other"].as_uri())
     refused_before_push(tmp_path, repo, "push_url_mismatch (not the authorised URL for "
                                         "your-org/your-repo)")
 
 
 def test_f1_two_push_urls_are_refused(tmp_path, repo):
-    git(tmp_path, "-C", repo["wt"], "config", "remote.origin.pushurl", str(repo["remote"]))
-    git(tmp_path, "-C", repo["wt"], "config", "--add", "remote.origin.pushurl", str(repo["other"]))
+    git(tmp_path, "-C", repo["wt"], "config", "remote.origin.pushurl", repo["remote"].as_uri())
+    git(tmp_path, "-C", repo["wt"], "config", "--add", "remote.origin.pushurl", repo["other"].as_uri())
     refused_before_push(tmp_path, repo, "push_url_count:2 (want exactly one URL)")
 
 
 def test_f1_two_fetch_urls_are_refused(tmp_path, repo):
-    git(tmp_path, "-C", repo["wt"], "config", "--add", "remote.origin.url", str(repo["other"]))
-    git(tmp_path, "-C", repo["wt"], "config", "remote.origin.pushurl", str(repo["remote"]))
+    git(tmp_path, "-C", repo["wt"], "config", "--add", "remote.origin.url", repo["other"].as_uri())
+    git(tmp_path, "-C", repo["wt"], "config", "remote.origin.pushurl", repo["remote"].as_uri())
     refused_before_push(tmp_path, repo, "fetch_url_count:2 (want exactly one URL)")
 
 
 def test_f1_origin_pointing_elsewhere_is_refused(tmp_path, repo):
-    git(tmp_path, "-C", repo["wt"], "remote", "set-url", "origin", str(repo["other"]))
-    git(tmp_path, "-C", repo["wt"], "config", "remote.origin.pushurl", str(repo["remote"]))
+    git(tmp_path, "-C", repo["wt"], "remote", "set-url", "origin", repo["other"].as_uri())
+    git(tmp_path, "-C", repo["wt"], "config", "remote.origin.pushurl", repo["remote"].as_uri())
     refused_before_push(tmp_path, repo, "fetch_url_mismatch (not the authorised URL for "
                                         "your-org/your-repo)")
 
@@ -224,14 +224,14 @@ def test_f1_origin_pointing_elsewhere_is_refused(tmp_path, repo):
 @pytest.mark.parametrize("kind", ["pushInsteadOf", "insteadOf"])
 def test_f1_url_rewrite_is_refused(tmp_path, repo, kind):
     """A rewrite also applies to an explicit URL, so any url.*.(push)insteadOf refuses."""
-    git(tmp_path, "-C", repo["wt"], "config", f"url.{repo['other']}.{kind}", str(repo["remote"]))
+    git(tmp_path, "-C", repo["wt"], "config", f"url.{repo['other'].as_uri()}.{kind}", repo["remote"].as_uri())
     refused_before_push(tmp_path, repo, "push_url_rewrite (an insteadOf/pushInsteadOf rule is configured)")
 
 
 def test_f1_wrong_push_url_placeholder_is_refused(tmp_path, repo):
     """The creator filled {push_url} with another repository: the check refuses before the push."""
     v = values(repo, go(tmp_path, repo["a"], repo["b"]))
-    v["push_url"] = str(repo["other"])
+    v["push_url"] = repo["other"].as_uri()
     r = step(tmp_path, "4", v)
     assert (r.returncode, r.stdout.strip()) == (
         1, "DENY push_dest_mismatch (not the authorised URL for your-org/your-repo)"), r.stdout
@@ -240,7 +240,7 @@ def test_f1_wrong_push_url_placeholder_is_refused(tmp_path, repo):
 
 def test_f1_trailing_dot_git_is_normalised(tmp_path, repo):
     """origin names the remote with ".git", the push_urls entry and {push_url} without it."""
-    bare = str(repo["remote"])
+    bare = repo["remote"].as_uri()
     assert bare.endswith(".git")
     repo["bin"] = kit_copy(tmp_path / "k2", bare[:-4])
     v = values(repo, go(tmp_path, repo["a"], repo["b"]))
@@ -303,7 +303,7 @@ def test_review_template_inspects_url_named_remote(tmp_path, repo):
     data = json.loads((repo["bin"].parent / "mandates.json").read_text())
     data["push_urls"] = {"your-org/your-repo": url}
     (repo["bin"].parent / "mandates.json").write_text(json.dumps(data))
-    git(tmp_path, "-C", repo["wt"], "config", f"remote.{url}.url", str(repo["other"]))
+    git(tmp_path, "-C", repo["wt"], "config", f"remote.{url}.url", repo["other"].as_uri())
     v = values(repo, go(tmp_path, repo["a"], repo["b"]))
     v["push_url"] = url
     result = step(tmp_path, "4", v)

@@ -731,7 +731,8 @@ def test_f1_repeated_flag_counts_as_two_urls(tmp_path):
 @pytest.mark.parametrize("value", ["https://github.com/attacker/cli-agent-orchestrator.git", URL + "/", ""])
 def test_f1_push_dest_must_be_the_authorised_url(tmp_path, value):
     rc, out = dest_check(tmp_path, push_dest=value)
-    assert (rc, out) == (1, f"DENY push_dest_mismatch (not the authorised URL for {REPO})")
+    reason = "push_dest_invalid" if not value else f"push_dest_mismatch (not the authorised URL for {REPO})"
+    assert (rc, out) == (1, f"DENY {reason}")
 
 
 @pytest.mark.parametrize("flag", ["push_dest", "push_url", "fetch_url"])

@@ -47,7 +47,7 @@ def destination_repo():
         yield root, work, good, evil, old, env
 
 
-def destination_check(root, work, want, old, env, dest=None):
+def destination_check(root, work, want, old, env, dest=None, head_url=None):
     path = root / "mandates.json"
     path.write_text(json.dumps(act(doc(push_urls={REPO: want}))))
     # The same observations used by publisher.md step 4, from real Git configuration.
@@ -55,7 +55,8 @@ def destination_check(root, work, want, old, env, dest=None):
     push = git(work, env, "remote", "get-url", "--push", "--all", "origin")
     rewrites = git(work, env, "config", "--get-regexp", r"^url\.", optional=True)
     remotes = git(work, env, "config", "--get-regexp", r"^remote\.")
-    remote = git(work, env, "ls-remote", want, "refs/heads/fix").split()[0]
+    remote = git(work, env, "ls-remote", want if head_url is None else head_url,
+                 "refs/heads/fix").split()[0]
     local = git(work, env, "rev-parse", "refs/heads/fix")
     assert remote == old
     return run("check_mandate.py", "--mandates", path, "--holder", "shepherd",
@@ -104,7 +105,8 @@ def test_delta_pushdefault_allows_real_push(destination_repo, key):
     assert git(work, env, "ls-remote", evil.as_uri(), "refs/heads/fix").split()[0] == old
 
 
-@pytest.mark.parametrize("key", ["remote.url", "remote.pushurl", "remote.receivepack"])
+@pytest.mark.parametrize("key", ["remote.url", "remote.pushurl", "remote.receivepack",
+                                 "remote.pushdefaults", "remote.xpushdefault", "remote.pushdefault2"])
 def test_delta_other_two_level_remote_denies(destination_repo, key):
     root, work, good, evil, old, env = destination_repo
     git(work, env, "config", key, evil.as_uri())
@@ -127,6 +129,67 @@ def test_delta_dotless_url_named_section_denies(destination_repo, variable):
     assert result.stdout.startswith("DENY push_remote_name")
 
 
+@pytest.mark.parametrize("kind", ["remotes", "branches"])
+def test_delta_legacy_remote_denies_real_push(destination_repo, kind):
+    root, work, good, evil, old, env = destination_repo
+    want = "goodrepo"
+    good = good.rename(work / want)
+    git(work, env, "config", "remote.origin.url", want)
+    legacy = work / ".git" / kind
+    legacy.mkdir()
+    content = (f"URL: {evil.as_uri()}\nPush: refs/heads/*:refs/heads/*\n"
+               if kind == "remotes" else f"{evil.as_uri()}\n")
+    (legacy / want).write_text(content)
+    result = destination_check(root, work, want, old, env)
+    # Bypass the gate only in this disposable probe: the legacy nickname redirects
+    # a real push to the evil file:// repo, which the gate must never authorise.
+    new = git(work, env, "rev-parse", "refs/heads/fix")
+    git(work, env, "push", want, f"{new}:refs/heads/fix")
+    assert git(work, env, "ls-remote", evil.as_uri(), "refs/heads/fix").split()[0] == new
+    assert git(work, env, "ls-remote", good.as_uri(), "refs/heads/fix").split()[0] == old
+    assert result.returncode == 1
+    assert result.stdout.startswith("DENY push_url_invalid")
+
+
+@pytest.mark.parametrize("dest", ["goodrepo", "host:repo", "../goodrepo"])
+def test_delta_schemeless_push_dest_cli_denies(destination_repo, dest):
+    root, work, good, evil, old, env = destination_repo
+    result = destination_check(root, work, good.as_uri(), old, env, dest=dest)
+    assert result.returncode == 1
+    assert result.stdout.startswith("DENY push_dest_invalid")
+
+
+@pytest.mark.parametrize("side", ["leading", "trailing"])
+def test_delta_edge_whitespace_push_urls_denies(destination_repo, side):
+    root, work, good, evil, old, env = destination_repo
+    clean = good.as_uri()
+    want = " " + clean if side == "leading" else clean + " "
+    # Keep --push-dest clean so its independent refusal cannot mask the URL check.
+    result = destination_check(root, work, want, old, env, dest=clean, head_url=clean)
+    assert result.returncode == 1
+    assert result.stdout.startswith("DENY push_url_invalid")
+
+
+@pytest.mark.parametrize("want", ["goodrepo", "host:repo", "../goodrepo"])
+def test_delta_schemeless_push_urls_refuse_go_add(tmp_path, want):
+    from go_ledger import mandate_repo
+
+    with pytest.raises(ValueError, match="^invalid push_urls URL$"):
+        mandate_repo({"push_urls": {REPO: want}})
+    kit = tmp_path / "kit"
+    shutil.copytree(BIN, kit / "bin", ignore=shutil.ignore_patterns("__pycache__"))
+    (kit / "mandates.json").write_text(json.dumps({"push_urls": {REPO: want}}))
+    result = subprocess.run([sys.executable, "-I", str(kit / "bin/go_ledger.py"), "add",
+                             "--writer-role", "conductor", "--id", "test-go", "--action", "factual_fix_reply",
+                             "--pr", "101", "--head", "a" * 40, "--policy-version", "test-1",
+                             "--granted-by", "conductor"],
+                            env=base_env(tmp_path, CAO_TERMINAL_ID="test-conductor"),
+                            capture_output=True, text=True)
+    assert result.returncode == 2
+    assert result.stdout.startswith("ERROR unreadable or ambiguous mandates repository")
+    assert not (tmp_path / "state/go.jsonl").exists()
+
+
 @pytest.mark.parametrize("char", [" ", "\t", "\n", "\x01", "\x7f", "\x85", "\u00a0"])
 @pytest.mark.parametrize("field", ["push_urls", "push_dest"])
 def test_delta_unsafe_destination_denies(tmp_path, char, field):
@@ -135,7 +198,7 @@ def test_delta_unsafe_destination_denies(tmp_path, char, field):
     unsafe = URL + char + "suffix"
     want = unsafe if field == "push_urls" else URL
     data = act(doc(push_urls={REPO: want}))
-    extra = dict(push_dest=unsafe, push_url=want, fetch_url=want,
+    extra = dict(push_dest=URL if field == "push_urls" else unsafe, push_url=want, fetch_url=want,
                  url_rewrites="", remote_config="")
     assert check_destination(data, REPO, extra) == (
         "push_url_invalid" if field == "push_urls" else "push_dest_invalid")
