@@ -1020,18 +1020,8 @@ class KimiCliProvider(BaseProvider):
             )
             # A draft in the composer does not make the previous turn busy.
             rows = kt.classify_lines(pane, kt.SpinnerSemantics.CODE)
-            composer_index = next(
-                (
-                    i
-                    for i in range(len(rows) - 1, -1, -1)
-                    if rows[i][2] is kt.KimiLineKind.READY_INPUT_FRAME
-                    and re.match(r"^\s*[│|]\s*>.*[│|]\s*$", rows[i][1])
-                ),
-                None,
-            )
-            ready = composer_index is not None and re.search(
-                NEW_TUI_STATUS_PATTERN, "\n".join(clean_rows)
-            )
+            composer_index = kt.find_composer_prompt(rows)
+            ready = re.search(NEW_TUI_STATUS_PATTERN, "\n".join(clean_rows))
             dialog = False
             for _, _, kind in reversed(rows):
                 if kind in (kt.KimiLineKind.USER_INPUT, kt.KimiLineKind.FINAL_BULLET):
@@ -1047,7 +1037,7 @@ class KimiCliProvider(BaseProvider):
             # every second even when the conversation above it is unchanged.
             transcript = "\n".join(raw for raw, _, _ in rows[:composer_index])
             with self._swarm_stream_lock:
-                if generation != self._swarm_generation or revision != self._swarm_revision:
+                if generation != self._swarm_generation:
                     return TerminalStatus.UNKNOWN
                 candidate = self._code_completion_candidate
                 if candidate is not None and candidate[:2] == (generation, transcript):
@@ -1065,9 +1055,14 @@ class KimiCliProvider(BaseProvider):
                 # boundary. Neither proves an otherwise-ready turn is running.
                 # Keep capture/lookup ValueErrors outside this catch.
                 with self._swarm_stream_lock:
-                    if generation != self._swarm_generation or revision != self._swarm_revision:
+                    if generation != self._swarm_generation:
                         return TerminalStatus.UNKNOWN
+                    # Retain the observation across footer writes. The next
+                    # poll rechecks the transcript and readiness, and callers
+                    # still discard a status verdict that overlaps new bytes.
                     self._code_completion_candidate = (generation, transcript, time.monotonic())
+                    if revision != self._swarm_revision:
+                        return TerminalStatus.UNKNOWN
                 return TerminalStatus.PROCESSING
         except Exception:
             with self._swarm_stream_lock:
@@ -3206,9 +3201,8 @@ class KimiCliProvider(BaseProvider):
         for i, line in enumerate(clean_lines):
             if not re.search(PROMPT_WITH_INPUT_PATTERN, line):
                 continue
-            if self._dialect is KimiDialect.CODE and (
-                row_kinds[i] is not kt.KimiLineKind.USER_INPUT
-                or not kt.is_user_input_start(raw_lines[i], line, kt.SpinnerSemantics.CODE)
+            if self._dialect is KimiDialect.CODE and not kt.is_user_input_start(
+                raw_lines[i], line, kt.SpinnerSemantics.CODE
             ):
                 continue
             prompt_input_idx = i

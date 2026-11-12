@@ -159,6 +159,9 @@ before reporting **COMPLETED**. Cursor-only redraws and changes to the custom
 status line below the composer do not restart the wait. A transcript change or
 new generation restarts it, and a live spinner, active dialog or non-ready pane
 cannot age into completion. The interval is a readiness check, not a task timeout.
+Each status verdict is still discarded if output arrives during detection.
+Continuous redraws faster than a status poll can therefore delay completion
+until a poll finishes between writes, even though the settle observation is retained.
 
 Completion and answer availability are separate: `get_output` with `mode=last`
 still reports an extraction error when there is no publishable final answer or

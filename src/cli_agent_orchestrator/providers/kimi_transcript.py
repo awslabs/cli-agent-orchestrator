@@ -1524,6 +1524,32 @@ def _confirm_ready_frames(
     ]
 
 
+def find_composer_prompt(rows: Sequence[Tuple[str, str, KimiLineKind]]) -> Optional[int]:
+    """Find the prompt in a confirmed composer, including multiline drafts.
+
+    The row classifier deliberately uses a small frame window to protect answer
+    tables. A draft can exceed that window, so follow the actual box borders
+    here without treating an unframed prompt-shaped table row as ready.
+    """
+    for bottom in range(len(rows) - 1, -1, -1):
+        if rows[bottom][2] is not KimiLineKind.READY_INPUT_FRAME or not _FRAME_EDGE_CLOSE_RE.match(
+            rows[bottom][1]
+        ):
+            continue
+        top = bottom - 1
+        while top >= 0 and _FRAME_BOX_ROW_RE.match(rows[top][1]):
+            top -= 1
+        if (
+            top >= 0
+            and top + 1 < bottom
+            and rows[top][2] is KimiLineKind.READY_INPUT_FRAME
+            and _FRAME_EDGE_OPEN_RE.match(rows[top][1])
+            and COMPOSER_PROMPT_RE.match(rows[top + 1][1])
+        ):
+            return top + 1
+    return None
+
+
 def is_response_marker_line(clean_line: str) -> bool:
     """True when ``clean_line`` starts a response/thinking bullet *with a payload*.
 

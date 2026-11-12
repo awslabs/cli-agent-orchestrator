@@ -373,19 +373,23 @@ def test_completion_settle_restarts_when_evidence_changes(provider, completion_p
     assert ready_status(provider) is TerminalStatus.COMPLETED
 
 
-@pytest.mark.parametrize("changes_text", [False, True], ids=["cursor-only", "clock"])
-def test_answerless_completion_ignores_idle_status_line(provider, completion_probe, changes_text):
+@pytest.mark.parametrize("change", ["cursor-only", "clock", "draft"])
+def test_answerless_completion_ignores_idle_status_line(provider, completion_probe, change):
     now, backend = completion_probe
     # Kimi puts custom status text between the composer and the context row.
     assert ready_status(provider) is TerminalStatus.PROCESSING
     for second in range(1, 4):
         now.return_value += 1
         redraw = "\x1b[6G\x1b[?25l"
-        if changes_text:
+        if change == "clock":
             clock_row = f" \x1b[38;5;253m{second}\x1b[39m"
             redraw = f"\x1b[2B\r\x1b[2K{clock_row}\x1b[2A{redraw}"
             backend.get_history.return_value = (
                 ECHO + TOOL + FOOTER.replace("context:", f"{clock_row}\ncontext:")
+            )
+        elif change == "draft":
+            backend.get_history.return_value = (
+                ECHO + TOOL + FOOTER.replace(" >          ", f" > draft {second}  ")
             )
         provider.record_status_chunk(redraw, 1)
         expected = TerminalStatus.PROCESSING if second < 2 else TerminalStatus.COMPLETED
@@ -418,19 +422,58 @@ def test_final_answer_arriving_during_settle_completes_immediately(provider, com
 
 
 @pytest.mark.parametrize("final_answer", [False, True])
-def test_draft_in_composer_does_not_strand_completed_turn(provider, completion_probe, final_answer):
+@pytest.mark.parametrize("draft_rows", [1, 2, 3, 8])
+def test_draft_in_composer_does_not_strand_completed_turn(
+    provider, completion_probe, final_answer, draft_rows
+):
     now, backend = completion_probe
     backend.get_history.return_value = (
         ECHO
         + TOOL
         + (ANSWER if final_answer else "")
-        + FOOTER.replace("│ >          │", "│ > next task│")
+        + FOOTER.replace(" >          ", " > next task ").replace(
+            " \x1b[38;5;240m╰",
+            " \x1b[38;5;240m│\x1b[39m draft row \x1b[38;5;240m│\x1b[39m\n" * (draft_rows - 1)
+            + " \x1b[38;5;240m╰",
+        )
     )
     assert ready_status(provider) is (
         TerminalStatus.COMPLETED if final_answer else TerminalStatus.PROCESSING
     )
     now.return_value += 2.1
     assert ready_status(provider) is TerminalStatus.COMPLETED
+
+
+def test_frameless_table_is_not_a_ready_composer(provider, completion_probe):
+    now, backend = completion_probe
+    backend.get_history.return_value = ECHO + ANSWER + "| > | Redirect stdout |\ncontext: 5%\n"
+    assert ready_status(provider) is TerminalStatus.PROCESSING
+    now.return_value += 600
+    assert ready_status(provider) is TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize("during", ["visible_only", "full_history"])
+def test_redraw_during_capture_keeps_answerless_candidate(provider, completion_probe, during):
+    now, backend = completion_probe
+    capture = ECHO + TOOL + FOOTER
+
+    def concurrent_capture(*args, **kwargs):
+        if kwargs.get(during):
+            provider.record_status_chunk("\x1b[6G\x1b[?25l", 1)
+        return capture
+
+    backend.get_history.side_effect = concurrent_capture
+    assert ready_status(provider) is TerminalStatus.UNKNOWN
+    now.return_value += 2.1
+    if during == "visible_only":
+        # A cached settle still cannot certify a poll overlapping new bytes.
+        assert ready_status(provider) is TerminalStatus.UNKNOWN
+    backend.get_history.side_effect = None
+    assert ready_status(provider) is TerminalStatus.COMPLETED
+    assert (
+        sum(bool(call.kwargs.get("full_history")) for call in backend.get_history.call_args_list)
+        == 1
+    )
 
 
 def test_capture_value_error_is_not_answerless_completion(provider, completion_probe):
@@ -512,6 +555,8 @@ def test_evidence_changed_during_capture_cannot_certify_completion(
     assert ready_status(provider) is TerminalStatus.UNKNOWN
     now.return_value += 600
     backend.get_history.side_effect = None
+    # Fresh output must also be present in the next visible capture.
+    backend.get_history.return_value = ECHO + TOOL.replace("example.txt", "other.txt") + FOOTER
     assert ready_status(provider) is TerminalStatus.PROCESSING
     now.return_value += 2.1
     assert ready_status(provider) is TerminalStatus.COMPLETED
