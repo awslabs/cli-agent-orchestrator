@@ -1,0 +1,41 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeTheModelsYouUse",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/au.anthropic.claude-sonnet-5-5",
+        "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/au.anthropic.claude-opus-5-5",
+        "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/au.anthropic.claude-haiku-5-5",
+        "arn:aws:bedrock:ap-southeast-2::foundation-model/anthropic.claude-*",
+        "arn:aws:bedrock:ap-southeast-4::foundation-model/anthropic.claude-*"
+      ]
+    },
+    {
+      "Sid": "WriteBackupsOnly",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::<backup-bucket>/cao-box/*"
+    },
+    {
+      "Sid": "ReadBackupsForRestore",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::<backup-bucket>/cao-box/*"
+    },
+    {
+      "Sid": "EncryptBackups",
+      "Effect": "Allow",
+      "Action": [
+        "kms:GenerateDataKey",
+        "kms:Decrypt"
+      ],
+      "Resource": "arn:aws:kms:ap-southeast-2:<account-id>:key/<backup-key-id>"
+    }
+  ]
+}

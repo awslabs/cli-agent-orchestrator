@@ -1,0 +1,35 @@
+# herdr server for CAO. bootstrap.sh fills in @BOX_USER@ and @BOX_HOME@ and
+# installs this as /etc/systemd/system/herdr-cao.service.
+#
+# The environment is deliberately tiny: every pane inherits the herdr
+# server's environment, so only HOME, USER, PATH, LANG and TERM are set here,
+# and herdr-start.sh starts herdr under `env -i` with just those five. No
+# EnvironmentFile, no tokens. Agent CLIs read their own config files.
+#
+# herdr-start.sh reads the session name from /etc/cao-box/box.env, moves the
+# saved layout aside (herdr-clean-layout.sh), then runs
+# `herdr --session cao-<instance-id> server`.
+#
+# Never make this unit PartOf= cao-server: restarting CAO must not kill panes.
+
+[Unit]
+Description=herdr server for CAO (session from /etc/cao-box/box.env)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@BOX_USER@
+Group=@BOX_USER@
+WorkingDirectory=@BOX_HOME@
+Environment=HOME=@BOX_HOME@
+Environment=USER=@BOX_USER@
+Environment=PATH=@BOX_HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=TERM=xterm-256color
+ExecStart=/usr/local/lib/cao-box/herdr-start.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,36 @@
+# OPTIONAL: a Telegram relay for the box's own (second) bot. Not installed or
+# enabled by bootstrap.sh. Pick a relay (for example herdr-remote, see
+# telegram/README.md), install it as the box user, then:
+#
+#   1. Replace the placeholders:
+#        @BOX_USER@, @BOX_HOME@   as in the other units
+#        RELAY_COMMAND            the relay's start command, absolute path
+#                                 first (for example @BOX_HOME@/.local/bin/<relay> ...)
+#   2. sudo cp cao-telegram-relay.service.example /etc/systemd/system/cao-telegram-relay.service
+#   3. sudo systemctl daemon-reload && sudo systemctl enable --now cao-telegram-relay.service
+#
+# This is the ONLY unit that reads the bot token. The token file is
+# @BOX_HOME@/.config/cao-box/telegram.env, mode 0600, owned by @BOX_USER@,
+# and holds one line, TELEGRAM_BOT_TOKEN=<token>. Never put the token in
+# box.env, the herdr unit or the cao-server unit: agent panes would see it.
+
+[Unit]
+Description=Telegram relay for the CAO box (second bot)
+Wants=herdr-cao.service network-online.target
+After=herdr-cao.service network-online.target
+
+[Service]
+Type=simple
+User=@BOX_USER@
+Group=@BOX_USER@
+WorkingDirectory=@BOX_HOME@
+EnvironmentFile=/etc/cao-box/box.env
+EnvironmentFile=@BOX_HOME@/.config/cao-box/telegram.env
+Environment=HOME=@BOX_HOME@
+Environment=PATH=@BOX_HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=RELAY_COMMAND
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
