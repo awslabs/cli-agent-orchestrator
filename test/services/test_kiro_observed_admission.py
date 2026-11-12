@@ -96,12 +96,34 @@ def test_observed_requires_same_major_predecessor(observed, monkeypatch, rows):
     assert "same major" in str(err.value)
 
 
-def test_observed_pending_schema_needs_allow_unverified(monkeypatch):
+@pytest.mark.parametrize("version, borrowed", [("3.2.0", "3.1.0"), ("2.36.5", "2.36.0")])
+def test_observed_pending_schema_needs_allow_unverified(monkeypatch, version, borrowed):
     monkeypatch.setattr(settings_service, "_load", lambda: {"kiro": {"v3_admission": "observed"}})
     with pytest.raises(KiroCapabilityError) as err:
-        probe("3.2.0")
+        probe(version)
     assert err.value.kind == "kiro_v3_unverified_version"
-    assert "pending" in str(err.value)
+    assert str(err.value) == (
+        f"kiro_v3_unverified_version: kiro-cli {version} would borrow kiro-cli "
+        f"{borrowed}'s schema, which is pending operator verification, so CAO does "
+        "not launch v3 on it. Use a supported verified kiro-cli version, or enable "
+        "kiro.v3_allow_unverified_versions to admit this borrowed schema."
+    )
+
+
+@pytest.mark.parametrize("observed_mode", [False, True])
+def test_listed_pending_refusal_text_unchanged(observed_mode):
+    gate = (
+        kiro_v3_schema.observed_kiro_v3_entry
+        if observed_mode
+        else kiro_v3_schema.require_launchable_kiro_v3_version
+    )
+    with pytest.raises(kiro_v3_schema.KiroV3UnverifiedVersionError) as err:
+        gate("3.1.0")
+    assert str(err.value) == (
+        "kiro_v3_unverified_version: kiro-cli 3.1.0's v3 engine schema was derived "
+        "statically and is pending operator verification, so CAO does not launch "
+        "v3 on it. Retry with engine 'v2'."
+    )
 
 
 def test_observed_refuses_newest_pending_even_with_older_verified_schema(monkeypatch):

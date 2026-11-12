@@ -305,9 +305,10 @@ workspace, `/mcp list` and `/tools` before task input. Installed-agent and other
 non-helper v3 launches remain strict even with this setting.
 
 Strict admission remains the default. Only the exact JSON string `"observed"`
-in the server's `settings.json` enables observed admission; there is no environment
-variable or CLI flag for it. Other strings, types, or an absent/unreadable setting
-retain strict admission.
+in the server's `settings.json` enables observed admission. There is no environment
+variable or launch flag; set it in `settings.json` or with
+`cao config set kiro.v3_admission observed`. Other strings, types, or an
+absent/unreadable setting retain strict admission.
 
 ```json
 { "kiro": { "v3_admission": "observed" } }
