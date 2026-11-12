@@ -33,9 +33,12 @@ class TestAssignFlags:
         assert create.call_args.kwargs["expect_callback"] is True
         assert "send results back" in create.call_args.kwargs["initial_message"]
 
+    # Patch both names: code that imported load_agent_profile into
+    # utils.orchestration never sees the agent_profiles patch alone.
+    @patch(f"{ORCH}.load_agent_profile", return_value=_profile("claude_code", {}), create=True)
     @patch(f"{AGENT_PROFILES}.load_agent_profile", return_value=_profile("claude_code", {}))
     @patch(f"{ORCH}._create_terminal", return_value=("w1", "claude_code"))
-    def test_profile_without_cao_server_still_gets_suffix(self, create, _load):
+    def test_profile_without_cao_server_still_gets_suffix(self, create, _load, _orch_load):
         """A provider can load cao-mcp-server from the user's own MCP config,
         so a profile that does not list it says nothing about the worker's tools.
         """
