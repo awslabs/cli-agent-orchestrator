@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """Build CAO's own Agent Plugins packages, and guard them against drift.
 
-CAO ships **two** packages, split by audience rather than cosmetically:
+CAO ships **four** packages, split by audience rather than cosmetically:
 
-===================  ==========================================================
-``cao``              **Operator** — someone driving CAO from a foreign
-                     Agent-Plugins-compatible client. "Install profiles, launch
-                     sessions, message a running fleet."
-``cao-contributor``  **Contributor** — someone extending CAO itself. Authoring a
-                     provider, authoring an event plugin, working on the repo
-                     itself.
-===================  ==========================================================
+==============================  ===============================================
+``cao``                         **Operator** — someone driving CAO from a
+                                foreign Agent-Plugins-compatible client.
+                                "Install profiles, launch sessions, message a
+                                running fleet."
+``cao-contributor``             **Contributor** — someone extending CAO itself.
+                                Authoring a provider, authoring an event plugin,
+                                working on the repo itself.
+``cao-agent-plugin-lifecycle``  **Package author** — someone authoring or
+                                auditing an Agent Plugins 1.0.0 package.
+``cao-ag-ui-builder``           **AG-UI client builder** — someone building a UI
+                                or client on CAO's AG-UI surface. Its name is
+                                provisional, like ``cao-contributor``'s.
+==============================  ===============================================
 
 Shipping repo-development skills inside the operator package would enlarge the
 prompt surface of every foreign agent that installs it with instructions it will
@@ -211,7 +217,34 @@ LIFECYCLE = PackageConfig(
     ),
 )
 
-PACKAGES: List[PackageConfig] = [OPERATOR, CONTRIBUTOR, LIFECYCLE]
+# The name is provisional (proposed in #1116's design, not final). A rename is
+# this one ``name`` edit plus `make agent-plugin-keep-pin`.
+AG_UI_BUILDER = PackageConfig(
+    name="cao-ag-ui-builder",
+    description=(
+        "Emit-side AG-UI vocabulary for CLI Agent Orchestrator: the six allow-listed "
+        "generative-UI components (approval_card, choice_prompt, diff_summary, progress, "
+        "metric, agent_card) an agent sends with emit_ui, carried as CUSTOM "
+        "`cao.generative_ui` frames. Describes CAO `main`; no released version carries "
+        "this yet (#1198). Needs a local cao-server with the [agui] extra. No mcp.json."
+    ),
+    keywords=["cao", "ag-ui", "agui", "generative-ui", "approvals"],
+    skills=[
+        # Emit-side: the closed component vocabulary and the CUSTOM frame it rides
+        # in, which is also exactly what an AG-UI client built on CAO must render.
+        # The operator package leaves it for "adjacent features with their own
+        # consumers"; this package is that consumer.
+        "agui-author",
+    ],
+    excluded_note=(
+        "Excluded: every operator skill (in the `cao` package), every contributor skill "
+        "(in `cao-contributor`) and the Agent Plugin lifecycle skills (in "
+        "`cao-agent-plugin-lifecycle`); `cao-mcp-apps` and `mcp-apps-builder` (MCP Apps is "
+        "a different UI surface with its own consumers)."
+    ),
+)
+
+PACKAGES: List[PackageConfig] = [OPERATOR, CONTRIBUTOR, LIFECYCLE, AG_UI_BUILDER]
 
 
 class BuildError(RuntimeError):

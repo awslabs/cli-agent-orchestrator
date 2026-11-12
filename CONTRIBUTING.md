@@ -113,7 +113,11 @@ A gitleaks secret scan runs on every PR and weekly over full history (see
 [SECURITY.md](SECURITY.md#secret-scanning)); you can run it locally with
 `scripts/security-scan.sh gitleaks`, or enable the optional pre-commit hook
 ([`.pre-commit-config.yaml`](.pre-commit-config.yaml)) with `pre-commit install`
-to catch secrets before they enter a commit. If a secret ever lands, follow the
+to catch secrets before they enter a commit. The same file installs two CAO
+Dojo trace hooks: the trace leak rule at commit time and the offline trace
+replay at push time (see
+[`examples/ag-ui/cao-dojo`](examples/ag-ui/cao-dojo/README.md#recorded-trace-and-drift-checks)).
+If a secret ever lands, follow the
 [Leak Response & Git-History Scrub Runbook](docs/security.md)
 — **rotate/revoke first**, rewrite history only if warranted by the runbook's
 severity triage table.

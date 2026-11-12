@@ -189,7 +189,9 @@ Operator-only, read straight from `settings.json` (no environment override). Pro
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `v3_allow_unverified_versions` | `false` | Only JSON `true` lets a Kiro v3 launch run on a kiro-cli version still *pending operator verification*, so an operator can run the live checklist on it. It admits nothing else: an unlisted version still refuses, and every other v3 check still applies. Each admitted launch logs a warning and carries a `launch_notes` entry. Keep it off otherwise. |
+| `v3_allow_unverified_versions` | `false` | Only JSON `true` lets a Kiro v3 launch run on a kiro-cli version still *pending operator verification*, so an operator can run the live checklist on it. By itself it never admits an unlisted version, and every other v3 check still applies. Each admitted launch logs a warning and carries a `launch_notes` entry. Keep it off otherwise. |
+
+Only `kiro.v3_admission: "observed"` enables [observed admission](kiro-cli.md#observed-admission-operator-only) for eligible unlisted versions on the sealed-home helper path; installed-agent launches and every other setting value keep strict admission.
 
 See [Kiro v3 (preview)](kiro-cli.md#pending-versions-operator-only).
 
