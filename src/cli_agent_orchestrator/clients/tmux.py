@@ -1333,9 +1333,12 @@ class TmuxClient:
     # Applied to BOTH inherited env and operator-supplied --env vars so a
     # forwarded ``CLAUDE_CODE_*`` cannot reintroduce nesting.
     _BLOCKED_ENV_PREFIXES = ("CLAUDE", "CODEX_", "__MISE_")
-    # Exact names never forwarded: the runtime-channel token (#745) authenticates
-    # an execution runtime to cao-server and is no business of an agent pane.
-    _BLOCKED_ENV_NAMES = frozenset({"CAO_RUNTIME_TOKEN", "CAO_RUNTIME_TOKEN_FILE"})
+    # Exact names never forwarded, whatever the prefix rules say: the runner
+    # channel's secrets (#745). The token, or the path of the file holding it,
+    # would let an agent register itself as a runner; the TLS key is the hub's.
+    _BLOCKED_ENV_NAMES = frozenset(
+        {"CAO_RUNNER_TOKEN", "CAO_RUNNER_TOKEN_FILE", "CAO_RUNNER_TLS_KEY"}
+    )
     _BLOCKED_PREFIX_ALLOWLIST = frozenset(
         {
             "CLAUDE_CODE_USE_BEDROCK",
@@ -1375,12 +1378,9 @@ class TmuxClient:
         applies) and the loader/shell/interpreter startup variables from
         ``utils.forwarded_env`` (``LD_PRELOAD``, ``BASH_ENV``, ``NODE_OPTIONS``,
         ...), whose value would run as the operator when the pane starts.
-        The second class has no allowlist. ``_BLOCKED_ENV_NAMES`` (the
-        runtime-channel token, #745) is blocked by exact name.
+        The second class has no allowlist.
         """
-        if key in cls._BLOCKED_ENV_NAMES:
-            return True
-        if is_hijack_env_key(key):
+        if is_hijack_env_key(key) or key in cls._BLOCKED_ENV_NAMES:
             return True
         if key in cls._BLOCKED_PREFIX_ALLOWLIST:
             return False

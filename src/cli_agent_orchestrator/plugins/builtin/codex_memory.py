@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+from cli_agent_orchestrator.utils.execution_host import runs_terminals_elsewhere
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.backends.base import TerminalBackend
@@ -107,6 +108,13 @@ class CodexMemoryPlugin(CaoPlugin):
 
         if event.provider != "codex":
             return
+        if runs_terminals_elsewhere():
+            # The remote backend (#745): the pane and its working directory are
+            # on a runner, not on this machine, so the file this plugin writes
+            # would land in the server's filesystem (or nowhere). Skipped; the
+            # memory context still reaches the agent through its first input.
+            logger.debug("codex_memory: %s runs on a runner; not writing here", event.terminal_id)
+            return
 
         try:
             working_directory = self._resolve_working_directory(event)
@@ -178,10 +186,6 @@ class CodexMemoryPlugin(CaoPlugin):
 
         metadata = get_terminal_metadata(event.terminal_id)
         if metadata is None:
-            return None
-        if metadata.get("runtime_id"):
-            # Its pane and working directory are in an execution runtime (#745),
-            # not on this machine.
             return None
 
         session_name = metadata.get("tmux_session") or event.session_id

@@ -51,6 +51,7 @@ from cli_agent_orchestrator.services.agui_stream import (
     _extract_ui_intent,
     to_agui_event,
 )
+from cli_agent_orchestrator.utils.event import snapshot_off_loop
 
 logger = logging.getLogger(__name__)
 
@@ -1010,7 +1011,7 @@ async def ambient_stream(
         # snapshot (and deltas) instead of tearing the run down.
         prev: Optional[Dict[str, Any]] = None
         try:
-            prev = fleet_snapshot()
+            prev = await snapshot_off_loop(fleet_snapshot)
         except Exception:
             logger.warning("ambient_run: initial STATE_SNAPSHOT failed", exc_info=True)
         if prev is not None:
@@ -1054,7 +1055,7 @@ async def ambient_stream(
                 for frame in emit(run.feed(record)):
                     yield frame
                 try:
-                    curr = fleet_snapshot()
+                    curr = await snapshot_off_loop(fleet_snapshot)
                     if prev is None:
                         prev = curr
                         for frame in emit(run.snapshot(curr)):

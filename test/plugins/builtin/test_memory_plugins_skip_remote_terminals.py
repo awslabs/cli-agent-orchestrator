@@ -1,7 +1,7 @@
 """The memory plugins leave a remote terminal alone on the central server (#745).
 
-A terminal that runs in an execution runtime has its pane, and its working
-directory, on another machine. The central server dispatches
+Under the remote terminal backend a terminal runs on a cao-runner: its pane,
+and its working directory, are on another machine. The central server dispatches
 ``post_create_terminal`` for it, so the plugins must neither ask the server's own
 tmux for that pane nor write into the server's filesystem.
 """
@@ -33,7 +33,6 @@ async def test_a_remote_terminal_is_skipped_without_touching_this_machine(
             "id": terminal_id,
             "tmux_session": "cao-beef",
             "tmux_window": "developer-beef",
-            "runtime_id": "cao-runtime-0",
         },
     )
     touched = []
@@ -46,6 +45,7 @@ async def test_a_remote_terminal_is_skipped_without_touching_this_machine(
         return touch
 
     # The hook logs and swallows errors, so each touch is recorded, not raised.
+    monkeypatch.setattr(module, "runs_terminals_elsewhere", lambda: True)
     monkeypatch.setattr(module, "get_backend", sentinel("the server's tmux"))
     monkeypatch.setattr(module, "remote_memory_url", lambda: None)
     monkeypatch.setattr(module, "MemoryService", sentinel("the server's memory store"))
@@ -57,3 +57,20 @@ async def test_a_remote_terminal_is_skipped_without_touching_this_machine(
     )
     await plugin_class().on_post_create_terminal(event)
     assert touched == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module_name,class_name,provider", PLUGINS)
+async def test_a_local_terminal_is_still_written(monkeypatch, module_name, class_name, provider):
+    module = importlib.import_module(f"cli_agent_orchestrator.plugins.builtin.{module_name}")
+    plugin_class = getattr(module, class_name)
+    monkeypatch.setattr(module, "runs_terminals_elsewhere", lambda: False)
+    resolved = []
+    monkeypatch.setattr(
+        plugin_class, "_resolve_working_directory", lambda self, event: resolved.append(1)
+    )
+    event = PostCreateTerminalEvent(
+        terminal_id="beef0001", agent_name="developer", provider=provider, session_id="cao-beef"
+    )
+    await plugin_class().on_post_create_terminal(event)
+    assert resolved == [1]  # the local path still runs

@@ -1,0 +1,24 @@
+# kind cluster for the remote-runner example: 1 control plane + 2 workers, so
+# the two runners (required anti-affinity) land on different nodes.
+# Replace <host-workspace-dir> with an absolute host path; every node mounts it
+# at /cao-workspace, which workspace-hostpath.yaml uses as the shared workspace.
+#
+# Keep kind's default CNI (kindnet): it enforces NetworkPolicy. Keep the node
+# names kind's defaults too: kindnet matches pods to its node by the node
+# container's hostname, and on a renamed node it silently enforces nothing.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: cao-remote
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: <host-workspace-dir>
+        containerPath: /cao-workspace
+  - role: worker
+    extraMounts:
+      - hostPath: <host-workspace-dir>
+        containerPath: /cao-workspace
+  - role: worker
+    extraMounts:
+      - hostPath: <host-workspace-dir>
+        containerPath: /cao-workspace

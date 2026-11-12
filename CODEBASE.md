@@ -32,9 +32,9 @@ to use.
 | `src/cli_agent_orchestrator/ops_mcp_server/` | External operations MCP tools |
 | `src/cli_agent_orchestrator/services/` | Session, terminal, inbox, workflow, memory, event, configuration, and plugin services |
 | `src/cli_agent_orchestrator/decisions/` | Launch-decision platform: points, policy, settings, deciders, records, shadow runner, telemetry, and operator access ([docs](docs/decisions.md)) |
-| `src/cli_agent_orchestrator/backends/` | Terminal-backend abstraction and tmux/herdr implementations |
+| `src/cli_agent_orchestrator/backends/` | Terminal-backend abstraction and tmux/herdr/remote implementations |
+| `src/cli_agent_orchestrator/runner/` | The remote backend's runner hub (in cao-server) and the execution-only `cao-runner` ([docs](docs/remote-runners.md)) |
 | `src/cli_agent_orchestrator/clients/` | SQLite and tmux clients used by services and backends |
-| `src/cli_agent_orchestrator/runtime_channel/` | Execution-runtime channel: the server's `/runtime/channel` endpoint and runtime registry, and the `cao-bridge` process ([execution runtimes](docs/execution-runtimes.md)) |
 | `src/cli_agent_orchestrator/providers/` | Provider adapters for interactive agent CLIs |
 | `src/cli_agent_orchestrator/models/` | Pydantic domain and API models |
 | `src/cli_agent_orchestrator/schemas/` | Shipped schemas, including agent-profile validation |
@@ -87,7 +87,9 @@ not a public provider recommendation.
 Terminal mechanics are abstracted by `backends/base.py` and selected through
 `backends/factory.py` and `backends/registry.py`. The tmux implementation uses
 `clients/tmux.py`; the herdr implementation integrates its own terminal
-backend. Provider logic should not assume a concrete backend when the base
+backend. The remote implementation (`backends/remote_backend.py`) forwards
+every operation to a `cao-runner` connected to the hub in `runner/hub.py`;
+the runner (`runner/agent.py`) drives tmux on its own host. Provider logic should not assume a concrete backend when the base
 contract supplies the operation.
 
 ## Persistence and event flow

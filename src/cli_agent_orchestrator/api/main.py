@@ -12,6 +12,7 @@ import signal
 import stat
 import struct
 import subprocess
+import sys
 import termios
 import time
 import weakref
@@ -64,6 +65,7 @@ from pydantic import (
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.backends.remote_backend import RemoteBackend
 from cli_agent_orchestrator.cli.commands.agent_plugin import UNTRUSTED_CONTENT_WARNING
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
@@ -137,7 +139,6 @@ from cli_agent_orchestrator.models.memory import (
 )
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
-    LocalExecutionDisabledError,
     Terminal,
     TerminalId,
     TerminalInputBlockedReason,
@@ -151,9 +152,10 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
 )
 from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
 from cli_agent_orchestrator.providers.kiro_v3_schema import KiroV3Refusal
-from cli_agent_orchestrator.runtime_channel.registry import RemoteRuntimeError
-from cli_agent_orchestrator.runtime_channel.server import router as runtime_channel_router
-from cli_agent_orchestrator.runtime_channel.token import runtime_token
+from cli_agent_orchestrator.runner.protocol import RunnerError
+from cli_agent_orchestrator.runner.token import TOKEN_ENV as RUNNER_TOKEN_ENV
+from cli_agent_orchestrator.runner.token import TOKEN_FILE_ENV as RUNNER_TOKEN_FILE_ENV
+from cli_agent_orchestrator.runner.token import runner_hub_ssl_context, runner_token
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -216,6 +218,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     IdempotentCreateFailed,
     OutputMode,
     TerminalInputBlockedError,
+    UnsupportedProviderError,
     _notify_elastic_terminal_ended,
 )
 from cli_agent_orchestrator.services.workflow_journal import (
@@ -227,6 +230,12 @@ from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils import delegation, server_lock
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
+from cli_agent_orchestrator.utils.event import snapshot_off_loop
+from cli_agent_orchestrator.utils.execution_host import (
+    ServerHostCodeRefused,
+    refuse_server_host_code,
+    remote_auth_refusal,
+)
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
@@ -1670,13 +1679,27 @@ def _sweep_workflow_runs_at_startup() -> None:
         logger.warning("workflow retention sweep failed at startup: %s", e)
 
 
+def _runner_token_refusal() -> Optional[str]:
+    """Why the remote backend cannot start without a runner token, or None."""
+    if isinstance(get_backend(), RemoteBackend) and runner_token() is None:
+        return (
+            "refusing to start: terminal.backend=remote requires a runner token; set "
+            f"{RUNNER_TOKEN_FILE_ENV} (preferred) or {RUNNER_TOKEN_ENV}"
+        )
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
-    # Read the runtime-channel token (#745) first, so it leaves this process's
-    # environment before anything below can start a child process: plugin
-    # setup, a tmux server, and so any agent pane.
-    runtime_token()
+    # #745 Phase 1: the remote backend cannot serve an authenticated API yet (see
+    # remote_auth_refusal). Checked first, before logging is set up (which creates
+    # files), the signal hooks, the server lock, the runner token, the database or
+    # any listener, so a refused start writes nothing. Reported on stderr.
+    auth_refusal = remote_auth_refusal()
+    if auth_refusal is not None:
+        print(auth_refusal, file=sys.stderr, flush=True)
+        raise SystemExit(1)
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     # Scrub credential query params (``?access_token=`` / ``?ticket=``) from
@@ -1706,6 +1729,15 @@ async def lifespan(app: FastAPI):
         logger.error("refusing to start: %s", exc.message().splitlines()[0])
         server_lock.refuse(exc)
     logger.info("Holding server lock %s (pid %d)", server_lock_handle.path, os.getpid())
+    # #745: the runner-channel token leaves this process's environment before
+    # anything it starts can inherit it (see runner.token).
+    # Without one the hub cannot start; say what to set rather than fail later
+    # with a traceback. An unreadable token file was already logged by name.
+    token_refusal = _runner_token_refusal()
+    if token_refusal is not None:
+        logger.error(token_refusal)
+        print(token_refusal, file=sys.stderr, flush=True)
+        raise SystemExit(1)
     # issue #583 Bolt 3 (``approval-enforcement-default``): report the approval gate's RESOLVED state
     # AND the mechanism that decided it. A malformed settings file fails closed, so the source tells
     # the operator why enforcement remains ON and how to recover. Logs only the boolean and a member
@@ -1888,6 +1920,33 @@ async def lifespan(app: FastAPI):
         herdr_inbox_task = asyncio.create_task(svc.start())
         logger.info("Herdr inbox service started")
 
+    # The remote backend's runner hub: a listener on its own thread and port
+    # that execution-only runners dial in to. Started only for that backend, so
+    # tmux/herdr servers open no extra socket.
+    runner_hub = None
+    if isinstance(backend, RemoteBackend):
+        from cli_agent_orchestrator.runner.hub import RunnerHub
+
+        runner_hub = RunnerHub(
+            token=runner_token() or "",
+            host=os.environ.get("CAO_RUNNER_BIND_HOST", "127.0.0.1"),
+            port=int(os.environ.get("CAO_RUNNER_PORT", "9891")),
+            call_timeout=float(os.environ.get("CAO_RUNNER_CALL_TIMEOUT", "30")),
+            placement_timeout=float(os.environ.get("CAO_RUNNER_PLACEMENT_TIMEOUT", "60")),
+            expiry=float(os.environ.get("CAO_RUNNER_EXPIRY", "600")),
+            reserved_sessions=[
+                name.strip()
+                for name in os.environ.get("CAO_RUNNER_RESERVED_SESSIONS", "").split(",")
+                if name.strip()
+            ],
+            state_path=CAO_HOME_DIR / "runner-hub.json",
+            ssl_context=runner_hub_ssl_context(),
+        )
+        # Routes are restored from the registry before the first runner can
+        # connect, so its report is reconciled against them, not raced.
+        backend.attach_hub(runner_hub)
+        runner_hub.start()
+
     yield
 
     # AG-UI ambient streams: backstop for launches whose shutdown reaches the
@@ -1895,6 +1954,9 @@ async def lifespan(app: FastAPI):
     from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run
 
     _ambient_run.request_stop(sticky=False)
+    if runner_hub is not None:
+        runner_hub.stop()
+        logger.info("Runner hub stopped")
 
     # Stop herdr inbox service on shutdown
     if herdr_inbox_task is not None:
@@ -2025,8 +2087,6 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan,
 )
-# Execution runtimes (#745): WS /runtime/channel and the /runtimes routes.
-app.include_router(runtime_channel_router)
 
 # Methods whose request could change server state. The Origin check only
 # guards these — GET/HEAD/OPTIONS stay open (reads leak nothing stateful, and
@@ -2095,6 +2155,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(ServerHostCodeRefused)
+async def _server_host_code_refused(request: Request, exc: ServerHostCodeRefused) -> JSONResponse:
+    """409: under the remote backend, user code would run on this host (#745)."""
+    return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
 
 
 @app.exception_handler(RequestValidationError)
@@ -2176,7 +2242,12 @@ async def health_check():
     from cli_agent_orchestrator.services.settings_service import get_server_settings
 
     backend = get_backend()
-    backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
+    if isinstance(backend, HerdrBackend):
+        backend_name = "herdr"
+    elif isinstance(backend, RemoteBackend):
+        backend_name = "remote"
+    else:
+        backend_name = "tmux"
 
     # The installed package version, so a client (the web UI's server card) can
     # show what it is talking to without a shell. Same source as `cao --version`.
@@ -2743,7 +2814,7 @@ async def agui_stream(
             # RFC-6902 STATE_DELTA patches after each fleet event.
             prev_snapshot: Optional[Dict] = None
             try:
-                prev_snapshot = _fleet_snapshot()
+                prev_snapshot = await snapshot_off_loop(_fleet_snapshot)
                 agui_type, data = state_snapshot_frame(prev_snapshot)
                 yield _sse(None, agui_type, data)
             except Exception:
@@ -2783,7 +2854,7 @@ async def agui_stream(
                 # natural follow-up for high event rates (this is the opt-in L2
                 # dashboard surface, not the orchestration hot path).
                 try:
-                    curr = _fleet_snapshot()
+                    curr = await snapshot_off_loop(_fleet_snapshot)
                     if prev_snapshot is not None:
                         delta = state_delta_frame(prev_snapshot, curr)
                         if delta is not None:
@@ -3360,6 +3431,22 @@ async def claim_ephemeral_agent_endpoint(
         )
     except ephemeral_service.EphemeralPolicyError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
+
+
+@app.get("/runners")
+async def list_runners_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """Connected cao-runners and what they host (remote terminal backend only).
+
+    Read-only operator view: an orchestrator or readiness check uses it to
+    wait for a runner that claims a session before creating that session.
+    Other backends have no runners and answer 404.
+    """
+    backend = get_backend()
+    if not isinstance(backend, RemoteBackend):
+        raise HTTPException(status_code=404, detail="terminal backend is not 'remote'")
+    return backend.hub.describe()
 
 
 @app.get("/agents/profiles")
@@ -4429,6 +4516,21 @@ def _set_launch_note(response: Response, plan: LaunchPlan | None) -> None:
             logger.warning("Decision response header could not be built", exc_info=True)
 
 
+def _raise_for_wrapped_runner_error(exc: BaseException) -> None:
+    """Answer with a runner's status when ``exc`` is, or was caused by, its failure (#745).
+
+    A service that wraps a backend error (``raise RuntimeError(...) from e``,
+    as session teardown does) would otherwise turn "runner unavailable" or
+    "outcome unknown" into a generic 500.
+    """
+    seen = 0
+    cause: Optional[BaseException] = exc
+    while cause is not None and seen < 8:
+        if isinstance(cause, RunnerError):
+            raise HTTPException(status_code=cause.status_code, detail=str(exc)) from exc
+        cause, seen = cause.__cause__, seen + 1
+
+
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     request: Request,
@@ -4686,8 +4788,6 @@ async def create_session(
         # A distinct status, so the caller reports that cause and does not
         # mistake it for a retryable server error.
         return _idempotent_create_failed_response(e)
-    except LocalExecutionDisabledError as e:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
@@ -4707,7 +4807,10 @@ async def create_session(
         # repo, or the 'git worktree add' itself failed -- a client-input
         # problem, not a server crash. Mirrors POST /sessions/{name}/terminals.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create session: {str(e)}",
@@ -4722,7 +4825,9 @@ async def list_sessions(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     try:
-        return session_service.list_sessions()
+        # Off the event loop: under the remote backend this asks every connected
+        # runner in turn, each call bounded only by the runner call timeout (#745).
+        return await asyncio.to_thread(session_service.list_sessions)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -4751,7 +4856,10 @@ async def get_session(
         return await asyncio.to_thread(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get session: {str(e)}",
@@ -4801,11 +4909,12 @@ async def delete_session(
         return {"success": True, **result}
     except HTTPException:
         raise
-    except RemoteRuntimeError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete session: {str(e)}",
@@ -5037,8 +5146,6 @@ async def create_terminal_in_session(
         # a rejected configuration is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except LocalExecutionDisabledError as e:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request or a missing session: the caller should
@@ -5060,7 +5167,10 @@ async def create_terminal_in_session(
         # or the 'git worktree add' itself failed -- a client-input problem,
         # not a server crash.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create terminal: {str(e)}",
@@ -5181,7 +5291,10 @@ async def create_terminal_in_session_as_operator(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create terminal: {str(e)}",
@@ -5216,8 +5329,11 @@ async def list_terminals_in_session(
             list_current_session_terminals,
         )
 
-        return list_current_session_terminals(session_name)
+        return await asyncio.to_thread(list_current_session_terminals, session_name)
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list terminals: {str(e)}",
@@ -5241,7 +5357,10 @@ async def get_terminal(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except TerminalNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get terminal: {str(e)}",
@@ -5437,11 +5556,12 @@ async def get_terminal_working_directory(
             terminal_service.get_working_directory, terminal_id
         )
         return WorkingDirectoryResponse(working_directory=working_directory)
-    except RemoteRuntimeError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get working directory: {str(e)}",
@@ -5477,20 +5597,6 @@ async def send_terminal_input(
         # request — including /health and concurrent assign/handoff. Same
         # hazard class as issue #382 (only fixed for DELETE /sessions there).
         #
-        # A terminal in an execution runtime (#745) takes send_input, which
-        # routes it to its runtime. Its output generation is the runtime's, so
-        # there is no boundary here to name, as for event-inbox backends below.
-        metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
-        if metadata and metadata.get("runtime_id"):
-            success = await asyncio.to_thread(
-                terminal_service.send_input,
-                terminal_id,
-                message,
-                registry=get_plugin_registry(request),
-                sender_id=sender_id,
-                orchestration_type=orchestration_type,
-            )
-            return {"success": success, "dispatch_boundary": None}
         # Called instead of the ``send_input`` bool wrapper purely to keep the
         # boundary it computes; the behaviour is identical.
         boundary: Optional[int] = await asyncio.to_thread(
@@ -5509,13 +5615,14 @@ async def send_terminal_input(
         if get_backend().supports_event_inbox():
             boundary = None
         return {"success": True, "dispatch_boundary": boundary}
-    except RemoteRuntimeError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e))
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to send input: {str(e)}",
@@ -5547,11 +5654,12 @@ async def send_terminal_key(
         # the same way /input is: a conflict with the terminal's state, not a
         # server fault.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except RemoteRuntimeError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to send key: {str(e)}",
@@ -5570,8 +5678,6 @@ async def get_terminal_output(
         # transcript can't stall the whole server.
         output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
-    except RemoteRuntimeError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e))
     except OutputExtractionError as e:
         # Ordered before the ValueError arm it subclasses, same as run_step: the
         # terminal and the route both resolved -- only the response marker was
@@ -5581,7 +5687,10 @@ async def get_terminal_output(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get output: {str(e)}",
@@ -5624,10 +5733,10 @@ async def get_terminal_output_range(
     except ValueError as e:
         # Malformed id / negative offset — a caller error, not a missing log.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except LocalExecutionDisabledError as e:
-        # A remote terminal (#745): its log is in its runtime, not here.
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         # A genuine file I/O failure surfaced by read_output_range (BR-4): report
         # it rather than masking a real fault as empty output.
         raise HTTPException(
@@ -5652,11 +5761,12 @@ async def exit_terminal(
         # does. That is a conflict with the terminal's state, not a server
         # fault -- matching the 409 POST /terminals/{id}/input already returns.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except RemoteRuntimeError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to exit terminal: {str(e)}",
@@ -6306,10 +6416,6 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-    except LocalExecutionDisabledError as e:
-        _settle_step(None, str(e))
-        await _record_job_state(job_id, "error", error_message=str(e))
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # The node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — surfaced
         # as 429 so a step scheduler can retry on a different node instead of
@@ -6352,6 +6458,7 @@ async def run_step(
     except Exception as e:
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to run step: {str(e)}",
@@ -7553,6 +7660,9 @@ async def submit_workflow_run_endpoint(
     # any insert so a rejected run leaves NO durable row and NO 202; (5) the awaited
     # HARD durable insert; (6) the in-process record C2 will drive.
     if isinstance(spec, ScriptSpec):
+        # Refused before the insert, like every gate here, so no 202 or RUNNING
+        # row exists for a script this server will not run (#745).
+        refuse_server_host_code("workflow script run")
         root = _script_root(body.working_directory)
         # Step 4 — script lint gate (OR-2): a lint fail -> 422 with a findings body,
         # in the handler's validation phase (never deferred into the background
@@ -9730,11 +9840,12 @@ async def delete_terminal(
         return {"success": True}
     except HTTPException:
         raise
-    except RemoteRuntimeError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete terminal: {str(e)}",
@@ -9759,11 +9870,10 @@ async def create_inbox_message_endpoint(
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except LocalExecutionDisabledError as e:
-        # The receiver runs in an execution runtime (#745): refused, not
-        # acknowledged and left pending.
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create inbox message: {str(e)}",
@@ -10218,10 +10328,6 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     if not metadata:
         await websocket.close(code=4004, reason="Terminal not found")
         return
-    if metadata.get("runtime_id"):
-        # Its pane lives in an execution runtime; attach is not relayed yet (#745).
-        await websocket.close(code=4004, reason="Terminal runs in an execution runtime")
-        return
 
     # Defence-in-depth: re-validate the names from the DB before they
     # flow into a tmux subprocess argument. The POST /sessions handler
@@ -10618,9 +10724,17 @@ async def run_flow(
     try:
         executed = await flow_service.execute_flow(name)
         return {"executed": executed}
+    except ServerHostCodeRefused as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except UnsupportedProviderError as e:
+        # The flow exists; the backend cannot run its provider (#745).
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RunnerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
+        _raise_for_wrapped_runner_error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to execute flow: {str(e)}",
@@ -11852,7 +11966,7 @@ def main():
     parser.add_argument(
         "--terminal",
         type=str,
-        choices=["tmux", "herdr"],
+        choices=["tmux", "herdr", "remote"],
         default=None,
         help="Terminal backend to use, overriding terminal_backend in config.json",
     )
@@ -11927,6 +12041,17 @@ def main():
     # ``uvicorn.error`` for WebSocket handshakes -- by
     # ``install_access_log_redaction()``, installed in the app lifespan so both
     # ``cao-server`` and ``uvicorn ...:app`` are covered.
+    # #745: the remote backend's start refusals, checked here too. Raised from
+    # the lifespan, uvicorn reports them as a failed startup: a SystemExit
+    # traceback and exit code 3. Here they exit 1 with the message alone. The
+    # lifespan keeps both checks for ``uvicorn cli_agent_orchestrator.api.main:app``.
+    # Only for the remote backend, read from the configuration by name, so any
+    # other backend stays lazy as above.
+    if ConfigService.get("terminal.backend", default="tmux", override=args.terminal) == "remote":
+        refusal = remote_auth_refusal() or _runner_token_refusal()
+        if refusal is not None:
+            print(refusal, file=sys.stderr, flush=True)
+            raise SystemExit(1)
     from cli_agent_orchestrator.services.agui.ambient_run import install_uvicorn_exit_hook
 
     install_uvicorn_exit_hook()

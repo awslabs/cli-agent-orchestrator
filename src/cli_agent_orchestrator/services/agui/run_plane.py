@@ -30,6 +30,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from cli_agent_orchestrator.services.agui.attribution import subagent_run_id_for_terminal
 from cli_agent_orchestrator.services.agui_stream import CAO_GENERATIVE_UI_EVENT_NAME
+from cli_agent_orchestrator.utils.event import snapshot_off_loop
 
 logger = logging.getLogger(__name__)
 
@@ -370,7 +371,7 @@ async def run_plane_stream(
             # Emit STATE_SNAPSHOT with current fleet state
             if snapshot_fn is not None:
                 try:
-                    snapshot = snapshot_fn()
+                    snapshot = await snapshot_off_loop(snapshot_fn)
                     snap_evt = StateSnapshotEvent(
                         type="STATE_SNAPSHOT",
                         snapshot=snapshot,
@@ -434,7 +435,7 @@ async def run_plane_stream(
     # ── 4. STATE_SNAPSHOT (initial fleet state) ─────────────────────────
     if snapshot_fn is not None:
         try:
-            snapshot = snapshot_fn()
+            snapshot = await snapshot_off_loop(snapshot_fn)
             snap_evt = StateSnapshotEvent(
                 type="STATE_SNAPSHOT",
                 snapshot=snapshot,

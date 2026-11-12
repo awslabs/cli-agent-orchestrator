@@ -43,8 +43,27 @@ CAO_MCP_SERVER_COMMAND = "cao-mcp-server"
 CAO_SERVER_ENV_KEYS = ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR")
 
 
+def _terminals_run_on_this_host() -> bool:
+    from cli_agent_orchestrator.backends.registry import current_backend
+
+    return getattr(current_backend(), "resolves_paths_locally", True) is not False
+
+
 def cao_server_env() -> Dict[str, str]:
-    """The running CAO's own address and home, for the variables that are set."""
+    """The running CAO's own address and home, for the variables that are set.
+
+    Under the remote terminal backend the agent runs on a cao-runner, where this
+    server's bind address and home directory mean nothing (loopback would be
+    the runner's own pod). The backend supplies the agent-facing address
+    instead, and this server's home is never forwarded.
+    """
+    from cli_agent_orchestrator.backends.registry import current_backend
+
+    backend = current_backend()
+    agent_env = getattr(backend, "agent_server_env", None)
+    forwarded = agent_env() if callable(agent_env) else None
+    if isinstance(forwarded, dict):
+        return forwarded
     env = {key: os.environ[key] for key in CAO_SERVER_ENV_KEYS if os.environ.get(key)}
     if "CAO_HOME_DIR" in env:
         # Forward the already-resolved absolute path (constants.py tilde-expands
@@ -184,6 +203,11 @@ def resolve_mcp_server_config(
         server_env = cao_server_env()
         if server_env:
             resolved["env"] = {**server_env, **(resolved.get("env") or {})}
+    if not _terminals_run_on_this_host():
+        # The agent runs on a cao-runner. A path resolved here (this server's
+        # interpreter, its sibling script) need not exist there; the bare
+        # console script resolves on the runner's own PATH.
+        return resolved
     new_command, new_args = resolve_cao_mcp_command(command, args, persisted=persisted)
     if (new_command, new_args) == (command, args):
         # Passthrough (non-bundled command): don't write back keys the entry

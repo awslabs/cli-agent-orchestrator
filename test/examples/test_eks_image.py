@@ -61,22 +61,25 @@ def test_claude_codes_install_script_may_fetch_its_native_binary():
     assert "--allow-scripts=@anthropic-ai/claude-code" in step
 
 
-def test_tini_is_installed_on_either_base():
-    step = _run_step("apk upgrade --no-cache")
-    apk, apt = step.split("elif command -v apt-get", 1)
-    assert re.search(r"\btini\b", apk) and re.search(r"\btini\b", apt.split("else", 1)[0])
-
-
-def test_the_runtime_pod_runs_tini_as_pid_1():
-    # cao-bridge reaps no children: without an init, every finished agent CLI
-    # in the runtime pod stays a zombie.
-    runtime = DOCKERFILE.parents[1] / "remote-runtime/runtime.yaml"
-    assert 'command: ["/usr/bin/tini", "--", "cao-entrypoint"]' in runtime.read_text()
-
-
 def test_the_kiro_cli_archive_is_checked_before_its_installer_runs():
     step = _run_step("kirocli.zip")
     assert step.index("sha256sum -c") < step.index("install.sh")
     text = DOCKERFILE.read_text()
     for arch in ("X86_64", "AARCH64"):
         assert re.search(rf"^ARG KIRO_CLI_SHA256_{arch}=[0-9a-f]{{64}}$", text, re.M)
+
+
+def test_the_entrypoint_refuses_the_removed_bridge_mode():
+    """A pod still deployed with CAO_NODE_MODE=bridge must not start cao-server."""
+    import os
+    import subprocess
+
+    entrypoint = (
+        Path(__file__).resolve().parents[2] / "examples/cao-clusters/kubernetes/eks/entrypoint.sh"
+    )
+    env = {**os.environ, "CAO_NODE_MODE": "bridge", "PATH": "/nonexistent"}
+    result = subprocess.run(
+        ["/bin/bash", str(entrypoint)], env=env, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 64, result.stderr
+    assert "CAO_NODE_MODE=bridge was removed" in result.stderr

@@ -40,6 +40,11 @@ from cli_agent_orchestrator.models.terminal import (
 )
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.runner.protocol import (
+    RunnerError,
+    RunnerOutcomeUnknown,
+    RunnerUnavailable,
+)
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -62,6 +67,18 @@ _SUBMIT_STARTED_STATUSES = {
     TerminalStatus.COMPLETED,
     TerminalStatus.WAITING_USER_ANSWER,
 }
+
+
+def _runner_error(exc: BaseException) -> Optional[RunnerError]:
+    """The runner failure ``exc`` is, or was caused by, if any (#745)."""
+    cause: Optional[BaseException] = exc
+    for _ in range(8):
+        if cause is None:
+            return None
+        if isinstance(cause, RunnerError):
+            return cause
+        cause = cause.__cause__
+    return None
 
 
 def _short_reason(exc: Exception) -> str:
@@ -409,10 +426,34 @@ class InboxService:
                         registry,
                     )
             except Exception as e:
-                for message in batch:
-                    logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
-                    update_message_status(message.id, MessageStatus.FAILED)
-                self._close_message_edges(terminal_id, batch, _short_reason(e), registry)
+                runner_error = _runner_error(e)
+                if isinstance(runner_error, RunnerUnavailable):
+                    # The terminal's runner is not connected: nothing was sent,
+                    # and a retry is safe (#745). Like a pane not resolvable
+                    # yet, the reconcile sweep delivers once it is back.
+                    for message in batch:
+                        update_message_status(message.id, MessageStatus.PENDING)
+                    logger.warning(
+                        f"Runner of terminal {terminal_id} unavailable; leaving "
+                        f"{len(batch)} message(s) pending for retry: {e}"
+                    )
+                elif isinstance(runner_error, RunnerOutcomeUnknown):
+                    # Sent, but no answer: the input may have reached the pane.
+                    # A "delivery failed" notice could make the sender send it
+                    # again, so the messages keep their optimistic DELIVERED and
+                    # their edges, as a delivery that succeeded would.
+                    logger.warning(
+                        f"Delivery of {len(batch)} message(s) to terminal {terminal_id} "
+                        f"has an unknown outcome (runner did not answer); not retrying: {e}"
+                    )
+                    self._arm_message_edges(terminal_id, batch)
+                else:
+                    for message in batch:
+                        logger.error(
+                            f"Failed to deliver message {message.id} to {terminal_id}: {e}"
+                        )
+                        update_message_status(message.id, MessageStatus.FAILED)
+                    self._close_message_edges(terminal_id, batch, _short_reason(e), registry)
 
     def deliver_pending_in_background(
         self, terminal_id: str, registry: PluginRegistry | None = None

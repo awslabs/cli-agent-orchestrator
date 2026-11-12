@@ -94,6 +94,7 @@ class TerminalConfig(BaseModel):
     pane_window: str = "cao-agents"
     pane_layout: str = "tiled"
     keep_finished: KeepFinishedConfig = Field(default_factory=KeepFinishedConfig)
+    remote_providers: str = "claude_code,mock_cli"
 
 
 class AppsConfig(BaseModel):
@@ -183,6 +184,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.keep_finished.idle_window_minutes": 60,
     "terminal.keep_finished.max_per_session": 5,
     "terminal.keep_finished.on_cap": "teardown_oldest",
+    "terminal.remote_providers": "claude_code,mock_cli",
     "apps.enabled": False,
     "apps.static_dir": None,
     "auth.jwks_uri": "",
@@ -205,6 +207,11 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_TERMINAL_SPAWN_MODE": ("terminal.spawn_mode", "str", "window"),
     "CAO_TERMINAL_PANE_WINDOW": ("terminal.pane_window", "str", "cao-agents"),
     "CAO_TERMINAL_PANE_LAYOUT": ("terminal.pane_layout", "str", "tiled"),
+    "CAO_TERMINAL_REMOTE_PROVIDERS": (
+        "terminal.remote_providers",
+        "str",
+        "claude_code,mock_cli",
+    ),
     "CAO_MCP_APPS_ENABLED": ("apps.enabled", "bool", False),
     "CAO_MCP_APPS_STATIC_DIR": ("apps.static_dir", "str", None),
     "CAO_AUTH_JWKS_URI": ("auth.jwks_uri", "str", ""),
@@ -737,6 +744,9 @@ class ConfigService:
                 pane_window=_get_value("terminal.pane_window", default="cao-agents"),
                 pane_layout=_get_value("terminal.pane_layout", default="tiled"),
                 keep_finished=_keep_finished_config(),
+                remote_providers=_get_value(
+                    "terminal.remote_providers", default="claude_code,mock_cli"
+                ),
             ),
             apps=AppsConfig(
                 enabled=_get_value("apps.enabled", default=False),

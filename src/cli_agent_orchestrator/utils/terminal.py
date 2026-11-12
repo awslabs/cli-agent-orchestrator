@@ -248,6 +248,98 @@ async def wait_until_status(
     return False
 
 
+def server_terminal_backend() -> Optional[str]:
+    """The terminal backend the running cao-server reports, or None if unknown.
+
+    Unknown (server unreachable, unexpected response) is not an error here: the
+    callers fall back to their ordinary local behavior.
+    """
+    try:
+        resp = api_http.get(f"{API_BASE_URL}/health", timeout=2.0)
+        resp.raise_for_status()
+        name = resp.json().get("terminal_backend")
+        return name if isinstance(name, str) and name else None
+    except Exception as e:
+        logger.debug(f"server_terminal_backend: could not reach server: {e}")
+        return None
+
+
+# How long server_terminal_backend_or_absent() waits for /health. The route
+# reads the backend singleton and touches no runner, so it answers within the
+# example's readinessProbe budget (1 s) on a healthy server; this allows a busy
+# one five times that. A timeout is never read as "no server": it refuses.
+_HEALTH_PROBE_TIMEOUT = 5.0
+
+
+class ServerBackendUnknown(RuntimeError):
+    """A cao-server answers (or may be there) but its terminal backend is unknown."""
+
+
+def _connection_refused(exc: BaseException) -> bool:
+    """Whether ``exc`` comes from a refused TCP connect (nothing listening).
+
+    requests wraps it several levels deep (ConnectionError, MaxRetryError,
+    NewConnectionError, then ConnectionRefusedError), so the reasons, causes,
+    contexts and exception arguments are followed.
+    """
+    pending: list = [exc]
+    seen: set = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen or len(seen) > 32:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ConnectionRefusedError):
+            return True
+        pending.extend(
+            [
+                getattr(current, "reason", None),
+                current.__cause__,
+                current.__context__,
+                *(a for a in getattr(current, "args", ()) if isinstance(a, BaseException)),
+            ]
+        )
+    return False
+
+
+def server_terminal_backend_or_absent() -> Optional[str]:
+    """The running cao-server's terminal backend; None only when no server listens.
+
+    For a caller that must not fail open: :func:`server_terminal_backend` folds
+    every failure into None, so a remote server that is slow, restarting or
+    answering 5xx would look like no server at all, and the caller would do
+    locally what that server would refuse (#745). Here only a refused
+    connection (nothing listening at ``API_BASE_URL``) is None; any other
+    failure raises :class:`ServerBackendUnknown`.
+    """
+    try:
+        resp = api_http.get(f"{API_BASE_URL}/health", timeout=_HEALTH_PROBE_TIMEOUT)
+    except api_http.exceptions.ConnectTimeout as e:
+        raise ServerBackendUnknown(f"cao-server at {API_BASE_URL} did not answer: {e}") from e
+    except api_http.exceptions.ConnectionError as e:
+        if isinstance(e, api_http.exceptions.ProxyError) or not _connection_refused(e):
+            # DNS, proxy, TLS or a reset: something may be there. A proxy
+            # error is never "no server", even when the proxy itself refused
+            # the connect: the server behind it was never asked.
+            raise ServerBackendUnknown(f"cao-server at {API_BASE_URL} did not answer: {e}") from e
+        logger.debug(f"server_terminal_backend_or_absent: no server at {API_BASE_URL}: {e}")
+        return None
+    except api_http.exceptions.RequestException as e:
+        raise ServerBackendUnknown(f"cao-server at {API_BASE_URL} did not answer: {e}") from e
+    try:
+        resp.raise_for_status()
+        name = resp.json().get("terminal_backend")
+    except Exception as e:
+        raise ServerBackendUnknown(
+            f"cao-server at {API_BASE_URL} did not report its terminal backend: {e}"
+        ) from e
+    if not isinstance(name, str) or not name:
+        raise ServerBackendUnknown(
+            f"cao-server at {API_BASE_URL} did not report its terminal backend"
+        )
+    return name
+
+
 def sync_backend_from_server() -> None:
     """Query the running cao-server's /health endpoint and align the local backend singleton.
 
@@ -263,15 +355,13 @@ def sync_backend_from_server() -> None:
     from cli_agent_orchestrator.backends.factory import BackendFactory
     from cli_agent_orchestrator.backends.registry import set_backend
 
+    backend_name = server_terminal_backend()
+    if not backend_name:
+        return
     try:
-        resp = api_http.get(f"{API_BASE_URL}/health", timeout=2.0)
-        resp.raise_for_status()
-        data = resp.json()
-        backend_name = data.get("terminal_backend")
-        if backend_name:
-            set_backend(BackendFactory.create(backend_override=backend_name))
+        set_backend(BackendFactory.create(backend_override=backend_name))
     except Exception as e:
-        logger.debug(f"sync_backend_from_server: could not reach server: {e}")
+        logger.debug(f"sync_backend_from_server: could not select {backend_name!r}: {e}")
 
 
 def _is_transient_poll_error(

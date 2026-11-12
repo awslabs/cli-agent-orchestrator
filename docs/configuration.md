@@ -286,7 +286,12 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 }
 ```
 
-- `backend`: `"tmux"` (default) or `"herdr"` [EXPERIMENTAL].
+- `backend`: `"tmux"` (default), `"herdr"` [EXPERIMENTAL], or `"remote"`
+  [EXPERIMENTAL]: one `cao-server` places every terminal on an execution-only
+  `cao-runner` (see [Remote runners](remote-runners.md)).
+- `remote_providers`: with `backend: "remote"`, the providers the server will
+  launch on runners (default `"claude_code,mock_cli"`). It can only narrow that
+  default; see [Providers](remote-runners.md#providers).
 - `herdr_session`: the herdr session name to connect to (default `"cao"`).
 - `spawn_mode`: `"window"` (default) or `"pane"` — where a terminal created by
   `assign` / `handoff` lands. See [Watching a fleet in one window](#watching-a-fleet-in-one-window).
@@ -310,7 +315,7 @@ Select a backend for a single run without touching `settings.json`:
 cao-server --terminal herdr
 ```
 
-`--terminal` (CLI flag) beats `CAO_TERMINAL_BACKEND` (env var) beats `terminal.backend` (file) beats the `"tmux"` default — the standard precedence chain. See [herdr.md](herdr.md) for herdr-specific setup, viewing/attaching, and troubleshooting.
+`--terminal` (CLI flag) beats `CAO_TERMINAL_BACKEND` (env var) beats `terminal.backend` (file) beats the `"tmux"` default — the standard precedence chain. See [herdr.md](herdr.md) for herdr-specific setup, viewing/attaching, and troubleshooting, and [Remote runners](remote-runners.md) for the remote backend's `CAO_RUNNER_*` settings, which are read from the environment only.
 
 #### Watching a fleet in one window
 
@@ -523,6 +528,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 |---|---|---|
 | `CAO_TERMINAL_BACKEND` | `terminal.backend` | str |
 | `CAO_HERDR_SESSION` | `terminal.herdr_session` | str |
+| `CAO_TERMINAL_REMOTE_PROVIDERS` | `terminal.remote_providers` | comma-separated list |
 | `CAO_TERMINAL_SPAWN_MODE` | `terminal.spawn_mode` | str |
 | `CAO_TERMINAL_PANE_WINDOW` | `terminal.pane_window` | str |
 | `CAO_TERMINAL_PANE_LAYOUT` | `terminal.pane_layout` | str |
@@ -588,18 +594,6 @@ Rendered-screen status detection adds `CAO_PYTE_STATUS` (default `true`) and `CA
 | `CAO_PIPE_LIVENESS_MAX_REARM_FAILURES` | `5` | int | Consecutive failed re-arm attempts before the watchdog gives up on a terminal. |
 | `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` | `3.0` | float | Grace period after a terminal is registered before a FIFO that has never delivered a single byte is treated as a cold-start stall (harness-control#93) instead of "still booting". |
 | `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` | `5` | int | Consecutive cold-start re-arm attempts (rearm() succeeded but the pipe still never delivered) before the watchdog gives up on a terminal — a separate failure class and counter from `CAO_PIPE_LIVENESS_MAX_REARM_FAILURES`, which only counts rearm() raising. |
-
-Execution runtimes ([#745](https://github.com/awslabs/cli-agent-orchestrator/issues/745)) add the variables below, read directly by `cao-server` and `cao-bridge`. [Running `cao-bridge`](execution-runtimes.md#running-cao-bridge) has their full rules.
-
-| Env var | Default | Type | Purpose |
-|---|---|---|---|
-| `CAO_LOCAL_EXECUTION` | on | bool | `0`/`false`/`no`/`off`: the server starts no agents itself; local terminal creation answers `409`. |
-| `CAO_RUNTIME_TOKEN_FILE` | *(none)* | str (path) | File holding the shared runtime token (server and `cao-bridge`). Takes precedence over `CAO_RUNTIME_TOKEN`. |
-| `CAO_RUNTIME_TOKEN` | *(none)* | str | The runtime token itself. With neither set, the server refuses every runtime. |
-| `CAO_RUNTIME_LAUNCH_TIMEOUT` | `240` | float (s) | How long the server waits for a runtime's launch before `504`. |
-| `CAO_BRIDGE_SERVER_URL` | *(required)* | str (`ws://`/`wss://` URL) | The server channel `cao-bridge` dials. |
-| `CAO_BRIDGE_RUNTIME_ID` | *(required)* | str | `cao-bridge`'s runtime id, one URL path segment. |
-| `CAO_BRIDGE_READY_FILE` | `$CAO_HOME_DIR/bridge-ready` | str (path) | Exists only while `cao-bridge`'s channel is up. |
 
 The `cao fleet` / `cao worker` commands ([control planes](control-planes.md#remote-fleets)) add two more, read directly in `utils/fleet.py`. They are the only configuration those commands take, and neither has a default: without both, every leaf exits with `No fleet configured.` rather than falling back to the local server.
 

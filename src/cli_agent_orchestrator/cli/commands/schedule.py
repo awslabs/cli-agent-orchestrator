@@ -5,7 +5,22 @@ import asyncio
 import click
 
 from cli_agent_orchestrator.clients.database import init_db
+from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.services import flow_service
+from cli_agent_orchestrator.utils import api_http
+from cli_agent_orchestrator.utils.terminal import (
+    ServerBackendUnknown,
+    server_terminal_backend_or_absent,
+)
+
+# How long `cao flow run` waits for POST /flows/{name}/run on a remote server.
+# The server runs the flow inside that request: its pre-script (capped at 30 s
+# in flow_service), then the terminal create, which waits up to
+# CAO_RUNNER_PLACEMENT_TIMEOUT (60 s by default) for a runner and then for the
+# provider to start (the profile's provider_init_timeout). Ten minutes covers
+# those with room. When it expires the run's outcome is unknown, and the
+# message says so.
+_FLOW_RUN_REQUEST_TIMEOUT = 600.0
 
 
 @click.group()
@@ -125,6 +140,22 @@ def run(name):
     """Manually run a flow."""
     init_db()
     try:
+        server_backend = server_terminal_backend_or_absent()
+    except ServerBackendUnknown as e:
+        # Not knowing must not mean "local": a remote server that is slow or
+        # restarting would then see its pre-script run here (#745).
+        raise click.ClickException(
+            f"{e}. Not running flow '{name}' in this process, because a remote "
+            "server would refuse its pre-script; retry once the server answers."
+        )
+    if server_backend == "remote":
+        # The server places terminals on runners and refuses pre-scripts on its
+        # own host (#745). Running the flow in this process would use the CLI's
+        # own backend (local tmux) and run the pre-script here, beside the
+        # server, so the server runs it instead and applies its own refusals.
+        _run_flow_on_server(name)
+        return
+    try:
         # execute_flow is async in the event-driven architecture (it awaits the
         # async create_terminal); drive it to completion from this sync command
         # with the event pipeline bootstrapped (see _run_flow_with_pipeline).
@@ -135,6 +166,31 @@ def run(name):
             click.echo(f"Flow '{name}' skipped (execute=false)")
     except Exception as e:
         raise click.ClickException(str(e))
+
+
+def _run_flow_on_server(name: str) -> None:
+    """``POST /flows/{name}/run`` on this node's cao-server; raise ClickException on failure."""
+    try:
+        resp = api_http.post(f"{API_BASE_URL}/flows/{name}/run", timeout=_FLOW_RUN_REQUEST_TIMEOUT)
+    except api_http.exceptions.ReadTimeout as e:
+        raise click.ClickException(
+            f"cao-server did not finish flow '{name}' within {_FLOW_RUN_REQUEST_TIMEOUT:.0f}s; "
+            f"it may still be running there: {e}"
+        )
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to run flow '{name}' on cao-server: {e}")
+    if not resp.ok:
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except ValueError:
+            detail = resp.text
+        raise click.ClickException(
+            f"cao-server refused flow '{name}' ({resp.status_code}): {detail}"
+        )
+    if resp.json().get("executed"):
+        click.echo(f"Flow '{name}' executed successfully")
+    else:
+        click.echo(f"Flow '{name}' skipped (execute=false)")
 
 
 @click.group(name="flow", hidden=True)

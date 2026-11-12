@@ -44,36 +44,15 @@
 # layer (AUTH0_DOMAIN / CAO_AUTH_JWKS_URI).
 set -euo pipefail
 
+# The bridge mode went with the #834 execution runtimes. A pod still deployed
+# with it must not quietly become a cao-server listening on 0.0.0.0.
+if [ "${CAO_NODE_MODE:-}" = "bridge" ]; then
+  echo "cao-entrypoint: CAO_NODE_MODE=bridge was removed with cao-bridge; use terminal.backend=remote with cao-runner (see docs/remote-runners.md)" >&2
+  exit 64
+fi
+
 BIND_HOST="${CAO_BIND_HOST:-0.0.0.0}"
 PORT="${CAO_API_PORT:-9889}"
-
-# The runtime-channel token (#745) belongs only to the process this script
-# finally execs: cao-bridge, or cao-server checking the runtimes that dial it.
-# Both forms leave the environment here, before anything below starts a
-# subprocess (cao init, cao install, the provider warm-up): CAO_RUNTIME_TOKEN,
-# and CAO_RUNTIME_TOKEN_FILE, which names a readable Secret and so is as good as
-# the token. Both are handed back on the final exec only.
-runtime_token="${CAO_RUNTIME_TOKEN-}"
-runtime_token_file="${CAO_RUNTIME_TOKEN_FILE-}"
-unset CAO_RUNTIME_TOKEN CAO_RUNTIME_TOKEN_FILE
-
-exec_with_runtime_token() {
-  if [ -n "${runtime_token}" ]; then
-    export CAO_RUNTIME_TOKEN="${runtime_token}"
-  fi
-  if [ -n "${runtime_token_file}" ]; then
-    export CAO_RUNTIME_TOKEN_FILE="${runtime_token_file}"
-  fi
-  exec "$@"
-}
-
-# A bridge's readiness file on a volume that outlives the container (the
-# example's emptyDir) says nothing about this start: a killed cao-bridge could
-# not remove it. Clear it before the setup below, so the pod is not Ready until
-# this start's cao-bridge has connected. The default is cao-bridge's own.
-if [ "${CAO_NODE_MODE:-server}" = "bridge" ]; then
-  rm -f "${CAO_BRIDGE_READY_FILE:-${CAO_HOME_DIR:-${HOME}/.aws/cli-agent-orchestrator}/bridge-ready}"
-fi
 
 # State seed — replace `cao init` + `cao install` with a tar extract.
 #
@@ -249,12 +228,5 @@ case "${warm_mode}" in
     ;;
 esac
 
-if [ "${CAO_NODE_MODE:-server}" = "bridge" ]; then
-  # Execution runtime (#745): no cao-server in this pod. cao-bridge dials the
-  # central server and runs agents here, beside this container's tmux.
-  echo "[cao-entrypoint] starting cao-bridge as runtime ${CAO_BRIDGE_RUNTIME_ID:-?}"
-  exec_with_runtime_token cao-bridge
-fi
-
 echo "[cao-entrypoint] starting cao-server on ${BIND_HOST}:${PORT}"
-exec_with_runtime_token cao-server --host "${BIND_HOST}" --port "${PORT}"
+exec cao-server --host "${BIND_HOST}" --port "${PORT}"
