@@ -526,8 +526,15 @@ class TestTerminalGuard:
                 async def send(self, data):
                     sent.append(data)
 
-            lock = runner._async_window_lock("s1", "w")
-            await lock.acquire()  # another call holds the window
+            held, release = asyncio.Event(), asyncio.Event()
+
+            async def hold():  # another call holds the window
+                async with runner._async_window_locks.hold(("s1", "w")):
+                    held.set()
+                    await release.wait()
+
+            holder = asyncio.ensure_future(hold())
+            await held.wait()
             frame = (
                 '{"type": "call", "id": "1", "op": "create_session", "args": '
                 '{"session_name": "s1", "window_name": "w", "terminal_id": "aaaaaaaa"}}'
@@ -535,7 +542,8 @@ class TestTerminalGuard:
             task = asyncio.ensure_future(runner._serve_call(WS(), frame))
             await asyncio.sleep(0.05)
             seen["queued"] = runner.dispatch("cleanup_terminal_exact", {"terminal_id": "aaaaaaaa"})
-            lock.release()
+            release.set()
+            await holder
             await task
             seen["after"] = sorted(runner._creating)
 

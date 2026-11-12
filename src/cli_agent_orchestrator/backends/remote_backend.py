@@ -47,6 +47,7 @@ from cli_agent_orchestrator.runner.protocol import (
     RunnerOutcomeUnknown,
     RunnerUnavailable,
 )
+from cli_agent_orchestrator.utils.keyed_lock import KeyedLock
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.runner.hub import RunnerHub
@@ -97,8 +98,8 @@ class RemoteBackend(TerminalBackend):
         # Per window: installing a pipe's sink and arming the runner is one
         # step. Two re-arms (a reconnect's and the FIFO watchdog's) must not
         # interleave, or the runner streams a pipe whose sink is already gone.
-        self._pipe_locks: Dict[Tuple[str, str], threading.Lock] = {}
-        self._pipe_locks_guard = threading.Lock()
+        # Per window; holds only the windows in use.
+        self._pipe_locks = KeyedLock()
 
     # --- Wiring ---
 
@@ -651,12 +652,8 @@ class RemoteBackend(TerminalBackend):
 
     # --- Pipe-pane ---
 
-    def _pipe_lock(self, session_name: str, window_name: str) -> threading.Lock:
-        with self._pipe_locks_guard:
-            return self._pipe_locks.setdefault((session_name, window_name), threading.Lock())
-
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
-        with self._pipe_lock(session_name, window_name):
+        with self._pipe_locks.hold((session_name, window_name)):
             self._pipe_pane_locked(session_name, window_name, file_path)
 
     def _pipe_pane_locked(self, session_name: str, window_name: str, file_path: str) -> None:
@@ -679,7 +676,7 @@ class RemoteBackend(TerminalBackend):
             raise
 
     def stop_pipe_pane(self, session_name: str, window_name: str) -> None:
-        with self._pipe_lock(session_name, window_name):
+        with self._pipe_locks.hold((session_name, window_name)):
             self._stop_pipe_pane_locked(session_name, window_name)
 
     def _stop_pipe_pane_locked(self, session_name: str, window_name: str) -> None:

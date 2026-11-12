@@ -53,6 +53,7 @@ from cli_agent_orchestrator.runner.protocol import (
     quiet_websockets_logging,
 )
 from cli_agent_orchestrator.runner.token import runner_token
+from cli_agent_orchestrator.utils.keyed_lock import AsyncKeyedLock, KeyedLock
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.backends.base import TerminalBackend
@@ -173,8 +174,9 @@ class Runner:
         # Re-adopted windows (recover_terminals) whose tmux pipe, if any, still
         # feeds the previous process's FIFO and must be cleared before re-arming.
         self._adopted: set = set()
-        self._window_locks: Dict[WindowKey, threading.Lock] = {}
-        self._async_window_locks: Dict[WindowKey, asyncio.Lock] = {}
+        # Per window; each map holds only the windows in use.
+        self._window_locks = KeyedLock()
+        self._async_window_locks = AsyncKeyedLock()
         # Terminal ids whose create is executing right now. Reported to the hub
         # so a reap marker for one is not cleared before its pane exists.
         # Reference-counted: the call handler and the worker thread both hold
@@ -465,7 +467,7 @@ class Runner:
                 # Wait for the window here, on the loop, not in a worker
                 # thread: calls queued behind one slow window must not occupy
                 # the executor that every other window and the inventory share.
-                async with self._async_window_lock(str(session), str(window)):
+                async with self._async_window_locks.hold((str(session), str(window))):
                     value = await asyncio.to_thread(self.dispatch, op, args)
             else:
                 value = await asyncio.to_thread(self.dispatch, op, args)
@@ -694,22 +696,14 @@ class Runner:
         # terminal guard, the operation and its bookkeeping are one step: a
         # stale send that passed the guard must not run after the window was
         # killed and re-created for another terminal.
-        with self._window_lock(session, window):
+        with self._window_locks.hold((session, window)):
             return self._dispatch_unlocked(op, session, window, args)
-
-    def _async_window_lock(self, session: str, window: str) -> asyncio.Lock:
-        # Only touched on the runner's event loop.
-        return self._async_window_locks.setdefault((session, window), asyncio.Lock())
 
     def _end_creating(self, terminal_id: str) -> None:
         # Caller holds self._lock.
         self._creating[terminal_id] -= 1
         if self._creating[terminal_id] <= 0:
             del self._creating[terminal_id]
-
-    def _window_lock(self, session: str, window: str) -> threading.Lock:
-        with self._lock:
-            return self._window_locks.setdefault((session, window), threading.Lock())
 
     def _dispatch_unlocked(self, op: str, session: str, window: str, args: Dict[str, Any]) -> Any:
         if op in ("create_session", "create_window"):

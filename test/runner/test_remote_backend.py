@@ -510,6 +510,22 @@ class TestOutputStreaming:
             os.close(read_fd)
             os.close(keepalive)
 
+    def test_the_per_window_lock_maps_keep_no_entry_for_a_finished_terminal(
+        self, backend, start_runner, tmp_path
+    ):
+        # One cao-server and its runners outlive many terminals: none of them
+        # may leave a lock entry behind on either side.
+        r = start_runner("a")
+        for n in range(20):
+            window = f"w{n}"
+            backend.create_session(f"s{n}", window, f"{n:08x}")
+            backend.pipe_pane(f"s{n}", window, str(tmp_path / f"{n}.fifo"))
+            backend.stop_pipe_pane(f"s{n}", window)
+            backend.kill_session(f"s{n}")
+        wait_for(lambda: len(r.runner._async_window_locks) == 0)
+        assert len(backend._pipe_locks) == 0
+        assert len(r.runner._window_locks) == 0
+
     def test_output_buffered_while_disconnected_is_replayed(self, hub, tmp_path):
         r = RunnerThread("ws://127.0.0.1:1", "a", str(tmp_path / "a"))  # nothing listening
         try:
