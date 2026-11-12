@@ -38,10 +38,15 @@ interface ProfileParamsEditorProps {
   invalid?: boolean
 }
 
-const fieldClass = (invalid: boolean) =>
-  `w-full rounded-lg border bg-gray-900 px-2 py-1.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600 disabled:opacity-50 ${
+const fieldBase = (invalid: boolean) =>
+  `w-full rounded-lg border bg-gray-900 py-1.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600 disabled:opacity-50 ${
     invalid ? 'border-red-700' : 'border-gray-700'
   }`
+
+const fieldClass = (invalid: boolean) => `px-2 ${fieldBase(invalid)}`
+
+/** A select's classes: the right padding leaves room for the chevron index.css draws. */
+const selectClass = (invalid: boolean) => `pl-2 pr-8 ${fieldBase(invalid)}`
 
 function FieldError({ id, message }: { id: string; message?: string }) {
   if (!message) return null
@@ -87,7 +92,7 @@ function ParamRowFields({ row, index, errors, disabled, idBase, onChange, onRemo
             value={row.type}
             disabled={disabled}
             onChange={e => change({ type: e.target.value as ParamType })}
-            className={fieldClass(false)}
+            className={selectClass(false)}
           >
             {PARAM_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
@@ -126,7 +131,7 @@ function ParamRowFields({ row, index, errors, disabled, idBase, onChange, onRemo
                 value={row.default}
                 disabled={disabled || row.required}
                 onChange={e => change({ default: e.target.value })}
-                className={fieldClass(!!errors.default)}
+                className={selectClass(!!errors.default)}
               >
                 <option value="">not set</option>
                 <option value="true">true</option>
