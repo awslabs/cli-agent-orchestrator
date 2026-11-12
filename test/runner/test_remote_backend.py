@@ -640,9 +640,15 @@ class TestReviewRegressions:
         wait_for(lambda: "a" not in hub.connected_runners())
         assert backend.kill_window("s1", "w") is False  # unconfirmed, never "gone"
         assert hub.is_reaping("aaaaaaaa")
-        back = RunnerThread(f"ws://127.0.0.1:{hub.port}", "a", str(tmp_path / "a2"))
-        back.runner._terminals = dict(r.runner._terminals)
-        back.local.windows = r.local.windows
+        # Hosted from the start, so the first hello reports the window: set
+        # after the thread starts, the hello could go out first and report
+        # nothing, and the hub would rightly settle the reap as gone.
+        back = RunnerThread(
+            f"ws://127.0.0.1:{hub.port}",
+            "a",
+            str(tmp_path / "a2"),
+            hosting=dict(r.runner._terminals),
+        )
         try:
             wait_for(lambda: not hub.is_reaping("aaaaaaaa"))
             assert back.local.windows == {}
