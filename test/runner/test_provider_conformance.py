@@ -297,7 +297,12 @@ class _Sandbox:
             if self.host_write(database.removeprefix("file:").split("?")[0], event):
                 self.refuse_write(event, database)
         elif event in _AUDITED_SPAWNS:
-            program = os.path.basename(os.fspath(args[0])) if args and args[0] else ""
+            # subprocess.Popen's event is (executable, args, cwd, env), and
+            # its executable is None unless one was given.
+            first = args[0] if args and args[0] else (args[1] if len(args) > 1 else None)
+            if isinstance(first, (list, tuple)):
+                first = first[0] if first else None
+            program = os.path.basename(os.fspath(first)) if first else ""
             self.record("spawn", f"{event} {program}".rstrip())
             raise OSError("no processes on cao-server under the remote backend")
         elif event == "glob.glob":
@@ -327,7 +332,23 @@ _AUDITED_PATH_WRITES = frozenset(
 _AUDITED_DESTINATION_WRITES = frozenset(
     {"shutil.copyfile", "shutil.copymode", "shutil.copystat", "shutil.copytree", "shutil.move"}
 )
-_AUDITED_SPAWNS = frozenset({"os.posix_spawn", "os.exec", "os.fork", "os.forkpty", "os.spawn"})
+# subprocess.Popen and os.system fork and exec in C and raise only their own
+# event, so a name bound before the sandbox began is seen only through these.
+_AUDITED_SPAWNS = frozenset(
+    {
+        "os.posix_spawn",
+        "os.exec",
+        "os.fork",
+        "os.forkpty",
+        "os.spawn",
+        "subprocess.Popen",
+        "os.system",
+    }
+)
+# Bound at import, before any sandbox patches the module attributes, as a
+# provider's own ``from subprocess import Popen`` would be.
+_EARLY_POPEN = subprocess.Popen
+_EARLY_SYSTEM = os.system
 
 # The sandbox the audit hook reports to, or None. A hook cannot be removed once
 # added, so one is added for the process and does nothing while this is None.
@@ -681,6 +702,8 @@ def test_the_sandbox_records_every_primitive_from_every_kind_of_thread(sandbox):
         "sqlite3.connect outside": lambda: __import__("sqlite3").connect(scratch / "db").close(),
         "os.mkfifo outside": lambda: os.mkfifo(scratch / "fifo"),
         "os.posix_spawnp": lambda: os.posix_spawnp("true", ["true"], dict(os.environ)),
+        "Popen bound before the sandbox": lambda: _EARLY_POPEN(["true"]),
+        "os.system bound before the sandbox": lambda: _EARLY_SYSTEM("true"),
         "shutil.copyfile outside": lambda: shutil.copyfile(target, scratch / "copy"),
         "shutil.rmtree outside": lambda: shutil.rmtree(scratch / "nothing-here"),
         "read in the server cwd": lambda: builtins.open(
