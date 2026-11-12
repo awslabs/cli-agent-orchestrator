@@ -1,35 +1,30 @@
-"""bootstrap.sh: a dry run in a fake root changes nothing; the OS guard refuses."""
+"""bootstrap.sh under --root: a dry run changes nothing; a real run writes the
+right files with the right modes and never calls IMDS or a system command."""
 
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 import pytest
-from remote_ec2_support import recording_stub, tree_snapshot, write_stub
+from remote_ec2_support import (
+    BOOTSTRAP_SETTINGS,
+    FAKE_INSTANCE_ID,
+    MUTATING,
+    recording_stub,
+    tree_snapshot,
+    write_stub,
+)
 
-MUTATING = [
-    "curl",
-    "useradd",
-    "usermod",
-    "systemctl",
-    "apt-get",
-    "mkfs.ext4",
-    "mount",
-    "dpkg",
-    "runuser",
-    "chown",
-    "install",
-    "sudo",
-    "uv",
-]
 SETTINGS = {
-    "BOX_USER": "boxuser",
-    "BOX_HOME": "/Users/boxuser",
-    "DATA_DEVICE": "/dev/nvme1n1",
-    "HERDR_VERSION": "v0.9.3",
-    "CAO_REF": "0123456789abcdef0123456789abcdef01234567",
+    **BOOTSTRAP_SETTINGS,
     "BACKUP_S3_URI": "s3://example-bucket/cao-box/",
+    "BACKUP_KMS_KEY_ARN": "arn:aws:kms:ap-southeast-2:0:key/test-key",
 }
+SESSION = f"cao-{FAKE_INSTANCE_ID}"
+UNITS = ["herdr-cao.service", "cao-server.service", "cao-backup.service", "cao-backup.timer"]
+# A real --root run writes files itself, so these must stay real commands.
+FILE_TOOLS = {"mkdir", "chmod", "cp", "mv", "install", "ln"}
 
 
 def make_root(base: Path, os_id: str = "ubuntu", version: str = "24.04") -> Path:
@@ -41,18 +36,27 @@ def make_root(base: Path, os_id: str = "ubuntu", version: str = "24.04") -> Path
     return root
 
 
-def arm_stubs(sandbox, arch: str = "aarch64") -> None:
+def arm_stubs(sandbox, arch: str = "aarch64", skip: frozenset[str] = frozenset()) -> None:
     write_stub(sandbox.stubs, "uname", f'case "$1" in -m) echo {arch} ;; *) echo Linux ;; esac\n')
     for name in MUTATING:
-        recording_stub(sandbox.stubs, name, sandbox.calls)
+        if name not in skip:
+            recording_stub(sandbox.stubs, name, sandbox.calls)
+
+
+def mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
 
 
 def test_dry_run_in_a_fake_root_prints_the_plan_and_changes_nothing(sandbox) -> None:
     root = make_root(sandbox.root)
     arm_stubs(sandbox)
+    tmpdir = sandbox.root / "dry-tmp"
+    tmpdir.mkdir()
     before = tree_snapshot(root)
 
-    result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), **SETTINGS)
+    result = sandbox.run(
+        "bootstrap.sh", "--dry-run", "--root", str(root), TMPDIR=str(tmpdir), **SETTINGS
+    )
 
     assert result.returncode == 0, result.stdout + result.stderr
     out = result.stdout
@@ -60,18 +64,15 @@ def test_dry_run_in_a_fake_root_prints_the_plan_and_changes_nothing(sandbox) -> 
         assert f"== {n}." in out, f"step {n} missing from the plan"
     assert "== done" in out
     assert "OS: ubuntu 24.04 aarch64" in out
-    for unit in [
-        "herdr-cao.service",
-        "cao-server.service",
-        "cao-backup.service",
-        "cao-backup.timer",
-    ]:
+    for unit in UNITS:
         assert f"/etc/systemd/system/{unit}" in out
+    assert "wait-herdr-socket.sh" in out
     assert "[dry-run] would run: systemctl --root=" in out
-    assert "enable --now" not in out
-    assert "CAO_BOX_SESSION=cao-<instance-id>" in out
+    assert "--now" not in out
+    assert "IMDS is never called under --root" in out
     assert tree_snapshot(root) == before
     assert sandbox.recorded_calls() == []
+    assert list(tmpdir.iterdir()) == [], "a dry run must not create temp folders"
 
 
 def test_a_second_dry_run_is_identical(sandbox) -> None:
@@ -83,17 +84,87 @@ def test_a_second_dry_run_is_identical(sandbox) -> None:
     assert first.stdout == second.stdout
 
 
-def test_an_existing_box_env_is_kept(sandbox) -> None:
+def seed_volume_box_env(root: Path) -> Path:
+    vol = root / "Users" / ".cao-box" / "box.env"
+    vol.parent.mkdir(parents=True)
+    vol.write_text(f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n", encoding="utf-8")
+    return vol
+
+
+def test_a_real_root_run_writes_the_files_with_the_right_modes(sandbox) -> None:
     root = make_root(sandbox.root)
-    (root / "etc" / "cao-box").mkdir(parents=True)
-    (root / "etc" / "cao-box" / "box.env").write_text(
-        "CAO_BOX_SESSION=cao-i-00000000feedface0\n", encoding="utf-8"
-    )
-    arm_stubs(sandbox)
-    result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), **SETTINGS)
+    vol = seed_volume_box_env(root)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    etc_env = root / "etc" / "cao-box" / "box.env"
+    assert etc_env.read_text(encoding="utf-8") == vol.read_text(encoding="utf-8")
+    assert mode(etc_env) == 0o644
+    backup_env = root / "etc" / "cao-box" / "backup.env"
+    assert mode(backup_env) == 0o644
+    assert "BACKUP_KMS_KEY_ARN=arn:aws:kms:" in backup_env.read_text(encoding="utf-8")
+    for unit in UNITS:
+        path = root / "etc" / "systemd" / "system" / unit
+        assert mode(path) == 0o644
+        text = path.read_text(encoding="utf-8")
+        assert "@BOX_" not in text
+        if not unit.endswith(".timer"):
+            assert "/Users/boxuser" in text
+    for script in ["herdr-start.sh", "wait-herdr-socket.sh", "backup.sh", "restore.sh"]:
+        assert mode(root / "usr" / "local" / "lib" / "cao-box" / script) == 0o755
+    settings = root / "Users" / "boxuser" / ".aws" / "cli-agent-orchestrator" / "settings.json"
+    assert f'"herdr_session": "{SESSION}"' in settings.read_text(encoding="utf-8")
+    assert mode(root / "Users" / "boxuser" / ".claude" / "settings.json") == 0o600
+    # The only system command a --root run may call is the offline enable.
+    assert sandbox.recorded_calls() == [
+        f"systemctl --root={root} enable herdr-cao.service cao-server.service cao-backup.timer"
+    ]
+
+    again = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    assert again.returncode == 0, again.stderr
+    assert "installed:" not in again.stdout and "wrote:" not in again.stdout
+
+
+def test_a_root_run_without_box_env_never_calls_imds(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
     assert result.returncode == 0, result.stderr
-    assert "kept existing" in result.stdout and "cao-i-00000000feedface0" in result.stdout
-    assert "would read the instance id" not in result.stdout
+    assert "IMDS is never called under --root" in result.stdout
+    assert not (root / "etc" / "cao-box" / "box.env").exists()
+    assert not any(call.startswith("curl") for call in sandbox.recorded_calls())
+
+
+def test_settings_that_disagree_with_box_env_stop_the_run(sandbox) -> None:
+    root = make_root(sandbox.root)
+    seed_volume_box_env(root)
+    settings = root / "Users" / "boxuser" / ".aws" / "cli-agent-orchestrator" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        '{"terminal": {"herdr_session": "cao-i-0000000000000000b"}}\n', encoding="utf-8"
+    )
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    assert result.returncode == 1
+    assert "make them match" in result.stderr
+
+
+def test_a_changed_backup_target_is_rewritten_and_an_unset_one_is_kept(sandbox) -> None:
+    root = make_root(sandbox.root)
+    seed_volume_box_env(root)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    backup_env = root / "etc" / "cao-box" / "backup.env"
+    assert sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS).returncode == 0
+    changed = {**SETTINGS, "BACKUP_S3_URI": "s3://example-bucket/other/"}
+    assert sandbox.run("bootstrap.sh", "--root", str(root), **changed).returncode == 0
+    assert "s3://example-bucket/other/" in backup_env.read_text(encoding="utf-8")
+    unset = {k: v for k, v in SETTINGS.items() if not k.startswith("BACKUP_")}
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **unset)
+    assert result.returncode == 0
+    assert "kept" in result.stdout and "s3://example-bucket/other/" in result.stdout
+    assert "s3://example-bucket/other/" in backup_env.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -110,23 +181,37 @@ def test_refuses_anything_but_ubuntu_2404_arm64(sandbox, os_id, version, arch) -
     assert sandbox.recorded_calls() == []
 
 
-def test_refuses_without_required_settings(sandbox) -> None:
+@pytest.mark.parametrize(
+    ("drop_or_change", "message"),
+    [
+        ({"CAO_REF": None}, "set CAO_REF"),
+        ({"HERDR_SHA256": None}, "set HERDR_SHA256"),
+        ({"BOX_UID": None}, "set BOX_UID"),
+        ({"HERDR_SHA256": "abc"}, "64 lowercase hex"),
+        ({"BOX_UID": "0"}, "BOX_UID must be"),
+        ({"BOX_USER": "x; rm"}, "plain Linux user name"),
+        ({"BOX_HOME": "/Users/boxuser/a b"}, "BOX_HOME must be"),
+        ({"BOX_HOME": "/Users/boxuser/a|b"}, "BOX_HOME must be"),
+        ({"BOX_HOME": "/Users/../etc"}, "contain .."),
+        ({"DATA_VOLUME_ID": "vol-123"}, "DATA_VOLUME_ID looks like"),
+        ({"DATA_DEVICE": "/dev/nvme1n1"}, "DATA_DEVICE alone is not accepted"),
+        ({"BACKUP_KMS_KEY_ARN": None}, "BACKUP_KMS_KEY_ARN"),
+        ({"INSTALL_DOCKER": "maybe"}, "INSTALL_DOCKER is yes or no"),
+    ],
+)
+def test_bad_settings_stop_the_run(sandbox, drop_or_change, message) -> None:
     root = make_root(sandbox.root)
     arm_stubs(sandbox)
-    partial = {k: v for k, v in SETTINGS.items() if k != "CAO_REF"}
-    result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), **partial)
+    settings = dict(SETTINGS)
+    for key, value in drop_or_change.items():
+        if value is None:
+            settings.pop(key, None)
+        else:
+            settings[key] = value
+    result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), **settings)
     assert result.returncode != 0
-    assert "set CAO_REF" in result.stderr
-
-
-def test_rejects_a_bad_user_name(sandbox) -> None:
-    root = make_root(sandbox.root)
-    arm_stubs(sandbox)
-    result = sandbox.run(
-        "bootstrap.sh", "--dry-run", "--root", str(root), **{**SETTINGS, "BOX_USER": "x; rm"}
-    )
-    assert result.returncode != 0
-    assert "plain Linux user name" in result.stderr
+    assert message in result.stderr
+    assert "== 1." not in result.stdout
 
 
 def test_unknown_flag_is_an_error(sandbox) -> None:
@@ -138,4 +223,4 @@ def test_unknown_flag_is_an_error(sandbox) -> None:
 def test_help_prints_the_header(sandbox) -> None:
     result = sandbox.run("bootstrap.sh", "--help")
     assert result.returncode == 0
-    assert "--dry-run" in result.stdout and "set -euo" not in result.stdout
+    assert "--format-new-volume" in result.stdout and "set -euo" not in result.stdout

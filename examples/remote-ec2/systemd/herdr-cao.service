@@ -11,6 +11,8 @@
 # `herdr --session cao-<instance-id> server`.
 #
 # Never make this unit PartOf= cao-server: restarting CAO must not kill panes.
+# Restart=always: herdr also comes back after a clean exit (for example
+# `herdr server stop`); the panes are gone either way, but the session is not.
 
 [Unit]
 Description=herdr server for CAO (session from /etc/cao-box/box.env)
@@ -28,7 +30,7 @@ Environment=PATH=@BOX_HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=LANG=C.UTF-8
 Environment=TERM=xterm-256color
 ExecStart=/usr/local/lib/cao-box/herdr-start.sh
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]

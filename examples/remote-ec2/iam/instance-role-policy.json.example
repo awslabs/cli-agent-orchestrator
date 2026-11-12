@@ -2,7 +2,17 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "InvokeTheModelsYouUse",
+      "Sid": "SessionManagerOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:UpdateInstanceInformation",
+        "ssmmessages:*",
+        "ec2messages:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "InvokeNamedProfiles",
       "Effect": "Allow",
       "Action": [
         "bedrock:InvokeModel",
@@ -12,24 +22,53 @@
         "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/au.anthropic.claude-sonnet-5-5",
         "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/au.anthropic.claude-opus-5-5",
         "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/au.anthropic.claude-haiku-5-5",
-        "arn:aws:bedrock:ap-southeast-2::foundation-model/anthropic.claude-*",
-        "arn:aws:bedrock:ap-southeast-4::foundation-model/anthropic.claude-*"
+        "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/global.anthropic.claude-sonnet-5-5",
+        "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/global.anthropic.claude-opus-5-5",
+        "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/global.anthropic.claude-haiku-5-5"
       ]
     },
     {
-      "Sid": "WriteBackupsOnly",
+      "Sid": "InvokeModelsOnlyThroughThoseProfiles",
       "Effect": "Allow",
-      "Action": "s3:PutObject",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:ap-southeast-2::foundation-model/anthropic.claude-sonnet-5-5",
+        "arn:aws:bedrock:ap-southeast-2::foundation-model/anthropic.claude-opus-5-5",
+        "arn:aws:bedrock:ap-southeast-2::foundation-model/anthropic.claude-haiku-5-5",
+        "arn:aws:bedrock:ap-southeast-4::foundation-model/anthropic.claude-sonnet-5-5",
+        "arn:aws:bedrock:ap-southeast-4::foundation-model/anthropic.claude-opus-5-5",
+        "arn:aws:bedrock:ap-southeast-4::foundation-model/anthropic.claude-haiku-5-5",
+        "arn:aws:bedrock:::foundation-model/anthropic.claude-sonnet-5-5",
+        "arn:aws:bedrock:::foundation-model/anthropic.claude-opus-5-5",
+        "arn:aws:bedrock:::foundation-model/anthropic.claude-haiku-5-5"
+      ],
+      "Condition": {
+        "StringLike": {
+          "bedrock:InferenceProfileArn": [
+            "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/au.anthropic.claude-sonnet-5-5",
+            "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/au.anthropic.claude-opus-5-5",
+            "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/au.anthropic.claude-haiku-5-5",
+            "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/global.anthropic.claude-sonnet-5-5",
+            "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/global.anthropic.claude-opus-5-5",
+            "arn:aws:bedrock:ap-southeast-2:<account-id>:inference-profile/global.anthropic.claude-haiku-5-5"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "WriteAndReadBackupsOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
       "Resource": "arn:aws:s3:::<backup-bucket>/cao-box/*"
     },
     {
-      "Sid": "ReadBackupsForRestore",
-      "Effect": "Allow",
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::<backup-bucket>/cao-box/*"
-    },
-    {
-      "Sid": "EncryptBackups",
+      "Sid": "BackupKey",
       "Effect": "Allow",
       "Action": [
         "kms:GenerateDataKey",

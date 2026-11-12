@@ -44,10 +44,12 @@ Telegram app  <---- Telegram API ---->   cao-telegram-relay.service (optional, s
 - cao-server listens on `127.0.0.1` only. You reach the dashboard through an
   SSH tunnel.
 - The herdr server, and so every pane, starts with only `HOME`, `USER`,
-  `PATH`, `LANG` and `TERM` in its environment. There are no tokens in any
-  unit except the optional relay's.
-- After a reboot, herdr starts with an empty layout and CAO relaunches agents
-  with the right flags. No bare-shell pane gets an inbox message.
+  `PATH`, `LANG` and `TERM` in its environment. No unit that agents can
+  reach holds a token. The optional relay runs as its own user.
+- After a reboot, the herdr unit moves the saved layout aside before herdr
+  starts, and cao-server starts only once that herdr's socket exists, so CAO
+  never starts a herdr of its own. CAO then relaunches agents with the right
+  flags. Phase 0 checks that herdr really comes up empty.
 
 ## Before you start
 
@@ -69,6 +71,7 @@ Decisions this sample has already made for you, all of which you can change:
 | OS | Ubuntu 24.04 LTS, arm64 | glibc 2.39. It's the OS that Docker's, Claude Code's, VS Code's and Kiro's install docs name. Security updates run to 2029. |
 | Home path | Your laptop's home path, for example `/Users/<you>` | Absolute paths in your kits, prompts and memory keep working unchanged. |
 | Editing | `hx` and `yazi` in herdr panes | Nothing to sync. VS Code Remote-SSH is optional. |
+| Docker | Off (`INSTALL_DOCKER=yes` turns it on) | Membership of the `docker` group is root on the box, for every agent. |
 
 ## Quick start
 
@@ -97,13 +100,15 @@ aws ssm get-parameter --region ap-southeast-2 \
 
 Edit [`iam/instance-role-policy.json.example`](iam/instance-role-policy.json.example)
 first: fill in `<account-id>`, `<backup-bucket>` and `<backup-key-id>`, and
-keep only the models you use.
+keep only the models you use. Read [`iam/README.md`](iam/README.md): the ARN
+forms are marked **check before use**. The policy replaces the managed
+`AmazonSSMManagedInstanceCore` with the few SSM actions Session Manager
+needs, because the managed policy would let every agent read Parameter
+Store.
 
 ```bash
 aws iam create-role --role-name <cao-box-role> \
   --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-aws iam attach-role-policy --role-name <cao-box-role> \
-  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 aws iam put-role-policy --role-name <cao-box-role> --policy-name cao-box \
   --policy-document file://iam/instance-role-policy.json.example
 aws iam create-instance-profile --instance-profile-name <cao-box-profile>
@@ -120,7 +125,12 @@ aws s3api put-public-access-block --bucket <backup-bucket> \
 aws s3api put-bucket-versioning --bucket <backup-bucket> --versioning-configuration Status=Enabled
 aws s3api put-bucket-encryption --bucket <backup-bucket> --server-side-encryption-configuration \
   '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"<backup-key-arn>"}}]}'
+aws s3api put-bucket-policy --bucket <backup-bucket> \
+  --policy file://iam/backup-bucket-policy.json.example     # TLS only, this KMS key only
 ```
+
+The backups hold CAO's database, and that includes message text. Treat the
+bucket like the box.
 
 ### 5. Launch the box
 
@@ -144,6 +154,14 @@ aws ec2 run-instances --region ap-southeast-2 \
 The subnet needs outbound internet (a NAT gateway, or a public IP with no
 inbound rules) or VPC endpoints for SSM, Bedrock and S3.
 
+Write down the data volume's id (`vol-...`). `bootstrap.sh` finds the disk
+by that id, never by device name:
+
+```bash
+aws ec2 describe-instances --region ap-southeast-2 --instance-ids <instance-id> \
+  --query 'Reservations[].Instances[].BlockDeviceMappings[?DeviceName==`/dev/sdf`].Ebs.VolumeId' --output text
+```
+
 ### 6. First login and your SSH key
 
 Session Manager gets you a shell before SSH is set up:
@@ -153,19 +171,42 @@ aws ssm start-session --region ap-southeast-2 --target <instance-id>
 ```
 
 Copy the sample to the box, for example with `git clone` of this repository.
-Then run a dry run (it prints every step and changes nothing), and after that
-the real thing. On Nitro instances the data volume shows up as an NVMe device:
-check with `lsblk`.
+Put the settings in a file, so every run uses the same ones. Every download
+is checked against a sha256, and a missing or wrong checksum stops the run.
+Copy each value from the release's published checksums (see
+[Tools](#tools-on-linux-arm64)).
 
 ```bash
 cd cli-agent-orchestrator/examples/remote-ec2
-lsblk
-sudo BOX_USER=<you> BOX_HOME=/Users/<you> DATA_DEVICE=/dev/nvme1n1 \
-     HERDR_VERSION=<laptop-herdr-version> CAO_REF=<cao-commit-sha> \
-     BACKUP_S3_URI=s3://<backup-bucket>/cao-box/ \
-     bash bootstrap.sh --dry-run
-sudo BOX_USER=<you> ... bash bootstrap.sh      # same settings, no --dry-run
+cat > box-settings.env <<'EOF'
+BOX_USER=<you>
+BOX_UID=<uid>                 # pick one (for example your laptop uid) and never change it
+BOX_HOME=/Users/<you>
+DATA_VOLUME_ID=<vol-id>
+HERDR_VERSION=<laptop-herdr-version>
+HERDR_SHA256=<sha256 of herdr-linux-aarch64>
+CAO_REF=<cao-commit-sha>
+BACKUP_S3_URI=s3://<backup-bucket>/cao-box/
+BACKUP_KMS_KEY_ARN=<backup-key-arn>
+AWS_CLI_VERSION=<version>
+AWS_CLI_SHA256=<sha256>
+SAM_VERSION=<version>
+SAM_SHA256=<sha256>
+YAZI_SHA256=<sha256>
+HELIX_SHA256=<sha256>
+UV_VERSION=<version>
+UV_SHA256=<sha256>
+EOF
+sudo env $(cat box-settings.env | sed 's/ *#.*//') bash bootstrap.sh --dry-run
+sudo env $(cat box-settings.env | sed 's/ *#.*//') bash bootstrap.sh --format-new-volume   # first run only
 ```
+
+The data-volume step formats **only** a disk that matches `DATA_VOLUME_ID`'s
+NVMe serial, is a whole disk, isn't the root disk, has no partitions, holders
+or mounts, has no signatures (`wipefs -n` is empty and `blkid -p` exits 2),
+**and** you passed `--format-new-volume`. Any other outcome stops the run.
+A disk that already has ext4 or xfs is mounted as it is. Leave the flag off
+on later runs.
 
 Then add your laptop's **public** key to `/Users/<you>/.ssh/authorized_keys`
 (mode 0600, owned by `<you>`).
@@ -181,15 +222,23 @@ herdr machine add cao-box --remote-session cao-<instance-id> --label cao-box
 ```
 
 **If `herdr machine add` offers to stop the remote server, answer No** (that's
-the default). The session name is in `/etc/cao-box/box.env` on the box.
+the default). The session name is in `/etc/cao-box/box.env` on the box (and
+a copy on the data volume, see [Backups and restore](#backups-and-restore)).
 
 ### 8. Start the services, log in, check
 
-On the box, as `<you>`:
+From your admin shell (the Session Manager shell; `<you>` has no sudo, and
+shouldn't):
 
 ```bash
-sudo systemctl start herdr-cao.service cao-server.service
+sudo systemctl start herdr-cao.service
+sudo systemctl start cao-server.service     # waits for herdr's socket; fails if it never appears
 curl -fsS http://127.0.0.1:9889/health
+```
+
+Then as `<you>` (over SSH, or in a herdr pane):
+
+```bash
 claude          # Bedrock through the instance role, see config/claude-settings.box.json.example
 codex login --device-auth
 gh auth login
@@ -205,8 +254,11 @@ Do quick-start steps 1–7, then start only `herdr-cao.service`. From the
 laptop's herdr, open a pane on the box and run `top`.
 - Reboot the laptop. The box's session should be listed again and `top` still
   running.
-- Reboot the box. The unit should come back by itself with an empty layout,
-  and the old layout should be in `restore-archive/`.
+- Reboot the box. The unit should come back by itself, the old layout
+  should be in `restore-archive/`, and herdr should show **no** old panes.
+  This sample assumes herdr starts empty when `session.json` is missing; it
+  wasn't verified that herdr never falls back to `session-snapshots/`. If it
+  does, stop here and report it.
 - Check `kiro-cli` here if you use Kiro: its docs don't confirm a
   linux-arm64 build. Claude Code and Codex work without it.
 
@@ -254,9 +306,25 @@ Ubuntu 24.04 arm64. `bootstrap.sh` refuses to run anywhere else.
 
 herdr, Claude Code, Codex CLI, `gh`, AWS CLI v2, SAM CLI, Docker, `yazi` and
 `hx` all publish arm64 builds. `bootstrap.sh` installs the non-agent tools at
-pinned versions (`HERDR_VERSION`, `GH_VERSION`, `YAZI_VERSION`,
-`HELIX_VERSION`). Docker comes from Ubuntu's `docker.io` package; use
-Docker's own apt repository if you need a newer one.
+pinned versions, and checks each download before it runs or installs it:
+
+| Tool | Pin | Checksum |
+|---|---|---|
+| herdr | `HERDR_VERSION` | `HERDR_SHA256`, required |
+| gh | `GH_VERSION` | read from the release's published `gh_<version>_checksums.txt` |
+| AWS CLI v2 | `AWS_CLI_VERSION` (a versioned zip) | `AWS_CLI_SHA256`. AWS also signs the zip with PGP: verify the signature by hand first if you want more than a checksum. |
+| SAM CLI | `SAM_VERSION` | `SAM_SHA256` |
+| yazi | `YAZI_VERSION` | `YAZI_SHA256` |
+| hx (helix) | `HELIX_VERSION` | `HELIX_SHA256` |
+| uv | `UV_VERSION` (the release tarball, not the install script) | `UV_SHA256` |
+
+A missing or wrong checksum stops the run. A checksum taken from the same
+release page proves the file wasn't damaged or swapped in transit, not who
+made it; that's the trust you'd give the project anyway.
+- Docker is optional and off by default (`INSTALL_DOCKER=yes`), from Ubuntu's
+  `docker.io` package. Adding the user to the `docker` group makes every
+  agent root on the box (`docker run -v /:/host ...`). Prefer rootless Docker
+  if you need containers.
 - Asset names change now and then. If a download 404s, check the release page
   and adjust the URL in `bootstrap.sh`.
 - kiro-cli on linux-arm64 is **not confirmed** by Kiro's docs. Try it in
@@ -290,7 +358,20 @@ you typed.
 ### cao-server
 
 It listens on loopback only (`--host 127.0.0.1` in the unit, on purpose) and
-is never public. The dashboard goes through `ssh -N cao-box-dash` and
+is never public.
+
+**It must never start its own herdr.** When CAO finds no herdr socket for its
+session, it starts a herdr server itself. That herdr would skip the
+clean-layout step and the minimal environment, and would live in
+cao-server's cgroup, so restarting cao-server would kill every pane. So the
+unit has `Requires=` and `After=herdr-cao.service`, and an `ExecStartPre`
+gate ([`bin/wait-herdr-socket.sh`](bin/wait-herdr-socket.sh)) that waits for
+herdr's socket and fails if it never appears.
+
+The same is true of any `cao` command you run by hand: if herdr is down, it
+starts a herdr of its own. So check `systemctl is-active herdr-cao` before
+running `cao` commands after a problem. A CAO setting to turn the auto-start
+off is a planned follow-up. The dashboard goes through `ssh -N cao-box-dash` and
 `http://127.0.0.1:19889`. There's exactly one cao-server per CAO home, so
 never point the laptop's CAO at the box's files.
 
@@ -300,16 +381,21 @@ never point the laptop's CAO at the box's files.
   `LANG`, `TERM`), and [`bin/herdr-start.sh`](bin/herdr-start.sh) runs herdr
   under `env -i`. Panes inherit the herdr server's environment, so that's all
   an agent sees from systemd.
-- The Telegram token sits in a mode 0600 file that only the relay unit reads.
+- The Telegram relay runs as its own system user, `cao-relay`. Its token
+  file belongs to that user, mode 0600, so agents can read neither the file
+  nor the relay's process environment.
 - Agent CLIs log in on the box, with their own device flows. Don't copy login
   files from the laptop.
 - **Every agent can reach the instance role** through the instance metadata
   service. So keep the role narrow: Bedrock invoke on the profiles you use,
   `s3:PutObject` and `s3:GetObject` on one prefix, the SSM core policy, and
-  nothing for IAM, EC2 or Secrets Manager. IMDSv2 with hop limit 1 keeps
-  containers on the box from reaching it. The exact Bedrock resource ARNs for
-  cross-Region profiles are worth checking against the Bedrock docs before
-  you rely on the example policy.
+  nothing for IAM, EC2, Secrets Manager or Parameter Store. IMDSv2 with hop
+  limit 1 keeps containers on a bridged network from reaching it (a
+  `--network host` container still can). The ARN forms in
+  [`iam/`](iam/README.md) are marked "check before use".
+- **What's left.** Any agent can read anything the box user owns: other
+  CLIs' login files, your kit, memory. Never give the box user `sudo` or the
+  `docker` group unless you accept that every agent is root.
 
 ### herdr
 
@@ -326,11 +412,14 @@ shells, or as agents without CAO's flags. So the herdr unit's start script
 moves the saved layout into a dated `restore-archive/` folder first, and
 [`config/herdr-config.toml.snippet`](config/herdr-config.toml.snippet) sets
 `resume_agents_on_restore = false`. CAO then relaunches agents with the right
-flags. herdr's own `session-snapshots/` are kept.
+flags. herdr's own `session-snapshots/` are kept. That herdr then comes up
+empty is an assumption that phase 0 checks.
 
 The session name is `cao-<instance-id>`. It's read once from the instance
-metadata (IMDSv2) at bootstrap and kept in `/etc/cao-box/box.env`. It's
-never recomputed, so it doesn't drift, and it survives stop and start.
+metadata (IMDSv2) at bootstrap and kept in `.cao-box/box.env` on the data
+volume, with a copy in `/etc/cao-box/box.env` for the units. It's never
+recomputed, so it doesn't drift, and it survives stop and start and a
+whole-box restore.
 
 ### Editing
 
@@ -340,8 +429,8 @@ two-way sync, so there are never two copies to reconcile.
 
 ### Telegram
 
-Use a second bot just for the box, and set it up one step at a time: see
-[`telegram/README.md`](telegram/README.md).
+Use a second bot just for the box, run its relay as its own user, and set it
+up one step at a time: see [`telegram/README.md`](telegram/README.md).
 
 ### Data
 
@@ -355,8 +444,9 @@ Use a second bot just for the box, and set it up one step at a time: see
 
 ### The home path
 
-`bootstrap.sh` creates the user with `BOX_HOME` as their real home and mounts
-the data volume at its parent (`DATA_MOUNT`, for example `/Users`). Set
+`bootstrap.sh` creates the user with `BOX_HOME` as their real home, uid and
+gid `BOX_UID`, and mounts the data volume at its parent (`DATA_MOUNT`, for
+example `/Users`). Set
 `BOX_HOME` to your laptop's home path, and absolute paths in your kits keep
 working.
 
@@ -365,12 +455,16 @@ working.
   sees `/home/...` and may disagree.
 - **No kit paths to keep?** Use the ordinary layout instead:
   `BOX_HOME=/home/<you> DATA_MOUNT=/home/<you>`. That mounts the volume as the
-  home itself and leaves the default `ubuntu` user alone.
+  home itself and leaves the default `ubuntu` user alone. `bootstrap.sh`
+  gives the freshly mounted folder to `<you>` and copies `/etc/skel` into it.
 
 ## Backups and restore
 
 [`backup.sh`](backup.sh) runs nightly from `cao-backup.timer`. It keeps 14
-local copies in `~/backups/cao/` and uploads each one to `BACKUP_S3_URI`.
+local copies in `~/backups/cao/` (folder 0700, files 0600) and uploads each
+one to `BACKUP_S3_URI`, asking for SSE-KMS with `BACKUP_KMS_KEY_ARN`. The
+backups hold message text: inbox, handoff results, launch records and
+memory metadata.
 
 ```bash
 # A drill: restore into a temp folder, check it, touch nothing live. Monthly.
@@ -380,15 +474,25 @@ local copies in `~/backups/cao/` and uploads each one to `BACKUP_S3_URI`.
 /usr/local/lib/cao-box/restore.sh --live ~/backups/cao/cao-<stamp>.db.gz --yes
 ```
 
-`--live` doesn't touch herdr, so running panes keep running. It refuses to
-write over a database that still has a `-journal`, `-wal` or `-shm` file next
-to it.
+- A drill refuses a `--to` folder inside the live CAO home, or any folder
+  that isn't empty.
+- `--live` checks the backup, stops cao-server, keeps the current database as
+  `<db>.pre-restore-<stamp>` (0600), swaps, starts, and waits for `/health`.
+  It refuses to write over a database that still has a `-journal`, `-wal` or
+  `-shm` file next to it, and it doesn't touch herdr, so running panes keep
+  running.
+- Don't run `cao` CLI commands during a live restore: some open the database
+  directly.
 
 **Whole-box restore:**
 1. Make a volume from a snapshot and attach it to a fresh instance.
-2. Run `bootstrap.sh` with the same settings. It finds the filesystem, skips
-   formatting, and keeps the existing `box.env`, so the session name stays
-   the same.
+2. Run `bootstrap.sh` with the same settings, the same `BOX_UID` and the new
+   `DATA_VOLUME_ID`, without `--format-new-volume`.
+3. It finds the filesystem and mounts it, checks the home belongs to
+   `BOX_UID`, and copies `.cao-box/box.env` from the volume to `/etc/cao-box/`.
+   So the session name stays the old one, and it matches CAO's `settings.json`
+   and the laptop's saved machine. It stops if `settings.json` and `box.env`
+   disagree.
 
 ## Checking it works
 
@@ -420,9 +524,15 @@ name stays the same. `Persistent=true` runs a missed backup at boot. You
 still pay for the EBS volumes and snapshots while it's stopped.
 
 **Does cao-server restarting kill my agents?**
-No. The panes belong to herdr, and cao-server reconnects to herdr's socket.
-Restarting herdr does end the panes. That's why the units are separate and
-herdr is never `PartOf=` cao-server.
+No. The panes belong to herdr's own unit, and cao-server reconnects to
+herdr's socket. That holds because cao-server never starts a herdr of its
+own: its start waits for herdr-cao's socket and fails without it (see
+[cao-server](#cao-server)). Restarting herdr does end the panes, and because
+of `Requires=` it restarts cao-server too.
+
+**Can I use Docker on the box?**
+Yes: `INSTALL_DOCKER=yes`. But the `docker` group is root-equivalent, so every
+agent becomes root on the box. Rootless Docker avoids that.
 
 **How do I turn on `CAO_AUTH_LOCAL_TOKEN`?**
 Put it in a root-owned 0600 file, for example `/etc/cao-box/cao-auth.env`.
@@ -433,7 +543,8 @@ Then add it with `sudo systemctl edit cao-server`:
 EnvironmentFile=/etc/cao-box/cao-auth.env
 ```
 
-It's all-or-nothing, and CAO passes it to every agent pane. Read
+It's all-or-nothing, and CAO passes it to every agent pane. If the box user
+is in the `docker` group, agents can read the file too. Read
 [the configuration docs](../../docs/configuration.md) first.
 
 **Which CAO version does the box run?**
@@ -467,7 +578,6 @@ aws s3api delete-bucket --bucket <backup-bucket>   # after deleting every object
 aws iam remove-role-from-instance-profile --instance-profile-name <cao-box-profile> --role-name <cao-box-role>
 aws iam delete-instance-profile --instance-profile-name <cao-box-profile>
 aws iam delete-role-policy --role-name <cao-box-role> --policy-name cao-box
-aws iam detach-role-policy --role-name <cao-box-role> --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 aws iam delete-role --role-name <cao-box-role>
 ```
 
@@ -479,15 +589,16 @@ Then remove the `cao-box` entries from the laptop's `~/.ssh/config`, run
 
 | File | What it does |
 |---|---|
-| [`bootstrap.sh`](bootstrap.sh) | Sets up the box. Idempotent, with `--dry-run`. Ubuntu 24.04 arm64 only. Enables units but never starts them. |
+| [`bootstrap.sh`](bootstrap.sh) | Sets up the box. Idempotent, with `--dry-run`. Ubuntu 24.04 arm64 only. Formats only a verified blank data volume, and only with `--format-new-volume`. Checks every download's sha256. Enables units but never starts them. |
 | [`backup.sh`](backup.sh), [`restore.sh`](restore.sh) | Nightly backup; restore drill and live restore. |
 | [`bin/box-session-name.sh`](bin/box-session-name.sh) | Prints `cao-<instance-id>` from IMDSv2. |
 | [`bin/herdr-start.sh`](bin/herdr-start.sh), [`bin/herdr-clean-layout.sh`](bin/herdr-clean-layout.sh) | Start herdr with the minimal environment, after moving the saved layout aside. |
+| [`bin/wait-herdr-socket.sh`](bin/wait-herdr-socket.sh) | cao-server's start gate: waits for herdr's socket, fails without it. |
 | [`bin/box-resume.sh`](bin/box-resume.sh) | Read-only checks after a reboot. |
 | [`bin/resource-probe-linux.sh`](bin/resource-probe-linux.sh), [`resource-gate-linux.md`](resource-gate-linux.md) | A Linux memory-pressure probe, and why a macOS-only gate stalls. |
 | [`systemd/`](systemd/) | `herdr-cao.service`, `cao-server.service`, `cao-backup.service` and `.timer`, and the optional relay unit. |
 | [`config/`](config/) | Box versions of the herdr, CAO and Claude Code settings (Sydney model ids). |
-| [`iam/instance-role-policy.json.example`](iam/instance-role-policy.json.example) | A narrow instance-role policy to adapt. |
+| [`iam/`](iam/README.md) | A narrow instance-role policy and a backup-bucket policy, with what to check before use. |
 | [`ssh/config.snippet`](ssh/config.snippet) | The laptop's SSH entries, plus the `herdr machine add` command. |
 | [`telegram/README.md`](telegram/README.md) | The second bot, step by step. |
 
@@ -506,8 +617,14 @@ They cover:
 - the unit files (`systemd-analyze verify` where it exists, otherwise a
   structural parse);
 - the herdr environment allowlist and the loopback bind;
-- a `bootstrap.sh --dry-run` in a fake root that must change nothing, and
-  its refusal on the wrong OS;
+- `bootstrap.sh --dry-run` against stubbed system commands, through every
+  step: the data-volume guard (blank, partition table only, blkid 4 and 8,
+  the root disk, a wrong serial, partitions, holders, no flag), user and
+  home ownership, pins and checksums, and `systemctl enable` without
+  `--now`;
+- a `--root` dry run that must change nothing, a real `--root` run (file
+  modes, no IMDS call), and the refusal on the wrong OS;
+- the cao-server socket gate;
 - the session name from a mocked IMDSv2;
 - a backup and restore round trip with `integrity_check`;
 - the clean-layout step and the resource probe;

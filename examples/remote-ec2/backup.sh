@@ -17,12 +17,16 @@
 #   BACKUP_DIR     default $HOME/backups/cao
 #   BACKUP_KEEP    default 14
 #   BACKUP_S3_URI  for example s3://<bucket>/cao-box/   (empty = no upload)
+#   BACKUP_KMS_KEY_ARN  the bucket's KMS key; required with BACKUP_S3_URI.
+#                  Uploads ask for SSE-KMS with this key explicitly, so the
+#                  bucket policy can refuse anything else.
 set -euo pipefail
 
 db="${CAO_DB:-$HOME/.aws/cli-agent-orchestrator/db/cli-agent-orchestrator.db}"
 dest="${BACKUP_DIR:-$HOME/backups/cao}"
 keep="${BACKUP_KEEP:-14}"
 s3_uri="${BACKUP_S3_URI:-}"
+kms_key="${BACKUP_KMS_KEY_ARN:-}"
 upload=1
 
 while [ $# -gt 0 ]; do
@@ -31,7 +35,7 @@ while [ $# -gt 0 ]; do
     --dest) dest="$2"; shift ;;
     --keep) keep="$2"; shift ;;
     --no-upload) upload=0 ;;
-    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "backup: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -64,7 +68,9 @@ echo "backup: wrote ${final} (integrity_check ok)"
 
 if [ "$upload" -eq 1 ] && [ -n "$s3_uri" ]; then
   case "$s3_uri" in s3://*/) ;; *) echo "backup: BACKUP_S3_URI must look like s3://<bucket>/<prefix>/" >&2; exit 2 ;; esac
-  aws s3 cp --only-show-errors "$final" "${s3_uri}$(basename "$final")"
+  [ -n "$kms_key" ] || { echo "backup: set BACKUP_KMS_KEY_ARN together with BACKUP_S3_URI" >&2; exit 2; }
+  aws s3 cp --only-show-errors --sse aws:kms --sse-kms-key-id "$kms_key" \
+    "$final" "${s3_uri}$(basename "$final")"
   echo "backup: uploaded to ${s3_uri}$(basename "$final")"
 elif [ "$upload" -eq 1 ]; then
   echo "backup: BACKUP_S3_URI is empty; kept the local copy only" >&2

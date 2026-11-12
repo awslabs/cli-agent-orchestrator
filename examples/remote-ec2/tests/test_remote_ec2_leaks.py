@@ -7,7 +7,13 @@ import re
 from pathlib import Path
 
 import pytest
-from remote_ec2_support import FAKE_INSTANCE_ID, SAMPLE_DIR
+from remote_ec2_support import (
+    FAKE_INSTANCE_ID,
+    FAKE_VOLUME_ID,
+    OTHER_INSTANCE_ID,
+    OTHER_VOLUME_ID,
+    SAMPLE_DIR,
+)
 
 THIS_FILE = Path(__file__).resolve()
 # Placeholder or test-fixture user names that may follow /Users/ or /home/.
@@ -52,7 +58,12 @@ def test_no_leaks(label: str) -> None:
         text = path.read_text(encoding="utf-8")
         for number, line in enumerate(text.splitlines(), start=1):
             for match in pattern.finditer(line):
-                if label == "a real-looking instance id" and match.group(0) == FAKE_INSTANCE_ID:
+                if match.group(0) in {
+                    FAKE_INSTANCE_ID,
+                    FAKE_VOLUME_ID,
+                    OTHER_INSTANCE_ID,
+                    OTHER_VOLUME_ID,
+                }:
                     continue
                 hits.append(f"{path.relative_to(SAMPLE_DIR)}:{number}: {match.group(0)}")
     assert hits == [], f"{label}:\n" + "\n".join(hits)

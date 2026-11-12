@@ -20,6 +20,7 @@ def test_the_sample_has_the_scripts_the_readme_names() -> None:
         "bin/box-session-name.sh",
         "bin/herdr-start.sh",
         "bin/herdr-clean-layout.sh",
+        "bin/wait-herdr-socket.sh",
         "bin/resource-probe-linux.sh",
         "bin/box-resume.sh",
     } <= names

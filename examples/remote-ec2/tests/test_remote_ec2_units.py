@@ -65,14 +65,22 @@ def test_unit_structure(unit: str) -> None:
         assert exec_start == "RELAY_COMMAND"
     else:
         assert exec_start.startswith(("/usr/local/lib/cao-box/", "@BOX_HOME@/")), exec_start
-    assert values(entries, "Service", "User") == ["@BOX_USER@"]
+    expected_user = "cao-relay" if unit.startswith("cao-telegram-relay") else "@BOX_USER@"
+    assert values(entries, "Service", "User") == [expected_user]
 
 
-def test_long_running_units_restart_and_install() -> None:
-    for unit in ["herdr-cao.service", "cao-server.service", "cao-telegram-relay.service.example"]:
-        entries = parse_unit(UNIT_DIR / unit)
-        assert values(entries, "Service", "Restart") == ["on-failure"], unit
-        assert values(entries, "Install", "WantedBy") == ["multi-user.target"], unit
+@pytest.mark.parametrize(
+    ("unit", "restart"),
+    [
+        ("herdr-cao.service", "always"),
+        ("cao-server.service", "on-failure"),
+        ("cao-telegram-relay.service.example", "on-failure"),
+    ],
+)
+def test_long_running_units_restart_and_install(unit: str, restart: str) -> None:
+    entries = parse_unit(UNIT_DIR / unit)
+    assert values(entries, "Service", "Restart") == [restart]
+    assert values(entries, "Install", "WantedBy") == ["multi-user.target"]
 
 
 def test_herdr_unit_environment_is_the_allowlist_and_nothing_else() -> None:
@@ -101,11 +109,25 @@ def test_cao_server_binds_loopback_only() -> None:
     assert "CAO_ALLOWED_HOSTS" not in env_names(entries)
 
 
-def test_cao_server_starts_after_herdr_without_tying_their_lifetimes() -> None:
+def test_cao_server_requires_herdr_and_waits_for_its_socket() -> None:
     entries = parse_unit(UNIT_DIR / "cao-server.service")
-    assert "herdr-cao.service" in " ".join(values(entries, "Unit", "After"))
-    assert "herdr-cao.service" in " ".join(values(entries, "Unit", "Wants"))
-    assert values(entries, "Unit", "Requires") == []
+    assert values(entries, "Unit", "Requires") == ["herdr-cao.service"]
+    assert "herdr-cao.service" in values(entries, "Unit", "After")[0].split()
+    # The gate runs before cao-server: without herdr's socket, CAO would start
+    # a herdr of its own (no clean layout, no minimal env, in CAO's cgroup).
+    assert values(entries, "Service", "ExecStartPre") == [
+        "/usr/local/lib/cao-box/wait-herdr-socket.sh"
+    ]
+    for key in ("PartOf", "BindsTo"):
+        assert values(entries, "Unit", key) == [], key
+
+
+def test_the_relay_runs_as_its_own_user_with_a_root_side_token_file() -> None:
+    entries = parse_unit(UNIT_DIR / "cao-telegram-relay.service.example")
+    assert values(entries, "Service", "User") == ["cao-relay"]
+    assert values(entries, "Service", "Group") == ["cao-relay"]
+    assert "/etc/cao-box/telegram.env" in values(entries, "Service", "EnvironmentFile")
+    assert not any("@BOX_HOME@/.config" in v for v in values(entries, "Service", "EnvironmentFile"))
 
 
 def test_no_core_unit_reads_a_secret_file() -> None:
