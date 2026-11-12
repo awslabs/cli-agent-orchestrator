@@ -201,6 +201,10 @@ sudo env $(cat box-settings.env | sed 's/ *#.*//') bash bootstrap.sh --dry-run
 sudo env $(cat box-settings.env | sed 's/ *#.*//') bash bootstrap.sh --format-new-volume   # first run only
 ```
 
+Keep the settings file to these names. `bootstrap.sh` refuses to run for
+real if any `BOX_TEST_*` variable is set (those are hooks for its dry-run
+tests).
+
 The data-volume step formats **only** a disk that matches `DATA_VOLUME_ID`'s
 NVMe serial, is a whole disk, isn't the root disk, has no partitions, holders
 or mounts, has no signatures (`wipefs -n` is empty and `blkid -p` exits 2),
@@ -457,6 +461,8 @@ working.
   `BOX_HOME=/home/<you> DATA_MOUNT=/home/<you>`. That mounts the volume as the
   home itself and leaves the default `ubuntu` user alone. `bootstrap.sh`
   gives the freshly mounted folder to `<you>` and copies `/etc/skel` into it.
+  In this layout the volume has no root-only folder, so `box.env` lives only
+  in `/etc/cao-box/`. Copy it by hand before a whole-box restore.
 
 ## Backups and restore
 
@@ -467,20 +473,28 @@ backups hold message text: inbox, handoff results, launch records and
 memory metadata.
 
 ```bash
-# A drill: restore into a temp folder, check it, touch nothing live. Monthly.
+# A drill, as <you>: restore into a temp folder, check it, touch nothing live. Monthly.
 /usr/local/lib/cao-box/restore.sh --drill s3://<backup-bucket>/cao-box/cao-<stamp>.db.gz
 
-# The real thing: stop cao-server, swap the DB (keeping the old one), start, wait for /health.
-/usr/local/lib/cao-box/restore.sh --live ~/backups/cao/cao-<stamp>.db.gz --yes
+# The real thing, as root from the admin shell (<you> has no sudo):
+sudo /usr/local/lib/cao-box/restore.sh --live /Users/<you>/backups/cao/cao-<stamp>.db.gz --yes
 ```
 
 - A drill refuses a `--to` folder inside the live CAO home, or any folder
   that isn't empty.
-- `--live` checks the backup, stops cao-server, keeps the current database as
-  `<db>.pre-restore-<stamp>` (0600), swaps, starts, and waits for `/health`.
-  It refuses to write over a database that still has a `-journal`, `-wal` or
-  `-shm` file next to it, and it doesn't touch herdr, so running panes keep
-  running.
+- `--live` runs only as root. It reads the box user from
+  `/etc/cao-box/box-user.env` (written by `bootstrap.sh`, root's), finds the
+  database in that user's home, and refuses if the database isn't the box
+  user's.
+  - It checks the backup, then stops cao-server.
+  - It keeps the current database as `<db>.pre-restore-<stamp>`.
+  - It puts the backup in its place, with both files owned by the box user
+    and in the live database's mode.
+  - It starts cao-server, waits for `/health`, and checks that the live
+    database has the backup's tables.
+  - It refuses to write over a database that still has a `-journal`, `-wal`
+    or `-shm` file next to it.
+  - It doesn't touch herdr, so running panes keep running.
 - Don't run `cao` CLI commands during a live restore: some open the database
   directly.
 
@@ -489,7 +503,9 @@ memory metadata.
 2. Run `bootstrap.sh` with the same settings, the same `BOX_UID` and the new
    `DATA_VOLUME_ID`, without `--format-new-volume`.
 3. It finds the filesystem and mounts it, checks the home belongs to
-   `BOX_UID`, and copies `.cao-box/box.env` from the volume to `/etc/cao-box/`.
+   `BOX_UID`, and reads `.cao-box/box.env` from the volume. The folder must
+   be root's, and the file must be exactly the two session lines with equal
+   values. It then writes those two lines afresh into `/etc/cao-box/box.env`.
    So the session name stays the old one, and it matches CAO's `settings.json`
    and the laptop's saved machine. It stops if `settings.json` and `box.env`
    disagree.
@@ -590,10 +606,11 @@ Then remove the `cao-box` entries from the laptop's `~/.ssh/config`, run
 | File | What it does |
 |---|---|
 | [`bootstrap.sh`](bootstrap.sh) | Sets up the box. Idempotent, with `--dry-run`. Ubuntu 24.04 arm64 only. Formats only a verified blank data volume, and only with `--format-new-volume`. Checks every download's sha256. Enables units but never starts them. |
-| [`backup.sh`](backup.sh), [`restore.sh`](restore.sh) | Nightly backup; restore drill and live restore. |
+| [`backup.sh`](backup.sh), [`restore.sh`](restore.sh) | Nightly backup; a restore drill (as the box user) and a live restore (root only). |
 | [`bin/box-session-name.sh`](bin/box-session-name.sh) | Prints `cao-<instance-id>` from IMDSv2. |
 | [`bin/herdr-start.sh`](bin/herdr-start.sh), [`bin/herdr-clean-layout.sh`](bin/herdr-clean-layout.sh) | Start herdr with the minimal environment, after moving the saved layout aside. |
 | [`bin/wait-herdr-socket.sh`](bin/wait-herdr-socket.sh) | cao-server's start gate: waits for herdr's socket, fails without it. |
+| [`bin/lib-cao-box.sh`](bin/lib-cao-box.sh) | Shared helpers: the checksum check, the strict two-line `box.env` parser, and the root-only ownership checks. |
 | [`bin/box-resume.sh`](bin/box-resume.sh) | Read-only checks after a reboot. |
 | [`bin/resource-probe-linux.sh`](bin/resource-probe-linux.sh), [`resource-gate-linux.md`](resource-gate-linux.md) | A Linux memory-pressure probe, and why a macOS-only gate stalls. |
 | [`systemd/`](systemd/) | `herdr-cao.service`, `cao-server.service`, `cao-backup.service` and `.timer`, and the optional relay unit. |

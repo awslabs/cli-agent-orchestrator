@@ -21,6 +21,7 @@ def test_the_sample_has_the_scripts_the_readme_names() -> None:
         "bin/herdr-start.sh",
         "bin/herdr-clean-layout.sh",
         "bin/wait-herdr-socket.sh",
+        "bin/lib-cao-box.sh",
         "bin/resource-probe-linux.sh",
         "bin/box-resume.sh",
     } <= names
@@ -36,6 +37,10 @@ def test_bash_parses(script) -> None:
 def test_strict_mode_and_shebang(script) -> None:
     text = script.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
+    if script.name.startswith("lib-"):
+        # A sourced library: it must not change the caller's shell options.
+        assert "set -" not in text
+        return
     # box-resume.sh keeps going after a failed check on purpose (-uo, no -e).
     assert "set -euo pipefail" in text or "set -uo pipefail" in text
 

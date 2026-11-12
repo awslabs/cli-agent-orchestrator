@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -161,66 +162,175 @@ def test_restore_refuses_a_corrupt_backup(sandbox) -> None:
     assert not (sandbox.root / "d" / "cli-agent-orchestrator.db").exists()
 
 
-def live_env(sandbox, db: Path | None = None) -> dict[str, str]:
-    """A fake systemctl that logs its calls and, on stop, snapshots the DB."""
-    snapshot = sandbox.root / "db-at-stop.bin"
-    copy = f'if [ "$1" = stop ]; then cp "{db}" "{snapshot}"; fi\n' if db else ""
-    systemctl = write_stub(
-        sandbox.stubs, "fake-systemctl", f'echo "fake-systemctl $*" >> "{sandbox.calls}"\n{copy}'
-    )
-    write_stub(sandbox.stubs, "curl", f'echo "curl $*" >> "{sandbox.calls}"\nexit 0\n')
-    return {"SYSTEMCTL": str(systemctl), "CAO_URL": "http://127.0.0.1:1"}
+class LiveBox:
+    """A fake box for restore.sh --live: a root-looking `id`, the box user in
+    `getent`, a root-owned-looking /etc/cao-box, and the user's live DB."""
+
+    def __init__(self, sandbox, rows: int = 3, db_mode: int = 0o640) -> None:
+        self.sandbox = sandbox
+        self.uid = os.getuid()
+        self.gid = os.getgid()
+        self.home = sandbox.root / "boxhome"
+        self.db = self.home / ".aws" / "cli-agent-orchestrator" / "db" / "cli-agent-orchestrator.db"
+        self.rows = make_db(self.db, rows=rows)
+        self.db.chmod(db_mode)
+        self.etc = sandbox.root / "etc-cao-box"
+        self.etc.mkdir()
+        self.user_env = self.etc / "box-user.env"
+        self.write_user_env(self.uid)
+        self.passwd_uid = self.uid
+        self.run_uid = 0
+        self.etc_mode = "755"
+        self.on_start = ""
+
+    def write_user_env(self, uid: int, extra: str = "") -> None:
+        self.user_env.write_text(
+            f"BOX_USER=boxuser\nBOX_UID={uid}\nBOX_HOME={self.home}\n{extra}", encoding="utf-8"
+        )
+
+    def env(self) -> dict[str, str]:
+        sb = self.sandbox
+        snapshot = sb.root / "db-at-stop.bin"
+        systemctl = write_stub(
+            sb.stubs,
+            "fake-systemctl",
+            f'echo "fake-systemctl $*" >> "{sb.calls}"\n'
+            f'if [ "$1" = stop ]; then cp "{self.db}" "{snapshot}"; fi\n'
+            f'if [ "$1" = start ]; then {self.on_start or ":"}; fi\n',
+        )
+        write_stub(sb.stubs, "curl", f'echo "curl $*" >> "{sb.calls}"\nexit 0\n')
+        write_stub(
+            sb.stubs,
+            "id",
+            f'[ "$1" = "-u" ] && echo {self.run_uid} && exit 0\nexec /usr/bin/id "$@"\n',
+        )
+        line = f"boxuser:x:{self.passwd_uid}:{self.gid}::{self.home}:/bin/bash"
+        write_stub(
+            sb.stubs, "getent", f'[ "$*" = "passwd boxuser" ] && echo "{line}" && exit 0\nexit 2\n'
+        )
+        # /etc/cao-box can't be root-owned in a test: report it as root's.
+        write_stub(
+            sb.stubs,
+            "stat",
+            f'case "$*" in\n  *"{self.etc}"*) echo "0 {self.etc_mode}" ;;\n  *) exec /usr/bin/stat "$@" ;;\nesac\n',
+        )
+        return {
+            "SYSTEMCTL": str(systemctl),
+            "CAO_URL": "http://127.0.0.1:1",
+            "CAO_BOX_ETC": str(self.etc),
+        }
+
+    def restore(self, backup: Path, *flags: str):
+        return self.sandbox.run("restore.sh", "--live", str(backup), *flags, **self.env())
+
+
+def a_backup(sandbox, rows: int = 9) -> tuple[Path, list[tuple]]:
+    backup = sandbox.root / "backup.db"
+    return backup, make_db(backup, rows=rows)
 
 
 def test_live_restore_needs_yes(sandbox) -> None:
-    db = sandbox.root / "live" / "cao.db"
-    make_db(db, rows=3)
-    backup = sandbox.root / "backup.db"
-    make_db(backup, rows=9)
-    result = sandbox.run("restore.sh", "--live", str(backup), "--db", str(db), **live_env(sandbox))
+    box = LiveBox(sandbox)
+    backup, _ = a_backup(sandbox)
+    result = box.restore(backup)
     assert result.returncode == 2
     assert "--yes" in result.stderr
     assert sandbox.recorded_calls() == []
-    assert len(read_rows(db)[1]) == 3
+    assert read_rows(box.db)[1] == box.rows
 
 
-def test_live_restore_swaps_the_database_and_keeps_the_old_one(sandbox) -> None:
-    db = sandbox.root / "live" / "cao.db"
-    old_rows = make_db(db, rows=3)
-    backup = sandbox.root / "backup.db"
-    new_rows = make_db(backup, rows=9)
-    old_bytes = db.read_bytes()
-    result = sandbox.run(
-        "restore.sh", "--live", str(backup), "--db", str(db), "--yes", **live_env(sandbox, db)
-    )
+def test_live_restore_is_root_only(sandbox) -> None:
+    box = LiveBox(sandbox)
+    box.run_uid = os.getuid() or 1000
+    backup, _ = a_backup(sandbox)
+    result = box.restore(backup, "--yes")
+    assert result.returncode == 2
+    assert "root-only" in result.stderr
+    assert sandbox.recorded_calls() == []
+
+
+def test_live_restore_refuses_db_flag(sandbox) -> None:
+    box = LiveBox(sandbox)
+    backup, _ = a_backup(sandbox)
+    result = box.restore(backup, "--yes", "--db", str(box.db))
+    assert result.returncode == 2
+    assert "--db is for drills only" in result.stderr
+
+
+def test_live_restore_swaps_as_the_box_user_and_keeps_modes(sandbox) -> None:
+    box = LiveBox(sandbox, db_mode=0o640)
+    backup, new_rows = a_backup(sandbox)
+    old_bytes = box.db.read_bytes()
+    result = box.restore(backup, "--yes")
     assert result.returncode == 0, result.stderr
+    assert "back on the restored database" in result.stdout
     # cao-server was stopped while the database was still the old one.
     assert (sandbox.root / "db-at-stop.bin").read_bytes() == old_bytes
     calls = sandbox.recorded_calls()
     assert calls[0] == "fake-systemctl stop cao-server.service"
     assert calls[1] == "fake-systemctl start cao-server.service"
     assert calls[2].startswith("curl ") and "http://127.0.0.1:1/health" in calls[2]
-    assert read_rows(db) == ("ok", new_rows)
-    [kept] = list(db.parent.glob("cao.db.pre-restore-*"))
-    assert read_rows(kept) == ("ok", old_rows)
-    assert kept.stat().st_mode & 0o777 == 0o600
-    assert db.stat().st_mode & 0o777 == 0o600
+    assert read_rows(box.db) == ("ok", new_rows)
+    [kept] = list(box.db.parent.glob("cli-agent-orchestrator.db.pre-restore-*"))
+    assert read_rows(kept) == ("ok", box.rows)
+    for path in (box.db, kept):
+        st = path.stat()
+        assert (st.st_uid, st.st_gid, st.st_mode & 0o777) == (box.uid, box.gid, 0o640), path
+
+
+def test_live_restore_fails_if_the_live_db_is_not_the_restored_one(sandbox) -> None:
+    box = LiveBox(sandbox)
+    box.on_start = f'/usr/bin/sqlite3 "{box.db}" "CREATE TABLE surprise (x)"'
+    backup, _ = a_backup(sandbox)
+    result = box.restore(backup, "--yes")
+    assert result.returncode == 1
+    assert "tables differ" in result.stderr
+
+
+def test_live_restore_refuses_a_db_the_box_user_does_not_own(sandbox) -> None:
+    box = LiveBox(sandbox)
+    box.write_user_env(box.uid + 1)
+    box.passwd_uid = box.uid + 1
+    backup, _ = a_backup(sandbox)
+    result = box.restore(backup, "--yes")
+    assert result.returncode == 1
+    assert "isn't owned by boxuser" in result.stderr
+    assert sandbox.recorded_calls() == []
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("extra-line", "exactly BOX_USER, BOX_UID and BOX_HOME"),
+        ("uid-mismatch", "uid isn't"),
+        ("etc-writable", "must be root's"),
+    ],
+)
+def test_live_restore_refuses_a_bad_box_user_file(sandbox, change, message) -> None:
+    box = LiveBox(sandbox)
+    if change == "extra-line":
+        box.write_user_env(box.uid, extra="LD_PRELOAD=/dev/shm/x.so\n")
+    elif change == "uid-mismatch":
+        box.passwd_uid = box.uid + 7
+    else:
+        box.etc_mode = "777"
+    backup, _ = a_backup(sandbox)
+    result = box.restore(backup, "--yes")
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert sandbox.recorded_calls() == []
 
 
 @pytest.mark.parametrize("side", ["-journal", "-wal", "-shm"])
 def test_live_restore_refuses_when_a_sidecar_file_remains(sandbox, side) -> None:
-    db = sandbox.root / "live" / "cao.db"
-    make_db(db, rows=3)
-    (db.parent / f"cao.db{side}").write_bytes(b"hot")
-    backup = sandbox.root / "backup.db"
-    make_db(backup, rows=9)
-    result = sandbox.run(
-        "restore.sh", "--live", str(backup), "--db", str(db), "--yes", **live_env(sandbox)
-    )
+    box = LiveBox(sandbox)
+    (box.db.parent / f"cli-agent-orchestrator.db{side}").write_bytes(b"hot")
+    backup, _ = a_backup(sandbox)
+    result = box.restore(backup, "--yes")
     assert result.returncode == 1
     assert "not restoring over it" in result.stderr
     assert sandbox.recorded_calls() == ["fake-systemctl stop cao-server.service"]
-    assert len(read_rows(db)[1]) == 3
+    assert read_rows(box.db)[1] == box.rows
 
 
 def failing_integrity_sqlite(sandbox) -> None:
@@ -259,17 +369,15 @@ def test_backup_keeps_nothing_when_integrity_check_fails(sandbox) -> None:
 
 
 def test_live_restore_stops_nothing_when_integrity_check_fails(sandbox) -> None:
-    db = sandbox.root / "live" / "cao.db"
-    make_db(db, rows=3)
-    backup = sandbox.root / "backup.db"
-    make_db(backup, rows=9)
-    env = live_env(sandbox)
+    box = LiveBox(sandbox)
+    backup, _ = a_backup(sandbox)
+    env = box.env()
     failing_integrity_sqlite(sandbox)
-    result = sandbox.run("restore.sh", "--live", str(backup), "--db", str(db), "--yes", **env)
+    result = sandbox.run("restore.sh", "--live", str(backup), "--yes", **env)
     assert result.returncode == 1
     assert "nothing changed" in result.stderr
     assert sandbox.recorded_calls() == []
-    assert len(read_rows(db)[1]) == 3
+    assert read_rows(box.db)[1] == box.rows
 
 
 def test_a_drill_refuses_the_live_cao_home(sandbox) -> None:

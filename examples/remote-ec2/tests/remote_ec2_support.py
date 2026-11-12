@@ -252,6 +252,7 @@ class FakeSystem:
             'case "$*" in\n'
             f'  "-u boxuser") {id_user} ;;\n'
             f'  "-nG boxuser") echo "{self.groups}" ;;\n'
+            '  "-u") echo 0 ;;\n'
             '  *) echo "id stub: unexpected $*" >&2; exit 64 ;;\n'
             "esac\n",
         )
@@ -265,7 +266,14 @@ class FakeSystem:
             "  *) exit 2 ;;\n"
             "esac\n",
         )
-        write_stub(stubs, "stat", f'echo "{self.home_owner}"\n')
+        write_stub(
+            stubs,
+            "stat",
+            'case "$*" in\n'
+            '  *"%u %a"*) echo "0 755" ;;\n'
+            f'  *) echo "{self.home_owner}" ;;\n'
+            "esac\n",
+        )
         write_stub(stubs, "dpkg-query", 'printf "install ok installed"\n')
         for name in MUTATING:
             recording_stub(stubs, name, log)

@@ -25,7 +25,7 @@ def short_home():
 
 def box_env(sandbox) -> str:
     path = sandbox.root / "box.env"
-    path.write_text(f"CAO_BOX_SESSION={SESSION}\n", encoding="utf-8")
+    path.write_text(f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n", encoding="utf-8")
     return str(path)
 
 
@@ -81,3 +81,40 @@ def test_a_missing_or_bad_box_env_fails(sandbox, short_home) -> None:
     result = sandbox.run("bin/wait-herdr-socket.sh", HOME=str(short_home), BOX_ENV_FILE=str(bad))
     assert result.returncode == 1
     assert "malformed" in result.stderr
+
+
+def test_a_herdr_session_that_differs_from_the_box_session_fails(sandbox, short_home) -> None:
+    # CAO uses CAO_HERDR_SESSION: if it pointed elsewhere, CAO would find no
+    # socket there and start a herdr of its own. The gate must refuse.
+    sock_dir = short_home / ".config" / "herdr" / "sessions" / SESSION
+    sock_dir.mkdir(parents=True)
+    env_file = sandbox.root / "split.env"
+    env_file.write_text(
+        f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION=cao-i-0000000000000000b\n", encoding="utf-8"
+    )
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(sock_dir / "herdr.sock"))
+        result = sandbox.run(
+            "bin/wait-herdr-socket.sh",
+            HOME=str(short_home),
+            BOX_ENV_FILE=str(env_file),
+            HERDR_SOCKET_WAIT_SECONDS="1",
+        )
+    finally:
+        server.close()
+    assert result.returncode == 1
+    assert "not starting cao-server" in result.stderr
+    assert "differ" in result.stderr
+
+
+def test_an_extra_line_in_box_env_fails(sandbox, short_home) -> None:
+    env_file = sandbox.root / "extra.env"
+    env_file.write_text(
+        f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\nLD_PRELOAD=/dev/shm/x.so\n",
+        encoding="utf-8",
+    )
+    result = sandbox.run(
+        "bin/wait-herdr-socket.sh", HOME=str(short_home), BOX_ENV_FILE=str(env_file)
+    )
+    assert result.returncode == 1

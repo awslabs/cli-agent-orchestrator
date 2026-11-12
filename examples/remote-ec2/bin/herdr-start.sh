@@ -14,11 +14,11 @@ set -euo pipefail
 box_env="${BOX_ENV_FILE:-/etc/cao-box/box.env}"
 herdr_bin="${HERDR_BIN:-$HOME/.local/bin/herdr}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/lib-cao-box.sh
+. "${here}/lib-cao-box.sh"
 
-[ -r "$box_env" ] || { echo "herdr-start: cannot read $box_env (run bootstrap.sh)" >&2; exit 1; }
-session="$(sed -n 's/^CAO_BOX_SESSION=//p' "$box_env" | head -n 1)"
-if ! [[ "$session" =~ ^cao-[a-z0-9-]+$ ]]; then
-  echo "herdr-start: CAO_BOX_SESSION missing or malformed in $box_env" >&2
+if ! session="$(cb_read_session "$box_env")"; then
+  echo "herdr-start: $box_env is missing or malformed (run bootstrap.sh)" >&2
   exit 1
 fi
 

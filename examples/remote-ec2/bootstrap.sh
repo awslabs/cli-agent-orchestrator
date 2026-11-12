@@ -47,14 +47,18 @@
 #                        are skipped.
 #
 # For the tests only: BOX_TEST_OS_RELEASE, BOX_TEST_DEVFS, BOX_TEST_SYSFS and
-# BOX_TEST_FSTAB point the probes at fake files. Never set them on a box.
+# BOX_TEST_FSTAB point the probes at fake files. They work ONLY with --dry-run;
+# a real run with any BOX_TEST_* variable set stops before step 0.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/bin/lib-cao-box.sh
+. "$HERE/bin/lib-cao-box.sh"
 DRY_RUN=0
 ROOT=""
 FORMAT_NEW=0
-[ "${FORMAT_DATA_DEVICE:-}" = "yes" ] && FORMAT_NEW=1
+FORMAT_FROM_ENV=0
+if [ "${FORMAT_DATA_DEVICE:-}" = "yes" ]; then FORMAT_NEW=1; FORMAT_FROM_ENV=1; fi
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
 
@@ -70,6 +74,14 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# Test hooks are for dry runs only (see the header).
+test_hooks="$(compgen -v BOX_TEST_ || true)"
+if [ -n "$test_hooks" ] && [ "$DRY_RUN" -ne 1 ]; then
+  printf '[bootstrap] ERROR: %s set: BOX_TEST_* variables are for --dry-run tests only; unset them\n' \
+    "$(printf '%s' "$test_hooks" | tr '\n' ' ')" >&2
+  exit 1
+fi
 
 log()  { printf '[bootstrap] %s\n' "$*"; }
 warn() { printf '[bootstrap] WARN: %s\n' "$*" >&2; }
@@ -161,9 +173,14 @@ AWS_CLI_VERSION="${AWS_CLI_VERSION:-}"
 SAM_VERSION="${SAM_VERSION:-}"
 UV_VERSION="${UV_VERSION:-}"
 
+if [ "$FORMAT_FROM_ENV" -eq 1 ]; then
+  warn "FORMAT_DATA_DEVICE=yes is set: remove it after the first run (prefer the --format-new-volume flag)"
+fi
+RUN_UID="$(id -u)"
+
 if [ -n "$ROOT" ]; then
   log "--root $ROOT: only file-writing steps run; system steps are listed and skipped"
-elif [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+elif [ "$DRY_RUN" -eq 0 ] && [ "$RUN_UID" -ne 0 ]; then
   die "run as root (sudo), or use --dry-run"
 fi
 
@@ -344,14 +361,12 @@ fetch() { run curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"; }
 
 # verify FILE SHA256 LABEL: stop the run on a missing or wrong checksum.
 verify() {
-  local file="$1" want="$2" label="$3" got
+  local file="$1" want="$2" label="$3"
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '[dry-run] would verify sha256 of %s = %s\n' "$label" "$want"
     return 0
   fi
-  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "no valid sha256 for ${label}"
-  got="$(sha256sum "$file" | cut -d' ' -f1)"
-  [ "$got" = "$want" ] || die "sha256 mismatch for ${label}: got ${got}, want ${want}"
+  cb_require_sha "$file" "$want" "$label"
   log "sha256 ok: ${label}"
 }
 
@@ -362,7 +377,7 @@ if ! system_step; then
 else
   herdr_bin="$BOX_HOME/.local/bin/herdr"
   need=()
-  if [ -x "$herdr_bin" ] && "$herdr_bin" --version 2>/dev/null | grep -qx "herdr ${HERDR_VERSION#v}"; then
+  if [ -x "$herdr_bin" ] && "$herdr_bin" --version 2>/dev/null | grep -Fqx "herdr ${HERDR_VERSION#v}"; then
     log "herdr ${HERDR_VERSION} present"
   else
     need+=(herdr)
@@ -470,31 +485,82 @@ fi
 step "6. herdr session name (cao-<instance-id>), kept on the data volume"
 etc_env="${ETC_DIR}/box.env"
 vol_env="${STATE_DIR}/box.env"
-valid_box_env() { [ -f "$1" ] && grep -Eq '^CAO_BOX_SESSION=cao-i-[0-9a-f]{8,17}$' "$1"; }
-src_env=""
-if valid_box_env "$vol_env"; then
-  src_env="$vol_env"; log "found on the data volume: $vol_env"
-elif valid_box_env "$etc_env"; then
-  src_env="$etc_env"; log "found: $etc_env"
+STOP_DIR="${ROOT:-/}"
+
+# read_box_env FILE: the session, if FILE and its folders are safe and FILE is
+# exactly the two session lines. A file that exists but fails stops the run.
+read_box_env() {
+  local file="$1" dir
+  dir="$(dirname "$file")"
+  cb_safe_dir "$dir" "$STOP_DIR" "$RUN_UID" || die "refusing ${file}: its folder must be owned by uid ${RUN_UID} and not writable by others"
+  cb_safe_path "$file" "$RUN_UID" || die "refusing ${file}: it must be owned by uid ${RUN_UID}, mode 0644 or tighter"
+  cb_read_session "$file" || die "refusing ${file}: it must hold exactly the two session lines"
+}
+
+# write_box_env DEST SESSION: render (never copy) the two lines into DEST.
+write_box_env() {
+  local dest="$1" session="$2"
+  if [ -f "$dest" ] && [ "$(cat "$dest")" = "$(cb_render_session "$session")" ]; then
+    log "unchanged: $dest"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    printf '[dry-run] would write %s (CAO_BOX_SESSION=CAO_HERDR_SESSION=%s)\n' "$dest" "$session"
+  else
+    mkdir -p "$(dirname "$dest")"
+    chmod 0755 "$(dirname "$dest")"
+    cb_render_session "$session" > "$dest.tmp"
+    chmod 0644 "$dest.tmp"
+    mv -- "$dest.tmp" "$dest"
+    log "wrote: $dest"
+  fi
+}
+
+# The volume copy is used only if its folder is safe: owned by root (the user
+# running this) all the way up, so no agent can swap it. In the
+# BOX_HOME=DATA_MOUNT layout the folder sits in the user's home, so it's skipped.
+use_vol=1
+if [ -e "$STATE_DIR" ]; then
+  cb_safe_dir "$STATE_DIR" "$STOP_DIR" "$RUN_UID" \
+    || die "refusing ${STATE_DIR}: it must be owned by uid ${RUN_UID}, 0755 or tighter, in folders nobody else can write"
+elif [ -d "$(dirname "$STATE_DIR")" ] && ! cb_safe_dir "$(dirname "$STATE_DIR")" "$STOP_DIR" "$RUN_UID" 2>/dev/null; then
+  use_vol=0
+  warn "$(dirname "$STATE_DIR") is not root-only: box.env is kept in /etc/cao-box only; copy it by hand before a whole-box restore"
+fi
+
+session_now=""
+if [ "$use_vol" -eq 1 ] && [ -e "$vol_env" ]; then
+  session_now="$(read_box_env "$vol_env")"
+  log "found on the data volume: $vol_env (${session_now})"
+elif [ -e "$etc_env" ]; then
+  session_now="$(read_box_env "$etc_env")"
+  log "found: $etc_env (${session_now})"
 elif ! system_step; then
   log "--root: no box.env to copy; the first real run writes it (IMDS is never called under --root)"
 elif [ "$DRY_RUN" -eq 1 ]; then
   printf '[dry-run] would read the instance id from IMDSv2 and write %s and %s:\n' "$vol_env" "$etc_env"
   printf '[dry-run]   CAO_BOX_SESSION=cao-<instance-id>\n[dry-run]   CAO_HERDR_SESSION=cao-<instance-id>\n'
 else
-  session="$("$HERE/bin/box-session-name.sh")"
-  mkdir -p "$STATE_DIR"
-  printf 'CAO_BOX_SESSION=%s\nCAO_HERDR_SESSION=%s\n' "$session" "$session" > "$vol_env"
-  chmod 0644 "$vol_env"
-  src_env="$vol_env"
-  log "wrote $vol_env ($session)"
+  session_now="$("$HERE/bin/box-session-name.sh")"
+  log "session from IMDSv2: ${session_now}"
 fi
-session_now=""
-if [ -n "$src_env" ]; then
-  session_now="$(sed -n 's/^CAO_BOX_SESSION=//p' "$src_env")"
-  for target in "$vol_env" "$etc_env"; do
-    [ "$target" = "$src_env" ] || install_file "$src_env" "$target" 0644 "box.env (${session_now})"
-  done
+if [ -n "$session_now" ]; then
+  [[ "$session_now" =~ ^cao-i-[0-9a-f]{8,17}$ ]] || die "unexpected session name ${session_now}"
+  [ "$use_vol" -eq 1 ] && write_box_env "$vol_env" "$session_now"
+  write_box_env "$etc_env" "$session_now"
+fi
+
+# Who owns the agents, for restore.sh --live (root-only, non-secret).
+user_env="${ETC_DIR}/box-user.env"
+user_text="$(printf 'BOX_USER=%s\nBOX_UID=%s\nBOX_HOME=%s' "$BOX_USER" "$BOX_UID" "$BOX_HOME")"
+if [ -f "$user_env" ] && [ "$(cat "$user_env")" = "$user_text" ]; then
+  log "unchanged: $user_env"
+elif [ "$DRY_RUN" -eq 1 ]; then
+  printf '[dry-run] would write %s (BOX_USER=%s BOX_UID=%s)\n' "$user_env" "$BOX_USER" "$BOX_UID"
+else
+  mkdir -p "$ETC_DIR"
+  printf '%s\n' "$user_text" > "$user_env.tmp"
+  chmod 0644 "$user_env.tmp"
+  mv -- "$user_env.tmp" "$user_env"
+  log "wrote: $user_env"
 fi
 
 backup_env="${ETC_DIR}/backup.env"
@@ -553,7 +619,7 @@ fi
 
 # ------------------------------------------------------- 8. scripts + units
 step "8. helper scripts and systemd units (enabled, NOT started)"
-for f in backup.sh restore.sh bin/box-session-name.sh bin/herdr-start.sh bin/herdr-clean-layout.sh \
+for f in backup.sh restore.sh bin/lib-cao-box.sh bin/box-session-name.sh bin/herdr-start.sh bin/herdr-clean-layout.sh \
          bin/wait-herdr-socket.sh bin/resource-probe-linux.sh bin/box-resume.sh; do
   install_file "$HERE/$f" "$LIB_DIR/$(basename "$f")" 0755
 done

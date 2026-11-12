@@ -224,3 +224,178 @@ def test_help_prints_the_header(sandbox) -> None:
     result = sandbox.run("bootstrap.sh", "--help")
     assert result.returncode == 0
     assert "--format-new-volume" in result.stdout and "set -euo" not in result.stdout
+
+
+# ------------------------------------------------- N1: test hooks are dry-only
+
+HOOKS = [
+    "BOX_TEST_OS_RELEASE",
+    "BOX_TEST_DEVFS",
+    "BOX_TEST_SYSFS",
+    "BOX_TEST_FSTAB",
+    "BOX_TEST_ANYTHING",
+]
+
+
+@pytest.mark.parametrize("hook", HOOKS)
+@pytest.mark.parametrize("with_root", [False, True], ids=["real", "real-root"])
+def test_a_real_run_with_a_test_hook_stops_before_any_step(sandbox, hook, with_root) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    args = ["--root", str(root)] if with_root else []
+    result = sandbox.run("bootstrap.sh", *args, **{**SETTINGS, hook: str(sandbox.root / "fake")})
+    assert result.returncode == 1
+    assert f"{hook} set: BOX_TEST_* variables are for --dry-run tests only" in result.stderr
+    assert "== 0." not in result.stdout
+    assert sandbox.recorded_calls() == []
+    assert not (root / "etc" / "cao-box").exists()
+
+
+def test_a_test_hook_with_dry_run_is_allowed(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox)
+    result = sandbox.run(
+        "bootstrap.sh",
+        "--dry-run",
+        "--root",
+        str(root),
+        **{**SETTINGS, "BOX_TEST_FSTAB": str(sandbox.root / "fstab")},
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_env_form_of_the_format_flag_warns(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox)
+    result = sandbox.run(
+        "bootstrap.sh", "--dry-run", "--root", str(root), FORMAT_DATA_DEVICE="yes", **SETTINGS
+    )
+    assert result.returncode == 0
+    assert "remove it after the first run" in result.stderr
+
+
+# ------------------------------------------- N2: box.env is parsed, not copied
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "LD_PRELOAD=/dev/shm/x.so\n",
+        "CAO_HERDR_SESSION=cao-other\n",
+        "NODE_OPTIONS=--require /dev/shm/x.js\n",
+    ],
+    ids=["ld-preload", "duplicate-herdr-session", "node-options"],
+)
+@pytest.mark.parametrize("where", ["volume", "etc"])
+def test_a_tampered_box_env_stops_the_run(sandbox, extra, where) -> None:
+    root = make_root(sandbox.root)
+    if where == "volume":
+        target = seed_volume_box_env(root)
+    else:
+        target = root / "etc" / "cao-box" / "box.env"
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n", encoding="utf-8"
+        )
+    target.write_text(target.read_text(encoding="utf-8") + extra, encoding="utf-8")
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    assert result.returncode == 1
+    assert "refusing" in result.stderr and "two session lines" in result.stderr
+    etc_env = root / "etc" / "cao-box" / "box.env"
+    if where == "volume":
+        assert not etc_env.exists(), "nothing may be copied from a tampered volume file"
+    assert not (root / "etc" / "systemd").exists(), "the run must stop before the units"
+
+
+def test_a_box_env_whose_two_sessions_differ_stops_the_run(sandbox) -> None:
+    root = make_root(sandbox.root)
+    vol = seed_volume_box_env(root)
+    vol.write_text(
+        f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION=cao-i-0000000000000000b\n", encoding="utf-8"
+    )
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    assert result.returncode == 1
+    assert "differ" in result.stderr
+
+
+def test_a_world_writable_volume_box_env_is_refused(sandbox) -> None:
+    root = make_root(sandbox.root)
+    vol = seed_volume_box_env(root)
+    vol.chmod(0o666)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    assert result.returncode == 1
+    assert "mode 0644 or tighter" in result.stderr
+    assert not (root / "etc" / "cao-box" / "box.env").exists()
+
+
+@pytest.mark.parametrize("folder", ["state", "mount"])
+def test_a_state_folder_others_can_write_is_refused(sandbox, folder) -> None:
+    root = make_root(sandbox.root)
+    vol = seed_volume_box_env(root)
+    (vol.parent if folder == "state" else vol.parent.parent).chmod(0o777)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    assert result.returncode == 1
+    assert "refusing" in result.stderr
+    assert not (root / "etc" / "cao-box" / "box.env").exists()
+
+
+def test_box_env_is_rendered_from_the_two_values(sandbox) -> None:
+    root = make_root(sandbox.root)
+    vol = seed_volume_box_env(root)
+    # Same values, other order: still valid, and /etc gets the canonical text.
+    vol.write_text(f"CAO_HERDR_SESSION={SESSION}\nCAO_BOX_SESSION={SESSION}\n", encoding="utf-8")
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    assert result.returncode == 0, result.stderr
+    canonical = f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n"
+    assert (root / "etc" / "cao-box" / "box.env").read_text(encoding="utf-8") == canonical
+    assert vol.read_text(encoding="utf-8") == canonical
+    user_env = root / "etc" / "cao-box" / "box-user.env"
+    assert (
+        user_env.read_text(encoding="utf-8")
+        == "BOX_USER=boxuser\nBOX_UID=2001\nBOX_HOME=/Users/boxuser\n"
+    )
+    assert mode(user_env) == 0o644
+
+
+def test_a_home_layout_volume_keeps_box_env_in_etc_only(sandbox) -> None:
+    # BOX_HOME=DATA_MOUNT: the volume is the user's home, so there is no
+    # root-only folder on it. bootstrap must not read or write a copy there.
+    root = make_root(sandbox.root)
+    home = root / "home" / "boxuser"
+    home.mkdir(parents=True)
+    home.chmod(0o770)  # writable by the user's group, like a home could be
+    etc = root / "etc" / "cao-box"
+    etc.mkdir(parents=True)
+    (etc / "box.env").write_text(
+        f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n", encoding="utf-8"
+    )
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    settings = {**SETTINGS, "BOX_HOME": "/home/boxuser", "DATA_MOUNT": "/home/boxuser"}
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **settings)
+    assert result.returncode == 0, result.stderr
+    assert "box.env is kept in /etc/cao-box only" in result.stderr
+    assert not (home / ".cao-box").exists()
+
+
+def test_an_unsafe_empty_state_folder_is_refused_not_written_into(sandbox) -> None:
+    # Someone made the volume's state folder writable and left it empty,
+    # hoping bootstrap writes box.env there for them to swap later.
+    root = make_root(sandbox.root)
+    state = root / "Users" / ".cao-box"
+    state.mkdir(parents=True)
+    state.chmod(0o777)
+    etc = root / "etc" / "cao-box"
+    etc.mkdir(parents=True)
+    (etc / "box.env").write_text(
+        f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n", encoding="utf-8"
+    )
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    assert result.returncode == 1
+    assert f"refusing {state}" in result.stderr
+    assert list(state.iterdir()) == []
