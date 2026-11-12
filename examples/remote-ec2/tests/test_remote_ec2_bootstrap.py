@@ -399,3 +399,28 @@ def test_an_unsafe_empty_state_folder_is_refused_not_written_into(sandbox) -> No
     assert result.returncode == 1
     assert f"refusing {state}" in result.stderr
     assert list(state.iterdir()) == []
+
+
+def test_a_home_layout_never_reads_a_planted_state_folder(sandbox) -> None:
+    # F3: an agent creates ~/.cao-box with junk. bootstrap must not stop (that
+    # would block upgrades) and must not read or write it.
+    root = make_root(sandbox.root)
+    home = root / "home" / "boxuser"
+    planted = home / ".cao-box"
+    planted.mkdir(parents=True)
+    planted.chmod(0o777)
+    (planted / "box.env").write_text("LD_PRELOAD=/dev/shm/x.so\n", encoding="utf-8")
+    etc = root / "etc" / "cao-box"
+    etc.mkdir(parents=True)
+    (etc / "box.env").write_text(
+        f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n", encoding="utf-8"
+    )
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    settings = {**SETTINGS, "BOX_HOME": "/home/boxuser", "DATA_MOUNT": "/home/boxuser"}
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **settings)
+    assert result.returncode == 0, result.stderr
+    assert "nothing on the volume is read" in result.stderr
+    assert (planted / "box.env").read_text(encoding="utf-8") == "LD_PRELOAD=/dev/shm/x.so\n"
+    assert (etc / "box.env").read_text(encoding="utf-8") == (
+        f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n"
+    )

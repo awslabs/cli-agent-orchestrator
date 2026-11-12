@@ -7,15 +7,18 @@
 #       and must not be inside the live CAO home: a drill never touches
 #       anything live. Do this monthly.
 #
-#   sudo restore.sh --live BACKUP --yes        (root only, from the admin shell)
+#   sudo restore.sh --live BACKUP --yes [--dry-run]   (root only, admin shell)
 #       Reads the box user from /etc/cao-box/box-user.env (written by
-#       bootstrap.sh) and finds the live DB in that user's home. Checks the
-#       backup, stops cao-server, keeps the current DB as
-#       <db>.pre-restore-<stamp>, puts the backup in its place (both owned by
-#       the box user, with the live DB's mode), starts cao-server, waits for
-#       /health and checks the live DB has the restored tables. herdr is not
-#       touched, so running panes keep running. Short-lived `cao` CLI commands
-#       also open the DB: don't run any during a live restore.
+#       bootstrap.sh) and finds the live DB in that user's home. Root does
+#       only that read and systemctl; every file operation in the box user's
+#       tree (reading the backup, keeping a copy, writing and swapping in the
+#       restored DB) runs AS the box user, and any symlink on those paths is
+#       refused. Checks the backup, stops cao-server, keeps the current DB as
+#       <db>.pre-restore-<stamp>, swaps in the backup with the live DB's mode,
+#       starts cao-server, waits for /health and checks the live DB has the
+#       restored tables. herdr is not touched, so running panes keep running.
+#       Short-lived `cao` CLI commands also open the DB: don't run any during
+#       a live restore. --dry-run does every check and prints the plan.
 #
 # BACKUP is a .db.gz or .db file, or an s3:// URI (fetched with the instance
 # role first).
@@ -24,13 +27,12 @@
 #     CAO_HOME    default $HOME/.aws/cli-agent-orchestrator
 #     CAO_DB      default $CAO_HOME/db/cli-agent-orchestrator.db
 #   Live (as root):
-#     CAO_BOX_ETC default /etc/cao-box (must be owned by root, not writable
-#                 by others; tests point it at a folder they own)
 #     CAO_URL     default http://127.0.0.1:9889
-#     SYSTEMCTL   default "systemctl"
+#     CAO_BOX_ETC, SYSTEMCTL   test overrides for /etc/cao-box and systemctl.
+#                 Running as root (EUID 0), they are refused unless --dry-run.
 set -euo pipefail
 
-mode=""; backup=""; to=""; yes=0; db_given=0
+mode=""; backup=""; to=""; yes=0; db_given=0; dry=0
 cao_home="${CAO_HOME:-$HOME/.aws/cli-agent-orchestrator}"
 db="${CAO_DB:-$cao_home/db/cli-agent-orchestrator.db}"
 cao_url="${CAO_URL:-http://127.0.0.1:9889}"
@@ -54,6 +56,7 @@ while [ $# -gt 0 ]; do
     --to) need_value "$1" "${2:-}"; to="$2"; shift ;;
     --db) need_value "$1" "${2:-}"; db="$2"; db_given=1; shift ;;
     --yes) yes=1 ;;
+    --dry-run) dry=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "restore: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -63,6 +66,19 @@ if [ -z "$mode" ]; then
   usage >&2
   exit 2
 fi
+# The test overrides, like bootstrap's BOX_TEST_* hooks, are never honoured
+# by a real run as root. EUID is the process's real identity (it can't be
+# faked through PATH, unlike `id`).
+# >>> refuse_overrides_as_root
+refuse_overrides_as_root() {
+  local euid="$1" dry_run="$2"
+  if [ "$euid" = "0" ] && [ "$dry_run" -ne 1 ] && { [ -n "${SYSTEMCTL:-}" ] || [ -n "${CAO_BOX_ETC:-}" ]; }; then
+    echo "restore: SYSTEMCTL and CAO_BOX_ETC are test overrides; unset them (or use --dry-run)" >&2
+    exit 2
+  fi
+}
+# <<< refuse_overrides_as_root
+refuse_overrides_as_root "${EUID}" "$dry"
 command -v sqlite3 >/dev/null 2>&1 || { echo "restore: sqlite3 is not installed" >&2; exit 1; }
 
 # real_dir PATH: the physical path of PATH, or of its nearest existing parent
@@ -121,8 +137,26 @@ else
   passwd="$(getent passwd "$box_user")" || { echo "restore: no user ${box_user}" >&2; exit 1; }
   [ "$(printf '%s' "$passwd" | cut -d: -f3)" = "$box_uid" ] || { echo "restore: ${box_user}'s uid isn't ${box_uid}" >&2; exit 1; }
   [ "$(printf '%s' "$passwd" | cut -d: -f6)" = "$box_home" ] || { echo "restore: ${box_user}'s home isn't ${box_home}" >&2; exit 1; }
-  box_gid="$(printf '%s' "$passwd" | cut -d: -f4)"
   db="${box_home}/.aws/cli-agent-orchestrator/db/cli-agent-orchestrator.db"
+  # as_box CMD...: run CMD as the box user. Root never reads or writes in the
+  # box user's tree, so a planted symlink can't make root copy its files.
+  as_box() { runuser -u "$box_user" -- "$@"; }
+  # no_links: refuse a symlink anywhere on the DB's path inside the home,
+  # on the backup, or on the paths this run creates.
+  no_links() {
+    local p
+    p="$(dirname "$db")"
+    while :; do
+      [ -L "$p" ] && { echo "restore: ${p} is a symlink; refusing" >&2; exit 1; }
+      [ "$p" = "$box_home" ] || [ "$p" = "/" ] && break
+      p="$(dirname "$p")"
+    done
+    for p in "$db" "$backup" "${db}.restoring" "$@"; do
+      [ -L "$p" ] && { echo "restore: ${p} is a symlink; refusing" >&2; exit 1; }
+    done
+    return 0
+  }
+  no_links
   [ -f "$db" ] || { echo "restore: no live database at ${db}" >&2; exit 1; }
   db_info="$(cb_owner_mode "$db")"
   [ "${db_info%% *}" = "$box_uid" ] || { echo "restore: ${db} isn't owned by ${box_user} (uid ${box_uid}); refusing" >&2; exit 1; }
@@ -138,9 +172,16 @@ case "$backup" in
   s3://*) aws s3 cp --only-show-errors "$backup" "${work}/$(basename "$backup")"; src="${work}/$(basename "$backup")" ;;
 esac
 [ -f "$src" ] || { echo "restore: no backup file at $src" >&2; exit 1; }
+if [ "$mode" = live ] && [ "$src" = "$backup" ]; then
+  # A local backup sits in the box user's tree: read it as the box user.
+  as_box cat -- "$src" > "${work}/backup.in"
+  src_copy="${work}/backup.in"
+else
+  src_copy="$src"
+fi
 case "$src" in
-  *.gz) gzip -d -c "$src" > "${work}/restored.db" ;;
-  *) cp -- "$src" "${work}/restored.db" ;;
+  *.gz) gzip -d -c "$src_copy" > "${work}/restored.db" ;;
+  *) cp -- "$src_copy" "${work}/restored.db" ;;
 esac
 
 check="$(sqlite3 "${work}/restored.db" 'PRAGMA integrity_check;')"
@@ -162,6 +203,13 @@ if [ "$mode" = drill ]; then
 fi
 
 # --live: stop first, then check nothing is left half-written, keep a copy, swap.
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+kept="${db}.pre-restore-${stamp}"
+if [ "$dry" -eq 1 ]; then
+  echo "restore: dry run; would stop cao-server, keep ${db} as ${kept} (as ${box_user}),"
+  echo "restore:   write ${db}.restoring (as ${box_user}, mode ${db_mode}), swap it in, start cao-server"
+  exit 0
+fi
 "${systemctl_cmd[@]}" stop cao-server.service
 for side in -journal -wal -shm; do
   if [ -e "${db}${side}" ]; then
@@ -170,19 +218,20 @@ for side in -journal -wal -shm; do
     exit 1
   fi
 done
-stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-kept="${db}.pre-restore-${stamp}"
-# install -o/-g: the files belong to the box user, with the live DB's mode.
-install -o "$box_uid" -g "$box_gid" -m "$db_mode" "$db" "$kept"
+no_links "$kept"   # again, right before the file work
+as_box cp -p -- "$db" "$kept"
 echo "restore: kept the old database as ${kept}"
-install -o "$box_uid" -g "$box_gid" -m "$db_mode" "${work}/restored.db" "${db}.restoring"
-mv -- "${db}.restoring" "$db"
+# shellcheck disable=SC2016  # $1 is expanded by the inner sh, on purpose
+as_box sh -c 'umask 077; cat > "$1"' sh "${db}.restoring" < "${work}/restored.db"
+as_box chmod "$db_mode" "${db}.restoring"
+as_box mv -- "${db}.restoring" "$db"
 "${systemctl_cmd[@]}" start cao-server.service
 
-want_tables="$(sqlite3 -readonly "${work}/restored.db" "SELECT group_concat(name, ' ') FROM (SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name);")"
+tables_sql="SELECT group_concat(name, ' ') FROM (SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name);"
+want_tables="$(sqlite3 -readonly "${work}/restored.db" "$tables_sql")"
 for _ in $(seq 1 30); do
   if curl -fsS --max-time 2 "${cao_url}/health" >/dev/null 2>&1; then
-    have_tables="$(sqlite3 -readonly "$db" "SELECT group_concat(name, ' ') FROM (SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name);")"
+    have_tables="$(as_box sqlite3 -readonly "$db" "$tables_sql")"
     if [ "$have_tables" != "$want_tables" ]; then
       echo "restore: /health answers, but the live DB's tables differ from the backup's; check ${db}" >&2
       exit 1

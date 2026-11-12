@@ -41,9 +41,14 @@ cb_owner_mode() {
   stat -c '%u %a' "$1" 2>/dev/null || stat -f '%u %Lp' "$1"
 }
 
-# cb_safe_path PATH UID: PATH is owned by UID and not writable by group or other.
+# cb_safe_path PATH UID: PATH is not a symlink, is owned by UID, and is not
+# writable by group or other.
 cb_safe_path() {
   local info owner mode
+  if [ -L "$1" ]; then
+    echo "$1 is a symlink; refusing" >&2
+    return 1
+  fi
   info="$(cb_owner_mode "$1")" || { echo "cannot stat $1" >&2; return 1; }
   owner="${info%% *}"
   mode="${info##* }"

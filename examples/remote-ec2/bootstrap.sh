@@ -360,6 +360,7 @@ as_user() { run runuser -u "$BOX_USER" -- env HOME="$BOX_HOME" PATH="$BOX_HOME/.
 fetch() { run curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"; }
 
 # verify FILE SHA256 LABEL: stop the run on a missing or wrong checksum.
+# >>> verify
 verify() {
   local file="$1" want="$2" label="$3"
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -369,6 +370,7 @@ verify() {
   cb_require_sha "$file" "$want" "$label"
   log "sha256 ok: ${label}"
 }
+# <<< verify
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -518,7 +520,12 @@ write_box_env() {
 # running this) all the way up, so no agent can swap it. In the
 # BOX_HOME=DATA_MOUNT layout the folder sits in the user's home, so it's skipped.
 use_vol=1
-if [ -e "$STATE_DIR" ]; then
+if [ "$DATA_MOUNT" = "$BOX_HOME" ]; then
+  # The volume IS the user's home: any folder on it can be the user's (and
+  # every agent's), so never read or write a copy there, whatever exists.
+  use_vol=0
+  warn "DATA_MOUNT is BOX_HOME: box.env is kept in /etc/cao-box only (nothing on the volume is read); copy it by hand before a whole-box restore"
+elif [ -e "$STATE_DIR" ]; then
   cb_safe_dir "$STATE_DIR" "$STOP_DIR" "$RUN_UID" \
     || die "refusing ${STATE_DIR}: it must be owned by uid ${RUN_UID}, 0755 or tighter, in folders nobody else can write"
 elif [ -d "$(dirname "$STATE_DIR")" ] && ! cb_safe_dir "$(dirname "$STATE_DIR")" "$STOP_DIR" "$RUN_UID" 2>/dev/null; then

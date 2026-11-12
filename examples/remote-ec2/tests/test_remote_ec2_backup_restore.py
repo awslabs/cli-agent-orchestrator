@@ -199,6 +199,14 @@ class LiveBox:
             f'if [ "$1" = start ]; then {self.on_start or ":"}; fi\n',
         )
         write_stub(sb.stubs, "curl", f'echo "curl $*" >> "{sb.calls}"\nexit 0\n')
+        # runuser -u USER -- CMD...: log it, then run CMD (the tests are one user).
+        write_stub(
+            sb.stubs,
+            "runuser",
+            f'echo "runuser $*" >> "{sb.calls}"\n'
+            '[ "$1" = "-u" ] && [ "$3" = "--" ] || exit 64\n'
+            'shift 3\nexec "$@"\n',
+        )
         write_stub(
             sb.stubs,
             "id",
@@ -261,21 +269,30 @@ def test_live_restore_swaps_as_the_box_user_and_keeps_modes(sandbox) -> None:
     box = LiveBox(sandbox, db_mode=0o640)
     backup, new_rows = a_backup(sandbox)
     old_bytes = box.db.read_bytes()
+    old_owner = (box.db.stat().st_uid, box.db.stat().st_gid)
     result = box.restore(backup, "--yes")
     assert result.returncode == 0, result.stderr
     assert "back on the restored database" in result.stdout
     # cao-server was stopped while the database was still the old one.
     assert (sandbox.root / "db-at-stop.bin").read_bytes() == old_bytes
     calls = sandbox.recorded_calls()
-    assert calls[0] == "fake-systemctl stop cao-server.service"
-    assert calls[1] == "fake-systemctl start cao-server.service"
-    assert calls[2].startswith("curl ") and "http://127.0.0.1:1/health" in calls[2]
+    root_calls = [c for c in calls if not c.startswith("runuser ")]
+    assert root_calls[0] == "fake-systemctl stop cao-server.service"
+    assert root_calls[1] == "fake-systemctl start cao-server.service"
+    assert root_calls[2].startswith("curl ") and "http://127.0.0.1:1/health" in root_calls[2]
+    # Every file operation in the box user's tree ran as the box user.
+    box_ops = [
+        c.split(" -- ", 1)[1].split()[0] for c in calls if c.startswith("runuser -u boxuser -- ")
+    ]
+    assert box_ops == ["cat", "cp", "sh", "chmod", "mv", "sqlite3"], calls
     assert read_rows(box.db) == ("ok", new_rows)
     [kept] = list(box.db.parent.glob("cli-agent-orchestrator.db.pre-restore-*"))
     assert read_rows(kept) == ("ok", box.rows)
     for path in (box.db, kept):
         st = path.stat()
-        assert (st.st_uid, st.st_gid, st.st_mode & 0o777) == (box.uid, box.gid, 0o640), path
+        # The box user wrote these files, so they're the box user's; the
+        # group follows the platform's rule, so compare with the original.
+        assert (st.st_uid, st.st_gid, st.st_mode & 0o777) == (*old_owner, 0o640), path
 
 
 def test_live_restore_fails_if_the_live_db_is_not_the_restored_one(sandbox) -> None:
@@ -329,7 +346,8 @@ def test_live_restore_refuses_when_a_sidecar_file_remains(sandbox, side) -> None
     result = box.restore(backup, "--yes")
     assert result.returncode == 1
     assert "not restoring over it" in result.stderr
-    assert sandbox.recorded_calls() == ["fake-systemctl stop cao-server.service"]
+    root_calls = [c for c in sandbox.recorded_calls() if not c.startswith("runuser ")]
+    assert root_calls == ["fake-systemctl stop cao-server.service"]
     assert read_rows(box.db)[1] == box.rows
 
 
@@ -376,7 +394,7 @@ def test_live_restore_stops_nothing_when_integrity_check_fails(sandbox) -> None:
     result = sandbox.run("restore.sh", "--live", str(backup), "--yes", **env)
     assert result.returncode == 1
     assert "nothing changed" in result.stderr
-    assert sandbox.recorded_calls() == []
+    assert not any(c.startswith("fake-systemctl") for c in sandbox.recorded_calls())
     assert read_rows(box.db)[1] == box.rows
 
 
@@ -420,3 +438,85 @@ def test_flags_without_a_value_are_usage_errors(sandbox, args) -> None:
     result = sandbox.run("restore.sh", *args)
     assert result.returncode == 2
     assert "needs a value" in result.stderr
+
+
+# ------------------------------------------- N4: symlinks and the box user
+
+
+def no_systemctl(sandbox) -> bool:
+    return not any(c.startswith("fake-systemctl") for c in sandbox.recorded_calls())
+
+
+def test_a_symlinked_live_db_pointing_at_a_root_only_file_is_refused(sandbox) -> None:
+    box = LiveBox(sandbox)
+    secret = sandbox.root / "root-only" / "shadow"
+    secret.parent.mkdir()
+    secret.write_text("TOP-SECRET-ROOT-FILE", encoding="utf-8")
+    secret.chmod(0o600)
+    box.db.unlink()
+    box.db.symlink_to(secret)
+    backup, _ = a_backup(sandbox)
+    result = box.restore(backup, "--yes")
+    assert result.returncode == 1
+    assert "is a symlink; refusing" in result.stderr
+    assert no_systemctl(sandbox)
+    leftovers = [p.name for p in box.db.parent.iterdir() if p.name != box.db.name]
+    assert leftovers == [], "nothing may be copied"
+    for path in box.db.parent.parent.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            assert "TOP-SECRET" not in path.read_text(encoding="utf-8", errors="ignore")
+
+
+def test_a_symlinked_backup_is_refused(sandbox) -> None:
+    box = LiveBox(sandbox)
+    real_backup, _ = a_backup(sandbox)
+    link = sandbox.root / "backup-link.db"
+    link.symlink_to(real_backup)
+    result = box.restore(link, "--yes")
+    assert result.returncode == 1
+    assert "is a symlink; refusing" in result.stderr
+    assert sandbox.recorded_calls() == []
+    assert read_rows(box.db)[1] == box.rows
+
+
+@pytest.mark.parametrize("level", ["db", "cli-agent-orchestrator", ".aws"])
+def test_a_symlinked_db_folder_is_refused(sandbox, level) -> None:
+    box = LiveBox(sandbox)
+    folder = {
+        "db": box.db.parent,
+        "cli-agent-orchestrator": box.db.parent.parent,
+        ".aws": box.db.parent.parent.parent,
+    }[level]
+    moved = folder.with_name(folder.name + "-real")
+    folder.rename(moved)
+    folder.symlink_to(moved)
+    backup, _ = a_backup(sandbox)
+    result = box.restore(backup, "--yes")
+    assert result.returncode == 1
+    assert "is a symlink; refusing" in result.stderr
+    assert sandbox.recorded_calls() == []
+    assert not list(moved.rglob("*.pre-restore-*"))
+
+
+def test_a_planted_restoring_symlink_is_refused(sandbox) -> None:
+    box = LiveBox(sandbox)
+    target = sandbox.root / "elsewhere"
+    (box.db.parent / "cli-agent-orchestrator.db.restoring").symlink_to(target)
+    backup, _ = a_backup(sandbox)
+    result = box.restore(backup, "--yes")
+    assert result.returncode == 1
+    assert "is a symlink; refusing" in result.stderr
+    assert no_systemctl(sandbox)
+    assert not target.exists()
+
+
+def test_a_live_dry_run_checks_everything_and_changes_nothing(sandbox) -> None:
+    box = LiveBox(sandbox)
+    backup, _ = a_backup(sandbox)
+    before = box.db.read_bytes()
+    result = box.restore(backup, "--yes", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert "dry run; would stop cao-server" in result.stdout
+    assert no_systemctl(sandbox)
+    assert box.db.read_bytes() == before
+    assert not list(box.db.parent.glob("*.pre-restore-*"))

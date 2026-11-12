@@ -170,3 +170,27 @@ def test_safe_dir_checks_every_parent_up_to_stop(tmp_path) -> None:
     bad = call(f'cb_safe_dir "{top}/mid/state" "{top}" {uid}', tmp_path)
     assert bad.returncode == 1
     assert "mid is writable" in bad.stderr
+
+
+def test_safe_path_refuses_a_symlink_even_to_a_safe_target(tmp_path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    real.chmod(0o755)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    result = call(f'cb_safe_path "{link}" {os.getuid()}', tmp_path)
+    assert result.returncode == 1
+    assert "is a symlink" in result.stderr
+
+
+def test_safe_dir_refuses_a_symlink_in_the_chain(tmp_path) -> None:
+    top = tmp_path / "top"
+    real = tmp_path / "real-state"
+    top.mkdir()
+    real.mkdir()
+    for p in (top, real):
+        p.chmod(0o755)
+    (top / "state").symlink_to(real)
+    result = call(f'cb_safe_dir "{top}/state" "{top}" {os.getuid()}', tmp_path)
+    assert result.returncode == 1
+    assert "is a symlink" in result.stderr

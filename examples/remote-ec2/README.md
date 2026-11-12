@@ -462,7 +462,8 @@ working.
   home itself and leaves the default `ubuntu` user alone. `bootstrap.sh`
   gives the freshly mounted folder to `<you>` and copies `/etc/skel` into it.
   In this layout the volume has no root-only folder, so `box.env` lives only
-  in `/etc/cao-box/`. Copy it by hand before a whole-box restore.
+  in `/etc/cao-box/`, and nothing on the volume is ever read for it. Copy it
+  by hand before a whole-box restore.
 
 ## Backups and restore
 
@@ -486,10 +487,16 @@ sudo /usr/local/lib/cao-box/restore.sh --live /Users/<you>/backups/cao/cao-<stam
   `/etc/cao-box/box-user.env` (written by `bootstrap.sh`, root's), finds the
   database in that user's home, and refuses if the database isn't the box
   user's.
+  - Root does only that read and `systemctl`. Every file operation in the
+    box user's tree runs **as the box user**: reading the backup, keeping a
+    copy and swapping in the restored database. It refuses any symlink on
+    the database's path, on the backup, and on the files it creates. So a
+    link an agent plants can't make root copy a root-only file.
   - It checks the backup, then stops cao-server.
   - It keeps the current database as `<db>.pre-restore-<stamp>`.
-  - It puts the backup in its place, with both files owned by the box user
-    and in the live database's mode.
+  - It puts the backup in its place, in the live database's mode.
+  - `--dry-run` runs every check and prints the plan without changing
+    anything.
   - It starts cao-server, waits for `/health`, and checks that the live
     database has the backup's tables.
   - It refuses to write over a database that still has a `-journal`, `-wal`
