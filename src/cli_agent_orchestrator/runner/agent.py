@@ -283,6 +283,11 @@ class Runner:
         self._welcomed = True
         logger.info(f"runner {self.runner_id} connected to {self.server_url}")
         self._set_ready(True)
+        # Wake the sender even with nothing queued: the gaps it resends per
+        # connection must not wait for some pipe's next output, which a quiet
+        # pipe never sends.
+        assert self._outbox_ready is not None
+        self._outbox_ready.set()
         sender = asyncio.create_task(self._drain_outbox(ws))
         inventory = asyncio.create_task(self._send_inventory(ws))
         calls: set = set()

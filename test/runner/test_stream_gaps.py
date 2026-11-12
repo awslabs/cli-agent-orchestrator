@@ -499,26 +499,68 @@ class TestADroppedTailIsReported:
         assert fed["pa"] == [b"one", b"three"]
 
     def test_a_gap_lost_with_its_connection_is_sent_again(self, monkeypatch, tmp_path):
-        """ws.send() returning does not prove the hub read it: resend per connection."""
-        runner, h, ws, gaps, fed = self._setup(monkeypatch, tmp_path)
+        """ws.send() returning does not prove the hub read it: resend per connection.
+
+        Driven through the real ``_session()`` with one ``_outbox_ready`` event
+        for the runner's life, as ``run_forever()`` has: the next connection
+        must send the gap at once, with no new output from any pipe.
+        """
+        import json
+
+        from websockets.exceptions import ConnectionClosed
+        from websockets.frames import Close
+
+        from cli_agent_orchestrator.runner.protocol import PROTOCOL_VERSION
+
+        runner, h, hub_ws, gaps, fed = self._setup(monkeypatch, tmp_path)
         runner._emit("pa", b"working")
-        self._drain(runner, ws)
+        self._drain(runner, hub_ws)
         runner._emit("pa", b"ready>")
         for _ in range(40):
             runner._emit("pb", b"y" * 200)
 
-        class Lost:
-            """A connection that takes the frames and then resets."""
+        class Connection:
+            def __init__(self, deliver):
+                self.deliver, self.closed = deliver, asyncio.Event()
 
             async def send(self, raw):
-                pass
+                if self.deliver and json.loads(raw)["type"] != "hello":
+                    await hub_ws.send(raw)
 
-        self._drain(runner, Lost())
-        assert gaps == []
-        runner._gaps_sent = {}  # what _session does on the next connection
-        self._drain(runner, ws)
+            async def recv(self):
+                return json.dumps({"type": "welcome", "protocol": PROTOCOL_VERSION})
 
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await self.closed.wait()
+                raise ConnectionClosed(None, Close(1011, "keepalive ping timeout"))
+
+        async def connect(ws, until):
+            session = asyncio.create_task(runner._session(ws))
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if until():
+                    break
+            ws.closed.set()
+            await asyncio.gather(session, return_exceptions=True)
+
+        async def run():
+            runner._loop = asyncio.get_running_loop()
+            runner._outbox_ready = asyncio.Event()  # once, as run_forever() does
+            # Connection 2 takes the gaps and the queued frames, then is lost.
+            await connect(
+                Connection(deliver=False),
+                lambda: not runner._outbox and runner._gaps_sent == runner._dropped,
+            )
+            assert gaps == [] and not runner._outbox
+            # Connection 3: no pipe has new output.
+            await connect(Connection(deliver=True), lambda: "aaaaaaaa" in gaps)
+
+        asyncio.run(run())
         assert "aaaaaaaa" in gaps
+        assert "bbbbbbbb" in gaps
 
     def test_a_gap_already_seen_is_not_reported_again_on_reconnect(self, monkeypatch, tmp_path):
         runner, h, ws, gaps, fed = self._setup(monkeypatch, tmp_path)
