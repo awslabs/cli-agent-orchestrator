@@ -308,6 +308,25 @@ def test_l8_window(window):
     assert fired(data, "L8", i + 2, path), describe(data)
 
 
+def test_l15_untokenised_runner_id():
+    meta, records = split()
+    i = find(records, "approve", frame_type("STATE_SNAPSHOT"))
+    records[i]["frame"]["snapshot"]["terminals"][0]["runner_id"] = "build-box-3"
+    data = join(meta, records)
+    path = "$.frame.snapshot.terminals[0].runner_id"
+    assert fired(data, "L15", i + 2, path), describe(data)
+
+
+def test_l15_the_old_runtime_id_name_is_flagged_even_when_null():
+    """3.0 renamed the field; the scrubber has no rule for the old name, so it must fail here."""
+    meta, records = split()
+    i = find(records, "approve", frame_type("STATE_SNAPSHOT"))
+    records[i]["frame"]["snapshot"]["terminals"][0]["runtime_id"] = None
+    data = join(meta, records)
+    path = "$.frame.snapshot.terminals[0].runtime_id"
+    assert fired(data, "L15", i + 2, path), describe(data)
+
+
 def _appended(records: Records, frame: Dict[str, Any]) -> Records:
     return records + [
         {
@@ -429,7 +448,7 @@ RULE_IDS = sorted(
 
 
 def test_the_rule_ids_are_read_from_the_checker():
-    assert RULE_IDS[0] == "L1" and len(RULE_IDS) >= 14, RULE_IDS
+    assert RULE_IDS[0] == "L1" and len(RULE_IDS) >= 15, RULE_IDS
 
 
 def test_every_rule_id_has_a_mutation_case():
@@ -514,6 +533,11 @@ def _near_l12(meta: Dict[str, Any], records: Records) -> None:
 
 def _near_l13(meta: Dict[str, Any], records: Records) -> None:
     records[:] = _appended(records, {"type": "STATE_DELTA", "delta": []})
+
+
+def _near_l15(meta: Dict[str, Any], records: Records) -> None:
+    i = find(records, "approve", frame_type("STATE_SNAPSHOT"))
+    records[i]["frame"]["snapshot"]["terminals"][0]["runner_id"] = "runner-1"
 
 
 def _near_l14(meta: Dict[str, Any], records: Records) -> None:

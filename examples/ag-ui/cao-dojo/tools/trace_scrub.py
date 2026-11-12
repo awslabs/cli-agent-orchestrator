@@ -21,7 +21,8 @@ Normalisation, in order:
    keys walked in sorted order. Generated ids (event ids, interrupt ids,
    ``traceparent``, and AG-UI 1.0's ``eventId``, ``subagentRunId`` and
    ``parentSubagentRunId``) become ``id-N``; CAO's named identities get kind-prefixed
-   tokens (``terminal-N``, ``session-N``, ``profile-N``, ``window-N``) so the
+   tokens (``terminal-N``, ``session-N``, ``profile-N``, ``window-N``,
+   ``runner-N``) so the
    leak rule can type them. One table per kind for the whole file, so a card's
    ``props.interrupt_id`` and run 1's ``interrupts[0].id`` map to the same token.
 4. **Synthesise timestamps** from a monotone clock starting at
@@ -107,6 +108,9 @@ TERMINAL_KEYS = frozenset({"terminal_id", "terminalId", "step_id"})
 SESSION_KEYS = frozenset({"session_name", "sessionName"})
 PROFILE_KEYS = frozenset({"agent_profile", "step_name"})
 WINDOW_KEYS = frozenset({"window", "tmux_window"})
+# A runner id is a label an operator chose and can look like a host name. ``null`` (a
+# local terminal, the only kind on main) stays ``null``; a string becomes ``runner-N``.
+RUNNER_KEYS = frozenset({"runner_id", "runnerId"})
 TIMESTAMP_KEYS = frozenset({"timestamp", "last_active", "expiresAt"})
 
 TOKEN_PREFIX = {
@@ -115,8 +119,9 @@ TOKEN_PREFIX = {
     "session": "session",
     "profile": "profile",
     "window": "window",
+    "runner": "runner",
 }
-TOKEN_RE = re.compile(r"^(id|terminal|session|profile|window)-\d+$")
+TOKEN_RE = re.compile(r"^(id|terminal|session|profile|window|runner)-\d+$")
 
 
 def classify(path: Tuple[Any, ...]) -> Optional[str]:
@@ -142,6 +147,8 @@ def classify(path: Tuple[Any, ...]) -> Optional[str]:
         return "profile"
     if key in WINDOW_KEYS:
         return "window"
+    if key in RUNNER_KEYS:
+        return "runner"
     # Positional identities: snapshot rows and interrupts.
     if isinstance(parent, int) and grandparent == "terminals" and key == "id":
         return "terminal"

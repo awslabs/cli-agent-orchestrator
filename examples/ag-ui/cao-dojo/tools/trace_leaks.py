@@ -69,11 +69,16 @@ TERMINAL_TOKEN = re.compile(r"^terminal-\d+$")
 SESSION_TOKEN = re.compile(r"^session-\d+$")
 PROFILE_TOKEN = re.compile(r"^profile-\d+$")
 WINDOW_TOKEN = re.compile(r"^window-\d+$")
+RUNNER_TOKEN = re.compile(r"^runner-\d+$")
 
 L5_KEYS = frozenset({"terminal_id", "terminalId", "step_id"})
 L6_KEYS = frozenset({"session_name", "sessionName"})
 L7_KEYS = frozenset({"agent_profile", "step_name"})
 L8_KEYS = frozenset({"window", "tmux_window"})
+# L15: a runner id. Kept apart from the scrubber's RUNNER_KEYS on purpose, like L14.
+L15_KEYS = frozenset({"runner_id", "runnerId"})
+# The name 3.0 replaced. It is never tokenised, so any value under it is a raw label.
+L15_OLD_KEYS = frozenset({"runtime_id", "runtimeId"})
 # L14: generated ids. Kept apart from the scrubber's ID_KEYS on purpose, so a key
 # dropped there still fails here. A raw AG-UI 1.0 session attribution
 # (``session:<16 hex>``) under one of these keys fails here by key, whatever its form.
@@ -126,7 +131,7 @@ RECORD_KEYS = {
 }
 
 
-# --- Runtime identity (read at call time so tests can monkeypatch) ------------
+# --- Runner identity (read at call time so tests can monkeypatch) ------------
 
 
 def _home() -> Optional[str]:
@@ -273,6 +278,11 @@ class _Checker:
             # A scrubber token (`window-100`) is never a finding; anything else is.
             if not (isinstance(value, str) and WINDOW_TOKEN.match(value)):
                 self.add("L8", line, report, value)
+        if key in L15_OLD_KEYS:
+            self.add("L15", line, report, value)
+        if key in L15_KEYS and value is not None:
+            if not (isinstance(value, str) and RUNNER_TOKEN.match(value)):
+                self.add("L15", line, report, value)
         if key in L14_KEYS or (
             isinstance(parent, int) and grandparent == "interrupts" and key == "id"
         ):

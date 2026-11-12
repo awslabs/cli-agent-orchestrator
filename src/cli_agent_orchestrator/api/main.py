@@ -2381,6 +2381,76 @@ def _agui_legacy_framing_headers() -> Dict[str, str]:
     }
 
 
+# --- AG-UI fleet snapshot ---------------------------------------------------------------
+
+#: How long a scan of the installed agent profiles is reused. The snapshot is recomputed on
+#: every bus event, and a scan walks several directories, so it must not run per event.
+_AGUI_PROFILE_CATALOG_TTL_SECONDS = 30.0
+_agui_profile_catalog_cache: Optional[Tuple[float, List[Dict]]] = None
+
+
+def _reset_agui_profile_catalog_cache() -> None:
+    """Forget the cached catalog (tests)."""
+    global _agui_profile_catalog_cache
+    _agui_profile_catalog_cache = None
+
+
+def _agui_profile_catalog() -> List[Dict]:
+    """The read-only profile catalog for the AG-UI snapshot, scanned at most once per TTL.
+
+    Failure-isolated like the rest of the snapshot: a scan error yields an empty catalog
+    (and is cached for the TTL, so a broken directory is not rescanned per event).
+    """
+    global _agui_profile_catalog_cache
+    now = time.monotonic()
+    cached = _agui_profile_catalog_cache
+    if cached is not None and now - cached[0] < _AGUI_PROFILE_CATALOG_TTL_SECONDS:
+        return cached[1]
+    from cli_agent_orchestrator.services.ui_state_service import build_profile_catalog
+
+    try:
+        from cli_agent_orchestrator.utils import agent_profiles
+
+        catalog = build_profile_catalog(agent_profiles.list_agent_profiles())
+    except Exception:
+        logger.debug("agui_stream: profile catalog scan failed", exc_info=True)
+        catalog = []
+    _agui_profile_catalog_cache = (now, catalog)
+    return catalog
+
+
+def _agui_fleet_snapshot(scopes: List[str], *, profiles: bool = True) -> Dict:
+    """Build the current fleet ``DashboardSnapshot`` for every AG-UI route.
+
+    The one place the three AG-UI routes (``GET`` and ``POST /agui/v1/stream`` and
+    ``POST /agui/v1/run``) build their snapshot, so they cannot diverge. The two ambient
+    stream routes carry the read-only ``profiles`` catalog, which the MCP Apps snapshot
+    does not. The run plane's one-shot hydrate (``profiles=False``) leaves it out: it
+    serves approvals, not the fleet view, so it never pays for a profile scan and its
+    recorded shape does not depend on what happens to be installed.
+
+    Failure-isolated: ``list_sessions`` already returns ``[]`` on error, and a terminal
+    listing that fails is skipped, so an unavailable tmux/herdr backend degrades to a
+    smaller snapshot rather than tearing down the stream.
+    """
+    from cli_agent_orchestrator.services import session_service
+    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
+
+    sessions = session_service.list_sessions()
+    terminals: List[Dict] = []
+    for sess in sessions:
+        try:
+            terminals.extend(
+                session_service.list_current_session_terminals(sess["id"], backend_exists=True)
+            )
+        except Exception:
+            logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
+    snapshot = build_dashboard_snapshot(sessions, terminals, scopes)
+    if profiles:
+        snapshot["profiles"] = _agui_profile_catalog()
+    return snapshot
+
+
 def _agui_ambient_response(
     *,
     thread_id: str,
@@ -2606,7 +2676,6 @@ async def agui_stream(
 
     from fastapi.responses import StreamingResponse
 
-    from cli_agent_orchestrator.services import session_service
     from cli_agent_orchestrator.services.agui.lifecycle_tracker import ToolCallLifecycleTracker
     from cli_agent_orchestrator.services.agui_stream import (
         state_delta_frame,
@@ -2615,25 +2684,11 @@ async def agui_stream(
     )
     from cli_agent_orchestrator.services.event_log_service import get_event_log
     from cli_agent_orchestrator.services.sse_bus import get_bus
-    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
 
     def _fleet_snapshot() -> Dict:
-        """Build the current DashboardSnapshot from live session/terminal state.
-
-        Failure-isolated: any backend hiccup yields an empty snapshot rather
-        than tearing down the stream. ``list_sessions`` already returns ``[]``
-        on error, so an unavailable tmux/herdr backend degrades gracefully.
-        """
-        sessions = session_service.list_sessions()
-        terminals: List[Dict] = []
-        for sess in sessions:
-            try:
-                terminals.extend(
-                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
-                )
-            except Exception:
-                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
-        return build_dashboard_snapshot(sessions, terminals, list(scopes))
+        # The deprecated legacy wire gains only ``runner_id`` on each terminal row; it
+        # never gains the catalog.
+        return _agui_fleet_snapshot(list(scopes), profiles=framing != AGUI_FRAMING_LEGACY)
 
     if framing != AGUI_FRAMING_LEGACY:
         import uuid
@@ -2930,22 +2985,10 @@ async def agui_stream_post(
             detail="forwardedProps.cao.maxSeconds must be an integer from 1 to 3600",
         )
 
-    from cli_agent_orchestrator.services import session_service
-    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
-
     scopes = list(_scopes)
 
     def _fleet_snapshot() -> Dict:
-        sessions = session_service.list_sessions()
-        terminals: List[Dict] = []
-        for sess in sessions:
-            try:
-                terminals.extend(
-                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
-                )
-            except Exception:
-                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
-        return build_dashboard_snapshot(sessions, terminals, scopes)
+        return _agui_fleet_snapshot(scopes)
 
     return _agui_ambient_response(
         thread_id=run_input.thread_id,
@@ -3273,19 +3316,7 @@ async def agui_run(
 
     # Build the snapshot function
     def _fleet_snapshot() -> Dict:
-        from cli_agent_orchestrator.services import session_service
-        from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
-
-        sessions = session_service.list_sessions()
-        terminals: List[Dict] = []
-        for sess in sessions:
-            try:
-                terminals.extend(
-                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
-                )
-            except Exception:
-                pass
-        return build_dashboard_snapshot(sessions, terminals, list(_scopes))
+        return _agui_fleet_snapshot(list(_scopes), profiles=False)
 
     from fastapi.responses import StreamingResponse
 

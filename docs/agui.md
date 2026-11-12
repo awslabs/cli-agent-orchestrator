@@ -29,10 +29,12 @@ to a build without the feature.
 
 The ambient stream is one [AG-UI 1.0](https://docs.ag-ui.com/) run that
 narrates the **fleet**: the sessions and terminals one `cao-server` can see.
-(A remote CAO deployment is a *runtime*; each runtime has its own fleet and its
-own stream.) Every frame is a `data:` line whose JSON carries its `type`, as the
-AG-UI SSE binding requires; there are no `event:` lines. A stock client such as
-`@ag-ui/client`'s `HttpAgent` reads it with no CAO code, and the pinned
+A *runner* is where a terminal executes. A terminal with no runner is local
+(`runner_id` is `null`), and a terminal placed on a remote runner carries that
+runner's id, so the fleet is the local and the remote terminals together; a
+runner does not have a stream of its own. Every frame is a `data:` line whose
+JSON carries its `type`, as the AG-UI SSE binding requires; there are no
+`event:` lines. A stock client such as `@ag-ui/client`'s `HttpAgent` reads it with no CAO code, and the pinned
 upstream `verifyEvents` accepts it (see [Verification](#verification)).
 
 A short run, captured from the conformance tests (`metadata` trimmed):
@@ -78,6 +80,35 @@ There are two ways in:
   characters; default `cao-fleet-<uuid>`, fixed for the server process),
   `since`, `maxSeconds`, and `access_token` (see Auth). Every connection is a
   new run with a new `runId`.
+
+### The fleet snapshot
+
+The first `STATE_SNAPSHOT` hydrates the fleet and later `STATE_DELTA` patches
+keep it current. Its keys:
+
+| Key | Content |
+|---|---|
+| `sessions` | `{id, name, status}` per session. Replaced whole on any change |
+| `terminals` | `{id, session_name, provider, agent_profile, window, status, last_active, runner_id}` per terminal. Replaced whole on any change |
+| `counts` | `{sessions, terminals}`. Patched per key |
+| `scopes` | The scopes the caller holds |
+| `profiles` | The profile catalog, below. Present on the ambient stream only |
+
+`runner_id` is a label for the remote runner a terminal runs on, or `null` for
+a local terminal. It is the only runner field on the wire, and it is metadata:
+no terminal output, path or argument is in this snapshot. Frames name a terminal
+by id, so a consumer joins to the snapshot to learn its runner; the session
+timeline entries, handoff interrupts and `SUBAGENT_*` frames do not repeat it.
+(The MCP Apps `DashboardSnapshot` and the deprecated [legacy framing](#legacy-framing)
+carry `runner_id` on each terminal too, and nothing else is added to them.)
+
+**Profile catalog.** `profiles` is a read-only list of `{name, source, role,
+loadable}`, one per installed agent profile, so a dashboard can name the profile
+behind a terminal. `source` is a label such as `built-in`, never a path. The
+description, prompt, tools and MCP servers of a profile are not on the wire. It
+is read with the same scopes as `GET /agents/profiles`, it is scanned at most
+every 30 seconds rather than per event, and it is not scoped to a tenant or an
+owner (that is #778). No AG-UI route writes a profile.
 
 ### Event mapping
 
@@ -585,8 +616,15 @@ and derives a `projection()` view without I/O.
 Folds `STATE_SNAPSHOT` and `STATE_DELTA` frames to maintain a local copy of the
 fleet topology. Derives:
 
-- `hierarchy()`: session-name keyed dict with terminal lists and counts
-- `supervisor_snapshot()`: active sessions, provider distribution, waiting terminals, rollup counters
+- `hierarchy()`: session-name keyed dict with terminal lists and counts, and the
+  `runner_ids` present in each session
+- `hierarchy_by_runner()`: the same, keyed by `(runner_id, session_name)`, so
+  two runners that both own a session called `main` stay apart
+- `by_runner()`: terminals grouped by `runner_id`, local (`null`) first, then
+  by id: `{runner_id, label, terminal_count, waiting, by_status}` per group. A
+  list, because JSON cannot key an object by `null`. A fleet whose terminals have
+  no runner is exactly one `local` group
+- `supervisor_snapshot()`: active sessions, provider distribution, waiting terminals, `by_runner`, rollup counters
 
 **Frames folded:** STATE_SNAPSHOT, STATE_DELTA, STEP_STARTED/FINISHED,
 RUN_STARTED/FINISHED, TOOL_CALL_START/END/RESULT (rollup counters).
@@ -700,7 +738,8 @@ The GIFs are committed under [`docs/media/`](media/) and re-generated + uploaded
 as CI artifacts (`agui-construct-demos`) on every run.
 
 **SupervisorDashboardStream** — folds `STATE_SNAPSHOT`/`STATE_DELTA` into a live
-fleet view (active sessions, provider distribution, waiting terminals):
+fleet view (active sessions, provider distribution, waiting terminals, and the
+terminals grouped by runner):
 
 ![SupervisorDashboardStream example asserting its fold logic](media/ag-ui-supervisor-dashboard-demo.gif)
 

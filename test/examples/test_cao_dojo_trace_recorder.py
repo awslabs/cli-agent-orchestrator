@@ -185,6 +185,19 @@ def test_named_identities_get_kind_prefixed_tokens():
     )
 
 
+def test_a_runner_id_is_tokenised_and_null_stays_null():
+    """A runner id is an operator-chosen label (it can look like a host name)."""
+    raw = raw_capture()
+    rows = raw[2]["frame"]["snapshot"]["terminals"]
+    rows[0]["runner_id"] = "build-box-3.internal"
+    rows.append({**rows[0], "id": "ffffffff", "runner_id": None})
+    rows.append({**rows[0], "id": "eeeeeeee", "runner_id": "build-box-3.internal"})
+    _, records = scrub.parse(scrub.normalise(META, raw))
+    out = records[2]["frame"]["snapshot"]["terminals"]
+    assert [r["runner_id"] for r in out] == ["runner-1", None, "runner-1"]
+    assert "build-box-3" not in scrub.normalise(META, raw).decode()
+
+
 def test_ag_ui_1_0_attribution_ids_are_remapped():
     """#1232's frames carry ``eventId``, ``subagentRunId`` and ``parentSubagentRunId``.
 
