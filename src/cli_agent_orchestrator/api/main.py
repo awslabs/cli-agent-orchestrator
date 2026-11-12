@@ -1679,6 +1679,16 @@ def _sweep_workflow_runs_at_startup() -> None:
         logger.warning("workflow retention sweep failed at startup: %s", e)
 
 
+def _runner_token_refusal() -> Optional[str]:
+    """Why the remote backend cannot start without a runner token, or None."""
+    if isinstance(get_backend(), RemoteBackend) and runner_token() is None:
+        return (
+            "refusing to start: terminal.backend=remote requires a runner token; set "
+            f"{RUNNER_TOKEN_FILE_ENV} (preferred) or {RUNNER_TOKEN_ENV}"
+        )
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -1723,13 +1733,10 @@ async def lifespan(app: FastAPI):
     # anything it starts can inherit it (see runner.token).
     # Without one the hub cannot start; say what to set rather than fail later
     # with a traceback. An unreadable token file was already logged by name.
-    if isinstance(get_backend(), RemoteBackend) and runner_token() is None:
-        message = (
-            "refusing to start: terminal.backend=remote requires a runner token; set "
-            f"{RUNNER_TOKEN_FILE_ENV} (preferred) or {RUNNER_TOKEN_ENV}"
-        )
-        logger.error(message)
-        print(message, file=sys.stderr, flush=True)
+    token_refusal = _runner_token_refusal()
+    if token_refusal is not None:
+        logger.error(token_refusal)
+        print(token_refusal, file=sys.stderr, flush=True)
         raise SystemExit(1)
     # issue #583 Bolt 3 (``approval-enforcement-default``): report the approval gate's RESOLVED state
     # AND the mechanism that decided it. A malformed settings file fails closed, so the source tells
@@ -12034,6 +12041,17 @@ def main():
     # ``uvicorn.error`` for WebSocket handshakes -- by
     # ``install_access_log_redaction()``, installed in the app lifespan so both
     # ``cao-server`` and ``uvicorn ...:app`` are covered.
+    # #745: the remote backend's start refusals, checked here too. Raised from
+    # the lifespan, uvicorn reports them as a failed startup: a SystemExit
+    # traceback and exit code 3. Here they exit 1 with the message alone. The
+    # lifespan keeps both checks for ``uvicorn cli_agent_orchestrator.api.main:app``.
+    # Only for the remote backend, read from the configuration by name, so any
+    # other backend stays lazy as above.
+    if ConfigService.get("terminal.backend", default="tmux", override=args.terminal) == "remote":
+        refusal = remote_auth_refusal() or _runner_token_refusal()
+        if refusal is not None:
+            print(refusal, file=sys.stderr, flush=True)
+            raise SystemExit(1)
     from cli_agent_orchestrator.services.agui.ambient_run import install_uvicorn_exit_hook
 
     install_uvicorn_exit_hook()

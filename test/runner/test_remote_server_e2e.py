@@ -471,3 +471,39 @@ def test_cao_flow_run_does_not_run_a_pre_script_on_the_server_host(stack):
     assert "409" in ran.stdout + ran.stderr
     assert not marker.exists()
     assert not any(row for row in stack.tmux("list-sessions").stdout.splitlines() if "pre" in row)
+
+
+@pytest.mark.parametrize(
+    "flag,extra_env,message",
+    [
+        (["--terminal", "remote"], {}, "requires a runner token"),
+        # Selected by configuration, not the flag.
+        ([], {"CAO_TERMINAL_BACKEND": "remote"}, "requires a runner token"),
+        (
+            ["--terminal", "remote"],
+            {"CAO_RUNNER_TOKEN": "t" * 48, "CAO_AUTH_LOCAL_TOKEN": "a" * 32},
+            "does not support API authentication",
+        ),
+    ],
+)
+def test_a_refused_remote_start_exits_1_with_the_message_alone(tmp_path, flag, extra_env, message):
+    """Raised from the lifespan, uvicorn would report a failed startup: a
+    SystemExit traceback and exit code 3. ``cao-server`` refuses first."""
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("CAO_", "TMUX", "PYTEST", "COV_")) and k != "HOME"
+    }
+    env.update(HOME=str(home), CAO_HOME_DIR=str(home / ".cao"), **extra_env)
+    done = subprocess.run(
+        [str(BIN / "cao-server"), *flag, "--port", str(_free_port())],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 1, done.stderr
+    assert message in done.stderr
+    assert "Traceback" not in done.stderr
