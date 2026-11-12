@@ -40,8 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does no execution-host work on the server (`terminal.remote_providers` can only narrow that
   list).
   Docs: `docs/remote-runners.md`; example:
-  `examples/cao-clusters/kubernetes/remote-runners/` (a cluster-neutral base and a kind
-  overlay).
+  `examples/cao-clusters/kubernetes/remote-runners/` (a cluster-neutral base, a kind
+  overlay, and an EKS Auto Mode overlay with its CloudFormation stack: EFS workspace, gp3
+  server state, `wss://` between runners and the hub, and Bedrock for the runners through
+  EKS Pod Identity).
 
 - **A reconnect no longer loses a tool call's end, and `toolCallName` is `assign`, not
   `OrchestrationType.ASSIGN`** (#1292). On the ambient AG-UI stream, a client that held an `assign`

@@ -1,0 +1,49 @@
+#!/bin/sh
+# Stub kubectl for the EKS deploy.sh test. Client-side commands (kustomize, a
+# --dry-run=client create) run the real kubectl; anything that would reach a
+# cluster is recorded in $STATE, and an applied object is kept as
+# $STATE/obj-<name> (its YAML).
+printf '%s\n' "$*" >> "$STATE/kubectl.argv"
+case "$*" in
+  kustomize*|*--dry-run=client*) exec "$REAL_KUBECTL" "$@" ;;
+esac
+file=""; prev=""; name=""; jsonpath=""
+for a in "$@"; do
+  [ "$prev" = "-f" ] && file="$a"
+  [ "$prev" = "secret" ] || [ "$prev" = "configmap" ] && [ -z "$name" ] && name="$a"
+  case "$a" in jsonpath=*) jsonpath="${a#jsonpath=}" ;; esac
+  prev="$a"
+done
+case "$*" in
+  *" get secret "*|*" get configmap "*)
+    if [ -n "$jsonpath" ]; then
+      [ -e "$STATE/obj-$name" ] || exit 0  # --ignore-not-found
+      exec "$STUB_PYTHON" - "$STATE/obj-$name" "$jsonpath" <<'PY'
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1]))
+key = sys.argv[2].strip("{}").replace("\\.", "\0").split(".")[-1].replace("\0", ".")
+sys.stdout.write((doc.get("data") or {}).get(key, ""))
+PY
+    fi
+    [ -e "$STATE/obj-$name" ] ;;
+  apply*|*" apply "*)
+    if [ "$file" = "-" ]; then cat > "$STATE/last-apply"; else cat "$file" > "$STATE/last-apply"; fi
+    if [ -n "${STUB_APPLY_FAILS_ON:-}" ] && grep -q "$STUB_APPLY_FAILS_ON" "$STATE/last-apply"; then
+      echo "stub kubectl: apply failed" >&2; exit 1
+    fi
+    { cat "$STATE/last-apply"; printf '\n---\n'; } >> "$STATE/applied.yaml"
+    "$STUB_PYTHON" - "$STATE/last-apply" "$STATE" <<'PY'
+import sys, yaml
+for doc in yaml.safe_load_all(open(sys.argv[1])):
+    if doc:
+        with open(f"{sys.argv[2]}/obj-{doc['metadata']['name']}", "w") as out:
+            yaml.safe_dump(doc, out)
+PY
+    ;;
+  *"create secret generic cao-runner-token"*)
+    for a in "$@"; do
+      case "$a" in --from-file=token=*) cp "${a#--from-file=token=}" "$STATE/token-file" ;; esac
+    done
+    : > "$STATE/obj-cao-runner-token" ;;
+  *) : ;;
+esac

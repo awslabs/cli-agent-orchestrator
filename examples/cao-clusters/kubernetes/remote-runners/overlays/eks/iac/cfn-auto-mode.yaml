@@ -1,0 +1,622 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# The AWS side of the remote-runners EKS overlay (#745): a two-AZ VPC, an EKS
+# Auto Mode cluster, the EFS workspace every runner mounts, the Bedrock role the
+# runners assume through EKS Pod Identity, and the image repository.
+#
+# What it does not do: create Kubernetes objects (../ has them, applied by
+# ../deploy.sh), build or push the image (../deploy.sh), or turn on NetworkPolicy
+# enforcement, which in Auto Mode is a ConfigMap in kube-system that only exists
+# once the cluster does (../deploy.sh applies it before anything else).
+#
+# Deploy (about 15 minutes, most of it the control plane):
+#   aws cloudformation deploy \
+#     --template-file examples/cao-clusters/kubernetes/remote-runners/overlays/eks/iac/cfn-auto-mode.yaml \
+#     --stack-name cao-remote \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides ClusterName=cao-remote PublicAccessCidrs=<your-ip>/32
+#
+# Cost while running: the EKS control plane, the Auto Mode nodes, the NAT
+# gateway and the EFS file system bill hourly. Delete the stack when done;
+# the image repository is emptied on delete, so nothing blocks it.
+
+Description: >-
+  CAO remote runners on EKS Auto Mode: VPC, cluster, EFS workspace, runner
+  Bedrock role (Pod Identity) and image repository.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: cao-remote
+    # Lower case, at most 40 characters: it prefixes the ECR repository (lower
+    # case only) and IAM names (64 characters at most).
+    AllowedPattern: "^[a-z][a-z0-9-]{0,38}[a-z0-9]$"
+    Description: EKS cluster name; also the prefix of every named resource.
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.35"
+    Description: EKS Kubernetes version.
+
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    # Four /20 subnets are carved from it, which needs at least a /18.
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/1[6-8]$"
+    Description: VPC CIDR (/16 to /18), split into two public and two private /20 subnets.
+
+  ServiceIpv4Cidr:
+    Type: String
+    Default: 10.100.0.0/16
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/16$"
+    Description: >-
+      Kubernetes Service CIDR. Pinned, not left to EKS, because Auto Mode runs
+      cluster DNS on each node at the .10 address of this range, and the overlay's
+      NetworkPolicy allows DNS to that address (../deploy.sh renders it).
+
+  PublicAccessCidrs:
+    Type: CommaDelimitedList
+    Description: >-
+      Source CIDRs allowed to reach the Kubernetes API endpoint, e.g. your
+      workstation's address as a /32. The endpoint still requires IAM
+      authentication; never use 0.0.0.0/0. The CAO API and the runner hub are
+      ClusterIP services and are never reachable from here.
+
+  BedrockModelPattern:
+    Type: String
+    Default: anthropic.claude-*
+    AllowedPattern: "^[a-z0-9][a-z0-9.*:-]*$"
+    Description: >-
+      Foundation models the runners may invoke, as an ARN resource pattern
+      (default: Anthropic Claude). Inference profiles for those models are
+      allowed in this account and region.
+
+Rules:
+  # The endpoint still needs IAM, but an open allowlist is never intended here.
+  # Defence in depth only: creating a change set (what `aws cloudformation
+  # deploy` does) was not seen to evaluate rules, so ../deploy.sh also refuses
+  # a cluster whose endpoint allows 0.0.0.0/0.
+  NoOpenApiEndpoint:
+    Assertions:
+      - Assert: !Not [!Contains [!Ref PublicAccessCidrs, "0.0.0.0/0"]]
+        AssertDescription: PublicAccessCidrs must not contain 0.0.0.0/0; list your own source ranges.
+
+
+Resources:
+  # ===========================================================================
+  # Network: two Availability Zones, one NAT gateway
+  # ===========================================================================
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      # Both required by EKS: nodes resolve the cluster endpoint by DNS, and EFS
+      # mount targets are addressed by DNS name.
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-igw"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Subnet CIDRs are carved with Fn::Cidr rather than taken as parameters, so
+  # there is nothing to compute by hand. The third argument is the host-bit
+  # count, so 12 yields /20s (4091 usable each): 0-1 public, 2-3 private.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 12]]
+      # Needed for the NAT gateway and any internet-facing load balancer.
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public-a"
+        # Marks the subnet usable for internet-facing load balancers.
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 12]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public-b"
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+
+  # Nodes, pods and EFS mount targets live here.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 12]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private-a"
+        # Marks the subnet usable for internal load balancers.
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+        - Key: karpenter.sh/discovery
+          Value: !Ref ClusterName
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 12]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private-b"
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+        - Key: karpenter.sh/discovery
+          Value: !Ref ClusterName
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-nat"
+
+  # A single NAT gateway in the first AZ. Both private subnets egress through it,
+  # which is the right trade for a demo: one NAT instead of two roughly halves
+  # the standing cost. The accepted consequence is that losing this AZ removes
+  # outbound internet for the whole cluster, and that traffic from the second AZ
+  # crosses an AZ boundary. For production, add a NAT per AZ and give each
+  # private subnet its own route table.
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-nat"
+
+  # One shared private route table, since both AZs use the same NAT gateway.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+
+  # ===========================================================================
+  # Cluster: EKS Auto Mode
+  # ===========================================================================
+
+  # Auto Mode needs the compute, block-storage, load-balancing and networking
+  # policies on the cluster role, and sts:TagSession in its trust policy.
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSComputePolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSBlockStoragePolicyV2"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSLoadBalancingPolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSNetworkingPolicy"
+
+  # The role Auto Mode nodes run as. Deliberately minimal: the runners get their
+  # Bedrock access from Pod Identity, never from the node.
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
+
+  # Envelope encryption for Kubernetes Secrets: the runner token and the hub's
+  # TLS key live there. Create-time only; EKS does not add it to a running
+  # cluster.
+  SecretsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub "Envelope encryption for Kubernetes Secrets in ${ClusterName}"
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Delegation to the account's IAM, not a wildcard grant: KMS rejects a
+          # policy that locks every principal out.
+          - Sid: DelegateToAccountIam
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+
+  # Granted from the role, not by naming the role in the key policy: a role
+  # created moments earlier is not always visible to KMS yet.
+  ClusterKmsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: secrets-envelope-encryption
+      Roles:
+        - !Ref ClusterRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: !GetAtt SecretsKey.Arn
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    DependsOn: ClusterKmsPolicy
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      # Auto Mode installs and runs its own networking, DNS, storage and
+      # load-balancing components; the self-managed default add-ons would
+      # duplicate them.
+      BootstrapSelfManagedAddons: false
+      ComputeConfig:
+        Enabled: true
+        NodePools:
+          - general-purpose
+          - system
+        NodeRoleArn: !GetAtt NodeRole.Arn
+      StorageConfig:
+        BlockStorage:
+          Enabled: true
+      KubernetesNetworkConfig:
+        ServiceIpv4Cidr: !Ref ServiceIpv4Cidr
+        ElasticLoadBalancing:
+          Enabled: true
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        # The public endpoint serves only the Kubernetes API, behind IAM, and
+        # only from PublicAccessCidrs. Private access keeps node and pod traffic
+        # to the API server inside the VPC.
+        EndpointPublicAccess: true
+        PublicAccessCidrs: !Ref PublicAccessCidrs
+        EndpointPrivateAccess: true
+      AccessConfig:
+        AuthenticationMode: API
+        # Cluster admin for whoever deploys the stack, so ../deploy.sh can run
+        # right after it.
+        BootstrapClusterCreatorAdminPermissions: true
+      EncryptionConfig:
+        - Resources:
+            - secrets
+          Provider:
+            KeyArn: !GetAtt SecretsKey.Arn
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+
+  # ===========================================================================
+  # Runner identity: Bedrock through EKS Pod Identity
+  # ===========================================================================
+
+  # The runners' only AWS permission: invoking the models BedrockModelPattern
+  # names, directly or through this account's inference profiles for them.
+  # cao-server runs no agent and gets none. Model access is not granted here:
+  # activate the model for the account once, as an administrator, before the
+  # first run (the runners hold no Marketplace permission).
+  RunnerBedrockPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    # No fixed name: a change that replaces the policy (its description, say)
+    # then cannot collide with the old one's name.
+    Properties:
+      Description: Bedrock invocation of the allowed models for the CAO runner pods, and nothing else.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # The claude_code provider calls the Bedrock invoke API, not Converse. A
+          # cross-region or global inference profile invokes the model in
+          # other regions, hence the region wildcard (and the empty region of
+          # a global profile's model ARN).
+          - Sid: InvokeAllowedModels
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${BedrockModelPattern}"
+              - !Sub "arn:${AWS::Partition}:bedrock:::foundation-model/${BedrockModelPattern}"
+              - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*.${BedrockModelPattern}"
+          # The claude_code provider reads the inference profiles at startup.
+          - Sid: ReadModelCatalogue
+            Effect: Allow
+            Action:
+              - bedrock:ListInferenceProfiles
+              - bedrock:GetInferenceProfile
+              - bedrock:ListFoundationModels
+              - bedrock:GetFoundationModel
+            Resource: "*"
+
+  RunnerBedrockRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-runner-bedrock"
+      Description: Assumed by the CAO runner pods through EKS Pod Identity.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - !Ref RunnerBedrockPolicy
+
+  # Pod Identity's agent is built into Auto Mode; only the association is needed.
+  # It applies at pod creation, so it must exist before the first runner starts
+  # (this stack runs before ../deploy.sh).
+  # The namespace and service account are fixed by the overlay
+  # (../../base/namespace.yaml, ../serviceaccount.yaml).
+  RunnerPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: cao-remote
+      ServiceAccount: cao-runner
+      RoleArn: !GetAtt RunnerBedrockRole.Arn
+
+  # ===========================================================================
+  # Workspace: EFS (ReadWriteMany across runner nodes)
+  # ===========================================================================
+
+  # Auto Mode has no built-in EFS driver.
+  EfsCsiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy"
+
+  EfsCsiAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: aws-efs-csi-driver
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - RoleArn: !GetAtt EfsCsiRole.Arn
+          ServiceAccount: efs-csi-controller-sa
+
+  # NFS only, and only from the cluster security group, which Auto Mode's
+  # default NodeClass puts on every node. The EFS driver mounts from the node.
+  WorkspaceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "NFS from ${ClusterName} nodes to the CAO workspace"
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: NFS from cluster nodes
+          IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !GetAtt Cluster.ClusterSecurityGroupId
+      # Mount targets only answer; security groups are stateful.
+      SecurityGroupEgress:
+        - Description: No egress required
+          IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-workspace-nfs"
+
+  # Delete on both: a replaced or deleted file system never lingers outside the
+  # stack, still billing. The workspace holds clones agents can recreate.
+  WorkspaceFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      # Disabled to match DeletionPolicy: Delete; recovery points would outlive
+      # the stack and keep billing.
+      BackupPolicy:
+        Status: DISABLED
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-workspace"
+
+  # Pins every NFS client to uid/gid 1000, the image's `cao` user.
+  WorkspaceAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /cao-workspace
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "0755"
+
+  WorkspaceMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups:
+        - !Ref WorkspaceSecurityGroup
+
+  WorkspaceMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups:
+        - !Ref WorkspaceSecurityGroup
+
+  # ===========================================================================
+  # Image repository
+  # ===========================================================================
+
+  # Immutable tags: a tag always names one image. Private, scanned on push,
+  # AES256 at rest; emptied on delete so the stack can be removed.
+  ServerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ClusterName}/cao-server"
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  KubeconfigCommand:
+    Value: !Sub "aws eks update-kubeconfig --region ${AWS::Region} --name ${Cluster}"
+  ClusterDnsIp:
+    Description: >-
+      Auto Mode's node-local DNS address, the .10 of a /16 ServiceIpv4Cidr;
+      ../deploy.sh renders it into allow-dns.
+    Value: !Join [".", [!Select [0, !Split [".", !Ref ServiceIpv4Cidr]], !Select [1, !Split [".", !Ref ServiceIpv4Cidr]], "0", "10"]]
+  WorkspaceVolumeHandle:
+    Description: spec.csi.volumeHandle of the workspace volume; ../deploy.sh renders it.
+    Value: !Sub "${WorkspaceFileSystem}::${WorkspaceAccessPoint}"
+  ServerRepositoryUri:
+    Value: !GetAtt ServerRepository.RepositoryUri
+  RunnerBedrockRoleArn:
+    Value: !GetAtt RunnerBedrockRole.Arn

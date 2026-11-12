@@ -1,0 +1,11 @@
+#!/bin/sh
+# Stub docker for the EKS deploy.sh test: records each call and its
+# DOCKER_CONFIG; a login writes a config there, as docker does; a push records
+# the tag pushed.
+printf '%s DOCKER_CONFIG=%s\n' "$*" "${DOCKER_CONFIG:-}" >> "$STATE/docker.argv"
+case "$1" in
+  login)
+    cat > /dev/null
+    if [ -n "${DOCKER_CONFIG:-}" ]; then echo '{"auths":{"r":{"auth":"x"}}}' > "$DOCKER_CONFIG/config.json"; fi ;;
+  push) for a in "$@"; do last="$a"; done; printf '%s' "${last##*:}" > "$STATE/image" ;;
+esac
