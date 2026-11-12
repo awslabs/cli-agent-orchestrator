@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<!--
+  ABOUTME: Zero-dependency raw event inspector: lists every record of a recorded /agui/v1 trace, in order.
+  ABOUTME: A reader of a recorded .ndjson file only. It opens no stream, calls no cao-server route, writes nothing.
+
+  CAO Dojo raw event inspector (#1165). It reads a trace recorded by
+  tools/record_trace.py (schema cao-dojo-trace/1), by default
+  trace/cao-dojo-trace.ndjson, and shows EVERY record in file order: its
+  capture, plane, direction, sequence number, type and timestamp, with the
+  record's JSON one click away.
+
+  What it is not: a client of /agui/v1. It has no EventSource, no POST and no
+  token field, so it needs no cao-server, no CAO_AGUI_ENABLED and no new route,
+  and it cannot change anything. The trace is metadata only (the recorder
+  scrubs and leak-checks it); the page renders it with textContent, never
+  innerHTML or eval.
+
+  Timestamps: the AG-UI frame `timestamp` (epoch milliseconds) is shown when the
+  frame has one. In the published trace only the CUSTOM approval cards carry
+  one; every other record shows "—" rather than an invented time.
+
+  Load a trace with ?trace=<path relative to this page>, or pick a local .ndjson
+  file. A page opened from file:// cannot fetch, so serve this directory:
+    cd examples/ag-ui/cao-dojo && python3 -m http.server 8790 --bind 127.0.0.1
+    open http://localhost:8790/inspector.html
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CAO Dojo: raw event inspector</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a21; --panel-2: #1e222b; --border: #2a2f3a;
+    --text: #e6e9ef; --muted: #9aa4b2; --accent: #6ea8fe; --ok: #4ec9a5;
+    --warn: #e6b450; --err: #f07178; --chip: #232833;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--border); }
+  h1 { margin: 0; font-size: 16px; }
+  label { color: var(--muted); font-size: 12px; }
+  input[type="text"] { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; width: 320px; }
+  input[type="file"] { color: var(--muted); font-size: 12px; }
+  button { background: var(--accent); color: #07101f; border: 0; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+  main { padding: 16px; }
+  #meta, #summary { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+  #error { color: var(--err); margin: 8px 0; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); vertical-align: top;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  th { color: var(--muted); font-weight: 600; background: var(--panel-2); }
+  .c-type { color: var(--accent); }
+  tr[data-dir="request"] .c-type { color: var(--warn); }
+  tr[data-type="RUN_ERROR"] .c-type { color: var(--err); }
+  tr[data-type="RUN_FINISHED"] .c-type { color: var(--ok); }
+  .c-ts.none { color: var(--muted); }
+  details summary { cursor: pointer; color: var(--muted); }
+  pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <h1>CAO Dojo: raw event inspector</h1>
+  <label for="trace">trace (relative path)</label>
+  <input id="trace" type="text" value="trace/cao-dojo-trace.ndjson" spellcheck="false" />
+  <button id="load" type="button">Load</button>
+  <label for="file">or a local .ndjson</label>
+  <input id="file" type="file" accept=".ndjson,.jsonl,.json,text/plain" />
+</header>
+<main>
+  <p id="meta">No trace loaded.</p>
+  <p id="summary"></p>
+  <div id="error" role="alert"></div>
+  <table id="events" aria-label="Recorded AG-UI events">
+    <thead>
+      <tr>
+        <th>#</th><th>capture</th><th>plane</th><th>dir</th><th>seq</th>
+        <th>type</th><th>timestamp (ms)</th><th>timestamp (UTC)</th><th>record</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</main>
+<script>
+(function () {
+  "use strict";
+
+  var els = {
+    trace: document.getElementById("trace"),
+    load: document.getElementById("load"),
+    file: document.getElementById("file"),
+    meta: document.getElementById("meta"),
+    summary: document.getElementById("summary"),
+    error: document.getElementById("error"),
+    body: document.querySelector("#events tbody")
+  };
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  // The type of a record: the AG-UI frame's `type`, or REQUEST for the
+  // RunAgentInput the recorder posted (a request has no frame).
+  function recordType(rec) {
+    return rec.frame && typeof rec.frame.type === "string" ? rec.frame.type : "REQUEST";
+  }
+
+  // Only a real integer `timestamp` on the frame counts; nothing is derived.
+  function frameTimestamp(rec) {
+    var ts = rec.frame ? rec.frame.timestamp : undefined;
+    return typeof ts === "number" && isFinite(ts) && Math.floor(ts) === ts ? ts : null;
+  }
+
+  function isoUtc(ms) {
+    try { return new Date(ms).toISOString(); } catch (e) { return "—"; }
+  }
+
+  // Parse NDJSON. The first line is the recorder's `_meta` header: it is shown
+  // above the table and is not an event. Every other non-blank line is a row.
+  function parseTrace(textBody) {
+    var meta = null, rows = [], problems = [];
+    var lines = textBody.split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      if (!lines[i].trim()) continue;
+      var rec;
+      try { rec = JSON.parse(lines[i]); } catch (e) {
+        problems.push("line " + (i + 1) + ": not JSON (" + e.message + ")");
+        continue;
+      }
+      if (rec === null || typeof rec !== "object" || Array.isArray(rec)) {
+        problems.push("line " + (i + 1) + ": not a JSON object");
+        continue;
+      }
+      if (Object.prototype.hasOwnProperty.call(rec, "_meta")) { meta = rec._meta; continue; }
+      rows.push(rec);
+    }
+    return { meta: meta, rows: rows, problems: problems };
+  }
+
+  function render(parsed, source) {
+    clear(els.body);
+    els.error.textContent = parsed.problems.join("; ");
+    var m = parsed.meta;
+    els.meta.textContent = m
+      ? source + " — " + (m.schema || "unknown schema") + ", AG-UI " + (m.ag_ui_protocol || "?") +
+        ", CAO " + (m.cao_version || "?") + ", provider " + (m.provider || "?")
+      : source + " — no _meta header";
+    var stamped = 0;
+    parsed.rows.forEach(function (rec, i) {
+      var type = recordType(rec);
+      var ts = frameTimestamp(rec);
+      if (ts !== null) stamped++;
+      var tr = el("tr");
+      tr.dataset.index = String(i + 1);
+      tr.dataset.type = type;
+      tr.dataset.timestamp = ts === null ? "" : String(ts);
+      tr.dataset.dir = String(rec.dir == null ? "" : rec.dir);
+      tr.dataset.plane = String(rec.plane == null ? "" : rec.plane);
+      tr.dataset.capture = String(rec.capture == null ? "" : rec.capture);
+      tr.dataset.seq = String(rec.seq == null ? "" : rec.seq);
+      tr.appendChild(el("td", "c-n", String(i + 1)));
+      tr.appendChild(el("td", "c-capture", tr.dataset.capture));
+      tr.appendChild(el("td", "c-plane", tr.dataset.plane));
+      tr.appendChild(el("td", "c-dir", tr.dataset.dir));
+      tr.appendChild(el("td", "c-seq", tr.dataset.seq));
+      tr.appendChild(el("td", "c-type", type));
+      tr.appendChild(el("td", "c-ts" + (ts === null ? " none" : ""), ts === null ? "—" : String(ts)));
+      tr.appendChild(el("td", "c-iso" + (ts === null ? " none" : ""), ts === null ? "—" : isoUtc(ts)));
+      var cell = el("td", "c-json");
+      var d = el("details");
+      d.appendChild(el("summary", null, "json"));
+      d.appendChild(el("pre", null, JSON.stringify(rec, null, 2)));
+      cell.appendChild(d);
+      tr.appendChild(cell);
+      els.body.appendChild(tr);
+    });
+    els.summary.textContent = parsed.rows.length + " record(s), " + stamped +
+      " with a frame timestamp, in file order.";
+  }
+
+  // Same-origin, relative paths only: this page reads a trace beside it and
+  // never fetches an arbitrary URL.
+  function safeRelative(path) {
+    var p = (path || "").trim();
+    if (!p || /^[a-z][a-z0-9+.-]*:/i.test(p) || p.indexOf("//") === 0 || p.charAt(0) === "/" ||
+        p.split("/").indexOf("..") !== -1) return null;
+    return p;
+  }
+
+  function loadFromPath(path) {
+    var rel = safeRelative(path);
+    if (!rel) {
+      els.error.textContent = "trace must be a relative path inside this directory (no scheme, no leading /, no ..)";
+      return;
+    }
+    fetch(rel, { method: "GET", credentials: "omit", cache: "no-store" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status + " for " + rel);
+      return r.text();
+    }).then(function (body) {
+      render(parseTrace(body), rel);
+    }).catch(function (e) {
+      clear(els.body);
+      els.summary.textContent = "";
+      els.error.textContent = "could not load " + rel + ": " + e.message +
+        " (serve this directory over http; file:// cannot fetch)";
+    });
+  }
+
+  els.load.addEventListener("click", function () { loadFromPath(els.trace.value); });
+  els.file.addEventListener("change", function () {
+    var f = els.file.files && els.file.files[0];
+    if (!f) return;
+    var reader = new FileReader();
+    reader.onload = function () { render(parseTrace(String(reader.result)), f.name); };
+    reader.onerror = function () { els.error.textContent = "could not read " + f.name; };
+    reader.readAsText(f);
+  });
+
+  var q = new URLSearchParams(window.location.search).get("trace");
+  if (q) els.trace.value = q;
+  loadFromPath(els.trace.value);
+})();
+</script>
+</body>
+</html>
