@@ -1433,6 +1433,26 @@ class TestBuildEnvArgs:
         assert "CAO_SESSION_NAME=cao-proj" in joined
         assert "CAO_SESSION_NAME=evil" not in joined
 
+    def test_build_env_args_sets_histfile_to_dev_null_over_extra_env(self):
+        """The pane shell must not write agent launch commands to the user's history."""
+        from cli_agent_orchestrator.backends.herdr_backend import (
+            HerdrBackend,
+            _sanitize_herdr_args,
+        )
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="tid",
+            session_name="s",
+            extra_env={"HISTFILE": "/tmp/operator_hist"},
+        )
+        values = [pairs[i + 1] for i in range(0, len(pairs), 2)]
+        assert "HISTFILE=/dev/null" in values
+        assert "HISTFILE=/tmp/operator_hist" not in values
+        # The herdr arg sanitizer must accept the pair, or terminal creation fails.
+        args = ["tab", "create", "--workspace", "w1", "--env", "HISTFILE=/dev/null"]
+        assert _sanitize_herdr_args(args) == args
+
     def test_build_env_args_forwards_this_cao_address_and_home(self, monkeypatch):
         from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
@@ -1447,9 +1467,9 @@ class TestBuildEnvArgs:
         # A pane must reach the CAO that created it, whoever started the herdr server.
         assert "CAO_API_PORT=9899" in values
         assert not any(v.startswith("CAO_API_HOST=") for v in values)
-        # An operator-forwarded value still overrides, and identity still comes last.
+        # An operator-forwarded value still overrides, and the CAO-owned vars still come last.
         assert "CAO_HOME_DIR=/srv/override" in values and "CAO_HOME_DIR=/srv/cao-b" not in values
-        assert values[-2:] == ["CAO_TERMINAL_ID=tid", "CAO_SESSION_NAME=s"]
+        assert values[-3:] == ["CAO_TERMINAL_ID=tid", "CAO_SESSION_NAME=s", "HISTFILE=/dev/null"]
 
     def test_build_env_args_drops_a_server_env_value_the_sanitizer_would_reject(
         self, monkeypatch, caplog
@@ -1484,7 +1504,14 @@ class TestBuildEnvArgs:
             monkeypatch.delenv(key, raising=False)
         backend = HerdrBackend.__new__(HerdrBackend)
         pairs = backend._build_env_args(terminal_id="tid", session_name="s")
-        assert pairs == ["--env", "CAO_TERMINAL_ID=tid", "--env", "CAO_SESSION_NAME=s"]
+        assert pairs == [
+            "--env",
+            "CAO_TERMINAL_ID=tid",
+            "--env",
+            "CAO_SESSION_NAME=s",
+            "--env",
+            "HISTFILE=/dev/null",
+        ]
 
 
 class TestEnvValueRedaction:
