@@ -15,11 +15,15 @@
 // The draft (workflow, inputs, run id) and any pending approval persist in
 // localStorage, so reloading the tab or opening the UI in a new tab still shows
 // the plan id waiting for approval instead of silently dropping it.
+//
+// A YAML workflow (source_path ends in .yaml or .yml) also offers Edit, which
+// opens the workflow builder, and Delete, which asks for the exact name first.
 
 import { useEffect, useRef, useState } from 'react'
-import { Play, Plus, X, Loader2, ChevronDown, ChevronRight, ShieldCheck, ListChecks, FileCode } from 'lucide-react'
+import { Play, Plus, X, Loader2, ChevronDown, ChevronRight, ShieldCheck, ListChecks, FileCode, Pencil } from 'lucide-react'
 import { api, WorkflowDefRow, WorkflowSpec, WorkflowValidation } from '../../api'
 import { useStore } from '../../store'
+import { DeleteWorkflowButton } from './DeleteWorkflowButton'
 
 interface InputRow {
   key: string
@@ -73,6 +77,20 @@ export function coerceInput(row: InputRow): { value?: unknown; error?: string } 
 
 export const LAUNCHER_DRAFT_KEY = 'cao.workflowLauncher'
 
+/** True for a workflow the builder can edit: its file is YAML. */
+export function isYamlWorkflow(def: Pick<WorkflowDefRow, 'source_path'>): boolean {
+  return /\.ya?ml$/i.test(def.source_path)
+}
+
+export interface WorkflowLauncherProps {
+  /** Bump to re-read the stored workflows, for example after the builder saves one. */
+  reloadKey?: number
+  /** Open the launcher on this workflow, for example one the builder just saved. Bump `seq` to repeat. */
+  focus?: { name: string; seq: number } | null
+  /** Opens the builder on a YAML workflow. Without it there is no Edit button. */
+  onEdit?: (name: string) => void
+}
+
 interface PendingApproval {
   planId: string
   message?: string
@@ -111,7 +129,7 @@ function saveLauncherDraft(d: LauncherDraft) {
   } catch { /* storage denied or full — the draft is a convenience */ }
 }
 
-export function WorkflowLauncher() {
+export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: WorkflowLauncherProps = {}) {
   const startWorkflowRun = useStore(s => s.startWorkflowRun)
   const showSnackbar = useStore(s => s.showSnackbar)
 
@@ -177,7 +195,9 @@ export function WorkflowLauncher() {
     }
   }
 
-  // Load the stored workflow definitions when the launcher is first opened.
+  // Load the stored workflow definitions when the launcher is first opened,
+  // and again after a save (reloadKey) or a delete (listVersion).
+  const [listVersion, setListVersion] = useState(0)
   useEffect(() => {
     if (!open) return
     let cancelled = false
@@ -188,14 +208,27 @@ export function WorkflowLauncher() {
         setLoadError(null)
         // Default the picker to the only / first workflow for a one-click run.
         if (rows.length && !selected) setSelected(rows[0].name)
+        // The selected workflow is gone (deleted): move to the first one left.
+        else if (selected && !rows.some(r => r.name === selected)) {
+          if (rows.length) pickWorkflow(rows[0].name)
+          else setSelected('')
+        }
       })
       .catch((e: any) => {
         if (!cancelled) setLoadError(e?.detail || e?.message || 'Failed to load workflows')
       })
     return () => { cancelled = true }
-  }, [open, selected])
+  }, [open, selected, reloadKey, listVersion])
 
-  // Prefill the input rows from what the selected workflow declares.
+  // Open on a workflow the caller names, such as one the builder just saved.
+  useEffect(() => {
+    if (!focus) return
+    setOpen(true)
+    if (focus.name !== selected) pickWorkflow(focus.name)
+  }, [focus?.seq])
+
+  // Prefill the input rows from what the selected workflow declares. Re-read
+  // after a save too (reloadKey), since the builder may have changed them.
   useEffect(() => {
     if (!open || !selected || !pristine.current) return
     let cancelled = false
@@ -203,7 +236,7 @@ export function WorkflowLauncher() {
       .then(spec => { if (!cancelled && pristine.current) setInputs(rowsFromDeclaredInputs(spec.inputs)) })
       .catch(() => { /* no declared inputs to offer; the rows stay as they are */ })
     return () => { cancelled = true }
-  }, [open, selected])
+  }, [open, selected, reloadKey])
 
   const pickWorkflow = (name: string) => {
     // Rows belong to the previous workflow; let the new one's declaration replace them.
@@ -233,6 +266,8 @@ export function WorkflowLauncher() {
     })
     return payload
   }
+
+  const selectedDef = workflows.find(w => w.name === selected)
 
   const run = async () => {
     const outcome = await startWorkflowRun(selected, buildPayload(), runId.trim() || undefined)
@@ -282,7 +317,7 @@ export function WorkflowLauncher() {
             <p className="text-sm text-red-400" role="alert">{loadError}</p>
           ) : workflows.length === 0 ? (
             <p className="text-sm text-gray-500">
-              No stored workflows yet. Author one with the workflow agent first, then it appears here.
+              No stored workflows yet. Create one with New workflow, or author one with the workflow agent, and it appears here.
             </p>
           ) : (
             <>
@@ -300,6 +335,22 @@ export function WorkflowLauncher() {
                   ))}
                 </select>
               </label>
+
+              {selectedDef && isYamlWorkflow(selectedDef) && (
+                <div className="flex items-center gap-2">
+                  {onEdit && (
+                    <button
+                      type="button"
+                      onClick={() => onEdit(selectedDef.name)}
+                      aria-label={`Edit workflow ${selectedDef.name}`}
+                      className="inline-flex items-center gap-1 rounded-lg border border-gray-700 px-2 py-1 text-xs text-gray-200 hover:bg-gray-800"
+                    >
+                      <Pencil size={13} aria-hidden="true" /> Edit
+                    </button>
+                  )}
+                  <DeleteWorkflowButton name={selectedDef.name} onDeleted={() => setListVersion(v => v + 1)} />
+                </div>
+              )}
 
               <div>
                 <span className="text-xs text-gray-400">Inputs</span>

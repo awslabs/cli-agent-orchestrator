@@ -13,7 +13,7 @@
 
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { realpathSync } from "node:fs";
+import { realpathSync, writeFileSync } from "node:fs";
 import { dirname, sep } from "node:path";
 import { createController, emptyPanel, openAmbient, reduceFrame, ROUTES, ALLOWED_COMPONENTS, type Frame } from "../core/index.ts";
 
@@ -21,7 +21,7 @@ const BASE = process.env.CAO_E2E_BASE ?? "";
 const SOCKET = process.env.CAO_E2E_TMUX_SOCKET ?? "";
 const WORKDIR = process.env.CAO_E2E_WORKDIR ?? "";
 assert.ok(BASE && SOCKET && WORKDIR, "run this through e2e/run.sh");
-assert.ok(!BASE.endsWith(":9889"), "refusing the default fleet port");
+assert.notEqual(new URL(BASE).port, "9889", "refusing the default port 9889");
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const log = (msg: string) => console.log(`[e2e] ${msg}`);
@@ -104,6 +104,25 @@ async function emitUi(component: string, terminalId: string, props: object): Pro
   return { status: res.status, body: await res.json() };
 }
 
+/** A worker the supervisor `caller` calls: an `assign` or `handoff` the ambient stream turns into a TOOL_CALL pair. */
+async function callWorker(session: string, caller: string, kind: "assign" | "handoff"): Promise<string> {
+  const q = new URLSearchParams({ agent_profile: "developer", provider: "mock_cli", caller_id: caller, defer_init: "true" });
+  const res = await fetch(`${BASE}/sessions/${session}/terminals?${q}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ initial_message: "Do the assigned task.", initial_message_orchestration_type: kind }),
+  });
+  const text = await res.text();
+  assert.equal(res.status, 201, `create worker: ${res.status} ${text}`);
+  return (JSON.parse(text) as { id: string }).id;
+}
+
+/** mock_cli never finishes by itself: closing the worker ends its call, as the receiver's work ending does. */
+async function closeWorker(id: string) {
+  const res = await fetch(`${BASE}/terminals/${id}`, { method: "DELETE" });
+  assert.equal(res.status, 200, `delete worker ${id}: ${res.status}`);
+}
+
 // ── the app ─────────────────────────────────────────────────────────────────
 const ctl = createController({ base: BASE, threadId: "operator-dashboard-e2e", fetchImpl: appFetch, timeoutMs: 15_000 });
 
@@ -181,8 +200,9 @@ async function main() {
   assert.ok(paneTail(A).some((l) => l.endsWith("MOCK: y")) && paneTail(B).some((l) => l.endsWith("MOCK: n")));
   log("PASS two interrupts: held until both decided, one resume[] with both, A got y and B got n");
 
-  // 6. The six components from real emit_ui calls, and the off-list call's 400, read on both ambient
-  //    transports at once: EventSource on GET (no token), and fetch on POST with a token.
+  // 6. The six components from real emit_ui calls, and the off-list call's 400 and its refusal record
+  //    (#1158), read on both ambient transports at once: EventSource on GET (no token), and fetch on
+  //    POST with a token.
   const esFrames: Frame[] = [];
   const esStatus: string[] = [];
   const ambientEs = openAmbient({
@@ -221,13 +241,17 @@ async function main() {
     const r = await emitUi(component, A.id, { label: `e2e ${component}`, note: "<b>not markup</b>" });
     assert.equal(r.status, 200, `${component}: ${JSON.stringify(r.body)}`);
   }
-  const offList = await emitUi("iframe_embed", A.id, { src: "x" });
+  const PROPS_MARKER = "e2e-offlist-props-marker";
+  const offList = await emitUi("iframe_embed", A.id, { src: PROPS_MARKER });
   assert.equal(offList.status, 400);
   assert.match((offList.body as { detail: string }).detail, /^Unknown UI component 'iframe_embed'/);
   const mineIn = (entries: typeof ctl.panel.entries) =>
     entries.filter((e) => e.kind === "component" && e.owner.sender === A.id && String(e.props.label).startsWith("e2e "));
   await until(() => mineIn(ctl.panel.entries).length >= 6 && mineIn(tokenPanel.entries).length >= 6, "six components on both streams");
-  // Settle: give a refused call time to arrive, were it ever to reach the stream, before asserting it did not.
+  const refusalsIn = (entries: typeof ctl.panel.entries) =>
+    entries.filter((e) => e.kind === "refused" && e.component.startsWith("iframe_embed."));
+  await until(() => refusalsIn(ctl.panel.entries).length >= 1 && refusalsIn(tokenPanel.entries).length >= 1, "the refusal on both streams");
+  // Settle: give a second refusal frame time to arrive, were the server ever to send one.
   await sleep(2000);
   ambientEs.close();
   ambientToken.close();
@@ -236,12 +260,23 @@ async function main() {
     const seen = mineIn(entries).map((e) => (e.kind === "component" ? e.component : "")).sort();
     assert.deepEqual(seen, [...ALLOWED_COMPONENTS], `${name}: ${seen.join(",")}`);
     assert.ok(mineIn(entries).every((e) => e.owner.subagentRunId === `terminal:${A.id}`), `${name}: attribution`);
-    assert.ok(!entries.some((e) => e.component === "iframe_embed"), `${name}: the refused call reached the stream`);
+    assert.ok(!entries.some((e) => e.component === "iframe_embed"), `${name}: the raw off-list name reached the stream`);
+    const refused = refusalsIn(entries);
+    assert.equal(refused.length, 1, `${name}: ${refused.length} refusal entries`);
+    assert.match(refused[0].component, /^iframe_embed\.[0-9a-f]{8}$/, `${name}: refusal name`);
+    assert.equal(refused[0].owner.subagentRunId, `terminal:${A.id}`, `${name}: refusal attribution`);
+  }
+  const rawRefusals = esFrames.filter((f) => f.type === "RAW" && typeof (f.event as { rejected_component?: unknown })?.rejected_component === "string");
+  assert.equal(rawRefusals.length, 1, `EventSource: ${rawRefusals.length} RAW refusal frames`);
+  assert.ok(!("props" in (rawRefusals[0].event as object)), "the refusal frame carries props");
+  assert.ok(!JSON.stringify(esFrames).includes(PROPS_MARKER), "the off-list props reached the stream");
+  if (process.env.CAO_E2E_CAPTURE_OFFLIST) {
+    writeFileSync(process.env.CAO_E2E_CAPTURE_OFFLIST, `${JSON.stringify(rawRefusals[0], null, 2)}\n`);
   }
   assert.deepEqual(tokenStatus, ["connecting", "open", "closed"]);
   log(`PASS six components from real emit_ui calls on the ambient stream, EventSource (${esFrames.length} frames)`);
   log(`PASS the same six on the token POST stream (${tokenFrames} frames; status ${tokenStatus.join(" → ")})`);
-  log('PASS off-list emit_ui: HTTP 400 "Unknown UI component \'iframe_embed\'", and nothing on either stream after a 2s settle');
+  log('PASS off-list emit_ui: HTTP 400 "Unknown UI component \'iframe_embed\'", and exactly one refusal frame, with no props, on each stream after a 2s settle');
 
   // 6b. A token stream that drops replays what it missed (#1248 review, P3-2). The first request
   //     asks the server to end the stream after 2 s (forwardedProps.cao.maxSeconds); the client
@@ -286,6 +321,133 @@ async function main() {
   assert.ok(since && !Number.isNaN(Date.parse(since)), `the reconnect body carried no forwardedProps.cao.since: ${JSON.stringify(replayBodies[1])}`);
   assert.equal(reopened, 1);
   log(`PASS the token stream replays across a drop: the reconnect sent forwardedProps.cao.since=${since}, the component emitted during the drop arrived, and the reopen was reported once`);
+
+  // 6c. A token stream that stops reading overflows the server's per-subscriber queue (256
+  //     events; sse_bus.SSE_MAX_QUEUE_SIZE) and is ended with RUN_ERROR cao.stream_overflow. The
+  //     client reconnects with forwardedProps.cao.since. The client "stops reading" because the
+  //     fetch it is given holds the first response body back: nothing is pulled from the socket
+  //     until the gate opens, so the server's writes back up. How much the socket buffers absorb
+  //     before the queue fills depends on the OS (about 340 events of 7 KB on macOS; Linux
+  //     loopback buffers hold several MB), so FILL is sized to overflow on both.
+  //     After the fill, and so after the overflow: the second call (its start is dropped), the
+  //     first worker's end, and MARK markers. The replay ring holds the newest 500 records
+  //     (event_log_service.RING_CAPACITY), so fillers older than that are not replayed; the
+  //     markers and both calls are among the newest and must be. Asserted: the overflow, the
+  //     dropped start recovered, every marker once, no filler or call twice, and the call held
+  //     across the gap listed once as completed or unconfirmed.
+  const FILL = 3000;
+  const MARK = 20;
+  let releaseGate: () => void = () => {};
+  let gate: Promise<void> = Promise.resolve();
+  const overflowBodies: Array<Record<string, unknown>> = [];
+  const gatedFetch: typeof fetch = async (input, init) => {
+    overflowBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    const res = await appFetch(input, init);
+    if (overflowBodies.length > 1 || !res.body) return res; // only the first stream is held back
+    const reader = res.body.getReader();
+    const held = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          await gate;
+          const chunk = await reader.read();
+          if (chunk.done) controller.close();
+          else controller.enqueue(chunk.value);
+        },
+        cancel: (reason) => reader.cancel(reason),
+      },
+      { highWaterMark: 0 },
+    );
+    return new Response(held, { status: res.status, headers: res.headers });
+  };
+  const flood = createController({ base: BASE, threadId: "operator-dashboard-e2e-overflow", fetchImpl: appFetch });
+  const floodFrames: Frame[] = [];
+  const floodStatus: string[] = [];
+  let floodReopened = 0;
+  const ambientFlood = openAmbient({
+    base: BASE,
+    threadId: "operator-dashboard-e2e-overflow",
+    token: "e2e-token",
+    fetchImpl: gatedFetch,
+    retryMs: 500,
+    onFrame: (f) => {
+      floodFrames.push(f);
+      void flood.ambient(f);
+    },
+    // Wired as view/Root.tsx wires it.
+    onReopen: () => {
+      floodReopened += 1;
+      flood.reconnected();
+    },
+    onStatus: (st) => floodStatus.push(st),
+  });
+  await until(() => floodStatus.includes("open"), "the overflow stream to open");
+  const workerOne = await callWorker(A.session, A.id, "assign");
+  await until(() => flood.timeline.entries.some((e) => e.receiver === workerOne && e.state === "open"), "the first call to reach the client");
+  gate = new Promise<void>((resolve) => (releaseGate = resolve)); // from here the client reads nothing
+  const floodPad = "x".repeat(7500); // emit_ui refuses props over 8 KB
+  for (let i = 0; i < FILL; i += 1) {
+    const r = await emitUi("progress", A.id, { label: `e2e fill ${i}`, note: floodPad });
+    assert.equal(r.status, 200, `fill ${i}: ${JSON.stringify(r.body)}`);
+  }
+  // After the queue is full: a call whose start the held stream cannot carry, the end of call 1,
+  // and the markers.
+  const workerTwo = await callWorker(A.session, A.id, "handoff");
+  await closeWorker(workerOne);
+  for (let i = 0; i < MARK; i += 1) {
+    const r = await emitUi("metric", A.id, { label: `e2e mark ${i}` });
+    assert.equal(r.status, 200, `mark ${i}: ${JSON.stringify(r.body)}`);
+  }
+  assert.ok(!floodFrames.some((f) => f.type === "RUN_ERROR"), "nothing has been read yet");
+  releaseGate();
+  const labelsWith = (prefix: string) =>
+    floodFrames.flatMap((f) => {
+      const value = f.type === "CUSTOM" ? (f.value as { props?: { label?: unknown } } | undefined) : undefined;
+      const label = value?.props?.label;
+      return typeof label === "string" && label.startsWith(prefix) ? [label] : [];
+    });
+  const marksSeen = () => new Set(labelsWith("e2e mark ")).size;
+  const floodDone = () => floodReopened > 0 && marksSeen() >= MARK && flood.timeline.entries.some((e) => e.receiver === workerTwo);
+  try {
+    await until(floodDone, "the resync to deliver the dropped start and every marker", 60_000);
+  } catch (error) {
+    const detail = {
+      status: floodStatus,
+      frames: floodFrames.length,
+      runError: floodFrames.find((f) => f.type === "RUN_ERROR"),
+      requests: overflowBodies.length,
+      fill: new Set(labelsWith("e2e fill ")).size,
+      marks: `${marksSeen()}/${MARK}`,
+      timeline: flood.timeline.entries.map((e) => [e.receiver, e.orchestrationType, e.state]),
+    };
+    throw new Error(`${error instanceof Error ? error.message : error}: ${JSON.stringify(detail)}`);
+  }
+  await sleep(1000); // settle: anything else the replay or the live stream sends arrives first
+  ambientFlood.close();
+  await ambientFlood.done;
+  const overflowError = floodFrames.find((f) => f.type === "RUN_ERROR");
+  assert.equal(overflowError?.code, "cao.stream_overflow", `the held stream was not ended by an overflow: ${JSON.stringify(overflowError)}`);
+  const floodSince = (overflowBodies[1]?.forwardedProps as { cao?: { since?: string } } | undefined)?.cao?.since;
+  assert.ok(floodSince && !Number.isNaN(Date.parse(floodSince)), `the reconnect carried no since: ${JSON.stringify(overflowBodies[1])}`);
+  assert.equal(floodReopened, 1, "the reopen is reported once");
+  const fills = labelsWith("e2e fill ");
+  assert.equal(new Set(fills).size, fills.length, "a filler arrived twice");
+  const marks = labelsWith("e2e mark ");
+  assert.equal(marks.length, MARK, `every marker once: ${marks.length}`);
+  assert.equal(new Set(marks).size, MARK, "a marker arrived twice");
+  const ids = flood.timeline.entries.map((e) => e.toolCallId);
+  assert.equal(new Set(ids).size, ids.length, `a call is listed twice: ${ids.join(",")}`);
+  const one = flood.timeline.entries.filter((e) => e.receiver === workerOne);
+  const two = flood.timeline.entries.filter((e) => e.receiver === workerTwo);
+  assert.equal(one.length, 1, "the call held across the gap is listed once");
+  assert.ok(["completed", "unconfirmed"].includes(one[0].state), `the held call is ${one[0].state}`);
+  assert.equal(two.length, 1, "the call whose start was dropped is recovered once");
+  assert.equal(two[0].orchestrationType, "handoff");
+  const startFrames = floodFrames.filter((f) => f.type === "TOOL_CALL_START").length;
+  log(
+    `PASS overflow then resync: RUN_ERROR cao.stream_overflow after the held stream was read, the reconnect sent since=${floodSince}, ` +
+      `${fills.length}/${FILL} fillers (none twice) and all ${MARK} markers once (counted in frames), the dropped start was recovered (call 2: ${two[0].state}), ` +
+      `the held call is listed once as ${one[0].state}, and ${startFrames} TOOL_CALL_START frames gave 2 entries`,
+  );
 
   // 7. Routes.
   const allowed = new Set<string>(Object.values(ROUTES));

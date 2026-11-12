@@ -419,6 +419,137 @@ def _tmux_server_liveness(socket_path: str) -> str:
     return _SERVER_UNKNOWN
 
 
+# ── Browser terminal views ───────────────────────────────────────────────
+#
+# A tmux session has ONE current window, shared by every client attached to it.
+# A browser terminal that ran ``attach-session -t <session>:<window>`` therefore
+# switched the window for every other client on that session: two web panes on
+# agents of the same session showed the same window, and an operator attached
+# from a real terminal had their view flipped too.
+#
+# Each browser terminal instead gets its own throwaway "view" session holding
+# only the agent's window, linked (not moved) with ``link-window``. Properties:
+#   * independent: each view has its own current window, so panes never follow
+#     each other and the agent's own session is not touched;
+#   * self-closing: when the agent's window is killed it is unlinked from every
+#     session, the view is left empty and tmux destroys it, so the browser sees
+#     the connection close instead of being dropped onto some other agent;
+#   * self-cleaning: ``destroy-unattached`` removes the view once its single
+#     client (the WebSocket's PTY) goes away.
+# Views are named WEB_VIEW_PREFIX + random hex, which does not start with
+# SESSION_PREFIX, so session listings never report them as CAO sessions. They
+# carry WEB_VIEW_OWNER_OPTION = the agent session's name, which is how
+# ``kill_session`` finds and removes them first (a window still linked into a
+# view would otherwise outlive its session).
+WEB_VIEW_PREFIX = "caoweb-"
+WEB_VIEW_OWNER_OPTION = "@cao_web_view_of"
+_WEB_VIEW_PLACEHOLDER = "_cao_view_placeholder"
+
+
+def is_web_view_session(name: Optional[str]) -> bool:
+    return bool(name) and name.startswith(WEB_VIEW_PREFIX)  # type: ignore[union-attr]
+
+
+def web_view_attach_argv(
+    session_name: str,
+    source_window: str,
+    view_name: Optional[str] = None,
+) -> List[str]:
+    """tmux argv that attaches a fresh view session showing ``source_window``.
+
+    ``source_window`` is a tmux window target (``session:window`` or ``@id``).
+    A new session needs an initial window; a short-lived placeholder is created,
+    replaced by the linked window, and killed before anything attaches. Bare
+    ``;`` arguments separate tmux commands within the one invocation. If the
+    link fails, tmux stops the sequence before attaching and the placeholder
+    session exits with its ``sleep``.
+
+    A view is a new session, so it starts from tmux's *global* options, not the
+    agent session's. Two of those matter here and are set on the view itself:
+      * ``mouse on``: what ``create_session`` sets on agent sessions (#546).
+        Without it xterm.js turns wheel ticks into Up/Down keys, which walk the
+        agent's prompt history or move a permission menu's selection.
+      * ``detach-on-destroy on``: when the view is destroyed (its window was
+        killed) the client exits instead of switching to another session, so
+        "self-closing" holds whatever the operator's tmux.conf says.
+
+    Pane spawn mode needs no pane selection here: the window holds every pane
+    and tmux keeps one active pane per window, not per client, so the WebSocket
+    handler selects the terminal's pane itself (see ``web_view_attach_plan``).
+    Keeping the chain free of a pane target also means a pane that vanishes
+    mid-attach cannot stop the chain after the view exists, which would have
+    left the view behind without ``destroy-unattached``.
+    """
+    view = view_name or f"{WEB_VIEW_PREFIX}{uuid.uuid4().hex[:12]}"
+    return [
+        "tmux",
+        "-u",
+        "new-session",
+        "-d",
+        "-s",
+        view,
+        "-n",
+        _WEB_VIEW_PLACEHOLDER,
+        "sleep 60",
+        ";",
+        "set-option",
+        "-t",
+        view,
+        WEB_VIEW_OWNER_OPTION,
+        session_name,
+        ";",
+        "set-option",
+        "-t",
+        view,
+        "mouse",
+        "on",
+        ";",
+        "set-option",
+        "-t",
+        view,
+        "detach-on-destroy",
+        "on",
+        ";",
+        "link-window",
+        "-s",
+        source_window,
+        "-t",
+        f"{view}:",
+        ";",
+        "kill-window",
+        "-t",
+        f"{view}:{_WEB_VIEW_PLACEHOLDER}",
+        ";",
+        "attach-session",
+        "-t",
+        view,
+        ";",
+        # Only once attached: set on an unattached session it destroys it at once.
+        "set-option",
+        "-t",
+        view,
+        "destroy-unattached",
+        "on",
+    ]
+
+
+def web_view_owner(
+    name: Optional[str], read_owner: Callable[[str], Optional[str]]
+) -> Optional[str]:
+    """The agent session a session name stands for, seen from inside its pane.
+
+    Inside an agent's pane, ``tmux display-message -p '#S'`` names the most
+    recently active session holding the pane's window. While a browser view
+    of that window is attached, that is the ``caoweb-*`` view, not the agent's
+    session. Views carry their owner in WEB_VIEW_OWNER_OPTION; ``read_owner``
+    reads it. Any other name is returned unchanged.
+    """
+    if not is_web_view_session(name):
+        return name
+    owner = read_owner(name)  # type: ignore[arg-type]
+    return owner or None
+
+
 def _require_cao_session_name(session_name: str, action: str) -> None:
     """Refuse a destructive tmux action on a session CAO did not create.
 
@@ -974,42 +1105,104 @@ class TmuxClient:
             logger.warning(f"Could not resolve a pane for {window_target}: {e}")
         return window_target
 
-    def attach_command(self, session_name: str, terminal_name: str) -> List[str]:
-        """Return the tmux argv that attaches to a session with a terminal focused.
+    def _locate_web_view_pane(
+        self, session_name: str, terminal_name: str
+    ) -> Optional[Tuple[str, str]]:
+        """``(window_id, pane_id)`` when the terminal lives as a pane, else None.
 
-        ``select-pane`` does not move the active window on its own, so a
-        terminal living as a pane needs its window selected first. tmux reads a
-        bare ``;`` argument as a command separator, so all three run on one
-        attach.
+        None means the terminal has a window of its own, or is not there at all
+        (the window target then makes tmux report it missing). A listing that
+        will not read raises ``TmuxLookupError``: the caller decides whether that
+        may degrade, because in pane mode "could not tell" must not become
+        "needs no pane selected".
         """
-        pane = None
+        session = self._find_session(session_name)
+        if session is None or self._find_window(session, session_name, terminal_name):
+            return None
+        pane = self._find_marked_pane(session, session_name, terminal_name)
+        if pane is None or not pane.pane_id or not pane.window.window_id:
+            return None
+        return pane.window.window_id, pane.pane_id
+
+    def web_view_attach_command(self, session_name: str, terminal_name: str) -> List[str]:
+        """``web_view_attach_argv`` for a terminal that may live as a pane.
+
+        A terminal without a window of its own is a marked pane, so the view
+        links the pane's window. A lookup that will not read falls back to the
+        window target, which tmux reports as missing in pane mode. The browser
+        path uses ``web_view_attach_plan`` instead, which also returns the pane.
+        """
         try:
-            session = self._find_session(session_name)
-            if session is not None and (
-                self._find_window(session, session_name, terminal_name) is None
-            ):
-                pane = self._find_marked_pane(session, session_name, terminal_name)
+            located = self._locate_web_view_pane(session_name, terminal_name)
         except TmuxLookupError:
-            pane = None
-        pane_id = pane.pane_id if pane is not None else None
-        window_id = pane.window.window_id if pane is not None else None
-        if pane_id is None or window_id is None:
-            return ["tmux", "-u", "attach-session", "-t", f"{session_name}:{terminal_name}"]
-        return [
-            "tmux",
-            "-u",
-            "attach-session",
-            "-t",
-            session_name,
-            ";",
-            "select-window",
-            "-t",
-            window_id,
-            ";",
-            "select-pane",
-            "-t",
-            pane_id,
-        ]
+            located = None
+        if located is None:
+            return web_view_attach_argv(session_name, f"{session_name}:{terminal_name}")
+        return web_view_attach_argv(session_name, located[0])
+
+    def web_view_attach_plan(
+        self, session_name: str, terminal_name: str
+    ) -> Tuple[List[str], Optional[Tuple[str, str]]]:
+        """The view argv and the ``(window_id, pane_id)`` its input must select.
+
+        Both come from ONE lookup, so the pane the WebSocket handler selects is
+        always the pane whose window the view links; a second lookup could
+        disagree (the pane exits in between) and leave input unselected. The
+        focus is None only for a terminal with a window of its own, whose view
+        holds nothing else. Raises ``TmuxLookupError`` when tmux cannot be read.
+        """
+        located = self._locate_web_view_pane(session_name, terminal_name)
+        if located is None:
+            return web_view_attach_argv(session_name, f"{session_name}:{terminal_name}"), None
+        return web_view_attach_argv(session_name, located[0]), located
+
+    def escape_time_ms(self) -> Optional[int]:
+        """The server's ``escape-time`` in milliseconds, or None if unreadable."""
+        try:
+            result = self.server.cmd("show-options", "-sv", "escape-time")
+        except Exception as e:  # noqa: BLE001 — the caller has a safe default
+            logger.warning(f"Could not read tmux escape-time: {e}")
+            return None
+        if result.returncode != 0 or not result.stdout:
+            return None
+        value = str(result.stdout[0]).strip()
+        return int(value) if value.isdigit() else None
+
+    def select_pane(self, pane_id: str) -> None:
+        """Make ``pane_id`` the active pane of its window.
+
+        ``pane_id`` must be a tmux-issued ``%N`` id; anything else is refused
+        before it reaches tmux.
+        """
+        if not re.fullmatch(r"%\d+", pane_id or ""):
+            raise ValueError(f"not a tmux pane id: {pane_id!r}")
+        result = self.server.cmd("select-pane", "-t", pane_id)
+        if result.returncode != 0:
+            raise TmuxLookupError("; ".join(result.stderr) or f"select-pane {pane_id} failed")
+
+    def kill_web_views(self, session_name: str) -> None:
+        """Kill every browser view session showing a window of ``session_name``.
+
+        Best effort: a failure is logged, never raised, because session teardown
+        must still proceed. Views are matched on the owner option CAO set, not
+        on their name alone, so nothing CAO did not create is touched.
+        """
+        try:
+            result = self.server.cmd(
+                "list-sessions", "-F", f"#{{session_name}}|#{{{WEB_VIEW_OWNER_OPTION}}}"
+            )
+        except Exception as e:  # noqa: BLE001 — teardown must not fail on this
+            logger.warning(f"Could not list browser views of {session_name}: {e}")
+            return
+        if result.returncode != 0:
+            return
+        for line in result.stdout or []:
+            name, sep, owner = line.partition("|")
+            if sep and is_web_view_session(name) and owner == session_name:
+                try:
+                    self.server.cmd("kill-session", "-t", f"={name}")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Could not kill browser view {name}: {e}")
 
     @staticmethod
     def _kill_via_cli(session_name: str, window_name: Optional[str] = None) -> bool:
@@ -1264,6 +1457,7 @@ class TmuxClient:
             # value. See issue #248.
             self._merge_extra_env(environment, extra_env)
             environment["CAO_TERMINAL_ID"] = terminal_id
+            environment["HISTFILE"] = "/dev/null"  # agent launch commands are noise
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
             # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to
@@ -1457,6 +1651,7 @@ class TmuxClient:
             window_env: dict[str, str] = {}
             self._merge_extra_env(window_env, extra_env)
             window_env["CAO_TERMINAL_ID"] = terminal_id
+            window_env["HISTFILE"] = "/dev/null"  # agent launch commands are noise
 
             kwargs: dict = {
                 "window_name": window_name,
@@ -1639,6 +1834,7 @@ class TmuxClient:
             pane_env: dict[str, str] = {}
             self._merge_extra_env(pane_env, extra_env)
             pane_env["CAO_TERMINAL_ID"] = terminal_id
+            pane_env["HISTFILE"] = "/dev/null"  # agent launch commands are noise
 
             host_window = self._find_window(session, session_name, host_window_name)
             if host_window is None:
@@ -2153,6 +2349,9 @@ class TmuxClient:
         other, so the fallback cannot report an unconfirmed kill as success.
         """
         _require_cao_session_name(session_name, "kill")
+        # A window still linked into a browser view survives kill-session, so
+        # the agent would keep running behind a "deleted" session. Views first.
+        self.kill_web_views(session_name)
         try:
             session = self._find_session(session_name)
             if session is None:
@@ -2281,7 +2480,13 @@ class TmuxClient:
         if session_name:
             session = self._find_session(session_name)
             return None if session is None else [session]
-        return self._read_listing("list-sessions", lambda: list(self.server.sessions))
+        # Browser views link the agent's own window, so scanning them would find
+        # the same terminal id twice and refuse the cleanup as ambiguous.
+        return [
+            session
+            for session in self._read_listing("list-sessions", lambda: list(self.server.sessions))
+            if not is_web_view_session(session.name)
+        ]
 
     def _scan_terminal_identity(
         self,

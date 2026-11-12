@@ -1,12 +1,50 @@
 """Agent profile models."""
 
-from typing import Any, Dict, List, Literal, Optional
+import logging
+import re
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
+from cli_agent_orchestrator.constants import (
+    PROFILE_MAX_PARAMS,
+    PROFILE_PARAM_DESCRIPTION_MAX_CHARS,
+    PROFILE_PARAM_MAX_ENUM_VALUES,
+    WORKFLOW_STEP_PARAM_KEY_RE,
+    WORKFLOW_STEP_PARAM_LINE_BREAK_RE,
+    WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS,
+)
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 
+logger = logging.getLogger(__name__)
+
 PermissionMode = Literal["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
+
+ProfileParamType = Literal["string", "int", "bool"]
+ProfileParamValue = Union[StrictBool, StrictInt, StrictStr]
+
+_PARAM_NAME_RE = re.compile(WORKFLOW_STEP_PARAM_KEY_RE)
+_LINE_BREAK_RE = re.compile(WORKFLOW_STEP_PARAM_LINE_BREAK_RE)
+_PARAM_TYPES = ("string", "int", "bool")
+_PARAM_KEYS = ("type", "required", "default", "description", "enum")
+# An int default or enum value has at most 18 digits, the same bound as a step's int value
+# (WORKFLOW_STEP_PARAM_INT_RE), so a declared value always passes the step check.
+_PARAM_INT_LIMIT = 10**18
+# How much of an unknown name or key a message quotes. The text comes from the profile.
+_QUOTED_CHARS = 80
+
+# One broken rule: where it is, as path parts below ``params``, and what is wrong.
+ParamProblem = Tuple[Tuple[Union[str, int], ...], str]
 
 
 class McpServer(BaseModel):
@@ -30,6 +68,261 @@ class ContainerConfig(BaseModel):
     """Container environment configuration."""
 
     path_maps: Optional[List[ContainerPathMap]] = None
+
+
+# ---------------------------------------------------------------------------
+# Profile ``params``: the params a workflow step that uses this profile must fill
+# ---------------------------------------------------------------------------
+# Profiles can be installed from a URL, so the declaration is untrusted. Every size is
+# bounded, nothing is evaluated, and no regex from the profile runs: there is no
+# ``pattern``, ``minimum``, ``maximum`` or ``maxLength`` key.
+#
+# ``param_declaration_problems`` is the one statement of the rules. The model raises on
+# what it returns, and the profile validator reports it, so the two cannot disagree.
+# ``schemas/agent_profile.schema.json`` states the same rules for schema-driven clients,
+# except three. Two JSON Schema cannot express: a default is one of the enum values, and an
+# int value is not written with a decimal point (JSON has one number type, so ``1.0``
+# passes ``"type": "integer"``). The third is that a string default or enum value has no
+# ``{{...}}`` placeholder. It uses the bounded check the step params use, so the schema
+# does not carry a second copy of the pattern.
+
+
+def _quoted(value: object) -> str:
+    """``repr`` of a name or key from the profile, cut to a bounded length."""
+    text = repr(value)
+    if len(text) <= _QUOTED_CHARS:
+        return text
+    return f"{text[:_QUOTED_CHARS]}..."
+
+
+def _kind(value: object) -> str:
+    """Name a parsed YAML value's type the way a profile author would write it."""
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, bool):  # before int: bool is an int subclass
+        return "a boolean"
+    if isinstance(value, int):
+        return "a whole number"
+    if isinstance(value, float):
+        return "a decimal number"
+    if isinstance(value, (list, tuple)):
+        return "a list"
+    if isinstance(value, dict):
+        return "a mapping"
+    return type(value).__name__
+
+
+def _one_line_problem(value: str, limit: int) -> Optional[str]:
+    """Why ``value`` is not one line of at most ``limit`` characters, or None."""
+    if len(value) > limit:
+        return f"is {len(value)} characters (max {limit})"
+    if _LINE_BREAK_RE.search(value):
+        return "must be one line (no line breaks)"
+    return None
+
+
+def _value_problem(value: object, declared: str) -> Optional[str]:
+    """Why ``value`` cannot be a default or enum value of a ``declared`` param, or None.
+
+    A YAML boolean is not a whole number, and a whole number written with a decimal
+    point (``1.0``) is not one either.
+    """
+    if declared == "bool":
+        return None if isinstance(value, bool) else f"must be true or false, not {_kind(value)}"
+    if declared == "int":
+        if isinstance(value, bool) or not isinstance(value, int):
+            return f"must be a whole number, not {_kind(value)}"
+        if abs(value) >= _PARAM_INT_LIMIT:
+            return "must be a whole number of at most 18 digits"
+        return None
+    if not isinstance(value, str):
+        return f"must be a string, not {_kind(value)} (quote the value)"
+    return _one_line_problem(value, WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS)
+
+
+# A step's params refuse a ``{{...}}`` placeholder, and the workflow builder copies a
+# default, or the enum value a step picks, into the step's params.
+_DEFAULT_PLACEHOLDER = (
+    "contains a {{...}} placeholder. A default is copied into workflow steps, "
+    "where values are fixed when the workflow is built."
+)
+_ENUM_PLACEHOLDER = (
+    "contains a {{...}} placeholder. An enum value is copied into the workflow steps "
+    "that pick it, where values are fixed when the workflow is built."
+)
+
+
+def _has_step_placeholder(value: object) -> bool:
+    """True when ``value`` is a string that a step's params would refuse as a placeholder.
+
+    Uses ``_has_placeholder``, the bounded check the step params use, so the two rules
+    agree. It is imported here rather than at the top because ``models.workflow`` imports
+    ``jsonschema`` and ``yaml``, and every provider imports this module.
+    """
+    if not isinstance(value, str):
+        return False
+    from cli_agent_orchestrator.models.workflow import _has_placeholder
+
+    return _has_placeholder(value)
+
+
+def _entry_problems(name: Optional[str], entry: object) -> List[ParamProblem]:
+    """Every rule one declaration breaks, as ``(path, message)`` pairs.
+
+    The path is relative to the entry: ``()`` for the entry itself, ``("default",)`` for
+    one key, ``("enum", 2)`` for one enum value. ``name`` is None when a declaration is
+    built on its own, outside a profile.
+    """
+    if isinstance(entry, ProfileParamDecl):
+        return []  # already validated
+    label = "param" if name is None else f"param {_quoted(name)}"
+    if not isinstance(entry, dict):
+        return [((), f"{label} must be a mapping, not {_kind(entry)}")]
+
+    problems: List[ParamProblem] = []
+    for key in entry:
+        if key not in _PARAM_KEYS:
+            problems.append(
+                (
+                    (),
+                    f"{label}: key {_quoted(key)} is not supported. A param declares only "
+                    "type, required, default, description and enum.",
+                )
+            )
+
+    declared: Optional[str] = "string"
+    if "type" in entry:
+        if entry["type"] in _PARAM_TYPES:
+            declared = entry["type"]
+        else:
+            problems.append((("type",), f"{label}: type must be string, int or bool"))
+            declared = None  # the default and enum values cannot be checked
+
+    required = entry.get("required", False)
+    if not isinstance(required, bool):
+        problems.append(
+            (("required",), f"{label}: required must be true or false, not {_kind(required)}")
+        )
+
+    if "description" in entry:
+        description = entry["description"]
+        if not isinstance(description, str):
+            problems.append(
+                (
+                    ("description",),
+                    f"{label}: description must be a string, not {_kind(description)}",
+                )
+            )
+        else:
+            problem = _one_line_problem(description, PROFILE_PARAM_DESCRIPTION_MAX_CHARS)
+            if problem is not None:
+                problems.append((("description",), f"{label}: description {problem}"))
+
+    enum_values: Optional[List[Any]] = None
+    if "enum" in entry:
+        values = entry["enum"]
+        if declared == "bool":
+            problems.append((("enum",), f"{label}: a bool param cannot have an enum"))
+        elif not isinstance(values, list):
+            problems.append((("enum",), f"{label}: enum must be a list, not {_kind(values)}"))
+        elif not 1 <= len(values) <= PROFILE_PARAM_MAX_ENUM_VALUES:
+            problems.append(
+                (
+                    ("enum",),
+                    f"{label}: enum has {len(values)} values "
+                    f"(it must have 1 to {PROFILE_PARAM_MAX_ENUM_VALUES})",
+                )
+            )
+        elif declared is not None:
+            value_problems: List[ParamProblem] = []
+            for index, value in enumerate(values):
+                problem = _value_problem(value, declared)
+                if problem is None and _has_step_placeholder(value):
+                    problem = _ENUM_PLACEHOLDER
+                if problem is not None:
+                    value_problems.append((("enum", index), f"{label}: enum[{index}] {problem}"))
+            problems.extend(value_problems)
+            if not value_problems:
+                # Every value is now a str, or an int that is not a bool, so it hashes and
+                # compares by value.
+                if len(set(values)) != len(values):
+                    problems.append((("enum",), f"{label}: enum lists a value more than once"))
+                else:
+                    enum_values = values
+
+    if "default" in entry:
+        default = entry["default"]
+        if required is True:
+            problems.append((("default",), f"{label}: a required param cannot have a default"))
+        elif declared is not None:
+            problem = _value_problem(default, declared)
+            if problem is None and _has_step_placeholder(default):
+                problem = _DEFAULT_PLACEHOLDER
+            if problem is not None:
+                problems.append((("default",), f"{label}: default {problem}"))
+            elif enum_values is not None and default not in enum_values:
+                problems.append((("default",), f"{label}: default must be one of the enum values"))
+
+    return problems
+
+
+def param_declaration_problems(params: object) -> List[ParamProblem]:
+    """Every rule a profile's ``params`` block breaks, as ``(path, message)`` pairs.
+
+    The path is relative to ``params``: ``()`` for the block itself, ``(name,)`` for one
+    declaration, and ``(name, key, ...)`` below it. A tuple, because a param name may
+    contain a dot. An empty list means the block is valid. A block with more than
+    ``PROFILE_MAX_PARAMS`` entries is reported without looking at them, so the work stays
+    bounded.
+    """
+    if not isinstance(params, dict):
+        return [((), f"params must be a mapping of names to declarations, not {_kind(params)}")]
+    if len(params) > PROFILE_MAX_PARAMS:
+        return [((), f"params declares {len(params)} params (max {PROFILE_MAX_PARAMS})")]
+    problems: List[ParamProblem] = []
+    for name, entry in params.items():
+        if not isinstance(name, str) or not _PARAM_NAME_RE.fullmatch(name):
+            problems.append(
+                (
+                    (),
+                    f"param name {_quoted(name)} is invalid "
+                    f"(must match {WORKFLOW_STEP_PARAM_KEY_RE})",
+                )
+            )
+            continue
+        for path, message in _entry_problems(name, entry):
+            problems.append(((name, *path), message))
+    return problems
+
+
+def _raise_on(problems: List[ParamProblem]) -> None:
+    if problems:
+        raise ValueError("; ".join(message for _path, message in problems))
+
+
+class ProfileParamDecl(BaseModel):
+    """One param a workflow step that uses the profile must fill (CAO-native).
+
+    Serialized by ``model_dump(exclude_none=True)``: ``type`` and ``required`` always
+    appear, ``default``, ``description`` and ``enum`` only when set. An int default is
+    a JSON number and a bool default a JSON bool.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: ProfileParamType = "string"
+    required: StrictBool = False
+    default: Optional[ProfileParamValue] = None
+    description: Optional[StrictStr] = None
+    enum: Optional[List[ProfileParamValue]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _check_declaration(cls, data: Any) -> Any:
+        _raise_on(_entry_problems(None, data))
+        return data
 
 
 class AgentProfile(BaseModel):
@@ -70,6 +363,39 @@ class AgentProfile(BaseModel):
     # instead of the server default (60s from settings_service). Allows containerized
     # profiles to declare longer init times (e.g., 180s) without changing global config.
     provider_init_timeout: Optional[int] = None
+
+    # CAO-native. The params a workflow step that uses this profile must fill, by
+    # name, in declaration order (see ProfileParamDecl). Read by the workflow builder
+    # and by the step check at validate and run start. Never passed to provider JSON.
+    # Step values are journaled in plaintext, so a param never holds a secret.
+    params: Optional[Dict[str, ProfileParamDecl]] = None
+
+    @field_validator("params", mode="before")
+    @classmethod
+    def _check_params(cls, value: Any, info: ValidationInfo) -> Any:
+        """Drop a ``params`` block that breaks a rule, with a warning.
+
+        A profile written before ``params`` existed may use the key for something
+        else. It loaded then, because the unknown key was dropped, so it must still
+        load and launch. The strict check stays where a profile is written or checked:
+        ``cao profile validate``, ``POST /agents/profiles/validate``, the profile write
+        routes and the Profiles tab. A workflow step that uses a profile whose block was
+        dropped gets no params checks, as for a profile that declares none.
+        """
+        if value is None:
+            return None
+        problems = param_declaration_problems(value)
+        if not problems:
+            return value
+        # The messages name params and keys but never echo a value.
+        logger.warning(
+            "agent profile %r: its params block is ignored because it breaks %d rule(s), "
+            "first: %s. Run 'cao profile validate' to see them all.",
+            info.data.get("name"),
+            len(problems),
+            problems[0][1],
+        )
+        return None
 
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None

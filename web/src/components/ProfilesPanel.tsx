@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, AgentProfileInfo, AgentProfileDetail, ProfileSearchResult, ProfileValidationMessage } from '../api'
-import { Package, Plus, Search, AlertTriangle, Copy, CopyPlus, FilePen, Tag, Trash2, Wrench, Loader2, Download } from 'lucide-react'
+import { Package, Plus, Search, AlertTriangle, Copy, CopyPlus, FilePen, SlidersHorizontal, Tag, Trash2, Wrench, Loader2, Download } from 'lucide-react'
 import { ProfileCreateModal } from './ProfileCreateModal'
 import { ProfileEditorModal } from './ProfileEditorModal'
 import { ConfirmModal } from './ConfirmModal'
+import { readDeclaredParams } from './workflow/workflowYaml'
 import { useStore } from '../store'
 import { useGeneration } from '../hooks/useGeneration'
 
@@ -67,6 +68,48 @@ function DetailField({ label, value }: { label: string; value: string | undefine
     <div>
       <div className="text-xs text-gray-500 uppercase tracking-wide mb-0.5">{label}</div>
       <div className="text-sm text-gray-200 font-mono">{value}</div>
+    </div>
+  )
+}
+
+/**
+ * The params the profile declares, in declaration order: the params a workflow
+ * step that uses it must fill. readDeclaredParams reads the untrusted
+ * declaration with every size bounded.
+ */
+function ParamsList({ params, editable }: { params: AgentProfileDetail['params']; editable: boolean }) {
+  const declared = readDeclaredParams(params)
+  return (
+    <div data-testid="profile-params">
+      <div className="flex items-center gap-1.5 text-xs text-gray-500 uppercase tracking-wide mb-1.5">
+        <SlidersHorizontal size={12} />
+        Params
+      </div>
+      {declared.length === 0 ? (
+        <p className="text-sm text-gray-500">
+          {editable
+            ? 'This profile declares no params. Edit it to add some.'
+            : 'This profile declares no params. Clone it to add some.'}
+        </p>
+      ) : (
+        <ul aria-label="Params" className="space-y-1.5">
+          {declared.map(p => (
+            <li key={p.name} data-testid="profile-param" data-name={p.name} className="text-sm">
+              <div className="flex flex-wrap items-baseline gap-x-2">
+                <span className="font-mono text-gray-200">
+                  {p.name}
+                  {p.required && <span aria-hidden="true" className="ml-0.5 text-red-400">*</span>}
+                  {p.required && <span className="sr-only"> (required)</span>}
+                </span>
+                <span className="text-xs text-gray-500">{p.type}</span>
+                {p.default !== null && <span className="text-xs text-gray-400">default: <span className="font-mono">{p.default}</span></span>}
+                {p.enum && <span className="text-xs text-gray-400">allowed: <span className="font-mono">{p.enum.join(', ')}</span></span>}
+              </div>
+              {p.description && <div className="text-xs text-gray-500">{p.description}</div>}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   )
 }
@@ -193,6 +236,7 @@ function ProfileDetail({
           </div>
           <ChipList label="Tags" icon={<Tag size={12} />} items={detail.tags ?? []} />
           <ChipList label="Capabilities" icon={<Wrench size={12} />} items={detail.capabilities ?? []} />
+          <ParamsList params={detail.params} editable={row.source === 'local'} />
         </>
       )}
     </div>

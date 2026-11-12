@@ -3533,8 +3533,8 @@ async def workflow_create(
     """Create a NEW Python workflow spec (issue #583 FR-10).
 
     A thin HTTP client over ``POST /workflows``. Refuses to overwrite an existing spec — use
-    ``workflow_update`` for that. Python only; a YAML-tier name is refused with a message naming the
-    restriction.
+    ``workflow_update`` for that. Python only: this tool never sends ``tier``, so the server writes a
+    Python spec. A name that is not bare, ``x.yaml`` included, is refused here before any request.
 
     Send the SOURCE TEXT, never a path: the server decides where a spec lands, and validation, the lint
     gate, path containment, the atomic write and the index update all happen there. This tool opens no

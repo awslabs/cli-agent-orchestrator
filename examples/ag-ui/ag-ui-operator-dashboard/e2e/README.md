@@ -40,12 +40,31 @@ The harness also calls `POST /agui/v1/emit_ui`, acting as an agent.
   on both transports at once: `EventSource` on `GET`, and fetch on `POST` with a
   token (auth is off on this server, so any token is accepted; the point is the
   `POST` path).
-- An off-list `emit_ui` call: HTTP 400, and nothing reaches either stream within
-  a 2 s settle window.
+- An off-list `emit_ui` call: HTTP 400, and exactly one refusal frame on each
+  stream within a 2 s settle window (#1158), attributed to the terminal, named
+  `iframe_embed.<8 hex>`, with no props; the marker in the call's props never
+  appears in the stream. With `CAO_E2E_CAPTURE_OFFLIST=<file>` it writes that
+  `RAW` frame to the file (`fixtures/raw-offlist.json` was captured this way).
 - A token stream that drops loses nothing: the first request asks the server to
   end it after 2 s (`forwardedProps.cao.maxSeconds`), a component is emitted
   while the client waits to reconnect, and it must arrive after the reconnect,
   which carries `forwardedProps.cao.since`. The reopen is reported once.
+- An overflow and its resync, for the session timeline. A supervisor assigns a
+  worker; once the call is listed, the client stops reading its token stream
+  (the fetch it uses holds the response body back) while 3000 `emit_ui` fillers
+  of about 7.5 KB are published: enough to fill the socket buffers and then the
+  server's per-subscriber queue of 256 on macOS and on Linux, whose loopback
+  buffers hold several MB. Then the supervisor hands off to a second worker, the
+  first worker is closed, and 20 markers are published. The stream ends with
+  `RUN_ERROR cao.stream_overflow`, and the client reconnects with
+  `forwardedProps.cao.since`. The replay ring holds the newest 500 records, so
+  older fillers are not replayed; the calls and markers are among the newest.
+  Asserted (counted in frames, since the panel keeps only 200): every marker
+  arrives once, no filler or call arrives twice, the dropped `handoff` start is
+  recovered, and the call held across the gap is listed once as completed or
+  unconfirmed. It does not assert which: today the replay cannot close a call
+  whose start came before the cursor (the end lost across a reconnect gap:
+  #1292).
 - The app requests no route outside `core/routes.ts`.
 
 ## Isolation
@@ -83,3 +102,16 @@ real Claude Code permission prompt through `core/` (#1156). It is never run by
 `npm run e2e` or by CI, because it needs a logged-in Claude Code and spends two
 model turns. Its header says what it touches; run `./e2e/live-claude-code.sh
 --dry-run` to see what it would do. The app's README has its usage.
+
+## Timeline screenshot (browser)
+
+After `e2e.ts`, `run.sh` runs `timeline.spec.ts` with Playwright, against the same
+private server. It opens the dashboard at `127.0.0.1:5173` (vite, started by
+`playwright.config.ts`), starts an assign and a handoff from a supervisor
+terminal, and checks that the session timeline panel renders both calls. The
+panel is saved to `e2e/artifacts/timeline-panel.png`. A missing panel fails the
+run. A failing run keeps its screenshot and video under `e2e/test-results/`.
+
+The browser is Chromium from `npm run playwright:install`, which the CI job runs
+as its own step. Locally, set `CAO_E2E_CHROME` to an installed Chromium to reuse
+it. The script never installs a browser.

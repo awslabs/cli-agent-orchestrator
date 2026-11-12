@@ -26,6 +26,7 @@ import {
   type Board,
 } from "./interrupts.ts";
 import { approvalHintProps, emptyPanel, reduceFrame, type Panel } from "./genui.ts";
+import { emptyTimeline, markReconnect, reduceTimeline, type Timeline } from "./timeline.ts";
 
 export interface ControllerOptions {
   base: string;
@@ -33,13 +34,15 @@ export interface ControllerOptions {
   token?: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
-  onChange?: (board: Board, panel: Panel) => void;
+  onChange?: (board: Board, panel: Panel, timeline: Timeline) => void;
   newRunId?: () => string;
 }
 
 export interface Controller {
   readonly board: Board;
   readonly panel: Panel;
+  /** The session timeline built from `TOOL_CALL_*` frames. */
+  readonly timeline: Timeline;
   /** True while a run is in flight. */
   readonly busy: boolean;
   /**
@@ -54,6 +57,11 @@ export interface Controller {
   undecide(id: string): void;
   /** Send the held decisions now if they cover every open interrupt. */
   send(): Promise<RunOutcome | null>;
+  /**
+   * The ambient stream opened again after a drop (its `onReopen`). Calls still open
+   * in the timeline become "unconfirmed" (see `markReconnect`).
+   */
+  reconnected(): void;
   /** Feed one ambient-stream frame. Never changes a card's state. */
   ambient(frame: Frame): Promise<void>;
   /** The interrupt ids of each `resume[]` sent so far, for tests and the e2e. */
@@ -63,12 +71,13 @@ export interface Controller {
 export function createController(opts: ControllerOptions): Controller {
   let board = emptyBoard();
   let panel = emptyPanel();
+  let timeline = emptyTimeline();
   let busy = false;
   let refreshWanted = false;
   let counter = 0;
   const sent: string[][] = [];
   const newRunId = opts.newRunId ?? (() => `run-${Date.now()}-${++counter}`);
-  const changed = () => opts.onChange?.(board, panel);
+  const changed = () => opts.onChange?.(board, panel, timeline);
 
   const run = (resume?: ResumeEntry[]) =>
     runOnce({
@@ -182,6 +191,9 @@ export function createController(opts: ControllerOptions): Controller {
     get panel() {
       return panel;
     },
+    get timeline() {
+      return timeline;
+    },
     get busy() {
       return busy;
     },
@@ -200,8 +212,13 @@ export function createController(opts: ControllerOptions): Controller {
       board = undecide(board, id);
       changed();
     },
+    reconnected() {
+      timeline = markReconnect(timeline);
+      changed();
+    },
     async ambient(frame) {
       panel = reduceFrame(panel, frame);
+      timeline = reduceTimeline(timeline, frame);
       const props = approvalHintProps(frame);
       let wantRefresh = false;
       if (props) {

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import {
   api,
+  errorDetailText,
   sessionDescriptionRevision,
   SESSION_DESCRIPTION_READ_ATTEMPTS,
   ApiError,
@@ -304,7 +305,8 @@ export const useStore = create<Store>((set, get) => ({
       if (e?.kind === 'approval_required' && typeof planId === 'string' && planId) {
         return { approvalPlanId: planId, message: e?.detail }
       }
-      get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to start workflow run' })
+      // A refused run, such as a 422 for a step param, shows every message the server sent.
+      get().showSnackbar({ type: 'error', message: errorDetailText(e) || e?.message || 'Failed to start workflow run' })
       return null
     }
   },

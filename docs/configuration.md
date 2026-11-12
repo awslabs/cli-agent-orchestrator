@@ -22,7 +22,7 @@ export CAO_HOME_DIR="$HOME/.cli-agent-orchestrator"
 
 Every derived path resolves from this value, so one override moves everything — with two exceptions noted below. `CAO_HOME_DIR` is read once, when CAO's `constants` module is first imported (the same convention as `CAO_AGENTS_DIR`), so export it **before** starting `cao-server`, the MCP servers, or any `cao` command. All CAO processes must resolve the same location. Exactly one `cao-server` may run per `CAO_HOME_DIR`: the server holds an exclusive `flock` on `server.lock` inside it for its lifetime, and a second server started against the same directory, even on a different port, refuses to start and names the process that owns it (#406, #709); run a second server only with its own `CAO_HOME_DIR` and `--port`. Empty or whitespace-only values are treated as unset, and tilde (`~`) is expanded.
 
-**When to use it.** Some environments restrict or sandbox access to `~/.aws` at the OS level to protect AWS credentials. Because CAO otherwise stores its data there, including the agent profiles it reads during a `handoff`, a locked-down `~/.aws` can leave CAO unable to read its own data (a handoff then fails with `Permission denied`). Relocating `CAO_HOME_DIR` outside `~/.aws` keeps CAO working while leaving those credential protections in place.
+**When to use it.** Some environments restrict or sandbox access to `~/.aws` at the OS level to protect AWS credentials. Because CAO otherwise stores its data there, including the agent profiles it reads during a `handoff`, a locked-down `~/.aws` can leave CAO unable to read its own data (a handoff then fails with `Permission denied`). Relocating `CAO_HOME_DIR` outside `~/.aws` keeps CAO working while leaving those credential protections in place. When only the *client* side is locked down (an agent CLI that sandboxes its MCP servers, while `cao-server` runs normally), `assign` and `handoff` fetch the agent profiles they need from `cao-server` automatically, so no relocation is needed for that case.
 
 **Security note.** When relocating outside `~/.aws`, choose a dedicated directory that is not world-readable or shared with other users. CAO creates its base directory and log/FIFO subdirectories with owner-only permissions (mode `0700`), and applies a best-effort `chmod` to an existing base directory, but the chosen parent path should also be private since terminal logs can capture secrets and tokens.
 
@@ -189,7 +189,9 @@ Operator-only, read straight from `settings.json` (no environment override). Pro
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `v3_allow_unverified_versions` | `false` | Only JSON `true` lets a Kiro v3 launch run on a kiro-cli version still *pending operator verification*, so an operator can run the live checklist on it. It admits nothing else: an unlisted version still refuses, and every other v3 check still applies. Each admitted launch logs a warning and carries a `launch_notes` entry. Keep it off otherwise. |
+| `v3_allow_unverified_versions` | `false` | Only JSON `true` lets a Kiro v3 launch run on a kiro-cli version still *pending operator verification*, so an operator can run the live checklist on it. By itself it never admits an unlisted version, and every other v3 check still applies. Each admitted launch logs a warning and carries a `launch_notes` entry. Keep it off otherwise. |
+
+Only `kiro.v3_admission: "observed"` enables [observed admission](kiro-cli.md#observed-admission-operator-only) for eligible unlisted versions on the sealed-home helper path; installed-agent launches and every other setting value keep strict admission.
 
 See [Kiro v3 (preview)](kiro-cli.md#pending-versions-operator-only).
 
@@ -406,6 +408,50 @@ working directory, are reported rather than worked around.
 The name is a label, not an authenticated identity: anything that can reach the
 tmux socket can set the same mark. Agents are not isolated from each other here,
 so this is in line with the rest of the backend rather than a new exposure.
+
+#### Browser terminals in pane mode
+
+A web terminal (the Workspace tab, or the Agents tab overlay) on a pane-mode
+agent shows the **whole** `pane_window`, every agent's pane tiled, with that
+agent's pane selected. Two web terminals on agents of the same window therefore
+show the same tiled window, not one agent each; window mode gives each terminal
+its own window.
+
+**Keys** reach only the agent the terminal belongs to. tmux keeps one active
+pane per window, not per client, so cao-server selects the terminal's pane
+before every input it forwards and holds that window until tmux has read the
+input, so a paste in one terminal and a key in another cannot interleave. Input
+that ends in Escape, Alt+[ or Alt+] holds the window a little longer: tmux keeps
+these as a partial key until its `escape-time` runs out (10 ms by default since
+tmux 3.5, 500 ms before), in case more of an escape sequence follows, and only
+then delivers them to the pane that is active. So after such a key, other web
+terminals on the same window wait before their next key, and a terminal opened
+on that window in that time selects its pane only afterwards. The wait lasts
+until `escape-time` has run out after the sending terminal's last Escape, Alt+[
+or Alt+], counted as at least 500 ms: about half a second after a single such
+key, and longer while that terminal keeps sending them (Escape held down, for
+example). The sender's next key does not end the wait early: cao-server cannot
+tell whether that key completes the escape sequence or extends it, and tmux's
+timer keeps running from the first byte. The terminal that sent the key
+does not wait. Input whose pane cannot be
+selected is dropped rather than sent to whichever pane is active, and a terminal
+whose pane cannot be found is not attached.
+
+**The mouse** works as it does in tmux: a click or the wheel acts on the pane
+under the pointer, even another agent's tile. A click makes that pane the
+active one; your next key goes to your own agent again. The wheel goes to the
+program in the pane under the pointer if that program uses the mouse or (since
+tmux 3.6) is in the alternate screen, as full-screen agent CLIs usually are.
+Otherwise it puts that pane into copy mode, where it reads keys as copy-mode
+commands, so an agent scrolled that way does not see what is typed to it until
+copy mode ends: press `q` in that agent's terminal (or scroll back to the
+bottom).
+
+One case is outside cao-server's reach: selecting another pane by hand, from a
+real terminal attached to the same window, in the instant between cao-server's
+selection and tmux reading the input. Work in a different window, or in window
+mode, if you drive pane-mode agents from a real terminal while typing to them
+from the browser.
 
 ### MCP Apps (`apps`)
 

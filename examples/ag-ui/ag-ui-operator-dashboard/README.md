@@ -10,6 +10,10 @@ surfaces and nothing else:
 - **Generative UI**, from the ambient stream (`/agui/v1/stream`). Agents'
   `emit_ui` calls arrive as `CUSTOM cao.generative_ui` frames, and the panel
   lists them, attributed to the subagent that sent them.
+- **Session timeline**, from the same ambient stream. A supervisor's `assign` or
+  `handoff` arrives as `TOOL_CALL_START` and the end of the receiver's work as
+  `TOOL_CALL_END`; the panel shows each call once: who called whom, and whether
+  it is open, completed, or unconfirmed after a reconnect.
 
 ```
 core/      TypeScript, no DOM and no framework: the run plane, the stream, and pure reducers
@@ -110,9 +114,41 @@ token, the run plane answers 403 and the card says so.
 `dangerouslySetInnerHTML` and no `eval`. A `RAW` frame with
 `event.rejected_component`, or a `CUSTOM` frame naming a component outside the
 six, shows as a refusal with the component name and sender and without props.
+A refusal the server folded others into adds "And N more refused." Refused
+entries are capped apart, at the newest 20 (`MAX_REFUSED_ENTRIES`), so a flood of
+refusals never pushes a real component out.
 The panel has no controls, not even on an `approval_card`. It keeps the newest
 200 entries (`MAX_PANEL_ENTRIES` in `core/genui.ts`), so a long session does not
 grow without limit.
+
+**Session timeline.** One entry per orchestration call, keyed by `toolCallId`
+and deduped by `metadata.cao.eventId` (`core/timeline.ts`). The label comes from
+`metadata.cao.orchestrationType`, sender and receiver; the wire's `toolCallName`
+is not used as a key. Only metadata is shown: no message text. A `TOOL_CALL_END`
+carries one of three `closedBy` values:
+
+- `completion`: the receiver's work ended (a terminal that is closed, too). The
+  call is "completed".
+- `superseded`: a newer call went to the same receiver, so the server ended this
+  one. It is shown as "ended: superseded by a newer call to the same receiver".
+- `stream_closed`: the stream itself stopped. It is ignored, because the work may
+  still be running and the next stream announces the call again.
+
+Any other value ends the call too, shown as "ended: <value>", so a value added
+later cannot leave a finished call shown as running. An end for a call the panel
+never saw is ignored, and a call is never reopened. The panel keeps 200 calls
+(`MAX_TIMELINE_ENTRIES`), dropping the oldest finished one before any live one,
+and caps each string at 200 characters.
+
+After a reconnect (an overflow, or any drop), each call that was still open is
+shown as "open; its end was not seen across a reconnect". Each new stream is a
+fresh run on the server, and its replay does not close a call whose start came
+before the replay window, so an end that fell inside the gap is not sent again.
+The panel does not guess: such a call completes (or ends) if an end for it
+arrives later, and otherwise stays unconfirmed. A call whose start arrives in the
+replay is listed as open only if it was not already listed; a listed unconfirmed
+call whose replay holds its start but no end stays unconfirmed. A superseded or
+ended call is not marked unconfirmed: the server has ended it. The end lost across a reconnect gap: #1292.
 
 **Routes.** The app requests `/agui/v1/run` and `/agui/v1/stream` and
 nothing else; `core/routes.ts` refuses any other path. It never calls `emit_ui` and never reads terminal output.
@@ -138,7 +174,11 @@ So a card says "delivered (decision applied: not reported by the run plane)".
 This app reads AC6's "composed from L2 constructs only" as: a TypeScript client
 consumes only the wire surfaces the L2 constructs produce. Those are the approval
 lifecycle of `AgentHandoffWithApproval`, served by `POST /agui/v1/run`, and the
-allow-listed `CUSTOM cao.generative_ui` carrier on `/agui/v1/stream`. The app
+allow-listed `CUSTOM cao.generative_ui` carrier on `/agui/v1/stream`, and the
+`TOOL_CALL_START` / `TOOL_CALL_END` frames on that stream that
+`MultiAgentSessionTimeline` (`services/agui/session_timeline.py`) folds into its
+entries. The construct also closes on `TOOL_CALL_RESULT`; the ambient stream never
+sends one, so the app reads only the end. The app
 adds no protocol code and changes nothing on the server. If maintainers read
 AC6 differently, the app is the place to change.
 

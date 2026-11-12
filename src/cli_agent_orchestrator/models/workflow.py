@@ -32,16 +32,21 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import jsonschema  # type: ignore[import-untyped]  # no bundled stubs; meta-schema API is stable
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SkipValidation, model_validator
 
 from cli_agent_orchestrator.constants import (
     WORKFLOW_MAX_INPUTS,
     WORKFLOW_MAX_RETRIES,
     WORKFLOW_MAX_SPEC_BYTES,
+    WORKFLOW_MAX_STEP_PARAMS,
     WORKFLOW_MAX_STEPS,
     WORKFLOW_NAME_RE,
     WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH,
+    WORKFLOW_PLACEHOLDER_RE,
     WORKFLOW_SHIPPED_UNITS,
+    WORKFLOW_STEP_PARAM_KEY_RE,
+    WORKFLOW_STEP_PARAM_LINE_BREAK_RE,
+    WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS,
 )
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 
@@ -68,6 +73,10 @@ logger = logging.getLogger(__name__)
 
 # Compiled once at import; validate_grammar is a pure function of the spec.
 _NAME_RE = re.compile(WORKFLOW_NAME_RE)
+_PARAM_KEY_RE = re.compile(WORKFLOW_STEP_PARAM_KEY_RE)
+_LINE_BREAK_RE = re.compile(WORKFLOW_STEP_PARAM_LINE_BREAK_RE)
+_PLACEHOLDER_RE = re.compile(WORKFLOW_PLACEHOLDER_RE)
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +88,10 @@ _NAME_RE = re.compile(WORKFLOW_NAME_RE)
 # it has no entry here because it never tags reserved (its absence => shipped
 # by definition once N5 lands; in Bolt 1 nothing executes, but a sequential-only
 # spec is the canonical "pass" case per the Bolt-1 flag-flip test).
+#
+# ``assign`` and ``send_message`` are step ``call`` types. ``handoff`` (or no
+# ``call``) is the only one the engine runs, so it has no entry; the other two
+# validate as reserved and are refused at run start.
 TIER_REGISTRY: Dict[str, str] = {
     "parallel": "N7",
     "pipeline": "N7",
@@ -89,6 +102,8 @@ TIER_REGISTRY: Dict[str, str] = {
     "on_no_progress": "N8",
     "when": "reserved",
     "rich_templating": "reserved",
+    "assign": "reserved",
+    "send_message": "reserved",
 }
 
 
@@ -161,6 +176,21 @@ class NotBuiltYetError(Exception):
     """
 
 
+class StepParamError(ValueError):
+    """A run refused at start because step params do not fit their profiles' declarations.
+
+    Raised before any journal row is written, by ``start_run`` and by the submit
+    route, from the errors ``services.step_params.check_step_params`` returns. Both
+    run routes map it to 422 with the messages joined in ``detail``. A ``ValueError``
+    subclass, so a caller that maps ``ValueError`` broadly still answers 4xx; the run
+    routes catch it first.
+    """
+
+    def __init__(self, errors: List[str]) -> None:
+        super().__init__("; ".join(errors))
+        self.errors = list(errors)
+
+
 # ---------------------------------------------------------------------------
 # Spec entities
 # ---------------------------------------------------------------------------
@@ -182,6 +212,10 @@ class WorkflowStep(BaseModel):
 
     Reserved fields (``when`` and the loop fields) validate structurally in
     Bolt 1 but never execute; the engine (N5/N8) animates them later.
+
+    ``call`` and ``params`` come from the workflow builder. Both are optional and
+    default to ``None``, so a spec that omits them, and a run journaled before they
+    existed, behaves exactly as before.
     """
 
     id: str
@@ -205,6 +239,18 @@ class WorkflowStep(BaseModel):
     # what to do once attempts are exhausted. ``retries: 0`` => exactly one
     # attempt, no retry. Validated in ``validate_grammar`` (0..WORKFLOW_MAX_RETRIES).
     retries: Optional[int] = None
+    # How the engine hands the step to its agent. ``None`` means ``handoff``, the
+    # only call type the engine runs. ``assign`` and ``send_message`` are reserved:
+    # they validate as ``pass_reserved`` and a run that uses them is refused before
+    # any journal row exists.
+    call: Optional[Literal["handoff", "assign", "send_message"]] = None
+    # Literal per-step parameters, added to the end of the step prompt in declaration
+    # order (``workflow_service._build_step_prompt``). Journaled in plaintext with the
+    # spec snapshot, like inputs, so never a secret. ``SkipValidation`` keeps the
+    # field type from rejecting a non-string value before ``validate_grammar`` runs:
+    # the grammar check names the step and the key, aggregated with every other error
+    # (BR-7), where a field error would say only "Input should be a valid string".
+    params: Optional[SkipValidation[Dict[str, str]]] = None
 
     def is_loop(self) -> bool:
         """True if this step declares ANY loop field (so BR-4 applies)."""
@@ -291,6 +337,12 @@ class WorkflowSpec(BaseModel):
                         f"step '{step.id}': retries {step.retries} out of range "
                         f"(0..{WORKFLOW_MAX_RETRIES})"
                     )
+
+        # 4c. Per-step params: a mapping of at most WORKFLOW_MAX_STEP_PARAMS entries,
+        # each key matching WORKFLOW_STEP_PARAM_KEY_RE and each value a single-line
+        # string of at most WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS characters.
+        for step in self.steps:
+            errors.extend(_param_errors(step))
 
         # 5. Loop guardrail completeness — structural floor (BR-4/FR-8.2).
         for step in self.steps:
@@ -512,6 +564,82 @@ def _default_matches_type(default: Union[str, int, bool], declared: str) -> bool
     return isinstance(default, str)
 
 
+def _yaml_kind(value: Any) -> str:
+    """Name a parsed YAML value's type the way a spec author would write it."""
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, bool):  # before int: bool is an int subclass
+        return "a boolean"
+    if isinstance(value, (int, float)):
+        return "a number"
+    if isinstance(value, (list, tuple)):
+        return "a list"
+    if isinstance(value, dict):
+        return "a mapping"
+    return type(value).__name__
+
+
+def _param_errors(step: "WorkflowStep") -> List[str]:
+    """Return the grammar errors in one step's ``params``, each naming the step and key.
+
+    ``params`` is a ``SkipValidation`` field, so the raw parsed value arrives here
+    unchecked. Every rule is enforced here, which keeps each violation in the one
+    aggregated ``ValueError`` (BR-7) instead of a bare Pydantic field error.
+    """
+    params: Any = step.params
+    if params is None:
+        return []
+    if not isinstance(params, dict):
+        return [
+            f"step '{step.id}': params must be a mapping of names to string values, "
+            f"not {_yaml_kind(params)}"
+        ]
+    errors: List[str] = []
+    if len(params) > WORKFLOW_MAX_STEP_PARAMS:
+        errors.append(
+            f"step '{step.id}' declares {len(params)} params (max {WORKFLOW_MAX_STEP_PARAMS})"
+        )
+    for key, value in params.items():
+        if not isinstance(key, str) or not _PARAM_KEY_RE.fullmatch(key):
+            errors.append(
+                f"step '{step.id}': param name {key!r} is invalid "
+                f"(must match {WORKFLOW_STEP_PARAM_KEY_RE})"
+            )
+        elif not isinstance(value, str):
+            errors.append(
+                f"step '{step.id}': param '{key}' must be a string, not {_yaml_kind(value)} "
+                "(quote the value)"
+            )
+        elif len(value) > WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS:
+            errors.append(
+                f"step '{step.id}': param '{key}' is {len(value)} characters "
+                f"(max {WORKFLOW_STEP_PARAM_VALUE_MAX_CHARS})"
+            )
+        elif _LINE_BREAK_RE.search(value):
+            errors.append(f"step '{step.id}': param '{key}' must be one line (no line breaks)")
+        elif _has_placeholder(value):
+            errors.append(
+                f"step '{step.id}': param '{key}' contains a {{{{...}}}} placeholder. "
+                "Param values are fixed when the workflow is built."
+            )
+    return errors
+
+
+def _has_placeholder(value: str) -> bool:
+    """True when the engine would find a ``{{...}}`` placeholder in ``value``.
+
+    Uses the engine's own pattern (``WORKFLOW_PLACEHOLDER_RE``) on ``value`` with each
+    run of whitespace cut to one space. That keeps the answer: a match is ``{{``, a run of
+    characters that are not braces, then ``}}``, and cutting whitespace changes neither
+    the braces nor whether a run is empty. It also bounds the time. On a long whitespace
+    run the pattern's ``\\s*`` and ``[^{}]+?`` can split the run in many ways, and a
+    512-character value took about 24 ms to search.
+    """
+    return _PLACEHOLDER_RE.search(_WHITESPACE_RUN_RE.sub(" ", value)) is not None
+
+
 def _schema_depth(node: Any, _depth: int = 1, _cap: Optional[int] = None) -> int:
     """Max nesting depth of a JSON-Schema-like dict/list structure.
 
@@ -565,12 +693,16 @@ def _constructs_used(spec: WorkflowSpec) -> List[str]:
 
     Used by ``validate_only`` to compute reserved notes. Order is deterministic
     (mode first, then per-step fields in declaration order) so reserved_notes
-    diffs are stable (RD-3.1).
+    diffs are stable (RD-3.1). A step's ``call`` emits its own value as the token
+    (``assign``, ``send_message``) unless it is ``None`` or ``handoff``, the call
+    type the engine runs.
     """
     used: List[str] = []
     if spec.mode != "sequential":
         used.append(spec.mode)
     for step in spec.steps:
+        if step.call is not None and step.call != "handoff" and step.call not in used:
+            used.append(step.call)
         for token, value in (
             ("when", step.when),
             ("until", step.until),
@@ -594,6 +726,18 @@ def _reserved_note(construct: str) -> str:
 def validate_only(text: str) -> ValidationResult:
     """Validate a workflow spec WITHOUT running it (FR-1.3). NEVER raises.
 
+    The result of :func:`validate_spec_text`, without the parsed spec.
+    """
+    return validate_spec_text(text)[0]
+
+
+def validate_spec_text(text: str) -> tuple[ValidationResult, Optional[WorkflowSpec]]:
+    """Validate a workflow spec WITHOUT running it, and return the spec it parsed.
+
+    The spec is ``None`` unless grammar passed. ``POST /workflows/validate`` uses it to
+    check each step's params against its profile, from the same parse, so the text is
+    not read or parsed a second time. NEVER raises.
+
     Accepts the raw YAML **text** of a spec (NOT a path). The byte-cap is
     enforced BEFORE parsing so an oversized spec fails fast without constructing
     a giant object graph. On any parse/grammar failure returns ``status="fail"``
@@ -612,9 +756,12 @@ def validate_only(text: str) -> ValidationResult:
     # bytes before decoding; this guards direct text callers (e.g. the API
     # validate endpoint and unit tests) and any oversized post-decode content.
     if len(text.encode("utf-8")) > WORKFLOW_MAX_SPEC_BYTES:
-        return ValidationResult(
-            status="fail",
-            errors=[f"spec exceeds byte cap (max {WORKFLOW_MAX_SPEC_BYTES})"],
+        return (
+            ValidationResult(
+                status="fail",
+                errors=[f"spec exceeds byte cap (max {WORKFLOW_MAX_SPEC_BYTES})"],
+            ),
+            None,
         )
 
     # Parse YAML, then construct the spec (triggers validate_grammar).
@@ -622,10 +769,13 @@ def validate_only(text: str) -> ValidationResult:
         data = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         logger.debug("validate_only: malformed YAML: %s", exc)
-        return ValidationResult(status="fail", errors=[f"malformed YAML: {exc}"])
+        return ValidationResult(status="fail", errors=[f"malformed YAML: {exc}"]), None
 
     if not isinstance(data, dict):
-        return ValidationResult(status="fail", errors=["spec root must be a mapping (YAML object)"])
+        return (
+            ValidationResult(status="fail", errors=["spec root must be a mapping (YAML object)"]),
+            None,
+        )
 
     try:
         spec = WorkflowSpec(**data)
@@ -640,12 +790,12 @@ def validate_only(text: str) -> ValidationResult:
         message = _extract_validation_message(exc)
         reasons = [r for r in (part.strip() for part in message.split("; ")) if r]
         logger.debug("validate_only: spec failed grammar: %s", reasons)
-        return ValidationResult(status="fail", errors=reasons or [message])
+        return ValidationResult(status="fail", errors=reasons or [message]), None
 
     reserved = [_reserved_note(c) for c in _constructs_used(spec) if is_reserved(c)]
     if reserved:
-        return ValidationResult(status="pass_reserved", reserved_notes=reserved)
-    return ValidationResult(status="pass")
+        return ValidationResult(status="pass_reserved", reserved_notes=reserved), spec
+    return ValidationResult(status="pass"), spec
 
 
 def _extract_validation_message(exc: Exception) -> str:

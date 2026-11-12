@@ -18,12 +18,21 @@ Two overflow policies exist for a full queue, chosen per subscriber at
   resends ``Last-Event-ID``) and the endpoint replays the dropped records
   exactly once. This closes the "silent gap" hole (PR #436, F2): overflow is no
   longer a silent drop on an open connection.
+
+``publish_lossy`` is a third, narrower path for records that may be lost by
+design (the off-list ``emit_ui`` refusal record, #1158). It only enqueues below
+a queue's high-water mark (half its capacity), never marks a subscriber
+overflowed and never enqueues the sentinel. And when a real event meets a full
+overflow-close queue, ``publish`` first drops the newest queued lossy record to
+make room, so lossy records never cause an overflow that the real events alone
+would not. A lossy record that is skipped or dropped is lost to that client; it
+stays in the event log for a later ``since`` replay.
 """
 
 import asyncio
 import logging
 import threading
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +67,11 @@ class _Subscriber:
         self.loop = loop
         self.overflow_close = overflow_close
         self.overflowed = False
+        # ``id()`` of each queued record that came through ``publish_lossy``. The
+        # record dicts are shared across subscribers (and are the event log's own
+        # rows), so they are never tagged in place. A queued record stays alive,
+        # so its id can't be reused while it is here; ``drain`` forgets it.
+        self.lossy: Set[int] = set()
 
 
 class SseBus:
@@ -100,6 +114,28 @@ class SseBus:
                     # loop will close the stream. Extra events are dropped (they
                     # are replayed on reconnect via Last-Event-ID).
                     return
+                if sub.lossy:
+                    # A lossy record (#1158) holds a slot: drop the newest one and
+                    # keep this real event, so lossy records never cause an
+                    # overflow the real events alone would not. Only a lossy record
+                    # leaves the queue, so the real events stay a contiguous prefix.
+                    held: List[Dict] = []
+                    while not sub.queue.empty():
+                        held.append(sub.queue.get_nowait())
+                    newest = max(
+                        (i for i, item in enumerate(held) if id(item) in sub.lossy), default=None
+                    )
+                    if newest is not None:
+                        sub.lossy.discard(id(held.pop(newest)))
+                    for item in held:
+                        sub.queue.put_nowait(item)
+                    if newest is not None:
+                        sub.queue.put_nowait(event)
+                        return
+                    # No queued lossy record after all (a stale tag): forget the
+                    # tags and take the ordinary overflow path below, never raise
+                    # here, where an exception would silently lose this event.
+                    sub.lossy.clear()
                 # First overflow: mark the gap and enqueue the sentinel. We must
                 # free a slot for it, and *which* event we drop is load-bearing
                 # for lossless recovery. The client replays on reconnect from the
@@ -143,6 +179,32 @@ class SseBus:
             with self._lock:
                 self._subs = [s for s in self._subs if s not in dead]
 
+    def publish_lossy(self, event: Dict) -> None:
+        """Deliver an event only to subscribers whose queue is below its high-water mark.
+
+        For records that may be dropped (see the module docstring). Thread-safe
+        and non-blocking, like :meth:`publish`. A subscriber whose queue holds
+        half its capacity or more, or that has already overflowed, is skipped
+        for this event; nothing else about it changes.
+        """
+
+        with self._lock:
+            subscribers = list(self._subs)
+
+        def _deliver(sub: _Subscriber) -> None:
+            if sub.overflowed or sub.queue.qsize() >= sub.queue.maxsize // 2:
+                logger.debug("Subscriber queue past its lossy high-water mark; skipping.")
+                return
+            sub.queue.put_nowait(event)
+            sub.lossy.add(id(event))
+
+        for sub in subscribers:
+            try:
+                sub.loop.call_soon_threadsafe(_deliver, sub)
+            except RuntimeError:
+                # A closed loop: publish() (the next real event) unregisters it.
+                logger.debug("SSE subscriber loop unavailable; skipping lossy event")
+
     def register(self, overflow_close: bool = False) -> _Subscriber:
         """Register a subscriber immediately and return its handle.
 
@@ -184,6 +246,7 @@ class SseBus:
 
         while True:
             item = await sub.queue.get()
+            sub.lossy.discard(id(item))
             if item is OVERFLOW_SENTINEL:
                 # Overflow gap signal: close the stream. The caller's ``finally``
                 # unregisters the subscriber; the client reconnects and replays.

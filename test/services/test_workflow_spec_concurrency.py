@@ -96,6 +96,40 @@ def _named_update_worker(
         results.put(("error", label, type(exc).__name__, getattr(exc, "actual", None)))
 
 
+def _large_yaml_source() -> str:
+    # A builder-style YAML spec padded with a comment, so its publish is not instant either.
+    return (
+        '"name": "contended"\n'
+        '"steps":\n'
+        '  - {"id": "s1", "provider": "claude_code", "agent": "dev", "prompt": "go"}\n'
+        "# " + ("y" * 100_000) + "\n"
+    )
+
+
+def _cross_tier_create_worker(
+    scan_dir: str,
+    tier: str,
+    start: Any,
+    results: Any,
+) -> None:
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    start.wait(timeout=10)
+    try:
+        if tier == "yaml":
+            written = workflow_spec_service.create_yaml_workflow(
+                "contended", _large_yaml_source(), scan_dir=scan_dir
+            )
+            results.put(("ok", tier, written.content_hash))
+        else:
+            spec = workflow_spec_service.create_workflow(
+                "contended", _large_source(tier), scan_dir=scan_dir
+            )
+            results.put(("ok", tier, spec.content_hash))
+    except BaseException as exc:  # noqa: BLE001 - child result must reach parent
+        results.put(("error", tier, type(exc).__name__))
+
+
 def _run_pair(target: Any, args: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
     ctx = multiprocessing.get_context("spawn")
     start = ctx.Barrier(3)
@@ -139,6 +173,28 @@ def test_two_process_creates_have_exactly_one_winner(tmp_path: Path) -> None:
     winner_label = winners[0][1]
     assert final == _large_source(winner_label).encode("utf-8")
     assert winners[0][2] == hashlib.sha256(final).hexdigest()
+
+
+def test_python_and_yaml_creates_of_one_name_have_exactly_one_winner(tmp_path: Path) -> None:
+    """Both tiers' writers take the same lock, so the second sees the first's file.
+
+    With a per-tier lock both could pass their existence checks and both publish, leaving a
+    ``.py`` beside a ``.yaml``: the same-stem collision every later read refuses.
+    """
+    outcomes = _run_pair(
+        _cross_tier_create_worker,
+        [(str(tmp_path), "python"), (str(tmp_path), "yaml")],
+    )
+
+    winners = [outcome for outcome in outcomes if outcome[0] == "ok"]
+    losers = [outcome for outcome in outcomes if outcome[0] == "error"]
+    assert len(winners) == 1, outcomes
+    assert len(losers) == 1, outcomes
+    assert losers[0][2] == "TierCollisionError"
+
+    published = "contended.yaml" if winners[0][1] == "yaml" else "contended.py"
+    assert sorted(os.listdir(tmp_path)) == [published]
+    assert winners[0][2] == hashlib.sha256((tmp_path / published).read_bytes()).hexdigest()
 
 
 def test_two_same_hash_process_updates_have_exactly_one_winner(tmp_path: Path) -> None:

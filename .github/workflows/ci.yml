@@ -374,10 +374,10 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Check code formatting with black
-        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/ examples/robotics/hierarchical-factory/ examples/skills/
+        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/ examples/robotics/hierarchical-factory/ examples/skills/ examples/ag-ui/cao-dojo/tools/
 
       - name: Check import sorting with isort
-        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/robotics/hierarchical-factory/ examples/skills/
+        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/robotics/hierarchical-factory/ examples/skills/ examples/ag-ui/cao-dojo/tools/
 
       # The dead-code gate (#1005). BLOCKING, like the mypy ratchet step below:
       # the selected rules (F401 unused import, F841 unused local, F821/F822
@@ -571,6 +571,9 @@ jobs:
   ag-ui-stock-client-live:
     name: AG-UI stock-client live (AC3)
     runs-on: ubuntu-latest
+    # The CAO Dojo trace steps below start a cao-server and mock_cli terminals;
+    # every wait inside them is bounded, and this bounds the job as a whole.
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -592,6 +595,16 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Install tmux (the CAO Dojo trace check launches mock_cli terminals)
+        # Not assumed on the runner image: ubuntu-latest is moving to a new release.
+        run: command -v tmux || (sudo apt-get update && sudo apt-get install -y tmux)
+
+      - name: Install the pinned @ag-ui/client from the lockfile
+        # Before run.sh, so run.sh finds node_modules and skips its unlocked
+        # `npm install`: the demo and the trace lane below run on the locked 1.0.3.
+        run: npm ci --no-audit --no-fund
+        working-directory: examples/ag-ui/ag-ui-stock-client-live
+
       - name: Run stock-client live demo (asserts >=1 post-connect frame)
         # Boots a CAO_AGUI_ENABLED cao-server with a keyless mock_cli fleet,
         # POSTs a RunAgentInput to /agui/v1/run with the pinned @ag-ui/client
@@ -601,6 +614,35 @@ jobs:
         # conformance tests capture, plus one live HttpAgent run.
         # Non-zero exit fails the job; the script cleans up the server on exit.
         run: ./examples/ag-ui/ag-ui-stock-client-live/run.sh
+
+      - name: CAO Dojo approve/reject/none e2e, keyless, and tier-2 drift check (#1116)
+        # Records the three captures against an isolated cao-server with mock_cli
+        # answering a scripted approval prompt (no credentials), asserts each
+        # capture's outcome, side effect and the leak rule, then compares the
+        # recording's shape with the committed shape file. Exit 1 prints DRIFT and
+        # the keyless command that regenerates the shape.
+        run: >-
+          uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --mock --check
+          --emit "$RUNNER_TEMP/cao-dojo-mock-trace.ndjson"
+
+      - name: CAO Dojo node lane's known-gap rule (a union across traces, like the Python lane)
+        # The end-to-end cases need the pinned @ag-ui/client installed above, so they
+        # run here; Unit Tests runs the same file and skips them without it.
+        # CAO_MUST_RUN names the assurance gate this step owns: any skip of a
+        # must_run("agui-node") test fails the step (test/_must_run.py).
+        run: uv run pytest test/examples/test_cao_dojo_verify_trace_node.py -q --no-cov -rs
+        env:
+          CAO_MUST_RUN: agui-node
+
+      - name: CAO Dojo trace through upstream enforceEvents and verifyEvents (tier 1, node)
+        run: |
+          published=examples/ag-ui/cao-dojo/trace/cao-dojo-trace.ndjson
+          [ -f "$published" ] || published=
+          node examples/ag-ui/ag-ui-stock-client-live/verify-trace.mjs \
+            "$RUNNER_TEMP/cao-dojo-mock-trace.ndjson" $published
+
+      - name: CAO Dojo published-trace debt (warns here; blocks on the release path)
+        run: uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --check-debt --warn
 
   ag-ui-operator-dashboard:
     name: AG-UI operator dashboard
@@ -664,8 +706,27 @@ jobs:
       # for a CLI that prints a permission prompt and waits. COVERED FOR REAL: the
       # approval bridge, classification, the run plane, resume and key delivery.
       # See examples/ag-ui/ag-ui-operator-dashboard/e2e/README.md.
-      - name: Keyless e2e (cao-server + mock_cli terminals)
+      # Chromium for the timeline screenshot (e2e/timeline.spec.ts). npm ci runs with
+      # install scripts off, so the browser is an explicit step, as in the AG-UI
+      # eventsource viewer's recorder job.
+      - name: Install Playwright browser (chromium)
+        run: npm run playwright:install
+
+      - name: Keyless e2e (cao-server + mock_cli terminals) and the timeline screenshot
         run: ./e2e/run.sh
+
+      # Evidence from the browser step, kept even when the e2e fails. Non-blocking:
+      # the e2e step above is the gate, not this upload.
+      - name: Upload dashboard e2e evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ag-ui-operator-dashboard-e2e-evidence
+          path: |
+            examples/ag-ui/ag-ui-operator-dashboard/e2e/artifacts/
+            examples/ag-ui/ag-ui-operator-dashboard/e2e/test-results/
+          if-no-files-found: warn
+        continue-on-error: true
   # =======================================================================================
   # RUST TUI (issue #321, unit `rust-ci`). THE FIRST JOB IN ci.yml THAT INSPECTS THE RUST
   # CRATE AT ALL — measured before this change: `cargo` appeared in only

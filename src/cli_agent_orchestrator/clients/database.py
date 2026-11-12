@@ -4248,6 +4248,15 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
 # Delegation edge functions (assign-callback-guarantee)
 
 
+def _edge_reason(value: str) -> EdgeReason:
+    # A stored row can carry a reason value this version does not define;
+    # it reads as the default so the edge stays usable.
+    try:
+        return EdgeReason(value)
+    except ValueError:
+        return EdgeReason.NO_CALLBACK
+
+
 def _edge_from_row(row: DelegationEdgeModel) -> DelegationEdge:
     return DelegationEdge(
         id=row.id,
@@ -4255,7 +4264,7 @@ def _edge_from_row(row: DelegationEdgeModel) -> DelegationEdge:
         worker_id=row.worker_id,
         source=EdgeSource(row.source),
         state=EdgeState(row.state),
-        reason=EdgeReason(row.reason),
+        reason=_edge_reason(row.reason),
         message_id=row.message_id,
         created_at=row.created_at,
         delivered_at=row.delivered_at,

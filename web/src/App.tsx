@@ -10,11 +10,12 @@ import { ProfilesPanel } from './components/ProfilesPanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { WorkflowsPanel } from './components/WorkflowsPanel'
 import { PluginsPanel } from './components/PluginsPanel'
+import { WorkspacePanel } from './components/WorkspacePanel'
 import { PLUGINS_TAB_ENABLED } from './featureFlags'
 import { CaoMark } from './components/CaoMark'
-import { Bot, Home, Clock, Settings, Brain, Workflow, Puzzle, CheckCircle, XCircle, Info, Wifi, WifiOff, Package } from 'lucide-react'
+import { Bot, Home, Clock, Settings, Brain, Workflow, Puzzle, PanelsTopLeft, CheckCircle, XCircle, Info, Wifi, WifiOff, Package } from 'lucide-react'
 
-type TabKey = 'home' | 'profiles' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows' | 'plugins'
+type TabKey = 'home' | 'profiles' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows' | 'plugins' | 'workspace'
 
 // Profiles sits between Home and Agents (#510): browsing/authoring profiles
 // precedes launching agents, and AgentPanel stays the launch picker. This was
@@ -36,6 +37,8 @@ const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'memory', label: 'Memory', icon: <Brain size={16} /> },
   { key: 'workflows', label: 'Workflows', icon: <Workflow size={16} /> },
   { key: 'plugins', label: 'Plugins', icon: <Puzzle size={16} /> },
+  // Appended last so the Alt+N numbers of the existing tabs do not shift.
+  { key: 'workspace', label: 'Workspace', icon: <PanelsTopLeft size={16} /> },
 ]
 
 function Snackbar() {
@@ -64,7 +67,7 @@ function Snackbar() {
   return (
     <div role="alert" className={`fixed bottom-4 right-4 z-50 px-4 py-3 rounded-lg border shadow-lg flex items-center gap-2 text-white ${colors[snackbar.type]}`}>
       {icons[snackbar.type]}
-      <span className="text-sm">{snackbar.message}</span>
+      <span className="text-sm whitespace-pre-line">{snackbar.message}</span>
     </div>
   )
 }
@@ -95,6 +98,8 @@ export default function App() {
   // Two independent gates, both fail-closed. Memory is a runtime capability
   // check; Plugins is the build-time graduation gate (#1244) and mirrors
   // `hidden=True` on the Click group and `Policy::Hidden` on the TUI rows.
+  const fullBleed = tab === 'workspace'
+
   const visibleTabs = TABS.filter(
     t => (t.key !== 'memory' || memoryEnabled) && (t.key !== 'plugins' || PLUGINS_TAB_ENABLED)
   )
@@ -132,7 +137,7 @@ export default function App() {
   }, [memoryEnabled])
 
   return (
-    <div className="min-h-screen bg-[#0f0f14] text-gray-200">
+    <div className={`bg-[#0f0f14] text-gray-200 ${fullBleed ? 'h-screen flex flex-col overflow-hidden' : 'min-h-screen'}`}>
       {/* Header */}
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-xs sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
@@ -190,7 +195,9 @@ export default function App() {
       </div>
 
       {/* Content */}
-      <main className="max-w-7xl mx-auto px-6 py-6">
+      {/* The Workspace fills the viewport below the tab bar: its terminals size
+          to their panes, so it cannot live in the centred, scrolling column. */}
+      <main className={fullBleed ? 'flex-1 min-h-0 w-full px-4 py-3' : 'max-w-7xl mx-auto px-6 py-6'}>
         <ErrorBoundary>
           <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">Loading...</div>}>
             {tab === 'home' && <DashboardHome onNavigate={(t) => requestTabChange(t as TabKey)} />}
@@ -201,6 +208,7 @@ export default function App() {
             {tab === 'memory' && <MemoryPanel />}
             {tab === 'workflows' && <WorkflowsPanel />}
             {tab === 'plugins' && PLUGINS_TAB_ENABLED && <PluginsPanel />}
+            {tab === 'workspace' && <WorkspacePanel />}
           </Suspense>
         </ErrorBoundary>
       </main>

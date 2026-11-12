@@ -186,7 +186,10 @@ def _from_primitive(event: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     if kind == "handoff":
         # Message dispatch between agents. Body is intentionally redacted -- the
         # detail is metadata-only (routing) by the EventLogPublisher contract.
+        # An OrchestrationType member (a str Enum) becomes its plain value, so the
+        # tool-call name is "assign", never the enum's repr.
         orchestration_type = detail.get("orchestration_type")
+        orchestration_type = getattr(orchestration_type, "value", orchestration_type)
         if orchestration_type in ("handoff", "assign"):
             # These orchestration types represent agent-to-agent task delegation,
             # so they map to TOOL_CALL_START (the receiver is starting a tool call).
@@ -348,6 +351,11 @@ def _from_generative_ui(event: Dict[str, Any], ui: Dict[str, Any]) -> Tuple[str,
         # Refuse: never render an unknown/unsafe component. Preserve the intent
         # under RAW so a client could log/inspect it, but do not treat it as UI.
         base.update(cao_kind="generative_ui", rejected_component=component)
+        # The server's refusal record (#1158) may fold later refusals into one:
+        # carry that count, an integer only, never anything else from the intent.
+        more = ui.get("more_refused")
+        if isinstance(more, int) and not isinstance(more, bool) and more > 0:
+            base["more_refused"] = more
         return AGUI_RAW, base
 
     props = ui.get("props")

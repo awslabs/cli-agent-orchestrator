@@ -601,9 +601,9 @@ def get_cmd(name, as_json):
     # issue #583 Bolt 3 (``authoring-cli-verbs``): ``cao workflow update`` requires an
     # ``--expected-hash`` and this was the only place a human could have found it — it was in the
     # ``--json`` output all along but absent from the table, so the required flag would have meant
-    # piping through jq for the one verb that needs it most. GUARDED rather than unconditional: a YAML
-    # spec carries no content_hash, and printing "Hash: None" on every YAML spec would be noise that
-    # reads like a defect.
+    # piping through jq for the one verb that needs it most. GUARDED rather than unconditional: a
+    # body without a content_hash must not print "Hash: None", which would read like a defect.
+    # The server sends one for Python specs and, since YAML specs became writable, for YAML specs too.
     content_hash = spec.get("content_hash")
     if content_hash:
         click.echo(f"Hash:        {content_hash}")
