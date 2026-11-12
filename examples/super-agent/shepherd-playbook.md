@@ -197,7 +197,8 @@ Re-run the gate. If the reviewer edits that body, it holds again and needs a new
    `insteadOf`/`pushInsteadOf` rewrite may exist. Pass every remote section in `$RC` from
    `git config --get-regexp '^remote\.'` as `--remote-config "$RC"`. URL-named remote sections
    (names containing `://` or equal to the push URL) are refused. A push then runs exactly
-   `git push <push_url> <new_head>:refs/heads/<branch>`, never to the name origin, and
+   `git -c core.hooksPath=/dev/null -c core.sshCommand= push --no-verify
+   <push_url> <new_head>:refs/heads/<branch>`, never to the name origin, and
    `ls-remote` reads the same URL.
 9. **Posts:** `outbox.py key …` → `check` (0 UNUSED; 1 USED: done; 4 PENDING: reconcile first) →
    pre-write check → `reserve … --owner-terminal "$CAO_TERMINAL_ID"` (atomic `O_EXCL` on
@@ -214,7 +215,8 @@ Re-run the gate. If the reviewer edits that body, it holds again and needs a new
 
 ## 6. Verification before publishing
 - **FF:** `git -C <wt> merge-base --is-ancestor <remote head> <new head> && echo FF-OK`.
-- **Remote:** `git -C <wt> ls-remote --heads origin <branch>` before the push and after.
+- **Remote:** before the push and after:
+  `git -C <wt> -c core.hooksPath=/dev/null ls-remote --heads origin <branch>`.
 - **Change-set check after a main merge, and the posted-body comparison:** the commands are in
   `conductor-playbook.md` §4. Only the intended resolution lines may differ.
 - **Tests:** the worker's `TESTS_RUN` must list the focused set **plus** the repo-root guards

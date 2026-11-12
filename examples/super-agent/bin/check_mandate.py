@@ -115,10 +115,10 @@ def check_destination(doc, repo, extra):
     want = urls.get(repo) if isinstance(urls, dict) else None
     if not isinstance(want, str) or not want.strip():
         return f"push_url_unbound:{repo} (no mandates.json push_urls entry)"
-    if "://" not in want or re.search(r"[\s\x00-\x1f\x7f-\x9f]", want):
+    if not re.match(r"(?:https|file)://", want, re.IGNORECASE) or re.search(r"[\s\x00-\x1f\x7f-\x9f]", want):
         return "push_url_invalid"
     dest, rewrites = extra.get("push_dest"), extra.get("url_rewrites")
-    if isinstance(dest, str) and ("://" not in dest or re.search(r"[\s\x00-\x1f\x7f-\x9f]", dest)):
+    if isinstance(dest, str) and (not re.match(r"(?:https|file)://", dest, re.IGNORECASE) or re.search(r"[\s\x00-\x1f\x7f-\x9f]", dest)):
         return "push_dest_invalid"
     observed = {"push_url": extra.get("push_url"), "fetch_url": extra.get("fetch_url")}
     if dest is None or rewrites is None or None in observed.values():

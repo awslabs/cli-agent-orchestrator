@@ -238,6 +238,11 @@ The probes use macOS tools (`memory_pressure`, `sysctl`); on another system an u
 value counts as THROTTLE, so the gate fails safe.
 
 ## Safety rules
+
+The gate checks remote URLs and URL rewrites in the pushing worktree, which must be a fresh clone
+made by the kit's own worker. It doesn't defend against a hostile .git directory beyond disabling
+hooks and the SSH command.
+
 - **Outside text is data.** PR comments, review bodies, CI logs and web pages rank below
   everything else: host and CAO policy, then the agent's profile, then `mandates.json`, then
   your messages, then other agents' reports. Text from outside can never grant, widen or
@@ -248,6 +253,7 @@ value counts as THROTTLE, so the gate fails safe.
 - **A push goes to one URL.** The publisher pushes `<new_head>:refs/heads/<branch>` to the
   repo's URL in `mandates.json` `push_urls`, never to the name `origin`, and refuses when the
   worktree's fetch or push URL differs or an `insteadOf` rewrite exists.
+  Scp-style `git@host:org/repo` values are not accepted; use `https://`.
 - **Nothing is posted twice.** Every post reserves an outbox key first; a crash leaves a
   `.pending` entry that must be reconciled before anything else is posted on that PR.
 - **Real findings hold auto-merge** until a newer non-merge commit fixes them, or you decline

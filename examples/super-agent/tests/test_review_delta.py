@@ -130,9 +130,9 @@ def test_delta_dotless_url_named_section_denies(destination_repo, variable):
 
 
 @pytest.mark.parametrize("kind", ["remotes", "branches"])
-def test_delta_legacy_remote_denies_real_push(destination_repo, kind):
+@pytest.mark.parametrize("want", ["goodrepo", "host:repo", "../goodrepo"])
+def test_delta_legacy_remote_denies_real_push(destination_repo, kind, want):
     root, work, good, evil, old, env = destination_repo
-    want = "goodrepo"
     good = good.rename(work / want)
     git(work, env, "config", "remote.origin.url", want)
     legacy = work / ".git" / kind
@@ -140,13 +140,25 @@ def test_delta_legacy_remote_denies_real_push(destination_repo, kind):
     content = (f"URL: {evil.as_uri()}\nPush: refs/heads/*:refs/heads/*\n"
                if kind == "remotes" else f"{evil.as_uri()}\n")
     (legacy / want).write_text(content)
-    result = destination_check(root, work, want, old, env)
+    result = destination_check(root, work, want, old, env, head_url=good.as_uri())
     # Bypass the gate only in this disposable probe: the legacy nickname redirects
     # a real push to the evil file:// repo, which the gate must never authorise.
     new = git(work, env, "rev-parse", "refs/heads/fix")
+    if want == "host:repo" and kind == "branches":
+        # Git refuses the legacy file's implicit colon-containing fetch refspec.
+        pushed = subprocess.run(["git", "-C", str(work), "push", want,
+                                 f"{new}:refs/heads/fix"], env=env,
+                                capture_output=True, text=True, timeout=30)
+        assert pushed.returncode != 0 and "invalid refspec" in pushed.stderr
+        assert git(work, env, "ls-remote", evil.as_uri(), "refs/heads/fix").split()[0] == old
+        assert git(work, env, "ls-remote", good.as_uri(), "refs/heads/fix").split()[0] == old
+        assert result.returncode == 1
+        assert result.stdout.startswith("DENY push_url_invalid")
+        return
     git(work, env, "push", want, f"{new}:refs/heads/fix")
-    assert git(work, env, "ls-remote", evil.as_uri(), "refs/heads/fix").split()[0] == new
-    assert git(work, env, "ls-remote", good.as_uri(), "refs/heads/fix").split()[0] == old
+    redirected = "/" not in want
+    assert git(work, env, "ls-remote", evil.as_uri(), "refs/heads/fix").split()[0] == (new if redirected else old)
+    assert git(work, env, "ls-remote", good.as_uri(), "refs/heads/fix").split()[0] == (old if redirected else new)
     assert result.returncode == 1
     assert result.stdout.startswith("DENY push_url_invalid")
 

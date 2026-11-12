@@ -61,7 +61,7 @@ def test_no_first_use_baseline():
 
 
 # every outside write is immediately preceded by the full pre-write check
-WRITES = re.compile(r"git -C \{worktree\} push |gh pr comment|gh pr merge|gh pr update-branch|gh run rerun"
+WRITES = re.compile(r"git -C \{worktree\} (?:-c \S+ )*push |gh pr comment|gh pr merge|gh pr update-branch|gh run rerun"
                     r"|gh pr create")
 
 
@@ -248,8 +248,8 @@ def test_publisher_has_no_reduced_one_off_path():
 def test_push_steps_pin_the_commit():
     for rel in ("templates/publisher.md",):
         block = re.search(r"## Assign message\n```text\n(.*?)```", text(rel), re.S).group(1)
-        push = [ln for ln in steps(block) if re.search(r"\bgit -C \{worktree\} push\b", ln)]
-        assert push and all("push {push_url} {new}:refs/heads/{branch}" in ln for ln in push), push
+        push = [ln for ln in steps(block) if re.search(r"\bgit -C \{worktree\} (?:-c \S+ )*push\b", ln)]
+        assert push and all("push --no-verify {push_url} {new}:refs/heads/{branch}" in ln for ln in push), push
         check = [ln for ln in steps(block) if "--action {push_action}" in ln]
         assert check and all(o in check[0] for o in ("--new-head {new}", '--local-head "$L"',
                                                     "--branch {branch}", "rev-parse refs/heads/{branch}"))

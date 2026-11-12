@@ -117,7 +117,8 @@ def test_template_push_never_names_a_bare_branch():
     pushes = [n for n, text in steps().items()  # `remote get-url --push` only reads the config
               if re.search(r"\bgit\b[^;|&]*\bpush\b", command(n).replace("get-url --push", "get-url"))]
     assert pushes == ["5"]
-    assert command("5") == "git -C {worktree} push {push_url} {new}:refs/heads/{branch}"
+    assert command("5") == ("git -C {worktree} -c core.hooksPath=/dev/null -c core.sshCommand= "
+                            "push --no-verify {push_url} {new}:refs/heads/{branch}")
 
 
 def test_template_reads_and_pushes_the_verified_url_never_origin():
@@ -125,7 +126,8 @@ def test_template_reads_and_pushes_the_verified_url_never_origin():
     for n in ("4", "5", "6"):
         assert not re.search(r"\b(?:ls-remote|push) origin\b", command(n)), n
     assert "ls-remote {push_url} refs/heads/{branch}" in command("4")
-    assert command("6") == "git -C {worktree} ls-remote {push_url} refs/heads/{branch} | cut -f1"
+    assert command("6") == ("git -C {worktree} -c core.hooksPath=/dev/null "
+                            "ls-remote {push_url} refs/heads/{branch} | cut -f1")
     for part in ("remote get-url --all origin", "remote get-url --push --all origin",
                  "config --get-regexp '^url\\.'", '--push-dest {push_url} --push-url "$PU" '
                  '--fetch-url "$FU" --url-rewrites "$RW"'):

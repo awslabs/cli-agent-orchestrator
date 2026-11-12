@@ -86,7 +86,7 @@ Run these yourself; a worker's report is a claim.
 ```sh
 W=<worktree>; B=<branch>; OLD=<remote head>; NEW=<new head>
 git -C "$W" merge-base --is-ancestor "$OLD" "$NEW" && echo FF-OK          # fast-forward only
-git -C "$W" ls-remote --heads origin "$B"                                  # remote head
+git -C "$W" -c core.hooksPath=/dev/null ls-remote --heads origin "$B"  # remote head
 gh api repos/your-org/your-repo/pulls/<N> --jq .head.sha       # PR head
 git -C "$W" range-diff <old_base>..<old_head> <new_base>..<new_head>       # rebase-only: all '='
 ```
