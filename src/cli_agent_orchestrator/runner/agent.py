@@ -195,6 +195,8 @@ class Runner:
         self._gaps_sent: Dict[str, int] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._outbox_ready: Optional[asyncio.Event] = None
+        # Set once the hub has welcomed this runner on the current connection.
+        self._welcomed = False
 
     @property
     def backend(self) -> "TerminalBackend":
@@ -225,6 +227,7 @@ class Runner:
         tls: Dict[str, Any] = {"ssl": ctx} if (ctx := self._ssl_context()) is not None else {}
         backoff = 1.0
         while True:
+            self._welcomed = False
             try:
                 async with connect(
                     self.server_url,
@@ -239,7 +242,6 @@ class Runner:
                         await self._session(ws)
                     finally:
                         self._set_ready(False)
-                    backoff = 1.0
             except InvalidStatus as exc:
                 logger.error(f"runner hub refused the connection: {exc}")
             except ConnectionClosed as exc:
@@ -260,6 +262,12 @@ class Runner:
                 # would restart the pod and lose every agent on it; only the
                 # close codes above mean retrying cannot help.
                 logger.warning(f"connection to runner hub failed: {exc!r}")
+            if self._welcomed:
+                # The hub was reachable and accepted this runner, so the drop
+                # (a clean close, a ping timeout, a server restart) is not a
+                # failing reconnect: start the delay over. Only consecutive
+                # failures to get a welcome grow it.
+                backoff = 1.0
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
@@ -270,6 +278,7 @@ class Runner:
         welcome = json.loads(await asyncio.wait_for(ws.recv(), timeout=HANDSHAKE_TIMEOUT))
         if welcome.get("type") != "welcome" or welcome.get("protocol") != PROTOCOL_VERSION:
             raise SystemExit(f"unexpected reply from runner hub: {welcome!r}")
+        self._welcomed = True
         logger.info(f"runner {self.runner_id} connected to {self.server_url}")
         self._set_ready(True)
         sender = asyncio.create_task(self._drain_outbox(ws))

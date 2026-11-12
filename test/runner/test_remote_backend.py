@@ -1141,3 +1141,99 @@ class TestTheTokenStaysOutOfDebugLogs:
         finally:
             ws_logger.setLevel(previous)
             root.setLevel(root_level)
+
+
+class TestReconnectBackoff:
+    """A drop after a welcomed session does not grow the reconnect delay (#745).
+
+    A network blip, a ping timeout or a server restart ends the session with
+    ``ConnectionClosed``. Each of those reconnects at once into a healthy
+    session, so the delay must start over; only consecutive failures to be
+    welcomed may grow it. Otherwise a few ordinary drops leave a runner waiting
+    the full 30 s, its terminals unknown, before every later reconnect.
+    """
+
+    class _Stop(BaseException):
+        pass
+
+    def _run(self, monkeypatch, tmp_path, connect, sleeps=5):
+        import websockets.asyncio.client as ws_client
+
+        from cli_agent_orchestrator.runner import agent as agent_mod
+
+        delays: List[float] = []
+        real_sleep = asyncio.sleep
+
+        async def sleep(delay, *args, **kwargs):
+            if delay >= 1.0:  # the reconnect delay; anything shorter is internal
+                delays.append(delay)
+                if len(delays) >= sleeps:
+                    raise self._Stop()
+                delay = 0
+            return await real_sleep(delay, *args, **kwargs)
+
+        monkeypatch.setattr(ws_client, "connect", connect)
+        monkeypatch.setattr(agent_mod.asyncio, "sleep", sleep)
+        runner = Runner(
+            "ws://127.0.0.1:1", TOKEN, "a", backend=FakeLocalBackend(), tmp_dir=str(tmp_path)
+        )
+        with pytest.raises(self._Stop):
+            asyncio.run(runner.run_forever())
+        return delays
+
+    def test_abnormal_drops_after_a_welcome_keep_the_delay_at_one_second(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+
+        from websockets.exceptions import ConnectionClosed
+        from websockets.frames import Close
+
+        from cli_agent_orchestrator.runner.protocol import PROTOCOL_VERSION
+
+        class Ws:
+            async def send(self, _frame):
+                pass
+
+            async def recv(self):
+                return json.dumps({"type": "welcome", "protocol": PROTOCOL_VERSION})
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                # A ping timeout: closed without a close frame from the hub.
+                raise ConnectionClosed(None, Close(1011, "keepalive ping timeout"))
+
+        class Connect:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return Ws()
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        assert self._run(monkeypatch, tmp_path, Connect) == [1.0] * 5
+
+    def test_consecutive_failures_to_connect_still_grow_the_delay(self, monkeypatch, tmp_path):
+        class Connect:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                raise ConnectionRefusedError("refused")
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        assert self._run(monkeypatch, tmp_path, Connect, sleeps=7) == [
+            1.0,
+            2.0,
+            4.0,
+            8.0,
+            16.0,
+            30.0,
+            30.0,
+        ]
