@@ -37,6 +37,7 @@ from cli_agent_orchestrator.models.workflow import StepState, WorkflowSpec, Work
 from cli_agent_orchestrator.models.workflow_runtime import StepOutputRecord
 from cli_agent_orchestrator.services import audit_log, workflow_journal, workflow_retention
 from cli_agent_orchestrator.services import workflow_service as ws
+from cli_agent_orchestrator.services.step_result import build_envelope, parse_envelope
 
 
 # ---------------------------------------------------------------------------
@@ -229,9 +230,16 @@ async def test_br_sec_2_capture_off_stores_no_prompt_or_output_text(settings, mo
 
     The worker's prompt ("SENTINEL_PROMPT") and raw output ("SENTINEL_OUTPUT") are
     injected; after a completed run every stored cell of every event row and every
-    step row is scanned. Neither sentinel appears anywhere (NFR-SEC-2). A regression
-    that started journaling free-text with capture off would surface a sentinel and
-    fail here.
+    step row is scanned. The prompt appears nowhere, and the output appears in no
+    event row (NFR-SEC-2). A regression that started journaling free-text into the
+    event log with capture off would surface a sentinel and fail here.
+
+    The step row is functional state, retained regardless of the capture gate
+    (docs/configuration.md, "Step output is retained regardless of
+    workflow_journal_capture_output"). Since the run view, a YAML step stores its final
+    answer there the way a script step does, so the output may appear in exactly one
+    step-row cell: ``result_json``, as the envelope ``build_envelope`` redacted and
+    bounded. Any other step-row cell holding it still fails.
     """
     settings["workflow_journal_capture_output"] = False
 
@@ -245,17 +253,33 @@ async def test_br_sec_2_capture_off_stores_no_prompt_or_output_text(settings, mo
     monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
     await ws.start_run(spec, {}, "runNoText")
 
-    # Scan every cell of every event row for the sentinels.
     with sqlite3.connect(str(workflow_journal_db())) as conn:
-        for table in ("workflow_run_event", "workflow_run_step"):
-            rows = conn.execute(
-                f"SELECT * FROM {table} WHERE run_id = ?", ("runNoText",)
-            ).fetchall()
-            for row in rows:
-                for cell in row:
-                    if isinstance(cell, str):
-                        assert "SENTINEL_PROMPT" not in cell, f"prompt text leaked into {table}"
-                        assert "SENTINEL_OUTPUT" not in cell, f"output text leaked into {table}"
+        # Every cell of every event row: neither sentinel.
+        rows = conn.execute(
+            "SELECT * FROM workflow_run_event WHERE run_id = ?", ("runNoText",)
+        ).fetchall()
+        assert rows, "the run emitted no events, so the scan below proves nothing"
+        for row in rows:
+            for cell in row:
+                if isinstance(cell, str):
+                    assert "SENTINEL_PROMPT" not in cell, "prompt text leaked into the event log"
+                    assert "SENTINEL_OUTPUT" not in cell, "output text leaked into the event log"
+
+        # Every cell of every step row: no prompt, and the output only in result_json.
+        cursor = conn.execute("SELECT * FROM workflow_run_step WHERE run_id = ?", ("runNoText",))
+        columns = [d[0] for d in cursor.description]
+        step_rows = cursor.fetchall()
+    assert step_rows
+    for row in step_rows:
+        for column, cell in zip(columns, row):
+            if not isinstance(cell, str):
+                continue
+            assert "SENTINEL_PROMPT" not in cell, f"prompt text leaked into step column {column}"
+            if column != "result_json":
+                assert "SENTINEL_OUTPUT" not in cell, f"output text leaked into {column}"
+        envelope = parse_envelope(row[columns.index("result_json")])
+        assert envelope is not None
+        assert envelope == build_envelope("SENTINEL_OUTPUT top secret", "completed", "term-1")
 
 
 @pytest.mark.asyncio

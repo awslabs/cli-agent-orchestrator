@@ -6798,13 +6798,21 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
 
     # Snapshot scrollback + metadata before killing (for debugging/restore)
     try:
-        # Capture plain text full scrollback (no -e, no line cap)
+        # Capture plain text full scrollback (no -e, no line cap). Rows tmux
+        # soft-wrapped at the pane width are rejoined into the lines the program
+        # wrote (-J): the workflow transcript route redacts this file, and a
+        # pattern matches a secret only whole, so a secret that crossed a wrap
+        # must not be split here. `cao terminal restore` then re-wraps the lines
+        # at its own pane's width. -J also keeps the trailing spaces a program
+        # wrote, which the default capture trims, so they are stripped.
         scrollback = get_backend().get_history(
             metadata["tmux_session"],
             metadata["tmux_window"],
             strip_escapes=True,
             full_history=True,
+            join_wrapped=True,
         )
+        scrollback = "\n".join(line.rstrip(" ") for line in scrollback.split("\n"))
         # Scrollback is raw terminal history and can hold anything the agent
         # printed, so both sidecars are published 0600 through the atomic
         # writer: a symlink planted at either path is replaced, not followed.

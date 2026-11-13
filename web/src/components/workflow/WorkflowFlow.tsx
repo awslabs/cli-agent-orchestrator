@@ -6,7 +6,8 @@
 //
 // With `states`, each step also shows its state as an icon, a glyph and text,
 // so the state never depends on colour alone (stateCues). The builder shows
-// the flow without states; RunDetail passes live ones.
+// the flow without states. The run page shows live states in its step rail
+// (StepRail), which reads them through flowStateView and flowStateKey.
 
 import { ChevronRight, Cpu } from 'lucide-react'
 import type { RunInspection, WorkflowEvent, WorkflowSpecStep } from '../../api'
@@ -55,6 +56,12 @@ export function flowStateView(state: string | undefined): StateView {
   const key = (state || 'pending').toLowerCase()
   const view = STATE_VIEWS[key]
   return view ? { cue: stepCue(view.cue), text: view.text } : { cue: stepCue('pending'), text: state as string }
+}
+
+/** The derived state a step state reads as, for its icon and colour. An unknown state reads as pending. */
+export function flowStateKey(state: string | undefined): DerivedStepState {
+  const key = (state || 'pending').toLowerCase()
+  return STATE_VIEWS[key]?.cue ?? 'pending'
 }
 
 const NODE_BORDER: Partial<Record<DerivedStepState, string>> = {

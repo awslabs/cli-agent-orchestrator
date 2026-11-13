@@ -326,12 +326,10 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
                 <select
                   value={selected}
                   onChange={e => pickWorkflow(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-gray-700 bg-gray-900 px-2 py-1.5 text-sm text-gray-200"
+                  className="mt-1 w-full rounded-lg border border-gray-700 bg-gray-900 py-1.5 pl-2 pr-8 text-sm text-gray-200"
                 >
                   {workflows.map(w => (
-                    <option key={w.name} value={w.name}>
-                      {w.name}{w.description ? ` — ${w.description}` : ''}
-                    </option>
+                    <option key={w.name} value={w.name}>{w.name}</option>
                   ))}
                 </select>
               </label>
@@ -363,10 +361,10 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
                           value={row.key}
                           onChange={e => setRow(i, { key: e.target.value })}
                           placeholder="name"
-                          className="w-28 rounded-lg border border-gray-700 bg-gray-900 px-2 py-1 text-sm text-gray-200 font-mono"
+                          className="w-28 shrink-0 rounded-lg border border-gray-700 bg-gray-900 px-2 py-1 text-sm text-gray-200 font-mono"
                         />
                         {row.type === 'bool' ? (
-                          <label className="flex flex-1 items-center gap-2 px-2 py-1 text-sm text-gray-300">
+                          <label className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1 text-sm text-gray-300">
                             <input
                               type="checkbox"
                               aria-label={`Input ${i + 1} value`}
@@ -383,14 +381,14 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
                             value={row.value}
                             onChange={e => setRow(i, { value: e.target.value })}
                             placeholder={row.required ? `value (required${row.type ? `, ${row.type}` : ''})` : row.type ? `value (${row.type})` : 'value'}
-                            className={`flex-1 rounded-lg border bg-gray-900 px-2 py-1 text-sm text-gray-200 ${coerced[i].error ? 'border-red-700' : 'border-gray-700'}`}
+                            className={`min-w-0 flex-1 rounded-lg border bg-gray-900 px-2 py-1 text-sm text-gray-200 ${coerced[i].error ? 'border-red-700' : 'border-gray-700'}`}
                           />
                         )}
                         <button
                           type="button"
                           onClick={() => removeRow(i)}
                           aria-label={`Remove input ${i + 1}`}
-                          className="p-1 text-gray-500 hover:text-red-400"
+                          className="shrink-0 p-1 text-gray-500 hover:text-red-400"
                         >
                           <X size={14} aria-hidden="true" />
                         </button>
@@ -420,12 +418,14 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
                 />
               </label>
 
-              <div className="flex gap-2">
+              {/* Run takes the full width; Validate and View spec share the row
+                  below, so no label wraps in the narrow side column. */}
+              <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
                   onClick={submit}
                   disabled={!selected || submitting || invalid}
-                  className="inline-flex items-center gap-2 rounded-lg bg-emerald-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="col-span-2 inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-emerald-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {submitting ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
                   Run workflow
@@ -434,7 +434,7 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
                   type="button"
                   onClick={validate}
                   disabled={!selected || validating}
-                  className="inline-flex items-center gap-2 rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-200 hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-200 hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {validating ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <ListChecks size={14} aria-hidden="true" />}
                   Validate
@@ -444,7 +444,7 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
                   onClick={toggleSpec}
                   disabled={!selected || loadingSpec}
                   aria-expanded={!!spec}
-                  className="inline-flex items-center gap-2 rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-200 hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-200 hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {loadingSpec ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <FileCode size={14} aria-hidden="true" />}
                   {spec ? 'Hide spec' : 'View spec'}

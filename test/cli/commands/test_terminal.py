@@ -42,7 +42,7 @@ class TestSnapshotOnDelete:
         delete_terminal("abc12345", end_reason="deleted")
 
         mock_tmux.get_history.assert_called_once_with(
-            "cao-test", "dev-abc1", strip_escapes=True, full_history=True
+            "cao-test", "dev-abc1", strip_escapes=True, full_history=True, join_wrapped=True
         )
         scrollback = (tmp_path / "abc12345.scrollback").read_text()
         assert scrollback == "line1\nline2\nline3"

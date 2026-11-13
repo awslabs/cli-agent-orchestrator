@@ -571,6 +571,39 @@ def update_step(
         )
 
 
+def set_step_terminal(run_id: str, step_id: str, terminal_id: Optional[str]) -> None:
+    """UPDATE ``workflow_run_step.terminal_id`` and nothing else (the run view).
+
+    A single-column setter on purpose. ``update_step`` writes every column it lists
+    on each call, so adding ``terminal_id`` there would make every later state write
+    clear it. The engine calls this as soon as a step's terminal exists, so the run
+    view can watch the step while it runs, and resume calls it with ``None`` to
+    clear a re-run step's old terminal. A missing row is a no-op (0 rows updated).
+    """
+    with closing_transaction(_connect()) as conn:
+        conn.execute(
+            "UPDATE workflow_run_step SET terminal_id = ? WHERE run_id = ? AND step_id = ?",
+            (terminal_id, run_id, step_id),
+        )
+
+
+def set_step_result(run_id: str, step_id: str, result_json: Optional[str]) -> None:
+    """UPDATE ``workflow_run_step.result_json`` and nothing else (the run view).
+
+    The YAML engine stores each settled step's final answer here, as the envelope
+    ``step_result.serialise_envelope`` builds, the same column the script tier fills
+    through :func:`settle_step`. Single-column for the same reason as
+    :func:`set_step_terminal`. Resume calls it with ``None`` so a re-run step never
+    shows the previous attempt's answer. This function sanitises nothing: the
+    caller hands it an envelope ``build_envelope`` already redacted and bounded.
+    """
+    with closing_transaction(_connect()) as conn:
+        conn.execute(
+            "UPDATE workflow_run_step SET result_json = ? WHERE run_id = ? AND step_id = ?",
+            (result_json, run_id, step_id),
+        )
+
+
 def update_run_current_step(run_id: str, current_step_id: Optional[str]) -> None:
     """UPDATE ``workflow_run.current_step_id`` (FR-6.4 "which step is live")."""
     with closing_transaction(_connect()) as conn:
