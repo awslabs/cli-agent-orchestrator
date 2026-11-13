@@ -274,7 +274,8 @@ def test_docker_opt_in_warns_that_the_group_is_root(sandbox) -> None:
     fake = FakeSystem(sandbox)
     result = dry_run(sandbox, fake, INSTALL_DOCKER="yes", **BOOTSTRAP_SETTINGS)
     assert result.returncode == 0, result.stderr
-    assert "docker.io" in result.stdout
+    packages = lines(result)[index_of(result, "3. packages:")].split("3. packages:", 1)[1].split()
+    assert "docker.io" in packages  # the apt package, as a token (not a URL check)
     assert "That is root on this box for every agent" in result.stderr
     assert "would run: usermod -aG docker boxuser" in result.stdout
 
