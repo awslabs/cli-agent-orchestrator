@@ -34,8 +34,8 @@ see [Configuration](configuration.md) and [Security](../SECURITY.md).
 ### Events and AG-UI
 
 - `/events` and `/events/history` expose server events.
-- `GET`/`POST /agui/v1/stream` serve the fleet as an AG-UI 1.0 run, and
-  `/agui/v1/emit_ui` takes generative UI input. `POST /agui/v1/run` is the run
+- `GET`/`POST /agui/v1/stream` serve the sessions and terminals this server can
+  see as an AG-UI 1.0 run, and `/agui/v1/emit_ui` takes generative UI input. `POST /agui/v1/run` is the run
   plane for approval interrupts, and `GET /agui/v1/capabilities` returns its
   AG-UI 1.0 `AgentCapabilities`.
 
@@ -181,7 +181,7 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 ### Sessions and terminals
 
 - `/sessions*` creates, lists, inspects, and deletes sessions.
-- `/sessions/{session_name}/terminals*` creates and lists session terminals.
+- `/sessions/{session_name}/terminals*` creates and lists session terminals. Each listed row also carries `status`, the last status the monitor applied (`null` when none has been observed). Unlike `GET /terminals/{id}` it does not re-detect, so a terminal that nothing polls can show `processing` after it went idle, until its status is next polled.
   The list is ordered oldest-first, and index 0 is the session's conductor —
   `cao session status`/`list` rely on that. Sort client-side on `last_active`
   if you need a different order.
@@ -544,7 +544,8 @@ Read-only views of a CAO cluster's workers, reached through the fleet's worker b
 (`CAO_ELASTIC_BROKER_URL` / `CAO_ELASTIC_BROKER_TOKEN` in cao-server's environment). No
 broker configured, unreachable, or erroring is a `503` carrying the broker's message.
 Releasing workers and shutting the fleet down stay CLI actions (`cao worker release`,
-`cao fleet shutdown`).
+`cao fleet shutdown`). This is the Kubernetes worker fleet behind `cao fleet`, not the
+sessions-and-terminals fleet in the AG-UI stream.
 
 - `GET /fleet/status` mirrors `cao fleet status`: `{broker, live, cleanup_pending, states}`.
 - `GET /fleet/workers` mirrors `cao worker list` (`?all=true` for `--all`):

@@ -1717,6 +1717,17 @@ def _sweep_workflow_runs_at_startup() -> None:
         logger.warning("workflow retention sweep failed at startup: %s", e)
 
 
+async def _prime_host_sampler_if_enabled() -> None:
+    """Take the host CPU baseline at start-up, only when the AG-UI surface is on.
+
+    Without it the first real host sample has no CPU window and reports no ``cpu_percent``.
+    """
+    if _agui_enabled():
+        from cli_agent_orchestrator.services.host_resources import prime_host_sampler
+
+        await asyncio.to_thread(prime_host_sampler)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -1733,6 +1744,7 @@ async def lifespan(app: FastAPI):
     from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run_hook
 
     _ambient_run_hook.install_signal_stop_hook()
+    await _prime_host_sampler_if_enabled()
     # issues #406 / #709: exactly one cao-server per CAO_HOME_DIR. Taken before
     # the database, the recovery sweeps, the terminal registry, the status
     # monitor and uvicorn's port bind (uvicorn binds after lifespan startup), so
@@ -2409,7 +2421,8 @@ async def _with_keepalive(events: Any, interval: float) -> Any:
 
 
 # ``?framing=`` values the ambient stream accepts. ``cao-legacy`` is the pre-1.0
-# framing, deprecated and kept byte-identical (#1193 mode ``off``).
+# framing, deprecated and kept unchanged (#1193 mode ``off``) except that the terminal rows
+# of its fleet snapshot gain ``runner_id`` and a live ``status``.
 AGUI_FRAMING_LEGACY = "cao-legacy"
 AGUI_STREAM_FRAMINGS = frozenset({AGUI_FRAMING_LEGACY})
 # RFC 9745 section 2.1: Deprecation is an Item Structured Header Field whose value
@@ -2430,6 +2443,87 @@ def _agui_legacy_framing_headers() -> Dict[str, str]:
         "Deprecation": f"@{_AGUI_LEGACY_DEPRECATED_AT}",
         "Link": _AGUI_LEGACY_DEPRECATION_LINK,
     }
+
+
+# --- AG-UI fleet snapshot ---------------------------------------------------------------
+
+#: How long a scan of the installed agent profiles is reused. The snapshot is recomputed on
+#: every bus event, and a scan walks several directories, so it must not run per event.
+_AGUI_PROFILE_CATALOG_TTL_SECONDS = 30.0
+_agui_profile_catalog_cache: Optional[Tuple[float, List[Dict]]] = None
+
+
+def _reset_agui_profile_catalog_cache() -> None:
+    """Forget the cached catalog (tests)."""
+    global _agui_profile_catalog_cache
+    _agui_profile_catalog_cache = None
+
+
+def _agui_profile_catalog() -> List[Dict]:
+    """The read-only profile catalog for the AG-UI snapshot, scanned at most once per TTL.
+
+    Failure-isolated like the rest of the snapshot: a scan error yields an empty catalog
+    (and is cached for the TTL, so a broken directory is not rescanned per event).
+
+    The scan runs inline on the event loop, at most once per TTL, the same pattern as the
+    ``list_sessions`` / terminal listing the snapshot already does there.
+    """
+    global _agui_profile_catalog_cache
+    now = time.monotonic()
+    cached = _agui_profile_catalog_cache
+    if cached is not None and now - cached[0] < _AGUI_PROFILE_CATALOG_TTL_SECONDS:
+        return [dict(entry) for entry in cached[1]]
+    from cli_agent_orchestrator.services.ui_state_service import build_profile_catalog
+
+    try:
+        from cli_agent_orchestrator.utils import agent_profiles
+
+        catalog = build_profile_catalog(agent_profiles.list_agent_profiles())
+    except Exception:
+        logger.debug("agui_stream: profile catalog scan failed", exc_info=True)
+        catalog = []
+    _agui_profile_catalog_cache = (now, catalog)
+    return [dict(entry) for entry in catalog]
+
+
+def _agui_fleet_snapshot(scopes: List[str], *, profiles: bool = True) -> Dict:
+    """Build the current fleet ``DashboardSnapshot`` for every AG-UI route.
+
+    The one place the three AG-UI routes (``GET`` and ``POST /agui/v1/stream`` and
+    ``POST /agui/v1/run``) build their snapshot, so they cannot diverge. The two ambient
+    stream routes carry the read-only ``profiles`` catalog, which the MCP Apps snapshot
+    does not. The run plane's one-shot hydrate (``profiles=False``) leaves it out: it
+    serves approvals, not the fleet view, so it never pays for a profile scan and its
+    recorded shape does not depend on what happens to be installed.
+
+    Failure-isolated: ``list_sessions`` already returns ``[]`` on error, and a terminal
+    listing that fails is skipped, so an unavailable tmux/herdr backend degrades to a
+    smaller snapshot rather than tearing down the stream.
+    """
+    from cli_agent_orchestrator.services import session_service
+    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
+
+    sessions = session_service.list_sessions()
+    terminals: List[Dict] = []
+    for sess in sessions:
+        try:
+            terminals.extend(
+                session_service.list_current_session_terminals(sess["id"], backend_exists=True)
+            )
+        except Exception:
+            logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
+    from cli_agent_orchestrator.services.terminal_service import with_live_status
+
+    # The terminals table has no status column; add the monitor's in-memory reading.
+    snapshot = build_dashboard_snapshot(sessions, with_live_status(terminals), scopes)
+    if profiles:
+        snapshot["profiles"] = _agui_profile_catalog()
+        # The host view follows the SAME flag as the catalog, so the three call sites
+        # cannot diverge. Numbers only; ``[]`` means "not reported".
+        from cli_agent_orchestrator.services.host_resources import sample_host
+
+        snapshot["host"] = sample_host()
+    return snapshot
 
 
 def _agui_ambient_response(
@@ -2539,7 +2633,8 @@ async def agui_stream(
         default=None,
         description=(
             "Wire framing. ``cao-legacy`` selects the pre-1.0 framing (named SSE "
-            "events, snake_case fields), which is deprecated and kept byte-identical."
+            "events, snake_case fields), which is deprecated and otherwise unchanged; "
+            "its terminal rows gain runner_id and a live status."
         ),
     ),
     thread_id: Optional[str] = Query(
@@ -2588,8 +2683,9 @@ async def agui_stream(
     carry an ``id:`` cursor. Message bodies are never carried (the ring buffer
     stores metadata only and the mapping redacts by construction).
 
-    ``?framing=cao-legacy`` serves the deprecated pre-1.0 wire byte-for-byte
-    (named ``event:`` frames via ``agui_stream.to_agui_event``), with
+    ``?framing=cao-legacy`` serves the deprecated pre-1.0 wire (named ``event:`` frames
+    via ``agui_stream.to_agui_event``; unchanged except that the terminal rows of its
+    fleet snapshot gain ``runner_id`` and a live ``status``), with
     ``Deprecation`` and ``Link`` headers. ``since`` / ``Last-Event-ID`` replay is
     a CAO extension that chooses which buffered records the new run narrates
     first (``docs/agui.md#replay``).
@@ -2657,7 +2753,6 @@ async def agui_stream(
 
     from fastapi.responses import StreamingResponse
 
-    from cli_agent_orchestrator.services import session_service
     from cli_agent_orchestrator.services.agui.lifecycle_tracker import ToolCallLifecycleTracker
     from cli_agent_orchestrator.services.agui_stream import (
         state_delta_frame,
@@ -2666,25 +2761,12 @@ async def agui_stream(
     )
     from cli_agent_orchestrator.services.event_log_service import get_event_log
     from cli_agent_orchestrator.services.sse_bus import get_bus
-    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
 
     def _fleet_snapshot() -> Dict:
-        """Build the current DashboardSnapshot from live session/terminal state.
-
-        Failure-isolated: any backend hiccup yields an empty snapshot rather
-        than tearing down the stream. ``list_sessions`` already returns ``[]``
-        on error, so an unavailable tmux/herdr backend degrades gracefully.
-        """
-        sessions = session_service.list_sessions()
-        terminals: List[Dict] = []
-        for sess in sessions:
-            try:
-                terminals.extend(
-                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
-                )
-            except Exception:
-                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
-        return build_dashboard_snapshot(sessions, terminals, list(scopes))
+        # The deprecated legacy wire keeps its schema but its terminal rows gain
+        # ``runner_id`` and carry a live (non-null) ``status``; it never gains the catalog
+        # or the host entry.
+        return _agui_fleet_snapshot(list(scopes), profiles=framing != AGUI_FRAMING_LEGACY)
 
     if framing != AGUI_FRAMING_LEGACY:
         import uuid
@@ -2981,22 +3063,10 @@ async def agui_stream_post(
             detail="forwardedProps.cao.maxSeconds must be an integer from 1 to 3600",
         )
 
-    from cli_agent_orchestrator.services import session_service
-    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
-
     scopes = list(_scopes)
 
     def _fleet_snapshot() -> Dict:
-        sessions = session_service.list_sessions()
-        terminals: List[Dict] = []
-        for sess in sessions:
-            try:
-                terminals.extend(
-                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
-                )
-            except Exception:
-                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
-        return build_dashboard_snapshot(sessions, terminals, scopes)
+        return _agui_fleet_snapshot(scopes)
 
     return _agui_ambient_response(
         thread_id=run_input.thread_id,
@@ -3324,19 +3394,7 @@ async def agui_run(
 
     # Build the snapshot function
     def _fleet_snapshot() -> Dict:
-        from cli_agent_orchestrator.services import session_service
-        from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
-
-        sessions = session_service.list_sessions()
-        terminals: List[Dict] = []
-        for sess in sessions:
-            try:
-                terminals.extend(
-                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
-                )
-            except Exception:
-                pass
-        return build_dashboard_snapshot(sessions, terminals, list(_scopes))
+        return _agui_fleet_snapshot(list(_scopes), profiles=False)
 
     from fastapi.responses import StreamingResponse
 
@@ -5310,8 +5368,11 @@ async def list_terminals_in_session(
         from cli_agent_orchestrator.services.session_service import (
             list_current_session_terminals,
         )
+        from cli_agent_orchestrator.services.terminal_service import with_live_status
 
-        return list_current_session_terminals(session_name)
+        # Each row also carries the live ``status`` (an in-memory read), as the single
+        # terminal route does, so a client need not fetch every terminal to show it.
+        return with_live_status(list_current_session_terminals(session_name))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

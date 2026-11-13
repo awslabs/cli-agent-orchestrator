@@ -77,10 +77,16 @@ git diff | cao agent send-message --message-file - --to "$SUPERVISOR_TERMINAL_ID
 other surface here addresses the `cao-server` beside it; these two address a
 cluster, where each agent has a `cao-server` of its own inside its own pod.
 
-The distinction is worth keeping straight because two commands are one word
+One distinction is worth keeping straight because two commands are one word
 apart and neither can do the other's job. `cao shutdown` removes sessions on
 this machine. `cao fleet shutdown` releases workers in a cluster, and the
 sessions inside them go with the workers.
+
+In CAO docs, "fleet" names three different things: the machines coordinated by
+`examples/fleet` (`fleet.json`, `cao-ops-mcp`), the Kubernetes worker cluster that
+`cao fleet` manages through a worker broker, and the sessions and terminals one
+`cao-server` can see (the AG-UI "fleet snapshot"). Only the second is meant in
+this section.
 
 Two variables are the whole configuration:
 

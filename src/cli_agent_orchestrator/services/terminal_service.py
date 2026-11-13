@@ -533,9 +533,24 @@ def _mark_initial_delivery_pending(terminal_id: str) -> None:
 
 
 def _clear_initial_delivery_pending(terminal_id: str) -> None:
-    """Release the pending mark. Idempotent — every exit path may call it."""
+    """Release the pending mark. Idempotent — every exit path may call it.
+
+    Releasing it lifts the ``reported_status`` mask, so the status a client reads changes
+    (``unknown`` becomes the real idle/completed) without the monitor's status changing, and
+    so without a ``terminal.<id>.status`` event. The release is therefore announced on the
+    in-process bus (``terminal.<id>.delivery``, once, metadata only) so a live view can
+    refresh. Best effort: a bus that cannot publish never affects the release.
+    """
     with _pending_initial_delivery_lock:
+        was_pending = terminal_id in _pending_initial_delivery
         _pending_initial_delivery.discard(terminal_id)
+    if was_pending:
+        try:
+            from cli_agent_orchestrator.services.event_bus import bus
+
+            bus.publish(f"terminal.{terminal_id}.delivery", {"pending": False})
+        except Exception:  # noqa: BLE001
+            logger.debug("initial-delivery release of %s not announced", terminal_id)
 
 
 def initial_delivery_pending(terminal_id: str) -> bool:
@@ -5783,6 +5798,50 @@ def callback_terminal_id_for_session(session_name: Optional[str]) -> Optional[st
     except Exception as exc:  # noqa: BLE001 — a missing creator must not break reads
         logger.warning(f"Failed to read callback terminal id for session {session_name}: {exc}")
         return None
+
+
+def live_status_of_row(row: Dict[str, Any]) -> Optional[str]:
+    """The last applied status of a listing row, read from memory only.
+
+    This is **not** a copy of what ``get_terminal`` reports; it is the cheap reading a
+    snapshot rebuilt on every event can afford: no re-detection, no pane capture, no file
+    or database read. It follows ``get_terminal`` where it can from memory:
+
+    - a durable deferred-init failure marker on the row is ``error`` (the marker is
+      authoritative, whatever the monitor last saw);
+    - otherwise the monitor's last applied status (``StatusMonitor.cached_status``), masked
+      by ``reported_status`` while the initial message is still undispatched;
+    - an external-owner ``error`` with no marker yet is published as ``unknown``, the
+      non-final verdict ``get_terminal`` gives in that window.
+
+    It differs from ``get_terminal`` in these ways:
+
+    - ``get_status`` flips a cached IDLE/COMPLETED to PROCESSING while a native swarm is
+      pending, and re-detects a cached PROCESSING/WAITING from the buffer (with the #558
+      ``capture-pane`` recovery). This does neither, so a stuck PROCESSING keeps its last
+      reading until something calls ``get_status``.
+    - A terminal never observed is ``None`` (a null in the snapshot) where ``get_terminal``
+      says ``unknown``. The dashboard shows both as unknown.
+    - It does not read the fallback failure sidecar (a file) or the retention override that
+      needs the row again, so those two edge cases read ``unknown`` here where
+      ``get_terminal`` may not.
+    """
+    terminal_id = row.get("id")
+    if not isinstance(terminal_id, str) or not terminal_id:
+        return None
+    if isinstance(row.get("deferred_init_failure"), dict):
+        return TerminalStatus.ERROR.value
+    observed = status_monitor.cached_status(terminal_id)
+    if observed is None:
+        return None
+    if observed == TerminalStatus.ERROR and row.get("deferred_init_external_owner"):
+        return TerminalStatus.UNKNOWN.value
+    return reported_status(terminal_id, observed).value
+
+
+def with_live_status(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Copies of ``rows`` with ``status`` set from :func:`live_status_of_row` (O(rows))."""
+    return [{**row, "status": live_status_of_row(row)} for row in rows]
 
 
 def get_terminal(terminal_id: str) -> Dict:

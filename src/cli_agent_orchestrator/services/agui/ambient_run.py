@@ -35,6 +35,7 @@ import json
 import logging
 import signal
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -965,6 +966,19 @@ class AmbientRun:
 # ---------------------------------------------------------------------------
 
 
+#: The shortest gap between two snapshot refreshes caused by status changes alone. Status
+#: changes arrive in bursts (a worker starting emits several), so they are coalesced to one
+#: refresh per this many seconds per stream, and the trailing change is always delivered.
+STATUS_REFRESH_MIN_SECONDS = 2.0
+
+#: The in-process topics that mean "a terminal's reported status may have changed": the
+#: status monitor publishes ``status`` only when a terminal's applied status CHANGES, and
+#: ``delivery`` is published when a terminal's first-message mask lifts (which changes the
+#: status a client reads without changing the applied one). Metadata only: the stream reads
+#: the fact of an event, never its payload.
+_STATUS_TOPICS = ("terminal.*.status", "terminal.*.delivery")
+
+
 async def ambient_stream(
     *,
     run: AmbientRun,
@@ -986,8 +1000,21 @@ async def ambient_stream(
     cancelled outcome; a bus overflow closes it with ``RUN_ERROR``.
     """
 
+    # When anything was last written to the client (a frame or a keep-alive), so a wake that
+    # produces nothing cannot starve the keep-alive.
+    last_write = time.monotonic()
+
     def emit(items: List[Item]) -> List[str]:
+        nonlocal last_write
+        if items:
+            last_write = time.monotonic()
         return [encode(sid, ev) for sid, ev in items]
+
+    status_queues: List[Tuple[str, "asyncio.Queue[Any]"]] = []
+    status_bus: Any = None
+    status_waits: Dict[Any, "asyncio.Future[Any]"] = {}
+    status_dirty = False
+    last_refresh = 0.0
 
     waiter = _register_stop_waiter()
     _, stop_event = waiter
@@ -997,6 +1024,19 @@ async def ambient_stream(
     pending: Optional["asyncio.Future[Any]"] = None
     stop_wait: Optional["asyncio.Future[Any]"] = None
     try:
+        # Subscribed inside the try that owns the finally, so nothing can leak the queue.
+        # Failure-isolated: without the status topic the stream still refreshes on records.
+        try:
+            from cli_agent_orchestrator.services import event_bus
+
+            status_bus = event_bus.bus
+            for topic in _STATUS_TOPICS:
+                status_queues.append((topic, status_bus.subscribe(topic)))
+        except Exception:
+            logger.warning(
+                "ambient_run: status topics unavailable; refreshing on records only",
+                exc_info=True,
+            )
         for frame in emit(run.start()):
             yield frame
         replayed_ids: Set[str] = set()
@@ -1016,6 +1056,30 @@ async def ambient_stream(
         if prev is not None:
             for frame in emit(run.snapshot(prev)):
                 yield frame
+        last_refresh = loop.time()
+
+        # shortcut: each open stream rebuilds the snapshot itself (coalesced per stream, not
+        # per server), so the cost grows with the number of open streams. A shared snapshot
+        # would need event-based invalidation and a key for the scope set; see docs/agui.md.
+        def refresh() -> List[str]:
+            """Recompute the fleet snapshot and encode the delta (or the first snapshot)."""
+            nonlocal prev, status_dirty, last_refresh
+            status_dirty = False
+            last_refresh = loop.time()
+            out: List[str] = []
+            try:
+                curr = fleet_snapshot()
+                if prev is None:
+                    prev = curr
+                    out.extend(emit(run.snapshot(curr)))
+                else:
+                    ops = diff(prev, curr)
+                    if ops:
+                        out.extend(emit(run.delta(ops)))
+                    prev = curr
+            except Exception:
+                logger.warning("ambient_run: STATE_DELTA computation failed", exc_info=True)
+            return out
 
         reason: Optional[str] = None
         overflow = False
@@ -1025,6 +1089,12 @@ async def ambient_stream(
             if deadline is not None and loop.time() >= deadline:
                 reason = "max_seconds"
                 break
+            # Wakes that send nothing (a status event whose refresh has no delta) must not
+            # starve the keep-alive: if the client has heard nothing for a whole interval,
+            # say so now, whatever woke us.
+            if is_sse and time.monotonic() - last_write >= keepalive_seconds:
+                last_write = time.monotonic()
+                yield ":keep-alive\n\n"
             if pending is None:
                 pending = asyncio.ensure_future(drain.__anext__())
             if stop_wait is None:
@@ -1032,12 +1102,34 @@ async def ambient_stream(
             timeout = keepalive_seconds
             if deadline is not None:
                 timeout = max(0.0, min(timeout, deadline - loop.time()))
+            waiting = {pending, stop_wait}
+            for _topic, queue in status_queues:
+                if queue not in status_waits:
+                    status_waits[queue] = asyncio.ensure_future(queue.get())
+                waiting.add(status_waits[queue])
+            if status_dirty:
+                # A change is waiting out the coalescing gap: wake exactly when it ends.
+                gap = STATUS_REFRESH_MIN_SECONDS - (loop.time() - last_refresh)
+                timeout = max(0.0, min(timeout, gap))
             done, _ = await asyncio.wait(
-                {pending, stop_wait}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
             )
             if stop_wait in done:
                 reason = "server_stop"
                 break
+            for _topic, queue in status_queues:
+                if status_waits.get(queue) in done:
+                    del status_waits[queue]  # one wake per drained batch; re-armed above
+                    while not queue.empty():
+                        queue.get_nowait()
+                    status_dirty = True
+            if status_dirty and loop.time() - last_refresh >= STATUS_REFRESH_MIN_SECONDS:
+                for frame in refresh():
+                    yield frame
+                if pending not in done:
+                    continue
+            elif status_dirty and pending not in done:
+                continue  # still inside the coalescing gap: wake again when it ends
             if pending in done:
                 fut, pending = pending, None
                 try:
@@ -1053,25 +1145,14 @@ async def ambient_stream(
                     continue
                 for frame in emit(run.feed(record)):
                     yield frame
-                try:
-                    curr = fleet_snapshot()
-                    if prev is None:
-                        prev = curr
-                        for frame in emit(run.snapshot(curr)):
-                            yield frame
-                        continue
-                    ops = diff(prev, curr)
-                    if ops:
-                        for frame in emit(run.delta(ops)):
-                            yield frame
-                    prev = curr
-                except Exception:
-                    logger.warning("ambient_run: STATE_DELTA computation failed", exc_info=True)
+                for frame in refresh():
+                    yield frame
                 continue
             if deadline is not None and loop.time() >= deadline:
                 reason = "max_seconds"
                 break
             if is_sse:
+                last_write = time.monotonic()
                 yield ":keep-alive\n\n"
 
         if overflow:
@@ -1090,7 +1171,12 @@ async def ambient_stream(
             for frame in emit(run.close_error(RUN_ERROR_INTERNAL, "ambient stream failed")):
                 yield frame
     finally:
-        for fut in (pending, stop_wait):
+        for fut in (pending, stop_wait, *status_waits.values()):
             if fut is not None and not fut.done():
                 fut.cancel()
+        for topic, queue in status_queues:
+            try:
+                status_bus.unsubscribe(topic, queue)
+            except Exception:
+                logger.debug("ambient_run: status unsubscribe failed", exc_info=True)
         _unregister_stop_waiter(waiter)
