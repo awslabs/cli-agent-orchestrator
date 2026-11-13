@@ -1,0 +1,34 @@
+#!/bin/sh
+# Stub aws for the EKS deploy.sh test: stack outputs, the endpoint check, an
+# image that exists once pushed, a registry password. Only the exact calls
+# deploy.sh makes are answered; anything else fails. Nothing reaches AWS.
+printf '%s\n' "$*" >> "$STATE/aws.argv"
+query="contains(cluster.resourcesVpcConfig.publicAccessCidrs, '0.0.0.0/0')"
+outputs() { echo "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue"; }
+case "$*" in
+  "cloudformation describe-stacks --stack-name cao-test --query $(outputs ClusterName) --output text")
+    echo cao-test ;;
+  "cloudformation describe-stacks --stack-name cao-test --query $(outputs ServerRepositoryUri) --output text")
+    echo 111122223333.dkr.ecr.ap-southeast-2.amazonaws.com/cao-test/cao-server ;;
+  "cloudformation describe-stacks --stack-name cao-test --query $(outputs WorkspaceVolumeHandle) --output text")
+    echo fs-0123::fsap-0456 ;;
+  "cloudformation describe-stacks --stack-name cao-test --query $(outputs ClusterDnsIp) --output text")
+    echo 10.100.0.10 ;;
+  "eks describe-cluster --name cao-test --query $query --output text")
+    if [ -n "${STUB_DESCRIBE_CLUSTER_FAILS:-}" ]; then
+      echo "An error occurred (AccessDeniedException) when calling the DescribeCluster operation" >&2
+      exit 254
+    fi
+    if [ -n "${STUB_OPEN_ENDPOINT:-}" ]; then echo True; else echo False; fi ;;
+  "eks update-kubeconfig --name cao-test --kubeconfig "*) : ;;
+  "ecr describe-images --repository-name cao-test/cao-server --image-ids imageTag="*)
+    if [ -n "${STUB_ECR_FAILS:-}" ]; then
+      echo "An error occurred (AccessDeniedException) when calling the DescribeImages operation" >&2
+      exit 254
+    fi
+    [ "$(cat "$STATE/image" 2>/dev/null)" = "${6#imageTag=}" ] && exit 0
+    echo "An error occurred (ImageNotFoundException) when calling the DescribeImages operation" >&2
+    exit 254 ;;
+  "ecr get-login-password") echo registry-password ;;
+  *) echo "stub aws: unexpected call: $*" >&2; exit 99 ;;
+esac

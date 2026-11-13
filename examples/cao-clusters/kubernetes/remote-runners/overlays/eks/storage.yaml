@@ -1,0 +1,34 @@
+# Server state: a gp3 volume from Auto Mode's built-in EBS driver. RWO is all
+# the one cao-server needs (its SQLite state, locks and FIFOs).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cao-gp3
+provisioner: ebs.csi.eks.amazonaws.com
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+  encrypted: "true"
+---
+# The shared workspace: the EFS file system and access point the stack created
+# (deploy.sh renders the handle). Static, so the claim always binds to this
+# file system and never to a new one.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: cao-remote-workspace
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: ["ReadWriteMany"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  # Reserved for the workspace claim; no other claim can bind it.
+  claimRef:
+    namespace: cao-remote
+    name: cao-remote-workspace
+  csi:
+    driver: efs.csi.aws.com
+    volumeHandle: <workspace-volume-handle>

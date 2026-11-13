@@ -1,0 +1,111 @@
+# EKS Auto Mode overlay (iac/cfn-auto-mode.yaml creates the AWS side; deploy.sh
+# renders the placeholders and applies this). Over the cluster-neutral base it
+# adds:
+# - the image from the stack's ECR repository;
+# - server state on gp3 (Auto Mode's EBS driver), the workspace on EFS;
+# - wss:// between runners and the hub: the hub serves TLS itself with a
+#   certificate deploy.sh issues; the runners get only the CA certificate, and
+#   the CA key is discarded once the certificate is signed;
+# - Bedrock for the runners through EKS Pod Identity (no keys in the cluster);
+# - NetworkPolicy changes for Auto Mode: DNS runs on each node, not in pods,
+#   and the Pod Identity agent answers on a link-local address.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: cao-remote
+resources:
+  - ../../base
+  - serviceaccount.yaml
+  - storage.yaml
+images:
+  - name: cao-server
+    newName: <server-repository-uri>
+    newTag: <image-tag>
+patches:
+  - target: {kind: PersistentVolumeClaim, name: cao-remote-workspace}
+    patch: |-
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: cao-remote-workspace}
+      spec:
+        storageClassName: ""
+        volumeName: cao-remote-workspace
+  - target: {kind: StatefulSet, name: cao-server}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata: {name: cao-server}
+      spec:
+        template:
+          metadata:
+            annotations:
+              # deploy.sh renders a hash of the hub's certificate and CA: new
+              # material rolls the server.
+              cao.awslabs.com/hub-tls: <hub-tls-hash>
+          spec:
+            # The image is built for amd64.
+            nodeSelector: {kubernetes.io/arch: amd64}
+            containers:
+              - name: cao-server
+                env:
+                  - {name: CAO_RUNNER_TLS_CERT, value: /var/run/cao-hub-tls/tls.crt}
+                  - {name: CAO_RUNNER_TLS_KEY, value: /var/run/cao-hub-tls/tls.key}
+                volumeMounts:
+                  - {name: hub-tls, mountPath: /var/run/cao-hub-tls, readOnly: true}
+            volumes:
+              - name: hub-tls
+                secret: {secretName: cao-hub-tls, defaultMode: 0440}
+        volumeClaimTemplates:
+          - metadata: {name: state}
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              storageClassName: cao-gp3
+              resources: {requests: {storage: 1Gi}}
+  - target: {kind: Deployment, name: cao-runner}
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: cao-runner}
+      spec:
+        template:
+          metadata:
+            annotations:
+              # deploy.sh renders hashes of cao-provider-env and of the hub's
+              # certificate and CA: a change to either rolls the runners.
+              cao.awslabs.com/provider-env: <provider-env-hash>
+              cao.awslabs.com/hub-tls: <hub-tls-hash>
+          spec:
+            serviceAccountName: cao-runner
+            nodeSelector: {kubernetes.io/arch: amd64}
+            containers:
+              - name: runner
+                env:
+                  - {name: CAO_RUNNER_SERVER_URL, value: "wss://cao-server.cao-remote.svc:9891"}
+                  - {name: CAO_RUNNER_CA_FILE, value: /var/run/cao-hub-ca/ca.crt}
+                volumeMounts:
+                  - {name: hub-ca, mountPath: /var/run/cao-hub-ca, readOnly: true}
+            volumes:
+              - name: hub-ca
+                configMap: {name: cao-hub-ca}
+  # Auto Mode runs cluster DNS on every node at the .10 address of the service
+  # range, so the base rule (CoreDNS pods in kube-system) matches nothing there.
+  - target: {kind: NetworkPolicy, name: allow-dns}
+    patch: |-
+      - op: add
+        path: /spec/egress/-
+        value:
+          to:
+            - ipBlock: {cidr: <cluster-dns-ip>/32}
+          ports:
+            - {port: 53, protocol: UDP}
+            - {port: 53, protocol: TCP}
+  # The EKS Pod Identity agent on each node; the base keeps link-local out of
+  # reach, so the runners' credential lookup needs this one address and port.
+  - target: {kind: NetworkPolicy, name: runner-egress}
+    patch: |-
+      - op: add
+        path: /spec/egress/-
+        value:
+          to:
+            - ipBlock: {cidr: 169.254.170.23/32}
+          ports:
+            - {port: 80, protocol: TCP}
