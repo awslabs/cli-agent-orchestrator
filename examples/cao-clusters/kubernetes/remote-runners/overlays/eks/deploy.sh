@@ -15,9 +15,10 @@
 #   CAO_IMAGE_TAG      tag to push (default: the checkout's short commit id and
 #                      a digest of the files the image is built from)
 #   CAO_IMAGE_REBUILD  1 to build and push a new image even if the content has
-#                      not changed, so it takes the OS package fixes published
-#                      since the last build (the default tag names only this
-#                      checkout's files, so a re-run reuses the pushed image)
+#                      not changed, with no cached layers, so it takes the OS
+#                      package fixes published since the last build (the
+#                      default tag names only this checkout's files, so a
+#                      re-run reuses the pushed image)
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
@@ -105,8 +106,12 @@ elif ! grep -q ImageNotFoundException <<<"${lookup}"; then
   echo "could not look up image ${REPO_URI}:${TAG}: ${lookup}" >&2
   exit 1
 else
-  docker build -q --platform linux/amd64 -f "${REPO}/examples/cao-clusters/kubernetes/eks/Dockerfile" \
-    -t "${REPO_URI}:${TAG}" "${REPO}"
+  # A rebuild must not reuse cached layers, or the apk upgrade layer, and with
+  # it the old packages, would be kept.
+  fresh=()
+  if [ "${CAO_IMAGE_REBUILD:-}" = 1 ]; then fresh=(--pull --no-cache); fi
+  docker build -q --platform linux/amd64 ${fresh[@]+"${fresh[@]}"} \
+    -f "${REPO}/examples/cao-clusters/kubernetes/eks/Dockerfile" -t "${REPO_URI}:${TAG}" "${REPO}"
   mkdir "${CTX}/docker"
   aws ecr get-login-password \
     | DOCKER_CONFIG="${CTX}/docker" docker login --username AWS --password-stdin "${REGISTRY}" >/dev/null

@@ -777,6 +777,7 @@ def test_material_issued_by_a_run_that_failed_still_rolls_the_workloads(deploy):
 def test_the_default_tag_names_the_build_content_and_is_stable(deploy):
     done = deploy(CAO_IMAGE_TAG="")
     assert done.returncode == 0, done.stderr
+    assert "--no-cache" not in _argv(deploy.state, "docker")
     commit = subprocess.run(
         ["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
         capture_output=True,
@@ -799,7 +800,8 @@ def test_a_rebuild_pushes_a_new_image_for_the_same_content(deploy):
     assert done.returncode == 0, done.stderr
     tag = (deploy.state / "image").read_text()
     assert re.fullmatch(rf"{re.escape(content_tag)}-r[0-9]{{14}}", tag), tag
-    assert "build " in _argv(deploy.state, "docker")
+    (build,) = [ln for ln in _argv(deploy.state, "docker").splitlines() if ln.startswith("build")]
+    assert "--pull" in build.split() and "--no-cache" in build.split()
     assert f"cao-server:{tag}" in (deploy.state / "applied.yaml").read_text()
 
 
