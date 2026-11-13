@@ -5,6 +5,10 @@
 #
 #   CAO_URL        default http://127.0.0.1:9889
 #   BOX_ENV_FILE   default /etc/cao-box/box.env
+#
+# Run it as BOX_USER: herdr keeps its state per user, so as another user (the
+# admin shell) the herdr check looks at that user's herdr, not the box's.
+#   sudo -u <you> -i /usr/local/lib/cao-box/box-resume.sh
 set -uo pipefail
 
 cao_url="${CAO_URL:-http://127.0.0.1:9889}"
@@ -21,6 +25,20 @@ check() {
   fi
 }
 
+# herdr_running SESSION: the session's server says "status: running". A bare
+# `herdr status` exits 0 even when nothing runs, so the exit code alone
+# proves nothing.
+herdr_running() {
+  local out
+  [ -n "$1" ] || return 1
+  out="$(herdr --session "$1" status 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | awk '
+    /^server:/ { in_server = 1; next }
+    /^[^ ]/    { in_server = 0 }
+    in_server && $1 == "status:" { found = ($2 == "running"); exit }
+    END { exit !found }'
+}
+
 session="$(sed -n 's/^CAO_BOX_SESSION=//p' "$box_env" 2>/dev/null | head -n 1)"
 printf 'session: %s\n' "${session:-<unknown: no $box_env>}"
 
@@ -28,7 +46,7 @@ check "herdr-cao.service is active" systemctl is-active --quiet herdr-cao.servic
 check "cao-server.service is active" systemctl is-active --quiet cao-server.service
 check "cao-backup.timer is active" systemctl is-active --quiet cao-backup.timer
 check "cao-server /health answers" curl -fsS --max-time 5 "${cao_url}/health"
-check "herdr status answers" herdr status
+check "herdr session ${session:-<unknown>} is running" herdr_running "$session"
 
 if [ "$failures" -gt 0 ]; then
   echo
@@ -39,7 +57,8 @@ cat <<'TXT'
 
 All up. herdr started with an empty layout (the old one is in
 ~/.config/herdr/sessions/<session>/restore-archive/). Next, by hand:
-  - look in the cao-server log for the startup "ghost terminal" cleanup line;
+  - CAO may keep terminal records of sessions from before the reboot (status
+    "unknown"): remove each old session with `cao shutdown --session <name>`;
   - relaunch your agents with `cao launch ...` (add --resume-session-id to
     continue a Claude conversation), and wait until each is idle before typing.
 TXT

@@ -49,12 +49,35 @@ def test_probe_unknown_without_meminfo(sandbox) -> None:
     assert result.stdout.startswith("unknown")
 
 
-def resume_stubs(sandbox, systemctl_code: int) -> dict[str, str]:
+SESSION = f"cao-{FAKE_INSTANCE_ID}"
+
+
+def herdr_status_stub(sandbox, server_status: str) -> Path:
+    """A herdr stub shaped like herdr 0.9.3: `--session S status` prints a
+    client and a server section and exits 0 whatever the server's state.
+    The server is only "running" for the box's own session."""
+    log = sandbox.root / "herdr.log"
+    body = (
+        f'echo "herdr $*" >> "{log}"\n'
+        'state="not running"\n'
+        f'if [ "$1" = "--session" ] && [ "$2" = "{SESSION}" ] && [ "$3" = "status" ]; then\n'
+        f'  state="{server_status}"\n'
+        "fi\n"
+        "printf 'client:\\n  version: 0.9.3\\n  protocol: 22\\n'\n"
+        "printf 'server:\\n  status: %s\\n  socket: /tmp/herdr.sock\\n' \"$state\"\n"
+        "printf 'update:\\n  restart_needed: no\\n'\n"
+        "exit 0\n"
+    )
+    write_stub(sandbox.stubs, "herdr", body)
+    return log
+
+
+def resume_stubs(sandbox, systemctl_code: int, server_status: str = "running") -> dict[str, str]:
     write_stub(sandbox.stubs, "systemctl", f"exit {systemctl_code}\n")
     write_stub(sandbox.stubs, "curl", "exit 0\n")
-    write_stub(sandbox.stubs, "herdr", "exit 0\n")
+    herdr_status_stub(sandbox, server_status)
     box_env = sandbox.root / "box.env"
-    box_env.write_text(f"CAO_BOX_SESSION=cao-{FAKE_INSTANCE_ID}\n", encoding="utf-8")
+    box_env.write_text(f"CAO_BOX_SESSION={SESSION}\n", encoding="utf-8")
     return {"BOX_ENV_FILE": str(box_env)}
 
 
@@ -71,3 +94,34 @@ def test_resume_reports_a_down_unit(sandbox) -> None:
     assert result.returncode == 1
     assert "FAIL  herdr-cao.service is active" in result.stdout
     assert "ok    cao-server /health answers" in result.stdout
+
+
+def test_resume_checks_the_box_session(sandbox) -> None:
+    result = sandbox.run("bin/box-resume.sh", **resume_stubs(sandbox, 0))
+    assert result.returncode == 0, result.stdout
+    assert f"ok    herdr session {SESSION} is running" in result.stdout
+    calls = (sandbox.root / "herdr.log").read_text(encoding="utf-8").splitlines()
+    assert calls == [f"herdr --session {SESSION} status"]
+
+
+def test_resume_fails_when_the_herdr_server_is_not_running(sandbox) -> None:
+    # herdr exits 0 here, as the real one does: only the text says it's down.
+    result = sandbox.run("bin/box-resume.sh", **resume_stubs(sandbox, 0, "not running"))
+    assert result.returncode == 1, result.stdout
+    assert f"FAIL  herdr session {SESSION} is running" in result.stdout
+    assert "All up" not in result.stdout
+
+
+def test_resume_fails_herdr_check_without_a_session(sandbox) -> None:
+    env = resume_stubs(sandbox, 0)
+    Path(env["BOX_ENV_FILE"]).unlink()
+    result = sandbox.run("bin/box-resume.sh", **env)
+    assert result.returncode == 1, result.stdout
+    assert "FAIL  herdr session <unknown> is running" in result.stdout
+    assert not (sandbox.root / "herdr.log").exists()
+
+
+def test_resume_hint_is_cao_shutdown_not_ghost_line(sandbox) -> None:
+    result = sandbox.run("bin/box-resume.sh", **resume_stubs(sandbox, 0))
+    assert "cao shutdown --session <name>" in result.stdout
+    assert "ghost" not in result.stdout

@@ -237,7 +237,10 @@ shouldn't):
 ```bash
 sudo systemctl start herdr-cao.service
 sudo systemctl start cao-server.service     # waits for herdr's socket; fails if it never appears
-curl -fsS http://127.0.0.1:9889/health
+sudo systemctl start cao-backup.timer       # bootstrap only enables it; a reboot would start it too
+# cao-server takes a few seconds to listen after systemd says it started:
+for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9889/health && break; sleep 1; done
+sudo -u <you> -i /usr/local/lib/cao-box/box-resume.sh   # as <you>: herdr state is per user
 ```
 
 Then as `<you>` (over SSH, or in a herdr pane):
@@ -247,6 +250,23 @@ claude          # Bedrock through the instance role, see config/claude-settings.
 codex login --device-auth
 gh auth login
 ```
+
+Claude Code asks "do you trust this folder?" the first time it opens a
+folder, and an agent that CAO launches waits on that question until the
+launch times out. On your laptop your folders are already trusted; on a fresh
+box they aren't. So trust each folder you'll launch agents in, once, as
+`<you>`: either open `claude` there and answer yes, or record it directly
+(replace the paths with your own):
+
+```bash
+for dir in "$HOME" "$HOME/work/my-repo"; do
+  jq --arg d "$dir" '.projects[$d].hasTrustDialogAccepted = true' ~/.claude.json > ~/.claude.json.tmp \
+    && chmod 600 ~/.claude.json.tmp && mv ~/.claude.json.tmp ~/.claude.json
+done
+```
+
+`~/.claude.json` exists once `claude` has run once. Only trust folders whose
+contents you'd run yourself.
 
 ## The phases
 
@@ -271,8 +291,11 @@ Start `cao-server.service` (installed from the pinned `CAO_REF`). Log in to
 Claude Code and launch one agent with `cao launch`.
 - Reboot the box. Both units come back, `cao-<instance-id>` is listed, no old
   pane text is replayed, and a fresh launch works.
-- In the cao-server log, look for the startup cleanup of old terminal rows.
-- Run [`bin/box-resume.sh`](bin/box-resume.sh) for the read-only checks.
+- CAO can keep the terminal records of sessions from before the reboot (their
+  status reads `unknown`). Remove each old session with
+  `cao shutdown --session <name>` before you relaunch.
+- Run [`bin/box-resume.sh`](bin/box-resume.sh) as `<you>` for the read-only
+  checks: `sudo -u <you> -i /usr/local/lib/cao-box/box-resume.sh`.
 
 **Phase 2 (optional): move your kit and Telegram.**
 Copy your conductor-style kit, prompts and memory to the same paths on the
@@ -340,7 +363,9 @@ There are no in-Region model ids in `ap-southeast-2`. Use the Australia
 profiles, `au.anthropic.claude-<model>-5-5`, which route to Sydney and
 Melbourne, or the global ones, `global.anthropic.claude-<model>-5-5`, which
 cost about 10% less but may run anywhere. `us.` profiles aren't offered in
-`ap-southeast-2`. Check which profiles you can use:
+`ap-southeast-2`. Check which profiles you can use **from your laptop**, with
+your own admin credentials. The box's instance role can only invoke models;
+it's denied `bedrock:ListInferenceProfiles` on purpose:
 
 ```bash
 aws bedrock list-inference-profiles --region ap-southeast-2 \
