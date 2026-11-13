@@ -1,0 +1,293 @@
+/* A minimal stylesheet for the operator dashboard. It styles the elements the page already
+   renders and nothing else: no class names, no markup changes, no fonts or URLs, so it works
+   offline. Light by default; a dark variant follows prefers-color-scheme. */
+:root {
+  color-scheme: light dark;
+  --ink: #1a2230;
+  --mut: #566175;
+  --line: #d7dde8;
+  --card: #ffffff;
+  --bg: #f3f5f9;
+  --soft: #fafbfd;
+  --code: #eef1f7;
+  --accent: #1b62d6;
+  --btn-bg: #1b62d6;
+  --btn-fg: #ffffff;
+  --ok-bg: #11785a;
+  --deny-fg: #c62833;
+  --warn: #8f5e00;
+  --warn-bg: #fffaf0;
+  --off-bg: #e3e7ee;
+  --off-fg: #5d6879;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e6ebf5;
+    --mut: #a5b0c3;
+    --line: #343d4f;
+    --card: #171d29;
+    --bg: #0f141d;
+    --soft: #1c2331;
+    --code: #263044;
+    --accent: #6ea8ff;
+    --btn-bg: #6ea8ff;
+    --btn-fg: #0b1220;
+    --ok-bg: #4cc29a;
+    --deny-fg: #ff9aa2;
+    --warn: #e0a63a;
+    --warn-bg: #2a2416;
+    --off-bg: #263044;
+    --off-fg: #9aa6ba;
+  }
+}
+html,
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 18px 22px 28px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px 20px;
+  align-items: start;
+}
+main > header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 18px;
+}
+main > header h1 {
+  margin: 0;
+  font-size: 18px;
+}
+main > header p {
+  margin: 0;
+  color: var(--mut);
+}
+main > header button {
+  margin-left: auto;
+}
+main > section {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 18px;
+  min-width: 0;
+}
+/* DOM order is Approvals, Generative UI, Session timeline; place them explicitly. */
+section[aria-label="Approvals"] {
+  grid-column: 1;
+  grid-row: 2;
+}
+section[aria-label="Session timeline"] {
+  grid-column: 2;
+  grid-row: 2;
+}
+section[aria-label="Generative UI"] {
+  grid-column: 1 / -1;
+  grid-row: 3;
+}
+/* The fleet view (with its host strip) sits below the three original panels. */
+section[aria-label="Fleet"] {
+  grid-column: 1 / -1;
+  grid-row: 4;
+}
+/* Only the Fleet panel's cards use the four-pair grid. An agent-emitted `agent_card` in the
+   narrow Generative UI column keeps the generic stacked label/value layout above (the value
+   column may shrink and long values wrap). */
+/* Terminal cards and the host strip: label/value pairs in a compact grid, four pairs to a
+   row, instead of one field per line. `minmax(0, 1fr)` and `overflow-wrap` keep a long id
+   or profile name inside its cell. */
+section[aria-label="Fleet"] article[aria-label="agent_card"] dl,
+section[aria-label="Host resources"] dl {
+  grid-template-columns: repeat(4, auto minmax(0, 1fr));
+  gap: 3px 12px;
+}
+section[aria-label="Fleet"] article[aria-label="agent_card"] h5 {
+  overflow-wrap: anywhere;
+}
+section[aria-label="Host resources"] {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 12px;
+  margin: 8px 0 4px;
+}
+section[aria-label="Host resources"] p {
+  margin: 0 0 4px;
+  color: var(--mut);
+  font-size: 12px;
+}
+section[aria-label="Host resources"] dd {
+  font-variant-numeric: tabular-nums;
+}
+section[aria-label^="Runner "] {
+  border-top: 1px solid var(--line);
+  margin-top: 10px;
+  padding-top: 8px;
+}
+section[aria-label^="Runner "] h4 {
+  margin: 8px 0 4px;
+  font-size: 12.5px;
+}
+section[aria-label="Fleet"] h5 {
+  margin: 0 0 2px;
+  font-size: 12px;
+}
+h2 {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+h3 {
+  margin: 0;
+  font-size: 13.5px;
+}
+main > section > p {
+  color: var(--mut);
+  font-size: 12px;
+  margin: 4px 0 10px;
+}
+p[role="alert"] {
+  color: var(--deny-fg);
+  font-weight: 600;
+}
+code {
+  background: var(--code);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 12px;
+}
+ul,
+ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+section[aria-label="Generative UI"] ol {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+article {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 12px;
+  background: var(--soft);
+}
+article[aria-label^="approval "] {
+  border-left: 4px solid var(--warn);
+  background: var(--warn-bg);
+}
+article[aria-label="refused component"] {
+  border-left: 4px solid var(--deny-fg);
+}
+article p {
+  margin: 2px 0 6px;
+  color: var(--mut);
+  font-size: 12px;
+}
+dl {
+  margin: 6px 0 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 14px;
+}
+article dl > div {
+  display: contents;
+}
+dt {
+  color: var(--mut);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+dd {
+  margin: 0;
+  min-width: 0;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+[data-testid="state"],
+[data-testid="call-state"] {
+  font-weight: 700;
+}
+article[aria-label^="approval "] > div {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+form {
+  margin-top: 8px;
+}
+label {
+  display: block;
+  color: var(--mut);
+  font-size: 12px;
+}
+input[type="text"] {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 4px 0 6px;
+  font: inherit;
+  color: var(--ink);
+  background: var(--card);
+  border: 1px solid var(--mut);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+button {
+  font: inherit;
+  font-weight: 600;
+  color: var(--btn-fg);
+  background: var(--btn-bg);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+button:disabled {
+  color: var(--off-fg);
+  background: var(--off-bg);
+  cursor: default;
+}
+article[aria-label^="approval "] > div > button:first-child:not(:disabled) {
+  background: var(--ok-bg);
+}
+article[aria-label^="approval "] > div > button:nth-child(2):not(:disabled) {
+  background: var(--card);
+  color: var(--deny-fg);
+  border-color: var(--deny-fg);
+}
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+@media (max-width: 900px) {
+  section[aria-label="Fleet"] article[aria-label="agent_card"] dl,
+  section[aria-label="Host resources"] dl {
+    grid-template-columns: repeat(2, auto minmax(0, 1fr));
+  }
+  main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  main > section[aria-label] {
+    grid-column: 1;
+    grid-row: auto;
+  }
+}

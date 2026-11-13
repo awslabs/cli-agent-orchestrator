@@ -185,6 +185,19 @@ def test_named_identities_get_kind_prefixed_tokens():
     )
 
 
+def test_a_runner_id_is_tokenised_and_null_stays_null():
+    """A runner id is an operator-chosen label (it can look like a host name)."""
+    raw = raw_capture()
+    rows = raw[2]["frame"]["snapshot"]["terminals"]
+    rows[0]["runner_id"] = "build-box-3.internal"
+    rows.append({**rows[0], "id": "ffffffff", "runner_id": None})
+    rows.append({**rows[0], "id": "eeeeeeee", "runner_id": "build-box-3.internal"})
+    _, records = scrub.parse(scrub.normalise(META, raw))
+    out = records[2]["frame"]["snapshot"]["terminals"]
+    assert [r["runner_id"] for r in out] == ["runner-1", None, "runner-1"]
+    assert "build-box-3" not in scrub.normalise(META, raw).decode()
+
+
 def test_ag_ui_1_0_attribution_ids_are_remapped():
     """#1232's frames carry ``eventId``, ``subagentRunId`` and ``parentSubagentRunId``.
 
@@ -207,6 +220,188 @@ def test_ag_ui_1_0_attribution_ids_are_remapped():
         assert scrub.TOKEN_RE.match(value) and value.startswith("id-"), value
     assert out_card["subagentRunId"] == out_finished["outcome"]["interrupts"][0]["subagentRunId"]
     assert out_card["subagentRunId"] != out_card["parentSubagentRunId"]
+
+
+def _stream_record(frame: Dict[str, Any]) -> Dict[str, Any]:
+    return {"capture": "approve", "plane": "stream", "dir": "out", "frame": frame}
+
+
+def test_ids_in_a_state_delta_value_are_held_to_the_snapshot_path_they_patch():
+    """A delta that replaces ``/terminals`` or ``/sessions`` carries the same identities as a
+    snapshot, so they are tokenised through the same tables (scrub gap, found by #1166)."""
+    raw = raw_capture()
+    row = dict(raw[2]["frame"]["snapshot"]["terminals"][0])
+    row.update(runner_id="build-box-3.internal", session_name="my-secret-session")
+    raw.append(
+        _stream_record(
+            {
+                "type": "STATE_DELTA",
+                "delta": [
+                    {"op": "replace", "path": "/terminals", "value": [row]},
+                    {
+                        "op": "replace",
+                        "path": "/sessions",
+                        "value": [{"id": "my-secret-session", "name": "my-secret-session"}],
+                    },
+                ],
+            }
+        )
+    )
+    data = scrub.normalise(META, raw)
+    for leaked in ("e327d8c9", "build-box-3", "my-secret-session"):
+        assert leaked not in data.decode(), leaked
+    _, records = scrub.parse(data)
+    snap_row = records[2]["frame"]["snapshot"]["terminals"][0]
+    ops = records[-1]["frame"]["delta"]
+    assert ops[0]["value"][0]["id"] == snap_row["id"]  # one raw id, one token, either frame
+    assert ops[0]["value"][0]["runner_id"] == "runner-1"
+    session = ops[1]["value"][0]
+    assert session["id"].startswith("session-") and session["id"] == session["name"]
+    assert ops[0]["value"][0]["session_name"] == session["id"]  # the same raw name, one token
+
+
+@pytest.mark.parametrize(
+    "pointer, expect",
+    [
+        ("/terminals", ("frame", "snapshot", "terminals")),
+        ("/terminals/-", ("frame", "snapshot", "terminals", 0)),  # RFC 6901 append slot
+        ("/host/-", ("frame", "snapshot", "host", 0)),
+        ("/terminals/3", ("frame", "snapshot", "terminals", 3)),
+        ("/terminals/03", ("frame", "snapshot", "terminals", 3)),  # leading zero: still an index
+        ("/terminals/0/runner_id", ("frame", "snapshot", "terminals", 0, "runner_id")),  # leaf
+        ("/a~1b/c~0d", ("frame", "snapshot", "a/b", "c~d")),  # ~1 is /, ~0 is ~
+        ("/terminals/\u0663", ("frame", "snapshot", "terminals", "\u0663")),  # Arabic-Indic digit
+        ("/terminals/\u00b2", ("frame", "snapshot", "terminals", "\u00b2")),  # superscript two
+    ],
+)
+def test_snapshot_path_reads_a_json_pointer(pointer, expect):
+    record = {"frame": {"type": "STATE_DELTA", "delta": [{"op": "add", "path": pointer}]}}
+    got = scrub.snapshot_path(record, ("frame", "delta", 0, "value"))
+    assert got == expect
+
+
+def test_a_value_appended_with_the_dash_slot_is_scrubbed_and_checked():
+    """``add /terminals/-`` and ``add /host/-`` carry one element, held to element rules."""
+    from .cao_dojo_trace_support import trace_leaks
+
+    raw = raw_capture()
+    row = dict(raw[2]["frame"]["snapshot"]["terminals"][0])
+    row.update(runner_id="build-box-3.internal", session_name="my-secret-session")
+    raw.append(
+        _stream_record(
+            {
+                "type": "STATE_DELTA",
+                "delta": [
+                    {"op": "add", "path": "/terminals/-", "value": row},
+                    {
+                        "op": "add",
+                        "path": "/host/-",
+                        "value": {
+                            "runner_id": "build-box-3.internal",
+                            "sampled_at": "2026-11-13T05:00:27+00:00",
+                        },
+                    },
+                ],
+            }
+        )
+    )
+    data = scrub.normalise(META, raw)
+    for leaked in ("e327d8c9", "build-box-3", "my-secret-session", "2026-11-13"):
+        assert leaked not in data.decode(), leaked
+    assert trace_leaks.check(data) == []
+    # Idempotent: scrubbing the scrubbed trace again changes nothing.
+    assert scrub.renormalise(data) == data
+    # The same raw trace without the dash slot is the leak the rule exists to catch.
+    leaky = scrub.dumps({"_meta": META}) + "\n"
+    meta, records = scrub.parse(data)
+    records[-1]["frame"]["delta"][0]["value"]["runner_id"] = "build-box-3.internal"
+    leaky += "\n".join(scrub.dumps(r) for r in records) + "\n"
+    assert any(f.rule_id == "L15" for f in trace_leaks.check(leaky.encode()))
+
+
+def test_a_non_ascii_digit_in_a_pointer_does_not_crash_the_scrubber():
+    raw = raw_capture()
+    raw.append(
+        _stream_record(
+            {
+                "type": "STATE_DELTA",
+                "delta": [{"op": "add", "path": "/terminals/\u0663", "value": {"id": "e327d8c9"}}],
+            }
+        )
+    )
+    scrub.normalise(META, raw)  # no ValueError
+
+
+def test_sampled_at_is_replaced_by_the_synthetic_clock():
+    raw = raw_capture()
+    raw[2]["frame"]["snapshot"]["host"] = [
+        {"runner_id": None, "sampled_at": "2026-11-13T05:00:27+00:00", "cpu_percent": 3}
+    ]
+    first = scrub.normalise(META, raw)
+    raw[2]["frame"]["snapshot"]["host"][0]["sampled_at"] = "2030-01-01T00:00:00+00:00"
+    assert scrub.normalise(META, raw) == first, "the sample time must not reach the trace"
+    assert "2026-11-13" not in first.decode() and "2030-01-01" not in first.decode()
+
+
+def test_sender_and_receiver_ids_are_tokenised_and_null_stays_null():
+    raw = raw_capture()
+    raw[0]["frame"]["metadata"] = {"cao": {"sender": "aaaa1111", "receiver": "bbbb2222"}}
+    raw.append(
+        _stream_record({"type": "CUSTOM", "name": "x", "metadata": {"cao": {"sender": None}}})
+    )
+    raw.append(
+        _stream_record(
+            {
+                "type": "CUSTOM",
+                "name": "cao.message_dispatched",
+                "value": {"sender": "aaaa1111", "receiver": "cccc3333"},
+            }
+        )
+    )
+    data = scrub.normalise(META, raw)
+    for leaked in ("aaaa1111", "bbbb2222", "cccc3333"):
+        assert leaked not in data.decode(), leaked
+    _, records = scrub.parse(data)
+    meta = records[0]["frame"]["metadata"]["cao"]
+    assert scrub.TOKEN_RE.match(meta["sender"]) and meta["sender"].startswith("terminal-")
+    assert meta["receiver"].startswith("terminal-") and meta["receiver"] != meta["sender"]
+    assert records[-2]["frame"]["metadata"]["cao"]["sender"] is None
+    assert records[-1]["frame"]["value"]["sender"] == meta["sender"]
+
+
+def test_thread_run_and_tool_call_ids_are_tokenised_but_the_pinned_ones_stay():
+    raw = raw_capture()
+    raw.append(
+        _stream_record(
+            {
+                "type": "TOOL_CALL_START",
+                "toolCallId": "call_9f8e7d6c5b4a",
+                "threadId": "thread-0123456789abcdef",
+                "runId": "run-fedcba9876543210",
+            }
+        )
+    )
+    raw.append(
+        _stream_record(
+            {
+                "type": "TOOL_CALL_END",
+                "toolCallId": "call_9f8e7d6c5b4a",
+                "threadId": scrub.THREAD_ID,
+                "runId": scrub.run_id("approve", 1),
+            }
+        )
+    )
+    raw.append(_stream_record({"type": "TOOL_CALL_END", "toolCallId": None}))
+    data = scrub.normalise(META, raw)
+    for leaked in ("call_9f8e7d6c5b4a", "0123456789abcdef", "fedcba9876543210"):
+        assert leaked not in data.decode(), leaked
+    _, records = scrub.parse(data)
+    start, end, null = (records[-3]["frame"], records[-2]["frame"], records[-1]["frame"])
+    for key in ("toolCallId", "threadId", "runId"):
+        assert scrub.TOKEN_RE.match(start[key]) and start[key].startswith("id-"), key
+    assert start["toolCallId"] == end["toolCallId"]  # one raw id, one token
+    assert (end["threadId"], end["runId"]) == (scrub.THREAD_ID, scrub.run_id("approve", 1))
+    assert null["toolCallId"] is None
 
 
 def test_raw_and_rewrapped_customs_are_dropped():

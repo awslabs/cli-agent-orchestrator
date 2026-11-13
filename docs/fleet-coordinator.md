@@ -14,8 +14,9 @@ the "why and how." It is the reference for issue
 
 > **"Fleet" here means multiple _CAO nodes_ (machines).** CAO's
 > [MCP Apps](mcp-apps.md) also uses "fleet" for the set of agents on **one**
-> `cao-server` (its Fleet UI). This guide is about coordinating **across machines**
-> and neither changes nor depends on that single-node Fleet UI.
+> `cao-server` (its Fleet UI), and `cao fleet` uses it for a Kubernetes worker
+> cluster. This guide is about coordinating **across machines** and neither
+> changes nor depends on that single-node Fleet UI.
 
 - [What it is](#what-it-is)
 - [Architecture](#architecture)
