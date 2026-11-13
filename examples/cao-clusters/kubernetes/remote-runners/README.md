@@ -177,6 +177,12 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   CA, or it expires within 30 days. A hash of both is in the server and runner
   pod templates, so new material rolls them, also on the run after a failed
   one. To rotate, delete `cao-hub-tls` and run `deploy.sh` again.
+- **Image updates:** the default tag is the commit plus a digest of the files
+  the image is built from, and the repository's tags are immutable, so a
+  re-run with the same files reuses the pushed image. The OS packages the build
+  upgrades are not in that digest: to take package fixes published since the
+  last build, run with `CAO_IMAGE_REBUILD=1`, which builds and pushes a new
+  image and rolls the pods onto it.
 - **Model:** `claude_code` on Bedrock, model `CAO_BEDROCK_MODEL` (default
   `au.anthropic.claude-sonnet-4-6`; choose one your region serves). Of the CAO
   pods, only the runners get AWS credentials, and those allow only invoking the

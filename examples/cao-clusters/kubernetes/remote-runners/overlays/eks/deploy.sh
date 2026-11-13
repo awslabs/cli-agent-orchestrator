@@ -14,6 +14,10 @@
 #                      au.anthropic.claude-sonnet-4-6; pick one your region serves)
 #   CAO_IMAGE_TAG      tag to push (default: the checkout's short commit id and
 #                      a digest of the files the image is built from)
+#   CAO_IMAGE_REBUILD  1 to build and push a new image even if the content has
+#                      not changed, so it takes the OS package fixes published
+#                      since the last build (the default tag names only this
+#                      checkout's files, so a re-run reuses the pushed image)
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
@@ -40,13 +44,20 @@ REPO_URI="$(output ServerRepositoryUri)"
 VOLUME_HANDLE="$(output WorkspaceVolumeHandle)"
 DNS_IP="$(output ClusterDnsIp)"
 
+case "${CAO_IMAGE_REBUILD:-}" in
+  ""|0|1) ;;
+  *) echo "CAO_IMAGE_REBUILD must be 1, 0 or unset" >&2; exit 2 ;;
+esac
 if [ -n "${CAO_IMAGE_TAG:-}" ]; then
   TAG="${CAO_IMAGE_TAG}"
 else
   # Immutable tags: the tag names the content the image is built from, so the
   # same files always give the same tag and any change, committed or not,
-  # gives a new one.
+  # gives a new one. The OS packages the build upgrades are not part of it.
   TAG="$(git -C "${REPO}" rev-parse --short HEAD)-$(python3 "${HERE}/context-digest.py" "${REPO}")"
+fi
+if [ "${CAO_IMAGE_REBUILD:-}" = 1 ]; then
+  TAG="${TAG}-r$(date -u +%Y%m%d%H%M%S)"
 fi
 
 # Private scratch space (mode 0700): kubeconfig, the registry login, the token

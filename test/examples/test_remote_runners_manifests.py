@@ -791,6 +791,25 @@ def test_the_default_tag_names_the_build_content_and_is_stable(deploy):
     assert f"imageTag={tag}" in _argv(deploy.state, "aws")
 
 
+def test_a_rebuild_pushes_a_new_image_for_the_same_content(deploy):
+    assert deploy(CAO_IMAGE_TAG="").returncode == 0
+    content_tag = (deploy.state / "image").read_text()
+    _fresh_argv(deploy.state)
+    done = deploy(CAO_IMAGE_TAG="", CAO_IMAGE_REBUILD="1")
+    assert done.returncode == 0, done.stderr
+    tag = (deploy.state / "image").read_text()
+    assert re.fullmatch(rf"{re.escape(content_tag)}-r[0-9]{{14}}", tag), tag
+    assert "build " in _argv(deploy.state, "docker")
+    assert f"cao-server:{tag}" in (deploy.state / "applied.yaml").read_text()
+
+
+def test_an_unknown_rebuild_value_is_refused(deploy):
+    done = deploy(CAO_IMAGE_REBUILD="yes")
+    assert done.returncode == 2
+    assert "CAO_IMAGE_REBUILD" in done.stderr
+    assert not (deploy.state / "kubectl.argv").exists()
+
+
 def test_the_context_digest_follows_content_and_skips_bytecode(tmp_path):
     script = EKS / "context-digest.py"
     root = tmp_path / "repo"
