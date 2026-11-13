@@ -18,7 +18,7 @@ different upgrade actions:
 
 | Installed via | Receipt shape | `cao update` runs | Why |
 |---|---|---|---|
-| `uv tool install git+…@main` (recommended) | `git = "…?rev=main"` | `uv tool install <git-source> --upgrade --reinstall` | `@main` is a **moving ref**. `uv tool upgrade` treats it as already satisfied ("Nothing to upgrade") and never fetches newer commits, so `--reinstall` is required. |
+| `uv tool install git+…@main` (recommended) | `git = "…?rev=main"` | `uv tool upgrade cli-agent-orchestrator --reinstall` | uv reuses the receipt, including the Git ref and any `--with` requirements. `--reinstall` refreshes moving refs such as `@main`, while an explicit commit remains pinned. |
 | `uv tool install cli-agent-orchestrator` | `{ name = "…" }` | `uv tool upgrade cli-agent-orchestrator` | Re-resolves to the latest published release. |
 | `uv tool install 'cli-agent-orchestrator==X.Y.Z'` (or any constraint: `<`, `~=`, …) | `specifier = "…"` | `uv tool install cli-agent-orchestrator@latest --upgrade` | **Any version constraint** can hold the install below the latest release, making `uv tool upgrade` a no-op that still reports success; `@latest` unpins to the newest release. |
 | `uv tool install .` (local clone) | `directory = "/path"` | *(nothing — prints guidance)* | A local source tree has no remote to advance. `cao update` tells you to update the source and reinstall. |
