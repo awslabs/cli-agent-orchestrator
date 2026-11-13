@@ -474,3 +474,108 @@ def test_a_real_root_run_never_writes_through_a_link_in_the_home(
         assert not outside.exists()
     assert not any(c.startswith("chown") for c in sandbox.recorded_calls())
     assert not (root / "etc" / "systemd" / "system" / "herdr-cao.service").exists()
+    # Refused in step 0: steps 1 to 6 changed nothing either.
+    assert "== 1." not in result.stdout
+    assert not (root / "etc" / "cao-box").exists()
+
+
+
+# --------------------------------- --settings: parsed, never sourced (P2-1)
+# The README used `sudo env $(cat box-settings.env) bash bootstrap.sh`, which
+# makes every line root's environment (BASH_ENV=... runs a file as root).
+# bootstrap.sh now reads the file itself and accepts only its own settings.
+
+
+def write_settings(path: Path, lines: list[str], mode: int = 0o600) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
+def settings_lines() -> list[str]:
+    lines = [f"{k}={v}" for k, v in SETTINGS.items()]
+    lines[1] += "                 # 1000-59999; pick one and never change it"
+    return ["# box settings", "", *lines]
+
+
+def test_a_settings_file_is_read_without_the_environment(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox)
+    kit = write_settings(sandbox.root / "kit" / "box-settings.env", settings_lines())
+    result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), "--settings", str(kit))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "settings read from" in result.stdout
+    assert "user boxuser (uid 2001) with home /Users/boxuser" in result.stdout
+    assert sandbox.recorded_calls() == []
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ("BASH_ENV={marker_script}", "BASH_ENV is not a bootstrap setting"),
+        ("LD_PRELOAD=/dev/shm/x.so", "LD_PRELOAD is not a bootstrap setting"),
+        ("FOO=1", "FOO is not a bootstrap setting"),
+        ("BOX_USER=other", "BOX_USER is set twice"),
+        ("BOX_HOME=/Users/<you>", "expected KEY=VALUE"),
+        ("CAO_REPO=$(touch {marker})", "expected KEY=VALUE"),
+        ("export PATH=/tmp", "expected KEY=VALUE"),
+    ],
+    ids=["bash-env", "ld-preload", "unknown", "twice", "placeholder", "command", "export"],
+)
+def test_a_settings_file_with_anything_else_is_refused(sandbox, extra, message) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox)
+    marker = sandbox.root / "sourced"
+    script = sandbox.root / "evil.sh"
+    script.write_text(f'touch "{marker}"\n', encoding="utf-8")
+    line = extra.format(marker_script=script, marker=marker)
+    kit = write_settings(sandbox.root / "kit" / "box-settings.env", [*settings_lines(), line])
+    result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), "--settings", str(kit))
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert message in result.stderr
+    assert "== 1." not in result.stdout
+    assert not marker.exists(), "a settings line ran code"
+
+
+def stat_says(sandbox, path: Path, answer: str) -> None:
+    """A stat stub that answers ANSWER ("<uid> <mode>") for PATH only."""
+    real = "/usr/bin/stat"
+    write_stub(
+        sandbox.stubs,
+        "stat",
+        f'case "$*" in\n  *"{path}"*) echo "{answer}" ;;\n  *) exec {real} "$@" ;;\nesac\n',
+    )
+
+
+@pytest.mark.parametrize("case", ["group-writable", "symlink", "in-the-home", "home-owned"])
+def test_an_unsafe_settings_file_is_refused(sandbox, case) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox)
+    kit = sandbox.root / "kit" / "box-settings.env"
+    if case == "group-writable":
+        write_settings(kit, settings_lines(), mode=0o620)
+        message = "must be yours"
+    elif case == "symlink":
+        real = write_settings(sandbox.root / "elsewhere" / "s.env", settings_lines())
+        kit.parent.mkdir(parents=True)
+        kit.symlink_to(real)
+        message = "is a symlink"
+    elif case == "in-the-home":
+        kit = write_settings(root / "Users" / "boxuser" / "box-settings.env", settings_lines())
+        message = "inside the box user's home"
+    else:
+        write_settings(kit, settings_lines())
+        stat_says(sandbox, kit, "2001 600")  # as if the box user (uid 2001) owned it
+        message = "must be yours"
+    result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), "--settings", str(kit))
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert message in result.stderr
+    assert "== 1." not in result.stdout
+    assert sandbox.recorded_calls() == []
+
+
+def test_settings_needs_a_file(sandbox) -> None:
+    result = sandbox.run("bootstrap.sh", "--settings")
+    assert result.returncode == 2
+    assert "--settings needs a file" in result.stderr

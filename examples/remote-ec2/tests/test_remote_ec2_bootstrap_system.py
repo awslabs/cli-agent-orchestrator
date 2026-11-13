@@ -16,6 +16,7 @@ from remote_ec2_support import (
     BOOTSTRAP_SETTINGS,
     FAKE_SHA,
     FAKE_VOLUME_ID,
+    SAMPLE_DIR,
     FakeSystem,
     tree_snapshot,
 )
@@ -370,7 +371,9 @@ def test_a_planted_herdr_is_never_run_and_is_downloaded_again(sandbox) -> None:
     assert sandbox.recorded_calls() == []
 
 
-def test_a_herdr_with_the_pinned_hash_is_kept_without_running_it(sandbox) -> None:
+def test_a_dry_run_never_opens_herdr_even_with_the_pinned_hash(sandbox) -> None:
+    # A real run has the box user hash it (test_remote_ec2_guards.py); a dry
+    # run doesn't look in the home at all, so it plans the download.
     home = box_home(sandbox)
     marker = sandbox.root / "herdr-ran"
     pinned = hashlib.sha256(plant_herdr(home, marker)).hexdigest()
@@ -379,9 +382,11 @@ def test_a_herdr_with_the_pinned_hash_is_kept_without_running_it(sandbox) -> Non
     settings = {**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home), "HERDR_SHA256": pinned}
     result = dry_run(sandbox, fake, **settings)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "herdr v0.9.3 present (sha256 matches HERDR_SHA256)" in result.stdout
-    assert "herdr-linux-aarch64" not in result.stdout
+    herdr = home / ".local" / "bin" / "herdr"
+    assert f"would check, as boxuser, that {herdr} is a regular file with sha256" in result.stdout
+    assert "releases/download/v0.9.3/herdr-linux-aarch64" in result.stdout
     assert not marker.exists(), "root ran a herdr from the box user's home"
+    assert sandbox.recorded_calls() == []
 
 
 def link_in_home(home: Path, name: str, target: Path) -> None:
@@ -390,17 +395,18 @@ def link_in_home(home: Path, name: str, target: Path) -> None:
     (home / name).symlink_to(target)
 
 
-def test_a_config_folder_linked_to_a_root_folder_is_refused(sandbox) -> None:
+@pytest.mark.parametrize("folder", [".config", ".local"])
+def test_a_config_folder_linked_to_a_root_folder_is_refused(sandbox, folder) -> None:
     home = box_home(sandbox)
     target = sandbox.root / "root-owned"
-    link_in_home(home, ".config", target)
+    link_in_home(home, folder, target)
     before = tree_snapshot(target)
     fake = FakeSystem(sandbox)
     fake.home_owner = "2001"
     result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home)})
     assert result.returncode == 1, result.stdout + result.stderr
-    assert f"{home}/.config is a symlink; refusing" in result.stderr
-    assert "== 3." not in result.stdout, "the run must stop in step 2"
+    assert f"{home}/{folder} is a symlink; refusing" in result.stderr
+    assert "== 1." not in result.stdout, "the run must stop in step 0, before any change"
     assert "install -d" not in result.stdout and "chown" not in result.stdout
     assert tree_snapshot(target) == before
     assert sandbox.recorded_calls() == []
@@ -416,10 +422,24 @@ def test_a_claude_folder_linked_to_the_unit_folder_is_refused(sandbox) -> None:
     result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home)})
     assert result.returncode == 1, result.stdout + result.stderr
     assert f"{home}/.claude is a symlink; refusing" in result.stderr
-    assert "== 8." not in result.stdout, "the run must stop in step 7"
+    assert "== 1." not in result.stdout, "the run must stop in step 0, before any change"
     # Nothing in the plan changes an owner, inside the home or out of it.
     assert "chown" not in result.stdout
     assert tree_snapshot(units) == before
+    assert sandbox.recorded_calls() == []
+
+
+def test_a_checkout_inside_the_box_users_home_is_refused(sandbox) -> None:
+    # Root sources and runs the sample's files: in the home, any agent could
+    # change them before the next re-run.
+    home = str(SAMPLE_DIR.parent)
+    fake = FakeSystem(sandbox)
+    fake.home_owner = "2001"
+    result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": home})
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "inside the box user's home" in result.stderr
+    assert "/opt/cao-box-src" in result.stderr
+    assert "== 1." not in result.stdout
     assert sandbox.recorded_calls() == []
 
 

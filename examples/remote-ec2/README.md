@@ -171,14 +171,23 @@ aws ssm start-session --region ap-southeast-2 --target <instance-id>
 ```
 
 Copy the sample to the box, for example with `git clone` of this repository.
+Keep the checkout and its settings file in a folder that only root can write,
+**outside `BOX_HOME`**, for example `/opt/cao-box-src`. Root runs
+`bootstrap.sh` and the files next to it, and every agent can write in the box
+user's home, so a checkout there would let any agent change what root runs
+next time. As root, `bootstrap.sh` refuses to run from anywhere else.
+
 Put the settings in a file, so every run uses the same ones. Every download
 is checked against a sha256, and a missing or wrong checksum stops the run.
 Copy each value from the release's published checksums (see
 [Tools](#tools-on-linux-arm64)).
 
 ```bash
-cd cli-agent-orchestrator/examples/remote-ec2
-cat > box-settings.env <<'EOF'
+sudo install -d -m 0755 /opt/cao-box-src
+sudo git clone https://github.com/awslabs/cli-agent-orchestrator.git /opt/cao-box-src/cli-agent-orchestrator
+cd /opt/cao-box-src/cli-agent-orchestrator/examples/remote-ec2
+sudo install -m 0600 /dev/null /opt/cao-box-src/box-settings.env
+sudo tee /opt/cao-box-src/box-settings.env > /dev/null <<'EOF'
 BOX_USER=<you>
 BOX_UID=<uid>                 # 1000-59999 (a macOS uid such as 501 is refused); pick one and never change it
 BOX_HOME=/Users/<you>
@@ -197,13 +206,18 @@ HELIX_SHA256=<sha256>
 UV_VERSION=<version>
 UV_SHA256=<sha256>
 EOF
-sudo env $(cat box-settings.env | sed 's/ *#.*//') bash bootstrap.sh --dry-run --format-new-volume   # first run: shows the format step too
-sudo env $(cat box-settings.env | sed 's/ *#.*//') bash bootstrap.sh --format-new-volume   # first run only
+sudo bash bootstrap.sh --settings /opt/cao-box-src/box-settings.env --dry-run --format-new-volume   # first run: shows the format step too
+sudo bash bootstrap.sh --settings /opt/cao-box-src/box-settings.env --format-new-volume   # first run only
 ```
 
-Keep the settings file to these names. `bootstrap.sh` refuses to run for
-real if any `BOX_TEST_*` variable is set (those are hooks for its dry-run
-tests).
+`bootstrap.sh` reads the settings file itself, one `KEY=VALUE` line at a
+time (`#` starts a comment). It accepts only the names above (plus the other
+settings in its header), and it never sources the file or passes it to
+`env`. So a line such as `BASH_ENV=...` or `LD_PRELOAD=...` stops the run
+instead of running code as root. The file must be root's, not a symlink, not
+writable by group or others, and outside `BOX_HOME`. `bootstrap.sh` also
+refuses to run for real if any `BOX_TEST_*` variable is set (those are hooks
+for its dry-run tests).
 
 The data-volume step formats **only** a disk that matches `DATA_VOLUME_ID`'s
 NVMe serial, is a whole disk, isn't the root disk, has no partitions, holders
@@ -424,11 +438,16 @@ never point the laptop's CAO at the box's files.
   [`iam/`](iam/README.md) are marked "check before use".
 - **Re-runs of `bootstrap.sh` don't trust the box user's home.** Any agent
   can plant a file or a symlink there, and `bootstrap.sh` runs as root. So it
-  never runs a program from the home: it keeps `~/.local/bin/herdr` only if
-  its sha256 is `HERDR_SHA256`, and otherwise downloads herdr again. It
-  creates the home's folders and config files as the box user, and it stops
-  if it finds a symlink on their path. The only owner it changes is the home
-  folder's own, when a freshly mounted volume gives it to root.
+  never runs or opens a file in the home as root. The box user hashes
+  `~/.local/bin/herdr`, under a time limit, and herdr is kept only if the
+  hash is `HERDR_SHA256`. Otherwise it is downloaded again. The box user also
+  creates the home's folders and config files. Before any step changes the
+  box, the run stops if there is a symlink on any of those paths. The only
+  owner it changes is the home folder's own, when a freshly mounted volume
+  gives it to root.
+- **The checkout and the settings stay out of the home.** `bootstrap.sh`
+  refuses to run as root from a folder that anyone but root can write, and
+  refuses a checkout or `--settings` file inside `BOX_HOME`.
 - **What's left.** Any agent can read anything the box user owns: other
   CLIs' login files, your kit, memory. Never give the box user `sudo` or the
   `docker` group unless you accept that every agent is root.
@@ -682,8 +701,14 @@ They cover:
   home ownership, pins and checksums, and `systemctl enable` without
   `--now`;
 - links and programs planted in the box user's home: a planted herdr never
-  runs, and a `~/.config`, `~/.claude` or settings file that links out of the
-  home stops the run before anything is written;
+  runs, the box user hashes herdr (a symlink, a FIFO or a hash that never
+  ends is not kept and doesn't hang the run), and a `~/.config`, `~/.claude`
+  or settings file that links out of the home stops the run in step 0,
+  before anything changes;
+- the checkout guard and `--settings`: a checkout inside the home or one that
+  others can write is refused, and so is a settings file with `BASH_ENV`, an
+  unknown name, a placeholder, group write, a symlink, or the box user as
+  owner;
 - a `--root` dry run that must change nothing, a real `--root` run (file
   modes, no IMDS call), and the refusal on the wrong OS;
 - the cao-server socket gate;

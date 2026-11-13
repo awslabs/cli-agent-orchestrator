@@ -9,12 +9,19 @@ running the exact function text from the script.
 - bootstrap.sh's home helpers on a real box (P1-1): every file in the box
   user's home is written through runuser, and a planted link stops the run
   before runuser is called.
+- bootstrap.sh's herdr check on a real box: the box user hashes herdr, under
+  a deadline, so root never opens it (a FIFO or a slow file can't hang root).
+- bootstrap.sh's checkout guard: as root, the sample must sit in folders that
+  only root can write. EUID can't be faked, so it runs with the test's uid.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import sys
+import time
 import stat
 import subprocess
 from pathlib import Path
@@ -196,3 +203,213 @@ def test_a_real_box_stops_on_cao_settings_for_another_session(tmp_path) -> None:
     assert "reached-the-end" not in result.stdout
     assert dest.read_text(encoding="utf-8") == text
     assert len(logged()) == 1
+
+
+# --------------------------------------- the herdr check on a real box (P3-1)
+
+HERDR_CHECK = extract("bootstrap.sh", "herdr-check")
+TIMEOUT_SHIM = f"""#!{sys.executable}
+# timeout SECONDS CMD...: coreutils' timeout, for hosts that lack it (macOS).
+import subprocess, sys
+proc = subprocess.Popen(sys.argv[2:])
+try:
+    sys.exit(proc.wait(timeout=float(sys.argv[1])))
+except subprocess.TimeoutExpired:
+    proc.kill()
+    proc.wait()
+    sys.exit(124)
+"""
+
+
+def herdr_box(tmp_path: Path, seconds: int = 20, slow_hash: bool = False):
+    """Run herdr_is_pinned on FILE with a runuser stub that logs, then runs."""
+    stubs = tmp_path / "stubs"
+    user_bin = tmp_path / "user-bin"  # the box user's SYS_PATH: the shim first
+    calls = tmp_path / "calls.log"
+    write_stub(
+        stubs,
+        "runuser",
+        f'echo "runuser $1 $2 $3" >> "{calls}"\n'
+        '[ "$1" = "-u" ] && [ "$3" = "--" ] || exit 64\n'
+        'shift 3\nexec "$@"\n',
+    )
+    shim = user_bin / "timeout"
+    user_bin.mkdir()
+    shim.write_text(TIMEOUT_SHIM, encoding="utf-8")
+    shim.chmod(0o755)
+    if slow_hash:
+        write_stub(user_bin, "sha256sum", "exec sleep 60\n")
+    # It prints the pinned version, so asking it would make a mutant keep it.
+    body = f'#!/bin/sh\necho ran > "{tmp_path / "herdr-ran"}"\necho "herdr 0.9.3"\n'.encode()
+    pinned = hashlib.sha256(body).hexdigest()
+
+    def check(file: Path, dry: int = 0) -> tuple[subprocess.CompletedProcess[str], float]:
+        snippet = (
+            BOOTSTRAP_PRELUDE
+            + f"BOX_USER=boxuser\nHERDR_SHA256={pinned}\nDRY_RUN={dry}\n"
+            + HERDR_CHECK
+            + f'SYS_PATH="{user_bin}:{system_path()}"\nHASH_SECONDS={seconds}\n'
+            + f'if herdr_keep "{file}"; then echo PINNED; else echo NOT-PINNED; fi\n'
+        )
+        start = time.monotonic()
+        result = subprocess.run(
+            [BASH, "-c", f"set -euo pipefail\n{snippet}"],
+            env={"PATH": f"{stubs}:{system_path()}", "HOME": str(tmp_path), "LANG": "C"},
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        return result, time.monotonic() - start
+
+    def logged() -> list[str]:
+        return calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+
+    return body, check, logged
+
+
+def herdr_file(tmp_path: Path, body: bytes, mode: int = 0o755) -> Path:
+    f = tmp_path / "home" / ".local" / "bin" / "herdr"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(body)
+    f.chmod(mode)
+    return f
+
+
+def test_the_pinned_herdr_is_kept_and_hashed_by_the_box_user(tmp_path) -> None:
+    body, check, logged = herdr_box(tmp_path)
+    result, _ = check(herdr_file(tmp_path, body))
+    assert result.stdout.strip() == "PINNED", result.stderr
+    assert logged() == ["runuser -u boxuser --"]
+    assert not (tmp_path / "herdr-ran").exists()
+
+
+@pytest.mark.parametrize("kind", ["planted", "symlink-to-pinned", "not-executable", "folder"])
+def test_anything_but_the_pinned_regular_file_is_downloaded_again(tmp_path, kind) -> None:
+    body, check, logged = herdr_box(tmp_path)
+    if kind == "planted":
+        target = herdr_file(tmp_path, body + b"# planted\n")
+    elif kind == "symlink-to-pinned":
+        real = tmp_path / "pinned-herdr"
+        real.write_bytes(body)
+        real.chmod(0o755)
+        target = tmp_path / "home" / ".local" / "bin" / "herdr"
+        target.parent.mkdir(parents=True)
+        target.symlink_to(real)
+    elif kind == "not-executable":
+        target = herdr_file(tmp_path, body, mode=0o644)
+    else:
+        target = tmp_path / "home" / ".local" / "bin" / "herdr"
+        target.mkdir(parents=True)
+    result, _ = check(target)
+    assert result.stdout.strip() == "NOT-PINNED", result.stderr
+    assert not (tmp_path / "herdr-ran").exists()
+
+
+def test_a_dry_run_never_looks_at_herdr(tmp_path) -> None:
+    body, check, logged = herdr_box(tmp_path)
+    result, _ = check(herdr_file(tmp_path, body), dry=1)
+    assert result.stdout.splitlines()[-1] == "NOT-PINNED", result.stderr
+    assert "[dry-run] would check, as boxuser, that" in result.stdout
+    assert logged() == []
+    assert not (tmp_path / "herdr-ran").exists()
+
+
+def test_bootstrap_never_runs_the_installed_herdr() -> None:
+    # "$herdr_bin" may only be checked by herdr_keep or be install's target.
+    text = (SAMPLE_DIR / "bootstrap.sh").read_text(encoding="utf-8")
+    uses = [line.strip() for line in text.splitlines() if '"$herdr_bin"' in line]
+    assert uses == [
+        'if herdr_keep "$herdr_bin"; then',
+        'as_user install -m 0755 "$TMP_DL/herdr" "$herdr_bin"',
+    ]
+
+
+def test_a_fifo_never_hangs_the_check(tmp_path) -> None:
+    _, check, logged = herdr_box(tmp_path, seconds=20)
+    fifo = tmp_path / "home" / ".local" / "bin" / "herdr"
+    fifo.parent.mkdir(parents=True)
+    os.mkfifo(fifo)
+    result, took = check(fifo)
+    assert result.stdout.strip() == "NOT-PINNED", result.stderr
+    assert took < 10, f"the check waited {took:.1f}s on a FIFO"
+
+
+def test_a_hash_that_never_ends_is_given_up(tmp_path) -> None:
+    # What a FIFO or a device swapped in after the user's checks would do.
+    body, check, _ = herdr_box(tmp_path, seconds=1, slow_hash=True)
+    result, took = check(herdr_file(tmp_path, body))
+    assert result.stdout.strip() == "NOT-PINNED", result.stderr
+    assert took < 15, f"the check waited {took:.1f}s"
+
+
+# -------------------------------------------- the checkout guard (P2-1)
+
+CHECKOUT_GUARD = extract("bootstrap.sh", "checkout-guard")
+
+
+def checkout(tmp_path: Path) -> Path:
+    here = tmp_path / "kit" / "remote-ec2"
+    (here / "bin").mkdir(parents=True)
+    (here / "bin" / "lib-cao-box.sh").write_text("# lib\n", encoding="utf-8")
+    for folder in (tmp_path / "kit", here, here / "bin"):
+        folder.chmod(0o755)
+    return here
+
+
+def guard(tmp_path: Path, here: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    return run(
+        CHECKOUT_GUARD + f'safe_checkout "{here}" "{os.getuid()}" "{tmp_path}"', tmp_path, **env
+    )
+
+
+def test_a_checkout_only_its_owner_can_write_passes(tmp_path) -> None:
+    result = guard(tmp_path, checkout(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert "reached-the-end" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("group-writable-checkout", "is writable by group or others"),
+        ("group-writable-parent", "is writable by group or others"),
+        ("other-writable-file", "is not owned by uid"),
+        ("linked-checkout", "is not a real folder"),
+        ("another-owner", "is owned by uid 2001"),
+    ],
+)
+def test_a_checkout_someone_else_can_change_is_refused(tmp_path, change, message) -> None:
+    here = checkout(tmp_path)
+    env: dict[str, str] = {}
+    if change == "group-writable-checkout":
+        here.chmod(0o775)
+    elif change == "group-writable-parent":
+        here.parent.chmod(0o775)
+    elif change == "other-writable-file":
+        (here / "bin" / "lib-cao-box.sh").chmod(0o646)
+    elif change == "linked-checkout":
+        link = tmp_path / "linked"
+        link.symlink_to(here)
+        here = link
+    else:
+        stubs = tmp_path / "stubs"
+        write_stub(
+            stubs,
+            "stat",
+            f'case "$*" in\n  *"{here.parent}") echo "2001 755" ;;\n  *) exec /usr/bin/stat "$@" ;;\nesac\n',
+        )
+        env = {"PATH": f"{stubs}:{system_path()}"}
+    result = guard(tmp_path, here, **env)
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "reached-the-end" not in result.stdout
+
+
+def test_bootstrap_guards_its_checkout_as_root_before_sourcing_anything() -> None:
+    text = (SAMPLE_DIR / "bootstrap.sh").read_text(encoding="utf-8")
+    here = text.index('HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"\n')
+    call = text.index('if [ "$EUID" -eq 0 ] && ! safe_checkout "$HERE" 0 /; then\n')
+    source = text.index('. "$HERE/bin/lib-cao-box.sh"')
+    assert here < call < source
+    assert "\n. " not in text[:call], "something is sourced before the guard"

@@ -3,16 +3,18 @@
 # herdr + CAO under systemd. Run it ON THE BOX, as root. Re-running it is safe:
 # every step checks before it acts, and anything unexpected stops the run.
 #
-#   sudo BOX_USER=<you> BOX_UID=<uid> BOX_HOME=/Users/<you> \
-#        DATA_VOLUME_ID=<vol-id> HERDR_VERSION=v0.9.3 HERDR_SHA256=<sha256> \
-#        CAO_REF=<commit-sha> ... bash bootstrap.sh --dry-run   # print the plan
-#   sudo ... bash bootstrap.sh                                  # do it
-#   sudo ... bash bootstrap.sh --format-new-volume              # first run only
+#   sudo bash bootstrap.sh --settings /opt/cao-box-src/box-settings.env --dry-run   # the plan
+#   sudo bash bootstrap.sh --settings /opt/cao-box-src/box-settings.env             # do it
+#   ... --format-new-volume                                                         # first run only
+#
+# As root it runs only from a folder that root owns and nobody else can write,
+# outside BOX_HOME (for example /opt/cao-box-src/...): root sources and runs
+# files from here, and every agent can write in the box user's home.
 #
 # It never creates AWS resources, never starts a service (it only enables
 # them), and never logs in to anything. See README.md for the full flow.
 #
-# Required settings (environment variables):
+# Required settings (in the --settings file, or environment variables):
 #   BOX_USER        the Linux user that owns the agents.
 #   BOX_UID         that user's uid (and gid). Use the SAME value on every
 #                   rebuild so the data volume's files keep their owner.
@@ -38,6 +40,13 @@
 #     UV_VERSION + UV_SHA256.
 #
 # Flags:
+#   --settings FILE      read the settings from FILE: KEY=VALUE lines for the
+#                        names in this header only (# starts a comment). It is
+#                        parsed, never sourced or passed to env, so any other
+#                        name (BASH_ENV, PATH, LD_PRELOAD, ...) stops the run.
+#                        FILE must not be a symlink, must belong to the user
+#                        running this with no group or other write and, as
+#                        root, sit in root-only folders outside BOX_HOME.
 #   --dry-run            print every planned step; change nothing.
 #   --format-new-volume  allow formatting DATA_VOLUME_ID, and only if it is a
 #                        blank, whole, non-root disk. Env form:
@@ -51,9 +60,43 @@
 # a real run with any BOX_TEST_* variable set stops before step 0.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# >>> checkout-guard
+# safe_checkout DIR UID STOP: DIR, every folder above it up to STOP, and
+# everything inside DIR (but symlinks, which only their owner can make) belong
+# to UID, and nobody else can write them. It is inline, not from
+# lib-cao-box.sh, because it decides whether that library may be sourced.
+safe_checkout() {
+  local p="$1" uid="$2" stop="$3" info bad
+  while :; do
+    if [ -L "$p" ] || [ ! -d "$p" ]; then
+      echo "${p} is not a real folder" >&2; return 1
+    fi
+    info="$(stat -c '%u %a' "$p" 2>/dev/null || stat -f '%u %Lp' "$p")" || { echo "cannot stat ${p}" >&2; return 1; }
+    if [ "${info%% *}" != "$uid" ]; then
+      echo "${p} is owned by uid ${info%% *}, not ${uid}" >&2; return 1
+    fi
+    if ! [[ "${info##* }" =~ ^[0-7]+$ ]] || [ $(( 8#${info##* } & 8#022 )) -ne 0 ]; then
+      echo "${p} is writable by group or others (mode ${info##* })" >&2; return 1
+    fi
+    if [ "$p" = "$stop" ] || [ "$p" = "/" ]; then break; fi
+    p="$(dirname "$p")"
+  done
+  bad="$(find "$1" ! -type l \( ! -user "$uid" -o -perm -g+w -o -perm -o+w \) -print 2>&1 | head -n 1)"
+  if [ -n "$bad" ]; then
+    echo "${bad} is not owned by uid ${uid}, or is writable by group or others" >&2; return 1
+  fi
+}
+# <<< checkout-guard
+# Root sources and runs files from here: refuse a checkout anyone else can change.
+if [ "$EUID" -eq 0 ] && ! safe_checkout "$HERE" 0 /; then
+  printf '[bootstrap] ERROR: refusing to run as root from %s: keep the sample in a folder that only root can write, outside BOX_HOME (for example /opt/cao-box-src)\n' "$HERE" >&2
+  exit 1
+fi
 # shellcheck source=SCRIPTDIR/bin/lib-cao-box.sh
 . "$HERE/bin/lib-cao-box.sh"
+SETTINGS_FILE=""
 DRY_RUN=0
 ROOT=""
 FORMAT_NEW=0
@@ -66,6 +109,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --format-new-volume) FORMAT_NEW=1 ;;
+    --settings)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "--settings needs a file" >&2; exit 2; }
+      SETTINGS_FILE="$2"; shift ;;
     --root)
       [ $# -ge 2 ] || { echo "--root needs a folder" >&2; exit 2; }
       ROOT="${2%/}"; shift ;;
@@ -124,6 +170,44 @@ if [ "$os_id" != "ubuntu" ] || [ "$os_ver" != "24.04" ] || [ "$arch" != "aarch64
   die "this sample supports Ubuntu 24.04 on aarch64 only (found: ${os_id:-?} ${os_ver:-?} ${arch})"
 fi
 log "OS: ubuntu 24.04 aarch64"
+
+# >>> settings-file
+SETTING_NAMES=" BOX_USER BOX_UID BOX_HOME HERDR_VERSION HERDR_SHA256 CAO_REF DATA_VOLUME_ID DATA_DEVICE \
+DATA_MOUNT INSTALL_DOCKER BACKUP_S3_URI BACKUP_KMS_KEY_ARN CAO_REPO GH_VERSION AWS_CLI_VERSION \
+AWS_CLI_SHA256 SAM_VERSION SAM_SHA256 YAZI_VERSION YAZI_SHA256 HELIX_VERSION HELIX_SHA256 UV_VERSION UV_SHA256 "
+# read_settings FILE: set the known settings from FILE. FILE is parsed line by
+# line, never sourced and never handed to env, so no line can run code as root.
+read_settings() {
+  local file="$1" dir line key value n=0 seen=" "
+  [ -f "$file" ] || die "--settings ${file}: no such file"
+  cb_safe_path "$file" "$EUID" || die "refusing --settings ${file}: it must be yours (uid ${EUID}), not a symlink, with no group or other write"
+  dir="$(cd "$(dirname "$file")" && pwd -P)"
+  if [ "$EUID" -eq 0 ]; then
+    cb_safe_dir "$dir" / 0 || die "refusing --settings ${file}: as root, its folders must be root's and nobody else's to write"
+  fi
+  SETTINGS_REAL="${dir}/$(basename "$file")"
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line="${line%%#*}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] || continue
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=([A-Za-z0-9._:/@+,=-]*)$ ]] \
+      || die "${file} line ${n}: expected KEY=VALUE, with only letters, digits and . _ : / @ + , = - in the value"
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    case "$SETTING_NAMES" in
+      *" ${key} "*) ;;
+      *) die "${file} line ${n}: ${key} is not a bootstrap setting; refusing" ;;
+    esac
+    case "$seen" in *" ${key} "*) die "${file}: ${key} is set twice" ;; esac
+    seen="${seen}${key} "
+    printf -v "$key" '%s' "$value"
+  done < "$file"
+  log "settings read from ${SETTINGS_REAL}"
+}
+# <<< settings-file
+SETTINGS_REAL=""
+if [ -n "$SETTINGS_FILE" ]; then read_settings "$SETTINGS_FILE"; fi
 
 PATH_RE='^/[A-Za-z0-9._/-]+$'
 BOX_USER="${BOX_USER:-}"
@@ -189,6 +273,16 @@ STATE_DIR="${ROOT}${DATA_MOUNT}/.cao-box"   # on the data volume: survives a reb
 LIB_DIR="${ROOT}/usr/local/lib/cao-box"
 UNIT_DIR="${ROOT}/etc/systemd/system"
 HOME_DIR="${ROOT}${BOX_HOME}"
+# The checkout and the settings file must be outside the box user's home:
+# every agent can write there.
+home_real="$HOME_DIR"
+if [ -d "$HOME_DIR" ]; then home_real="$(cd "$HOME_DIR" && pwd -P)"; fi
+for p in "$HERE" ${SETTINGS_REAL:+"$SETTINGS_REAL"}; do
+  case "$p/" in
+    "$home_real"/*|"$HOME_DIR"/*)
+      die "refusing ${p}: it is inside the box user's home (${HOME_DIR}), where any agent can change it; keep the sample and its settings in a root-owned folder outside BOX_HOME, for example /opt/cao-box-src" ;;
+  esac
+done
 DEVFS="${BOX_TEST_DEVFS:-/dev}"
 SYSFS="${BOX_TEST_SYSFS:-/sys}"
 FSTAB="${BOX_TEST_FSTAB:-/etc/fstab}"
@@ -281,6 +375,13 @@ put_home_file() {
   fi
 }
 # <<< home-helpers
+
+# Every path in the home that steps 2 and 7 work on is checked now, before any
+# step changes the box. Steps 2 and 7 check again just before they act.
+home_paths=("$HOME_DIR/.config/herdr/config.toml" "$HOME_DIR/.aws/cli-agent-orchestrator/settings.json" \
+            "$HOME_DIR/.claude/settings.json")
+if system_step; then home_paths+=("$BOX_HOME/.local/bin"); fi
+no_links "${home_paths[@]}"
 
 # ---------------------------------------------------------- 1. data volume
 step "1. data volume ${DATA_VOLUME_ID:-<none>} -> ${DATA_MOUNT}"
@@ -453,15 +554,42 @@ verify() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# >>> herdr-check
+# herdr_is_pinned FILE: true if FILE is a regular, executable file (not a
+# symlink) whose sha256 is HERDR_SHA256. The box user looks and hashes, under a deadline, so
+# root never opens a path in the home: a FIFO, a device or a slow file there
+# can't hang root or make it read anything.
+SYS_PATH="/usr/bin:/bin"
+HASH_SECONDS=30
+# The program is expanded by the box user's bash, not here.
+# shellcheck disable=SC2016
+HERDR_HASH='[ -f "$1" ] && [ -x "$1" ] && [ ! -L "$1" ] || exit 3
+exec timeout "$2" sha256sum -- "$1"'
+herdr_is_pinned() {
+  local got
+  got="$(runuser -u "$BOX_USER" -- env -i PATH="$SYS_PATH" LANG=C \
+    bash -c "$HERDR_HASH" herdr-hash "$1" "$HASH_SECONDS" 2>/dev/null)" || return 1
+  [ "${got%% *}" = "$HERDR_SHA256" ]
+}
+# herdr_keep FILE: keep the installed herdr? Never run it to ask its version:
+# any agent can plant a herdr there, and root would run it. A dry run doesn't
+# look in the home at all, so it plans the download.
+herdr_keep() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '[dry-run] would check, as %s, that %s is a regular file with sha256 HERDR_SHA256; the plan below assumes it is not\n' \
+      "$BOX_USER" "$1"
+    return 1
+  fi
+  herdr_is_pinned "$1"
+}
+# <<< herdr-check
+
 if ! system_step; then
   log "skipped under --root: downloads into ${BOX_HOME}/.local/bin and /usr/local"
 else
   herdr_bin="$BOX_HOME/.local/bin/herdr"
   need=()
-  # Never run it to ask its version: any agent can plant a herdr there, and
-  # root would run it. Keep it only if it is the pinned release, by its hash.
-  if [ ! -L "$herdr_bin" ] && [ -f "$herdr_bin" ] && [ -x "$herdr_bin" ] \
-     && cb_verify "$herdr_bin" "$HERDR_SHA256" herdr 2>/dev/null; then
+  if herdr_keep "$herdr_bin"; then
     log "herdr ${HERDR_VERSION} present (sha256 matches HERDR_SHA256)"
   else
     need+=(herdr)
