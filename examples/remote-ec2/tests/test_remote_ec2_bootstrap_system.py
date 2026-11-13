@@ -8,8 +8,17 @@ system is a recording stub, and a dry run must never call one.
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
 import pytest
-from remote_ec2_support import BOOTSTRAP_SETTINGS, FAKE_SHA, FAKE_VOLUME_ID, FakeSystem
+from remote_ec2_support import (
+    BOOTSTRAP_SETTINGS,
+    FAKE_SHA,
+    FAKE_VOLUME_ID,
+    FakeSystem,
+    tree_snapshot,
+)
 
 VOLUME = {**BOOTSTRAP_SETTINGS, "DATA_VOLUME_ID": FAKE_VOLUME_ID}
 
@@ -186,12 +195,14 @@ def test_a_new_user_gets_a_pinned_uid_and_owns_local_before_user_installs(sandbo
     out = result.stdout
     assert "would run: groupadd --gid 2001 boxuser" in out
     assert "would run: useradd --uid 2001 --gid 2001 --home-dir /Users/boxuser --create-home" in out
+    # The user makes its own folders: root never runs `install -d -o` there.
     owned = index_of(
         result,
-        "would run: install -d -o boxuser -g boxuser -m 0755 /Users/boxuser/.local "
+        "would run: runuser -u boxuser -- env HOME=/Users/boxuser PATH=/Users/boxuser/.local/bin:"
+        "/usr/local/bin:/usr/bin:/bin install -d -m 0755 /Users/boxuser/.local "
         "/Users/boxuser/.local/bin /Users/boxuser/.config",
     )
-    herdr = index_of(result, "-- env HOME=/Users/boxuser")
+    herdr = index_of(result, "<download-dir>/herdr /Users/boxuser/.local/bin/herdr")
     assert owned < herdr
     # User-level installs run as the user, never as root.
     for needle in [
@@ -201,14 +212,15 @@ def test_a_new_user_gets_a_pinned_uid_and_owns_local_before_user_installs(sandbo
     ]:
         line = lines(result)[index_of(result, needle)]
         assert "would run: runuser -u boxuser -- env HOME=/Users/boxuser" in line, line
+    # Step 7 writes the config files as the user, so root changes no owner.
     for path in [
         "/Users/boxuser/.config/herdr/config.toml",
-        "/Users/boxuser/.config/herdr",
         "/Users/boxuser/.aws/cli-agent-orchestrator/settings.json",
-        "/Users/boxuser/.aws",
         "/Users/boxuser/.claude/settings.json",
     ]:
-        assert f"would run: chown boxuser:boxuser {path}\n" in out + "\n", path
+        assert f"would, as boxuser: keep {path} if it exists, else write it" in out, path
+    assert "chown" not in out
+    assert "would install config/" not in out
     assert sandbox.recorded_calls() == []
 
 
@@ -320,6 +332,95 @@ def test_a_missing_pin_stops_before_any_download(sandbox, drop, listed) -> None:
     assert result.returncode == 1
     assert listed in result.stderr
     assert "would run: curl" not in result.stdout
+
+
+# ------------------------------------------ the box user's home (P1-1, #1316)
+# Any agent can write in the box user's home. A re-run as root, also with
+# --dry-run, must never run a file from it, write through a link in it, or
+# change an owner through it.
+
+
+def box_home(sandbox) -> Path:
+    home = sandbox.root / "home-mount" / "boxuser"
+    home.mkdir(parents=True)
+    return home
+
+
+def plant_herdr(home: Path, marker: Path) -> bytes:
+    """A ~/.local/bin/herdr that leaves MARKER if anything runs it."""
+    body = f'#!/bin/sh\necho ran > "{marker}"\necho "herdr 0.9.3"\n'.encode()
+    herdr = home / ".local" / "bin" / "herdr"
+    herdr.parent.mkdir(parents=True)
+    herdr.write_bytes(body)
+    herdr.chmod(0o755)
+    return body
+
+
+def test_a_planted_herdr_is_never_run_and_is_downloaded_again(sandbox) -> None:
+    home = box_home(sandbox)
+    marker = sandbox.root / "herdr-ran"
+    plant_herdr(home, marker)
+    fake = FakeSystem(sandbox)
+    fake.home_owner = "2001"
+    result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not marker.exists(), "root ran a herdr from the box user's home"
+    assert "herdr v0.9.3 present" not in result.stdout
+    assert "releases/download/v0.9.3/herdr-linux-aarch64" in result.stdout
+    assert sandbox.recorded_calls() == []
+
+
+def test_a_herdr_with_the_pinned_hash_is_kept_without_running_it(sandbox) -> None:
+    home = box_home(sandbox)
+    marker = sandbox.root / "herdr-ran"
+    pinned = hashlib.sha256(plant_herdr(home, marker)).hexdigest()
+    fake = FakeSystem(sandbox)
+    fake.home_owner = "2001"
+    settings = {**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home), "HERDR_SHA256": pinned}
+    result = dry_run(sandbox, fake, **settings)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "herdr v0.9.3 present (sha256 matches HERDR_SHA256)" in result.stdout
+    assert "herdr-linux-aarch64" not in result.stdout
+    assert not marker.exists(), "root ran a herdr from the box user's home"
+
+
+def link_in_home(home: Path, name: str, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "keep.txt").write_text("not the box user's\n", encoding="utf-8")
+    (home / name).symlink_to(target)
+
+
+def test_a_config_folder_linked_to_a_root_folder_is_refused(sandbox) -> None:
+    home = box_home(sandbox)
+    target = sandbox.root / "root-owned"
+    link_in_home(home, ".config", target)
+    before = tree_snapshot(target)
+    fake = FakeSystem(sandbox)
+    fake.home_owner = "2001"
+    result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home)})
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"{home}/.config is a symlink; refusing" in result.stderr
+    assert "== 3." not in result.stdout, "the run must stop in step 2"
+    assert "install -d" not in result.stdout and "chown" not in result.stdout
+    assert tree_snapshot(target) == before
+    assert sandbox.recorded_calls() == []
+
+
+def test_a_claude_folder_linked_to_the_unit_folder_is_refused(sandbox) -> None:
+    home = box_home(sandbox)
+    units = sandbox.root / "fakeroot" / "etc" / "systemd" / "system"
+    link_in_home(home, ".claude", units)
+    before = tree_snapshot(units)
+    fake = FakeSystem(sandbox)
+    fake.home_owner = "2001"
+    result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home)})
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"{home}/.claude is a symlink; refusing" in result.stderr
+    assert "== 8." not in result.stdout, "the run must stop in step 7"
+    # Nothing in the plan changes an owner, inside the home or out of it.
+    assert "chown" not in result.stdout
+    assert tree_snapshot(units) == before
+    assert sandbox.recorded_calls() == []
 
 
 # ---------------------------------------------------- session name and units

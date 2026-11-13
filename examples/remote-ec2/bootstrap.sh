@@ -194,16 +194,93 @@ SYSFS="${BOX_TEST_SYSFS:-/sys}"
 FSTAB="${BOX_TEST_FSTAB:-/etc/fstab}"
 system_step() { [ -z "$ROOT" ]; }
 
-# chown_chain PATH: give BOX_USER PATH and every folder above it, up to (not
-# including) BOX_HOME. Only on a real run (not under --root).
-chown_chain() {
-  system_step || return 0
-  local p="$1"
-  while [ "$p" != "$BOX_HOME" ] && [ "$p" != "/" ] && [ "$p" != "." ]; do
-    run chown "$BOX_USER:$BOX_USER" "$p"
-    p="$(dirname "$p")"
+# The box user's home belongs to the agents: any of them can plant a file or a
+# symlink there. So root never runs a file from it, never writes in it and
+# never changes an owner through it. Every file operation in the home runs as
+# the box user (as_user, put_home_file), after no_links.
+# >>> home-helpers
+USER_PATH="$BOX_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+as_user() { run runuser -u "$BOX_USER" -- env HOME="$BOX_HOME" PATH="$USER_PATH" "$@"; }
+
+# no_links PATH...: refuse a symlink at PATH or at any folder between PATH and
+# the home. It only looks (lstat); it never follows a link.
+no_links() {
+  local p
+  for p in "$@"; do
+    while [ "$p" != "$HOME_DIR" ] && [ "$p" != "/" ] && [ "$p" != "." ]; do
+      if [ -L "$p" ]; then
+        die "${p} is a symlink; refusing (root never follows a link in ${BOX_HOME})"
+      fi
+      p="$(dirname "$p")"
+    done
   done
+  return 0
 }
+
+# home_put ACTION DEST MODE WANT < CONTENT: the home side of put_home_file. It
+# runs in its own bash with the box user's rights, so it uses nothing else
+# from this script. If DEST exists it is kept (and checked, for ACTION herdr
+# or cao); if not, CONTENT is written there with MODE.
+home_put() {
+  set -euo pipefail
+  local action="$1" dest="$2" mode="$3" want="$4" have tmp
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    case "$action" in
+      herdr)
+        if grep -Eq '^[[:space:]]*resume_agents_on_restore[[:space:]]*=[[:space:]]*false' "$dest"; then
+          printf '[bootstrap] herdr config already sets resume_agents_on_restore = false\n'
+        else
+          printf '[bootstrap] WARN: %s exists: add the lines from config/herdr-config.toml.snippet by hand\n' "$dest" >&2
+        fi
+        ;;
+      cao)
+        have="$(sed -n 's/.*"herdr_session"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest")"
+        have="${have%%$'\n'*}"
+        if [ -n "$want" ] && [ -n "$have" ] && [ "$have" != "$want" ]; then
+          printf '[bootstrap] ERROR: %s has herdr_session %s, but box.env says %s; make them match\n' \
+            "$dest" "$have" "$want" >&2
+          return 1
+        fi
+        printf '[bootstrap] kept existing: %s\n' "$dest"
+        ;;
+      *) printf '[bootstrap] kept existing: %s (compare with config/claude-settings.box.json.example)\n' "$dest" ;;
+    esac
+    return 0
+  fi
+  if [ "$action" = cao ] && [ -z "$want" ]; then
+    printf '[bootstrap] no box.env yet: %s is written on the first real run\n' "$dest"
+    return 0
+  fi
+  umask 077
+  mkdir -p -- "${dest%/*}"
+  tmp="$(mktemp "${dest}.XXXXXX")"
+  cat > "$tmp"
+  chmod "$mode" "$tmp"
+  mv -f -- "$tmp" "$dest"
+  printf '[bootstrap] wrote: %s\n' "$dest"
+}
+
+# put_home_file ACTION DEST MODE WANT LABEL < CONTENT: keep or write DEST in the
+# home, as the box user (as the user running this, under --root). Root only
+# streams CONTENT, which comes from this sample's own files.
+put_home_file() {
+  local action="$1" dest="$2" mode="$3" want="$4" label="$5" who prog
+  no_links "$dest"
+  if system_step; then who="$BOX_USER"; else who="the user running this"; fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '[dry-run] would, as %s: keep %s if it exists, else write it from %s (mode %s)\n' \
+      "$who" "$dest" "$label" "$mode"
+    return 0
+  fi
+  prog="$(declare -f home_put)"$'\n''home_put "$@"'
+  if system_step; then
+    runuser -u "$BOX_USER" -- env HOME="$BOX_HOME" PATH="$USER_PATH" \
+      bash -c "$prog" home_put "$action" "$dest" "$mode" "$want"
+  else
+    bash -c "$prog" home_put "$action" "$dest" "$mode" "$want"
+  fi
+}
+# <<< home-helpers
 
 # ---------------------------------------------------------- 1. data volume
 step "1. data volume ${DATA_VOLUME_ID:-<none>} -> ${DATA_MOUNT}"
@@ -320,7 +397,10 @@ else
   fi
 fi
 if system_step; then
-  run install -d -o "$BOX_USER" -g "$BOX_USER" -m 0755 "$BOX_HOME/.local" "$BOX_HOME/.local/bin" "$BOX_HOME/.config"
+  # As the user: root's `install -d -o` would follow a planted link (say
+  # ~/.config -> /etc) and give its target to the user.
+  no_links "$BOX_HOME/.local/bin" "$BOX_HOME/.config"
+  as_user install -d -m 0755 "$BOX_HOME/.local" "$BOX_HOME/.local/bin" "$BOX_HOME/.config"
 fi
 
 # ---------------------------------------------------------- 3. apt packages
@@ -356,7 +436,6 @@ fi
 
 # ------------------------------------------------------- 4. pinned tools
 step "4. pinned, checksum-verified tools: herdr, gh, AWS CLI v2, SAM CLI, yazi, hx, uv"
-as_user() { run runuser -u "$BOX_USER" -- env HOME="$BOX_HOME" PATH="$BOX_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" "$@"; }
 fetch() { run curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"; }
 
 # verify FILE SHA256 LABEL: stop the run on a missing or wrong checksum.
@@ -379,8 +458,11 @@ if ! system_step; then
 else
   herdr_bin="$BOX_HOME/.local/bin/herdr"
   need=()
-  if [ -x "$herdr_bin" ] && "$herdr_bin" --version 2>/dev/null | grep -Fqx "herdr ${HERDR_VERSION#v}"; then
-    log "herdr ${HERDR_VERSION} present"
+  # Never run it to ask its version: any agent can plant a herdr there, and
+  # root would run it. Keep it only if it is the pinned release, by its hash.
+  if [ ! -L "$herdr_bin" ] && [ -f "$herdr_bin" ] && [ -x "$herdr_bin" ] \
+     && cb_verify "$herdr_bin" "$HERDR_SHA256" herdr 2>/dev/null; then
+    log "herdr ${HERDR_VERSION} present (sha256 matches HERDR_SHA256)"
   else
     need+=(herdr)
   fi
@@ -588,41 +670,16 @@ fi
 # --------------------------------------------------------------- 7. config
 step "7. box config: herdr [session], CAO settings, Claude Code example"
 herdr_cfg="$HOME_DIR/.config/herdr/config.toml"
-if [ -f "$herdr_cfg" ] && grep -Eq '^[[:space:]]*resume_agents_on_restore[[:space:]]*=[[:space:]]*false' "$herdr_cfg"; then
-  log "herdr config already sets resume_agents_on_restore = false"
-elif [ -f "$herdr_cfg" ]; then
-  warn "$herdr_cfg exists: add the lines from config/herdr-config.toml.snippet by hand"
-else
-  install_file "$HERE/config/herdr-config.toml.snippet" "$herdr_cfg" 0644
-  chown_chain "$herdr_cfg"
-fi
+put_home_file herdr "$herdr_cfg" 0644 "" config/herdr-config.toml.snippet \
+  < "$HERE/config/herdr-config.toml.snippet"
 
 cao_settings="$HOME_DIR/.aws/cli-agent-orchestrator/settings.json"
-if [ -f "$cao_settings" ]; then
-  have_session="$(sed -n 's/.*"herdr_session"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cao_settings" | head -n 1)"
-  if [ -n "$session_now" ] && [ -n "$have_session" ] && [ "$have_session" != "$session_now" ]; then
-    die "$cao_settings has herdr_session ${have_session}, but box.env says ${session_now}; make them match"
-  fi
-  log "kept existing: $cao_settings"
-elif [ "$DRY_RUN" -eq 1 ]; then
-  printf '[dry-run] would write %s with terminal.herdr_session from box.env\n' "$cao_settings"
-  chown_chain "$cao_settings"
-elif [ -z "$session_now" ]; then
-  log "no box.env yet: $cao_settings is written on the first real run"
-else
-  mkdir -p "$(dirname "$cao_settings")"
-  sed "s/cao-<instance-id>/${session_now}/" "$HERE/config/cao-settings.json.snippet" > "$cao_settings"
-  chown_chain "$cao_settings"
-  log "wrote: $cao_settings"
-fi
+put_home_file cao "$cao_settings" 0644 "$session_now" "config/cao-settings.json.snippet (herdr_session from box.env)" \
+  < <(sed "s/cao-<instance-id>/${session_now:-cao-<instance-id>}/" "$HERE/config/cao-settings.json.snippet")
 
 claude_settings="$HOME_DIR/.claude/settings.json"
-if [ -e "$claude_settings" ]; then
-  log "kept existing: $claude_settings (compare with config/claude-settings.box.json.example)"
-else
-  install_file "$HERE/config/claude-settings.box.json.example" "$claude_settings" 0600
-  chown_chain "$claude_settings"
-fi
+put_home_file claude "$claude_settings" 0600 "" config/claude-settings.box.json.example \
+  < "$HERE/config/claude-settings.box.json.example"
 
 # ------------------------------------------------------- 8. scripts + units
 step "8. helper scripts and systemd units (enabled, NOT started)"

@@ -1,4 +1,5 @@
-"""Static checks on every shell script in the sample: bash -n and shellcheck."""
+"""Static checks on every shell script in the sample (bash -n, shellcheck),
+backup.sh's flag parsing, and the tests' hermetic PATH."""
 
 from __future__ import annotations
 
@@ -6,7 +7,14 @@ import shutil
 import subprocess
 
 import pytest
-from remote_ec2_support import BASH, SAMPLE_DIR, shell_scripts
+from remote_ec2_support import (
+    BASH,
+    HOST_DIRS,
+    SAMPLE_DIR,
+    link_host_tools,
+    shell_scripts,
+    write_stub,
+)
 
 SCRIPTS = shell_scripts()
 
@@ -62,3 +70,27 @@ def test_shellcheck_is_clean(script) -> None:
 def test_scripts_are_executable() -> None:
     for script in SCRIPTS:
         assert script.stat().st_mode & 0o111, f"{script.name} is not executable"
+
+
+@pytest.mark.parametrize("flag", ["--db", "--dest", "--keep"])
+def test_backup_flags_without_a_value_are_usage_errors(sandbox, flag) -> None:
+    result = sandbox.run("backup.sh", "--no-upload", flag)
+    assert result.returncode == 2, result.stderr
+    assert f"backup: {flag} needs a value" in result.stderr
+    assert "unbound variable" not in result.stderr
+
+
+PROBED = ["aws", "gh", "sam", "yazi", "ya", "hx", "uv", "uvx", "herdr", "systemctl", "runuser"]
+
+
+def test_the_test_path_never_has_the_hosts_probed_tools(tmp_path) -> None:
+    # A host with aws, gh, ... in a system folder (gh is in /usr/bin on GitHub's
+    # Ubuntu runners): none of them may reach the scripts under test.
+    host = tmp_path / "host-bin"
+    for name in [*PROBED, "cat"]:
+        write_stub(host, name, "exit 0\n")
+    folder = link_host_tools(tmp_path / "bin", (str(host), *HOST_DIRS))
+    names = {p.name for p in folder.iterdir()}
+    assert names.isdisjoint(PROBED), sorted(names & set(PROBED))
+    assert (folder / "cat").resolve() == (host / "cat").resolve()
+    assert {"bash", "sed", "awk", "grep", "mktemp"} <= names

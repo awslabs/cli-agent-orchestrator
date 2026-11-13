@@ -8,7 +8,13 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from remote_ec2_support import BASH, FAKE_INSTANCE_ID, OTHER_INSTANCE_ID, SAMPLE_DIR
+from remote_ec2_support import (
+    BASH,
+    FAKE_INSTANCE_ID,
+    OTHER_INSTANCE_ID,
+    SAMPLE_DIR,
+    system_path,
+)
 
 LIB = SAMPLE_DIR / "bin" / "lib-cao-box.sh"
 SESSION = f"cao-{FAKE_INSTANCE_ID}"
@@ -18,7 +24,7 @@ def call(snippet: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
     script = f'set -euo pipefail\n. "{LIB}"\n{snippet}\necho reached-the-end\n'
     return subprocess.run(
         [BASH, "-c", script],
-        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(tmp_path), "LANG": "C"},
+        env={"PATH": system_path(), "HOME": str(tmp_path), "LANG": "C"},
         capture_output=True,
         text=True,
         check=False,

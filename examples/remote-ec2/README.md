@@ -422,6 +422,13 @@ never point the laptop's CAO at the box's files.
   limit 1 keeps containers on a bridged network from reaching it (a
   `--network host` container still can). The ARN forms in
   [`iam/`](iam/README.md) are marked "check before use".
+- **Re-runs of `bootstrap.sh` don't trust the box user's home.** Any agent
+  can plant a file or a symlink there, and `bootstrap.sh` runs as root. So it
+  never runs a program from the home: it keeps `~/.local/bin/herdr` only if
+  its sha256 is `HERDR_SHA256`, and otherwise downloads herdr again. It
+  creates the home's folders and config files as the box user, and it stops
+  if it finds a symlink on their path. The only owner it changes is the home
+  folder's own, when a freshly mounted volume gives it to root.
 - **What's left.** Any agent can read anything the box user owns: other
   CLIs' login files, your kit, memory. Never give the box user `sudo` or the
   `docker` group unless you accept that every agent is root.
@@ -655,7 +662,10 @@ See also [herdr in CAO](../../docs/herdr.md).
 
 ## Testing this sample
 
-The tests need no network, no AWS, no root and no real servers.
+The tests need no network, no AWS, no root and no real servers. They don't
+depend on the host either: each one runs with umask 022, and with a PATH that
+holds only basic tools and the test's own stubs, so a host `aws` or `gh`
+changes nothing. CI runs them with the rest of the unit tests.
 
 ```bash
 uv run pytest examples/remote-ec2/tests -q --no-cov
@@ -671,6 +681,9 @@ They cover:
   the root disk, a wrong serial, partitions, holders, no flag), user and
   home ownership, pins and checksums, and `systemctl enable` without
   `--now`;
+- links and programs planted in the box user's home: a planted herdr never
+  runs, and a `~/.config`, `~/.claude` or settings file that links out of the
+  home stops the run before anything is written;
 - a `--root` dry run that must change nothing, a real `--root` run (file
   modes, no IMDS call), and the refusal on the wrong OS;
 - the cao-server socket gate;

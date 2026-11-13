@@ -4,21 +4,66 @@ Every test runs the sample's shell scripts as subprocesses with an explicit,
 minimal environment: a temp HOME, and a PATH that starts with a folder of
 stub commands (fake curl, systemctl, uname, ...). Nothing here touches the
 network, AWS, root-owned paths or a real service manager.
+
+The rest of that PATH is hermetic (system_path()): one folder of links to an
+allowlist of basic host tools. A host's aws, gh, sam, yazi, hx, uv or herdr is
+never on it, so bootstrap.sh's "is it installed?" probes see only the stubs a
+test puts there. conftest.py also fixes the umask at 022 for every test.
 """
 
 from __future__ import annotations
 
+import atexit
+import functools
 import os
 import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 
 SAMPLE_DIR = Path(__file__).resolve().parents[1]
 BASH = shutil.which("bash") or "/bin/bash"
-SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# Where system_path() looks for its tools, in order.
+HOST_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+# The basic tools the scripts and the stubs use. Anything a script probes for
+# (aws, gh, sam, yazi, hx, uv, herdr, sqlite3, systemctl, runuser, getent, ...)
+# is left out on purpose: a test that needs one writes a stub for it.
+HOST_TOOLS = (
+    "awk", "basename", "bash", "cat", "chmod", "cmp", "cp", "cut", "date", "dd",
+    "diff", "dirname", "env", "expr", "false", "find", "grep", "gunzip", "gzip",
+    "head", "id", "install", "ln", "ls", "mkdir", "mktemp", "mv", "od", "printf",
+    "readlink", "realpath", "rm", "rmdir", "sed", "seq", "sh", "sha256sum",
+    "shasum", "sleep", "sort", "stat", "tail", "tar", "tee", "touch", "tr",
+    "true", "uname", "uniq", "wc", "xargs", "zcat",
+)  # fmt: skip
+# The sqlite3 the backup tests skip on is the one the scripts get.
+SQLITE3 = shutil.which("sqlite3")
+
+
+def link_host_tools(folder: Path, host_dirs: tuple[str, ...] = HOST_DIRS) -> Path:
+    """Fill FOLDER with links to HOST_TOOLS (the first match in HOST_DIRS) and SQLITE3."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in HOST_TOOLS:
+        for host_dir in host_dirs:
+            tool = Path(host_dir) / name
+            if tool.is_file() and os.access(tool, os.X_OK):
+                (folder / name).symlink_to(tool)
+                break
+    if SQLITE3:
+        (folder / "sqlite3").symlink_to(SQLITE3)
+    return folder
+
+
+@functools.lru_cache(maxsize=None)
+def system_path() -> str:
+    """The hermetic system part of every test's PATH (built once per run)."""
+    folder = Path(tempfile.mkdtemp(prefix="remote-ec2-bin-"))
+    atexit.register(shutil.rmtree, folder, ignore_errors=True)
+    return str(link_host_tools(folder))
+
 
 # A made-up instance id, used by every test that needs one. The leak test
 # allows exactly this value and nothing else that looks like an instance id.
@@ -58,7 +103,7 @@ def sandbox(tmp_path: Path):
         def env(self, **extra: str) -> dict[str, str]:
             env = {
                 "HOME": str(home),
-                "PATH": f"{stubs}:{SYSTEM_PATH}",
+                "PATH": f"{stubs}:{system_path()}",
                 "LANG": "C",
                 "TMPDIR": str(tmp_path),
             }

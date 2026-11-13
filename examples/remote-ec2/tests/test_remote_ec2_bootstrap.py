@@ -424,3 +424,53 @@ def test_a_home_layout_never_reads_a_planted_state_folder(sandbox) -> None:
     assert (etc / "box.env").read_text(encoding="utf-8") == (
         f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n"
     )
+
+
+# ------------------------------- links planted in the box user's home (P1-1)
+# Under --root nobody else owns the tree, but step 7 must refuse a link in the
+# home the same way: the code is the code a real box runs, as the box user.
+
+
+@pytest.mark.parametrize(
+    ("link", "target", "written"),
+    [
+        (".claude", "etc/systemd/system", "settings.json"),
+        (".config", "root-owned", "herdr/config.toml"),
+        (".aws/cli-agent-orchestrator/settings.json", "etc/systemd/system/x.service", ""),
+    ],
+    ids=[
+        "claude-folder-to-units",
+        "config-folder-to-root-folder",
+        "cao-settings-dangling-to-a-unit",
+    ],
+)
+def test_a_real_root_run_never_writes_through_a_link_in_the_home(
+    sandbox, link, target, written
+) -> None:
+    root = make_root(sandbox.root)
+    seed_volume_box_env(root)
+    home = root / "Users" / "boxuser"
+    outside = root / target
+    if written:
+        outside.mkdir(parents=True)
+        (outside / "keep.txt").write_text("root's\n", encoding="utf-8")
+    else:
+        outside.parent.mkdir(parents=True)  # a dangling link: x.service doesn't exist
+    planted = home / link
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.symlink_to(outside)
+    watched = outside if written else outside.parent
+    before = tree_snapshot(watched)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"{planted} is a symlink; refusing" in result.stderr
+    assert tree_snapshot(watched) == before, "the run wrote through the link"
+    if written:
+        assert not (outside / written).exists()
+    else:
+        assert not outside.exists()
+    assert not any(c.startswith("chown") for c in sandbox.recorded_calls())
+    assert not (root / "etc" / "systemd" / "system" / "herdr-cao.service").exists()

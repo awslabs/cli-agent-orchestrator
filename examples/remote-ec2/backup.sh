@@ -29,11 +29,12 @@ s3_uri="${BACKUP_S3_URI:-}"
 kms_key="${BACKUP_KMS_KEY_ARN:-}"
 upload=1
 
+need_value() { [ -n "${2:-}" ] || { echo "backup: $1 needs a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --db) db="$2"; shift ;;
-    --dest) dest="$2"; shift ;;
-    --keep) keep="$2"; shift ;;
+    --db) need_value "$1" "${2:-}"; db="$2"; shift ;;
+    --dest) need_value "$1" "${2:-}"; dest="$2"; shift ;;
+    --keep) need_value "$1" "${2:-}"; keep="$2"; shift ;;
     --no-upload) upload=0 ;;
     -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "backup: unknown argument: $1" >&2; exit 2 ;;

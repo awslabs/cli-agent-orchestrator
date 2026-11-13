@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import gzip
 import os
-import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
-from remote_ec2_support import recording_stub, write_stub
+from remote_ec2_support import SQLITE3, recording_stub, write_stub
 
-pytestmark = pytest.mark.skipif(shutil.which("sqlite3") is None, reason="sqlite3 CLI missing")
+pytestmark = pytest.mark.skipif(SQLITE3 is None, reason="sqlite3 CLI missing")
 KMS_KEY = "arn:aws:kms:ap-southeast-2:0:key/test-key"
 
 
@@ -297,7 +296,7 @@ def test_live_restore_swaps_as_the_box_user_and_keeps_modes(sandbox) -> None:
 
 def test_live_restore_fails_if_the_live_db_is_not_the_restored_one(sandbox) -> None:
     box = LiveBox(sandbox)
-    box.on_start = f'/usr/bin/sqlite3 "{box.db}" "CREATE TABLE surprise (x)"'
+    box.on_start = f'"{SQLITE3}" "{box.db}" "CREATE TABLE surprise (x)"'
     backup, _ = a_backup(sandbox)
     result = box.restore(backup, "--yes")
     assert result.returncode == 1
@@ -353,7 +352,7 @@ def test_live_restore_refuses_when_a_sidecar_file_remains(sandbox, side) -> None
 
 def failing_integrity_sqlite(sandbox) -> None:
     """A sqlite3 wrapper that reports corruption on integrity_check, else the real CLI."""
-    real = shutil.which("sqlite3")
+    real = SQLITE3
     write_stub(
         sandbox.stubs,
         "sqlite3",
