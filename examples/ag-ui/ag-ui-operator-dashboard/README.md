@@ -22,6 +22,8 @@ fixtures/  frames captured from a real cao-server (see fixtures/README.md)
 e2e/       keyless end-to-end check: core/ driven headless against cao-server and mock_cli
 ```
 
+The page ships a minimal stylesheet, `view/styles.css` (no fonts or remote URLs; light, with a dark variant under `prefers-color-scheme`).
+
 ## Run it
 
 ```bash
