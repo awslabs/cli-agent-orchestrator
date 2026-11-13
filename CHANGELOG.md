@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Codex 0.167 folder-trust dialogs are accepted before the first input** (#1319).
+  Recognise the new "Trust this folder?" header and "enter continue · esc back"
+  footer while keeping earlier wordings and ignoring dismissed dialogs above the composer.
 - **`GET /terminals/{id}` reports whether a Kiro terminal passed its identity check** (#1131).
   The terminal now carries `identity_verified`, read from the row the Kiro input gate (#1074)
   already writes: `false` until the check passes, `true` after it, and `null` for other

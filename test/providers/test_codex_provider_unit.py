@@ -3071,6 +3071,138 @@ class TestCodexProviderMisc:
 class TestCodexProviderTrustPrompt:
     """Tests for Codex workspace trust prompt handling."""
 
+    _COMPOSER_V0167 = "\n› Ask Codex to do anything\n" "  GPT-6.1-Sol default · /tmp/demo\n"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_accepts_v0167_dialog(self, mock_backend, mock_sleep):
+        mock_backend.return_value.get_history.return_value = load_fixture(
+            "codex_trust_dialog_v0167.txt"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch(
+            "cli_agent_orchestrator.providers.codex.time",
+            fake_clock(0.0, 0.0, 0.0, 0.0, 100.0),
+        ):
+            await provider._handle_trust_prompt(outer_timeout=2.0)
+
+        mock_backend.return_value.send_special_key.assert_called_once_with(
+            "test-session", "window-0", "Enter"
+        )
+        mock_backend.return_value.send_keys.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_with_trust_prompt_v0167(
+        self, mock_backend, mock_wait_shell, mock_wait_status
+    ):
+        mock_wait_shell.return_value = True
+        codex_launched(mock_backend)
+        mock_wait_status.return_value = True
+        mock_backend.return_value.get_history.side_effect = frames(
+            load_fixture("codex_trust_dialog_v0167.txt"), SETTLED
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock):
+            result = await provider.initialize()
+
+        assert result is True
+        mock_backend.return_value.send_special_key.assert_called_once_with(
+            "test-session", "window-0", "Enter"
+        )
+
+    @pytest.mark.parametrize("initialized", [False, True])
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_trust_prompt_v0167_is_waiting(self, mock_backend, initialized):
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = load_fixture("codex_trust_dialog_v0167.txt")
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = initialized
+        provider.shell_baseline = "zsh"
+
+        # Neither the placeholder ABOVE the dialog nor its numbered selector
+        # is the idle composer. The active trust dialog owns this frame.
+        assert not _has_startup_idle_composer(output)
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.parametrize(
+        ("case", "expected"),
+        [
+            ("live", "trust"),
+            ("composer_below", "composer"),
+            ("header_only", "transitional"),
+            ("header_below_composer", "transitional"),
+            ("footer_above_header", "transitional"),
+            ("shared_footer_only", "transitional"),
+            ("wrapped", "trust"),
+            ("login_below", "login"),
+            ("update_below", "update"),
+        ],
+    )
+    def test_live_startup_block_v0167(self, case, expected):
+        dialog = load_fixture("codex_trust_dialog_v0167.txt")
+        header = "  Trust this folder?\n"
+        screens = {
+            "live": dialog,
+            "composer_below": dialog + self._COMPOSER_V0167,
+            "header_only": header,
+            "header_below_composer": self._COMPOSER_V0167 + header,
+            "footer_above_header": "enter continue · esc back\n" + header,
+            "shared_footer_only": header + "Press enter to continue\n",
+            "wrapped": dialog.replace("/tmp/demo", "/tmp/de\n  mo")
+            .replace("permission settings.", "permission\n  settings.")
+            .replace("enter continue · esc back", "enter continue ·\n  esc back"),
+            "login_below": header + TestLiveStartupBlock._LOGIN,
+            "update_below": header + TestLiveStartupBlock._UPDATE,
+        }
+
+        assert _live_startup_block(screens[case]) == expected
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_v0167_header_above_login_sends_no_key(
+        self, mock_backend, mock_sleep
+    ):
+        mock_backend.return_value.get_history.return_value = (
+            "Trust this folder?\n" + TestLiveStartupBlock._LOGIN
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert await provider._handle_trust_prompt(outer_timeout=2.0) == "settled"
+        mock_backend.return_value.send_special_key.assert_not_called()
+        mock_backend.return_value.send_keys.assert_not_called()
+
+    @pytest.mark.parametrize("quoted", [False, True])
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_trust_v0167_in_scrollback_does_not_false_positive(
+        self, mock_backend, quoted
+    ):
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = (
+            '• The dialog says "Trust this folder?" and remembers your choice.\n'
+            if quoted
+            else load_fixture("codex_trust_dialog_v0167.txt")
+        ) + self._COMPOSER_V0167
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+
+        assert provider.get_status(output) != TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.parametrize("variant", ["v1", "v2", "v0167"])
+    def test_live_startup_block_trust_variants(self, variant):
+        screens = {
+            "v1": TestLiveStartupBlock._TRUST_V1,
+            "v2": "Do you trust the contents of this directory?\nPress enter to continue\n",
+            "v0167": load_fixture("codex_trust_dialog_v0167.txt"),
+        }
+
+        assert _live_startup_block(screens[variant]) == "trust"
+
     @pytest.mark.parametrize(
         "placeholder",
         [

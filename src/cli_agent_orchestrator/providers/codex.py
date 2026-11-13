@@ -248,13 +248,17 @@ SHELL_PROMPT_ONLY_PATTERN = r"^[$%#>❯›»]\s*$"
 LAUNCH_COMMAND_PATTERN = r"(?P<prompt>.*[$%#>❯›»])\s*codex\b"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
-# Two known variants:
+# Three known variants:
 #   v0.98+: "allow Codex to work in this folder"
 #   v0.130+ (git worktree): "Do you trust the contents of this directory?"
-# Both indicate the TUI is blocked waiting for user input.
+#   v0.167+: "Trust this folder?" with footer "enter continue · esc back",
+#     not the shared "Press enter to continue" footer.
+# All indicate the TUI is blocked waiting for user input.
 TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
 TRUST_PROMPT_PATTERN_V2 = r"Do you trust the contents of this directory\?"
+TRUST_PROMPT_PATTERN_V3 = r"Trust this folder\?"
 TRUST_PROMPT_FOOTER = r"Press enter to continue"
+TRUST_PROMPT_FOOTER_V3 = r"enter\s+continue\s+·\s+esc\s+back"
 
 # First-run auth menu, shown when no OpenAI/Codex credentials are configured yet:
 #   Welcome to Codex, OpenAI's command-line coding agent
@@ -461,7 +465,8 @@ MODAL_FRAME_CHARS = "─│╭╮╰╯├┤━┃┏┓┗┛┣┫═║╔�
 MODAL_FRAME_GLYPHS = frozenset(MODAL_FRAME_CHARS) - frozenset(" \t")
 STARTUP_BLOCKING_INPUT_PATTERN = (
     rf"(?:{APPROVAL_MODAL_HEADER_PATTERN}|{APPROVAL_MODAL_CHOICE_PATTERN}|"
-    rf"{APPROVAL_PROMPT_PATTERN}|{APPROVAL_PROMPT_FOOTER}|{TRUST_PROMPT_FOOTER})"
+    rf"{APPROVAL_PROMPT_PATTERN}|{APPROVAL_PROMPT_FOOTER}|{TRUST_PROMPT_FOOTER}|"
+    rf"{TRUST_PROMPT_FOOTER_V3})"
 )
 STARTUP_IDLE_PLACEHOLDER_PATTERN = (
     rf"^\s*{IDLE_PROMPT_PATTERN}[^\S\n]+(?:"
@@ -898,7 +903,7 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
     """Name the startup state currently drawn lowest in the pane, if any.
 
     Returns ``"composer"`` (the idle composer), ``"trust"`` (workspace-trust
-    dialog, either wording), ``"update"`` (update-available dialog), ``"login"``
+    dialog, three wordings), ``"update"`` (update-available dialog), ``"login"``
     (first-run sign-in menu), ``"transitional"`` (a recognised header is being
     drawn below everything else complete, so the frame is mid-redraw and no key
     is safe) or ``None``. ``_handle_trust_prompt`` and ``get_status`` both take
@@ -935,8 +940,10 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
     It belongs to whichever block it is drawn under, so a block that renders one
     (update, login, the v2 trust header) must be followed by a footer to count
     at all; the v1 wording carries its own numbered options and has never had
-    one. The update dialog must additionally be followed by its numbered menu,
-    as the update-dialog check has always required.
+    one. The v3 trust header needs its own "enter continue · esc back" footer;
+    a shared footer under a later login/update dialog must not make it live.
+    The update dialog must additionally be followed by its numbered menu, as
+    the update-dialog check has always required.
 
     Offsets are only comparable because every match comes from the same string.
     Callers pass the bottom window, never the whole capture: a live dialog is by
@@ -950,19 +957,22 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
         return last
 
     footer_starts = [m.start() for m in re.finditer(TRUST_PROMPT_FOOTER, bottom_region)]
+    footer_v3_starts = [m.start() for m in re.finditer(TRUST_PROMPT_FOOTER_V3, bottom_region)]
 
-    def _footer_below(position: int) -> bool:
-        return any(start > position for start in footer_starts)
+    def _footer_below(position: int, starts: list[int]) -> bool:
+        return any(start > position for start in starts)
 
     candidates: Dict[str, int] = {}
 
     v1 = _last_start(TRUST_PROMPT_PATTERN)
     v2 = _last_start(TRUST_PROMPT_PATTERN_V2)
-    if v1 is not None or v2 is not None:
+    v3 = _last_start(TRUST_PROMPT_PATTERN_V3)
+    if v1 is not None or v2 is not None or v3 is not None:
         # One dialog can match both wordings (v0.130+ shows the v2 header over
         # the v1 option text), so trust is one block located by its lowest line.
-        trust = max(position for position in (v1, v2) if position is not None)
-        if v1 is not None or _footer_below(trust):
+        trust = max(position for position in (v1, v2, v3) if position is not None)
+        trust_footers = footer_v3_starts if trust == v3 else footer_starts
+        if v1 is not None or _footer_below(trust, trust_footers):
             candidates["trust"] = trust
 
     update = _last_start(UPDATE_DIALOG_PATTERN)
@@ -970,11 +980,11 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
         menu_below = any(
             m.start() > update for m in re.finditer(UPDATE_DIALOG_MENU_PATTERN, bottom_region)
         )
-        if menu_below and _footer_below(update):
+        if menu_below and _footer_below(update, footer_starts):
             candidates["update"] = update
 
     login = _last_start(LOGIN_MENU_PATTERN)
-    if login is not None and _footer_below(login):
+    if login is not None and _footer_below(login, footer_starts):
         candidates["login"] = login
 
     composer = _composer_position(bottom_region)
@@ -983,7 +993,7 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
 
     incomplete = [
         position
-        for name, position in (("trust", v2), ("update", update), ("login", login))
+        for name, position in (("trust", v2), ("trust", v3), ("update", update), ("login", login))
         if position is not None and name not in candidates
     ]
     if not candidates:
@@ -1977,9 +1987,10 @@ class CodexProvider(BaseProvider):
         that block is ever sent a key. Handles two classes of blocking dialog
         in a single poll loop:
 
-        1. Workspace trust prompt (two variants):
+        1. Workspace trust prompt (three variants):
              v0.98+: "allow Codex to work in this folder"
              v0.130+ (git worktree): "Do you trust the contents of this directory?"
+             v0.167+: "Trust this folder?"
            Dismissed with Enter (default = allow).
 
         2. Update-available dialog (defense-in-depth; normally suppressed via
@@ -2026,7 +2037,15 @@ class CodexProvider(BaseProvider):
             if live == "trust" and not trust_dismissed:
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-                wording = "v2" if re.search(TRUST_PROMPT_PATTERN_V2, bottom_region) else "v1"
+                wording = max(
+                    (match.start(), variant)
+                    for variant, pattern in (
+                        ("v1", TRUST_PROMPT_PATTERN),
+                        ("v2", TRUST_PROMPT_PATTERN_V2),
+                        ("v3", TRUST_PROMPT_PATTERN_V3),
+                    )
+                    for match in re.finditer(pattern, bottom_region)
+                )[1]
                 logger.info("Codex workspace trust prompt (%s) detected, auto-accepting", wording)
                 status_monitor.notify_input_sent(self.terminal_id)
                 await asyncio.to_thread(
@@ -2643,7 +2662,7 @@ class CodexProvider(BaseProvider):
         # Startup states, resolved ONCE and positionally, by the same function the
         # startup handler uses (``_live_startup_block``): trust wording (the menu
         # uses › which matches the idle prompt pattern, and PROCESSING_PATTERN
-        # matches "running" in "You are running Codex in..."), the v2 dialog, the
+        # matches "running" in "You are running Codex in..."), the v2/v3 dialogs, the
         # update dialog, the login menu, or a modal mid-redraw. Each is only
         # WAITING when it is the LOWEST thing drawn; the idle composer takes part
         # in that ordering, so the option line a dismissed v0.130+ trust dialog
