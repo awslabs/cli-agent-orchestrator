@@ -327,6 +327,123 @@ def test_l15_the_old_runtime_id_name_is_flagged_even_when_null():
     assert fired(data, "L15", i + 2, path), describe(data)
 
 
+def _host_snapshot(records: Records, entry: Dict[str, Any]):
+    i = find(records, "approve", frame_type("STATE_SNAPSHOT"))
+    records[i]["frame"]["snapshot"]["host"] = [entry]
+    return i
+
+
+GOOD_HOST = {
+    "runner_id": None,
+    "sampled_at": "2026-11-12T00:00:00+00:00",
+    "cpu_percent": 12,
+    "load_per_core": 0.5,
+    "memory_used_percent": 40,
+    "memory_pressure": "warn",
+}
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("hostname", "build-box"),  # a key outside the allow-list
+        ("cpu_percent", "12"),  # a string where a number belongs
+        ("cpu_percent", True),
+        ("memory_pressure", "SENTINEL"),
+        ("sampled_at", "yesterday"),
+    ],
+)
+def test_l16_host_entry_rejects_anything_but_numbers(key, value):
+    meta, records = split()
+    i = _host_snapshot(records, {**GOOD_HOST, key: value})
+    data = join(meta, records)
+    assert fired(data, "L16", i + 2, f"$.frame.snapshot.host[0].{key}"), describe(data)
+
+
+def test_l16_also_holds_a_state_delta_host_value():
+    """A patch cannot carry what a snapshot may not: the delta's /host value is held too."""
+    meta, records = split()
+    delta = {
+        "type": "STATE_DELTA",
+        "delta": [
+            {"op": "replace", "path": "/host", "value": [{**GOOD_HOST, "cpu_percent": "12"}]}
+        ],
+    }
+    data = join(meta, _appended(records, delta))
+    assert fired(data, "L16", len(records) + 2, "$.frame.delta[0].value[0].cpu_percent"), describe(
+        data
+    )
+    clean = {
+        "type": "STATE_DELTA",
+        "delta": [{"op": "replace", "path": "/host", "value": [GOOD_HOST]}],
+    }
+    assert not [
+        f for f in trace_leaks.check(join(meta, _appended(records, clean))) if f.rule_id == "L16"
+    ]
+
+
+@pytest.mark.parametrize("value", ["SENTINEL", 7, {"cpu_percent": 1}, ["SENTINEL"]])
+def test_l16_host_replaced_by_a_non_entry_is_a_finding(value):
+    """A /host op whose value is a scalar, an object or a list of scalars is not a host list."""
+    meta, records = split()
+    delta = {"type": "STATE_DELTA", "delta": [{"op": "replace", "path": "/host", "value": value}]}
+    data = join(meta, _appended(records, delta))
+    assert [f for f in trace_leaks.check(data) if f.rule_id == "L16"], describe(data)
+
+
+@pytest.mark.parametrize(
+    "frame,path",
+    [
+        ({"type": "TOOL_CALL_START", "toolCallId": "call_9f8e7d6c5b4a"}, "$.frame.toolCallId"),
+        ({"type": "RUN_STARTED", "runId": "run-fedcba98"}, "$.frame.runId"),
+        ({"type": "RUN_STARTED", "threadId": "thread-0123"}, "$.frame.threadId"),
+        (
+            {"type": "CUSTOM", "name": "x", "metadata": {"cao": {"sender": "build-box"}}},
+            "$.frame.metadata.cao.sender",
+        ),
+        (
+            {"type": "CUSTOM", "name": "x", "metadata": {"cao": {"receiver": "build-box"}}},
+            "$.frame.metadata.cao.receiver",
+        ),
+        (
+            {"type": "CUSTOM", "name": "cao.message_dispatched", "value": {"sender": "build-box"}},
+            "$.frame.value.sender",
+        ),
+    ],
+)
+def test_l17_an_untokenised_thread_run_tool_call_or_party_id(frame, path):
+    meta, records = split()
+    data = join(meta, _appended(records, frame))
+    assert fired(data, "L17", len(records) + 2, path), describe(data)
+
+
+def test_l17_a_raw_id_inside_a_state_delta_value_is_caught_by_the_snapshot_rules():
+    """The delta value is held to the path it patches, so a raw terminal id fires L5."""
+    meta, records = split()
+    delta = {
+        "type": "STATE_DELTA",
+        "delta": [{"op": "replace", "path": "/terminals", "value": [{"id": "e327d8c9"}]}],
+    }
+    data = join(meta, _appended(records, delta))
+    assert fired(data, "L5", len(records) + 2, "$.frame.delta[0].value[0].id"), describe(data)
+
+
+def _near_l17(meta: Dict[str, Any], records: Records) -> None:
+    ok = {
+        "type": "TOOL_CALL_START",
+        "toolCallId": "id-4",
+        "threadId": "cao-dojo-trace",
+        "runId": "approve-run-1",
+    }
+    records[:] = _appended(records, ok)
+    records[:] = _appended(
+        records, {"type": "CUSTOM", "name": "x", "metadata": {"cao": {"sender": "terminal-2"}}}
+    )
+    records[:] = _appended(
+        records, {"type": "CUSTOM", "name": "x", "metadata": {"cao": {"receiver": None}}}
+    )
+
+
 def _appended(records: Records, frame: Dict[str, Any]) -> Records:
     return records + [
         {
@@ -543,6 +660,10 @@ def _near_l15(meta: Dict[str, Any], records: Records) -> None:
 def _near_l14(meta: Dict[str, Any], records: Records) -> None:
     i = find(records, "approve", is_card)
     records[i]["frame"]["value"]["event_id"] = "id-7"
+
+
+def _near_l16(meta: Dict[str, Any], records: Records) -> None:
+    _host_snapshot(records, dict(GOOD_HOST))
 
 
 NEAR_MISSES: Dict[str, Callable[[Dict[str, Any], Records], None]] = {

@@ -55,6 +55,13 @@ test.describe("real stream", () => {
     // The role and source come from the profile catalog, not from the terminal row.
     await expect(cards.first()).toContainText("built-in");
     await expect(fleet.getByRole("button")).toHaveCount(0);
+    // Host resources: numbers from the real server's own machine. CPU may read "—" on the
+    // first sample (it needs a window), so only the figures that never need one are required.
+    const host = fleet.locator('section[aria-label="Host resources"]');
+    await expect(host).toContainText(/Memory used\s*\d+%/);
+    await expect(host).toContainText(/Load per core\s*\d+(\.\d)?/);
+    await expect(host.getByRole("button")).toHaveCount(0);
+    await host.screenshot({ path: join(ARTIFACTS, "host-strip-real.png") });
     await page.waitForTimeout(1500); // let the clip settle on the finished panel
     await fleet.screenshot({ path: join(ARTIFACTS, "fleet-panel-real.png") });
   });

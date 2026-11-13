@@ -112,6 +112,24 @@ WINDOW_KEYS = frozenset({"window", "tmux_window"})
 # local terminal, the only kind on main) stays ``null``; a string becomes ``runner-N``.
 RUNNER_KEYS = frozenset({"runner_id", "runnerId"})
 TIMESTAMP_KEYS = frozenset({"timestamp", "last_active", "expiresAt"})
+# The two ends of a message: a terminal id wherever a frame carries it (``metadata.cao`` on
+# an attributed frame, the value of ``cao.message_dispatched``). ``null`` stays ``null``.
+PARTY_KEYS = frozenset(
+    (
+        "sender",
+        "receiver",
+    )
+)
+# Free-form per-run identities a custom driver generates (the recorder pins its own). They
+# go through the ``id`` table, except the values the recorder itself sends, which are part of
+# the trace's shape and stay as they are.
+FREE_ID_KEYS = frozenset(
+    (
+        "threadId",
+        "runId",
+        "toolCallId",
+    )
+)
 
 TOKEN_PREFIX = {
     "id": "id",
@@ -149,6 +167,8 @@ def classify(path: Tuple[Any, ...]) -> Optional[str]:
         return "window"
     if key in RUNNER_KEYS:
         return "runner"
+    if key in PARTY_KEYS and path[0] == "frame":
+        return "terminal"
     # Positional identities: snapshot rows and interrupts.
     if isinstance(parent, int) and grandparent == "terminals" and key == "id":
         return "terminal"
@@ -159,12 +179,44 @@ def classify(path: Tuple[Any, ...]) -> Optional[str]:
     return None
 
 
+def snapshot_path(record: Mapping[str, Any], path: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """Map a STATE_DELTA op's value onto the snapshot path it patches.
+
+    ``frame.delta[i].value`` under an op with ``path: "/terminals"`` is held to the same rules
+    as ``frame.snapshot.terminals``, so a patch cannot carry what a snapshot may not. The
+    scrubber classifies through this and the leak rule reads through it too (one mapping, so
+    the two cannot drift).
+    """
+    frame = record.get("frame")
+    if (
+        len(path) >= 4
+        and path[0] == "frame"
+        and path[1] == "delta"
+        and isinstance(path[2], int)
+        and path[3] == "value"
+        and isinstance(frame, dict)
+        and frame.get("type") == "STATE_DELTA"
+    ):
+        ops = frame.get("delta") or []
+        op = ops[path[2]] if path[2] < len(ops) else None
+        pointer = op.get("path") if isinstance(op, dict) else None
+        if isinstance(pointer, str) and pointer.startswith("/"):
+            segments: List[Any] = []
+            for raw in pointer[1:].split("/"):
+                part = raw.replace("~1", "/").replace("~0", "~")
+                segments.append(int(part) if part.isdigit() else part)
+            return ("frame", "snapshot", *segments, *path[4:])
+    return path
+
+
 class _Tables:
     """First-seen remap tables, one per identity class, plus the clock."""
 
     def __init__(self) -> None:
         self.tables: Dict[str, Dict[str, str]] = {k: {} for k in TOKEN_PREFIX}
         self.ticks = 0
+        # The record being walked, so a STATE_DELTA value is classified by the path it patches.
+        self.record: Mapping[str, Any] = {}
 
     def token(self, kind: str, value: str) -> str:
         table = self.tables[kind]
@@ -197,7 +249,11 @@ def _walk(value: Any, path: Tuple[Any, ...], tables: _Tables) -> Any:
     key = path[-1] if path else None
     if isinstance(key, str) and key in TIMESTAMP_KEYS and isinstance(value, (str, int, float)):
         return tables.tick(value)
-    kind = classify(path)
+    if isinstance(key, str) and key in FREE_ID_KEYS and isinstance(value, str):
+        if value == THREAD_ID or value in RUN_IDS:
+            return value
+        return tables.token("id", value)
+    kind = classify(snapshot_path(tables.record, path))
     if kind is not None and isinstance(value, str):
         return tables.token(kind, value)
     return value
@@ -246,6 +302,7 @@ def normalise_records(raw: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         capture = record["capture"]
         seq[capture] = seq.get(capture, 0) + 1
         record["seq"] = seq[capture]
+        tables.record = record
         out.append(_walk(record, (), tables))
     return out
 

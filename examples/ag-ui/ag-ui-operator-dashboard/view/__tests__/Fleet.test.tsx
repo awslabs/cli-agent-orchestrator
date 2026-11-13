@@ -110,3 +110,43 @@ describe("the fleet panel", () => {
     expect(within(region()).getByRole("status").textContent).toContain("out of sync");
   });
 });
+
+describe("Host resources strip", () => {
+  const strip = () => screen.getByRole("region", { name: "Host resources" });
+  const snap = (host: unknown): Frame => ({
+    type: "STATE_SNAPSHOT",
+    snapshot: { sessions: [], terminals: [term("a")], counts: {}, scopes: [], host },
+  });
+
+  it("shows the local numbers, and no control", async () => {
+    const store = mount();
+    await feed(store, [
+      snap([
+        { runner_id: null, sampled_at: "2026-11-12T00:00:00+00:00", cpu_percent: 7, load_per_core: 0.4, memory_used_percent: 55, memory_pressure: "normal" },
+      ]),
+    ]);
+    const text = strip().textContent ?? "";
+    expect(text).toContain("7%");
+    expect(text).toContain("0.4");
+    expect(text).toContain("55%");
+    expect(text).toContain("normal");
+    expect(within(strip()).queryAllByRole("button")).toHaveLength(0);
+    expect(strip().querySelector("form,input,select,textarea")).toBeNull();
+  });
+
+  it("a missing field is a dash, never 0", async () => {
+    const store = mount();
+    await feed(store, [snap([{ runner_id: null, sampled_at: "2026-11-12T00:00:00+00:00", load_per_core: 0.4 }])]);
+    const text = strip().textContent ?? "";
+    expect(text).toContain("CPU—");
+    expect(text).toContain("Memory used—");
+    expect(text).toContain("Memory pressure—");
+    expect(text).not.toMatch(/CPU0/);
+  });
+
+  it("an empty or missing host says not reported", async () => {
+    const store = mount();
+    await feed(store, [snap([])]);
+    expect(strip().textContent).toContain("not reported");
+  });
+});

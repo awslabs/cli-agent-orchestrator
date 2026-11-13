@@ -23,7 +23,8 @@ Snapshot shape (kept in sync with ``cao_mcp_apps/src/shared/types.ts``):
 
 ``TerminalView.runner_id`` is the remote execution unit a terminal runs on, or ``None``
 for a local terminal (the only kind a row without the key can be). The AG-UI snapshot
-additionally carries ``profiles`` (see :func:`build_profile_catalog`).
+additionally carries ``profiles`` (see :func:`build_profile_catalog`) and ``host`` (a list of
+zero or one local-host resource entries, see ``services.host_resources``).
 
 Diff granularity (per the design):
 
@@ -40,7 +41,7 @@ from typing import Any, Dict, List, Optional
 
 # Top-level snapshot keys whose value is replaced wholesale (never diffed
 # element-by-element) when anything inside them changes.
-_WHOLE_KEY_REPLACE = frozenset({"terminals", "sessions", "profiles"})
+_WHOLE_KEY_REPLACE = frozenset({"terminals", "sessions", "profiles", "host"})
 
 
 def _escape_token(token: str) -> str:
@@ -180,7 +181,7 @@ def diff_snapshot(prev: Dict[str, Any], curr: Dict[str, Any]) -> List[Dict[str, 
 
     Granularity:
 
-    * keys in ``_WHOLE_KEY_REPLACE`` (``terminals`` / ``sessions``) emit a single
+    * keys in ``_WHOLE_KEY_REPLACE`` (``terminals`` / ``sessions`` / ``profiles`` / ``host``) emit a single
       whole-value ``replace`` when changed;
     * nested dict keys (e.g. ``counts``) are diffed **per-key**;
     * other scalars emit a per-key ``replace``;

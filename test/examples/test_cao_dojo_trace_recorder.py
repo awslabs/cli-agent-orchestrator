@@ -222,6 +222,105 @@ def test_ag_ui_1_0_attribution_ids_are_remapped():
     assert out_card["subagentRunId"] != out_card["parentSubagentRunId"]
 
 
+def _stream_record(frame: Dict[str, Any]) -> Dict[str, Any]:
+    return {"capture": "approve", "plane": "stream", "dir": "out", "frame": frame}
+
+
+def test_ids_in_a_state_delta_value_are_held_to_the_snapshot_path_they_patch():
+    """A delta that replaces ``/terminals`` or ``/sessions`` carries the same identities as a
+    snapshot, so they are tokenised through the same tables (scrub gap, found by #1166)."""
+    raw = raw_capture()
+    row = dict(raw[2]["frame"]["snapshot"]["terminals"][0])
+    row.update(runner_id="build-box-3.internal", session_name="my-secret-session")
+    raw.append(
+        _stream_record(
+            {
+                "type": "STATE_DELTA",
+                "delta": [
+                    {"op": "replace", "path": "/terminals", "value": [row]},
+                    {
+                        "op": "replace",
+                        "path": "/sessions",
+                        "value": [{"id": "my-secret-session", "name": "my-secret-session"}],
+                    },
+                ],
+            }
+        )
+    )
+    data = scrub.normalise(META, raw)
+    for leaked in ("e327d8c9", "build-box-3", "my-secret-session"):
+        assert leaked not in data.decode(), leaked
+    _, records = scrub.parse(data)
+    snap_row = records[2]["frame"]["snapshot"]["terminals"][0]
+    ops = records[-1]["frame"]["delta"]
+    assert ops[0]["value"][0]["id"] == snap_row["id"]  # one raw id, one token, either frame
+    assert ops[0]["value"][0]["runner_id"] == "runner-1"
+    session = ops[1]["value"][0]
+    assert session["id"].startswith("session-") and session["id"] == session["name"]
+    assert ops[0]["value"][0]["session_name"] == session["id"]  # the same raw name, one token
+
+
+def test_sender_and_receiver_ids_are_tokenised_and_null_stays_null():
+    raw = raw_capture()
+    raw[0]["frame"]["metadata"] = {"cao": {"sender": "aaaa1111", "receiver": "bbbb2222"}}
+    raw.append(
+        _stream_record({"type": "CUSTOM", "name": "x", "metadata": {"cao": {"sender": None}}})
+    )
+    raw.append(
+        _stream_record(
+            {
+                "type": "CUSTOM",
+                "name": "cao.message_dispatched",
+                "value": {"sender": "aaaa1111", "receiver": "cccc3333"},
+            }
+        )
+    )
+    data = scrub.normalise(META, raw)
+    for leaked in ("aaaa1111", "bbbb2222", "cccc3333"):
+        assert leaked not in data.decode(), leaked
+    _, records = scrub.parse(data)
+    meta = records[0]["frame"]["metadata"]["cao"]
+    assert scrub.TOKEN_RE.match(meta["sender"]) and meta["sender"].startswith("terminal-")
+    assert meta["receiver"].startswith("terminal-") and meta["receiver"] != meta["sender"]
+    assert records[-2]["frame"]["metadata"]["cao"]["sender"] is None
+    assert records[-1]["frame"]["value"]["sender"] == meta["sender"]
+
+
+def test_thread_run_and_tool_call_ids_are_tokenised_but_the_pinned_ones_stay():
+    raw = raw_capture()
+    raw.append(
+        _stream_record(
+            {
+                "type": "TOOL_CALL_START",
+                "toolCallId": "call_9f8e7d6c5b4a",
+                "threadId": "thread-0123456789abcdef",
+                "runId": "run-fedcba9876543210",
+            }
+        )
+    )
+    raw.append(
+        _stream_record(
+            {
+                "type": "TOOL_CALL_END",
+                "toolCallId": "call_9f8e7d6c5b4a",
+                "threadId": scrub.THREAD_ID,
+                "runId": scrub.run_id("approve", 1),
+            }
+        )
+    )
+    raw.append(_stream_record({"type": "TOOL_CALL_END", "toolCallId": None}))
+    data = scrub.normalise(META, raw)
+    for leaked in ("call_9f8e7d6c5b4a", "0123456789abcdef", "fedcba9876543210"):
+        assert leaked not in data.decode(), leaked
+    _, records = scrub.parse(data)
+    start, end, null = (records[-3]["frame"], records[-2]["frame"], records[-1]["frame"])
+    for key in ("toolCallId", "threadId", "runId"):
+        assert scrub.TOKEN_RE.match(start[key]) and start[key].startswith("id-"), key
+    assert start["toolCallId"] == end["toolCallId"]  # one raw id, one token
+    assert (end["threadId"], end["runId"]) == (scrub.THREAD_ID, scrub.run_id("approve", 1))
+    assert null["toolCallId"] is None
+
+
 def test_raw_and_rewrapped_customs_are_dropped():
     raw = raw_capture()
     extra = [

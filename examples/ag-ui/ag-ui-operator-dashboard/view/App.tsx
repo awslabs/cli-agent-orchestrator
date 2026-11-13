@@ -188,6 +188,7 @@ function FleetPanel({ fleet }: { fleet: Fleet }) {
           snapshot, which a reconnect brings.
         </p>
       ) : null}
+      <HostStrip fleet={fleet} />
       {groups.length === 0 ? <p>No terminals yet.</p> : null}
       {groups.map((group) => (
         <section key={group.runnerId === null ? "group:local" : `runner:${group.runnerId}`} aria-label={`Runner ${group.label}`}>
@@ -212,6 +213,40 @@ function FleetPanel({ fleet }: { fleet: Fleet }) {
           ))}
         </section>
       ))}
+    </section>
+  );
+}
+
+const shown = (value: number | null, unit = ""): string => (value === null ? "—" : `${value}${unit}`);
+
+/** Host resources. Numbers only; a missing one is "—", never 0. The server reports the local host only. */
+function HostStrip({ fleet }: { fleet: Fleet }) {
+  const local = fleet.host.find((entry) => entry.runnerId === null) ?? null;
+  return (
+    <section aria-label="Host resources">
+      <p>
+        <strong>Host resources</strong>
+      </p>
+      {local === null ? (
+        <p>Host resources: not reported.</p>
+      ) : (
+        <dl>
+          <dt>CPU</dt>
+          <dd>{shown(local.cpuPercent, "%")}</dd>
+          <dt>Load per core</dt>
+          <dd>{shown(local.loadPerCore)}</dd>
+          <dt>Memory used</dt>
+          <dd>{shown(local.memoryUsedPercent, "%")}</dd>
+          <dt>Memory pressure</dt>
+          <dd>{local.memoryPressure ?? "—"}</dd>
+        </dl>
+      )}
+      <p>
+        <small>
+          Local host only. Numbers refresh when the fleet changes and at most every 30 seconds, so an idle fleet
+          shows the last sample{local?.sampledAt ? ` (taken ${local.sampledAt})` : ""}.
+        </small>
+      </p>
     </section>
   );
 }

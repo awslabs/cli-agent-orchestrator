@@ -13,7 +13,7 @@
  * cannot reach the view.
  *
  * The delta applier handles only the operations the server sends (whole-key `replace`
- * of `/terminals`, `/sessions` and `/profiles`, and per-key `add`, `replace` and
+ * of `/terminals`, `/sessions`, `/profiles` and `/host`, and per-key `add`, `replace` and
  * `remove` under `/counts`). It is all-or-nothing: if any operation in a delta is not
  * understood, none is applied, the fleet keeps what it had and is marked `stale` until
  * the next `STATE_SNAPSHOT`. It never throws and never applies half a patch.
@@ -50,6 +50,19 @@ export interface ProfileEntry {
   loadable: boolean;
 }
 
+/**
+ * One host resource entry. Numbers only; a field the server could not read is `null` here
+ * (absent on the wire), and the view shows it as "not reported", never as 0.
+ */
+export interface HostEntry {
+  runnerId: string | null;
+  sampledAt: string | null;
+  cpuPercent: number | null;
+  loadPerCore: number | null;
+  memoryUsedPercent: number | null;
+  memoryPressure: "normal" | "warn" | "critical" | null;
+}
+
 export interface Fleet {
   /** A `STATE_SNAPSHOT` has been folded. Deltas before that are ignored. */
   hydrated: boolean;
@@ -59,10 +72,12 @@ export interface Fleet {
   terminals: FleetTerminal[];
   counts: Record<string, number>;
   profiles: ProfileEntry[];
+  /** Host resources, one entry per runner that reported (the server only reports the local host). */
+  host: HostEntry[];
 }
 
 export function emptyFleet(): Fleet {
-  return { hydrated: false, stale: false, sessions: [], terminals: [], counts: {}, profiles: [] };
+  return { hydrated: false, stale: false, sessions: [], terminals: [], counts: {}, profiles: [], host: [] };
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -93,6 +108,22 @@ function toProfile(row: unknown): ProfileEntry | null {
   return { name: row.name, source: str(row.source), role: strOrNull(row.role), loadable: row.loadable === true };
 }
 
+const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+const PRESSURE = ["normal", "warn", "critical"] as const;
+
+function toHost(row: unknown): HostEntry | null {
+  if (!isObject(row)) return null;
+  const pressure = PRESSURE.find((level) => level === row.memory_pressure) ?? null;
+  return {
+    runnerId: strOrNull(row.runner_id),
+    sampledAt: strOrNull(row.sampled_at),
+    cpuPercent: num(row.cpu_percent),
+    loadPerCore: num(row.load_per_core),
+    memoryUsedPercent: num(row.memory_used_percent),
+    memoryPressure: pressure,
+  };
+}
+
 function listOf<T>(value: unknown, convert: (row: unknown) => T | null): T[] {
   if (!Array.isArray(value)) return [];
   return value.map(convert).filter((row): row is T => row !== null);
@@ -113,6 +144,7 @@ function fromSnapshot(snapshot: Record<string, unknown>): Fleet {
     terminals: listOf(snapshot.terminals, toTerminal),
     counts: toCounts(snapshot.counts),
     profiles: listOf(snapshot.profiles, toProfile),
+    host: listOf(snapshot.host, toHost),
   };
 }
 
@@ -135,6 +167,9 @@ function applyOp(fleet: Fleet, op: unknown): boolean {
         return true;
       case "profiles":
         fleet.profiles = remove ? [] : listOf(op.value, toProfile);
+        return true;
+      case "host":
+        fleet.host = remove ? [] : listOf(op.value, toHost);
         return true;
       case "counts":
         fleet.counts = remove ? {} : toCounts(op.value);

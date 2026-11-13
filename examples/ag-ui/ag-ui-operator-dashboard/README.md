@@ -11,7 +11,12 @@ surfaces and nothing else:
   from anything an agent wrote. It has no controls. A delta the dashboard does not
   understand is not applied: the panel shows a banner that it may be out of sync, and
   it does not ask the server for a new snapshot. Recovery is a reconnect, which
-  starts a new run and sends one.
+  starts a new run and sends one. A **Host resources** strip above the groups shows
+  the snapshot's `host` entry for the machine running `cao-server`: CPU %, load per
+  core, memory used and memory pressure, as numbers. A figure the server could not
+  read shows `—`, never 0 (CPU shows a dash until two samples 30 to 60 seconds apart
+  exist), and no entry shows "not reported". It refreshes when the fleet changes and
+  at most every 30 seconds, so an idle fleet shows its last sample.
 - **Approvals**, from the run plane (`POST /agui/v1/run`). When a terminal is
   waiting on a permission prompt, the run ends `RUN_FINISHED(interrupt)` and the
   dashboard shows a card for each open interrupt. You answer Approve, Deny, or

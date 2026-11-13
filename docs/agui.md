@@ -93,6 +93,7 @@ keep it current. Its keys:
 | `counts` | `{sessions, terminals}`. Patched per key |
 | `scopes` | The scopes the caller holds |
 | `profiles` | The profile catalog, below. Present on the ambient stream only |
+| `host` | Host resources, below. Ambient stream only, local host only, numbers only. Replaced whole |
 
 `runner_id` is a label for the remote runner a terminal runs on, or `null` for
 a local terminal. It is the only runner field on the wire, and it is metadata:
@@ -109,6 +110,42 @@ description, prompt, tools and MCP servers of a profile are not on the wire. It
 is read with the same scopes as `GET /agents/profiles`, it is scanned at most
 every 30 seconds rather than per event, and it is not scoped to a tenant or an
 owner (that is #778). No AG-UI route writes a profile.
+
+**Host resources.** `host` is a list of zero or one entries for the machine that
+runs `cao-server`: `{runner_id: null, sampled_at, cpu_percent, load_per_core,
+memory_used_percent, memory_pressure}`. Every number is a plain number
+(`cpu_percent` and `memory_used_percent` are integers, `load_per_core` has one
+decimal), and `memory_pressure` is `normal`, `warn` or `critical`. No process
+name, argument, path, host name or user is in it, and there is no per-terminal
+figure. A value the server could not read is left out, never sent as 0, and
+`host: []` or a missing key both mean "not reported". Only the local host is
+probed, so a remote runner has no entry.
+
+- It rides the ambient stream only, under the same switch as `profiles`, so the
+  deprecated legacy framing, the run plane and MCP Apps never carry it.
+- It is read with the same scopes as the rest of the snapshot, has no write
+  path and adds no route.
+- It is sampled at most every 30 seconds, off the event loop: the stream serves the
+  cached sample and a stale one starts a background refresh, so a snapshot taken
+  just after the 30 seconds lapse shows the previous sample (`sampled_at` says when)
+  and the next one the new sample. The stream recomputes the snapshot when the fleet
+  changes, so an idle fleet keeps its last sample, and each refresh changes
+  `sampled_at`, which is one whole-key `/host` replace per 30 seconds of fleet
+  activity and never one per event. It is cheap by design (#519's laptop rule): no
+  timer of its own, one probe per 30 seconds of activity.
+- CPU needs two samples 30 to 60 seconds apart. The first sample after start has no
+  `cpu_percent`, and neither has a sample taken more than 60 seconds after the
+  previous one, so after a quiet spell the first reading shows a dash and the
+  second shows a figure.
+- `memory_used_percent` is `psutil`'s available-based figure, `100 * (total -
+  available) / total`. It is not the "used" of Activity Monitor or `top`, so compare
+  those only loosely.
+- `memory_pressure` is a heuristic, and it is not comparable across platforms.
+  On Linux it is the kernel's PSI `some avg10` figure for memory (below 10
+  `normal`, below 40 `warn`, else `critical`), omitted when PSI is not
+  available. On macOS it is the kernel's own pressure level. Other platforms
+  report none. A container's CPU or memory limit (cgroup quota) is not seen:
+  the numbers are the host's.
 
 ### Event mapping
 

@@ -108,6 +108,13 @@ def _supervisor_by_runner() -> List[Dict[str, Any]]:
     return dash.by_runner()
 
 
+def _host_entries() -> List[Dict[str, Any]]:
+    from cli_agent_orchestrator.services import host_resources
+
+    host_resources.reset_host_sampler()
+    return host_resources.refresh_host_now()
+
+
 #: Every projection that names a terminal, by the thing that builds it.
 PROJECTIONS = {
     "fleet snapshot terminals (ui_state_service.build_dashboard_snapshot)": (
@@ -115,6 +122,7 @@ PROJECTIONS = {
     ),
     "agent detail snapshot (ui_state_service.build_agent_detail_snapshot)": (_agent_detail_runner),
     "SupervisorDashboardStream.by_runner": _supervisor_by_runner,
+    "host resource view (host_resources.sample_host)": _host_entries,
 }
 
 #: AG-UI constructs that deliberately do NOT carry ``runner_id`` today, with the reason.
@@ -165,8 +173,8 @@ def test_every_agui_construct_has_a_runner_decision() -> None:
     assert all(reason.strip() for reason in EXEMPT.values())
 
 
-def test_registry_covers_all_three_builders() -> None:
-    assert len(PROJECTIONS) == 3
+def test_registry_covers_all_four_builders() -> None:
+    assert len(PROJECTIONS) == 4
 
 
 # --- value tests ------------------------------------------------------------------------
@@ -397,3 +405,11 @@ def test_the_wire_has_no_runtime_id_key(monkeypatch: pytest.MonkeyPatch) -> None
     with client.stream("GET", "/agui/v1/stream") as resp:
         body = "".join(resp.iter_text())
     assert "runtime_id" not in body and '"runner_id"' in body
+
+
+def test_host_projection_entries_carry_runner_id() -> None:
+    """The host view is a registered projection: every entry has ``runner_id`` present."""
+    entries = PROJECTIONS["host resource view (host_resources.sample_host)"]()
+    assert entries, "psutil/os give a value on every CI platform: the guard must not be vacuous"
+    assert all("runner_id" in e and e["runner_id"] is None for e in entries)
+    assert not any("runtime_id" in e for e in entries), "the old name must not be on the wire"

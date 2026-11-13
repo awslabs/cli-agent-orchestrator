@@ -1666,6 +1666,17 @@ def _sweep_workflow_runs_at_startup() -> None:
         logger.warning("workflow retention sweep failed at startup: %s", e)
 
 
+async def _prime_host_sampler_if_enabled() -> None:
+    """Take the host CPU baseline at start-up, only when the AG-UI surface is on.
+
+    Without it the first real host sample has no CPU window and reports no ``cpu_percent``.
+    """
+    if _agui_enabled():
+        from cli_agent_orchestrator.services.host_resources import prime_host_sampler
+
+        await asyncio.to_thread(prime_host_sampler)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -1682,6 +1693,7 @@ async def lifespan(app: FastAPI):
     from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run_hook
 
     _ambient_run_hook.install_signal_stop_hook()
+    await _prime_host_sampler_if_enabled()
     # issues #406 / #709: exactly one cao-server per CAO_HOME_DIR. Taken before
     # the database, the recovery sweeps, the terminal registry, the status
     # monitor and uvicorn's port bind (uvicorn binds after lifespan startup), so
@@ -2405,7 +2417,7 @@ def _agui_profile_catalog() -> List[Dict]:
     now = time.monotonic()
     cached = _agui_profile_catalog_cache
     if cached is not None and now - cached[0] < _AGUI_PROFILE_CATALOG_TTL_SECONDS:
-        return cached[1]
+        return [dict(entry) for entry in cached[1]]
     from cli_agent_orchestrator.services.ui_state_service import build_profile_catalog
 
     try:
@@ -2416,7 +2428,7 @@ def _agui_profile_catalog() -> List[Dict]:
         logger.debug("agui_stream: profile catalog scan failed", exc_info=True)
         catalog = []
     _agui_profile_catalog_cache = (now, catalog)
-    return catalog
+    return [dict(entry) for entry in catalog]
 
 
 def _agui_fleet_snapshot(scopes: List[str], *, profiles: bool = True) -> Dict:
@@ -2448,6 +2460,11 @@ def _agui_fleet_snapshot(scopes: List[str], *, profiles: bool = True) -> Dict:
     snapshot = build_dashboard_snapshot(sessions, terminals, scopes)
     if profiles:
         snapshot["profiles"] = _agui_profile_catalog()
+        # The host view follows the SAME flag as the catalog, so the three call sites
+        # cannot diverge. Numbers only; ``[]`` means "not reported".
+        from cli_agent_orchestrator.services.host_resources import sample_host
+
+        snapshot["host"] = sample_host()
     return snapshot
 
 

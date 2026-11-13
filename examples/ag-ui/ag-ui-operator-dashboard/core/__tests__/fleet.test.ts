@@ -274,7 +274,7 @@ describe("every shape the server may send, and the wrong ones", () => {
 
   it("a top-level key the server does not send is not understood", () => {
     const base = fold([snap()]);
-    expect(reduceFleet(base, delta({ op: "add", path: "/host", value: {} })).stale).toBe(true);
+    expect(reduceFleet(base, delta({ op: "add", path: "/not-a-fleet-key", value: {} })).stale).toBe(true);
   });
 
   it("a path deeper than the server sends is not understood", () => {
@@ -310,5 +310,51 @@ describe("the card for a catalog entry that says less", () => {
       source: "local",
       loadable: "no",
     });
+  });
+});
+
+describe("host resources", () => {
+  const host = (extra: Record<string, unknown> = {}) => ({
+    runner_id: null,
+    sampled_at: "2026-11-12T00:00:00+00:00",
+    cpu_percent: 12,
+    load_per_core: 0.5,
+    memory_used_percent: 40,
+    memory_pressure: "warn",
+    ...extra,
+  });
+
+  it("folds the host list from a snapshot; a field the server omitted is null, never 0", () => {
+    const fleet = fold([snapshot({ terminals: [], host: [host({ cpu_percent: undefined })] })]);
+    expect(fleet.host).toEqual([
+      {
+        runnerId: null,
+        sampledAt: "2026-11-12T00:00:00+00:00",
+        cpuPercent: null,
+        loadPerCore: 0.5,
+        memoryUsedPercent: 40,
+        memoryPressure: "warn",
+      },
+    ]);
+  });
+
+  it("a snapshot with no host key (older server, or not reported) is an empty list", () => {
+    expect(fold([snapshot({ terminals: [] })]).host).toEqual([]);
+    expect(fold([snapshot({ terminals: [], host: "x" })]).host).toEqual([]);
+  });
+
+  it("applies a whole-key replace of /host and a remove, and keeps the rest of the fleet", () => {
+    const base = snapshot({ terminals: [term("a")], host: [host()] });
+    const replaced = fold([base, delta({ op: "replace", path: "/host", value: [host({ cpu_percent: 90 })] })]);
+    expect(replaced.host[0].cpuPercent).toBe(90);
+    expect(replaced.terminals).toHaveLength(1);
+    expect(replaced.stale).toBe(false);
+    expect(fold([base, delta({ op: "remove", path: "/host" })]).host).toEqual([]);
+  });
+
+  it("drops junk entries and an unknown pressure level", () => {
+    const fleet = fold([snapshot({ terminals: [], host: [7, null, host({ memory_pressure: "SENTINEL" })] })]);
+    expect(fleet.host).toHaveLength(1);
+    expect(fleet.host[0].memoryPressure).toBeNull();
   });
 });

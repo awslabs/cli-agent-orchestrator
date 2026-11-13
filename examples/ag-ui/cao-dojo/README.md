@@ -172,7 +172,7 @@ fails the recording as the approval bridge's expiry race, never as drift.
 
 | Gate | Where | Command |
 |---|---|---|
-| Leak rule (L1-L14: a mutation case and a near miss for each) | pre-commit, and the Unit Tests job | `uv run pytest test/examples/test_cao_dojo_trace_leaks.py` |
+| Leak rule (L1-L17: a mutation case and a near miss for each) | pre-commit, and the Unit Tests job | `uv run pytest test/examples/test_cao_dojo_trace_leaks.py` |
 | Replay, tier 1 (SDK models, closed shape, lifecycle, cross-plane, upstream controls) | pre-push, and the Unit Tests job | `uv run pytest test/examples/test_cao_dojo_trace_replay.py test/examples/test_cao_dojo_trace_recorder.py` |
 | Replay, tier 1 with upstream `enforceEvents` and `verifyEvents` | CI | `node examples/ag-ui/ag-ui-stock-client-live/verify-trace.mjs <trace.ndjson>...` |
 | Keyless approve/reject/none e2e and tier 2 drift | CI | `uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --mock --check` |

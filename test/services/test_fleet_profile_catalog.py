@@ -313,3 +313,20 @@ def test_emit_ui_allow_list_is_frozen() -> None:
     assert GENERATIVE_UI_COMPONENTS == frozenset(
         {"approval_card", "choice_prompt", "diff_summary", "progress", "metric", "agent_card"}
     )
+
+
+def test_the_catalog_is_returned_as_copies(
+    monkeypatch: pytest.MonkeyPatch, scans: List[int]
+) -> None:
+    """The cache is shared across streams: a caller that edits its result must not edit it."""
+    first = main._agui_profile_catalog()
+    # A shallow copy per entry is enough because an entry holds only scalars (the wire shape
+    # is name, source, role, loadable); this pins that, so a nested value forces a deepcopy.
+    assert all(
+        not isinstance(v, (dict, list, set, tuple)) for entry in first for v in entry.values()
+    )
+    first[0]["name"] = "changed"
+    first.append({"name": "extra"})
+    again = main._agui_profile_catalog()
+    assert [p["name"] for p in again] == ["dev", "sup"]
+    assert len(scans) == 1

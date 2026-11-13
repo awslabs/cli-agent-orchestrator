@@ -7,7 +7,7 @@ so a scrubber bug shows up here instead of being trusted.
 
 Each rule is either **path-scoped** (it applies only at the listed keys) or
 **global** (it applies to every string value outside ``_meta``). The rule ids
-(L1-L14) are stable: ``test_cao_dojo_trace_leaks.py`` injects one leak per
+(L1-L17) are stable: ``test_cao_dojo_trace_leaks.py`` injects one leak per
 rule and asserts that exact id fires at that exact path, so deleting a rule
 fails its own test. A near miss per rule pins the other edge, so widening a
 rule fails too.
@@ -28,7 +28,7 @@ import socket
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Tuple
 
-from trace_scrub import CAO_GENERATIVE_UI, META_KEYS, parse
+from trace_scrub import CAO_GENERATIVE_UI, META_KEYS, parse, snapshot_path
 
 # --- Findings ------------------------------------------------------------------
 
@@ -79,6 +79,45 @@ L8_KEYS = frozenset({"window", "tmux_window"})
 L15_KEYS = frozenset({"runner_id", "runnerId"})
 # The name 3.0 replaced. It is never tokenised, so any value under it is a raw label.
 L15_OLD_KEYS = frozenset({"runtime_id", "runtimeId"})
+# L16: the host resource entry (#1155) is numbers only. Under ``host[i]`` only these keys
+# may appear; a number, an enum level and an ISO timestamp are the only value shapes.
+# ``runner_id`` there is held by L15. It holds a STATE_SNAPSHOT's ``host`` and, through
+# ``_logical``, a STATE_DELTA op on ``/host``.
+L16_NUMERIC_KEYS = frozenset(
+    (
+        "cpu_percent",
+        "load_per_core",
+        "memory_used_percent",
+    )
+)
+L16_KEYS = L16_NUMERIC_KEYS.union(
+    (
+        "runner_id",
+        "sampled_at",
+        "memory_pressure",
+    )
+)
+L16_PRESSURE = frozenset({"normal", "warn", "critical"})
+L16_ISO = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+# L17: per-run identities a driver generates (``threadId``, ``runId``, ``toolCallId``) and the
+# two ends of a message (``sender``, ``receiver``). Each must be a scrubber token, or one of
+# the values the recorder itself pins; ``null`` is fine. The pinned values are written out
+# here on purpose, not imported, so a change to the scrubber's table cannot widen this rule.
+L17_ID_KEYS = frozenset(
+    (
+        "threadId",
+        "runId",
+        "toolCallId",
+    )
+)
+L17_PARTY_KEYS = frozenset(
+    (
+        "sender",
+        "receiver",
+    )
+)
+PINNED_THREAD = "cao-dojo-trace"
+PINNED_RUN = re.compile(r"^(none|approve|reject)-run-[12]$")
 # L14: generated ids. Kept apart from the scrubber's ID_KEYS on purpose, so a key
 # dropped there still fails here. A raw AG-UI 1.0 session attribution
 # (``session:<16 hex>``) under one of these keys fails here by key, whatever its form.
@@ -187,32 +226,12 @@ def _key(path: Tuple[Any, ...], depth: int = 1) -> Any:
 
 
 def _logical(record: dict, path: Tuple[Any, ...]) -> Tuple[Any, ...]:
-    """Map a STATE_DELTA op's value onto the snapshot path it patches.
+    """The snapshot path a STATE_DELTA op's value patches (the scrubber's own mapping)."""
+    return snapshot_path(record, path)
 
-    ``frame.delta[i].value`` under an op with ``path: "/terminals"`` is held to
-    the same rules as ``frame.snapshot.terminals``, so a patch cannot carry what
-    a snapshot may not.
-    """
-    frame = record.get("frame")
-    if (
-        len(path) >= 4
-        and path[0] == "frame"
-        and path[1] == "delta"
-        and isinstance(path[2], int)
-        and path[3] == "value"
-        and isinstance(frame, dict)
-        and frame.get("type") == "STATE_DELTA"
-    ):
-        ops = frame.get("delta") or []
-        op = ops[path[2]] if path[2] < len(ops) else None
-        pointer = op.get("path") if isinstance(op, dict) else None
-        if isinstance(pointer, str) and pointer.startswith("/"):
-            segments: List[Any] = []
-            for raw in pointer[1:].split("/"):
-                part = raw.replace("~1", "/").replace("~0", "~")
-                segments.append(int(part) if part.isdigit() else part)
-            return ("frame", "snapshot", *segments, *path[4:])
-    return path
+
+def _is_number(value: Any) -> bool:
+    return value is None or (isinstance(value, (int, float)) and not isinstance(value, bool))
 
 
 class _Checker:
@@ -260,10 +279,34 @@ class _Checker:
         key = _key(path)
         parent = _key(path, 2)
         grandparent = _key(path, 3)
+        # L16: ``host`` is a list of objects. A scalar or a list of scalars (a STATE_DELTA that
+        # replaces the key, or a snapshot) is not a host entry, so it cannot be held to the
+        # per-field rule below and is a finding itself.
+        if key == "host" and parent == "snapshot" and not isinstance(value, list):
+            self.add("L16", line, report, value)
+        if isinstance(key, int) and parent == "host" and grandparent == "snapshot":
+            if not isinstance(value, dict):
+                self.add("L16", line, report, value)
         if not isinstance(key, str):
             return
+        if key in L17_ID_KEYS and value is not None:
+            pinned = value == PINNED_THREAD or bool(PINNED_RUN.match(str(value)))
+            if not (isinstance(value, str) and (ID_TOKEN.match(value) or pinned)):
+                self.add("L17", line, report, value)
+        if key in L17_PARTY_KEYS and path[0] == "frame" and value is not None:
+            if not (isinstance(value, str) and TERMINAL_TOKEN.match(value)):
+                self.add("L17", line, report, value)
         in_terminals = isinstance(parent, int) and grandparent == "terminals"
         in_sessions = isinstance(parent, int) and grandparent == "sessions"
+
+        if isinstance(parent, int) and grandparent == "host":
+            ok = {
+                "runner_id": True,  # L15 holds the value
+                "sampled_at": isinstance(value, str) and bool(L16_ISO.match(value)),
+                "memory_pressure": value is None or value in L16_PRESSURE,
+            }.get(key, key in L16_NUMERIC_KEYS and _is_number(value))
+            if key not in L16_KEYS or not ok:
+                self.add("L16", line, report, value)
 
         if key in L5_KEYS or (in_terminals and key == "id"):
             if value is not None and not (isinstance(value, str) and TERMINAL_TOKEN.match(value)):
