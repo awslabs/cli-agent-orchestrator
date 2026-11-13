@@ -180,7 +180,7 @@ Copy each value from the release's published checksums (see
 cd cli-agent-orchestrator/examples/remote-ec2
 cat > box-settings.env <<'EOF'
 BOX_USER=<you>
-BOX_UID=<uid>                 # pick one (for example your laptop uid) and never change it
+BOX_UID=<uid>                 # 1000-59999 (a macOS uid such as 501 is refused); pick one and never change it
 BOX_HOME=/Users/<you>
 DATA_VOLUME_ID=<vol-id>
 HERDR_VERSION=<laptop-herdr-version>
@@ -197,7 +197,7 @@ HELIX_SHA256=<sha256>
 UV_VERSION=<version>
 UV_SHA256=<sha256>
 EOF
-sudo env $(cat box-settings.env | sed 's/ *#.*//') bash bootstrap.sh --dry-run
+sudo env $(cat box-settings.env | sed 's/ *#.*//') bash bootstrap.sh --dry-run --format-new-volume   # first run: shows the format step too
 sudo env $(cat box-settings.env | sed 's/ *#.*//') bash bootstrap.sh --format-new-volume   # first run only
 ```
 
