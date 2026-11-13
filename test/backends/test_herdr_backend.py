@@ -122,20 +122,91 @@ class TestHerdrBackendCommands:
         assert result[1]["name"] == "cao-proj2"
 
     @patch("subprocess.run")
-    def test_prepare_web_attach_focuses_tab_and_returns_herdr_command(self, mock_run, backend):
-        """Browser attachment focuses the requested Herdr tab before opening its TUI."""
+    def test_prepare_web_attach_returns_single_pane_view(self, mock_run, backend):
+        """Browser attachment runs the one-pane view, not herdr's shared-focus TUI."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-1", "workspace_id": "w1", "label": "developer-abcd"}]
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),
             _completed(_make_tab_list_response(tabs)),
-            _completed(),
         ]
 
         command = backend.prepare_web_attach("cao-test", "developer-abcd")
 
-        assert command == ["herdr", "--session", "cao"]
-        assert mock_run.call_args_list[-1].args[0][-3:] == ["tab", "focus", "tab-1"]
+        assert command[1:3] == ["-m", "cli_agent_orchestrator.backends.herdr_web_view"]
+        args = dict(zip(command[3::2], command[4::2]))
+        assert args["--herdr-session"] == "cao"
+        assert args["--workspace"] == "cao-test"
+        assert args["--tab"] == "developer-abcd"
+        assert args["--socket"].endswith("/herdr/sessions/cao/herdr.sock")
+        # Attaching no longer moves herdr's focus: input does, per frame.
+        assert all("focus" not in call.args[0] for call in mock_run.call_args_list)
+
+    def test_prepare_web_attach_input_scopes_by_herdr_session(self, backend):
+        """Input focus is serialised per herdr session and names the tab by its labels."""
+        with patch.object(backend, "prepare_web_attach", return_value=["view"]):
+            argv, focus = backend.prepare_web_attach_input("cao-test", "developer-abcd")
+
+        assert argv == ["view"]
+        assert focus == ("herdr:cao", json.dumps(["cao-test", "developer-abcd"]))
+
+    @staticmethod
+    def _snapshot(ws_focused, tab_focused):
+        return json.dumps(
+            {
+                "result": {
+                    "snapshot": {
+                        "workspaces": [
+                            {"workspace_id": "w1", "label": "cao-test", "focused": ws_focused}
+                        ],
+                        "tabs": [
+                            {
+                                "tab_id": "w1:t2",
+                                "workspace_id": "w1",
+                                "label": "developer-abcd",
+                                "focused": tab_focused,
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+
+    @patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep")
+    def test_focus_web_input_focuses_and_settles_when_elsewhere(self, mock_sleep, backend):
+        """A focus change is followed by a settle wait, so the next key is not lost."""
+        target = json.dumps(["cao-test", "developer-abcd"])
+        with (
+            patch.object(backend, "_resolve_workspace_id", return_value="w1"),
+            patch.object(
+                backend,
+                "_run_herdr",
+                side_effect=[_completed(self._snapshot(True, False)), _completed()],
+            ) as run,
+        ):
+            backend.focus_web_input(target)
+
+        assert run.call_args_list[-1].args[0] == ["tab", "focus", "w1:t2"]
+        mock_sleep.assert_called_once()
+
+    @patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep")
+    def test_focus_web_input_skips_when_already_focused(self, mock_sleep, backend):
+        """Typing into the focused tab costs no focus command and no wait."""
+        target = json.dumps(["cao-test", "developer-abcd"])
+        with (
+            patch.object(backend, "_resolve_workspace_id", return_value="w1"),
+            patch.object(
+                backend, "_run_herdr", return_value=_completed(self._snapshot(True, True))
+            ) as run,
+        ):
+            backend.focus_web_input(target)
+
+        assert run.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_focus_web_input_rejects_malformed_target(self, backend):
+        with pytest.raises(TerminalBackendError):
+            backend.focus_web_input("not-json")
 
     def test_prepare_web_attach_propagates_tab_not_found(self, backend):
         """Browser attachment propagates a missing requested Herdr tab."""

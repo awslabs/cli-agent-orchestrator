@@ -15,9 +15,10 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, cast
+from typing import Dict, List, Optional, Tuple, cast
 
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
@@ -42,6 +43,14 @@ HERDR_AGENT_STATUS_TO_TERMINAL_STATUS: Dict[str, TerminalStatus] = {
     "done": TerminalStatus.COMPLETED,
     "idle": TerminalStatus.IDLE,
 }
+
+# How long the browser terminal holds a trailing Escape before the next input
+# frame may refocus herdr: herdr's client waits this long for the rest of an
+# escape sequence before it delivers a lone Escape to the focused tab.
+_HERDR_WEB_INPUT_ESCAPE_HOLD_S = 0.3
+# Wait after a browser terminal moves herdr's focus to its tab, before its input
+# is written (see HerdrBackend.focus_web_input).
+_HERDR_WEB_FOCUS_SETTLE_S = 0.15
 
 # Herdr CLI subcommands that _run_herdr is allowed to invoke.
 _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
@@ -879,11 +888,83 @@ class HerdrBackend(TerminalBackend):
         os.execvp("herdr", ["herdr", "--session", self._herdr_session])
 
     def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
-        """Focus the requested Herdr tab and return the browser PTY attach command."""
+        """Return the browser PTY command: a view of this agent's pane only.
+
+        A herdr TUI client shows the server's focused tab, and all clients
+        share that focus, so attaching ``herdr`` itself made every browser
+        terminal show the last agent focused. The view in ``herdr_web_view``
+        draws one pane from herdr's socket API instead; see that module.
+        Raises ``TerminalBackendError`` when the tab does not exist.
+        """
         workspace_id = self._resolve_workspace_id(session_name)
-        tab_id = self._resolve_tab_id(session_name, workspace_id, window_name)
+        self._resolve_tab_id(session_name, workspace_id, window_name)
+        return [
+            sys.executable,
+            "-m",
+            "cli_agent_orchestrator.backends.herdr_web_view",
+            "--herdr-session",
+            self._herdr_session,
+            "--socket",
+            self._session_socket_path(),
+            "--workspace",
+            session_name,
+            "--tab",
+            window_name,
+        ]
+
+    def prepare_web_attach_input(
+        self, session_name: str, window_name: str
+    ) -> Tuple[List[str], Optional[Tuple[str, str]]]:
+        """The single-pane view, and the tab to focus before each input frame.
+
+        The view's keystrokes go through a herdr client, which types into the
+        server's focused tab. The scope is the herdr session, because every
+        CAO session's tabs share that one focus; the target names the tab by
+        its labels, because herdr renumbers ids when a tab closes.
+        """
+        argv = self.prepare_web_attach(session_name, window_name)
+        return argv, (f"herdr:{self._herdr_session}", json.dumps([session_name, window_name]))
+
+    def web_input_escape_hold(self) -> float:
+        """Seconds herdr may hold a trailing Escape before delivering it."""
+        return _HERDR_WEB_INPUT_ESCAPE_HOLD_S
+
+    def focus_web_input(self, target: str) -> None:
+        """Focus the tab named by ``target`` (from ``prepare_web_attach_input``)."""
+        try:
+            session_name, window_name = json.loads(target)
+        except (TypeError, ValueError) as e:
+            raise TerminalBackendError(f"Malformed herdr web input target: {target!r}") from e
+        workspace_id = self._resolve_workspace_id(session_name)
+        tab_id, focused = self._web_tab_focus_state(session_name, workspace_id, window_name)
+        if focused:
+            return
         self._run_herdr(["tab", "focus", tab_id])
-        return ["herdr", "--session", self._herdr_session]
+        # herdr's clients pick up a focus change asynchronously: a key written
+        # straight after `tab focus` returns is lost, so let the switch land.
+        time.sleep(_HERDR_WEB_FOCUS_SETTLE_S)
+
+    def _web_tab_focus_state(
+        self, session_name: str, workspace_id: str, window_name: str
+    ) -> Tuple[str, bool]:
+        """The tab's id, and whether herdr's focus is on it now (its workspace and tab)."""
+        snapshot = self._parse_herdr_json(self._run_herdr(["api", "snapshot"]).stdout)
+        snapshot = snapshot.get("snapshot", snapshot) if isinstance(snapshot, dict) else {}
+        workspace_focused = any(
+            w.get("workspace_id") == workspace_id and w.get("focused") is True
+            for w in snapshot.get("workspaces", [])
+            if isinstance(w, dict)
+        )
+        for tab in snapshot.get("tabs", []):
+            if (
+                isinstance(tab, dict)
+                and tab.get("workspace_id") == workspace_id
+                and tab.get("label") == window_name
+            ):
+                return str(tab["tab_id"]), workspace_focused and tab.get("focused") is True
+        raise TerminalBackendError(
+            f"No tab labeled '{window_name}' found in workspace '{session_name}'"
+        )
 
     # --- Capability overrides ---
 
