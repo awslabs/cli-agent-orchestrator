@@ -6,23 +6,25 @@ import pytest
 
 from cli_agent_orchestrator.backends import herdr_web_view as view
 
+ESC = "\x1b"
+
 
 class TestRender:
     def test_paints_each_row_and_erases_the_rest(self):
         out = view.render("\r\nfirst\r\nsecond\r\n", rows=10)
-        assert out.startswith("\x1b[1;1Hfirst\x1b[0m\x1b[K")
-        assert "\x1b[2;1Hsecond\x1b[0m\x1b[K" in out
-        assert out.endswith("\x1b[3;1H\x1b[0m\x1b[J")
+        assert out.startswith(f"{ESC}[1;1Hfirst{ESC}[0m{ESC}[K")
+        assert f"{ESC}[2;1Hsecond{ESC}[0m{ESC}[K" in out
+        assert out.endswith(f"{ESC}[3;1H{ESC}[0m{ESC}[J")
 
     def test_keeps_the_bottom_rows_when_the_browser_is_shorter(self):
         screen = "\r\n" + "\r\n".join(f"line{i}" for i in range(10))
         out = view.render(screen, rows=3)
         assert "line6" not in out
-        assert "\x1b[1;1Hline7" in out and "\x1b[3;1Hline9" in out
+        assert f"{ESC}[1;1Hline7" in out and f"{ESC}[3;1Hline9" in out
 
     def test_drops_trailing_blank_rows(self):
         out = view.render("\r\nprompt\r\n   \r\n\r\n", rows=10)
-        assert out.endswith("\x1b[2;1H\x1b[0m\x1b[J")
+        assert out.endswith(f"{ESC}[2;1H{ESC}[0m{ESC}[J")
 
 
 class TestResolvePane:
@@ -40,23 +42,84 @@ class TestResolvePane:
                 {"pane_id": "w1:p1", "tab_id": "w1:t1"},
                 {"pane_id": "w2:p1", "tab_id": "w2:t1"},
             ],
+            "layouts": [
+                {"tab_id": "w1:t1", "area": {"width": 190, "height": 38}},
+                {"tab_id": "w2:t1", "area": {"width": 70, "height": 20}},
+            ],
         }
     }
 
     def test_matches_workspace_and_tab_labels(self):
         with patch.object(view, "herdr_call", return_value=self.SNAPSHOT):
-            assert view.resolve_pane("/sock", "cao-b", "dev-1") == "w2:p1"
+            pane = view.resolve_pane("/sock", "cao-b", "dev-1")
+        assert pane.pane_id == "w2:p1"
+        assert (pane.area_rows, pane.area_cols) == (20, 70)
 
     def test_none_when_the_tab_is_gone(self):
         with patch.object(view, "herdr_call", return_value=self.SNAPSHOT):
             assert view.resolve_pane("/sock", "cao-a", "dev-9") is None
 
 
+class TestSplitMouse:
+    def test_wheel_reports_are_taken_out(self):
+        data = f"a{ESC}[<64;10;5M{ESC}[<64;10;5Mb{ESC}[<65;1;1M".encode()
+        keys, wheel, rest = view.split_mouse(data)
+        assert keys == b"ab" and rest == b""
+        assert wheel == [(64, 10, 5), (64, 10, 5), (65, 1, 1)]
+
+    def test_clicks_are_dropped_not_forwarded(self):
+        keys, wheel, rest = view.split_mouse(f"{ESC}[<0;3;4M{ESC}[<0;3;4mx".encode())
+        assert (keys, wheel, rest) == (b"x", [], b"")
+
+    def test_a_report_cut_off_is_carried_over(self):
+        keys, wheel, rest = view.split_mouse(f"hi{ESC}[<64;1".encode())
+        assert (keys, wheel, rest) == (b"hi", [], f"{ESC}[<64;1".encode())
+        keys, wheel, rest = view.split_mouse(rest + b";2M")
+        assert (keys, wheel, rest) == (b"", [(64, 1, 2)], b"")
+
+    def test_escape_and_arrow_keys_pass_through(self):
+        keys, wheel, _ = view.split_mouse(f"{ESC}[A{ESC}".encode())
+        assert (keys, wheel) == (f"{ESC}[A{ESC}".encode(), [])
+
+
+class TestSizer:
+    def _sizer(self):
+        return view._Sizer(client_pid=1, client_fd=99)
+
+    def test_resize_adds_herdr_chrome(self):
+        sizer = self._sizer()
+        with (
+            patch.object(view, "_set_window_size") as set_size,
+            patch.object(view.os, "kill"),
+        ):
+            sizer.resize(20, 70)
+        set_size.assert_called_once_with(99, 21, 96)
+
+    def test_calibrate_corrects_the_chrome_estimate(self):
+        sizer = self._sizer()
+        with (
+            patch.object(view, "_set_window_size") as set_size,
+            patch.object(view.os, "kill"),
+        ):
+            sizer.resize(20, 70)
+            sizer.calibrate(20, 66)  # herdr's sidebar was 4 columns wider
+        assert set_size.call_args_list[-1].args == (99, 21, 100)
+        assert sizer.attempts == view.CALIBRATION_ATTEMPTS - 1
+
+    def test_calibrate_stops_once_the_pane_fits(self):
+        sizer = self._sizer()
+        with patch.object(view, "_set_window_size"), patch.object(view.os, "kill"):
+            sizer.resize(20, 70)
+            sizer.calibrate(20, 70)
+        assert sizer.attempts == 0 and not sizer.due()
+
+    def test_wheel_report_lands_on_the_pane_past_herdr_chrome(self):
+        assert self._sizer().wheel_report(65, 3, 4) == f"{ESC}[<65;29;5M".encode()
+
+
 class TestReadScreen:
     def test_asks_for_the_visible_screen_with_colours(self):
-        with patch.object(
-            view, "herdr_call", return_value={"read": {"text": "\r\nhi"}}
-        ) as call:
+        with patch.object(view, "herdr_call", return_value={"read": {"text": "\r\nhi"}}) as call:
             assert view.read_screen("/sock", "w1:p1") == "\r\nhi"
         method, params = call.call_args.args[1:]
         assert method == "pane.read"
