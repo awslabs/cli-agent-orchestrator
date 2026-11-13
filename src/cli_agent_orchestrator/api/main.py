@@ -1135,6 +1135,22 @@ class StepOutputResponse(BaseModel):
 # (BR-2, additive-only). These models exist only to give the two read routes a
 # stable, documented JSON contract for the web surface (U8) and #505's clients.
 # ---------------------------------------------------------------------------
+class StepResultView(BaseModel):
+    """A settled step's final answer, read from its ``result_json`` envelope (the run view).
+
+    ``text`` is the envelope's ``last_message``: the step's last terminal answer with
+    secrets redacted (``redacted``) and capped at ``WORKFLOW_JOURNAL_RESULT_MAX_BYTES``
+    (``truncated``). ``status`` is the status the envelope recorded, ``completed`` for a
+    step that answered and the step state (``failed``, ``skipped``) for one that settled
+    without an answer, whose ``text`` is empty.
+    """
+
+    text: str
+    status: str
+    truncated: bool
+    redacted: bool
+
+
 class StepInspection(BaseModel):
     """One step's durable projection inside a ``RunInspection`` (FR-5.1).
 
@@ -1147,7 +1163,12 @@ class StepInspection(BaseModel):
     byte-for-byte and only ADDED to (BR-2). A pre-U1 row surfaces the additive
     columns as ``None``.
 
-    ``output_json`` and ``error`` carry the step's FULL text and are NOT gated by
+    ``terminal_id`` is set from the moment the step's terminal exists, while it runs.
+    ``result`` is the step's final answer parsed from its ``result_json`` envelope, or
+    ``None`` when the row has none (not settled yet, or settled before the run view) or
+    the envelope does not parse.
+
+    ``output_json``, ``error`` and ``result`` carry step text and are NOT gated by
     ``workflow_journal_capture_output`` — see the payload-posture note on
     ``get_workflow_run_endpoint`` before adding a consumer or a log line.
     """
@@ -1161,6 +1182,36 @@ class StepInspection(BaseModel):
     terminal_id: Optional[str] = None
     reprompted: Optional[int] = None
     call_fingerprint: Optional[str] = None
+    result: Optional[StepResultView] = None
+
+
+class StepScreenView(BaseModel):
+    """``GET /workflows/runs/{run_id}/steps/{step_id}/screen``: a running step's screen.
+
+    Plain text with no escape codes: the visible pane plus scrollback above it, at most
+    ``WORKFLOW_STEP_SCREEN_MAX_LINES`` lines and ``WORKFLOW_STEP_SCREEN_MAX_BYTES``, with
+    secrets redacted. ``captured_at`` is an ISO-8601 UTC time.
+    """
+
+    terminal_id: str
+    text: str
+    truncated: bool
+    redacted: bool
+    captured_at: str
+
+
+class StepTranscriptView(BaseModel):
+    """``GET /workflows/runs/{run_id}/steps/{step_id}/transcript``: a finished step's text.
+
+    The last ``WORKFLOW_STEP_TRANSCRIPT_MAX_BYTES`` of the terminal's saved
+    ``.scrollback`` file, from a line start, with secrets redacted. ``truncated`` means
+    the file holds more than ``text``.
+    """
+
+    terminal_id: str
+    text: str
+    truncated: bool
+    redacted: bool
 
 
 class RunInspection(BaseModel):
@@ -7844,11 +7895,19 @@ async def get_workflow_run_endpoint(
        transition regardless of it, because the resume path and
        ``{{steps.<id>.output.<field>}}`` templating read them back. So with capture
        at its default OFF, this route still returns step output and error verbatim.
+       The same holds for ``steps[].result`` (the run view's Output tab): each
+       settled step's final answer, parsed from its ``result_json`` envelope. That
+       text is secret-redacted and capped at ``WORKFLOW_JOURNAL_RESULT_MAX_BYTES`` by
+       ``build_envelope`` before it is stored, unlike ``output_json`` and ``error``.
+       A missing or unparseable envelope reads as ``result: null``, never a 500.
     2. The ONLY protection is the scope dependency above, and it is INERT in the
        default deployment: with no IdP and no ``CAO_AUTH_LOCAL_TOKEN`` configured,
        ``require_any_scope`` returns the full scope set and enforces nothing. A
        local CAO server therefore
        serves step output and error text to any caller that can reach the port.
+
+    ``steps[].terminal_id`` is set from the moment a step's terminal exists, so a
+    caller can watch a running step through ``/steps/{step_id}/screen``.
 
     Deliberately documented rather than further gated: stripping the fields removes
     the feature, and gating them behind the capture flag would break resume and
@@ -7900,6 +7959,7 @@ async def get_workflow_run_endpoint(
                 terminal_id=srow.terminal_id if srow else None,
                 reprompted=srow.reprompted if srow else None,
                 call_fingerprint=srow.call_fingerprint if srow else None,
+                result=_step_result_view(srow.result_json) if srow else None,
             )
         )
         seen.add(st.id)
@@ -7917,6 +7977,7 @@ async def get_workflow_run_endpoint(
                 terminal_id=srow.terminal_id,
                 reprompted=srow.reprompted,
                 call_fingerprint=srow.call_fingerprint,
+                result=_step_result_view(srow.result_json),
             )
         )
 
@@ -7946,6 +8007,143 @@ async def get_workflow_run_endpoint(
         finished_at=finished_at,
         tier=tier,
         steps=steps,
+    )
+
+
+def _step_result_view(result_json: Optional[str]) -> Optional[StepResultView]:
+    """Parse a step row's ``result_json`` envelope for the inspection, leniently.
+
+    ``parse_envelope`` is total: NULL, malformed JSON and valid JSON of the wrong shape
+    all read as ``None``, so a row from before the run view or a corrupt envelope gives
+    ``result: null`` rather than failing the whole inspection.
+    """
+    from cli_agent_orchestrator.services.step_result import parse_envelope
+
+    envelope = parse_envelope(result_json)
+    if envelope is None:
+        return None
+    return StepResultView(
+        text=envelope.last_message,
+        status=envelope.status,
+        truncated=envelope.truncated,
+        redacted=envelope.redacted,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The run view's Terminal tab: a read-only live screen while a step runs, and its
+# saved transcript after. Both resolve the terminal from the step's JOURNAL ROW,
+# never from the request, and redact before they bound what they return
+# (services/workflow_step_view.py). Neither attaches a client or sends input, so
+# neither can resize the agent's window or type into it.
+# ---------------------------------------------------------------------------
+def _step_view_keys_or_400(run_id: str, step_id: str) -> None:
+    """Validate both path keys with the shared key validator; a bad key is a 400."""
+    from cli_agent_orchestrator.services.step_output_store import _validate_key_part
+
+    try:
+        _validate_key_part(run_id, "run_id")
+        _validate_key_part(step_id, "step_id")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@app.get(
+    "/workflows/runs/{run_id}/steps/{step_id}/screen",
+    response_model=StepScreenView,
+)
+async def get_workflow_step_screen_endpoint(
+    run_id: str,
+    step_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> StepScreenView:
+    """The live view of a running step: its screen as plain text, redacted (the run view).
+
+    A read-only capture through the backend's ``get_history`` (tmux and herdr): no
+    attach, no input, no resize. The web UI polls it about once a second while the
+    step's Terminal tab is visible.
+
+    ``400`` for a malformed ``run_id`` or ``step_id``; ``404`` for an unknown run or
+    step, or a step with no terminal recorded; ``410`` once the step's terminal has
+    ended, after which ``/transcript`` is the read. Same read-or-better scope gate as
+    the other run read routes, inert with auth disabled.
+    """
+    from cli_agent_orchestrator.services import workflow_step_view
+
+    _step_view_keys_or_400(run_id, step_id)
+    try:
+        terminal_id = await asyncio.to_thread(
+            workflow_step_view.recorded_terminal_id, run_id, step_id
+        )
+        capture = await asyncio.to_thread(workflow_step_view.capture_screen, terminal_id)
+    except workflow_step_view.StepTerminalNotFound as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except workflow_step_view.StepTerminalEnded as e:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(e))
+    except Exception:
+        # Identifiers only: the capture is agent output and stays out of the log line.
+        logger.warning(
+            "screen capture for run '%s' step '%s' failed", run_id, step_id, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="failed to capture the step's screen",
+        )
+    return StepScreenView(
+        terminal_id=capture.terminal_id,
+        text=capture.text,
+        truncated=capture.truncated,
+        redacted=capture.redacted,
+        captured_at=capture.captured_at,
+    )
+
+
+@app.get(
+    "/workflows/runs/{run_id}/steps/{step_id}/transcript",
+    response_model=StepTranscriptView,
+)
+async def get_workflow_step_transcript_endpoint(
+    run_id: str,
+    step_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> StepTranscriptView:
+    """The saved transcript of a finished step, redacted (the run view).
+
+    The last 256 KiB of ``<terminal_id>.scrollback``, which ``terminal_service`` writes
+    when the step's terminal is torn down. Redacted before it is cut, so a secret split
+    at the cut is never returned in part.
+
+    ``400`` for a malformed ``run_id`` or ``step_id``; ``404`` for an unknown run or
+    step, a step with no terminal recorded, or no transcript file: the step is still
+    running, the run predates the run view, or the file was deleted after
+    ``RETENTION_DAYS``. Same read-or-better scope gate as the other run read routes.
+    """
+    from cli_agent_orchestrator.services import workflow_step_view
+
+    _step_view_keys_or_400(run_id, step_id)
+    try:
+        terminal_id = await asyncio.to_thread(
+            workflow_step_view.recorded_terminal_id, run_id, step_id
+        )
+        transcript = await asyncio.to_thread(workflow_step_view.read_transcript, terminal_id)
+    except (
+        workflow_step_view.StepTerminalNotFound,
+        workflow_step_view.TranscriptNotFound,
+    ) as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception:
+        logger.warning(
+            "transcript read for run '%s' step '%s' failed", run_id, step_id, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="failed to read the step's transcript",
+        )
+    return StepTranscriptView(
+        terminal_id=transcript.terminal_id,
+        text=transcript.text,
+        truncated=transcript.truncated,
+        redacted=transcript.redacted,
     )
 
 

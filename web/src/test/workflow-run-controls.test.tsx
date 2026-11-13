@@ -2,7 +2,7 @@
 // resume/result/artifact client methods, the store's approval outcomes, and the
 // launcher, plan-approval form, result panel and report viewer components.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within, cleanup } from '@testing-library/react'
 import { api, WorkflowRunResult } from '../api'
 import { useStore } from '../store'
 import { PlanApprovalForm } from '../components/workflow/PlanApprovalForm'
@@ -131,6 +131,19 @@ describe('WorkflowLauncher', () => {
     ])
     expect(rowsFromDeclaredInputs({})).toEqual([{ key: '', value: '' }])
     expect(rowsFromDeclaredInputs(undefined)).toEqual([{ key: '', value: '' }])
+  })
+
+  it('lists the stored workflows by name only, without their descriptions', async () => {
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue([
+      { ...DEF, description: 'Review the open pull requests' },
+      { ...DEF, name: 'nightly-check', source_path: '/wf/nightly-check.yaml', description: 'Check the orders pipeline' },
+    ])
+    vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue({ name: 'review_flow', inputs: {} })
+    render(<WorkflowLauncher />)
+    fireEvent.click(screen.getByRole('button', { name: /Run a workflow/ }))
+    const select = await screen.findByRole('combobox')
+    await waitFor(() => expect(within(select).getAllByRole('option')).toHaveLength(2))
+    expect(within(select).getAllByRole('option').map(o => o.textContent)).toEqual(['review_flow', 'nightly-check'])
   })
 
   it('prefills the selected workflow’s declared inputs when opened', async () => {

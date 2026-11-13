@@ -241,8 +241,10 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 > `workflow_run_step` projection persists each step's full `output_json` and `error`
 > text on every state transition, unconditionally, because the resume path and
 > `{{steps.<id>.output.<field>}}` templating read them back — gating them would
-> break both. The flag governs only the event-log output digest and the diagnostics
-> bundle's excerpts.
+> break both. Each settled step also stores its final answer in `result_json`, for
+> both script and YAML steps, after secret redaction and capped at 32 KiB; the web
+> UI's Output tab reads it. The flag governs only the event-log output digest and the
+> diagnostics bundle's excerpts.
 >
 > That retained text is served, in full, by `GET /workflows/runs/{run_id}`. Its only
 > protection is a scope requirement (`cao:read`/`cao:write`/`cao:admin`), and that

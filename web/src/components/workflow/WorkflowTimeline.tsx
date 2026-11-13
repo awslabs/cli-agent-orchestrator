@@ -5,18 +5,37 @@
 // semantically distinct from the empty/no-events state, and NEVER inferred from
 // event numbering (BR-4). An ARIA live region announces the selected event as
 // playback moves. Transport + ScrubBar drive the shared selectedIndex.
+//
+// Each row shows the event's local time, its step and a plain label, such as
+// "Attempt 2 failed (timeout)" or "Step completed in 29 s" (runView's
+// eventLabels). Only an outcome event carries an outcome badge, and the badge
+// comes from the event's type: the `state` an event recorded is the step's
+// state at that moment, so showing it made a finished run's first row still
+// read "running". During a live run the selection follows the newest event
+// until the user picks one; Latest jumps back and follows again.
 
-import { Fragment, useState } from 'react'
+import { Fragment, useMemo, useState } from 'react'
+import { ChevronsDown } from 'lucide-react'
 import type { WorkflowEvent, GapMarker } from '../../api'
 import { PlaybackTransport } from './PlaybackTransport'
 import { ScrubBar } from './ScrubBar'
 import { GAP_CUE } from './stateCues'
+import { flowStateView } from './WorkflowFlow'
+import { eventLabels, eventOutcome, formatLocalTime } from './runView'
 
 interface WorkflowTimelineProps {
   events: WorkflowEvent[]
   gaps: GapMarker[]
   selectedIndex: number
   onSelectIndex: (index: number) => void
+  /** The run's start time, for a run outcome's duration when no run.started event was recorded. */
+  runStartedAt?: string | null
+  /** True while the run is live, so new events can still arrive. */
+  live?: boolean
+  /** True while the selection follows the newest event. */
+  following?: boolean
+  /** Select the newest event and follow new ones again. Without it there is no Latest button. */
+  onLatest?: () => void
 }
 
 export function WorkflowTimeline({
@@ -24,9 +43,14 @@ export function WorkflowTimeline({
   gaps,
   selectedIndex,
   onSelectIndex,
+  runStartedAt,
+  live = false,
+  following = true,
+  onLatest,
 }: WorkflowTimelineProps) {
   const [playing, setPlaying] = useState(false)
   const [focusScrub, setFocusScrub] = useState(false)
+  const labels = useMemo(() => eventLabels(events, runStartedAt), [events, runStartedAt])
 
   // An INTERIOR declared gap is keyed by the seq of the event it precedes (its
   // before_seq), so we can render it immediately above that event.
@@ -92,20 +116,45 @@ export function WorkflowTimeline({
 
   const selected = events[selectedIndex]
 
+  const latest = () => {
+    setPlaying(false)
+    // Following moves the selection on every new event, so the scrubber must
+    // not take focus on each move.
+    setFocusScrub(false)
+    onLatest?.()
+  }
+
   return (
     <div className="space-y-3">
       {/* Transport + scrubber */}
       <div className="flex flex-col gap-2">
-        <PlaybackTransport
-          eventCount={events.length}
-          selectedIndex={selectedIndex}
-          playing={playing}
-          onSetIndex={i => {
-            onSelectIndex(i)
-            setFocusScrub(false)
-          }}
-          onSetPlaying={setPlaying}
-        />
+        <div className="flex flex-wrap items-center gap-3">
+          <PlaybackTransport
+            eventCount={events.length}
+            selectedIndex={selectedIndex}
+            playing={playing}
+            onSetIndex={i => {
+              onSelectIndex(i)
+              setFocusScrub(false)
+            }}
+            onSetPlaying={setPlaying}
+          />
+          {onLatest && live && !following && (
+            <button
+              type="button"
+              onClick={latest}
+              title="Select the newest event and follow new ones"
+              className="inline-flex items-center gap-1 rounded-lg border border-emerald-700/60 px-2 py-1 text-xs text-emerald-300 hover:bg-emerald-900/30"
+            >
+              <ChevronsDown size={13} aria-hidden="true" /> Latest
+            </button>
+          )}
+          {onLatest && following && live && (
+            <span className="text-[11px] text-gray-500" data-testid="timeline-following">
+              Following the newest event
+            </span>
+          )}
+        </div>
         <ScrubBar
           events={events}
           gapBeforeSeqs={gapBeforeSeqs}
@@ -119,9 +168,9 @@ export function WorkflowTimeline({
       {/* ARIA live region: announces the selected event as playback advances. */}
       <div aria-live="polite" className="sr-only" data-testid="timeline-live">
         {selected
-          ? `Selected event ${selectedIndex + 1} of ${events.length}: ${selected.event_type}${
+          ? `Selected event ${selectedIndex + 1} of ${events.length}: ${labels[selectedIndex]}${
               selected.step_id ? `, step ${selected.step_id}` : ''
-            }${selected.state ? `, state ${selected.state}` : ''}`
+            }`
           : ''}
       </div>
 
@@ -129,6 +178,8 @@ export function WorkflowTimeline({
       <ol className="space-y-1" aria-label="Event timeline">
         {events.map((ev, i) => {
           const gap = gapByBeforeSeq.get(ev.seq)
+          const outcome = eventOutcome(ev)
+          const badge = outcome ? flowStateView(outcome) : null
           return (
             <Fragment key={ev.seq}>
               {/* A declared gap is its OWN <li> sibling, not a nested one: an
@@ -156,16 +207,32 @@ export function WorkflowTimeline({
                   type="button"
                   onClick={() => handleJump(i)}
                   aria-current={i === selectedIndex}
-                  className={`w-full text-left flex items-center gap-3 px-3 py-1.5 rounded text-xs font-mono transition-colors ${
+                  title={ev.event_type}
+                  data-testid={`timeline-event-${ev.seq}`}
+                  className={`w-full text-left flex items-center gap-3 px-3 py-1.5 rounded text-xs transition-colors ${
                     i === selectedIndex
                       ? 'bg-emerald-900/30 text-emerald-200 ring-1 ring-emerald-600/40'
                       : 'text-gray-400 hover:bg-gray-800/50'
                   }`}
                 >
-                  <span className="text-gray-600 tabular-nums w-10 shrink-0">#{ev.seq}</span>
-                  <span className="truncate">{ev.event_type}</span>
-                  {ev.step_id && <span className="text-gray-500 truncate">{ev.step_id}</span>}
-                  {ev.state && <span className="text-gray-500 ml-auto">{ev.state}</span>}
+                  <span className="text-gray-600 font-mono tabular-nums w-10 shrink-0">#{ev.seq}</span>
+                  <span className="text-gray-500 font-mono tabular-nums w-20 shrink-0" data-testid="timeline-time">
+                    {formatLocalTime(ev.ts)}
+                  </span>
+                  <span className="text-gray-500 font-mono truncate w-28 shrink-0" data-testid="timeline-step">
+                    {ev.step_id ?? ''}
+                  </span>
+                  <span className="truncate" data-testid="timeline-label">{labels[i]}</span>
+                  {badge && (
+                    <span
+                      className={`ml-auto inline-flex shrink-0 items-center gap-1 ${badge.cue.color}`}
+                      data-testid="timeline-outcome"
+                    >
+                      <badge.cue.Icon size={12} aria-hidden="true" />
+                      <span aria-hidden="true">{badge.cue.glyph}</span>
+                      <span>{badge.text}</span>
+                    </span>
+                  )}
                 </button>
               </li>
             </Fragment>

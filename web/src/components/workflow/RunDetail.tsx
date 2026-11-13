@@ -1,32 +1,60 @@
-// RunDetail — the selected run's inspection + playback surface (#504 / U8).
-// Composes: StepSummary, WorkflowTimeline (playback transport + scrubber +
-// declared-gap segments), SyncedTerminalPane (offset-synced to the selected
-// event, degrading gracefully on the null-offset seam), FailureDetail,
-// RunComparison, and the diagnostics/delete actions. Live-follows the SSE
-// stream while the run is non-terminal.
+// RunDetail: the run page (#504 / U8), the Workflows tab's view of one run. It
+// fills the window below the tab row:
 //
-// The Flow section draws the run with WorkflowFlow. Its step states come from
-// the data this view already follows: the polled inspection and the followed
-// events. The call types come from the workflow's spec, read best effort; when
-// that read fails the edges carry no call label.
+// - RunBar: back to the Workflows home, the run's state, a switcher over the
+//   runs of this workflow, Follow the running step, Cancel or Resume, and a
+//   More menu (Export diagnostics, Compare runs, Delete run). Under it, when
+//   they apply, the approve-and-resume prompt and the failure detail.
+// - StepRail: the steps as a vertical stepper, then a Result node once the run
+//   has ended, then the run's facts. The list scrolls on its own.
+// - The console: StepConsole for the selected step (Terminal, Output, Params,
+//   Events), or the run-level panels for Result (RunResultPanel, RunArtifacts,
+//   RunComparison).
+// - EventsStrip: the newest three events, and "All N events", which opens
+//   WorkflowTimeline (playback, declared gaps) and the SyncedTerminalPane under
+//   it in a slide-over.
+//
+// It live-follows the SSE stream while the run is non-terminal, and polls the
+// inspection, as before. Step states come from the polled inspection and the
+// followed events (runStepStates); call types, agents and params come from the
+// workflow's spec, read best effort.
+//
+// Follow: while the run is live and the user has picked nothing, the console
+// shows the running step and moves when the next one starts. Picking a step
+// turns Follow off; turning it on picks the running step again. A run that has
+// ended opens on the step that failed, else on its last step with an answer.
+//
+// The run page reads terminals only through the read-only screen and
+// transcript routes; it never opens a terminal WebSocket.
 
-import { useEffect, useMemo, useState } from 'react'
-import { Loader2, Radio, Ban, RotateCcw, ShieldCheck } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Flag, ShieldCheck } from 'lucide-react'
 import { api } from '../../api'
 import type { RunInspection, RunSummaryRow, WorkflowSpecStep } from '../../api'
 import { useStore } from '../../store'
 import { useEventFollow } from './useEventFollow'
-import { StepSummary } from './StepSummary'
 import { WorkflowTimeline } from './WorkflowTimeline'
 import { SyncedTerminalPane } from './SyncedTerminalPane'
 import { FailureDetail } from './FailureDetail'
 import { RunArtifacts } from './RunArtifacts'
 import { RunComparison } from './RunComparison'
-import { DiagnosticsExportButton } from './DiagnosticsExportButton'
-import { DeleteRunButton } from './DeleteRunButton'
 import { RunResultPanel } from './RunResultPanel'
-import { WorkflowFlow, runFlowSteps, runStepStates } from './WorkflowFlow'
-import { runCue } from './stateCues'
+import { runFlowSteps, runStepStates, flowStateKey, flowStateView } from './WorkflowFlow'
+import { eventTimeMs, latestStepStarts, stepActivity, stepTerminalId, formatDuration } from './runView'
+import {
+  finishedTarget,
+  followTarget,
+  labelledEvents,
+  railSteps,
+  runSeconds,
+  stepProgress,
+  type RunPick,
+} from './runPage'
+import { CHIP_TONES, SlideOver, useFillHeight } from './runPageParts'
+import { RunBar } from './RunBar'
+import { StepRail } from './StepRail'
+import { StepConsole, type SpecStatus } from './StepConsole'
+import { EventsStrip } from './EventsStrip'
 
 interface RunDetailProps {
   run: RunInspection
@@ -40,16 +68,20 @@ interface RunDetailProps {
 // journal's set if a run state is ever added. The values are also part of the
 // wire contract (`RunInspection.state`), so a drift here shows up as a live
 // follower that never stops polling a finished run.
-const TERMINAL_RUN_STATES = new Set(['completed', 'failed', 'cancelled'])
+export const TERMINAL_RUN_STATES: ReadonlySet<string> = new Set(['completed', 'failed', 'cancelled'])
 
 /** How often the detail re-reads a live run's inspection (the list polls every 10s). */
 export const RUN_REFRESH_MS = 5000
+
+type Slide = 'events' | 'compare' | null
 
 export function RunDetail({ run, allRuns }: RunDetailProps) {
   const events = useStore(s => s.wfEvents)
   const gaps = useStore(s => s.wfGaps)
   const selectedIndex = useStore(s => s.selectedIndex)
   const setSelectedIndex = useStore(s => s.setSelectedIndex)
+  const followLatest = useStore(s => s.followLatest)
+  const followLatestEvent = useStore(s => s.followLatestEvent)
   const appendWorkflowEvent = useStore(s => s.appendWorkflowEvent)
   const addWorkflowGap = useStore(s => s.addWorkflowGap)
   const followConnected = useStore(s => s.followConnected)
@@ -57,6 +89,7 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
   const cancelWorkflowRun = useStore(s => s.cancelWorkflowRun)
   const resumeWorkflowRun = useStore(s => s.resumeWorkflowRun)
   const refreshSelectedRun = useStore(s => s.refreshSelectedRun)
+  const selectWorkflowRun = useStore(s => s.selectWorkflowRun)
   const showSnackbar = useStore(s => s.showSnackbar)
   // Guards the cancel/resume buttons against double-submit while the request is
   // in flight (both actions re-fetch + re-select the run when they settle).
@@ -78,6 +111,14 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
       return
     }
     await resume()
+  }
+  const act = (fn: () => Promise<unknown>) => async () => {
+    setActing(true)
+    try {
+      await fn()
+    } finally {
+      setActing(false)
+    }
   }
 
   // Live-follow only while the run has not gone terminal (a finished run has a
@@ -124,130 +165,243 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
     if (liveState && liveState !== run.state) refreshSelectedRun()
   }, [liveState, run.state, refreshSelectedRun])
 
-  // The spec supplies each step's call type, agent and provider. Best effort:
-  // a Python workflow has no steps here, and a deleted one is a 404.
+  // The spec supplies each step's call type, agent, provider and params. Best
+  // effort: a Python workflow has no steps here, and a deleted one is a 404.
   const [specSteps, setSpecSteps] = useState<WorkflowSpecStep[] | null>(null)
+  const [specStatus, setSpecStatus] = useState<SpecStatus>('loading')
   useEffect(() => {
     let cancelled = false
     setSpecSteps(null)
+    setSpecStatus('loading')
     api.getWorkflowSpec(run.workflow_name)
-      .then(spec => { if (!cancelled) setSpecSteps(Array.isArray(spec?.steps) ? spec.steps : null) })
-      .catch(() => { /* no call labels */ })
+      .then(spec => {
+        if (cancelled) return
+        const steps = Array.isArray(spec?.steps) ? spec.steps : null
+        setSpecSteps(steps)
+        setSpecStatus(steps ? 'ready' : 'script')
+      })
+      .catch(() => {
+        if (!cancelled) setSpecStatus('unavailable')
+      })
     return () => { cancelled = true }
   }, [run.workflow_name])
   const flowSteps = useMemo(() => runFlowSteps(run, specSteps), [run, specSteps])
+  const stepIds = useMemo(() => flowSteps.map(s => s.id), [flowSteps])
   const flowStates = useMemo(() => runStepStates(run, events), [run, events])
 
-  const cue = runCue(effectiveState)
+  // The steps in progress now, with their latest start time when the events
+  // carry one. A run that has ended has none.
+  const stepStarts = useMemo(() => latestStepStarts(events), [events])
+  const running = useMemo(() => {
+    const out: Record<string, number | null> = {}
+    for (const [id, state] of Object.entries(flowStates)) {
+      if (stepActivity(state, isTerminal) === 'running') out[id] = stepStarts[id] ?? null
+    }
+    return out
+  }, [flowStates, stepStarts, isTerminal])
+
+  const rail = useMemo(
+    () => railSteps({ run, stepIds, states: flowStates, running, events, specSteps, runEnded: isTerminal }),
+    [run, stepIds, flowStates, running, events, specSteps, isTerminal],
+  )
+  const progress = useMemo(
+    () => stepProgress(rail.map(s => ({ state: s.state, attempts: s.inspection?.attempts }))),
+    [rail],
+  )
+  const labelled = useMemo(() => labelledEvents(events, run.started_at), [events, run.started_at])
+
+  // ── What the console shows ──────────────────────────────────────────────
+  // A pick is tied to its run, so switching runs starts over. No pick means
+  // Follow is on while the run is live; a Result pick only counts once the
+  // run has ended, so a resumed run follows again.
+  const [pick, setPick] = useState<{ runId: string; pick: RunPick } | null>(null)
+  const rawPick = pick?.runId === run.run_id ? pick.pick : null
+  const picked =
+    rawPick?.kind === 'result'
+      ? isTerminal ? rawPick : null
+      : rawPick && stepIds.includes(rawPick.id) ? rawPick : null
+  const following = !isTerminal && picked == null
+  const autoId = isTerminal ? finishedTarget(run, stepIds, flowStates) : followTarget(stepIds, running, events, flowStates)
+  const current: RunPick | null = picked ?? (autoId ? { kind: 'step', id: autoId } : null)
+
+  const selectStep = (stepId: string) => {
+    // The step Follow already shows: picking it changes nothing.
+    if (following && current?.kind === 'step' && current.id === stepId) return
+    setPick({ runId: run.run_id, pick: { kind: 'step', id: stepId } })
+  }
+  const selectResult = () => setPick({ runId: run.run_id, pick: { kind: 'result' } })
+  const setFollow = (on: boolean) => {
+    if (on) setPick(null)
+    else if (current) setPick({ runId: run.run_id, pick: current })
+  }
+
+  const currentStep = current?.kind === 'step' ? rail.find(s => s.id === current.id) ?? null : null
+  const terminalId = currentStep
+    ? stepTerminalId(events, currentStep.id, currentStep.inspection?.terminal_id, currentStep.activity)
+    : null
+  const stepEvents = useMemo(
+    () => (currentStep ? labelled.filter(row => row.event.step_id === currentStep.id) : []),
+    [labelled, currentStep?.id],
+  )
+
+  /** The last step in run order that has an answer, so a halted run whose last
+   * step was skipped still shows what its steps said. Falls back to the last step. */
+  const lastAnswered = [...run.steps].reverse().find(s => s.result != null || s.output_json != null)
+  const lastInspected = lastAnswered ?? (run.steps.length > 0 ? run.steps[run.steps.length - 1] : null)
+  const lastStep = lastInspected ? { step: lastInspected, state: flowStates[lastInspected.id] ?? lastInspected.state } : null
+
+  // ── The event timeline, in a slide-over ─────────────────────────────────
+  const [slide, setSlide] = useState<Slide>(null)
+  useEffect(() => setSlide(null), [run.run_id])
+  const openEvents = (index: number | null) => {
+    if (index != null) {
+      if (index === events.length - 1) followLatestEvent()
+      else setSelectedIndex(index)
+    }
+    setSlide('events')
+  }
+  const stepContext = (stepId: string) => {
+    const step = run.steps.find(s => s.id === stepId) ?? null
+    const state = flowStates[stepId] ?? step?.state ?? 'pending'
+    return { state, terminalId: stepTerminalId(events, stepId, step?.terminal_id, stepActivity(state, isTerminal)) }
+  }
   const selectedEvent = events[selectedIndex] ?? null
+  const eventStep = selectedEvent?.step_id ? stepContext(selectedEvent.step_id) : null
+
+  const startedMs = eventTimeMs(run.started_at)
+  const seconds = runSeconds(run.started_at, liveRow?.finished_at ?? run.finished_at)
+
+  const pageRef = useRef<HTMLDivElement>(null)
+  const height = useFillHeight(pageRef)
 
   return (
-    <div className="space-y-4">
-      {/* Header */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <span className={`inline-flex items-center gap-1.5 ${cue.color}`}>
-          <cue.Icon size={16} aria-hidden="true" />
-          <span aria-hidden="true">{cue.glyph}</span>
-          <span className="font-medium">{cue.label}</span>
-          <span className="sr-only">{cue.sr}</span>
-        </span>
-        <h2 className="text-base font-semibold text-white">{run.workflow_name}</h2>
-        <span className="text-xs font-mono text-gray-500">{run.run_id}</span>
-        {!isTerminal && (
-          <span
-            className={`inline-flex items-center gap-1 text-[11px] ${
-              followConnected ? 'text-emerald-400' : 'text-gray-500'
-            }`}
-            title={followConnected ? 'Live-following' : 'Reconnecting…'}
-          >
-            {followConnected ? (
-              <Radio size={12} aria-hidden="true" />
-            ) : (
-              <Loader2 size={12} className="animate-spin" aria-hidden="true" />
-            )}
-            {followConnected ? 'Live' : 'Reconnecting'}
-          </span>
-        )}
-        <div className="ml-auto flex items-center gap-2">
-          {!isTerminal && (
-            <button
-              type="button"
-              disabled={acting}
-              onClick={async () => { setActing(true); try { await cancelWorkflowRun(run.run_id) } finally { setActing(false) } }}
-              className="inline-flex items-center gap-1 rounded-lg border border-amber-700/60 px-2 py-1 text-xs text-amber-300 hover:bg-amber-900/30 disabled:opacity-50"
-            >
-              <Ban size={13} aria-hidden="true" /> Cancel
-            </button>
-          )}
-          {(effectiveState === 'failed' || effectiveState === 'cancelled') && (
-            <button
-              type="button"
-              disabled={acting}
-              onClick={async () => { setActing(true); try { await resume() } finally { setActing(false) } }}
-              className="inline-flex items-center gap-1 rounded-lg border border-emerald-700/60 px-2 py-1 text-xs text-emerald-300 hover:bg-emerald-900/30 disabled:opacity-50"
-            >
-              <RotateCcw size={13} aria-hidden="true" /> Resume
-            </button>
-          )}
-          <DiagnosticsExportButton runId={run.run_id} />
-          <DeleteRunButton runId={run.run_id} workflowName={run.workflow_name} />
-        </div>
-      </div>
+    <div
+      ref={pageRef}
+      style={height != null ? { height } : undefined}
+      className="flex min-h-[30rem] flex-col overflow-hidden rounded-xl border border-gray-800 bg-[#0a0d12]"
+      data-testid="run-page"
+    >
+      <RunBar
+        run={run}
+        state={effectiveState}
+        runEnded={isTerminal}
+        connected={followConnected}
+        startedMs={startedMs}
+        seconds={seconds}
+        onBack={() => void selectWorkflowRun(null)}
+        follow={isTerminal ? null : { on: following, onChange: setFollow }}
+        acting={acting}
+        onCancel={isTerminal ? null : act(() => cancelWorkflowRun(run.run_id))}
+        onResume={effectiveState === 'failed' || effectiveState === 'cancelled' ? act(resume) : null}
+        onCompare={() => setSlide('compare')}
+      />
 
-      {resumePlanId && (
-        <div role="alert" className="rounded-lg border border-amber-700/60 bg-amber-950/30 p-3 space-y-2">
-          <p className="text-sm text-amber-200">
-            The workflow changed since its plan was approved, so resuming needs a new approval.
-          </p>
-          <p className="text-xs text-gray-400">
-            Plan id: <code className="break-all font-mono text-gray-300">{resumePlanId}</code>
-          </p>
-          <button
-            type="button"
-            disabled={acting}
-            onClick={async () => { setActing(true); try { await approveAndResume() } finally { setActing(false) } }}
-            className="inline-flex items-center gap-2 rounded-lg bg-amber-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50"
-          >
-            <ShieldCheck size={14} aria-hidden="true" /> Approve &amp; resume
-          </button>
+      {(resumePlanId || run.state === 'failed') && (
+        <div className="shrink-0 space-y-2 border-b border-gray-800 px-5 py-3">
+          {resumePlanId && (
+            <div role="alert" className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-amber-700/60 bg-amber-950/30 px-3 py-2">
+              <div className="min-w-0 flex-1 space-y-0.5">
+                <p className="text-sm text-amber-200">
+                  The workflow changed since its plan was approved, so resuming needs a new approval.
+                </p>
+                <p className="text-xs text-gray-400">
+                  Plan id: <code className="break-all font-mono text-gray-300">{resumePlanId}</code>
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={acting}
+                onClick={act(approveAndResume)}
+                className="inline-flex shrink-0 items-center gap-2 rounded-lg bg-amber-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50"
+              >
+                <ShieldCheck size={14} aria-hidden="true" /> Approve &amp; resume
+              </button>
+            </div>
+          )}
+          <FailureDetail run={run} />
         </div>
       )}
 
-      <FailureDetail run={run} />
-
-      <RunResultPanel runId={run.run_id} terminal={isTerminal} state={effectiveState} />
-      <RunArtifacts runId={run.run_id} terminal={isTerminal} />
-
-      {/* Flow, with live step states */}
-      <div className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-3">
-        <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Flow</h3>
-        <WorkflowFlow steps={flowSteps} states={flowStates} label="Run flow" />
-      </div>
-
-      {/* Steps */}
-      <div className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-3">
-        <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Steps</h3>
-        <StepSummary run={run} />
-      </div>
-
-      {/* Timeline + playback */}
-      <div className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-3">
-        <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Timeline</h3>
-        <WorkflowTimeline
-          events={events}
-          gaps={gaps}
-          selectedIndex={selectedIndex}
-          onSelectIndex={setSelectedIndex}
+      <div className="grid min-h-0 flex-1 grid-cols-[minmax(15rem,22.5rem)_minmax(0,1fr)]">
+        <StepRail
+          steps={rail}
+          selected={current}
+          onSelectStep={selectStep}
+          onSelectResult={selectResult}
+          runEnded={isTerminal}
+          runState={effectiveState}
+          runSeconds={seconds}
+          progress={progress}
+          startedAt={run.started_at}
+          runId={run.run_id}
+          tier={run.tier}
         />
+        <section aria-label="Console" className="flex min-h-0 min-w-0 flex-col">
+          <div className="flex min-h-0 flex-1 flex-col px-5 pb-4 pt-4">
+            {current?.kind === 'result' ? (
+              <section aria-label="Result of the run" className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1" data-testid="run-result-view">
+                <header className="flex items-center gap-3">
+                  <Flag size={16} aria-hidden="true" className="text-gray-400" />
+                  <h2 className="text-base font-semibold text-white">Result</h2>
+                  <span
+                    className={`inline-flex h-6 items-center rounded-full px-2.5 text-xs font-semibold ${CHIP_TONES[flowStateKey(effectiveState)]}`}
+                  >
+                    {effectiveState === 'completed' && seconds != null
+                      ? `Completed in ${formatDuration(seconds)}`
+                      : flowStateView(effectiveState).text}
+                  </span>
+                </header>
+                <RunResultPanel runId={run.run_id} terminal={isTerminal} state={effectiveState} lastStep={lastStep} />
+                <RunArtifacts runId={run.run_id} terminal={isTerminal} />
+                <div className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-3">
+                  <RunComparison runId={run.run_id} otherRuns={allRuns} />
+                </div>
+              </section>
+            ) : currentStep ? (
+              <StepConsole
+                key={`${run.run_id}:${currentStep.id}`}
+                runId={run.run_id}
+                step={currentStep}
+                terminalId={terminalId}
+                runEnded={isTerminal}
+                specStatus={specStatus}
+                events={stepEvents}
+              />
+            ) : (
+              <p className="text-sm text-gray-500" role="status">No steps recorded for this run.</p>
+            )}
+          </div>
+          <EventsStrip rows={labelled} gaps={gaps} onOpen={openEvents} />
+        </section>
       </div>
 
-      {/* Synced terminal (the null-offset graceful-degrade seam) */}
-      <SyncedTerminalPane event={selectedEvent} />
-
-      {/* Comparison */}
-      <div className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-3">
-        <RunComparison runId={run.run_id} otherRuns={allRuns} />
-      </div>
+      {slide === 'events' && (
+        <SlideOver title="All events" onClose={() => setSlide(null)} testId="events-slide-over">
+          <div className="space-y-4">
+            <WorkflowTimeline
+              events={events}
+              gaps={gaps}
+              selectedIndex={selectedIndex}
+              onSelectIndex={setSelectedIndex}
+              runStartedAt={run.started_at}
+              live={!isTerminal}
+              following={followLatest}
+              onLatest={followLatestEvent}
+            />
+            {/* The selected event's step terminal (byte-exact once offset capture lands) */}
+            <SyncedTerminalPane
+              event={selectedEvent}
+              step={eventStep ? { state: eventStep.state, terminalId: eventStep.terminalId } : null}
+              runEnded={isTerminal}
+            />
+          </div>
+        </SlideOver>
+      )}
+      {slide === 'compare' && (
+        <SlideOver title="Compare runs" onClose={() => setSlide(null)} testId="compare-slide-over">
+          <RunComparison runId={run.run_id} otherRuns={allRuns} />
+        </SlideOver>
+      )}
     </div>
   )
 }
