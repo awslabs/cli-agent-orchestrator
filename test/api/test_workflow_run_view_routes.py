@@ -50,6 +50,8 @@ _RUN = "run-view-1"
 _TERMINAL = "0badcafe"
 # A credential shape ``secret_gate`` redacts (GitHub classic PAT: ``ghp_`` + 36 chars).
 _TOKEN = "ghp_" + "Q1w2E3r4T5" * 3 + "Y6u7I8"
+# AWS's documented example key id: the one AWS key the repo's .gitleaks.toml allowlists.
+_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 _ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
@@ -108,6 +110,18 @@ class _ReadOnlyBackend:
         if self.error is not None:
             raise self.error
         return self.text
+
+
+class _WrappingBackend(_ReadOnlyBackend):
+    """Returns ``rows`` as tmux renders them at the pane width, or ``joined`` with -J."""
+
+    def __init__(self, rows: str, joined: str) -> None:
+        super().__init__(rows)
+        self.joined = joined
+
+    def get_history(self, session_name: str, window_name: str, **kwargs: Any) -> str:
+        rows = super().get_history(session_name, window_name, **kwargs)
+        return self.joined if kwargs.get("join_wrapped") else rows
 
 
 def _live_terminal(monkeypatch, backend: _ReadOnlyBackend, metadata: Any = "default") -> List[str]:
@@ -189,7 +203,9 @@ def test_a_script_run_gets_result_from_the_envelope_its_settle_writes(client):
 # ---------------------------------------------------------------------------
 def test_screen_returns_a_read_only_plain_text_capture(client, monkeypatch):
     _seed()
-    backend = _ReadOnlyBackend("MockCli ready.\n> MOCK: working\n\n\n   \n")
+    # The first captured line is always dropped, because it can start mid-line (see
+    # test_screen_drops_its_first_captured_line). -J keeps written trailing spaces.
+    backend = _ReadOnlyBackend("$ mock_cli\nMockCli ready.\n> MOCK: working  \n\n\n   \n")
     looked_up = _live_terminal(monkeypatch, backend)
 
     resp = _screen(client)
@@ -207,17 +223,50 @@ def test_screen_returns_a_read_only_plain_text_capture(client, monkeypatch):
             "window": "check-orders-1",
             "tail_lines": 250,
             "strip_escapes": True,
+            "join_wrapped": True,
         }
     ]
 
 
 def test_screen_redacts_secrets(client, monkeypatch):
     _seed()
-    _live_terminal(monkeypatch, _ReadOnlyBackend(f"exporting {_TOKEN}\n❯ "))
+    _live_terminal(monkeypatch, _ReadOnlyBackend(f"$ env\nexporting {_TOKEN}\n❯ "))
     body = _screen(client).json()
     assert _TOKEN not in body["text"]
     assert "[REDACTED:github_pat]" in body["text"]
     assert body["redacted"] is True
+
+
+def test_screen_rejoins_wrapped_rows_so_a_secret_that_wraps_is_redacted(client, monkeypatch):
+    """tmux splits a long line into rows at the pane width, and a pattern matches a secret
+    only whole. Read as rows, a key that crossed a wrap came back as two unredacted halves
+    with ``redacted: false`` (#1309 review). The screen asks for the rows rejoined (-J)."""
+    _seed()
+    line = "x" * 50 + _AWS_KEY  # on a 60-column pane the wrap falls 10 characters into the key
+    backend = _WrappingBackend(
+        rows=f"$ env\n{line[:60]}\n{line[60:]}\n❯ ",
+        joined=f"$ env\n{line}\n❯ ",
+    )
+    _live_terminal(monkeypatch, backend)
+    body = _screen(client).json()
+    assert backend.calls[0]["join_wrapped"] is True
+    for fragment in (_AWS_KEY[:10], _AWS_KEY[10:]):
+        assert fragment not in body["text"]
+    assert "[REDACTED:aws_access_key]" in body["text"]
+    assert body["redacted"] is True
+
+
+def test_screen_drops_its_first_captured_line(client, monkeypatch):
+    """The capture starts 250 rows up, and joined rows begin there even mid-line, so its
+    first line can be the second half of a key that began above the window, which no
+    pattern matches. Dropping 50 of 250 ROWS used to cover that edge, but 250 joined rows
+    can be fewer than 200 lines. So the first line is dropped before redaction."""
+    _seed()
+    tail = _AWS_KEY[10:]
+    _live_terminal(monkeypatch, _ReadOnlyBackend(f"{tail} was exported\n$ next\n❯ "))
+    body = _screen(client).json()
+    assert tail not in body["text"]
+    assert body["text"] == "$ next\n❯"
 
 
 def test_screen_keeps_the_last_200_lines(client, monkeypatch):
@@ -252,7 +301,7 @@ def test_screen_redacts_before_cutting_at_the_byte_edge(client, monkeypatch):
     # The raw cut lands 20 bytes into the 40-byte token. The padding is not alphanumeric,
     # so the greedy token pattern cannot swallow it and shrink the text below the cap.
     line = "." * 100 + " " + _TOKEN + " " + "." * (WORKFLOW_STEP_SCREEN_MAX_BYTES - 21)
-    _live_terminal(monkeypatch, _ReadOnlyBackend(line))
+    _live_terminal(monkeypatch, _ReadOnlyBackend("$ cat config\n" + line))
     body = _screen(client).json()
     assert len(body["text"].encode("utf-8")) <= WORKFLOW_STEP_SCREEN_MAX_BYTES
     for fragment in (_TOKEN[20:], _TOKEN[-12:], _TOKEN[:12]):

@@ -14,10 +14,18 @@ Two reads back ``GET /workflows/runs/{run_id}/steps/{step_id}/screen`` and
 
 TRUST. Both take the terminal id from the step's journal row (:func:`recorded_terminal_id`),
 never from the request, and each re-checks it against the ``TerminalId`` pattern inline,
-in the function that uses it. Both redact secrets BEFORE they cut the text to its bound:
-the screen captures more lines than it returns, the transcript reads a margin before the
-bytes it returns. A secret straddling the edge of what is returned is therefore redacted
-whole and never returned in part.
+in the function that uses it.
+
+REDACTION. A pattern matches a secret only whole, so both read the lines the program
+wrote, not the rows the terminal split them into at its width: the screen asks the backend
+to rejoin wrapped rows (tmux ``capture-pane -J``), and ``terminal_service`` saves the
+transcript's scrollback the same way. herdr has no rejoin option, so on herdr a secret
+split across lines is not redacted. Both redact BEFORE they cut the text to its bound: the
+screen captures more lines than it returns, the transcript reads a margin before the bytes
+it returns. Both drop a first line that can start in the middle of a line, before
+redaction: the screen always, because joined rows begin wherever its capture window does,
+and the transcript when its read starts inside the file. A secret straddling the edge of
+what is returned is therefore redacted whole and never returned in part.
 
 Every function here is synchronous (sqlite, tmux or herdr, and file I/O): callers on the
 event loop run them through ``asyncio.to_thread``.
@@ -118,11 +126,12 @@ def recorded_terminal_id(run_id: str, step_id: str) -> str:
 def capture_screen(terminal_id: str) -> ScreenCapture:
     """Capture the step's live screen: the visible pane plus scrollback above it.
 
-    Takes the last ``WORKFLOW_STEP_SCREEN_CAPTURE_LINES`` lines of history (tmux counts
-    them above the visible pane), redacts the whole capture, drops the empty rows below
-    the last output, then returns the last ``WORKFLOW_STEP_SCREEN_MAX_LINES`` lines, at
-    most ``WORKFLOW_STEP_SCREEN_MAX_BYTES``. ``truncated`` is True when lines or bytes
-    were dropped. Read-only: no client attaches and no key is sent.
+    Takes the last ``WORKFLOW_STEP_SCREEN_CAPTURE_LINES`` rows of history (tmux counts
+    them above the visible pane) with wrapped rows rejoined, drops the first line, strips
+    trailing spaces, redacts the whole capture, drops the empty rows below the last
+    output, then returns the last ``WORKFLOW_STEP_SCREEN_MAX_LINES`` lines, at most
+    ``WORKFLOW_STEP_SCREEN_MAX_BYTES``. ``truncated`` is True when the line or byte bound
+    dropped text. Read-only: no client attaches and no key is sent.
 
     Raises:
         StepTerminalNotFound: ``terminal_id`` is not a valid terminal id.
@@ -140,6 +149,9 @@ def capture_screen(terminal_id: str) -> ScreenCapture:
             metadata["tmux_window"],
             tail_lines=WORKFLOW_STEP_SCREEN_CAPTURE_LINES,
             strip_escapes=True,
+            # Rows tmux soft-wrapped at the pane width come back as the one line the
+            # program wrote, so redaction sees a secret that crossed a wrap whole.
+            join_wrapped=True,
         )
     except (ValueError, TerminalNotFoundError) as e:
         # The registry row outlived the pane (teardown in progress, or a deferred cleanup
@@ -149,8 +161,16 @@ def capture_screen(terminal_id: str) -> ScreenCapture:
         ) from e
     captured_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # The capture starts at a row, and joined rows begin there even when it is the middle
+    # of a line that started above the window, such as the second half of a secret that
+    # no pattern matches. So the first line is dropped BEFORE redaction and never
+    # returned in part. When the whole history fits in the window, it is the terminal's
+    # first line. -J also keeps the trailing spaces a program wrote, which the default
+    # capture trims: strip them, so lines read as they would without -J.
+    captured = [line.rstrip(" ") for line in raw.split("\n")[1:]]
+
     # Redact the whole capture first, then cut.
-    text, fired = redact_secrets(raw)
+    text, fired = redact_secrets("\n".join(captured))
     lines = text.split("\n")
     while lines and not lines[-1].strip():
         lines.pop()  # the empty rows of the visible pane below the last output

@@ -452,13 +452,16 @@ The spec-route scope checks apply when authentication is enabled.
 - `GET /workflows/runs/{run_id}/steps/{step_id}/screen` returns a running step's screen:
   `{terminal_id, text, truncated, redacted, captured_at}`. `text` is plain text with no
   escape codes: the visible screen plus the scrollback above it, at most 200 lines and
-  64 KiB, with secrets redacted. `captured_at` is an ISO-8601 UTC time. The capture is
+  64 KiB, with secrets redacted. Rows the terminal wrapped at its width are joined first,
+  so a secret that wraps is still redacted. herdr cannot join them, so on herdr a secret
+  split across lines is not redacted. `captured_at` is an ISO-8601 UTC time. The capture is
   read-only: it attaches no client, sends no input and never resizes the agent's window.
   Malformed `run_id` or `step_id` 400; unknown run or step, or a step with no terminal
   recorded, 404; a terminal that has ended 410 (read the transcript instead).
 - `GET /workflows/runs/{run_id}/steps/{step_id}/transcript` returns a finished step's saved
   transcript: `{terminal_id, text, truncated, redacted}`. `text` is the last 256 KiB of the
   terminal's `<terminal_id>.scrollback` file, starting at a line, with secrets redacted.
+  CAO saves that file with wrapped rows joined, for the same reason as the screen.
   Secrets are redacted before the text is cut, so a secret split at the cut is never
   returned in part. `truncated` means the file holds more than `text`. Malformed `run_id`
   or `step_id` 400; unknown run or step, no terminal recorded, or no transcript file yet

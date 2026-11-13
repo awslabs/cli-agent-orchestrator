@@ -376,11 +376,14 @@ row (see [Configuration](configuration.md#memory-memory)).
 
 **The live screen.** A step's `terminal_id` is set as soon as its terminal exists, while
 the step runs. `GET /workflows/runs/{run_id}/steps/{step_id}/screen` returns that terminal's
-screen as plain text: the last 200 lines, redacted. It is a read-only capture. It never
+screen as plain text: the last 200 lines, redacted. Rows the terminal wrapped at its width
+are joined first, so a secret that wraps is still redacted. herdr cannot join them, so on
+herdr a secret split across lines is not redacted. It is a read-only capture. It never
 attaches to the terminal, sends input or resizes the agent's window. It returns `410` once
 the terminal has ended.
 
-**The transcript.** When a step's terminal ends, CAO saves its scrollback. After that,
+**The transcript.** When a step's terminal ends, CAO saves its scrollback, with wrapped
+rows joined the same way. After that,
 `GET /workflows/runs/{run_id}/steps/{step_id}/transcript` returns the last 256 KiB of it,
 redacted. The cleanup service deletes it with the terminal's other logs after 14 days
 (`RETENTION_DAYS`). The saved answer stays, because it is in the journal. A step that timed
