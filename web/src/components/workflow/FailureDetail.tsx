@@ -1,7 +1,8 @@
 // FailureDetail — the forensic summary for a failed run (#504 / U8, FR-7.2).
 // From the durable read (cold-read capable): the last step that changed state,
 // its failing attempt count, the structured error_kind, and the owning terminal
-// id. Renders nothing for a non-failed run.
+// id. Renders nothing for a non-failed run. The run page shows it as a banner
+// under its run bar.
 
 import { AlertOctagon } from 'lucide-react'
 import type { RunInspection } from '../../api'
@@ -24,7 +25,7 @@ export function FailureDetail({ run }: FailureDetailProps) {
     return (
       <section
         aria-label="Failure detail"
-        className="rounded-lg border border-red-700/40 bg-red-950/20 p-3 text-xs text-red-300"
+        className="rounded-lg border border-red-700/40 bg-red-950/20 px-3 py-2 text-xs text-red-300"
       >
         <div className="flex items-center gap-2">
           <AlertOctagon size={14} aria-hidden="true" />
@@ -37,21 +38,29 @@ export function FailureDetail({ run }: FailureDetailProps) {
   return (
     <section
       aria-label="Failure detail"
-      className="rounded-lg border border-red-700/40 bg-red-950/20 p-3 space-y-1.5"
+      className="flex flex-wrap items-center gap-x-5 gap-y-1 rounded-lg border border-red-700/40 bg-red-950/20 px-3 py-2"
     >
       <div className="flex items-center gap-2 text-sm font-medium text-red-300">
         <AlertOctagon size={16} aria-hidden="true" />
         Run failed
       </div>
-      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
-        <dt className="text-gray-500">Last step</dt>
-        <dd className="font-mono text-gray-300">{failedStep.id}</dd>
-        <dt className="text-gray-500">Failing attempt</dt>
-        <dd className="text-gray-300 tabular-nums">{failedStep.attempts}</dd>
-        <dt className="text-gray-500">Error kind</dt>
-        <dd className="font-mono text-red-300">{failedStep.error_kind || 'unknown'}</dd>
-        <dt className="text-gray-500">Terminal</dt>
-        <dd className="font-mono text-gray-300">{failedStep.terminal_id || '—'}</dd>
+      <dl className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+        <div className="flex items-center gap-1.5">
+          <dt className="text-gray-500">Last step</dt>
+          <dd className="font-mono text-gray-300">{failedStep.id}</dd>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <dt className="text-gray-500">Failing attempt</dt>
+          <dd className="text-gray-300 tabular-nums">{failedStep.attempts}</dd>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <dt className="text-gray-500">Error kind</dt>
+          <dd className="font-mono text-red-300">{failedStep.error_kind || 'unknown'}</dd>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <dt className="text-gray-500">Terminal</dt>
+          <dd className="font-mono text-gray-300">{failedStep.terminal_id || '—'}</dd>
+        </div>
       </dl>
     </section>
   )

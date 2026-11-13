@@ -2738,6 +2738,8 @@ class TestListTerminalsInSessions:
             "deferred_init_external_owner",
             "deferred_init_runtime_reclaimed",
             "session_incarnation_id",
+            # #1131: the stored Kiro identity record, None for other providers.
+            "identity_verified",
             # #1225: end of a kept child's window, None when not kept.
             "kept_until",
             "last_active",

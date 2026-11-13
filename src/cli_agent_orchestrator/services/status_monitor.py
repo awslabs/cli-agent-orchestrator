@@ -1080,6 +1080,31 @@ class StatusMonitor:
         with self._lock:
             return self._output_generation.get(terminal_id, 0)
 
+    def cached_status(self, terminal_id: str) -> Optional[TerminalStatus]:
+        """The last status applied to this terminal, or ``None`` if none ever was.
+
+        A pure read of the in-memory table under its lock: it re-detects nothing, captures
+        no pane, forks nothing, writes nothing and publishes nothing. ``get_status`` and
+        ``status_observation`` can do all of those, so a caller that must stay cheap and
+        side-effect free (a snapshot built for every event) reads this instead.
+
+        It is the *last applied* reading, which is not always what ``get_status`` returns:
+
+        - ``get_status`` flips a cached IDLE/COMPLETED to PROCESSING while a native swarm
+          is pending; this does not.
+        - ``get_status`` re-detects a cached PROCESSING (or WAITING_USER_ANSWER) from the
+          buffer, and may recover it from a quiet pane with ``capture-pane`` (#558). This
+          does not, so a stuck PROCESSING keeps its last reading until something calls
+          ``get_status``.
+        - A terminal the monitor has never applied a status to is ``None`` here, where
+          ``get_status`` gives ``UNKNOWN``.
+
+        On an event-inbox backend (herdr) nothing feeds the table, so this is ``None``
+        there; those statuses are derived on demand and cannot be read without a shell-out.
+        """
+        with self._lock:
+            return self._last_status.get(terminal_id)
+
     def status_observation(self, terminal_id: str) -> "StatusObservation":
         """Return the terminal's applied status together with the output generation it was earned at.
 

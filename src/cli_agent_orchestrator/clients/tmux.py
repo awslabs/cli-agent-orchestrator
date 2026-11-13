@@ -1457,6 +1457,7 @@ class TmuxClient:
             # value. See issue #248.
             self._merge_extra_env(environment, extra_env)
             environment["CAO_TERMINAL_ID"] = terminal_id
+            environment["HISTFILE"] = "/dev/null"  # agent launch commands are noise
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
             # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to
@@ -1650,6 +1651,7 @@ class TmuxClient:
             window_env: dict[str, str] = {}
             self._merge_extra_env(window_env, extra_env)
             window_env["CAO_TERMINAL_ID"] = terminal_id
+            window_env["HISTFILE"] = "/dev/null"  # agent launch commands are noise
 
             kwargs: dict = {
                 "window_name": window_name,
@@ -1832,6 +1834,7 @@ class TmuxClient:
             pane_env: dict[str, str] = {}
             self._merge_extra_env(pane_env, extra_env)
             pane_env["CAO_TERMINAL_ID"] = terminal_id
+            pane_env["HISTFILE"] = "/dev/null"  # agent launch commands are noise
 
             host_window = self._find_window(session, session_name, host_window_name)
             if host_window is None:

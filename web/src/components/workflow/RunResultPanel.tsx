@@ -6,10 +6,15 @@
 // run-level output, so what a run emitted is read from its steps' outputs; any
 // string field that names a report (a `report*` key, or a value ending in .md) is
 // lifted out and shown first, because that is the deliverable a user looks for.
+//
+// It also shows the last answer from the run's inspection: the last step in run
+// order that has one, with the same rules as the step panel's Output tab
+// (StepOutput). A halted run usually ends on a skipped step, which has none.
 
 import { useEffect, useState } from 'react'
 import { ChevronDown, ChevronRight, FileText } from 'lucide-react'
-import { api, WorkflowRunResult } from '../../api'
+import { api, WorkflowRunResult, type StepInspection } from '../../api'
+import { StepOutput } from './StepOutput'
 
 /** Report-like string fields across all step outputs, de-duplicated, in step order. */
 export function findReportPaths(result: WorkflowRunResult): string[] {
@@ -27,7 +32,15 @@ export function findReportPaths(result: WorkflowRunResult): string[] {
   return found
 }
 
-export function RunResultPanel({ runId, terminal, state }: { runId: string; terminal: boolean; state: string }) {
+export interface RunResultPanelProps {
+  runId: string
+  terminal: boolean
+  state: string
+  /** The run's last answer: the last step in run order that has one, with its live state. */
+  lastStep?: { step: StepInspection; state: string } | null
+}
+
+export function RunResultPanel({ runId, terminal, state, lastStep }: RunResultPanelProps) {
   const [result, setResult] = useState<WorkflowRunResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [showJson, setShowJson] = useState(false)
@@ -87,6 +100,14 @@ export function RunResultPanel({ runId, terminal, state }: { runId: string; term
               )}
             </div>
           )}
+        </div>
+      )}
+      {lastStep && (
+        <div className="mt-3 space-y-1 text-xs" data-testid="run-result-last-step">
+          <p className="text-gray-400">
+            Last answer, from step <span className="font-mono text-gray-200">{lastStep.step.id}</span>
+          </p>
+          <StepOutput step={lastStep.step} state={lastStep.state} runEnded={terminal} />
         </div>
       )}
     </div>

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **`GET /terminals/{id}` reports whether a Kiro terminal passed its identity check** (#1131).
+  The terminal now carries `identity_verified`, read from the row the Kiro input gate (#1074)
+  already writes: `false` until the check passes, `true` after it, and `null` for other
+  providers and for Kiro rows older than the column, never coerced to `false`. A client that
+  picks terminals by `status` can now skip a Kiro terminal that reads `idle` but whose input
+  CAO refuses. `GET /sessions/{name}` and `GET /sessions/{name}/terminals` carry it too, read
+  from the rows they already fetch, and so do the create responses (`POST /sessions` and both
+  `POST /sessions/{name}/terminals` routes): `true` for a synchronous Kiro create, which returns
+  only after the check passed, and `false` for a deferred one, still being checked. Read-only:
+  the gate itself is unchanged.
+- **CAO terminals running bash, or zsh set up without its own `HISTFILE`, no longer write
+  agent launch commands to your shell history.** Every tmux session, window and pane and every
+  herdr pane that CAO creates now gets `HISTFILE=/dev/null` in its environment, set after
+  operator-forwarded `--env` values, as `CAO_TERMINAL_ID` is. Your shell config is not changed,
+  so a shell that sets `HISTFILE` at startup still records the launch line: stock macOS zsh
+  (its `/etc/zshrc` sets `HISTFILE`) and any rc file that assigns `HISTFILE`. The value is set
+  on the tmux session CAO creates, so a window you open yourself in that session later also
+  inherits `HISTFILE=/dev/null` and keeps no history.
+- **`assign` again tells every worker to send its results back with `send_message`** (#1247).
+  Since #1247, `assign` left the "send results back to terminal X using send_message" instruction
+  out of the task, and returned a note that the worker could not reply, whenever the worker's
+  profile named a `provider` and its `mcpServers` did not list `cao-mcp-server`. Providers such as
+  `claude_code` load `cao-mcp-server` from the user's own MCP config instead, so a custom profile
+  that pins `provider:` lost the instruction for a worker that had the tool. The instruction is
+  appended whenever sender-ID injection is on, as before #1247, and the auto-forward fallback
+  still covers a worker that does not reply. The `worker_can_reply` query parameter on terminal
+  create and the `no_send_message_tool` edge reason are removed; a stored edge with that reason
+  reads as `no_callback`.
 - **Kiro v3 helpers can admit unlisted kiro-cli versions with an operator opt-in.**
   `kiro.v3_admission: "observed"` borrows the newest same-major schema row
   at or below the probed version, for versions from 2.35.1 to below 4.0.0. The existing

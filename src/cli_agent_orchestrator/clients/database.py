@@ -3517,6 +3517,9 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # As stored, None included (#1131), read from the row already
+                # fetched here: no extra query per terminal.
+                "identity_verified": t.identity_verified,
                 # #1225: end of the keep window for a kept child, else None.
                 "kept_until": kept_until,
                 "last_active": t.last_active,
@@ -3625,6 +3628,9 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # As stored, None included (#1131), read from the row already
+                # fetched here: no extra query per terminal.
+                "identity_verified": t.identity_verified,
                 # #1225: end of the keep window for a kept child, else None.
                 "kept_until": kept_until,
                 "last_active": t.last_active,
@@ -3661,6 +3667,9 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # As stored, None included (#1131), read from the row already
+                # fetched here: no extra query per terminal.
+                "identity_verified": t.identity_verified,
                 # #1225: end of the keep window for a kept child, else None.
                 "kept_until": kept_until,
                 "last_active": t.last_active,
@@ -4248,6 +4257,15 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
 # Delegation edge functions (assign-callback-guarantee)
 
 
+def _edge_reason(value: str) -> EdgeReason:
+    # A stored row can carry a reason value this version does not define;
+    # it reads as the default so the edge stays usable.
+    try:
+        return EdgeReason(value)
+    except ValueError:
+        return EdgeReason.NO_CALLBACK
+
+
 def _edge_from_row(row: DelegationEdgeModel) -> DelegationEdge:
     return DelegationEdge(
         id=row.id,
@@ -4255,7 +4273,7 @@ def _edge_from_row(row: DelegationEdgeModel) -> DelegationEdge:
         worker_id=row.worker_id,
         source=EdgeSource(row.source),
         state=EdgeState(row.state),
-        reason=EdgeReason(row.reason),
+        reason=_edge_reason(row.reason),
         message_id=row.message_id,
         created_at=row.created_at,
         delivered_at=row.delivered_at,

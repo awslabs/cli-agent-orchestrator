@@ -13,12 +13,13 @@ that exposes multi-agent fleet observability to any stock AG-UI client.
 
 | Directory | Description | Requires |
 |-----------|-------------|----------|
-| [`ag-ui-supervisor-dashboard/`](ag-ui-supervisor-dashboard/) | L2 `SupervisorDashboardStream` construct — folds STATE_SNAPSHOT/DELTA into a live fleet hierarchy | `uv run` |
+| [`ag-ui-supervisor-dashboard/`](ag-ui-supervisor-dashboard/) | L2 `SupervisorDashboardStream` construct — folds STATE_SNAPSHOT/DELTA into a live fleet hierarchy, grouped by runner | `uv run` |
 | [`ag-ui-session-timeline/`](ag-ui-session-timeline/) | L2 `MultiAgentSessionTimeline` construct — reconstructs delegation + message timeline from TOOL_CALL lifecycle | `uv run` |
 | [`ag-ui-handoff-approval/`](ag-ui-handoff-approval/) | L2 `AgentHandoffWithApproval` construct — full interrupt lifecycle (prompt → classify → interrupt → approve/deny/edit → delivery) | `uv run` |
 | [`ag-ui-cross-provider-sync/`](ag-ui-cross-provider-sync/) | L2 `CrossProviderStateSync` construct — convergence proof across kiro_cli / claude_code / codex | `uv run` |
 | [`ag-ui-stock-client-live/`](ag-ui-stock-client-live/) | AC3 verification — stock `@ag-ui/client` `HttpAgent` completes a run against `POST /agui/v1/run` with zero CAO-specific code | Node.js |
-| [`ag-ui-operator-dashboard/`](ag-ui-operator-dashboard/) | Operator dashboard (React + Vite): answers approvals on the run plane (Edit only where `responseSchema` offers it, decisions batched into one `resume[]`) and lists the six `emit_ui` components from the ambient stream as text | Node.js 22 + `cao-server` |
+| [`ag-ui-operator-dashboard/`](ag-ui-operator-dashboard/) | Operator dashboard (React + Vite): answers approvals on the run plane (Edit only where `responseSchema` offers it, decisions batched into one `resume[]`), lists the six `emit_ui` components from the ambient stream as text, and shows the fleet grouped by runner with each terminal's profile | Node.js 22 + `cao-server` |
+| [`cao-dojo/`](cao-dojo/) | CAO Dojo: a zero-dependency live fleet page with an answerable approval card, a recorded-trace drift check, and `inspector.html`, a raw event inspector that lists every record of a recorded `/agui/v1` trace in order with its type and timestamp | Browser (`uv run` for the trace tools) |
 | [`ag-ui-meta-dogfood/`](ag-ui-meta-dogfood/) | Real supervisor→developer→reviewer cross-provider fleet captured on the live AG-UI stream (metadata only, privacy boundary verified) | `uv run` + `cao-server` |
 | [`ag-ui-dashboard/`](ag-ui-dashboard/) | L1 showcase — drives all 6 `emit_ui` components live and demonstrates off-list refusal | `uv run` |
 | [`ag-ui-eventsource-viewer/`](ag-ui-eventsource-viewer/) | Browser-based SSE viewer for `GET /agui/v1/stream` — raw frame inspector | Browser |
