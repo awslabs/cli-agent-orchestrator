@@ -1193,6 +1193,64 @@ class TestScreenDetection:
         assert rendered is not None
         assert rendered[45].startswith("clamped")
 
+    def test_hpa_moves_the_cursor_to_the_column(self):
+        """HPA is ``CSI n ```; pyte 0.8.2 binds it to ``'`` and would drop it.
+
+        agy sends ``CSI 3 ``` after a line feed in place of a carriage return.
+        """
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "abcdef\n\x1b[3`XY")
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert rendered[0].rstrip() == "abcdef"
+        assert rendered[1].rstrip() == "  XY"
+
+    def test_hpa_without_a_parameter_goes_to_column_one(self):
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "abcdef\n\x1b[`Z")
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert rendered[1].rstrip() == "Z"
+
+    def test_repeated_hpa_rows_do_not_wrap_and_drift_the_composite(self):
+        """The drift: without HPA the column grows, the text wraps, rows go missing."""
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", ("\n\x1b[3`" + "x" * 150) * 4 + "\n\x1b[3`last")
+
+        screen = sm._screens["t1"][0]
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert screen.cursor.y == 5
+        assert [row.rstrip() for row in rendered[1:5]] == ["  " + "x" * 150] * 4
+        assert rendered[5].rstrip() == "  last"
+
+    def test_hpa_mapping_does_not_change_pyte_global_csi_table(self):
+        import pyte
+
+        before = dict(pyte.Stream.csi)
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "a\x1b[3`b")
+        assert pyte.Stream.csi == before
+
+    def test_hpa_mapping_survives_a_pyte_that_binds_hpa_itself(self, monkeypatch):
+        """A later pyte that maps ``CSI n ``` itself must not break the mapping."""
+        import pyte
+
+        monkeypatch.setitem(pyte.Stream.csi, "`", "cursor_to_column")
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "abcdef\n\x1b[3`XY")
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert rendered[1].rstrip() == "  XY"
+
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_render_error_falls_back_to_raw_buffer_detection(self, mock_pm):
         class BrokenScreen:
