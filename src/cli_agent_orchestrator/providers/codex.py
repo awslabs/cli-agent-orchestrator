@@ -251,14 +251,15 @@ LAUNCH_COMMAND_PATTERN = r"(?P<prompt>.*[$%#>❯›»])\s*codex\b"
 # Three known variants:
 #   v0.98+: "allow Codex to work in this folder"
 #   v0.130+ (git worktree): "Do you trust the contents of this directory?"
-#   v0.167+: "Trust this folder?" with footer "enter continue · esc back",
-#     not the shared "Press enter to continue" footer.
+#   v0.156+: "Trust this folder?" with footer "enter continue · esc <cancel>",
+#     not the shared "Press enter to continue" footer. The cancel word is
+#     "quit", "back" or "cancel" depending on the Codex version and launch.
 # All indicate the TUI is blocked waiting for user input.
 TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
 TRUST_PROMPT_PATTERN_V2 = r"Do you trust the contents of this directory\?"
 TRUST_PROMPT_PATTERN_V3 = r"Trust this folder\?"
 TRUST_PROMPT_FOOTER = r"Press enter to continue"
-TRUST_PROMPT_FOOTER_V3 = r"enter\s+continue\s+·\s+esc\s+back"
+TRUST_PROMPT_FOOTER_V3 = r"enter\s+continue\s+·\s+esc\s+(?:back|quit|cancel)"
 
 # First-run auth menu, shown when no OpenAI/Codex credentials are configured yet:
 #   Welcome to Codex, OpenAI's command-line coding agent
@@ -1990,7 +1991,7 @@ class CodexProvider(BaseProvider):
         1. Workspace trust prompt (three variants):
              v0.98+: "allow Codex to work in this folder"
              v0.130+ (git worktree): "Do you trust the contents of this directory?"
-             v0.167+: "Trust this folder?"
+             v0.156+: "Trust this folder?"
            Dismissed with Enter (default = allow).
 
         2. Update-available dialog (defense-in-depth; normally suppressed via
@@ -2037,15 +2038,15 @@ class CodexProvider(BaseProvider):
             if live == "trust" and not trust_dismissed:
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-                wording = max(
+                headers = [
                     (match.start(), variant)
                     for variant, pattern in (
-                        ("v1", TRUST_PROMPT_PATTERN),
                         ("v2", TRUST_PROMPT_PATTERN_V2),
                         ("v3", TRUST_PROMPT_PATTERN_V3),
                     )
                     for match in re.finditer(pattern, bottom_region)
-                )[1]
+                ]
+                wording = max(headers)[1] if headers else "v1"
                 logger.info("Codex workspace trust prompt (%s) detected, auto-accepting", wording)
                 status_monitor.notify_input_sent(self.terminal_id)
                 await asyncio.to_thread(

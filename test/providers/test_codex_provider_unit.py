@@ -3092,6 +3092,71 @@ class TestCodexProviderTrustPrompt:
         )
         mock_backend.return_value.send_keys.assert_not_called()
 
+    @staticmethod
+    def _dialog_with_cancel(option, word):
+        return (
+            load_fixture("codex_trust_dialog_v0167.txt")
+            .replace("2. Back to Agent Command Center", f"2. {option}")
+            .replace("enter continue · esc back", f"enter continue · esc {word}")
+        )
+
+    @pytest.mark.parametrize(
+        ("option", "word"),
+        [("Quit", "quit"), ("Keep current directory", "cancel")],
+    )
+    def test_live_startup_block_trust_folder_dialog_with_other_cancel_words(self, option, word):
+        assert _live_startup_block(self._dialog_with_cancel(option, word)) == "trust"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_accepts_esc_quit_dialog(self, mock_backend, mock_sleep):
+        mock_backend.return_value.get_history.return_value = self._dialog_with_cancel(
+            "Quit", "quit"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch(
+            "cli_agent_orchestrator.providers.codex.time",
+            fake_clock(0.0, 0.0, 0.0, 0.0, 100.0),
+        ):
+            await provider._handle_trust_prompt(outer_timeout=2.0)
+
+        mock_backend.return_value.send_special_key.assert_called_once_with(
+            "test-session", "window-0", "Enter"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("screen", "wording"),
+        [
+            ("v1", "v1"),
+            ("v2", "v2"),
+            ("v3", "v3"),
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_logs_the_wording_of_the_dialog_header(
+        self, mock_backend, mock_sleep, screen, wording, caplog
+    ):
+        screens = {
+            "v1": TestLiveStartupBlock._TRUST_V1,
+            "v2": TestLiveStartupBlock._TRUST_V2,
+            "v3": load_fixture("codex_trust_dialog_v0167.txt"),
+        }
+        mock_backend.return_value.get_history.return_value = screens[screen]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with (
+            caplog.at_level(logging.INFO),
+            patch(
+                "cli_agent_orchestrator.providers.codex.time",
+                fake_clock(0.0, 0.0, 0.0, 0.0, 100.0),
+            ),
+        ):
+            await provider._handle_trust_prompt(outer_timeout=2.0)
+
+        assert f"trust prompt ({wording}) detected" in caplog.text
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
