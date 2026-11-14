@@ -458,11 +458,30 @@ def test_the_real_branch_enables_but_never_starts(sandbox) -> None:
     assert "systemctl start" not in "\n".join(l for l in lines(result) if "would run" in l)
 
 
+@pytest.mark.skipif(
+    Path("/etc/cao-box/box.env").exists(),
+    reason=(
+        "this host is a bootstrapped cao-box: bootstrap.sh reads the real "
+        "/etc/cao-box/box.env (ETC_DIR is ${ROOT}/etc/cao-box, and --root skips "
+        "the IMDS branch), so the first-run IMDS plan can't be exercised here"
+    ),
+)
 def test_the_session_name_would_come_from_imds_and_go_to_the_volume(sandbox) -> None:
-    result = dry_run(sandbox, FakeSystem(sandbox), **BOOTSTRAP_SETTINGS)
+    box_home = sandbox.root / "box-home"
+    data_mount = sandbox.root / "data-volume"
+    result = dry_run(
+        sandbox,
+        FakeSystem(sandbox),
+        **{
+            **BOOTSTRAP_SETTINGS,
+            "BOX_HOME": str(box_home),
+            "DATA_MOUNT": str(data_mount),
+        },
+    )
     assert result.returncode == 0
     assert (
-        "would read the instance id from IMDSv2 and write /Users/.cao-box/box.env and /etc/cao-box/box.env"
+        f"would read the instance id from IMDSv2 and write {data_mount}/.cao-box/box.env "
+        "and /etc/cao-box/box.env"
         in result.stdout
     )
     assert sandbox.recorded_calls() == []
