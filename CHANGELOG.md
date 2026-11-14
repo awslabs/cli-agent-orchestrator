@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Codex "Trust this folder?" dialogs (0.156 and later) are accepted before the first input** (#1319).
+  Recognise the "Trust this folder?" header and its "enter continue · esc back", "esc quit"
+  and "esc cancel" footers while keeping earlier wordings and ignoring dismissed dialogs
+  above the composer.
+- **dnspython is now 2.9.2 or later** (CVE-2026-128089, HIGH). The floor in `pyproject.toml` and
+  the three lock files move from 2.9.0 to 2.9.2, the first release with the fix.
+- **`GET /terminals/{id}` reports whether a Kiro terminal passed its identity check** (#1131).
+  The terminal now carries `identity_verified`, read from the row the Kiro input gate (#1074)
+  already writes: `false` until the check passes, `true` after it, and `null` for other
+  providers and for Kiro rows older than the column, never coerced to `false`. A client that
+  picks terminals by `status` can now skip a Kiro terminal that reads `idle` but whose input
+  CAO refuses. `GET /sessions/{name}` and `GET /sessions/{name}/terminals` carry it too, read
+  from the rows they already fetch, and so do the create responses (`POST /sessions` and both
+  `POST /sessions/{name}/terminals` routes): `true` for a synchronous Kiro create, which returns
+  only after the check passed, and `false` for a deferred one, still being checked. Read-only:
+  the gate itself is unchanged.
 - **CAO terminals running bash, or zsh set up without its own `HISTFILE`, no longer write
   agent launch commands to your shell history.** Every tmux session, window and pane and every
   herdr pane that CAO creates now gets `HISTFILE=/dev/null` in its environment, set after

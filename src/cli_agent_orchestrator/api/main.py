@@ -1135,6 +1135,22 @@ class StepOutputResponse(BaseModel):
 # (BR-2, additive-only). These models exist only to give the two read routes a
 # stable, documented JSON contract for the web surface (U8) and #505's clients.
 # ---------------------------------------------------------------------------
+class StepResultView(BaseModel):
+    """A settled step's final answer, read from its ``result_json`` envelope (the run view).
+
+    ``text`` is the envelope's ``last_message``: the step's last terminal answer with
+    secrets redacted (``redacted``) and capped at ``WORKFLOW_JOURNAL_RESULT_MAX_BYTES``
+    (``truncated``). ``status`` is the status the envelope recorded, ``completed`` for a
+    step that answered and the step state (``failed``, ``skipped``) for one that settled
+    without an answer, whose ``text`` is empty.
+    """
+
+    text: str
+    status: str
+    truncated: bool
+    redacted: bool
+
+
 class StepInspection(BaseModel):
     """One step's durable projection inside a ``RunInspection`` (FR-5.1).
 
@@ -1147,7 +1163,12 @@ class StepInspection(BaseModel):
     byte-for-byte and only ADDED to (BR-2). A pre-U1 row surfaces the additive
     columns as ``None``.
 
-    ``output_json`` and ``error`` carry the step's FULL text and are NOT gated by
+    ``terminal_id`` is set from the moment the step's terminal exists, while it runs.
+    ``result`` is the step's final answer parsed from its ``result_json`` envelope, or
+    ``None`` when the row has none (not settled yet, or settled before the run view) or
+    the envelope does not parse.
+
+    ``output_json``, ``error`` and ``result`` carry step text and are NOT gated by
     ``workflow_journal_capture_output`` — see the payload-posture note on
     ``get_workflow_run_endpoint`` before adding a consumer or a log line.
     """
@@ -1161,6 +1182,36 @@ class StepInspection(BaseModel):
     terminal_id: Optional[str] = None
     reprompted: Optional[int] = None
     call_fingerprint: Optional[str] = None
+    result: Optional[StepResultView] = None
+
+
+class StepScreenView(BaseModel):
+    """``GET /workflows/runs/{run_id}/steps/{step_id}/screen``: a running step's screen.
+
+    Plain text with no escape codes: the visible pane plus scrollback above it, at most
+    ``WORKFLOW_STEP_SCREEN_MAX_LINES`` lines and ``WORKFLOW_STEP_SCREEN_MAX_BYTES``, with
+    secrets redacted. ``captured_at`` is an ISO-8601 UTC time.
+    """
+
+    terminal_id: str
+    text: str
+    truncated: bool
+    redacted: bool
+    captured_at: str
+
+
+class StepTranscriptView(BaseModel):
+    """``GET /workflows/runs/{run_id}/steps/{step_id}/transcript``: a finished step's text.
+
+    The last ``WORKFLOW_STEP_TRANSCRIPT_MAX_BYTES`` of the terminal's saved
+    ``.scrollback`` file, from a line start, with secrets redacted. ``truncated`` means
+    the file holds more than ``text``.
+    """
+
+    terminal_id: str
+    text: str
+    truncated: bool
+    redacted: bool
 
 
 class RunInspection(BaseModel):
@@ -1666,6 +1717,17 @@ def _sweep_workflow_runs_at_startup() -> None:
         logger.warning("workflow retention sweep failed at startup: %s", e)
 
 
+async def _prime_host_sampler_if_enabled() -> None:
+    """Take the host CPU baseline at start-up, only when the AG-UI surface is on.
+
+    Without it the first real host sample has no CPU window and reports no ``cpu_percent``.
+    """
+    if _agui_enabled():
+        from cli_agent_orchestrator.services.host_resources import prime_host_sampler
+
+        await asyncio.to_thread(prime_host_sampler)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -1682,6 +1744,7 @@ async def lifespan(app: FastAPI):
     from cli_agent_orchestrator.services.agui import ambient_run as _ambient_run_hook
 
     _ambient_run_hook.install_signal_stop_hook()
+    await _prime_host_sampler_if_enabled()
     # issues #406 / #709: exactly one cao-server per CAO_HOME_DIR. Taken before
     # the database, the recovery sweeps, the terminal registry, the status
     # monitor and uvicorn's port bind (uvicorn binds after lifespan startup), so
@@ -2358,7 +2421,8 @@ async def _with_keepalive(events: Any, interval: float) -> Any:
 
 
 # ``?framing=`` values the ambient stream accepts. ``cao-legacy`` is the pre-1.0
-# framing, deprecated and kept byte-identical (#1193 mode ``off``).
+# framing, deprecated and kept unchanged (#1193 mode ``off``) except that the terminal rows
+# of its fleet snapshot gain ``runner_id`` and a live ``status``.
 AGUI_FRAMING_LEGACY = "cao-legacy"
 AGUI_STREAM_FRAMINGS = frozenset({AGUI_FRAMING_LEGACY})
 # RFC 9745 section 2.1: Deprecation is an Item Structured Header Field whose value
@@ -2379,6 +2443,87 @@ def _agui_legacy_framing_headers() -> Dict[str, str]:
         "Deprecation": f"@{_AGUI_LEGACY_DEPRECATED_AT}",
         "Link": _AGUI_LEGACY_DEPRECATION_LINK,
     }
+
+
+# --- AG-UI fleet snapshot ---------------------------------------------------------------
+
+#: How long a scan of the installed agent profiles is reused. The snapshot is recomputed on
+#: every bus event, and a scan walks several directories, so it must not run per event.
+_AGUI_PROFILE_CATALOG_TTL_SECONDS = 30.0
+_agui_profile_catalog_cache: Optional[Tuple[float, List[Dict]]] = None
+
+
+def _reset_agui_profile_catalog_cache() -> None:
+    """Forget the cached catalog (tests)."""
+    global _agui_profile_catalog_cache
+    _agui_profile_catalog_cache = None
+
+
+def _agui_profile_catalog() -> List[Dict]:
+    """The read-only profile catalog for the AG-UI snapshot, scanned at most once per TTL.
+
+    Failure-isolated like the rest of the snapshot: a scan error yields an empty catalog
+    (and is cached for the TTL, so a broken directory is not rescanned per event).
+
+    The scan runs inline on the event loop, at most once per TTL, the same pattern as the
+    ``list_sessions`` / terminal listing the snapshot already does there.
+    """
+    global _agui_profile_catalog_cache
+    now = time.monotonic()
+    cached = _agui_profile_catalog_cache
+    if cached is not None and now - cached[0] < _AGUI_PROFILE_CATALOG_TTL_SECONDS:
+        return [dict(entry) for entry in cached[1]]
+    from cli_agent_orchestrator.services.ui_state_service import build_profile_catalog
+
+    try:
+        from cli_agent_orchestrator.utils import agent_profiles
+
+        catalog = build_profile_catalog(agent_profiles.list_agent_profiles())
+    except Exception:
+        logger.debug("agui_stream: profile catalog scan failed", exc_info=True)
+        catalog = []
+    _agui_profile_catalog_cache = (now, catalog)
+    return [dict(entry) for entry in catalog]
+
+
+def _agui_fleet_snapshot(scopes: List[str], *, profiles: bool = True) -> Dict:
+    """Build the current fleet ``DashboardSnapshot`` for every AG-UI route.
+
+    The one place the three AG-UI routes (``GET`` and ``POST /agui/v1/stream`` and
+    ``POST /agui/v1/run``) build their snapshot, so they cannot diverge. The two ambient
+    stream routes carry the read-only ``profiles`` catalog, which the MCP Apps snapshot
+    does not. The run plane's one-shot hydrate (``profiles=False``) leaves it out: it
+    serves approvals, not the fleet view, so it never pays for a profile scan and its
+    recorded shape does not depend on what happens to be installed.
+
+    Failure-isolated: ``list_sessions`` already returns ``[]`` on error, and a terminal
+    listing that fails is skipped, so an unavailable tmux/herdr backend degrades to a
+    smaller snapshot rather than tearing down the stream.
+    """
+    from cli_agent_orchestrator.services import session_service
+    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
+
+    sessions = session_service.list_sessions()
+    terminals: List[Dict] = []
+    for sess in sessions:
+        try:
+            terminals.extend(
+                session_service.list_current_session_terminals(sess["id"], backend_exists=True)
+            )
+        except Exception:
+            logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
+    from cli_agent_orchestrator.services.terminal_service import with_live_status
+
+    # The terminals table has no status column; add the monitor's in-memory reading.
+    snapshot = build_dashboard_snapshot(sessions, with_live_status(terminals), scopes)
+    if profiles:
+        snapshot["profiles"] = _agui_profile_catalog()
+        # The host view follows the SAME flag as the catalog, so the three call sites
+        # cannot diverge. Numbers only; ``[]`` means "not reported".
+        from cli_agent_orchestrator.services.host_resources import sample_host
+
+        snapshot["host"] = sample_host()
+    return snapshot
 
 
 def _agui_ambient_response(
@@ -2488,7 +2633,8 @@ async def agui_stream(
         default=None,
         description=(
             "Wire framing. ``cao-legacy`` selects the pre-1.0 framing (named SSE "
-            "events, snake_case fields), which is deprecated and kept byte-identical."
+            "events, snake_case fields), which is deprecated and otherwise unchanged; "
+            "its terminal rows gain runner_id and a live status."
         ),
     ),
     thread_id: Optional[str] = Query(
@@ -2537,8 +2683,9 @@ async def agui_stream(
     carry an ``id:`` cursor. Message bodies are never carried (the ring buffer
     stores metadata only and the mapping redacts by construction).
 
-    ``?framing=cao-legacy`` serves the deprecated pre-1.0 wire byte-for-byte
-    (named ``event:`` frames via ``agui_stream.to_agui_event``), with
+    ``?framing=cao-legacy`` serves the deprecated pre-1.0 wire (named ``event:`` frames
+    via ``agui_stream.to_agui_event``; unchanged except that the terminal rows of its
+    fleet snapshot gain ``runner_id`` and a live ``status``), with
     ``Deprecation`` and ``Link`` headers. ``since`` / ``Last-Event-ID`` replay is
     a CAO extension that chooses which buffered records the new run narrates
     first (``docs/agui.md#replay``).
@@ -2606,7 +2753,6 @@ async def agui_stream(
 
     from fastapi.responses import StreamingResponse
 
-    from cli_agent_orchestrator.services import session_service
     from cli_agent_orchestrator.services.agui.lifecycle_tracker import ToolCallLifecycleTracker
     from cli_agent_orchestrator.services.agui_stream import (
         state_delta_frame,
@@ -2615,25 +2761,12 @@ async def agui_stream(
     )
     from cli_agent_orchestrator.services.event_log_service import get_event_log
     from cli_agent_orchestrator.services.sse_bus import get_bus
-    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
 
     def _fleet_snapshot() -> Dict:
-        """Build the current DashboardSnapshot from live session/terminal state.
-
-        Failure-isolated: any backend hiccup yields an empty snapshot rather
-        than tearing down the stream. ``list_sessions`` already returns ``[]``
-        on error, so an unavailable tmux/herdr backend degrades gracefully.
-        """
-        sessions = session_service.list_sessions()
-        terminals: List[Dict] = []
-        for sess in sessions:
-            try:
-                terminals.extend(
-                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
-                )
-            except Exception:
-                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
-        return build_dashboard_snapshot(sessions, terminals, list(scopes))
+        # The deprecated legacy wire keeps its schema but its terminal rows gain
+        # ``runner_id`` and carry a live (non-null) ``status``; it never gains the catalog
+        # or the host entry.
+        return _agui_fleet_snapshot(list(scopes), profiles=framing != AGUI_FRAMING_LEGACY)
 
     if framing != AGUI_FRAMING_LEGACY:
         import uuid
@@ -2930,22 +3063,10 @@ async def agui_stream_post(
             detail="forwardedProps.cao.maxSeconds must be an integer from 1 to 3600",
         )
 
-    from cli_agent_orchestrator.services import session_service
-    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
-
     scopes = list(_scopes)
 
     def _fleet_snapshot() -> Dict:
-        sessions = session_service.list_sessions()
-        terminals: List[Dict] = []
-        for sess in sessions:
-            try:
-                terminals.extend(
-                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
-                )
-            except Exception:
-                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
-        return build_dashboard_snapshot(sessions, terminals, scopes)
+        return _agui_fleet_snapshot(scopes)
 
     return _agui_ambient_response(
         thread_id=run_input.thread_id,
@@ -3273,19 +3394,7 @@ async def agui_run(
 
     # Build the snapshot function
     def _fleet_snapshot() -> Dict:
-        from cli_agent_orchestrator.services import session_service
-        from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
-
-        sessions = session_service.list_sessions()
-        terminals: List[Dict] = []
-        for sess in sessions:
-            try:
-                terminals.extend(
-                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
-                )
-            except Exception:
-                pass
-        return build_dashboard_snapshot(sessions, terminals, list(_scopes))
+        return _agui_fleet_snapshot(list(_scopes), profiles=False)
 
     from fastapi.responses import StreamingResponse
 
@@ -5259,8 +5368,11 @@ async def list_terminals_in_session(
         from cli_agent_orchestrator.services.session_service import (
             list_current_session_terminals,
         )
+        from cli_agent_orchestrator.services.terminal_service import with_live_status
 
-        return list_current_session_terminals(session_name)
+        # Each row also carries the live ``status`` (an in-memory read), as the single
+        # terminal route does, so a client need not fetch every terminal to show it.
+        return with_live_status(list_current_session_terminals(session_name))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -7844,11 +7956,19 @@ async def get_workflow_run_endpoint(
        transition regardless of it, because the resume path and
        ``{{steps.<id>.output.<field>}}`` templating read them back. So with capture
        at its default OFF, this route still returns step output and error verbatim.
+       The same holds for ``steps[].result`` (the run view's Output tab): each
+       settled step's final answer, parsed from its ``result_json`` envelope. That
+       text is secret-redacted and capped at ``WORKFLOW_JOURNAL_RESULT_MAX_BYTES`` by
+       ``build_envelope`` before it is stored, unlike ``output_json`` and ``error``.
+       A missing or unparseable envelope reads as ``result: null``, never a 500.
     2. The ONLY protection is the scope dependency above, and it is INERT in the
        default deployment: with no IdP and no ``CAO_AUTH_LOCAL_TOKEN`` configured,
        ``require_any_scope`` returns the full scope set and enforces nothing. A
        local CAO server therefore
        serves step output and error text to any caller that can reach the port.
+
+    ``steps[].terminal_id`` is set from the moment a step's terminal exists, so a
+    caller can watch a running step through ``/steps/{step_id}/screen``.
 
     Deliberately documented rather than further gated: stripping the fields removes
     the feature, and gating them behind the capture flag would break resume and
@@ -7900,6 +8020,7 @@ async def get_workflow_run_endpoint(
                 terminal_id=srow.terminal_id if srow else None,
                 reprompted=srow.reprompted if srow else None,
                 call_fingerprint=srow.call_fingerprint if srow else None,
+                result=_step_result_view(srow.result_json) if srow else None,
             )
         )
         seen.add(st.id)
@@ -7917,6 +8038,7 @@ async def get_workflow_run_endpoint(
                 terminal_id=srow.terminal_id,
                 reprompted=srow.reprompted,
                 call_fingerprint=srow.call_fingerprint,
+                result=_step_result_view(srow.result_json),
             )
         )
 
@@ -7946,6 +8068,143 @@ async def get_workflow_run_endpoint(
         finished_at=finished_at,
         tier=tier,
         steps=steps,
+    )
+
+
+def _step_result_view(result_json: Optional[str]) -> Optional[StepResultView]:
+    """Parse a step row's ``result_json`` envelope for the inspection, leniently.
+
+    ``parse_envelope`` is total: NULL, malformed JSON and valid JSON of the wrong shape
+    all read as ``None``, so a row from before the run view or a corrupt envelope gives
+    ``result: null`` rather than failing the whole inspection.
+    """
+    from cli_agent_orchestrator.services.step_result import parse_envelope
+
+    envelope = parse_envelope(result_json)
+    if envelope is None:
+        return None
+    return StepResultView(
+        text=envelope.last_message,
+        status=envelope.status,
+        truncated=envelope.truncated,
+        redacted=envelope.redacted,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The run view's Terminal tab: a read-only live screen while a step runs, and its
+# saved transcript after. Both resolve the terminal from the step's JOURNAL ROW,
+# never from the request, and redact before they bound what they return
+# (services/workflow_step_view.py). Neither attaches a client or sends input, so
+# neither can resize the agent's window or type into it.
+# ---------------------------------------------------------------------------
+def _step_view_keys_or_400(run_id: str, step_id: str) -> None:
+    """Validate both path keys with the shared key validator; a bad key is a 400."""
+    from cli_agent_orchestrator.services.step_output_store import _validate_key_part
+
+    try:
+        _validate_key_part(run_id, "run_id")
+        _validate_key_part(step_id, "step_id")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@app.get(
+    "/workflows/runs/{run_id}/steps/{step_id}/screen",
+    response_model=StepScreenView,
+)
+async def get_workflow_step_screen_endpoint(
+    run_id: str,
+    step_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> StepScreenView:
+    """The live view of a running step: its screen as plain text, redacted (the run view).
+
+    A read-only capture through the backend's ``get_history`` (tmux and herdr): no
+    attach, no input, no resize. The web UI polls it about once a second while the
+    step's Terminal tab is visible.
+
+    ``400`` for a malformed ``run_id`` or ``step_id``; ``404`` for an unknown run or
+    step, or a step with no terminal recorded; ``410`` once the step's terminal has
+    ended, after which ``/transcript`` is the read. Same read-or-better scope gate as
+    the other run read routes, inert with auth disabled.
+    """
+    from cli_agent_orchestrator.services import workflow_step_view
+
+    _step_view_keys_or_400(run_id, step_id)
+    try:
+        terminal_id = await asyncio.to_thread(
+            workflow_step_view.recorded_terminal_id, run_id, step_id
+        )
+        capture = await asyncio.to_thread(workflow_step_view.capture_screen, terminal_id)
+    except workflow_step_view.StepTerminalNotFound as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except workflow_step_view.StepTerminalEnded as e:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(e))
+    except Exception:
+        # Identifiers only: the capture is agent output and stays out of the log line.
+        logger.warning(
+            "screen capture for run '%s' step '%s' failed", run_id, step_id, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="failed to capture the step's screen",
+        )
+    return StepScreenView(
+        terminal_id=capture.terminal_id,
+        text=capture.text,
+        truncated=capture.truncated,
+        redacted=capture.redacted,
+        captured_at=capture.captured_at,
+    )
+
+
+@app.get(
+    "/workflows/runs/{run_id}/steps/{step_id}/transcript",
+    response_model=StepTranscriptView,
+)
+async def get_workflow_step_transcript_endpoint(
+    run_id: str,
+    step_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> StepTranscriptView:
+    """The saved transcript of a finished step, redacted (the run view).
+
+    The last 256 KiB of ``<terminal_id>.scrollback``, which ``terminal_service`` writes
+    when the step's terminal is torn down. Redacted before it is cut, so a secret split
+    at the cut is never returned in part.
+
+    ``400`` for a malformed ``run_id`` or ``step_id``; ``404`` for an unknown run or
+    step, a step with no terminal recorded, or no transcript file: the step is still
+    running, the run predates the run view, or the file was deleted after
+    ``RETENTION_DAYS``. Same read-or-better scope gate as the other run read routes.
+    """
+    from cli_agent_orchestrator.services import workflow_step_view
+
+    _step_view_keys_or_400(run_id, step_id)
+    try:
+        terminal_id = await asyncio.to_thread(
+            workflow_step_view.recorded_terminal_id, run_id, step_id
+        )
+        transcript = await asyncio.to_thread(workflow_step_view.read_transcript, terminal_id)
+    except (
+        workflow_step_view.StepTerminalNotFound,
+        workflow_step_view.TranscriptNotFound,
+    ) as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception:
+        logger.warning(
+            "transcript read for run '%s' step '%s' failed", run_id, step_id, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="failed to read the step's transcript",
+        )
+    return StepTranscriptView(
+        terminal_id=transcript.terminal_id,
+        text=transcript.text,
+        truncated=transcript.truncated,
+        redacted=transcript.redacted,
     )
 
 
@@ -9952,7 +10211,10 @@ def _ws_input_refusal(
 # start of an escape sequence, so it keeps a trailing ``\x1b`` as a partial key
 # until its ``escape-time`` timer expires, and only then sends it to the pane
 # that is active AT THAT TIME. It does the same with a trailing ``\x1b[`` or
-# ``\x1b]`` (Alt+[ and Alt+]), which also start longer sequences. So a frame
+# ``\x1b]`` (Alt+[ and Alt+]), which also start longer sequences, and, in the
+# first seconds after a client attaches, with ``\x1bP`` (Alt+Shift+P): tmux reads
+# it as the start of the reply to one of its own terminal queries, which
+# xterm.js never answers, until that query times out. So a frame
 # that ends in any of these leaves an "Escape hold" on its window: other
 # terminals wait it out before they select a pane. The hold is not ended early
 # by the sender's next frame, because those bytes can extend the partial key
@@ -9965,8 +10227,10 @@ _WEB_INPUT_DRAIN_TIMEOUT_S = 2.0
 _WEB_INPUT_DRAIN_POLL_S = 0.002
 # The Escape hold when the backend cannot say how long its key timer is.
 _WEB_INPUT_ESCAPE_HOLD_FALLBACK_S = 0.55
-# Frame endings tmux keeps as a partial key: Escape, Alt+[ and Alt+].
-_WEB_INPUT_PARTIAL_KEYS = (b"\x1b", b"\x1b[", b"\x1b]")
+# Frame endings tmux keeps as a partial key: Escape, Alt+[, Alt+] and, just
+# after an attach, Alt+Shift+P. Holding on the last one later too costs only a
+# short wait for other terminals.
+_WEB_INPUT_PARTIAL_KEYS = (b"\x1b", b"\x1b[", b"\x1b]", b"\x1bP")
 
 
 class _WebInputWindow:

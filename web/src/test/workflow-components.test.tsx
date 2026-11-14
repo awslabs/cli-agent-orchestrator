@@ -5,8 +5,6 @@ import { WorkflowTimeline } from '../components/workflow/WorkflowTimeline'
 import {
   SyncedTerminalPane,
   hasTerminalOffsets,
-  canTailTerminal,
-  TAIL_MAX_CHARS,
 } from '../components/workflow/SyncedTerminalPane'
 import { DeleteRunButton } from '../components/workflow/DeleteRunButton'
 import { WorkflowsPanel } from '../components/WorkflowsPanel'
@@ -83,7 +81,8 @@ describe('WorkflowTimeline', () => {
     render(<WorkflowTimeline events={events} gaps={[]} selectedIndex={0} onSelectIndex={() => {}} />)
     const slider = screen.getByRole('slider', { name: /playback position/i })
     expect(slider).toHaveAttribute('aria-valuenow', '0')
-    expect(screen.getByTestId('timeline-live')).toHaveTextContent(/step\.started/)
+    // The announcement uses the row's plain label, not the raw event type.
+    expect(screen.getByTestId('timeline-live')).toHaveTextContent('Selected event 1 of 2: Step started, step a')
   })
 
   it('scrubber ArrowRight advances the selected index', () => {
@@ -114,120 +113,99 @@ describe('SyncedTerminalPane — null-offset graceful-degrade seam (mutation gua
     const spy = vi
       .spyOn(api, 'getTerminalOutputRange')
       .mockResolvedValue({ terminal_id: 't1', offset: 10, length: 40, data: 'captured output here' })
+    const stepSpy = vi.spyOn(api, 'getWorkflowStepTranscript')
     render(<SyncedTerminalPane event={withOffsets} />)
     await waitFor(() => expect(screen.getByText('captured output here')).toBeInTheDocument())
     expect(spy).toHaveBeenCalledWith('t1', 10, 40)
-    // NOT the degrade state.
-    expect(screen.queryByText(/sync pending/i)).not.toBeInTheDocument()
+    // The byte window wins over the step routes.
+    expect(stepSpy).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('terminal-step-notice')).not.toBeInTheDocument()
   })
 
-  it('BRANCH 2 — NULL offsets: never calls the offset-exact RANGE api', async () => {
+  it('BRANCH 2 — NULL offsets: reads the step routes, never the offset-exact RANGE api', async () => {
     const rangeSpy = vi.spyOn(api, 'getTerminalOutputRange')
-    vi.spyOn(api, 'getTerminalOutput').mockResolvedValue({ output: 'tail', mode: 'full' })
-    render(<SyncedTerminalPane event={nullOffsets} />)
+    const tailSpy = vi.spyOn(api, 'getTerminalOutput')
+    const transcript = vi
+      .spyOn(api, 'getWorkflowStepTranscript')
+      .mockResolvedValue({ terminal_id: 't1', text: 'tail', truncated: false, redacted: false })
+    render(<SyncedTerminalPane event={nullOffsets} step={{ state: 'completed', terminalId: 't1' }} />)
     await waitFor(() => expect(screen.getByText('tail')).toBeInTheDocument())
+    expect(transcript).toHaveBeenCalledWith('r', 'a')
     // The range API is NOT called when offsets are null — there is no window.
     expect(rangeSpy).not.toHaveBeenCalled()
+    // Nor the agent terminal's own output route, which is gone once a step ends.
+    expect(tailSpy).not.toHaveBeenCalled()
   })
 
-  it('BRANCH 3 — no selected event: shows the degrade state, no crash', () => {
+  it('BRANCH 3 — no selected event: says so in plain prose, no crash', () => {
     render(<SyncedTerminalPane event={null} />)
-    expect(screen.getByText(/sync pending/i)).toBeInTheDocument()
+    expect(screen.getByTestId('terminal-no-step')).toHaveTextContent("Select an event to see its step's terminal.")
     // No issue link: the pane used to cite a fabricated issue URL (wrong org,
     // non-existent number), so the degrade state is plain prose.
     expect(screen.queryByRole('link')).toBeNull()
   })
 })
 
-// PR #526 human review — IMPORTANT: the PR body claimed an 8 KiB terminal tail
-// fallback on the NULL-offset branch, but the branch rendered a static "sync
-// pending" message and fetched nothing. Rather than editing the body down, the
-// fallback is implemented — so these tests pin the behaviour the body describes.
-describe('SyncedTerminalPane — NULL-offset TAIL fallback', () => {
-  const nullOffsetsWithTerminal: WorkflowEvent = {
+// The pane under the timeline shows the selected event's step through the
+// step routes: the read-only screen while the step runs, the saved transcript
+// after. A run-level event has no terminal, and the pane says so.
+describe('SyncedTerminalPane — the selected event\'s step', () => {
+  const stepEvent: WorkflowEvent = {
     run_id: 'r', seq: 2, event_type: 'step.started', event_schema_version: 1, ts: '',
-    step_id: 'a', terminal_id: 't1', terminal_offset_start: null, terminal_offset_len: null,
+    step_id: 'a', terminal_id: null, terminal_offset_start: null, terminal_offset_len: null,
   }
-  const noTerminal: WorkflowEvent = {
-    run_id: 'r', seq: 4, event_type: 'run.started', event_schema_version: 1, ts: '',
+  const runEvent: WorkflowEvent = {
+    run_id: 'r', seq: 4, event_type: 'run.completed', event_schema_version: 1, ts: '',
     step_id: null, terminal_id: null, terminal_offset_start: null, terminal_offset_len: null,
   }
-  const withOffsets: WorkflowEvent = {
-    run_id: 'r', seq: 3, event_type: 'step.output.received', event_schema_version: 1, ts: '',
-    step_id: 'a', terminal_id: 't1', terminal_offset_start: 10, terminal_offset_len: 40,
-  }
 
-  it('canTailTerminal: true only when a terminal_id exists WITHOUT offsets', () => {
-    expect(canTailTerminal(nullOffsetsWithTerminal)).toBe(true)
-    expect(canTailTerminal(noTerminal)).toBe(false)
-    expect(canTailTerminal(null)).toBe(false)
-    // With offsets present it is branch 1's job, not the fallback's.
-    expect(canTailTerminal(withOffsets)).toBe(false)
-  })
-
-  it('fetches the terminal tail and RENDERS it when offsets are null', async () => {
-    const spy = vi
-      .spyOn(api, 'getTerminalOutput')
-      .mockResolvedValue({ output: 'recent terminal tail text', mode: 'full' })
-
-    render(<SyncedTerminalPane event={nullOffsetsWithTerminal} />)
-
-    await waitFor(() =>
-      expect(screen.getByText('recent terminal tail text')).toBeInTheDocument()
-    )
-    expect(spy).toHaveBeenCalledWith('t1')
-    // It is no longer the do-nothing pending state.
-    expect(screen.queryByText(/sync pending/i)).not.toBeInTheDocument()
-  })
-
-  it('labels the tail as NOT synced to the event (the degrade must be visible)', async () => {
-    vi.spyOn(api, 'getTerminalOutput').mockResolvedValue({ output: 'x', mode: 'full' })
-    render(<SyncedTerminalPane event={nullOffsetsWithTerminal} />)
+  it('says the view is the step terminal now, not at the selected event', async () => {
+    vi.spyOn(api, 'getWorkflowStepTranscript').mockResolvedValue({ terminal_id: 't1', text: 'x', truncated: false, redacted: false })
+    render(<SyncedTerminalPane event={stepEvent} step={{ state: 'completed', terminalId: 't1' }} />)
     await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
-
-    const notice = screen.getByTestId('terminal-tail-notice')
-    expect(notice).toHaveTextContent(/recent tail \(not synced to this event\)/i)
+    expect(screen.getByTestId('terminal-step-notice')).toHaveTextContent(/not as it was at this event/i)
     // And it must NOT claim a byte range it does not have.
     expect(screen.queryByText(/^bytes /)).not.toBeInTheDocument()
   })
 
-  it('caps the rendered tail at TAIL_MAX_CHARS, keeping the END of the output', async () => {
-    const long = 'A'.repeat(TAIL_MAX_CHARS) + 'TAIL_END'
-    vi.spyOn(api, 'getTerminalOutput').mockResolvedValue({ output: long, mode: 'full' })
-
-    render(<SyncedTerminalPane event={nullOffsetsWithTerminal} />)
-
-    const pre = await waitFor(() => screen.getByText(/TAIL_END$/))
-    expect(pre.textContent).toHaveLength(TAIL_MAX_CHARS)
-    expect(pre.textContent?.endsWith('TAIL_END')).toBe(true)
+  it('reads the live screen while the step runs', async () => {
+    const screenSpy = vi.spyOn(api, 'getWorkflowStepScreen').mockResolvedValue({
+      terminal_id: 't1', text: 'working on it', truncated: false, redacted: false, captured_at: '2026-11-10T10:00:00Z',
+    })
+    render(<SyncedTerminalPane event={stepEvent} step={{ state: 'running', terminalId: 't1' }} />)
+    await waitFor(() => expect(screen.getByText('working on it')).toBeInTheDocument())
+    expect(screenSpy).toHaveBeenCalledWith('r', 'a')
+    expect(screen.getByTestId('step-terminal-live')).toHaveTextContent('Live')
   })
 
-  it('degrades VISIBLY when the tail fetch fails — an alert, not a crash or a spinner', async () => {
-    vi.spyOn(api, 'getTerminalOutput').mockRejectedValue(
-      Object.assign(new Error('boom'), { detail: 'terminal not found' })
+  it('degrades VISIBLY when the transcript read fails: an alert, not a crash or a spinner', async () => {
+    vi.spyOn(api, 'getWorkflowStepTranscript').mockRejectedValue(
+      Object.assign(new Error('500 Error'), { status: 500, detail: 'journal unavailable' })
     )
-
-    render(<SyncedTerminalPane event={nullOffsetsWithTerminal} />)
-
+    render(<SyncedTerminalPane event={stepEvent} step={{ state: 'failed', terminalId: 't1' }} />)
     const alert = await waitFor(() => screen.getByRole('alert'))
-    expect(alert).toHaveTextContent('terminal not found')
-    // The spinner is gone — a failed fetch must not leave it spinning forever.
+    expect(alert).toHaveTextContent('journal unavailable')
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
   })
 
-  it('renders an explicit empty note (not a blank pane) when the tail is empty', async () => {
-    vi.spyOn(api, 'getTerminalOutput').mockResolvedValue({ output: '', mode: 'full' })
-    render(<SyncedTerminalPane event={nullOffsetsWithTerminal} />)
-    await waitFor(() => expect(screen.getByText(/no terminal output yet/i)).toBeInTheDocument())
+  it('renders an explicit empty note (not a blank pane) when the transcript is empty', async () => {
+    vi.spyOn(api, 'getWorkflowStepTranscript').mockResolvedValue({ terminal_id: 't1', text: '', truncated: false, redacted: false })
+    render(<SyncedTerminalPane event={stepEvent} step={{ state: 'completed', terminalId: 't1' }} />)
+    await waitFor(() => expect(screen.getByText(/the transcript is empty/i)).toBeInTheDocument())
   })
 
-  it('does NOT fetch anything when the event names no terminal (branch 3)', () => {
-    const tailSpy = vi.spyOn(api, 'getTerminalOutput')
-    const rangeSpy = vi.spyOn(api, 'getTerminalOutputRange')
-    render(<SyncedTerminalPane event={noTerminal} />)
-    expect(screen.getByText(/sync pending/i)).toBeInTheDocument()
-    expect(tailSpy).not.toHaveBeenCalled()
-    expect(rangeSpy).not.toHaveBeenCalled()
+  it('says a run-level event has no terminal, and fetches nothing', () => {
+    const spies = [
+      vi.spyOn(api, 'getTerminalOutput'),
+      vi.spyOn(api, 'getTerminalOutputRange'),
+      vi.spyOn(api, 'getWorkflowStepScreen'),
+      vi.spyOn(api, 'getWorkflowStepTranscript'),
+    ]
+    render(<SyncedTerminalPane event={runEvent} />)
+    expect(screen.getByTestId('terminal-no-step')).toHaveTextContent(
+      'This event belongs to the run, not to a step, so it has no terminal.'
+    )
+    for (const spy of spies) expect(spy).not.toHaveBeenCalled()
   })
 })
 

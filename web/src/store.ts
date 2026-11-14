@@ -71,9 +71,16 @@ interface Store {
   // (PR #526 review round 3). Distinct from `selectedRun?.run_id`, which is null
   // while a fetch is in flight and therefore useless as a guard.
   selectedRunId: string | null
+  // Why the last selectWorkflowRun failed to load its run, or null. The run
+  // page shows it in place of a spinner that would never stop.
+  selectedRunError: string | null
   wfEvents: WorkflowEvent[]
   wfGaps: GapMarker[]
   selectedIndex: number
+  // True while the timeline selection follows the newest event: each event
+  // that arrives selects itself. Picking an event (a click, the transport, the
+  // scrubber) stops following; `followLatestEvent` resumes it.
+  followLatest: boolean
   followConnected: boolean
 
   // Resolves to an error message when the list read failed, or null on success.
@@ -93,6 +100,8 @@ interface Store {
   appendWorkflowEvent: (event: WorkflowEvent) => void
   addWorkflowGap: (gap: GapMarker) => void
   setSelectedIndex: (index: number) => void
+  // Select the newest event and follow new ones again (the timeline's Latest).
+  followLatestEvent: () => void
   setFollowConnected: (connected: boolean) => void
   clearSelectedRun: () => void
 }
@@ -109,9 +118,11 @@ export const useStore = create<Store>((set, get) => ({
   workflowRuns: [],
   selectedRun: null,
   selectedRunId: null,
+  selectedRunError: null,
   wfEvents: [],
   wfGaps: [],
   selectedIndex: 0,
+  followLatest: true,
   followConnected: false,
 
   fetchSessions: async () => {
@@ -239,9 +250,11 @@ export const useStore = create<Store>((set, get) => ({
     set({
       selectedRun: null,
       selectedRunId: runId,
+      selectedRunError: null,
       wfEvents: [],
       wfGaps: [],
       selectedIndex: 0,
+      followLatest: true,
       followConnected: false,
     })
     try {
@@ -268,8 +281,9 @@ export const useStore = create<Store>((set, get) => ({
       // arriving after B succeeded would blank B's loaded detail pane and blame it
       // for an error that belongs to a run the user already navigated away from.
       if (get().selectedRunId !== runId) return
-      set({ selectedRun: null })
-      get().showSnackbar({ type: 'error', message: e?.message || 'Failed to load run' })
+      const message = e?.message || 'Failed to load run'
+      set({ selectedRun: null, selectedRunError: message })
+      get().showSnackbar({ type: 'error', message })
     }
   },
 
@@ -357,7 +371,15 @@ export const useStore = create<Store>((set, get) => ({
       let i = events.length
       while (i > 0 && events[i - 1].seq > event.seq) i--
       events.splice(i, 0, event)
-      return { wfEvents: events }
+      // While following, the newest event selects itself. Otherwise the
+      // selection stays on the event the user picked: an insert at or before it
+      // moves that event one place down the list.
+      const selectedIndex = state.followLatest
+        ? events.length - 1
+        : i <= state.selectedIndex && state.wfEvents.length > 0
+          ? state.selectedIndex + 1
+          : state.selectedIndex
+      return { wfEvents: events, selectedIndex }
     }),
 
   addWorkflowGap: (gap) =>
@@ -374,8 +396,17 @@ export const useStore = create<Store>((set, get) => ({
     set(state => {
       const max = Math.max(0, state.wfEvents.length - 1)
       const clamped = Math.min(Math.max(0, index), max)
-      if (clamped === state.selectedIndex) return state
-      return { selectedIndex: clamped }
+      // Every caller is a user's pick (a row, the transport, the scrubber), so
+      // the selection stops following the newest event.
+      if (clamped === state.selectedIndex && !state.followLatest) return state
+      return { selectedIndex: clamped, followLatest: false }
+    }),
+
+  followLatestEvent: () =>
+    set(state => {
+      const last = Math.max(0, state.wfEvents.length - 1)
+      if (state.followLatest && state.selectedIndex === last) return state
+      return { selectedIndex: last, followLatest: true }
     }),
 
   setFollowConnected: (connected) =>
@@ -387,9 +418,11 @@ export const useStore = create<Store>((set, get) => ({
       // Cleared too, so an in-flight fetch for the run being closed cannot resolve
       // afterwards and re-populate a pane the user has dismissed.
       selectedRunId: null,
+      selectedRunError: null,
       wfEvents: [],
       wfGaps: [],
       selectedIndex: 0,
+      followLatest: true,
       followConnected: false,
     }),
 }))

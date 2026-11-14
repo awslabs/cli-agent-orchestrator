@@ -5,7 +5,11 @@
 //   2. a text LABEL, and
 //   3. a screen-reader phrase (`sr`) / glyph token used in text lists + charts.
 // Color is applied on top as a fourth, redundant channel — never the sole cue.
+//
+// A running step also moves: its icon spins and its Flow node's border pulses,
+// both only under `motion-safe`, and it shows how long it has been running.
 
+import { useEffect, useState } from 'react'
 import {
   Circle,
   Loader2,
@@ -18,6 +22,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import type { DerivedStepState } from './derivedStepState'
+import { formatDuration } from './runView'
 
 export interface StateCue {
   label: string
@@ -75,4 +80,35 @@ export function stepCue(state: DerivedStepState): StateCue {
 export function runCue(state: string): StateCue {
   const key = (state || '').toLowerCase() as DerivedStepState
   return STEP_STATE_CUES[key] ?? STEP_STATE_CUES.pending
+}
+
+/**
+ * The class that spins a running state's icon. `motion-safe:` keeps the icon
+ * still for anyone who asks for reduced motion; the text label still says
+ * Running, so no information is lost.
+ */
+export const SPIN_CLASS = 'motion-safe:animate-spin'
+
+/** The class that pulses a running Flow node's border, still under reduced motion. */
+export const PULSE_CLASS = 'motion-safe:animate-pulse'
+
+/** The current time in ms, updated every `intervalMs` while `enabled`. */
+export function useNow(enabled = true, intervalMs = 1000): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!enabled) return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), intervalMs)
+    return () => clearInterval(timer)
+  }, [enabled, intervalMs])
+  return now
+}
+
+/**
+ * The time since `since` (ms since the epoch), such as "12 s", updated every
+ * second. Only this element re-renders on each tick.
+ */
+export function Elapsed({ since }: { since: number }) {
+  const now = useNow()
+  return <span className="tabular-nums">{formatDuration((now - since) / 1000)}</span>
 }
