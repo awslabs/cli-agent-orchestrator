@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **dnspython 2.9.2 and opentelemetry 1.45.2** (CVE-2026-128089, CVE-2026-126360). dnspython fixes
+  CVE-2026-128089 (HIGH) in 2.9.2, and opentelemetry-api fixes CVE-2026-126360 (MEDIUM) in 1.45.2. The
+  lockfiles move to those versions and the `dnspython` floor is now `>=2.9.2`. No behaviour change.
 - **`GET /terminals/{id}` reports whether a Kiro terminal passed its identity check** (#1131).
   The terminal now carries `identity_verified`, read from the row the Kiro input gate (#1074)
   already writes: `false` until the check passes, `true` after it, and `null` for other

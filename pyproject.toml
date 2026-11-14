@@ -33,9 +33,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    # CVE-2026-114605: dnspython comes in via fastmcp -> pydantic[email] -> email-validator,
-    # and only 2.9.0 is fixed. The lock pins it; this floor holds for pip installs too.
-    "dnspython>=2.9.0",
+    # CVE-2026-114605 and CVE-2026-128089: dnspython comes in via fastmcp -> pydantic[email] -> email-validator,
+    # and only 2.9.2 and later are fixed. The lock pins it; this floor holds for pip installs too.
+    "dnspython>=2.9.2",
     "fastapi>=0.104.0",
     # Upper bound: ext_apps/sep2133.advertise_capability monkey-patches a FastMCP
     # internal (create_initialization_options); cap the major to avoid silent
