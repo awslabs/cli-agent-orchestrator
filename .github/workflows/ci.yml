@@ -67,7 +67,7 @@ jobs:
           fi
           # CI intentionally includes integration-marked tests except for the Kiro
           # provider test, which requires an authenticated external CLI.
-          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote-ec2/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
@@ -307,7 +307,7 @@ jobs:
         # coverage:ratchet. --cov-branch adds num_branches/covered_branches to
         # totals; the ratchet floors line and branch SEPARATELY (#1005).
         run: |
-          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote-ec2/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \

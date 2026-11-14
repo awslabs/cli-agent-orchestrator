@@ -1,0 +1,8 @@
+# Box-side herdr settings (~/.config/herdr/config.toml on the box).
+# bootstrap.sh installs this file only when the box has no herdr config yet;
+# otherwise add the [session] lines by hand.
+
+[session]
+# After a reboot the pane processes are gone. Do not resume agents into their
+# old conversations without CAO's launch flags; CAO relaunches them instead.
+resume_agents_on_restore = false

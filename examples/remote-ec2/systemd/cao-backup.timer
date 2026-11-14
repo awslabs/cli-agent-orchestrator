@@ -1,0 +1,13 @@
+# Runs cao-backup.service every night. Persistent=true runs a missed backup
+# at the next boot (for example after a nightly stop).
+
+[Unit]
+Description=Nightly CAO database backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

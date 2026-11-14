@@ -1,0 +1,41 @@
+# cao-server, loopback only. bootstrap.sh fills in @BOX_USER@ and @BOX_HOME@
+# and installs this as /etc/systemd/system/cao-server.service.
+#
+# SECURITY: --host 127.0.0.1 is explicit. Never change it to 0.0.0.0 or a
+# private address on this box: anyone who reaches the port can launch agents.
+# Reach the dashboard from the laptop with an SSH tunnel (ssh/config.snippet).
+#
+# herdr ordering. When CAO finds no herdr socket it starts a herdr of its own,
+# which would skip the clean-layout step and the minimal environment, and
+# would live in THIS unit's cgroup (restarting CAO would then kill the panes).
+# So: Requires= + After= herdr-cao.service, and an ExecStartPre gate that
+# waits for herdr's socket and fails if it never appears.
+#
+# box.env holds two non-secret lines: CAO_BOX_SESSION and CAO_HERDR_SESSION
+# (the same value). CAO copies its CAO_* variables into agent panes, so never
+# add a secret to box.env. For phase 3's CAO_AUTH_LOCAL_TOKEN see README.md.
+
+[Unit]
+Description=CAO server (127.0.0.1 only)
+Requires=herdr-cao.service
+Wants=network-online.target
+After=herdr-cao.service network-online.target
+
+[Service]
+Type=simple
+User=@BOX_USER@
+Group=@BOX_USER@
+WorkingDirectory=@BOX_HOME@
+EnvironmentFile=/etc/cao-box/box.env
+Environment=HOME=@BOX_HOME@
+Environment=USER=@BOX_USER@
+Environment=PATH=@BOX_HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+ExecStartPre=/usr/local/lib/cao-box/wait-herdr-socket.sh
+ExecStart=@BOX_HOME@/.local/bin/cao-server --host 127.0.0.1 --port 9889
+TimeoutStartSec=90
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+{
+  "env": {
+    "CLAUDE_CODE_USE_BEDROCK": "1",
+    "AWS_REGION": "ap-southeast-2",
+    "ANTHROPIC_MODEL": "au.anthropic.claude-sonnet-5-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "au.anthropic.claude-haiku-5-5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "au.anthropic.claude-sonnet-5-5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "au.anthropic.claude-opus-5-5"
+  }
+}
