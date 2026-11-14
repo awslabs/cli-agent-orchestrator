@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="430" viewBox="0 0 1000 430" role="img" aria-labelledby="title desc">
+  <title id="title">One pull request through the gates</title>
+  <desc id="desc">How the kit would handle PR 1263's real P3 review, rather than a record of its live fix round. A new review wakes the shepherd. The P3 holds the PR. If the resource gate says GO, a fixer changes the comment. Before a push, every permission check must pass. A fast-forward push and a short reply follow; the kit's reply uses its outbox. The push dismisses the approval. A modelled clean re-approval is read and cleared by the conductor before the auto-merge gate can say ARM. The kit never merges directly. The actual live round used the earlier watcher and ended in a maintainer's merge.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-grey" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#64748b"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: 1.5px; fill: #64748b; }
+      .step { font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .copy { font-size: 12.5px; fill: #475569; }
+      .gate { font-size: 15px; font-weight: 700; fill: #92400e; }
+      .done { font-size: 15px; font-weight: 700; fill: #047857; }
+    </style>
+  </defs>
+
+  <rect width="1000" height="430" fill="#ffffff"/>
+  <text class="eyebrow" x="40" y="36">HOW THE KIT WOULD HANDLE #1263'S REVIEW</text>
+
+  <!-- Row 1 -->
+  <rect x="40" y="64" width="200" height="72" rx="12" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+  <text class="step" x="60" y="94">1. New review</text>
+  <text class="copy" x="60" y="116">the shepherd wakes up</text>
+
+  <rect x="280" y="64" width="200" height="72" rx="12" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text class="gate" x="300" y="94">2. HOLD</text>
+  <text class="copy" x="300" y="116">the approval lists one P3</text>
+
+  <rect x="520" y="64" width="200" height="72" rx="12" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text class="gate" x="540" y="94">3. Resource gate</text>
+  <text class="copy" x="540" y="116">GO: a worker may start</text>
+
+  <rect x="760" y="64" width="200" height="72" rx="12" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+  <text class="step" x="780" y="94">4. Fixer</text>
+  <text class="copy" x="780" y="116">changes the comment only</text>
+
+  <path d="M240 100H276" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <path d="M480 100H516" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <path d="M720 100H756" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <path d="M860 136V176" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- Row 2: the last-moment check -->
+  <rect x="520" y="180" width="440" height="110" rx="12" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text class="gate" x="540" y="208">5. Permission check, right before the push</text>
+  <text class="copy" x="540" y="232">Not paused? Standing OK and policy still valid?</text>
+  <text class="copy" x="540" y="252">PR head unchanged? Pushing the approved commit</text>
+  <text class="copy" x="540" y="272">to the approved URL? Every check must pass.</text>
+
+  <path d="M520 235H484" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="180" width="440" height="110" rx="12" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+  <text class="step" x="60" y="208">6. Fast-forward push and a short reply</text>
+  <text class="copy" x="60" y="232">The reply goes through an outbox that can't post twice.</text>
+  <text class="copy" x="60" y="252">The push dismisses the approval, so the PR</text>
+  <text class="copy" x="60" y="272">waits for a fresh one.</text>
+
+  <path d="M260 290V330" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- Row 3 -->
+  <rect x="40" y="334" width="440" height="72" rx="12" fill="#ecfdf5" stroke="#047857" stroke-width="2"/>
+  <text class="done" x="60" y="364">7. Clean re-approval</text>
+  <text class="copy" x="60" y="386">modelled: conductor reads and clears the clean review</text>
+
+  <!-- Side step: what the kit does next time -->
+  <path d="M480 370H576" fill="none" stroke="#64748b" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-grey)"/>
+  <rect x="580" y="334" width="380" height="72" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="step" x="600" y="362">8. Ready to arm auto-merge</text>
+  <text class="copy" x="600" y="384">the auto-merge gate says ARM: green, required</text>
+  <text class="copy" x="600" y="400">checks present, at most 1,500 lines. It never merges.</text>
+</svg>

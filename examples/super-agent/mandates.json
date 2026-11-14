@@ -1,0 +1,266 @@
+{
+  "policy_version": "example-1",
+  "about": "Standing OKs from the user, as structured records. This is the sample's starting set: replace your-org/your-repo and your-login with your own repo and GitHub login, and keep shepherd_mode observe until you trust the proposals. Only the conductor edits this file, and only on the user's explicit words; it mirrors every change to CAO memory and bumps policy_version. check_mandate.py reads it before every outside action.",
+  "shepherd_mode": "observe",
+  "paused": false,
+  "paused_by": null,
+  "paused_at": null,
+  "reason": null,
+  "push_urls": {
+    "your-org/your-repo": "https://github.com/your-org/your-repo.git"
+  },
+  "push_urls_about": "The only URL a push action may publish to, per repo. The publisher pushes and runs ls-remote against this exact URL (never the name origin). Its pre-write check refuses unless the worktree's fetch and push URLs for origin are each exactly this one URL (only a trailing .git is normalised) and no url.*.insteadOf or pushInsteadOf rewrite exists.",
+  "forbidden_without_user": [
+    "force_push",
+    "open_pr",
+    "open_issue",
+    "close",
+    "merge_outside_gate",
+    "security_decision",
+    "other_github_text",
+    "release",
+    "consent_and_keys"
+  ],
+  "mandates": [
+    {
+      "id": "M1-ff-fix-push",
+      "holder": "shepherd",
+      "action": "ff_fix_push",
+      "scope": {
+        "repo": "your-org/your-repo",
+        "pr_author": "your-login",
+        "base": "main"
+      },
+      "conditions": {
+        "what": "Fast-forward fix commits for CI fixes and review feedback on the user's own open PRs.",
+        "never": [
+          "force push",
+          "amend, rebase or rewrite pushed history",
+          "push to another author's PR"
+        ],
+        "before_push": [
+          "merge-base --is-ancestor <remote head> <new head> succeeds",
+          "ls-remote head equals the expected remote head",
+          "our own checks pass: focused set + repo-root guards + test/decisions",
+          "independent pre-push review for a large or risky change",
+          "no competing PR already has the change (gh pr list --search)",
+          "git rev-parse <branch> equals the approved new head; push exactly git push <push_urls URL> <new head>:refs/heads/<branch>, never a bare branch name or the name origin"
+        ],
+        "after_push": "ls-remote read-back equals the new head; report it to the conductor"
+      },
+      "granted_by": "user",
+      "granted_at": "<date you granted it>",
+      "source": "the user's words to the conductor (quote them here)",
+      "revoked": false
+    },
+    {
+      "id": "M2-factual-fix-reply",
+      "holder": "shepherd",
+      "action": "factual_fix_reply",
+      "scope": {
+        "repo": "your-org/your-repo",
+        "pr_author": "your-login",
+        "base": "main"
+      },
+      "conditions": {
+        "what": "A short, factual reply to a reviewer listing the fixes that were pushed.",
+        "never": [
+          "any other GitHub text (that is other_github_text)",
+          "editing the PR description",
+          "declining or arguing a finding"
+        ],
+        "before_post": [
+          "outbox.py check <key> is unused",
+          "leak and internal-id grep of the body is empty",
+          "outbox.py reserve <key> ... --owner-terminal <publisher id> prints RESERVED"
+        ],
+        "after_post": "posted body equals the file; outbox.py sent <key> --url <url>"
+      },
+      "granted_by": "user",
+      "granted_at": "<date you granted it>",
+      "source": "the user's words to the conductor (quote them here)",
+      "revoked": false
+    },
+    {
+      "id": "M3-rerun-outage-ci",
+      "holder": "shepherd",
+      "action": "rerun_failed_outage",
+      "scope": {
+        "repo": "your-org/your-repo",
+        "pr_author": "your-login",
+        "base": "main"
+      },
+      "conditions": {
+        "what": "gh run rerun <id> --failed on our own PRs, only when the failure is an outside download outage.",
+        "requires": [
+          "the job log shows the failing step is an outside download, not a test",
+          "the run is completed"
+        ],
+        "never": [
+          "re-run for a real test failure or a flaky test (that needs the user)",
+          "re-run other people's PRs or main"
+        ],
+        "tell_user": "every time, through the conductor"
+      },
+      "granted_by": "user",
+      "granted_at": "<date you granted it>",
+      "source": "the user's words to the conductor (quote them here)",
+      "revoked": false
+    },
+    {
+      "id": "M4-main-merge-push",
+      "holder": "shepherd",
+      "action": "main_merge_push",
+      "scope": {
+        "repo": "your-org/your-repo",
+        "pr_author": "your-login",
+        "base": "main"
+      },
+      "conditions": {
+        "what": "Merge origin/main into our PR branch when mergeStateStatus is BEHIND or DIRTY, as a merge commit, then a fast-forward push.",
+        "requires": [
+          "mergeStateStatus is BEHIND or DIRTY",
+          "a merge commit, never a rebase",
+          "per-file change-set check: sorted +/- lines of diff(old-main, old-head) equal diff(new-main, merge), apart from the intended resolution lines",
+          "git show --remerge-diff reviewed",
+          "repo-root guards + test/decisions on the merged tree; CI-shaped full suite or the signature/caller grep both ways",
+          "merge-base --is-ancestor <remote head> <merge> succeeds",
+          "git rev-parse <branch> equals the merge; push exactly git push <push_urls URL> <merge>:refs/heads/<branch>"
+        ],
+        "never": [
+          "force push",
+          "resolve a non-trivial conflict without escalating"
+        ]
+      },
+      "granted_by": "user",
+      "granted_at": "<date you granted it>",
+      "source": "the user's words to the conductor (quote them here)",
+      "revoked": false
+    },
+    {
+      "id": "M5-update-branch",
+      "holder": "shepherd",
+      "action": "update_branch",
+      "scope": {
+        "repo": "your-org/your-repo",
+        "pr_author": "your-login",
+        "base": "main"
+      },
+      "conditions": {
+        "what": "gh pr update-branch <n> (merge update, never --rebase) for an approved, green PR that is BEHIND, also when auto-merge is already armed. The auto-merge rule's order: arm first, update later. One worker does only this, reports the new head and stops. Where branch protection keeps approvals on a merge from main, update-branch keeps the approval; a fix push dismisses it.",
+        "requires": [
+          "automerge_gate.py --action update_branch prints UPDATE_BRANCH <head> (it includes the hold-on-findings window check)",
+          "check_mandate.py --expect-head <head> --remote-head <ls-remote> right before the command"
+        ],
+        "never_prs": [],
+        "rules": [
+          "rules/auto-merge.md",
+          "rules/hold-on-findings.md"
+        ],
+        "never_prs_about": "PR numbers that must never auto-merge or be updated (for example a release PR). Integers only."
+      },
+      "granted_by": "user",
+      "granted_at": "<date you granted it>",
+      "source": "the user's words to the conductor (quote them here)",
+      "revoked": false
+    },
+    {
+      "id": "M6-arm-automerge",
+      "holder": "shepherd",
+      "action": "arm_automerge",
+      "scope": {
+        "repo": "your-org/your-repo",
+        "pr_author": "your-login",
+        "base": "main"
+      },
+      "conditions": {
+        "what": "gh pr merge <n> --auto --squash --match-head-commit <head>, with the repo's default title and body.",
+        "requires": [
+          "automerge_gate.py --action arm prints ARM <head> on a fresh run for the current head (it includes the hold-on-findings window: every review and comment since the last non-merge commit)",
+          "auto-merge is not already on",
+          "check_mandate.py --expect-head <head> --remote-head <ls-remote> right before the command"
+        ],
+        "max_changed_lines": 1500,
+        "never_prs": [],
+        "never": [
+          "merge without --auto",
+          "change the merge method",
+          "disable or re-arm an auto-merge someone else armed"
+        ],
+        "rules": [
+          "rules/auto-merge.md",
+          "rules/hold-on-findings.md"
+        ],
+        "never_prs_about": "PR numbers that must never auto-merge or be updated (for example a release PR). Integers only."
+      },
+      "granted_by": "user",
+      "granted_at": "<date you granted it>",
+      "source": "the user's words to the conductor (quote them here)",
+      "revoked": false
+    },
+    {
+      "id": "M7-approve-review-plan",
+      "holder": "conductor",
+      "action": "approve_review_plan",
+      "scope": {
+        "repo": "your-org/your-repo",
+        "pr_author": "*",
+        "base": "main"
+      },
+      "conditions": {
+        "what": "cao workflow approve <plan_id> for a plan the cao_pr_reviewer reported as refused.",
+        "workflows": [
+          "pr-review",
+          "branch-review"
+        ],
+        "requires": [
+          "the cao_pr_reviewer reported the refusal",
+          "inputs match the PR it reported: head_sha equals the PR's live head",
+          "follow-ups: base_sha is the last reviewed head and an ancestor of head, or the PR's mergeBaseOid after a rebase",
+          "bin/plan_hash_check.py ~/.aws/cli-agent-orchestrator/workflows/<both workflow>.py prints MATCH for both (the trusted baselines in state/plan-approvals.jsonl); a missing or changed baseline goes to the user, and the conductor never records a baseline itself"
+        ],
+        "never": [
+          "any other workflow or plan",
+          "approving on any mismatch",
+          "disabling enforcement"
+        ],
+        "tell_user": "after each approval"
+      },
+      "granted_by": "user",
+      "granted_at": "<date you granted it>",
+      "source": "the user's words to the conductor (quote them here)",
+      "revoked": true,
+      "revoked_by": "user",
+      "revoked_at": "<date>",
+      "revoked_source": "off by default in the sample: the reviewer is optional. Set revoked to false only if you run cao_pr_reviewer and want the conductor to approve its two workflow plans."
+    },
+    {
+      "id": "M8-clear-hold",
+      "holder": "shepherd",
+      "action": "clear_hold",
+      "scope": {
+        "repo": "your-org/your-repo",
+        "pr_author": "your-login",
+        "base": "main"
+      },
+      "conditions": {
+        "what": "Mark ONE review or comment as not holding (bin/holds.py clear), bound to its id and the sha256 of its exact body, after reading it: for clean bodies the keyword scan misreads, such as 'APPROVE (0 P1, 0 P2, 0 P3) ... Findings: None.'",
+        "go_always_required": true,
+        "requires": [
+          "the shepherd sent WOULD <wid>: clear_hold #N item=<id> reason=...",
+          "the conductor read the same body file and replied GO <wid>",
+          "the conductor recorded the GO in state/go.jsonl itself (writer_role conductor) with this item and body sha256"
+        ],
+        "never": [
+          "clear a body with a severity-tagged finding (holds.py refuses; those wait for a newer non-merge commit or the user's decline)",
+          "clear without the conductor's GO, in any mode",
+          "clear an edited body under an old GO"
+        ]
+      },
+      "granted_by": "user",
+      "granted_at": "<date you granted it>",
+      "source": "the user's words to the conductor (quote them here)",
+      "revoked": false
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+# Run-time state of your copy of the kit. Never commit it: it holds GO records, holds, the
+# outbox, the heavy-job slot, worker registries, briefs and the reviewer's ledger.
+state/
+work/
+reviews/
+
+# The poll loop's local data: your watch list, snapshots, reports, digest and log.
+pr-watch/watch.json
+pr-watch/watch.json.*
+pr-watch/config.json
+pr-watch/state/
+pr-watch/reports/
+pr-watch/digest.md
+pr-watch/log.md
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

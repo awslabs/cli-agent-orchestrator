@@ -1,0 +1,9 @@
+{
+ "about": "Thresholds for bin/resource_gate.py on this 32 GB, 10-core Mac. STOP wins over THROTTLE. A value that can't be measured counts as THROTTLE. Pressure must be exactly 1, 2 or 4 and every number finite and in range, or the verdict is THROTTLE.",
+ "stop": {"pressure_level_gte": 4, "free_memory_pct_lt": 15, "disk_free_gib_lt": 20, "live_terminals_gte": 7},
+ "throttle": {"pressure_level_gte": 2, "free_memory_pct_lt": 30, "swap_used_gib_gt": 16, "disk_free_gib_lt": 40, "load_per_cpu_gt": 1.2, "live_terminals_gte": 4},
+ "heavy": {"stale_hours": 3, "lock_timeout_s": 10},
+ "cao_url": "http://localhost:9889",
+ "disk_path": "/System/Volumes/Data",
+ "probe_timeouts": {"sysctl": 5, "memory_pressure": 20}
+}
