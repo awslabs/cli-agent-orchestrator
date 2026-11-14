@@ -7,6 +7,9 @@ the UNLOCKED variant: the locked writer keeps one lock file per target in
 ``LOCK_DIR`` for good, so routing the sidecars through it grew ``LOCK_DIR`` by
 two files per teardown with nothing to reap them. The lock-count assertions here
 pin that regression.
+
+The scrollback keeps each line whole: the workflow transcript route redacts this
+file, and a secret that tmux soft-wrapped across rows would otherwise be split.
 """
 
 from __future__ import annotations
@@ -133,3 +136,18 @@ class TestSidecarsArePrivateAndSymlinkSafe:
 
         for name in (f"{TID}.scrollback", f"{TID}.snapshot.json"):
             assert oct((log_dir / name).stat().st_mode & 0o777) == oct(0o600)
+
+
+class TestScrollbackKeepsLinesWhole:
+    def test_wrapped_rows_are_rejoined_and_trailing_spaces_stripped(self, log_dir, backend):
+        """A pattern matches a secret only whole, so the capture asks tmux to rejoin the
+        rows it soft-wrapped at the pane width (-J). -J also keeps the trailing spaces a
+        program wrote, which the default capture trims, so they are stripped."""
+        backend.get_history.return_value = "a line a program padded   \nnext\n"
+
+        _snapshot(log_dir, backend)
+
+        kwargs = backend.get_history.call_args.kwargs
+        assert kwargs["join_wrapped"] is True
+        assert kwargs["full_history"] is True and kwargs["strip_escapes"] is True
+        assert (log_dir / f"{TID}.scrollback").read_text() == "a line a program padded\nnext\n"

@@ -505,14 +505,15 @@ Some entries are rejected, always with a report and never silently:
 ## CAO's own packages
 
 CAO ships its own agent plugins, so any Agent-Plugins-compatible client can
-drive a CAO session, extend CAO, or author and audit an agent plugin without
-CAO-specific integration code:
+drive a CAO session, extend CAO, author and audit an agent plugin, or build an
+AG-UI client on CAO without CAO-specific integration code:
 
 | Package | Install this if you are… | Skills | Also ships |
 |---|---|---|---|
 | [`cao`](../agent-plugin/cao) | **an operator** driving CAO from another client | `cao-session-management`, `cao-agent-routing`, `cao-supervisor-protocols`, `cao-worker-protocols` | the `cao-ops` MCP server |
 | [`cao-contributor`](../agent-plugin/cao-contributor) | **a contributor** extending CAO itself | `cao-provider`, `cao-plugin`, `cao-contributing` | — |
 | [`cao-agent-plugin-lifecycle`](../agent-plugin/cao-agent-plugin-lifecycle) | **an author** writing a new Agent Plugins 1.0.0 package or auditing an existing one | `cao-agent-plugin-creator`, `cao-agent-plugin-audit` | — |
+| [`cao-ag-ui-builder`](../agent-plugin/cao-ag-ui-builder) (name provisional) | **a builder** writing a UI or client on CAO's AG-UI surface, against CAO `main` | `agui-author` | — |
 
 The skill names are the folder names you will see under
 `~/.aws/cli-agent-orchestrator/skills/` after installing, which is what makes a
@@ -542,7 +543,12 @@ authoring skills work through the host agent's own tools and need no CAO
 runtime, so the `uv` and `cao-server` prerequisites do not apply to it.
 `cao-agent-plugin-lifecycle` ships no `mcp.json` either: its skills need no CAO
 runtime, and the audit skill's validator is a standalone script that carries its
-own pinned copy of the schemas.
+own pinned copy of the schemas. Nor does `cao-ag-ui-builder`: `agui-author`
+teaches the emit-side vocabulary (the six allow-listed generative-UI components
+and the `CUSTOM` `cao.generative_ui` frame they ride in), which an agent sends
+through the `emit_ui` tool CAO already gives it. Its recorded wire trace and the
+gates that guard it live in [`examples/ag-ui/cao-dojo`](../examples/ag-ui/cao-dojo/README.md#recorded-trace-and-drift-checks),
+because a generated package may hold only its manifest, docs and skills.
 
 The build also refuses to write a pin whose published `cao-ops-mcp-server` does
 not bound its HTTP requests, and it decides that by **inspecting the published

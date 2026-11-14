@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Codex "Trust this folder?" dialogs (0.156 and later) are accepted before the first input** (#1319).
+  Recognise the "Trust this folder?" header and its "enter continue · esc back", "esc quit"
+  and "esc cancel" footers while keeping earlier wordings and ignoring dismissed dialogs
+  above the composer.
+- **dnspython is now 2.9.2 or later** (CVE-2026-128089, HIGH). The floor in `pyproject.toml` and
+  the three lock files move from 2.9.0 to 2.9.2, the first release with the fix.
+- **`GET /terminals/{id}` reports whether a Kiro terminal passed its identity check** (#1131).
+  The terminal now carries `identity_verified`, read from the row the Kiro input gate (#1074)
+  already writes: `false` until the check passes, `true` after it, and `null` for other
+  providers and for Kiro rows older than the column, never coerced to `false`. A client that
+  picks terminals by `status` can now skip a Kiro terminal that reads `idle` but whose input
+  CAO refuses. `GET /sessions/{name}` and `GET /sessions/{name}/terminals` carry it too, read
+  from the rows they already fetch, and so do the create responses (`POST /sessions` and both
+  `POST /sessions/{name}/terminals` routes): `true` for a synchronous Kiro create, which returns
+  only after the check passed, and `false` for a deferred one, still being checked. Read-only:
+  the gate itself is unchanged.
+- **CAO terminals running bash, or zsh set up without its own `HISTFILE`, no longer write
+  agent launch commands to your shell history.** Every tmux session, window and pane and every
+  herdr pane that CAO creates now gets `HISTFILE=/dev/null` in its environment, set after
+  operator-forwarded `--env` values, as `CAO_TERMINAL_ID` is. Your shell config is not changed,
+  so a shell that sets `HISTFILE` at startup still records the launch line: stock macOS zsh
+  (its `/etc/zshrc` sets `HISTFILE`) and any rc file that assigns `HISTFILE`. The value is set
+  on the tmux session CAO creates, so a window you open yourself in that session later also
+  inherits `HISTFILE=/dev/null` and keeps no history.
+- **`assign` again tells every worker to send its results back with `send_message`** (#1247).
+  Since #1247, `assign` left the "send results back to terminal X using send_message" instruction
+  out of the task, and returned a note that the worker could not reply, whenever the worker's
+  profile named a `provider` and its `mcpServers` did not list `cao-mcp-server`. Providers such as
+  `claude_code` load `cao-mcp-server` from the user's own MCP config instead, so a custom profile
+  that pins `provider:` lost the instruction for a worker that had the tool. The instruction is
+  appended whenever sender-ID injection is on, as before #1247, and the auto-forward fallback
+  still covers a worker that does not reply. The `worker_can_reply` query parameter on terminal
+  create and the `no_send_message_tool` edge reason are removed; a stored edge with that reason
+  reads as `no_callback`.
+- **Kiro v3 helpers can admit unlisted kiro-cli versions with an operator opt-in.**
+  `kiro.v3_admission: "observed"` borrows the newest same-major schema row
+  at or below the probed version, for versions from 2.35.1 to below 4.0.0. The existing
+  pending-version opt-in is required when that newest row is pending; CAO never falls
+  back to an older verified row. Versions must use canonical ASCII parts of at most six digits.
+  The v3 capability probe and every live check remain required before task input;
+  each admission logs a WARNING and reports both versions in `launch_notes`. Strict admission stays the default
+  and always applies to installed-agent launches.
+
 - **A reconnect no longer loses a tool call's end, and `toolCallName` is `assign`, not
   `OrchestrationType.ASSIGN`** (#1292). On the ambient AG-UI stream, a client that held an `assign`
   or `handoff` call open, lost its stream (an overflow, or a dropped connection) and reconnected
@@ -163,6 +206,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its tmux server as an orphan. The open is now non-blocking and retried, and while it waits the
   writer exits as soon as tmux closes its stdin. Output written before a late reader attaches is
   still delivered.
+
+- **The CAO Dojo has a recorded, scrubbed AG-UI trace with leak and drift guards** (#1116).
+  `examples/ag-ui/cao-dojo/trace/cao-dojo-trace.ndjson` holds three captures (`none`, `approve`,
+  `reject`) from a real Claude Code permission prompt, recorded by
+  `examples/ag-ui/cao-dojo/tools/record_trace.py` against an isolated `cao-server`. A typed leak
+  rule (L1-L14, each mutation-tested) runs at pre-commit; an offline replay (tier 1: the pinned SDK
+  models plus upstream `enforceEvents`/`verifyEvents`) runs at pre-push (Python) and in CI (Python
+  and node); a keyless `mock_cli` approve/reject/none e2e checks a live recording against the
+  committed shape file in the `AG-UI stock-client live (AC3)` job (tier 2). The release path refuses a missing or stale
+  trace. `mock_cli`'s scripted mode gains `__mock_approval__`, which holds a prompt until it is
+  answered. New `make` targets: `record-agui-trace`, `check-agui-trace`,
+  `check-agui-trace-release`.
+- **A fourth agent-plugin package, `cao-ag-ui-builder`** (#1116; the name is provisional). It
+  ships the `agui-author` skill and no `mcp.json`.
 - **A keyed create no longer reveals whether its `idempotency_key` is in use (#944).** The key is
   now stored scoped by the request fingerprint, so a request that reuses a key another, different
   request already claimed gets its own slot. On `POST /sessions` and

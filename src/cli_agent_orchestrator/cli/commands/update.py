@@ -18,7 +18,7 @@ _PACKAGE = "cli-agent-orchestrator"
 
 # Source kinds returned by _classify_source. The install method decides how (or
 # whether) `cao update` can advance CAO to a newer version.
-_GIT = "git"  # git+<url>[?rev=...] — reinstall to fetch newer commits
+_GIT = "git"  # uv upgrades from the recorded git source
 _REGISTRY = "registry"  # unpinned PyPI — `uv tool upgrade` advances it
 _REGISTRY_CONSTRAINED = "registry_constrained"  # any version constraint — @latest to unpin
 _DIRECTORY = "directory"  # local source tree — user must update + reinstall
@@ -86,7 +86,7 @@ def _str_field(req: dict, key: str) -> Optional[str]:
 def _classify_source(receipt: Optional[Path]) -> Tuple[str, Optional[str]]:
     """Classify how CAO was installed into ``(kind, detail)``.
 
-    - ``(_GIT, "git+<url>[@rev]")`` — a git source string ready to reinstall.
+    - ``(_GIT, "git+<url>[@rev]")`` — a git source string for status output.
     - ``(_DIRECTORY, path)`` / ``(_PATH, path)`` / ``(_EDITABLE, path)`` — a
       local install location.
     - ``(_REGISTRY_CONSTRAINED, "<spec>")`` — a registry install carrying ANY
@@ -134,9 +134,9 @@ def _classify_source(receipt: Optional[Path]) -> Tuple[str, Optional[str]]:
 def _build_command(kind: str, detail: Optional[str]) -> List[str]:
     """The uv invocation that advances CAO for a remote-backed install kind.
 
-    - git: ``uv tool install <git-source> --upgrade --reinstall``. ``@main`` is
-      a MOVING ref that ``uv tool upgrade`` treats as already satisfied, so
-      ``--reinstall`` is required to fetch the latest commit.
+    - git: ``uv tool upgrade <pkg> --reinstall`` lets uv reuse the receipt,
+      including the git revision and extra requirements. Reinstalling
+      also refreshes moving refs such as ``@main``.
     - registry (unconstrained): ``uv tool upgrade`` re-resolves to the latest.
     - registry (constrained): ``uv tool upgrade`` honours the constraint and can
       report "Nothing to upgrade"; ``uv tool install <pkg>@latest --upgrade``
@@ -146,7 +146,7 @@ def _build_command(kind: str, detail: Optional[str]) -> List[str]:
     handled by the command before reaching here.
     """
     if kind == _GIT and detail:
-        return ["uv", "tool", "install", detail, "--upgrade", "--reinstall"]
+        return ["uv", "tool", "upgrade", _PACKAGE, "--reinstall"]
     if kind == _REGISTRY_CONSTRAINED:
         return ["uv", "tool", "install", f"{_PACKAGE}@latest", "--upgrade"]
     return ["uv", "tool", "upgrade", _PACKAGE]
@@ -177,8 +177,8 @@ def update():
     """Update CAO to the latest version.
 
     Detects how CAO was installed (from uv's install receipt) and runs the
-    matching uv command: a git install is reinstalled from its git source to
-    pick up the latest commit; an unconstrained registry install is upgraded to
+    matching uv command: a git install is reinstalled using its recorded ref
+    and dependencies; an unconstrained registry install is upgraded to
     the latest published release; a version-constrained registry install is
     unpinned to the latest. A local directory/path/editable install can't be
     advanced remotely, so the command prints the exact steps instead. Requires

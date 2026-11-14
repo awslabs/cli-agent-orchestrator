@@ -23,7 +23,6 @@ class EdgeReason(str, Enum):
     """Why an auto-forward would happen for this edge."""
 
     NO_CALLBACK = "no_callback"
-    NO_SEND_MESSAGE_TOOL = "no_send_message_tool"
 
 
 class DelegationEdge(BaseModel):

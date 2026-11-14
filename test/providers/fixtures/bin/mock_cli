@@ -14,6 +14,10 @@
 #       /exit | /quit          → clean exit 0
 #       __mock_error__         → emit ERROR indicator (drives ERROR status)
 #       __mock_sleep_<N>       → sleep N seconds (exercises long PROCESSING)
+#       __mock_approval__ <t>  → print "APPROVAL_REQUIRED: <t>" as the last line and
+#                                block on the answer (scripted-prompt mode). Accepts
+#                                only y or n ("> MOCK: answered <y|n>"); anything
+#                                else prints "> MOCK: unexpected answer <x>"
 #
 # Not on PATH outside pytest — see test/conftest.py PATH-prepend.
 
@@ -59,6 +63,30 @@ while IFS= read -r line; do
             ;;
         __mock_error__)
             echo "ERROR: mock failure injected"
+            printf '%s' "$PROMPT"
+            ;;
+        __mock_approval__*)
+            # Print the scripted-prompt marker as the LAST line, with no prompt
+            # after it, so MockCliProvider's scripted mode reports
+            # WAITING_USER_ANSWER until an answer arrives.
+            text="${clean_line#__mock_approval__}"
+            text="${text# }"
+            printf 'APPROVAL_REQUIRED: %s\n' "$text"
+            answer=""
+            # CAO's bracketed paste can deliver an empty line first; skip blanks.
+            while IFS= read -r answer_line; do
+                answer_line="${answer_line#$'\x1b[200~'}"
+                answer_line="${answer_line%$'\x1b[201~'}"
+                answer_line="${answer_line%$'\r'}"
+                if [[ -n "${answer_line//[[:space:]]/}" ]]; then
+                    answer="$answer_line"
+                    break
+                fi
+            done
+            case "$answer" in
+                y|n) echo "> MOCK: answered $answer" ;;
+                *)   echo "> MOCK: unexpected answer $answer" ;;
+            esac
             printf '%s' "$PROMPT"
             ;;
         __mock_sleep_*)

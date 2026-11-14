@@ -1,0 +1,24 @@
+AG-UI conformance stream fixtures
+=================================
+
+The three *.json files in this directory are vendored, unmodified, from the
+upstream AG-UI protocol repository. CAO's Dojo trace tests run them through
+the same lifecycle check they apply to CAO's own recorded frames, to prove the
+check can fail (see test/examples/test_cao_dojo_trace_replay.py and
+examples/ag-ui/ag-ui-stock-client-live/verify-trace.mjs).
+
+Source project : AG-UI protocol
+Source URL     : https://github.com/ag-ui-protocol/ag-ui
+Source commit  : 08eae9dc13546e91272efb2d0ef863e21acc6ee3
+Upstream path  : spec/1.0/conformance/streams/
+License        : MIT (the upstream LICENSE file, reproduced verbatim beside
+                 this NOTICE)
+
+Vendored files:
+  - first-event-not-run-started-fatal.json
+  - nested-run-started-fatal.json
+  - run-finished-interrupt-outcome-accepted.json
+
+PIN.json records the sha256 of every vendored file and of LICENSE; a test
+fails if any byte changes. To refresh, copy the files from a newer upstream
+commit, then update the commit and hashes in PIN.json in the same change.
