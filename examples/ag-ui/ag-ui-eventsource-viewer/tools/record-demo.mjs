@@ -15,7 +15,8 @@
 //
 // Usage:  npm ci && npm run playwright:install && npm run record
 // Env:    CAO_AGUI_BASE (default http://localhost:9889), STATIC_PORT (8123),
-//         FFMPEG_BIN (default: ffmpeg on PATH), CAO_REPO (repo root).
+//         FFMPEG_BIN (default: the ffmpeg-static binary, else ffmpeg on PATH),
+//         CAO_REPO (repo root).
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
@@ -23,6 +24,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { chromium } from "@playwright/test";
+import ffmpegStatic from "ffmpeg-static";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO = process.env.CAO_REPO || resolve(__dirname, "..", "..", "..", "..");
@@ -32,7 +34,7 @@ const BASE = process.env.CAO_AGUI_BASE || `http://localhost:${AGUI_PORT}`;
 const VIEWER_URL = `http://localhost:${STATIC_PORT}/examples/ag-ui/ag-ui-eventsource-viewer/`;
 const OUT_DIR = resolve(REPO, "docs/media");
 const TMP_DIR = resolve(__dirname, ".demo-tmp");
-const FFMPEG_BIN = process.env.FFMPEG_BIN || "ffmpeg";
+const FFMPEG_BIN = process.env.FFMPEG_BIN || ffmpegStatic || "ffmpeg";
 const VIEWPORT = { width: 1280, height: 800 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -190,7 +192,9 @@ async function main() {
   } else {
     console.log(`[demo] reusing cao-server already reachable at ${BASE}`);
   }
-  const staticSrv = spawn("python3", ["-m", "http.server", String(STATIC_PORT)], {
+  // uv runs the interpreter (no project needed), so the job does not depend on a
+  // python3 binary in the image.
+  const staticSrv = spawn("uv", ["run", "--no-project", "python", "-m", "http.server", String(STATIC_PORT)], {
     cwd: REPO,
     stdio: "inherit",
   });
@@ -294,7 +298,10 @@ async function main() {
       await run(FFMPEG_BIN, ["-y", "-i", outWebm, "-i", palette, "-lavfi", `${vf} [x]; [x][1:v] paletteuse`, outGif]);
       console.log(`[demo] wrote ${outGif}`);
     } else {
-      console.log(`[demo] gif-capable ffmpeg not found (${FFMPEG_BIN}); kept ${outWebm} only.`);
+      // CI must not pass with the GIF missing: the docs and the artifact expect it.
+      const msg = `gif-capable ffmpeg not found (${FFMPEG_BIN}); kept ${outWebm} only`;
+      if (process.env.CI === "true") throw new Error(msg);
+      console.log(`[demo] ${msg}.`);
     }
     console.log("[demo] PASS: 6 components rendered live, off-list refused, GIF exported.");
   } catch (err) {

@@ -16,7 +16,7 @@
     "test:coverage": "vitest run --coverage",
     "test:dependencies": "node --test scripts/dependency-security.cjs",
     "e2e": "./e2e/run.sh",
-    "playwright:install": "playwright install --with-deps chromium",
+    "playwright:install": "playwright install chromium",
     "e2e:browser": "playwright test -c playwright.config.ts"
   },
   "dependencies": {
