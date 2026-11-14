@@ -1205,6 +1205,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maps it to 502, and the structured kind survives journal settlement and status
   rendering. (#638)
 
+- **The pipe-pane liveness watchdog re-baselined past frames the FIFO never
+  delivered.** A forwarder that stalled mid-burst could watch the pane settle
+  into a new frame before the next check and reset its healthy baseline to
+  that never-delivered frame, hiding the stall. A byte-arrived interval now
+  never strikes, and re-baselining past a frame waits until the FIFO side has
+  actually reached the pane's trailing rows — rendered-to-rendered against
+  the pyte screen the status pipeline composites when active, otherwise a
+  normalized raw-stream comparison that treats a lone carriage return without
+  a following erase as a wrap continuation. A frame comparison shorter than
+  the pane must also clear a folded-length floor
+  (`CAO_PIPE_LIVENESS_FRAME_MATCH_MIN_FOLDED`) before it may re-baseline, so
+  a stalled side collapsed to the pane's last row cannot latch a
+  never-delivered frame. On ordinary
+  shell activity a healthy terminal is no longer re-armed on every
+  activity-to-idle transition; in-place TUI repaints (cursor-addressed
+  redraws, e.g. kiro-cli's chat UI) can still cost one reconciling re-arm
+  per transition, which the replay settles without looping (#711)
 - **Workflow script run-step refusals now retain their typed reason in run
   records.** When a structured HTTP error includes a string `detail.kind`,
   `ShimHTTPError` includes that kind and its optional message in the exception
