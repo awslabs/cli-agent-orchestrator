@@ -10,6 +10,8 @@ It's a sample: scripts, unit files and notes for you to copy and adapt. It is
 the small, one-box version of the cluster ideas in issue #1238, in the same
 spirit as the super-agent sample (#1300).
 
+Want an agent to do the setup for you? Point it at [`AGENT-SETUP.md`](AGENT-SETUP.md).
+
 > **Nothing here creates AWS resources by itself.** Every command that creates
 > or deletes something in your account is written out in this README for you
 > to run. `bootstrap.sh` runs on the box and only sets up the box.
