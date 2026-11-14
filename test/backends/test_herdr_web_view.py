@@ -83,35 +83,81 @@ class TestSplitMouse:
 
 
 class TestSizer:
-    def _sizer(self):
-        return view._Sizer(client_pid=1, client_fd=99)
+    def _sizer(self, tmp_path=None, **kwargs):
+        if tmp_path is not None:
+            kwargs.setdefault("lock_path", str(tmp_path / "resize.lock"))
+            kwargs.setdefault("chrome_path", str(tmp_path / "chrome.json"))
+        return view._Sizer(client_pid=1, client_fd=99, **kwargs)
 
-    def test_resize_adds_herdr_chrome(self):
-        sizer = self._sizer()
+    def _run(self, sizer, areas):
+        """Drive the sequence to its end, answering each read with the next area."""
+        answers = list(areas)
         with (
             patch.object(view, "_set_window_size") as set_size,
             patch.object(view.os, "kill"),
         ):
-            sizer.resize(20, 70)
+            while sizer.attempts > 0:
+                sizer.next_at = 0.0
+                sizer.step(lambda: answers.pop(0) if answers else None)
+        return set_size
+
+    def test_resize_adds_herdr_chrome(self, tmp_path):
+        sizer = self._sizer(tmp_path)
+        sizer.resize(20, 70)
+        set_size = self._run(sizer, [(20, 70)])
         set_size.assert_called_once_with(99, 21, 96)
 
-    def test_calibrate_corrects_the_chrome_estimate(self):
-        sizer = self._sizer()
+    def test_calibrate_corrects_the_chrome_estimate(self, tmp_path):
+        sizer = self._sizer(tmp_path)
+        sizer.resize(20, 70)
+        # herdr's sidebar was 4 columns wider than the estimate, then it fits.
+        set_size = self._run(sizer, [(20, 66), (20, 70)])
+        assert set_size.call_args_list[-1].args == (99, 21, 100)
+        assert (sizer.chrome_rows, sizer.chrome_cols) == (1, 30)
+
+    def test_the_measurement_is_shared_with_the_next_view(self, tmp_path):
+        first = self._sizer(tmp_path)
+        first.resize(20, 70)
+        self._run(first, [(20, 66), (20, 70)])
+
+        second = self._sizer(tmp_path)
+        assert (second.chrome_rows, second.chrome_cols) == (1, 30)
+        second.resize(20, 70)
+        set_size = self._run(second, [(20, 70)])
+        set_size.assert_called_once_with(99, 21, 100)
+
+    def test_a_view_waits_while_another_is_resizing(self, tmp_path):
+        holder = self._sizer(tmp_path)
+        assert holder._acquire() is True
+
+        waiting = self._sizer(tmp_path)
+        waiting.resize(20, 70)
         with (
             patch.object(view, "_set_window_size") as set_size,
             patch.object(view.os, "kill"),
         ):
-            sizer.resize(20, 70)
-            sizer.calibrate(20, 66)  # herdr's sidebar was 4 columns wider
-        assert set_size.call_args_list[-1].args == (99, 21, 100)
-        assert sizer.attempts == view.CALIBRATION_ATTEMPTS - 1
+            waiting.next_at = 0.0
+            waiting.step(lambda: pytest.fail("read the layout while another view was resizing"))
+        set_size.assert_not_called()
+        assert waiting.attempts == view.CALIBRATION_ATTEMPTS  # still to do, not given up
 
-    def test_calibrate_stops_once_the_pane_fits(self):
-        sizer = self._sizer()
-        with patch.object(view, "_set_window_size"), patch.object(view.os, "kill"):
-            sizer.resize(20, 70)
-            sizer.calibrate(20, 70)
-        assert sizer.attempts == 0 and not sizer.due()
+        holder._release()
+        set_size = self._run(waiting, [(20, 70)])
+        set_size.assert_called_once_with(99, 21, 96)
+
+    def test_the_lock_is_released_when_the_pane_cannot_be_read(self, tmp_path):
+        sizer = self._sizer(tmp_path)
+        sizer.resize(20, 70)
+        self._run(sizer, [None])
+        assert sizer.attempts == 0
+        assert self._sizer(tmp_path)._acquire() is True
+
+    def test_it_gives_up_after_a_bounded_number_of_tries(self, tmp_path):
+        sizer = self._sizer(tmp_path)
+        sizer.resize(20, 70)
+        set_size = self._run(sizer, [(20, 60), (20, 61), (20, 62), (20, 63), (20, 64)])
+        assert len(set_size.call_args_list) <= view.CALIBRATION_ATTEMPTS
+        assert not sizer.due()
 
     def test_wheel_report_lands_on_the_pane_past_herdr_chrome(self):
         assert self._sizer().wheel_report(65, 3, 4) == f"{ESC}[<65;29;5M".encode()

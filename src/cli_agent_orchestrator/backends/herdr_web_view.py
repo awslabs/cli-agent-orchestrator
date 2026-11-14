@@ -52,19 +52,22 @@ import signal
 import socket
 import struct
 import sys
+import tempfile
 import termios
 import time
 import tty
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 POLL_INTERVAL_S = 0.1
 RESOLVE_INTERVAL_S = 2.0
 SOCKET_TIMEOUT_S = 5.0
-# How long herdr takes to lay out again after its client is resized, and how
-# many times a view corrects its estimate of herdr's chrome after one resize.
+# How long herdr takes to lay out again after its client is resized, how many
+# times a view corrects its estimate of herdr's chrome, and how long it waits
+# for another view that is in the middle of the same sequence.
 RESIZE_SETTLE_S = 0.4
-CALIBRATION_ATTEMPTS = 3
+CALIBRATION_ATTEMPTS = 4
+LOCK_RETRY_S = 0.2
 # herdr 0.9.5 defaults: a 26-column sidebar and a one-row tab bar.
 DEFAULT_CHROME = (1, 26)
 
@@ -245,26 +248,128 @@ def _write_all(fd: int, data: bytes) -> None:
         data = data[written:]
 
 
-class _Sizer:
-    """Keeps herdr's pane size equal to this view's size (see the module docstring)."""
+def session_state_dir(herdr_session: str) -> str:
+    """Directory the views of one herdr session share, for the lock and chrome below."""
+    path = os.path.join(
+        tempfile.gettempdir(), f"cao-herdr-web-view-{os.getuid()}", herdr_session
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
 
-    def __init__(self, client_pid: int, client_fd: int) -> None:
+
+class _Sizer:
+    """Keeps herdr's pane size equal to this view's size (see the module docstring).
+
+    One pane size is shared by the whole herdr session, so views must not resize
+    at the same time: a view that reads the layout while another is resizing
+    would read the other view's size and mis-correct its chrome estimate. Each
+    view therefore holds a lock around its whole apply-and-verify sequence, and
+    saves what it measured for the next view to start from. Layout changes size
+    every visible pane to the same cell, so the view that finishes last leaves
+    the size right for all of them.
+    """
+
+    def __init__(
+        self,
+        client_pid: int,
+        client_fd: int,
+        lock_path: Optional[str] = None,
+        chrome_path: Optional[str] = None,
+    ) -> None:
         self.client_pid = client_pid
         self.client_fd = client_fd
-        self.chrome_rows, self.chrome_cols = DEFAULT_CHROME
+        self.lock_path = lock_path
+        self.chrome_path = chrome_path
+        self.chrome_rows, self.chrome_cols = self._load_chrome()
         self.rows = 0
         self.cols = 0
         self.attempts = 0
-        self.check_at = 0.0
+        self.next_at = 0.0
+        self._applied = False
+        self._lock_fd: Optional[int] = None
+
+    # --- chrome, shared between the views of one herdr session ---
+
+    def _load_chrome(self) -> Tuple[int, int]:
+        try:
+            with open(self.chrome_path or "", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            return int(saved["rows"]), int(saved["cols"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return DEFAULT_CHROME
+
+    def _save_chrome(self) -> None:
+        if not self.chrome_path:
+            return
+        try:
+            with open(self.chrome_path, "w", encoding="utf-8") as handle:
+                json.dump({"rows": self.chrome_rows, "cols": self.chrome_cols}, handle)
+        except OSError:
+            pass
+
+    # --- the lock, held for one apply-and-verify sequence ---
+
+    def _acquire(self) -> bool:
+        if self._lock_fd is not None:
+            return True
+        if not self.lock_path:
+            return True
+        try:
+            fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            self.lock_path = None  # unlockable: resize unserialised rather than not at all
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._lock_fd = fd
+        return True
+
+    def _release(self) -> None:
+        if self._lock_fd is None:
+            return
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._lock_fd)
+            self._lock_fd = None
 
     def wheel_report(self, button: int, column: int, row: int) -> bytes:
         """A wheel report at a view cell, moved to the same cell of herdr's pane area."""
         return f"\x1b[<{button};{column + self.chrome_cols};{row + self.chrome_rows}M".encode()
 
     def resize(self, rows: int, cols: int) -> None:
-        """The browser terminal is now ``rows`` x ``cols``: resize the hidden client to match."""
+        """The browser terminal is now ``rows`` x ``cols``: start matching herdr to it."""
         self.rows, self.cols = rows, cols
         self.attempts = CALIBRATION_ATTEMPTS
+        self.next_at = 0.0
+        self._applied = False
+
+    def due(self) -> bool:
+        return self.attempts > 0 and time.monotonic() >= self.next_at
+
+    def step(self, read_area: "Callable[[], Optional[Tuple[int, int]]]") -> None:
+        """One step of the sequence: take the lock, apply this view's size, verify it."""
+        if not self._acquire():
+            self.next_at = time.monotonic() + LOCK_RETRY_S  # another view is resizing
+            return
+        if not self._applied:
+            self._applied = True
+            self._apply()
+            return
+        area = read_area()
+        self.attempts -= 1
+        if area == (self.rows, self.cols):
+            self._save_chrome()
+            self._finish()
+            return
+        if self.attempts <= 0 or area is None:
+            self._finish()
+            return
+        self.chrome_rows = max(self.chrome_rows + self.rows - area[0], 0)
+        self.chrome_cols = max(self.chrome_cols + self.cols - area[1], 0)
         self._apply()
 
     def _apply(self) -> None:
@@ -273,24 +378,11 @@ class _Sizer:
             os.kill(self.client_pid, signal.SIGWINCH)
         except OSError:
             pass
-        self.check_at = time.monotonic() + RESIZE_SETTLE_S
+        self.next_at = time.monotonic() + RESIZE_SETTLE_S
 
-    def due(self) -> bool:
-        return self.attempts > 0 and time.monotonic() >= self.check_at
-
-    def calibrate(self, area_rows: Optional[int], area_cols: Optional[int]) -> None:
-        """Correct the chrome estimate from herdr's layout, after this view's own resize only."""
-        self.attempts -= 1
-        if area_rows is None or area_cols is None:
-            return
-        if (area_rows, area_cols) == (self.rows, self.cols):
-            self.attempts = 0
-            return
-        self.chrome_rows += self.rows - area_rows
-        self.chrome_cols += self.cols - area_cols
-        self.chrome_rows = max(self.chrome_rows, 0)
-        self.chrome_cols = max(self.chrome_cols, 0)
-        self._apply()
+    def _finish(self) -> None:
+        self.attempts = 0
+        self._release()
 
 
 def _take_controlling_terminal(fd: int) -> None:
@@ -319,7 +411,13 @@ def run(herdr_session: str, socket_path: str, workspace_label: str, tab_label: s
     client_pid, client_fd = _spawn_input_client(
         herdr_session, rows + DEFAULT_CHROME[0], cols + DEFAULT_CHROME[1]
     )
-    sizer = _Sizer(client_pid, client_fd)
+    state_dir = session_state_dir(herdr_session)
+    sizer = _Sizer(
+        client_pid,
+        client_fd,
+        lock_path=os.path.join(state_dir, "resize.lock"),
+        chrome_path=os.path.join(state_dir, "chrome.json"),
+    )
     sizer.resize(rows, cols)
     signal.signal(signal.SIGWINCH, lambda _signum, _frame: None)  # wakes select()
     saved_tty = None
@@ -374,8 +472,22 @@ def run(herdr_session: str, socket_path: str, workspace_label: str, tab_label: s
             if now < next_poll:
                 continue
             next_poll = now + POLL_INTERVAL_S
+
+            def _read_area() -> Optional[Tuple[int, int]]:
+                """herdr's current pane area, re-resolved; None if it cannot be read."""
+                nonlocal pane, last_resolve
+                last_resolve = time.monotonic()
+                found = resolve_pane(socket_path, workspace_label, tab_label)
+                if found is not None:
+                    pane = found
+                if found is None or found.area_rows is None or found.area_cols is None:
+                    return None
+                return found.area_rows, found.area_cols
+
             try:
-                if sizer.due() or now - last_resolve >= RESOLVE_INTERVAL_S:
+                if sizer.due():
+                    sizer.step(_read_area)
+                if now - last_resolve >= RESOLVE_INTERVAL_S:
                     last_resolve = now
                     found = resolve_pane(socket_path, workspace_label, tab_label)
                     if found is None:
@@ -384,8 +496,6 @@ def run(herdr_session: str, socket_path: str, workspace_label: str, tab_label: s
                         )
                         return 0
                     pane = found
-                    if sizer.due():
-                        sizer.calibrate(pane.area_rows, pane.area_cols)
                 screen = read_screen(socket_path, pane.pane_id)
             except HerdrSocketError:
                 last_resolve = 0.0  # look the pane up again on the next poll
