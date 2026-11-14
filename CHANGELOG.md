@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Recognise the "Trust this folder?" header and its "enter continue · esc back", "esc quit"
   and "esc cancel" footers while keeping earlier wordings and ignoring dismissed dialogs
   above the composer.
+- **dnspython is now 2.9.2 or later** (CVE-2026-128089, HIGH). The floor in `pyproject.toml` and
+  the three lock files move from 2.9.0 to 2.9.2, the first release with the fix.
 - **`GET /terminals/{id}` reports whether a Kiro terminal passed its identity check** (#1131).
   The terminal now carries `identity_verified`, read from the row the Kiro input gate (#1074)
   already writes: `false` until the check passes, `true` after it, and `null` for other
