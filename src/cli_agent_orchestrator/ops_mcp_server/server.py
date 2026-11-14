@@ -948,6 +948,9 @@ async def shutdown_session(
 from cli_agent_orchestrator.ops_mcp_server.decision_tools import (  # noqa: E402
     register_decision_tools,
 )
+from cli_agent_orchestrator.ops_mcp_server.gate import (  # noqa: E402
+    install_ops_allowlist_middleware,
+)
 
 # Plugins may add operator-facing tools here too (the cao_quota plugin's
 # provider_availability / record_provider_refusal, for example): an external
@@ -957,6 +960,12 @@ from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces
 
 register_decision_tools(mcp)
 register_mcp_server_surfaces(mcp)
+
+# LAST, so every tool above -- including anything a plugin just registered -- is
+# inside the gate. A bound CAO terminal needs '@cao-ops-mcp-server' to reach this
+# control plane (#1062); an operator context, with no CAO_TERMINAL_ID, is
+# unchanged. See ops_mcp_server/gate.py for the three decisions this encodes.
+install_ops_allowlist_middleware(mcp)
 
 
 def main() -> None:

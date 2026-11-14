@@ -334,7 +334,13 @@ def test_command_uses_profile_model_when_no_explicit_model(tmp_path, monkeypatch
         assert shlex.split(provider._build_omp_command()) == ["omp", "--model", "profile-model"]
 
 
-def test_extension_root_merges_mcp_without_overriding_explicit_terminal_id(tmp_path, monkeypatch):
+def test_extension_root_merges_mcp_and_overrides_a_declared_terminal_id(tmp_path, monkeypatch):
+    """The declared ``CAO_TERMINAL_ID`` on ``custom`` is replaced, not honoured.
+
+    Inverted for #1062: the CAO MCP gates authorize on this value, so a profile
+    declaring it chose its own authorization posture. See
+    ``test/providers/test_terminal_identity_forwarding.py``.
+    """
     monkeypatch.setattr("cli_agent_orchestrator.providers.omp.CAO_HOME_DIR", tmp_path)
     profile = make_profile(
         mcpServers={
@@ -363,7 +369,7 @@ def test_extension_root_merges_mcp_without_overriding_explicit_terminal_id(tmp_p
     ) == "export default function () {}"
     config = json.loads((extension_dir / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
     assert config["cao"]["env"] == {"KEEP": "yes", "CAO_TERMINAL_ID": "terminal-123"}
-    assert config["custom"]["env"] == {"CAO_TERMINAL_ID": "explicit"}
+    assert config["custom"]["env"] == {"CAO_TERMINAL_ID": "terminal-123"}
     assert config["remote"] == {"type": "http", "url": "https://mcp.example.test"}
     assert resolve.call_count == 3
     assert all(call.kwargs["persisted"] is False for call in resolve.call_args_list)

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import threading
 from importlib.metadata import EntryPoint
 from types import SimpleNamespace
@@ -213,6 +214,190 @@ def test_enabling_point_prints_effective_states():
     assert result.exit_code == 0
     assert json.loads(result.output)["points"]["model.route"]["state"] == "shadow"
     assert not egress.is_halted()
+
+
+@pytest.mark.parametrize("state", ["shadow", "on"])
+def test_the_mutation_lifts_the_halt_for_exactly_the_shared_states(monkeypatch, state):
+    """``set_point`` reads ``HALT_LIFTING_STATES``, the set the MCP gate asks about.
+
+    #1062 refuses a bound MCP caller the states that LIFT an operator's halt. The
+    gate asks ``settings.lifts_halt``, which reads this same set, so widening the
+    set moves both -- a guard with its own ``("shadow", "on")`` copy stops guarding
+    the day the mutation gains a state. The gate's half of this is
+    ``test/ops_mcp_server/test_ops_tool_surface_allowlist.py::
+    TestLiftingAHaltIsOperatorOnly::test_the_gate_has_no_private_copy_of_the_lifting_states``.
+    """
+    egress.HALT_FILE.touch()
+    assert settings.lifts_halt(state)
+
+    # Narrow the shared set and the mutation follows it, not a literal of its own.
+    monkeypatch.setattr(settings, "HALT_LIFTING_STATES", frozenset())
+    settings.set_point("model.route", state, posture=settings.CallerPosture.OPERATOR)
+    assert egress.is_halted(), "set_point lifted the halt for a non-lifting state"
+    assert not settings.lifts_halt(state)
+
+    monkeypatch.setattr(settings, "HALT_LIFTING_STATES", frozenset({state}))
+    settings.set_point("model.route", state, posture=settings.CallerPosture.OPERATOR)
+    assert not egress.is_halted()
+
+
+class TestTheHaltLiftRuleLivesInTheMutation:
+    """#1062 item 3, re-sited by independent review: the gate cannot be the control.
+
+    The first implementation asked ``lifts_halt`` in the ops MCP middleware and
+    removed the marker later, in ``set_point``, with nothing held across the two.
+    A granted bound caller whose ``decisions_set_point(on)`` passed the
+    middleware while no marker existed therefore raced ``operator.off()``: off
+    published the marker, and the already-authorized mutation removed it
+    (``marker_after_off=True marker_after_set=False final_state=on``).
+
+    So the rule is decided inside the mutation, under the exclusive egress lock,
+    and the marker is only removed if it was SEEN under that lock. The
+    end-to-end probe through real FastMCP dispatch is
+    ``test/ops_mcp_server/test_ops_tool_surface_allowlist.py::
+    TestTheHaltLiftRuleIsEnforcedInsideTheMutation``.
+    """
+
+    @staticmethod
+    def _recorded_state(point="model.route"):
+        """The state as WRITTEN, not as loaded -- a halt loads every point off."""
+        raw = settings_service._load_or_raise()
+        return raw.get("decisions", {}).get("points", {}).get(point, {}).get("state")
+
+    @pytest.mark.parametrize("state", ["shadow", "on"])
+    def test_a_bound_caller_is_refused_and_writes_nothing(self, state):
+        egress.HALT_FILE.touch()
+        with pytest.raises(settings.HaltLiftRefused) as refusal:
+            settings.set_point("model.route", state, posture=settings.CallerPosture.BOUND)
+        assert str(refusal.value) == settings.HALT_LIFT_DENIAL
+        assert egress.is_halted()
+        assert self._recorded_state() is None
+
+    def test_the_refusal_does_not_claim_the_caller_is_on_mcp(self):
+        """It said "not available over MCP to a bound CAO terminal" -- but since
+        ``posture`` defaults to ``BOUND``, a plain in-process caller that states
+        no posture receives it too, and would have gone looking for an MCP
+        setting that has nothing to do with its problem. Reported by independent
+        re-review of #1062. What the text must carry instead is the remedy: which
+        contexts may lift a halt.
+        """
+        egress.HALT_FILE.touch()
+        with pytest.raises(settings.HaltLiftRefused) as refusal:
+            settings.set_point("model.route", "on")  # no posture: the default
+        text = str(refusal.value)
+        assert "over MCP" not in text
+        assert "bound CAO terminal" in text
+        assert "operator context" in text
+        assert "CAO_TERMINAL_ID" in text
+        assert "cao decisions set <point> <state>" in text
+
+    @pytest.mark.parametrize("state", ["shadow", "on"])
+    def test_a_bound_caller_may_set_a_lifting_state_with_no_halt_in_place(self, state):
+        assert not egress.is_halted()
+        settings.set_point("model.route", state, posture=settings.CallerPosture.BOUND)
+        assert self._recorded_state() == state
+
+    def test_a_bound_caller_may_still_turn_a_point_off_under_a_halt(self):
+        egress.HALT_FILE.touch()
+        settings.set_point("model.route", "off", posture=settings.CallerPosture.BOUND)
+        assert self._recorded_state() == "off" and egress.is_halted()
+
+    @pytest.mark.parametrize("state", ["shadow", "on"])
+    def test_an_operator_still_lifts(self, state):
+        egress.HALT_FILE.touch()
+        settings.set_point("model.route", state, posture=settings.CallerPosture.OPERATOR)
+        assert not egress.is_halted()
+        assert self._recorded_state() == state
+
+    def test_the_default_posture_is_the_restricted_one(self):
+        """A caller that says nothing does not get to lift a halt.
+
+        #671's lesson applied to this rule: a control that depends on every
+        future call site remembering to opt in is a control that lapses. Both
+        operator entry points state ``OPERATOR`` explicitly;
+        ``test_enabling_point_prints_effective_states`` pins that the CLI still
+        lifts, so dropping the argument there fails loudly.
+        """
+        egress.HALT_FILE.touch()
+        with pytest.raises(settings.HaltLiftRefused):
+            settings.set_point("model.route", "on")
+        with pytest.raises(settings.HaltLiftRefused):
+            operator.set_point("model.route", "on")
+        assert egress.is_halted()
+        assert self._recorded_state() is None
+
+    def test_a_halt_published_during_the_write_is_not_lifted(self, monkeypatch):
+        """The unlink applies to the halt this call SAW, not to any later one.
+
+        This is what makes ``operator.off()`` safe without blocking on the lock:
+        a kill switch must never wait on an outstanding egress permit, so off
+        publishes its marker whether or not it won the lock -- and a marker that
+        appears after the mutation's read is not the marker it is lifting.
+        """
+        real_write = settings._write_point
+
+        def write_then_halt(point, state, decider):
+            real_write(point, state, decider)
+            egress.HALT_FILE.touch()
+
+        monkeypatch.setattr(settings, "_write_point", write_then_halt)
+        settings.set_point("model.route", "on")
+        assert egress.is_halted(), "a halt published during the write was erased"
+        assert self._recorded_state() == "on"
+
+    def test_a_bound_caller_is_refused_when_the_lock_cannot_be_taken(self, monkeypatch):
+        """Fail closed: an unknown halt state must not be lifted."""
+        import fcntl
+
+        monkeypatch.setattr(egress, "HALT_CONTROL_TIMEOUT_S", 0)
+        fd = egress._open_lock()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises(settings.HaltLiftRefused) as refusal:
+                settings.set_point("model.route", "on", posture=settings.CallerPosture.BOUND)
+        finally:
+            os.close(fd)
+        assert str(refusal.value) == settings.HALT_LOCK_BUSY_DENIAL
+        assert self._recorded_state() is None
+
+    def test_an_operator_proceeds_without_the_lock(self, monkeypatch, caplog):
+        """An operator context may lift a halt; it may not lose that to a lock."""
+        import fcntl
+
+        monkeypatch.setattr(egress, "HALT_CONTROL_TIMEOUT_S", 0)
+        egress.HALT_FILE.touch()
+        fd = egress._open_lock()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with caplog.at_level("WARNING"):
+                settings.set_point("model.route", "on", posture=settings.CallerPosture.OPERATOR)
+        finally:
+            os.close(fd)
+        assert not egress.is_halted()
+        assert self._recorded_state() == "on"
+        assert "without it" in caplog.text
+
+    def test_off_publishes_its_marker_even_when_the_lock_is_busy(self, monkeypatch):
+        """``operator.off()`` takes the lock best-effort; the halt is immediate."""
+        import fcntl
+
+        fd = egress._open_lock()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            monkeypatch.setattr(egress, "drain", lambda timeout: True)
+            result = operator.off()
+        finally:
+            os.close(fd)
+        assert result["halted"] and egress.is_halted()
+
+
+def test_lifts_halt_is_false_with_no_halt_and_for_a_non_string():
+    """Nothing to lift, and whatever arrived over the wire need not be a string."""
+    assert not egress.is_halted()
+    assert not settings.lifts_halt("on")
+    egress.HALT_FILE.touch()
+    assert not settings.lifts_halt(None) and not settings.lifts_halt(7)
+    assert not settings.lifts_halt("off")
 
 
 @pytest.mark.parametrize(

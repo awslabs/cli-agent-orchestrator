@@ -18,6 +18,7 @@ import pytest
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.security import mcp_tool_gate
 from cli_agent_orchestrator.utils.delegation import resolve_delegate_tools, tools_exceeding
 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
@@ -42,7 +43,9 @@ def _allowed(profile: AgentProfile) -> list[str]:
 def _denied(monkeypatch, allowed: list[str], tool: str):
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
     monkeypatch.setattr(server, "_get_terminal_context_from_env", lambda: {"id": "abcd1234"})
-    monkeypatch.setattr(server, "_caller_effective_allowed_tools", lambda context: allowed)
+    # The allowlist resolution lives in the shared gate since #1062 (the ops MCP
+    # server asks the same one), so that is where the seam is.
+    monkeypatch.setattr(mcp_tool_gate, "caller_effective_allowed_tools", lambda context: allowed)
     return server._tool_denied_reason(tool)
 
 
