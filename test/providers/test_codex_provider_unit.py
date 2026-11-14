@@ -3092,6 +3092,36 @@ class TestCodexProviderTrustPrompt:
         )
         mock_backend.return_value.send_keys.assert_not_called()
 
+    @pytest.mark.parametrize("stale", ["v1", "v2"])
+    def test_live_startup_block_bare_trust_folder_header_below_older_wording_is_transitional(
+        self, stale
+    ):
+        older = {
+            "v1": TestLiveStartupBlock._TRUST_V1 + self._COMPOSER_V0167,
+            "v2": TestLiveStartupBlock._TRUST_V2,
+        }[stale]
+
+        assert _live_startup_block(older + "  Trust this folder?\n") == "transitional"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_settles_on_composer_below_dialog_accepted_by_operator(
+        self, mock_backend, mock_sleep
+    ):
+        mock_backend.return_value.get_history.return_value = (
+            load_fixture("codex_trust_dialog_v0167.txt") + self._COMPOSER_V0167
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch(
+            "cli_agent_orchestrator.providers.codex.time",
+            fake_clock(0.0, 0.0, 0.0, 0.0, 100.0),
+        ):
+            result = await provider._handle_trust_prompt(outer_timeout=2.0)
+
+        assert result == "settled"
+        mock_backend.return_value.send_special_key.assert_not_called()
+
     @staticmethod
     def _dialog_with_cancel(option, word):
         return (

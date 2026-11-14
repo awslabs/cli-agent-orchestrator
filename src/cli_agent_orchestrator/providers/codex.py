@@ -466,8 +466,7 @@ MODAL_FRAME_CHARS = "─│╭╮╰╯├┤━┃┏┓┗┛┣┫═║╔�
 MODAL_FRAME_GLYPHS = frozenset(MODAL_FRAME_CHARS) - frozenset(" \t")
 STARTUP_BLOCKING_INPUT_PATTERN = (
     rf"(?:{APPROVAL_MODAL_HEADER_PATTERN}|{APPROVAL_MODAL_CHOICE_PATTERN}|"
-    rf"{APPROVAL_PROMPT_PATTERN}|{APPROVAL_PROMPT_FOOTER}|{TRUST_PROMPT_FOOTER}|"
-    rf"{TRUST_PROMPT_FOOTER_V3})"
+    rf"{APPROVAL_PROMPT_PATTERN}|{APPROVAL_PROMPT_FOOTER}|{TRUST_PROMPT_FOOTER})"
 )
 STARTUP_IDLE_PLACEHOLDER_PATTERN = (
     rf"^\s*{IDLE_PROMPT_PATTERN}[^\S\n]+(?:"
@@ -941,7 +940,7 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
     It belongs to whichever block it is drawn under, so a block that renders one
     (update, login, the v2 trust header) must be followed by a footer to count
     at all; the v1 wording carries its own numbered options and has never had
-    one. The v3 trust header needs its own "enter continue · esc back" footer;
+    one. The v3 trust header needs its own "enter continue · esc <cancel>" footer;
     a shared footer under a later login/update dialog must not make it live.
     The update dialog must additionally be followed by its numbered menu, as
     the update-dialog check has always required.
@@ -973,7 +972,7 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
         # the v1 option text), so trust is one block located by its lowest line.
         trust = max(position for position in (v1, v2, v3) if position is not None)
         trust_footers = footer_v3_starts if trust == v3 else footer_starts
-        if v1 is not None or _footer_below(trust, trust_footers):
+        if (v1 is not None and trust != v3) or _footer_below(trust, trust_footers):
             candidates["trust"] = trust
 
     update = _last_start(UPDATE_DIALOG_PATTERN)
