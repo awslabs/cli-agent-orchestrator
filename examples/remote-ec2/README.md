@@ -10,7 +10,7 @@ It's a sample: scripts, unit files and notes for you to copy and adapt. It is
 the small, one-box version of the cluster ideas in issue #1238, in the same
 spirit as the super-agent sample (#1300).
 
-Want an agent to do the setup for you? Point it at [`AGENT-SETUP.md`](AGENT-SETUP.md).
+Want an agent to do the setup for you? Point it at [`AGENT-SETUP.md`](AGENT-SETUP.md); it starts from a laptop with nothing installed.
 
 > **Nothing here creates AWS resources by itself.** Every command that creates
 > or deletes something in your account is written out in this README for you
@@ -26,6 +26,7 @@ Want an agent to do the setup for you? Point it at [`AGENT-SETUP.md`](AGENT-SETU
 - [Backups and restore](#backups-and-restore)
 - [Checking it works](#checking-it-works)
 - [FAQ](#faq)
+- [Daily use](#daily-use)
 - [Teardown and cost](#teardown-and-cost)
 - [Files](#files)
 - [Testing this sample](#testing-this-sample)
@@ -634,6 +635,34 @@ In `~/.config/herdr/sessions/cao-<instance-id>/`, plus
 **Kiro?**
 kiro-cli on linux-arm64 isn't confirmed. Try it in phase 0. The other
 providers don't depend on it.
+
+## Daily use
+
+**Attach** in one of three ways (herdr 0.9.3; details in
+[`AGENT-SETUP.md`](AGENT-SETUP.md#6e-attaching-to-the-remote-session)):
+
+```bash
+herdr                                                 # cao-box is in the sidebar and reconnects by itself
+herdr --remote cao-box --session cao-<instance-id>    # straight to the box's session
+herdr session attach cao-<instance-id>                # from an SSH shell on the box, as <you>
+```
+
+`herdr machine status cao-box` checks it without attaching. If herdr says the box isn't
+reachable, run `ssh cao-box true` first: the box may be stopped, your AWS sign-in may have
+expired, or the Session Manager plugin may be old.
+
+**Stop and start** (stopping ends every pane, like a reboot):
+
+```bash
+aws ec2 stop-instances --region ap-southeast-2 --instance-ids <instance-id>
+aws ec2 start-instances --region ap-southeast-2 --instance-ids <instance-id>
+```
+
+After a start, wait for SSM to show Online, then run `box-resume.sh` as `<you>`; the units come
+back on boot by themselves. While it's stopped you pay for the EBS volumes and snapshots only.
+While your laptop sleeps, everything on the box keeps running; only the laptop's herdr window and
+any dashboard tunnel drop, and herdr reconnects on wake. More in
+[`AGENT-SETUP.md`](AGENT-SETUP.md#15-daily-use-stop-start-re-attach).
 
 ## Teardown and cost
 

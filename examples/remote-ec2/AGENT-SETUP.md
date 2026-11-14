@@ -19,12 +19,14 @@ Each step ends with a check, so a failure shows up at that step instead of three
 
 - [Rules for the agent](#rules-for-the-agent)
 - [The steps at a glance](#the-steps-at-a-glance)
+- [0. A new laptop: install the tools](#0-a-new-laptop-install-the-tools)
 - [1. Collect the inputs](#1-collect-the-inputs)
 - [2. Laptop preflight](#2-laptop-preflight)
 - [3. Create the AWS resources](#3-create-the-aws-resources)
 - [4. SSH over SSM, as the admin user](#4-ssh-over-ssm-as-the-admin-user)
 - [5. On the box: checkout, settings, bootstrap](#5-on-the-box-checkout-settings-bootstrap)
 - [6. Start the services and connect herdr](#6-start-the-services-and-connect-herdr)
+  - [6e. Attaching to the remote session](#6e-attaching-to-the-remote-session)
 - [7. The user's logins](#7-the-users-logins)
 - [8. The first agent](#8-the-first-agent)
 - [9. Optional: the CAO TUI](#9-optional-the-cao-tui)
@@ -33,6 +35,8 @@ Each step ends with a check, so a failure shows up at that step instead of three
 - [12. Troubleshooting](#12-troubleshooting)
 - [13. Teardown and cost](#13-teardown-and-cost)
 - [14. The final report](#14-the-final-report)
+- [15. Daily use: stop, start, re-attach](#15-daily-use-stop-start-re-attach)
+- [16. The end-to-end check on a new machine](#16-the-end-to-end-check-on-a-new-machine)
 
 ## Rules for the agent
 
@@ -73,6 +77,7 @@ to every `aws` command on the laptop; it is left out below to keep the lines sho
 
 ## The steps at a glance
 
+0. A new laptop: install the tools, and the user signs in to AWS.
 1. Collect the inputs.
 2. Laptop preflight.
 3. Create the AWS resources (after the user's OK).
@@ -87,6 +92,149 @@ to every `aws` command on the laptop; it is left out below to keep the lines sho
 12. Troubleshooting.
 13. Teardown and cost.
 14. The final report.
+15. Daily use: stop, start, re-attach.
+16. The end-to-end check on a new machine.
+
+## 0. A new laptop: install the tools
+
+Skip this step on a laptop that already passes step 2. On a brand-new laptop, assume **nothing**
+is installed. For each tool: run its check first, install only if the check fails, then run
+the check again. The install commands are **check before use**: this sample can't test them
+offline, and download links and package names change. Take them from each tool's own install
+page, linked below. Installs that need `sudo` on the laptop, or a package manager the user
+hasn't chosen, are the user's call: show them the command and let them run it (rule 5 applies
+here too: never pipe a download into a shell).
+
+**0a. A package manager (macOS).** Homebrew is the usual one; it isn't on a new Mac. Linux
+laptops use their own (`apt-get` on Ubuntu or Debian, below).
+
+```bash
+brew --version
+```
+
+> **User step.** If it's missing and the user wants it, they install Homebrew from
+> [brew.sh](https://brew.sh), reading the script before running it. Without Homebrew, use each
+> tool's own installer below.
+
+**0b. `ssh`, `ssh-keygen` and `git`.**
+
+```bash
+command -v ssh ssh-keygen git
+```
+
+**Check:** three paths. macOS ships `ssh` and `ssh-keygen`; `git` comes with Apple's command
+line tools (`xcode-select --install`, a user step: it opens a dialog) or `brew install git`. On
+Ubuntu or Debian: `sudo apt-get install -y openssh-client git` (**check before use**).
+
+**0c. The AWS CLI v2** ([install page](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)).
+
+```bash
+aws --version          # must say aws-cli/2.
+```
+
+If it's missing (**check before use**, take the current commands from the install page):
+
+- macOS: AWS's `.pkg` installer from that page, or `brew install awscli`;
+- Linux: AWS's zip for the laptop's CPU (`uname -m` says `x86_64` or `aarch64`), unpacked, then
+  `sudo ./aws/install`. The install page shows how to check the zip's PGP signature first.
+
+An `aws-cli/1.` version, or an `aws` from a distribution's Python package, is too old: install
+v2 and make sure `command -v aws` finds it first.
+
+**0d. The Session Manager plugin** ([install page](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)).
+SSH to the box runs inside a Session Manager session (step 4), so this is required.
+
+```bash
+session-manager-plugin --version
+```
+
+If it's missing (**check before use**): on macOS, the page's signed `.pkg` for the Mac's CPU
+(or `brew install --cask session-manager-plugin`); on Ubuntu or Debian, the page's `.deb`, then
+`sudo dpkg -i <file>.deb`. An old plugin can make SSH over SSM fail (step 6f): if the check
+prints a version, compare it with the page's release notes.
+
+**0e. herdr, pinned.** The laptop and the box must run the **same** herdr version
+([`README.md`](README.md), "herdr"); a mismatch has broken every CAO call before. Pick the
+version for both now, before step 2c records it:
+
+- herdr's home is [herdr.dev](https://herdr.dev); its releases are on GitHub at
+  [`herdrdev/herdr`](https://github.com/herdrdev/herdr/releases);
+- the box needs that release's `herdr-linux-aarch64` asset. It is published for v0.9.3 and
+  v0.9.5 (README, "herdr"); for any other version, check the release lists it;
+- the laptop needs that release's asset for its own OS and CPU (**check before use**: read the
+  asset names on the release page).
+
+With `gh` (0f) you can list the versions and assets:
+
+```bash
+gh api repos/herdrdev/herdr/releases --jq '.[].tag_name' | head -n 10
+gh api repos/herdrdev/herdr/releases/tags/<herdr-version> --jq '.assets[] | .name + " " + .digest'
+```
+
+Install the laptop's asset into a folder on the user's `PATH`, for example `~/.local/bin`, and
+check its sha256 against the release's `digest` before you run it (the same way step 5b does
+for the box; **check before use**):
+
+```bash
+shasum -a 256 <downloaded-herdr-asset>      # Linux: sha256sum; must equal the digest without "sha256:"
+install -m 0755 <downloaded-herdr-asset> ~/.local/bin/herdr
+herdr --version
+```
+
+**Check:** `herdr --version` prints the version you picked. A package manager's herdr (for
+example Homebrew's) installs whatever version is current, which may not be the box's: use it
+only if `herdr --version` matches. Don't run `herdr update` or upgrade herdr's package on just
+one side; to move, pin the new version on both (step 12, the herdr row).
+
+**0f. Optional: `gh`** ([cli.github.com](https://cli.github.com)). Step 5b and 0e use it to read
+release digests; without it, read the same `digest` field from
+`https://api.github.com/repos/<owner>/<repo>/releases/tags/<tag>` with `curl`.
+
+```bash
+gh --version
+```
+
+If it's missing (**check before use**): `brew install gh` on macOS; on Linux, GitHub's own
+package repository, as cli.github.com describes. Reading public releases needs no login; if
+the user wants to log in on the laptop, `gh auth login` is their step (rule 2).
+
+**0g. An SSH key pair.** Step 1 asks which key to use.
+
+```bash
+ls ~/.ssh/*.pub 2>/dev/null
+```
+
+> **User step.** If there is none, or the user wants one just for the box, they make it, and
+> choose its passphrase themselves:
+>
+> ```bash
+> ssh-keygen -t ed25519 -f ~/.ssh/<your-key> -C cao-box
+> ```
+
+**Check:** `~/.ssh/<your-key>.pub` exists. Only the `.pub` half ever leaves the laptop.
+
+**0h. The user signs in to AWS.** This is the **user's** step: you never see, type or store an
+access key or a password.
+
+> **User step.** The user signs in with the AWS CLI, in the way their organization uses, for
+> example IAM Identity Center:
+>
+> ```bash
+> aws configure sso                          # once: makes a named profile
+> aws sso login --profile <aws-profile>      # again whenever the sign-in expires
+> ```
+>
+> or an existing named profile. They tell you the profile's **name**; step 1 records it.
+
+**Check** (the account id is printed masked, so it never lands in a log):
+
+```bash
+aws sts get-caller-identity --profile <aws-profile> --query Account --output text \
+  | sed -E 's/^(..).*(....)$/\1******\2/'
+```
+
+It prints something like `12******3456`. An error means the sign-in failed or expired: the
+user runs `aws sso login` again.
 
 ## 1. Collect the inputs
 
@@ -103,14 +251,14 @@ time, and add a `KEY=value` line for each answer.
 |---|---|---|
 | `REGION` | Which AWS region? | `ap-southeast-2`. The sample's files are written for Sydney: [`ssh/config.snippet`](ssh/config.snippet), the IAM ARNs and the [`config/`](config/) model ids all name it. Another region means editing those too (**check before use**). |
 | `INSTANCE_TYPE` | Which box size? | `m8g.4xlarge` (Graviton4, 16 vCPU, 64 GiB). Alternatives: `c8g.4xlarge` (32 GiB), `r8g.4xlarge` (128 GiB), and `m7g.4xlarge` (Graviton3) as the fallback. Graviton, 16 vCPU or more ([`README.md`](README.md), "The box"). |
-| `AWS_PROFILE_NAME` | Which AWS CLI profile on the laptop may create these resources? | No default. Store the profile's **name** only. |
+| `AWS_PROFILE_NAME` | Which AWS CLI profile on the laptop may create these resources? | No default; on a new laptop, the one from step 0h. Store the profile's **name** only. |
 | `VPC_ID`, `SUBNET_ID` | Which VPC and subnet? | The subnet needs outbound internet (a NAT gateway, or a public IP with no inbound rules) or VPC endpoints for SSM, Bedrock and S3 (README quick start, step 5). |
 | `BOX_USER` | The Linux user name for the agents? | A plain Linux name: `^[a-z_][a-z0-9_-]{0,31}$` (`bootstrap.sh` step 0). |
 | `BOX_UID` | Its uid? | A number from 1000 to 59999. A macOS uid such as 501 is refused. Pick one and never change it: rebuilds must reuse it so the data volume's files keep their owner (`bootstrap.sh` header and step 0). |
 | `BOX_HOME` | The home path? | The laptop's home path (`/Users/<you>`), so absolute paths in kits keep working, or the ordinary `/home/<you>`. With `/home/<you>`, also set `DATA_MOUNT=/home/<you>` ([`README.md`](README.md), "The home path"). |
 | `INSTALL_DOCKER` | Docker on the box? | `no`. Say this before they answer: with `yes`, the box user joins the `docker` group, and that makes every agent root on the box (`docker run -v /:/host ...`). Rootless Docker avoids that ([`README.md`](README.md), "Tools on linux-arm64"). |
 | `BACKUPS` | Nightly backups to S3? | Optional; see step 11. The backups hold message text, so treat the bucket like the box ([`README.md`](README.md), "Backups and restore"). |
-| `SSH_KEY` | Which SSH key pair on the laptop? | A path under `~/.ssh/`. Only the **public** half ever goes to AWS or the box (README, "Before you start"). |
+| `SSH_KEY` | Which SSH key pair on the laptop? | A path under `~/.ssh/` (step 0g). Only the **public** half ever goes to AWS or the box (README, "Before you start"). |
 
 **Check:** the answers file has a line for every row, and `stat -f %Lp` (macOS) or
 `stat -c %a` (Linux) on it prints `600`. Read the file back to the user and ask them to confirm
@@ -543,6 +691,56 @@ the box's herdr and every pane.
 **Check:** the laptop's herdr shows `cao-box` with the box's session, and a pane opened there
 runs on the box (`uname -m` prints `aarch64`).
 
+### 6e. Attaching to the remote session
+
+Once step 6d has saved the machine, there are three ways to reach the box's herdr session
+(`cao-<instance-id>`). They were checked against herdr 0.9.3's `--help`; on another version,
+check `herdr --help` says the same (**check before use**). `cao-box` here is the SSH host from
+step 4 and the machine label from step 6d.
+
+1. **Plain `herdr` on the laptop.** The saved machine `cao-box` appears in the sidebar and
+   reconnects by itself, for example after the laptop wakes up. This is the everyday way.
+   ```bash
+   herdr
+   ```
+2. **Straight to the remote session, over SSH:**
+   ```bash
+   herdr --remote cao-box --session cao-<instance-id>
+   ```
+3. **From an SSH shell on the box**, as the box user: log in with `ssh cao-box`, then run
+   ```bash
+   herdr session attach cao-<instance-id>
+   ```
+   If `herdr` isn't found there, fix the login `PATH` first (step 8a).
+
+To look at the saved machine without attaching:
+
+```bash
+herdr machine list                          # the saved machines, cao-box among them
+herdr machine status cao-box                # reachable or not; it never prompts for a login
+herdr --machine cao-box workspace list      # the box's workspaces, run through the saved machine
+```
+
+**Check:** `herdr machine status cao-box` says it is reachable, and
+`herdr --machine cao-box workspace list` answers. A machine that has to sign in again can be
+reconnected in a terminal with `herdr machine reconnect cao-box`.
+
+### 6f. If herdr says the box isn't reachable
+
+herdr reaches the box through the same SSH entry, so test SSH on its own first:
+
+```bash
+ssh cao-box true
+```
+
+- **It fails:** the cause is below herdr. The box may be **stopped** (start it, step 15), SSM
+  may not be `Online` yet (step 3e), the user's AWS sign-in may have **expired** (they run
+  `aws sso login` again, step 0h), or the Session Manager plugin may be **old** (update it,
+  step 0d). Fix that, then `ssh cao-box true` again.
+- **It works, but herdr still can't reach the box:** check the versions match on both sides
+  (`herdr --version` on the laptop, `ssh cao-box 'bash -lc "herdr --version"'` on the box; step
+  12, the herdr row), and that the box's herdr is up (`ssh cao-box systemctl is-active herdr-cao`).
+
 ## 7. The user's logins
 
 All of these run **as the box user** on the box (`ssh cao-box`, or a herdr pane on the box).
@@ -843,7 +1041,11 @@ Cost: about <price> per hour for the instance (source: <pricing page or API>), p
   storage (charged even while stopped), S3/KMS if any, and Bedrock use.
 
 Checks passed: /health, box-resume.sh all ok, herdr machine cao-box, first agent idle,
-  reboot drill <done | not done>, restore drill <done | not done>.
+  reboot drill <done | not done>, restore drill <done | not done>,
+  end-to-end check (step 16) <all ticked | which items failed>.
+
+To attach: run `herdr` (the box is cao-box in the sidebar), or
+  herdr --remote cao-box --session cao-<instance-id>   (AGENT-SETUP.md step 6e)
 
 Left for you:
   - <logins not done yet: gh, Codex, Kiro>
@@ -854,3 +1056,76 @@ Left for you:
 To stop it: aws ec2 stop-instances --region <region> --instance-ids <instance-id>
 To remove it: AGENT-SETUP.md step 13, which deletes the data volume on purpose.
 ```
+
+## 15. Daily use: stop, start, re-attach
+
+**Stop the box to save money.** Stopping ends every pane and agent on the box (like a reboot),
+so get the user's OK and let running agents finish first:
+
+```bash
+aws ec2 stop-instances --region <region> --instance-ids <instance-id>
+aws ec2 wait instance-stopped --region <region> --instance-ids <instance-id>
+```
+
+**What a stopped box costs:** no instance charge, but the EBS volumes (the 50 GiB root and the
+200 GiB data volume) and any snapshots are still charged (README, FAQ, "Can I stop the box at
+night"). Quote no price; take it from the EBS pricing page (rule 1).
+
+**Start it again:**
+
+```bash
+aws ec2 start-instances --region <region> --instance-ids <instance-id>
+aws ec2 wait instance-running --region <region> --instance-ids <instance-id>
+```
+
+Then wait for SSM to show `Online` (step 3e's command), and `ssh cao-box true`. The instance id,
+the session name `cao-<instance-id>` and the data volume all stay the same; SSH over SSM doesn't
+care that the public IP changed. The units are enabled, so they come back on boot by themselves
+(README, "Reboot recovery"). Check them, as the box user:
+
+```bash
+ssh cao-box 'bash -lc /usr/local/lib/cao-box/box-resume.sh'   # a login shell, so herdr is on the PATH (step 8a)
+```
+
+**Check:** every line is `ok`, and it ends with `All up.` Then, as after a reboot (step 10):
+herdr is empty, so remove CAO's stale records (`cao shutdown --session <name>`) and relaunch the
+agents you need (step 8e). A backup missed while the box was stopped runs at boot
+(`Persistent=true`).
+
+**Re-attach** with any of the three ways in step 6e; plain `herdr` usually reconnects by
+itself. If it says the box isn't reachable, step 6f.
+
+**While the laptop sleeps** (or restarts, or loses its network):
+
+| Keeps running, on the box | Stops, on the laptop |
+|---|---|
+| herdr's server and every pane, so the agents keep working | the laptop's herdr window and its SSH connection (it reconnects on wake) |
+| cao-server, the backup timer, and the optional Telegram relay | an `ssh -N cao-box-dash` tunnel to the dashboard: run it again |
+| | anything started in a laptop-local herdr session, not on `cao-box` |
+
+The user's AWS sign-in may also expire while the laptop sleeps. Then SSH, and so herdr, can't
+reach the box until they run `aws sso login` again (step 0h). The box itself never needs that
+sign-in: it uses its instance role.
+
+## 16. The end-to-end check on a new machine
+
+Run this last, on the new laptop, and tick each line. Stop at the first one that fails, and fix
+it at the step named.
+
+- [ ] Every tool from step 0 prints its version, and `herdr --version` matches the box's pin
+      (steps 0, 2c).
+- [ ] The preflight passes: the CLI, the plugin, the sign-in, the box type, the model ids and the
+      image (step 2).
+- [ ] The box is created, with its ids in the answers file (step 3).
+- [ ] SSM says `Online` (step 3e).
+- [ ] `ssh cao-box-admin` and `ssh cao-box true` both work (steps 4, 6c).
+- [ ] `systemctl is-active herdr-cao cao-server cao-backup.timer` prints `active` three times
+      (step 6a).
+- [ ] `/health` answers on `127.0.0.1:9889`, and only there (step 6a).
+- [ ] `box-resume.sh` ends with `All up.` (step 6b).
+- [ ] herdr is attached: `herdr machine status cao-box` says reachable, and a pane on the box
+      prints `aarch64` (steps 6d, 6e).
+- [ ] The first agent reached idle and answered a short prompt (step 8).
+- [ ] The reboot drill passed (step 10).
+
+Then give the user the final report (step 14).
