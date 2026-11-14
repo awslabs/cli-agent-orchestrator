@@ -110,7 +110,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --format-new-volume) FORMAT_NEW=1 ;;
     --settings)
-      [ $# -ge 2 ] && [ -n "$2" ] || { echo "--settings needs a file" >&2; exit 2; }
+      { [ $# -ge 2 ] && [ -n "$2" ]; } || { echo "--settings needs a file" >&2; exit 2; }
       SETTINGS_FILE="$2"; shift ;;
     --root)
       [ $# -ge 2 ] || { echo "--root needs a folder" >&2; exit 2; }
