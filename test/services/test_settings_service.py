@@ -1,6 +1,7 @@
 """Tests for settings_service module."""
 
 import json
+import os
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -780,6 +781,7 @@ _WRITERS = [
     pytest.param(
         lambda: settings_service.set_skill_projection_mode("copy"), id="skill_projection_mode"
     ),
+    pytest.param(lambda: settings_service.set_session_label("cao-demo", "Run"), id="label"),
 ]
 
 
@@ -817,6 +819,22 @@ class TestWritersFailClosed:
         with pytest.raises(settings_service.SettingsUnreadableError):
             write()
         assert settings_file.is_dir()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.parametrize("write", _WRITERS)
+    def test_a_permission_denied_file_is_refused_and_preserved(self, settings_file, write):
+        """EACCES on settings.json itself: ``locked_atomic_rewrite`` pre-reads
+        the target before ``compute`` runs, so the PermissionError surfaces
+        there and must be mapped like EISDIR and undecodable bytes, not escape
+        as a raw traceback (gutosantos82 / plauzy, #724 review)."""
+        settings_file.write_text('{"keep": 1}')
+        settings_file.chmod(0o000)
+        try:
+            with pytest.raises(settings_service.SettingsUnreadableError):
+                write()
+        finally:
+            settings_file.chmod(0o600)
+        assert settings_file.read_text() == '{"keep": 1}'
 
     @pytest.mark.parametrize("write", _WRITERS)
     def test_an_absent_file_is_still_created(self, settings_file, write):
@@ -902,6 +920,135 @@ class TestWritersFailClosed:
         data = json.loads(settings_file.read_text())
         assert data["extra_agent_dirs"] == ["/a"]
         assert data["extra_skill_dirs"] == ["/b"]
+
+
+class TestSessionLabels:
+    """Per-session display aliases: trimmed, capped, cleared by a blank label."""
+
+    def test_empty_when_unset(self, settings_file):
+        assert settings_service.get_session_labels() == {}
+
+    def test_set_trims_and_persists(self, settings_file):
+        labels = settings_service.set_session_label("cao-demo", "  Nightly triage  ")
+        assert labels == {"cao-demo": "Nightly triage"}
+        assert settings_service.get_session_labels() == {"cao-demo": "Nightly triage"}
+        assert json.loads(settings_file.read_text())["session_labels"] == {
+            "cao-demo": "Nightly triage"
+        }
+
+    def test_blank_label_clears(self, settings_file):
+        settings_service.set_session_label("cao-demo", "x")
+        assert settings_service.set_session_label("cao-demo", "   ") == {}
+        assert settings_service.get_session_labels() == {}
+
+    def test_clearing_an_unknown_session_is_a_no_op(self, settings_file):
+        assert settings_service.set_session_label("cao-nope", "") == {}
+        # ...including on disk: teardown clears unconditionally, and that must
+        # not create or rewrite settings.json on every session delete.
+        assert not settings_file.exists()
+
+    def test_clearing_over_an_unparseable_settings_file_is_refused_and_preserved(
+        self, settings_file
+    ):
+        """A clear is a write like any other: over a file that exists but does
+        not parse it must neither rewrite the file (#737) nor pretend to have
+        succeeded. The service raises; ``delete_session`` is the one caller
+        that downgrades this to a warning (haofeif, #724 review, P3)."""
+        settings_file.write_text('{"terminal": {"backend": "tmux"},}')  # trailing comma
+        before = settings_file.read_bytes()
+        with pytest.raises(settings_service.SettingsUnreadableError):
+            settings_service.set_session_label("cao-gone", "")
+        assert settings_file.read_bytes() == before
+
+    def test_resetting_the_same_label_does_not_rewrite(self, settings_file):
+        """The no-op guard must actually skip the write, not merely produce the
+        same bytes. Every publish goes through a temp file and ``os.replace``,
+        so a write that did happen shows up as a new inode."""
+        settings_service.set_session_label("cao-demo", "Run")
+        before = settings_file.stat().st_ino
+        assert settings_service.set_session_label("cao-demo", "Run") == {"cao-demo": "Run"}
+        assert settings_file.stat().st_ino == before, "a no-op label reset rewrote the file"
+        assert json.loads(settings_file.read_text())["session_labels"] == {"cao-demo": "Run"}
+
+    def test_control_characters_are_rejected_before_the_lock(self, settings_file):
+        """Escapes and line breaks would be echoed verbatim into every listing
+        (plauzy, #724 review). Refused as a ValueError like every other bad
+        input, and nothing is written."""
+        with pytest.raises(ValueError, match="printable"):
+            settings_service.set_session_label("cao-demo", "ok\x1b[2J\nrm -rf /")
+        with pytest.raises(ValueError, match="printable"):
+            settings_service.set_session_label("cao-demo", "two\nlines")
+        assert not settings_file.exists()
+        # Ordinary punctuation and non-ASCII letters are fine.
+        assert settings_service.set_session_label("cao-demo", "Nightly triage: étape 2 (ok)") == {
+            "cao-demo": "Nightly triage: étape 2 (ok)"
+        }
+
+    def test_label_is_capped(self, settings_file):
+        long = "x" * (settings_service.SESSION_LABEL_MAX_LENGTH + 20)
+        labels = settings_service.set_session_label("cao-demo", long)
+        assert len(labels["cao-demo"]) == settings_service.SESSION_LABEL_MAX_LENGTH
+
+    def test_other_settings_survive(self, settings_file):
+        settings_file.write_text(json.dumps({"agent_dirs": {"kiro_cli": "/x"}}))
+        settings_service.set_session_label("cao-demo", "Run")
+        data = json.loads(settings_file.read_text())
+        assert data["agent_dirs"] == {"kiro_cli": "/x"}
+        assert data["session_labels"] == {"cao-demo": "Run"}
+
+    def test_corrupt_labels_value_is_treated_as_empty(self, settings_file):
+        settings_file.write_text(json.dumps({"session_labels": ["not", "a", "dict"]}))
+        assert settings_service.get_session_labels() == {}
+        assert settings_service.set_session_label("cao-demo", "Run") == {"cao-demo": "Run"}
+
+
+class TestWritesAreSerializedAndAtomic:
+    def test_publish_replaces_the_file_rather_than_truncating_it(self, settings_file):
+        """A reader that opens the file mid-write must see the old content or
+        the new, never a partial one: the publish is a temp file plus
+        ``os.replace``, which shows up as a fresh inode."""
+        settings_service.set_session_label("cao-demo", "One")
+        before = settings_file.stat().st_ino
+        settings_service.set_session_label("cao-demo", "Two")
+        assert settings_file.stat().st_ino != before
+
+    def test_concurrent_writers_do_not_lose_each_others_update(self, settings_file):
+        """Two writers that both load before either saves would each publish
+        their own view and the later one would win whole. The read-modify-write
+        holds an inter-process lock for its whole span, so the second writer
+        cannot even load until the first has published: pinned by parking the
+        first writer inside its load and checking the second is still waiting.
+        """
+        settings_file.write_text(json.dumps({"agent_dirs": {"kiro_cli": "/keep"}}))
+        first_is_inside = threading.Event()
+        release_first = threading.Event()
+        real_load = settings_service._load_or_raise
+        entered = []
+
+        def parked_load():
+            data = real_load()
+            if not entered:
+                entered.append(True)
+                first_is_inside.set()
+                assert release_first.wait(5), "test harness never released the first writer"
+            return data
+
+        first = threading.Thread(target=settings_service.set_session_label, args=("cao-a", "A"))
+        second = threading.Thread(target=settings_service.set_session_label, args=("cao-b", "B"))
+        with patch.object(settings_service, "_load_or_raise", parked_load):
+            first.start()
+            assert first_is_inside.wait(5)
+            second.start()
+            second.join(0.5)
+            assert second.is_alive(), "the second writer got in while the first held the lock"
+            release_first.set()
+            first.join(5)
+            second.join(5)
+        assert not first.is_alive() and not second.is_alive()
+
+        data = json.loads(settings_file.read_text())
+        assert data["session_labels"] == {"cao-a": "A", "cao-b": "B"}
+        assert data["agent_dirs"] == {"kiro_cli": "/keep"}
 
 
 @pytest.mark.parametrize(
