@@ -518,7 +518,7 @@ rule `bootstrap.sh` enforces as root (its `safe_checkout`). This prints nothing:
 
 ```bash
 sudo find /opt/cao-box-src ! -type l \( ! -user root -o -perm -g+w -o -perm -o+w \) -print | head -n 1
-ls /opt/cao-box-src/cli-agent-orchestrator/examples/remote-ec2/bootstrap.sh
+ls /opt/cao-box-src/cli-agent-orchestrator/examples/remote/ec2/bootstrap.sh
 ```
 
 **5b. Find each tool's pin and sha256.** `bootstrap.sh` checks every download against a sha256,
@@ -601,7 +601,7 @@ sudo grep -c '<' /opt/cao-box-src/box-settings.env          # 0: no placeholder 
 blank, so the first run needs `--format-new-volume`:
 
 ```bash
-cd /opt/cao-box-src/cli-agent-orchestrator/examples/remote-ec2
+cd /opt/cao-box-src/cli-agent-orchestrator/examples/remote/ec2
 sudo bash bootstrap.sh --settings /opt/cao-box-src/box-settings.env --dry-run --format-new-volume
 ```
 
@@ -857,7 +857,7 @@ lists each folder.
 example `developer`) set no provider. A profile pinned to another provider's model failed in a
 real run on a box without that provider, even with `--provider claude_code`
 (**check before use**). So pick a Claude Code profile, or copy one and change its
-provider and model ([`docs/agent-profile.md`](../../docs/agent-profile.md)).
+provider and model ([`docs/agent-profile.md`](../../../docs/agent-profile.md)).
 
 **8e. Launch.** As the box user, in a herdr pane on the box:
 
@@ -875,7 +875,7 @@ Tell the user to wait until it's idle before typing to it (`bin/box-resume.sh`'s
 
 `cao tui` runs a compiled `cao-tui` binary. A git install of CAO builds it only when cargo is on
 the `PATH` at install time. Without cargo the install still works, but `cao tui` says the binary
-is missing ([`scripts/hatch_build_tui_tag.py`](../../scripts/hatch_build_tui_tag.py),
+is missing ([`scripts/hatch_build_tui_tag.py`](../../../scripts/hatch_build_tui_tag.py),
 `src/cli_agent_orchestrator/cli/commands/tui.py`). `bootstrap.sh` installs CAO with a `PATH` of
 only `~/.local/bin` and the system folders (its `USER_PATH`), so its install has no TUI.
 

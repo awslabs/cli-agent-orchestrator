@@ -349,7 +349,7 @@ CHECKOUT_GUARD = extract("bootstrap.sh", "checkout-guard")
 
 
 def checkout(tmp_path: Path) -> Path:
-    here = tmp_path / "kit" / "remote-ec2"
+    here = tmp_path / "kit" / "ec2"
     (here / "bin").mkdir(parents=True)
     (here / "bin" / "lib-cao-box.sh").write_text("# lib\n", encoding="utf-8")
     for folder in (tmp_path / "kit", here, here / "bin"):

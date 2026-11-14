@@ -1,0 +1,23 @@
+# Examples
+
+- [ag-ui/](ag-ui/README.md) — AG-UI Examples
+- [aidlc-portfolio/](aidlc-portfolio/README.md) — AI-DLC Portfolio Example
+- [assign/](assign/README.md) — Assign (Async) Pattern Example
+- [aws/](aws/README.md) — AWS Cloud-Ops Agent Examples
+- [codex-basic/](codex-basic/README.md) — Codex CLI Basic Usage Example
+- [cohesivity-backend/](cohesivity-backend/README.md) — Cohesivity backend worker example
+- [cross-provider/](cross-provider/README.md) — Cross-Provider Examples
+- [decision-model-host/](decision-model-host/README.md) — Self-hosted decision model: JevK5-4B, local or on AWS
+- [deed-page-publisher/](deed-page-publisher/README.md) — deed.page Publisher Example
+- [fleet/](fleet/README.md) — CAO Fleet — cross-node coordinator
+- [fxmacrodata-macro/](fxmacrodata-macro/README.md) — FXMacroData Macro Release Example
+- [headless-ci/](headless-ci/README.md) — Headless / CI Example
+- [mcp-apps/](mcp-apps/README.md) — Example: the MCP Apps fleet UI
+- [obsidian-vault-demo/](obsidian-vault-demo/README.md) — Obsidian Vault Demo
+- [ops-mcp/](ops-mcp/README.md) — Ops MCP Example
+- [plugins/](plugins/README.md) — Plugins — Example Plugins
+- [remote/ec2/](remote/ec2/README.md) — CAO on one always-on EC2 box, reached from your laptop's herdr
+- [serply-research/](serply-research/README.md) — Serply Scholar and News Research Example
+- [skills/](skills/README.md) — Skills Lifecycle Example
+- [tool-restrictions/](tool-restrictions/README.md) — Tool Restrictions Example
+- [workflow/](workflow/README.md) — Workflow Example

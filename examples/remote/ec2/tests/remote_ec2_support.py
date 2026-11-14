@@ -60,7 +60,7 @@ def link_host_tools(folder: Path, host_dirs: tuple[str, ...] = HOST_DIRS) -> Pat
 @functools.lru_cache(maxsize=None)
 def system_path() -> str:
     """The hermetic system part of every test's PATH (built once per run)."""
-    folder = Path(tempfile.mkdtemp(prefix="remote-ec2-bin-"))
+    folder = Path(tempfile.mkdtemp(prefix="ec2-sample-bin-"))
     atexit.register(shutil.rmtree, folder, ignore_errors=True)
     return str(link_host_tools(folder))
 

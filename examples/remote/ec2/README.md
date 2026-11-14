@@ -188,7 +188,7 @@ Copy each value from the release's published checksums (see
 ```bash
 sudo install -d -m 0755 /opt/cao-box-src
 sudo git clone https://github.com/awslabs/cli-agent-orchestrator.git /opt/cao-box-src/cli-agent-orchestrator
-cd /opt/cao-box-src/cli-agent-orchestrator/examples/remote-ec2
+cd /opt/cao-box-src/cli-agent-orchestrator/examples/remote/ec2
 sudo install -m 0600 /dev/null /opt/cao-box-src/box-settings.env
 sudo tee /opt/cao-box-src/box-settings.env > /dev/null <<'EOF'
 BOX_USER=<you>
@@ -623,7 +623,7 @@ EnvironmentFile=/etc/cao-box/cao-auth.env
 
 It's all-or-nothing, and CAO passes it to every agent pane. If the box user
 is in the `docker` group, agents can read the file too. Read
-[the configuration docs](../../docs/configuration.md) first.
+[the configuration docs](../../../docs/configuration.md) first.
 
 **Which CAO version does the box run?**
 The commit in `CAO_REF`. To upgrade, re-run `bootstrap.sh` with a new
@@ -723,7 +723,7 @@ Then remove the `cao-box` entries from the laptop's `~/.ssh/config`, run
 | [`ssh/config.snippet`](ssh/config.snippet) | The laptop's SSH entries, plus the `herdr machine add` command. |
 | [`telegram/README.md`](telegram/README.md) | The second bot, step by step. |
 
-See also [herdr in CAO](../../docs/herdr.md).
+See also [herdr in CAO](../../../docs/herdr.md).
 
 ## Testing this sample
 
@@ -733,7 +733,7 @@ holds only basic tools and the test's own stubs, so a host `aws` or `gh`
 changes nothing. CI runs them with the rest of the unit tests.
 
 ```bash
-uv run pytest examples/remote-ec2/tests -q --no-cov
+uv run pytest examples/remote/ec2/tests -q --no-cov
 ```
 
 They cover:
