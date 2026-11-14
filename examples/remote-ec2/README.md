@@ -276,14 +276,15 @@ box they aren't. So trust each folder you'll launch agents in, once, as
 (replace the paths with your own):
 
 ```bash
-for dir in "$HOME" "$HOME/work/my-repo"; do
+for dir in "$HOME/work/my-repo"; do
   jq --arg d "$dir" '.projects[$d].hasTrustDialogAccepted = true' ~/.claude.json > ~/.claude.json.tmp \
     && chmod 600 ~/.claude.json.tmp && mv ~/.claude.json.tmp ~/.claude.json
 done
 ```
 
 `~/.claude.json` exists once `claude` has run once. Only trust folders whose
-contents you'd run yourself.
+contents you'd run yourself. If you want to trust `$HOME` itself, first know
+that this trusts every folder under it.
 
 ## The phases
 
@@ -671,15 +672,29 @@ snapshots, S3, KMS and Bedrock usage. This sample quotes no prices: check
 the EC2, EBS and Bedrock pricing pages for Sydney. Set a budget alarm
 before you start.
 
-To remove everything (this deletes data; download what you want to keep
-first):
+To remove everything, first get the user's OK to terminate the instance, then
+terminate it:
 
 ```bash
 aws ec2 terminate-instances --region ap-southeast-2 --instance-ids <instance-id>
+aws ec2 wait instance-terminated --region ap-southeast-2 --instance-ids <instance-id>
+```
+
+Before deleting data, show the user the exact data volume id, every snapshot
+id with its date, the backup bucket, and the KMS key id. The user downloads
+what they want to keep. Get a separate explicit OK to delete that data, then:
+
+```bash
 aws ec2 delete-volume --region ap-southeast-2 --volume-id <data-volume-id>      # it survives termination
 aws ec2 delete-snapshot --region ap-southeast-2 --snapshot-id <snapshot-id>     # each one; and the DLM policy
-aws ec2 delete-security-group --region ap-southeast-2 --group-id <sg-id>
 aws s3api delete-bucket --bucket <backup-bucket>   # after deleting every object version
+aws kms schedule-key-deletion --key-id <backup-key-id>   # check before use
+```
+
+Then remove the resources that hold no user data:
+
+```bash
+aws ec2 delete-security-group --region ap-southeast-2 --group-id <sg-id>
 aws iam remove-role-from-instance-profile --instance-profile-name <cao-box-profile> --role-name <cao-box-role>
 aws iam delete-instance-profile --instance-profile-name <cao-box-profile>
 aws iam delete-role-policy --role-name <cao-box-role> --policy-name cao-box

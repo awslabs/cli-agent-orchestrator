@@ -752,11 +752,19 @@ Agent CLIs log in on the box with their own flows; don't copy login files from t
 > **User step.** In a shell on the box, as the box user:
 >
 > ```bash
-> gh auth login --scopes repo,workflow,read:org
+> gh auth login
 > gh auth setup-git
 > git config --global user.name "<their name>"
 > git config --global user.email "<their email>"
 > ```
+
+If the user wants agents to change GitHub Actions workflow files, tell them first that the
+`workflow` scope lets every agent that can use this token push workflow changes, which can expose
+Actions secrets or change `GITHUB_TOKEN` permissions. Get their explicit OK, then they run:
+
+```bash
+gh auth refresh --scopes workflow
+```
 
 **Check (you may run these; they show no token):**
 
@@ -832,12 +840,13 @@ it opens one, and an agent that CAO launches waits on that question until the la
 run themselves), as the box user:
 
 ```bash
-for dir in "$HOME" "<work-folder>"; do
+for dir in "<work-folder>"; do
   jq --arg d "$dir" '.projects[$d].hasTrustDialogAccepted = true' ~/.claude.json > ~/.claude.json.tmp \
     && chmod 600 ~/.claude.json.tmp && mv ~/.claude.json.tmp ~/.claude.json
 done
 ```
 
+If the user wants to trust `$HOME` itself, tell them first that this trusts every folder under it.
 `~/.claude.json` exists once `claude` has run once (step 7b).
 
 **Check:** `jq -r '.projects | to_entries[] | select(.value.hasTrustDialogAccepted) | .key' ~/.claude.json`
@@ -990,22 +999,37 @@ restore"; [`iam/README.md`](iam/README.md)).
 
 Most of the bill is the instance; then the EBS volumes, snapshots, S3, KMS and Bedrock use
 (README, "Teardown and cost"). **Stopping** the box keeps everything and stops the instance
-charge; the volumes are still charged (README, FAQ). Get the user's OK before any of these.
+charge; the volumes are still charged (README, FAQ).
 
 **Stop (keeps everything):**
+
+Get the user's OK, then:
 
 ```bash
 aws ec2 stop-instances --region <region> --instance-ids <instance-id>
 ```
 
-**Remove everything.** This deletes data: the user downloads what they want to keep first. The
-data volume survives termination, so delete it on purpose:
+**Remove everything.** First, get the user's OK to terminate the instance, then terminate it:
 
 ```bash
 aws ec2 terminate-instances --region <region> --instance-ids <instance-id>
 aws ec2 wait instance-terminated --region <region> --instance-ids <instance-id>
+```
+
+Before deleting any remaining data, show the user the exact data volume id, every snapshot id
+with its date, the backup bucket, and the KMS key id. The user downloads what they want to keep.
+Get a separate explicit OK to delete that data, then:
+
+```bash
 aws ec2 delete-volume --region <region> --volume-id <data-volume-id>
 aws ec2 delete-snapshot --region <region> --snapshot-id <snapshot-id>      # each one, if any
+aws s3api delete-bucket --bucket <backup-bucket>                            # after deleting every object version
+aws kms schedule-key-deletion --key-id <backup-key-id>                     # check before use
+```
+
+Then remove the resources that hold no user data:
+
+```bash
 aws ec2 delete-security-group --region <region> --group-id <sg-id>
 aws ec2 delete-key-pair --region <region> --key-name <cao-box-key>
 aws iam remove-role-from-instance-profile --instance-profile-name <cao-box-profile> --role-name <cao-box-role>
@@ -1013,9 +1037,6 @@ aws iam delete-instance-profile --instance-profile-name <cao-box-profile>
 aws iam delete-role-policy --role-name <cao-box-role> --policy-name cao-box
 aws iam delete-role --role-name <cao-box-role>
 ```
-
-With backups: delete every object version, then `aws s3api delete-bucket --bucket <backup-bucket>`,
-then schedule the KMS key's deletion (`aws kms schedule-key-deletion`, **check before use**).
 
 On the laptop: remove the `cao-box`, `cao-box-dash` and `cao-box-admin` entries from
 `~/.ssh/config`, and run `herdr machine remove cao-box`.

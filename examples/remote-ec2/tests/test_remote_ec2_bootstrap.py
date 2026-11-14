@@ -575,6 +575,30 @@ def test_an_unsafe_settings_file_is_refused(sandbox, case) -> None:
     assert sandbox.recorded_calls() == []
 
 
+def test_a_settings_path_through_a_link_in_the_box_users_home_is_refused(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox)
+    real_kit = sandbox.root / "kit"
+    write_settings(real_kit / "box-settings.env", settings_lines())
+    linked_kit = root / "Users" / "boxuser" / "linked-kit"
+    linked_kit.parent.mkdir(parents=True)
+    linked_kit.symlink_to(real_kit, target_is_directory=True)
+
+    result = sandbox.run(
+        "bootstrap.sh",
+        "--dry-run",
+        "--root",
+        str(root),
+        "--settings",
+        str(linked_kit / "box-settings.env"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "inside the box user's home" in result.stderr
+    assert "== 1." not in result.stdout
+    assert sandbox.recorded_calls() == []
+
+
 def test_settings_needs_a_file(sandbox) -> None:
     result = sandbox.run("bootstrap.sh", "--settings")
     assert result.returncode == 2

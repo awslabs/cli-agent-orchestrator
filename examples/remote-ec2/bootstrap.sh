@@ -179,13 +179,13 @@ AWS_CLI_SHA256 SAM_VERSION SAM_SHA256 YAZI_VERSION YAZI_SHA256 HELIX_VERSION HEL
 # line, never sourced and never handed to env, so no line can run code as root.
 read_settings() {
   local file="$1" dir line key value n=0 seen=" "
-  [ -f "$file" ] || die "--settings ${file}: no such file"
-  cb_safe_path "$file" "$EUID" || die "refusing --settings ${file}: it must be yours (uid ${EUID}), not a symlink, with no group or other write"
-  dir="$(cd "$(dirname "$file")" && pwd -P)"
+  dir="$(cd "$(dirname "$file")" 2>/dev/null && pwd -P)" || die "--settings ${file}: no such folder"
+  SETTINGS_REAL="${dir}/$(basename "$file")"
+  [ -f "$SETTINGS_REAL" ] || die "--settings ${file}: no such file"
+  cb_safe_path "$SETTINGS_REAL" "$EUID" || die "refusing --settings ${file}: it must be yours (uid ${EUID}), not a symlink, with no group or other write"
   if [ "$EUID" -eq 0 ]; then
     cb_safe_dir "$dir" / 0 || die "refusing --settings ${file}: as root, its folders must be root's and nobody else's to write"
   fi
-  SETTINGS_REAL="${dir}/$(basename "$file")"
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
     line="${line%%#*}"
@@ -202,7 +202,7 @@ read_settings() {
     case "$seen" in *" ${key} "*) die "${file}: ${key} is set twice" ;; esac
     seen="${seen}${key} "
     printf -v "$key" '%s' "$value"
-  done < "$file"
+  done < "$SETTINGS_REAL"
   log "settings read from ${SETTINGS_REAL}"
 }
 # <<< settings-file
@@ -277,7 +277,7 @@ HOME_DIR="${ROOT}${BOX_HOME}"
 # every agent can write there.
 home_real="$HOME_DIR"
 if [ -d "$HOME_DIR" ]; then home_real="$(cd "$HOME_DIR" && pwd -P)"; fi
-for p in "$HERE" ${SETTINGS_REAL:+"$SETTINGS_REAL"}; do
+for p in "$HERE" ${SETTINGS_FILE:+"$SETTINGS_FILE"} ${SETTINGS_REAL:+"$SETTINGS_REAL"}; do
   case "$p/" in
     "$home_real"/*|"$HOME_DIR"/*)
       die "refusing ${p}: it is inside the box user's home (${HOME_DIR}), where any agent can change it; keep the sample and its settings in a root-owned folder outside BOX_HOME, for example /opt/cao-box-src" ;;
