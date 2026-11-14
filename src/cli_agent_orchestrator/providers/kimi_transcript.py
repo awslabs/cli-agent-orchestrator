@@ -337,6 +337,7 @@ _COMPOSER_FRAME_CHARS = "─╭╮╰╯│| \t"
 # User input echo. Kimi Code renders the submitted user message bold + colour
 # 222 with a leading sparkle; the legacy TUI uses the same sparkle inline.
 USER_INPUT_SPARKLE_RE = re.compile(r"[✨💫][^\S\n]+\S")
+USER_INPUT_CODE_PROMPT_RE = re.compile(r"^\s*❯[^\S\n]+\S")
 USER_INPUT_STYLE_RE = re.compile(r"\x1b\[1m\x1b\[38;5;222m|\x1b\[38;5;222m")
 
 #: The measured foreground index Kimi Code draws submitted user input in. A
@@ -471,6 +472,11 @@ TRUST_HINT_RE = re.compile(r"↑↓\s*navigate\s*·\s*Enter\s*select\s*·\s*Esc\
 TRUST_OPTION_TRUST = "Trust this folder"
 TRUST_OPTION_REJECT = "Don't trust"
 TRUST_OPTIONS: Tuple[str, ...] = (TRUST_OPTION_TRUST, TRUST_OPTION_REJECT)
+# Kimi Code 2.3 renamed the choices without changing the trust dialog.
+TRUST_OPTION_ALIASES = {
+    "Trust and continue": TRUST_OPTION_TRUST,
+    "Exit": TRUST_OPTION_REJECT,
+}
 # The trust dialog's selection marker is U+276F. Deliberately distinct from the
 # approval dialog's U+25B6 so one dialog's navigation can never be applied to
 # the other.
@@ -497,8 +503,8 @@ def _trust_option_body(stripped: str) -> str:
     """The option label on a row, with any selection marker removed."""
 
     if stripped.startswith(TRUST_SELECT_MARKER):
-        return stripped[len(TRUST_SELECT_MARKER) :].strip()
-    return stripped
+        stripped = stripped[len(TRUST_SELECT_MARKER) :].strip()
+    return TRUST_OPTION_ALIASES.get(stripped, stripped)
 
 
 def is_trust_option_row(clean_line: str) -> bool:
@@ -731,7 +737,7 @@ def _confirm_context_kinds(
     raw_lines: Sequence[str],
     clean_lines: Sequence[str],
     kinds: Sequence[KimiLineKind],
-    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    submission_starts: Sequence[bool],
 ) -> List[KimiLineKind]:
     """Promote only rows inside *their own* rendered UI region.
 
@@ -753,8 +759,8 @@ def _confirm_context_kinds(
     cleans = list(clean_lines)
     confirmed = list(kinds)
 
-    trust_rows = _confirmed_trust_dialog_rows(raws, cleans, semantics)
-    approval_rows = _confirmed_approval_dialog_rows(raws, cleans, semantics)
+    trust_rows = _confirmed_trust_dialog_rows(raws, cleans, submission_starts)
+    approval_rows = _confirmed_approval_dialog_rows(raws, cleans, submission_starts)
 
     for index, kind in enumerate(confirmed):
         if kind is KimiLineKind.TRUST_DIALOG and index not in trust_rows:
@@ -785,10 +791,8 @@ _DIALOG_REGION_MAX_LINES = 80
 
 
 def _dialog_scan_end(
-    raw_lines: Sequence[str],
-    clean_lines: Sequence[str],
+    submission_starts: Sequence[bool],
     start: int,
-    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
 ) -> int:
     """Bound one dialog search to its local turn/region.
 
@@ -796,16 +800,13 @@ def _dialog_scan_end(
     before it can own rows after it.  The hard line cap prevents a malformed
     capture from turning structural confirmation into an unbounded forward scan.
 
-    ``semantics`` is passed through to :func:`is_user_input_start` so the
-    boundary is identified with the same dialect-specific submission evidence the
-    main pass uses; a dimmed sparkle inside payload is not a submission.
+    Use the same submission candidates as the main pass, including its
+    capture-wide check for styling.
     """
 
-    end = min(len(clean_lines), start + _DIALOG_REGION_MAX_LINES)
+    end = min(len(submission_starts), start + _DIALOG_REGION_MAX_LINES)
     for index in range(start + 1, end):
-        raw = raw_lines[index] if index < len(raw_lines) else ""
-        clean = clean_lines[index]
-        if is_user_input_start(raw, clean, semantics):
+        if submission_starts[index]:
             return index
     return end
 
@@ -813,7 +814,7 @@ def _dialog_scan_end(
 def _confirmed_trust_dialog_rows(
     raw_lines: Sequence[str],
     clean_lines: Sequence[str],
-    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    submission_starts: Sequence[bool],
 ) -> Set[int]:
     """Rows belonging to positively rendered trust-dialog spans.
 
@@ -834,7 +835,7 @@ def _confirmed_trust_dialog_rows(
         if not TRUST_TITLE_RE.match(clean):
             continue
 
-        end = _dialog_scan_end(raw_lines, clean_lines, start, semantics)
+        end = _dialog_scan_end(submission_starts, start)
         hint_seen = False
         option_rows: List[int] = []
         selected_seen = False
@@ -870,7 +871,7 @@ def _confirmed_trust_dialog_rows(
 def _confirmed_approval_dialog_rows(
     raw_lines: Sequence[str],
     clean_lines: Sequence[str],
-    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    submission_starts: Sequence[bool],
 ) -> Set[int]:
     """Rows belonging to positively rendered approval-dialog spans.
 
@@ -884,7 +885,7 @@ def _confirmed_approval_dialog_rows(
         if not APPROVAL_TITLE_RE.search(clean):
             continue
 
-        end = _dialog_scan_end(raw_lines, clean_lines, start, semantics)
+        end = _dialog_scan_end(submission_starts, start)
         hint_seen = False
         selected_rows: List[int] = []
         option_rows: List[int] = []
@@ -1523,6 +1524,32 @@ def _confirm_ready_frames(
     ]
 
 
+def find_composer_prompt(rows: Sequence[Tuple[str, str, KimiLineKind]]) -> Optional[int]:
+    """Find the prompt in a confirmed composer, including multiline drafts.
+
+    The row classifier deliberately uses a small frame window to protect answer
+    tables. A draft can exceed that window, so follow the actual box borders
+    here without treating an unframed prompt-shaped table row as ready.
+    """
+    for bottom in range(len(rows) - 1, -1, -1):
+        if rows[bottom][2] is not KimiLineKind.READY_INPUT_FRAME or not _FRAME_EDGE_CLOSE_RE.match(
+            rows[bottom][1]
+        ):
+            continue
+        top = bottom - 1
+        while top >= 0 and _FRAME_BOX_ROW_RE.match(rows[top][1]):
+            top -= 1
+        if (
+            top >= 0
+            and top + 1 < bottom
+            and rows[top][2] is KimiLineKind.READY_INPUT_FRAME
+            and _FRAME_EDGE_OPEN_RE.match(rows[top][1])
+            and COMPOSER_PROMPT_RE.match(rows[top + 1][1])
+        ):
+            return top + 1
+    return None
+
+
 def is_response_marker_line(clean_line: str) -> bool:
     """True when ``clean_line`` starts a response/thinking bullet *with a payload*.
 
@@ -1590,6 +1617,8 @@ def is_user_input_start(
     raw_line: str,
     clean_line: Optional[str] = None,
     semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    *,
+    capture_has_sgr: bool = False,
 ) -> bool:
     """True when the row is a positively identified *submitted* user message.
 
@@ -1620,6 +1649,14 @@ def is_user_input_start(
         and USER_INPUT_COLOR_INDEX not in foreground_color_indices(raw)
     ):
         return False
+
+    # Kimi Code 2.3 renders submitted messages with ❯ instead of a sparkle.
+    # A trust dialog uses the same glyph, so keep its option rows distinct and
+    # require the submission's foreground colour whenever SGR is available.
+    if semantics is SpinnerSemantics.CODE and USER_INPUT_CODE_PROMPT_RE.match(clean):
+        if capture_has_sgr or _SGR_RE.search(raw):
+            return is_drawn_in_foreground(raw, USER_INPUT_COLOR_INDEX)
+        return not is_trust_option_row(clean)
 
     return bool(
         USER_INPUT_SPARKLE_RE.search(clean)
@@ -1686,7 +1723,10 @@ def classify_line(
     # --- dialogs first: their rows would otherwise be read as content ---
     if TRUST_TITLE_RE.match(clean) or TRUST_HINT_RE.search(clean):
         return KimiLineKind.TRUST_DIALOG
-    if is_trust_option_row(clean):
+    # The 2.3 reject label is the ordinary word "Exit". A bare alias in an
+    # answer is content; the complete dialog is already identified by its
+    # title/hint, and detect_trust_dialog normalizes both option rows itself.
+    if is_trust_option_row(clean) and stripped not in TRUST_OPTION_ALIASES:
         return KimiLineKind.TRUST_DIALOG
     if stripped.startswith(TRUST_MCP_TARGETS_PREFIX):
         return KimiLineKind.TRUST_DIALOG
@@ -1839,6 +1879,7 @@ def _swarm_status_context(
     or using a payload-shaped panel to accept a new dispatch.
     """
     rows = classify_lines(output, SpinnerSemantics.CODE, include_unclosed_fences=True)
+    capture_has_sgr = bool(_SGR_RE.search(output))
     raws = [raw for raw, _, _ in rows]
     cleans = [clean for _, clean, _ in rows]
     initial_kinds = [classify_line(raw, clean, SpinnerSemantics.CODE) for raw, clean, _ in rows]
@@ -1850,7 +1891,9 @@ def _swarm_status_context(
             for i, (raw, clean, kind) in enumerate(rows)
             if i
             and kind is KimiLineKind.USER_INPUT
-            and is_user_input_start(raw, clean, SpinnerSemantics.CODE)
+            and is_user_input_start(
+                raw, clean, SpinnerSemantics.CODE, capture_has_sgr=capture_has_sgr
+            )
         ]
         + [len(rows)]
     )
@@ -2073,16 +2116,23 @@ def classify_rows(
             for index, raw in enumerate(raws)
         ]
 
+    # tmux capture-pane -e can omit SGR on individual default-colour rows.
+    # Only a wholly unstyled capture can use the text-only ❯ fallback.
+    capture_has_sgr = semantics is SpinnerSemantics.CODE and any(
+        _SGR_RE.search(raw) for raw in raws
+    )
+    submission_starts = [
+        is_user_input_start(raw, clean, semantics, capture_has_sgr=capture_has_sgr)
+        for raw, clean in zip(raws, cleans)
+    ]
     kinds = [classify_line(raw, clean, semantics) for raw, clean in zip(raws, cleans)]
-    kinds = _confirm_context_kinds(raws, cleans, kinds, semantics)
+    kinds = _confirm_context_kinds(raws, cleans, kinds, submission_starts)
     # The last positively identified submission starts the current turn. Renderer
     # evidence for the composer is scoped to it, so a historical turn's composer
     # cannot change how the current turn's rows are read (the historical-prefix
     # invariant).
-    turn_start = 0
-    for index, (raw, clean) in enumerate(zip(raws, cleans)):
-        if is_user_input_start(raw, clean, semantics):
-            turn_start = index
+    submission_indices = [i for i, starts in enumerate(submission_starts) if starts]
+    turn_start = submission_indices[-1] if submission_indices else 0
     kinds = _confirm_ready_frames(raws, cleans, kinds, semantics, turn_start)
 
     result: List[KimiLineKind] = []
@@ -2094,15 +2144,7 @@ def classify_rows(
     # Execution probes also quarantine unfinished fences: later bytes may close
     # them, but an acceptance latch cannot be revoked once it has fired.
     quoted: Set[int] = set()
-    boundaries = (
-        [0]
-        + [
-            i
-            for i, (raw, clean) in enumerate(zip(raws, cleans))
-            if i and is_user_input_start(raw, clean, semantics)
-        ]
-        + [len(cleans)]
-    )
+    boundaries = [0] + [i for i in submission_indices if i] + [len(cleans)]
     for start, end in zip(boundaries, boundaries[1:]):
         fence_scan_lines = [
             _answer_fence_scan_text(raws[i], cleans[i], kinds[i], semantics)
@@ -2130,7 +2172,7 @@ def classify_rows(
         # after it was published as the answer. The escape-free fallback that lets
         # a plain sparkle start a submission is still available where no private
         # block is open (the shape the screen/status consumers see).
-        starts_submission = is_user_input_start(raw, clean, semantics) and not (
+        starts_submission = submission_starts[index] and not (
             in_tool_block
             and semantics is SpinnerSemantics.CODE
             and USER_INPUT_COLOR_INDEX not in foreground_color_indices(raw)
