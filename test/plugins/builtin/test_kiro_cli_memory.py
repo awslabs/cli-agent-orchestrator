@@ -93,6 +93,36 @@ async def test_writes_steering_file_on_post_create_terminal(
 
 
 @pytest.mark.asyncio
+async def test_same_memory_body_twice_does_not_call_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_metadata_and_cwd(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
+        lambda: type(
+            "F",
+            (),
+            {"get_memory_context_for_terminal": lambda self, t: "<cao-memory>SAME</cao-memory>"},
+        )(),
+    )
+
+    plugin = KiroCliMemoryPlugin()
+    await plugin.on_post_create_terminal(_event())
+    target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
+    original = target.read_bytes()
+    writes: list[Path] = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.locked_atomic_rewrite",
+        lambda path, compute: writes.append(path),
+    )
+
+    await plugin.on_post_create_terminal(_event())
+
+    assert writes == []
+    assert target.read_bytes() == original
+
+
+@pytest.mark.asyncio
 async def test_overwrites_previous_memory_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -101,7 +131,10 @@ async def test_overwrites_previous_memory_file(
     target_dir = tmp_path / STEERING_SUBDIR
     target_dir.mkdir(parents=True)
     target = target_dir / MEMORY_FILENAME
-    target.write_text("stale memory from a prior run\n", encoding="utf-8")
+    target.write_text(
+        '<cao-memory generated="2000-01-01T00:00:00Z">stale</cao-memory>\n',
+        encoding="utf-8",
+    )
 
     _install_metadata_and_cwd(monkeypatch, tmp_path)
 
@@ -120,6 +153,8 @@ async def test_overwrites_previous_memory_file(
     content = target.read_text(encoding="utf-8")
     assert "fresh" in content
     assert "stale" not in content
+    assert "2000-01-01T00:00:00Z" not in content
+    assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
 
 
 @pytest.mark.asyncio
@@ -180,7 +215,10 @@ async def test_empty_context_replaces_stale_file_by_default(
 ) -> None:
     target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
     target.parent.mkdir(parents=True)
-    target.write_text("<cao-memory>STALE</cao-memory>\n", encoding="utf-8")
+    target.write_text(
+        '<cao-memory generated="2000-01-01T00:00:00Z">STALE</cao-memory>\n',
+        encoding="utf-8",
+    )
     _install_metadata_and_cwd(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
@@ -191,6 +229,7 @@ async def test_empty_context_replaces_stale_file_by_default(
 
     content = target.read_text(encoding="utf-8")
     assert "STALE" not in content
+    assert "2000-01-01T00:00:00Z" not in content
     assert "<!-- no memories selected -->" in content
     assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
 

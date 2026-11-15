@@ -27,7 +27,9 @@ from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
 from cli_agent_orchestrator.services.memory_injection import (
     empty_memory_block,
+    memory_blocks_have_same_body,
     stamp_memory_block,
+    uniquely_delimited_block,
 )
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 
@@ -186,6 +188,15 @@ class CodexMemoryPlugin(CaoPlugin):
             return
 
         try:
+            try:
+                existing = await asyncio.to_thread(target.read_text, encoding="utf-8")
+            except FileNotFoundError:
+                existing = ""
+            existing_block = uniquely_delimited_block(existing, BEGIN_MARKER, END_MARKER)
+            if existing_block is not None and memory_blocks_have_same_body(
+                existing_block, context_block
+            ):
+                return
             # locked_atomic_rewrite polls with time.sleep up to the lock
             # timeout; run it off the event loop so a contended lock cannot
             # stall cao-server for other terminals.

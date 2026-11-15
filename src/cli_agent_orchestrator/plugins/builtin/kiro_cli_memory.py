@@ -33,6 +33,7 @@ from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
 from cli_agent_orchestrator.services.memory_injection import (
     empty_memory_block,
+    memory_blocks_have_same_body,
     stamp_memory_block,
 )
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
@@ -188,6 +189,12 @@ class KiroCliMemoryPlugin(CaoPlugin):
             return
 
         try:
+            try:
+                existing = await asyncio.to_thread(target.read_text, encoding="utf-8")
+            except FileNotFoundError:
+                existing = ""
+            if memory_blocks_have_same_body(existing, context_block):
+                return
             # Whole-file overwrite (no read-modify-write), but routed through
             # the shared locked-atomic helper so concurrent writers sharing a
             # cwd cannot collide on the temp file (defect A). The compute

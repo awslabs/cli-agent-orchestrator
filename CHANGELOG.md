@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Memory injection no longer leaves stale provider context or drops a scope behind one
   long note** (#1329). Claude Code, Codex and Kiro provider files receive UTC-stamped
-  blocks, including an explicit empty block when no memories are selected. The v1 builder
-  clips an oversized first note, continues to later notes that fit, and follows recorded
-  project `cwd_hash` aliases. `memory.injection.clear_on_empty` and
+  blocks, including an explicit empty block when no memories are selected. A launch whose
+  selected memory body is unchanged preserves the provider file byte-for-byte, including
+  its prior stamp, so tracked files do not gain stamp-only diffs. The v1 builder clips an
+  oversized first note, continues to later notes that fit, and follows recorded project
+  `cwd_hash` aliases. `memory.injection.clear_on_empty` and
   `memory.injection.v1_fixes` both default to `true`; setting either to `false` restores
   its legacy behavior.
 - **Codex "Trust this folder?" dialogs (0.156 and later) are accepted before the first input** (#1319).

@@ -11,6 +11,10 @@ from pathlib import Path
 
 import pytest
 
+from cli_agent_orchestrator.services.memory_injection import (
+    memory_blocks_have_same_body,
+    uniquely_delimited_block,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
 
 pytestmark = pytest.mark.usefixtures("isolated_memory_db")
@@ -83,3 +87,20 @@ def test_injection_settings_default_to_hygiene_fixes() -> None:
         "clear_on_empty": True,
         "v1_fixes": True,
     }
+
+
+def test_idempotency_compares_only_the_uniquely_delimited_managed_block() -> None:
+    begin_marker = "<!-- cao-memory:begin -->"
+    end_marker = "<!-- cao-memory:end -->"
+    content = (
+        "# User example\n"
+        "<cao-memory>SAME</cao-memory>\n"
+        f"{begin_marker}\n"
+        '<cao-memory generated="2000-01-01T00:00:00Z">OLD</cao-memory>\n'
+        f"{end_marker}\n"
+    )
+
+    managed = uniquely_delimited_block(content, begin_marker, end_marker)
+
+    assert managed is not None
+    assert not memory_blocks_have_same_body(managed, "<cao-memory>SAME</cao-memory>")

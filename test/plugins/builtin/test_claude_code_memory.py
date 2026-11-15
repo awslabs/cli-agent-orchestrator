@@ -89,6 +89,46 @@ async def test_writes_memory_block_on_post_create_terminal(
 
 
 @pytest.mark.asyncio
+async def test_same_memory_body_twice_does_not_call_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
+        lambda terminal_id: {
+            "tmux_session": "cao-test-session",
+            "tmux_window": "developer-abcd",
+            "id": terminal_id,
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_backend",
+        lambda: type(
+            "FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)}
+        )(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
+        lambda: type(
+            "F",
+            (),
+            {"get_memory_context_for_terminal": lambda self, t: "<cao-memory>SAME</cao-memory>"},
+        )(),
+    )
+
+    plugin = ClaudeCodeMemoryPlugin()
+    await plugin.on_post_create_terminal(_event())
+    target = tmp_path / ".claude" / "CLAUDE.md"
+    original = target.read_bytes()
+    writes: list[tuple[Path, str]] = []
+    monkeypatch.setattr(plugin, "_write_block", lambda path, block: writes.append((path, block)))
+
+    await plugin.on_post_create_terminal(_event())
+
+    assert writes == []
+    assert target.read_bytes() == original
+
+
+@pytest.mark.asyncio
 async def test_replaces_existing_memory_block_on_rerun(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -99,7 +139,8 @@ async def test_replaces_existing_memory_block_on_rerun(
     target = target_dir / "CLAUDE.md"
     target.write_text(
         "# Project Notes\n\nHand-written content.\n"
-        f"{BEGIN_MARKER}\n<cao-memory>OLD</cao-memory>\n{END_MARKER}\n",
+        f'{BEGIN_MARKER}\n<cao-memory generated="2000-01-01T00:00:00Z">'
+        f"OLD</cao-memory>\n{END_MARKER}\n",
         encoding="utf-8",
     )
 
@@ -132,7 +173,8 @@ async def test_replaces_existing_memory_block_on_rerun(
 
     content = target.read_text(encoding="utf-8")
     assert ">NEW</cao-memory>" in content
-    assert "<cao-memory>OLD</cao-memory>" not in content
+    assert "2000-01-01T00:00:00Z" not in content
+    assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
     assert "Hand-written content." in content, "prior user content must be preserved"
     assert content.count(BEGIN_MARKER) == 1
     assert content.count(END_MARKER) == 1
@@ -181,7 +223,9 @@ async def test_empty_context_replaces_stale_block_by_default(
     target = tmp_path / ".claude" / "CLAUDE.md"
     target.parent.mkdir()
     target.write_text(
-        "# Project Notes\n" f"{BEGIN_MARKER}\n<cao-memory>STALE</cao-memory>\n{END_MARKER}\n",
+        "# Project Notes\n"
+        f'{BEGIN_MARKER}\n<cao-memory generated="2000-01-01T00:00:00Z">'
+        f"STALE</cao-memory>\n{END_MARKER}\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -207,6 +251,7 @@ async def test_empty_context_replaces_stale_block_by_default(
 
     content = target.read_text(encoding="utf-8")
     assert "STALE" not in content
+    assert "2000-01-01T00:00:00Z" not in content
     assert "<!-- no memories selected -->" in content
     assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
     assert "# Project Notes" in content

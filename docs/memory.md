@@ -328,7 +328,9 @@ of that provider is created in the cwd: `claude_code` writes
 validation and write failures still leave the previous block in place. Kiro
 owns its steering file and replaces the whole file; Claude Code and Codex
 replace only their delimited blocks. All three retain their cwd and symlink
-containment checks.
+containment checks. When the existing and selected block bodies are identical,
+the provider file is left byte-for-byte unchanged, including its existing
+`generated` stamp.
 Frozen workflow replays continue using the recorded memory block without
 rechecking lifecycle; another terminal creation does not invalidate that
 snapshot. A fresh workflow run resolves current memory.
