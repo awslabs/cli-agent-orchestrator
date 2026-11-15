@@ -570,8 +570,22 @@ def test_command_omits_empty_context_and_preserves_native_configuration(tmp_path
 
     parts = _command_parts(make_provider())
 
-    assert parts == ["omp"]
-    assert not (tmp_path / "tmp" / "omp").exists()
+    overlay = tmp_path / "tmp" / "omp" / "terminal-123" / "cao-input.yml"
+    assert parts == ["omp", "--config", str(overlay)]
+    assert sorted(path.name for path in overlay.parent.iterdir()) == ["cao-input.yml"]
+
+
+def test_command_overlay_only_disables_large_paste_menu(tmp_path, monkeypatch):
+    """OMP 18.3.1+ opens a menu for pastes of 100+ lines; CAO's submitting Enter
+    would pick its first entry and leave the task staged in the composer."""
+    monkeypatch.setattr("cli_agent_orchestrator.providers.omp.CAO_HOME_DIR", tmp_path)
+
+    parts = _command_parts(make_provider())
+
+    overlay = Path(parts[parts.index("--config") + 1])
+    assert overlay.read_text(encoding="utf-8") == "paste:\n  largeMenuThreshold: 0\n"
+    assert stat.S_IMODE(overlay.stat().st_mode) == 0o600
+    assert parts.count("--config") == 1
 
 
 def test_command_prefers_explicit_model_and_writes_private_append_prompt(tmp_path, monkeypatch):
@@ -600,7 +614,6 @@ def test_command_prefers_explicit_model_and_writes_private_append_prompt(tmp_pat
     assert "--system-prompt" not in parts
     assert not {
         "--profile",
-        "--config",
         "--no-tools",
         "--tools",
         "--no-skills",
@@ -631,7 +644,11 @@ def test_command_uses_profile_model_when_no_explicit_model(tmp_path, monkeypatch
         ),
         patch("cli_agent_orchestrator.providers.omp.load_agent_profile", return_value=profile),
     ):
-        assert shlex.split(provider._build_omp_command()) == ["omp", "--model", "profile-model"]
+        parts = shlex.split(provider._build_omp_command())
+
+    assert parts[:3] == ["omp", "--model", "profile-model"]
+    assert parts[3] == "--config" and parts[4].endswith("cao-input.yml")
+    assert len(parts) == 5
 
 
 def test_extension_root_merges_mcp_without_overriding_explicit_terminal_id(tmp_path, monkeypatch):
@@ -696,7 +713,11 @@ def test_cleanup_removes_only_generated_terminal_artifacts(tmp_path, monkeypatch
 # ── Initialization and extraction ───────────────────────────────────────
 
 
-def test_initialize_starts_omp_and_waits_for_ready():
+def test_initialize_starts_omp_and_waits_for_ready(tmp_path, monkeypatch):
+    monkeypatch.setattr("cli_agent_orchestrator.providers.omp.CAO_HOME_DIR", tmp_path)
+    launch = shlex.join(
+        ["omp", "--config", str(tmp_path / "tmp" / "omp" / "terminal-123" / "cao-input.yml")]
+    )
     backend = MagicMock()
     backend.get_pane_current_command.return_value = "zsh"
     provider = make_provider()
@@ -718,9 +739,9 @@ def test_initialize_starts_omp_and_waits_for_ready():
     assert provider.shell_baseline == "zsh"
     assert backend.method_calls == [
         call.get_pane_current_command("test-session", "window-0"),
-        call.send_keys("test-session", "window-0", "omp"),
+        call.send_keys("test-session", "window-0", launch),
     ]
-    backend.send_keys.assert_called_once_with("test-session", "window-0", "omp")
+    backend.send_keys.assert_called_once_with("test-session", "window-0", launch)
     assert wait.call_args.args[1] == {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
 
 

@@ -120,6 +120,15 @@ class ProviderError(Exception):
     """Raised for OMP-specific setup failures."""
 
 
+# OMP 18.3.1+ opens a "Pasted N lines" menu when a paste reaches
+# ``paste.largeMenuThreshold`` lines (default 100). CAO delivers a task as a
+# bracketed paste followed by Enter, so that Enter picks the menu's first entry
+# and the task stays staged in the composer instead of being submitted. This
+# per-run overlay (``--config``, OMP 17.2.5+) turns only that menu off; large
+# pastes still collapse to an attachment chip and submit on Enter.
+_INPUT_CONFIG_OVERLAY = "paste:\n  largeMenuThreshold: 0\n"
+
+
 class OmpProvider(BaseProvider):
     """Launch and monitor an interactive OMP session inside a CAO terminal."""
 
@@ -225,6 +234,10 @@ class OmpProvider(BaseProvider):
         model = self._model or (profile.model if profile is not None else None)
         if model:
             command.extend(["--model", model])
+
+        overlay_path = self._artifact_root() / "cao-input.yml"
+        self._write_private_file(overlay_path, _INPUT_CONFIG_OVERLAY)
+        command.extend(["--config", str(overlay_path)])
 
         context = ""
         if profile is not None:
