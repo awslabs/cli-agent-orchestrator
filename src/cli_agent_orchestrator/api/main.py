@@ -654,6 +654,15 @@ class RunStepRequest(BaseModel):
         description="Delete the created terminal after the step (ignored when reusing)",
     )
     timeout: float = Field(default=600.0, description="Max seconds to wait for completion", gt=0)
+    timeout_excludes_waiting: bool = Field(
+        default=False, description="Pause the completion timeout while awaiting a user answer"
+    )
+    max_waiting: Optional[float] = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Maximum total seconds awaiting user answers when timeout_excludes_waiting is true",
+    )
     working_directory: Optional[str] = Field(
         default=None, description="Working directory for a freshly created terminal"
     )
@@ -838,6 +847,12 @@ class RunStepRequest(BaseModel):
     orchestration_type: Optional[Literal["handoff"]] = None
 
     @model_validator(mode="after")
+    def validate_waiting_timeout(self) -> "RunStepRequest":
+        if self.max_waiting is not None and not self.timeout_excludes_waiting:
+            raise ValueError("max_waiting requires timeout_excludes_waiting")
+        return self
+
+    @model_validator(mode="after")
     def validate_delegation(self) -> "RunStepRequest":
         if (self.orchestration_type is None) != (self.delegation_message is None):
             raise ValueError("orchestration_type and delegation_message must travel together")
@@ -857,6 +872,9 @@ class RunStepResponse(BaseModel):
     terminal_id: str
     last_message: str
     status: str
+    waited_seconds: Optional[float] = Field(
+        default=None, description="Seconds observed awaiting user answers during completion polling"
+    )
     torn_down: bool = Field(
         default=False,
         description=(
@@ -5969,6 +5987,7 @@ async def run_step(
         last_message: Optional[str] = None,
         response_status: Optional[str] = None,
         error_kind: Optional[str] = None,
+        waited_seconds: Optional[float] = None,
     ) -> None:
         # ``last_message`` is the step's own text result and defaults to None because
         # every FAILURE arm below has none to give: the step never produced one. Only
@@ -5979,7 +5998,9 @@ async def run_step(
         if on_step_settled is None:
             return
         try:
-            on_step_settled(terminal_id, error, last_message, response_status, error_kind)
+            on_step_settled(
+                terminal_id, error, last_message, response_status, error_kind, waited_seconds
+            )
         except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
             logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
 
@@ -6101,6 +6122,8 @@ async def run_step(
                     # hardcoded so it stays correct if that ever changes.
                     reused_terminal=body.reuse_terminal_id is not None,
                     timeout=body.timeout,
+                    timeout_excludes_waiting=body.timeout_excludes_waiting,
+                    max_waiting=body.max_waiting,
                 )
             ),
         )
@@ -6173,6 +6196,7 @@ async def run_step(
                     last_message=envelope.last_message,
                     status=envelope.status,
                     replayed=True,
+                    waited_seconds=envelope.waited_seconds,
                 )
             if decision.verdict is step_replay.ReplayVerdict.DIVERGED:
                 # FR-3's surfacing. NO fingerprint travels with it, and none can be
@@ -6256,6 +6280,8 @@ async def run_step(
             reuse_terminal_id=body.reuse_terminal_id,
             teardown=body.teardown,
             timeout=body.timeout,
+            timeout_excludes_waiting=body.timeout_excludes_waiting,
+            max_waiting=body.max_waiting,
             # BR-10: the ALREADY-RESOLVED directory rides the existing parameter, so
             # ``run_agent_step``'s own ``working_directory is None and caller_id is
             # not None`` guard simply does not fire and the resolution never runs
@@ -6287,7 +6313,13 @@ async def run_step(
         response_status = (
             result.status.value if hasattr(result.status, "value") else str(result.status)
         )
-        _settle_step(result.terminal_id, None, result.last_message, response_status)
+        _settle_step(
+            result.terminal_id,
+            None,
+            result.last_message,
+            response_status,
+            waited_seconds=result.waited_seconds,
+        )
         keep_outcome = keep_outcomes[0] if keep_outcomes else keep_service.NOT_APPLICABLE
         _schedule_elastic_terminal_ended(
             background_tasks,
@@ -6309,6 +6341,7 @@ async def run_step(
             status=response_status,
             # False for a kept worker: it was not torn down (#1203 / #1225).
             torn_down=result.torn_down,
+            waited_seconds=result.waited_seconds,
             kept_until=keep_outcome.kept_until if keep_outcome.kept else None,
             keep_note=keep_outcome.note,
         )

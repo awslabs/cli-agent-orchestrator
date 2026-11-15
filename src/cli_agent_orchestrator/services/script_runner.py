@@ -856,7 +856,17 @@ def _sanitise_output_json(output_json: Optional[str]) -> Optional[str]:
 def record_step_completion(
     env_vars: Optional[Dict[str, str]],
 ) -> Optional[
-    Callable[[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], None]
+    Callable[
+        [
+            Optional[str],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+            Optional[float],
+        ],
+        None,
+    ]
 ]:
     """Build the RUNNING->COMPLETED/FAILED transition for a script-tier step.
 
@@ -931,6 +941,7 @@ def record_step_completion(
         last_message: Optional[str],
         response_status: Optional[str] = None,
         error_kind: Optional[str] = None,
+        waited_seconds: Optional[float] = None,
     ) -> None:
         st = record.step_states.get(step_id)
         if st is None:
@@ -990,6 +1001,7 @@ def record_step_completion(
                         last_message or "",
                         response_status if response_status is not None else st.state.value,
                         st.terminal_id,
+                        waited_seconds=waited_seconds,
                     )
                 ),
                 output_json=_sanitise_output_json(raw_output_json),
