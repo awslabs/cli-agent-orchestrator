@@ -47,7 +47,6 @@ logger = logging.getLogger(__name__)
 # a well-known injection boundary.
 BEGIN_MARKER = "<!-- cao-memory:begin -->"
 END_MARKER = "<!-- cao-memory:end -->"
-SEPARATOR_MARKER = "<!-- cao-memory:separator -->"
 AGENTS_FILENAME = "AGENTS.md"
 
 
@@ -297,7 +296,7 @@ class CodexMemoryPlugin(CaoPlugin):
 
         def compute_new_content(existing: str) -> str:
             stripped = self._strip_existing_block(existing)
-            separator = "" if not stripped or stripped.endswith("\n") else f"\n{SEPARATOR_MARKER}\n"
+            separator = "" if not stripped or stripped.endswith("\n") else "\n"
             return f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
 
         locked_atomic_rewrite(target, compute_new_content)
@@ -332,9 +331,6 @@ class CodexMemoryPlugin(CaoPlugin):
                 content = content[:begin] + content[begin + len(BEGIN_MARKER) :]
                 continue
             before = content[:begin]
-            inserted_separator = f"\n{SEPARATOR_MARKER}\n"
-            if before.endswith(inserted_separator):
-                before = before[: -len(inserted_separator)]
             after = content[end + len(END_MARKER) :]
             if before.endswith("\n") and after.startswith("\n"):
                 after = after[1:]

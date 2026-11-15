@@ -3,14 +3,12 @@
 On ``post_create_terminal`` for a ``kiro_cli`` provider, writes the CAO
 memory context to ``<cwd>/.kiro/steering/cao-memory.md``. Kiro CLI natively
 loads every ``*.md`` file under ``.kiro/steering/``, so this file is picked
-up automatically. CAO marks its section so disabling project-file writes can
-remove it without changing user-authored text in the same file.
+up automatically. CAO owns this file and replaces it as a whole on each run.
 
 The target path is fixed *per working directory*
-(``<cwd>/.kiro/steering/cao-memory.md``), so its managed-section update uses
-``locked_atomic_rewrite``. This holds an inter-process lock across the
-read-strip-append-publish cycle and writes through a unique temp file, keeping
-both concurrent updates and temp-file collisions safe.
+(``<cwd>/.kiro/steering/cao-memory.md``), so its whole-file update uses
+``locked_atomic_rewrite``. This serializes concurrent writes and publishes
+through a unique temp file.
 
 Observer-only: runs after terminal creation, logs-and-skips on every
 error path rather than crashing ``cao-server``.
@@ -20,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -43,9 +42,9 @@ logger = logging.getLogger(__name__)
 
 STEERING_SUBDIR = ".kiro/steering"
 MEMORY_FILENAME = "cao-memory.md"
-BEGIN_MARKER = "<!-- cao-memory:begin -->"
-END_MARKER = "<!-- cao-memory:end -->"
-SEPARATOR_MARKER = "<!-- cao-memory:separator -->"
+_CAO_GENERATED_MEMORY_FILE = re.compile(
+    r'^\s*<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">'
+)
 
 
 def get_backend() -> "TerminalBackend":
@@ -208,10 +207,11 @@ class KiroCliMemoryPlugin(CaoPlugin):
                 existing = ""
             if memory_blocks_have_same_body(existing, context_block):
                 return
-            # The locked callback replaces CAO's section while preserving
-            # user text. It also makes concurrent writers serialize their
-            # read-strip-append-publish cycles.
-            await asyncio.to_thread(self._write_block, target, context_block)
+            await asyncio.to_thread(
+                locked_atomic_rewrite,
+                target,
+                lambda _existing: context_block + "\n",
+            )
         except Exception as exc:
             logger.warning(
                 "kiro_cli_memory: write failed for %s: %s",
@@ -279,50 +279,11 @@ class KiroCliMemoryPlugin(CaoPlugin):
 
     @staticmethod
     def _remove_owned_file(target: Path) -> None:
-        def strip_cao_content(content: str) -> str:
-            stripped = KiroCliMemoryPlugin._strip_existing_block(content)
-            if stripped != content:
-                return stripped
-            # Files published before managed delimiters were introduced were
-            # CAO-owned whole-file writes, so retain their cleanup behavior.
-            return "" if 'generated="' in content else content
+        def remove_if_owned(content: str) -> str:
+            return "" if _CAO_GENERATED_MEMORY_FILE.match(content) else content
 
         locked_atomic_rewrite_or_delete(
             target,
-            strip_cao_content,
+            remove_if_owned,
             lambda content: not content.strip(),
         )
-
-    def _write_block(self, target: Path, context_block: str) -> None:
-        def compute_new_content(existing: str) -> str:
-            stripped = self._strip_existing_block(existing)
-            if stripped == existing and 'generated="' in existing:
-                # Replace CAO's pre-delimiter whole-file format rather than
-                # retaining stale memory alongside the new managed section.
-                stripped = ""
-            separator = "" if not stripped or stripped.endswith("\n") else f"\n{SEPARATOR_MARKER}\n"
-            return f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
-
-        locked_atomic_rewrite(target, compute_new_content)
-
-    @staticmethod
-    def _strip_existing_block(content: str) -> str:
-        """Remove managed sections with the same separator logic as the writers."""
-        while True:
-            begin = content.find(BEGIN_MARKER)
-            if begin == -1:
-                break
-            end = content.find(END_MARKER, begin + len(BEGIN_MARKER))
-            next_begin = content.find(BEGIN_MARKER, begin + len(BEGIN_MARKER))
-            if end == -1 or (next_begin != -1 and next_begin < end):
-                content = content[:begin] + content[begin + len(BEGIN_MARKER) :]
-                continue
-            before = content[:begin]
-            inserted_separator = f"\n{SEPARATOR_MARKER}\n"
-            if before.endswith(inserted_separator):
-                before = before[: -len(inserted_separator)]
-            after = content[end + len(END_MARKER) :]
-            if before.endswith("\n") and after.startswith("\n"):
-                after = after[1:]
-            content = before + after
-        return content

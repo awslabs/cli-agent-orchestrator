@@ -542,7 +542,9 @@ Provider project-file writes are disabled by default because `.claude/CLAUDE.md`
 Set `memory.injection.write_project_files=true` to restore the legacy writes.
 With the default, CAO removes its old delimited blocks from Claude Code and Codex
 files, or its recognizable Kiro steering file; tracked files can therefore show
-as modified or deleted once.
+as modified or deleted once. Cleanup restores a user file exactly when it ended
+with a newline before CAO wrote its block. For a file without a trailing newline,
+CAO's historic separator can remain as one trailing newline after cleanup.
 
 The block format:
 

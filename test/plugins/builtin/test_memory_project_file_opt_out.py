@@ -106,7 +106,7 @@ async def test_default_does_not_create_project_file_or_fetch_memory(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", CASES, ids=lambda case: case.provider)
+@pytest.mark.parametrize("case", CASES[:2], ids=lambda case: case.provider)
 async def test_default_removes_only_cao_block_and_deletes_cao_only_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: ProviderCase
 ) -> None:
@@ -127,9 +127,20 @@ async def test_default_removes_only_cao_block_and_deletes_cao_only_file(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", CASES, ids=lambda case: case.provider)
-async def test_write_then_default_cleanup_restores_user_file_byte_for_byte(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: ProviderCase
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        (b"user text\n", b"user text\n"),
+        (b"user text", b"user text\n"),
+    ],
+)
+@pytest.mark.parametrize("case", CASES[:2], ids=lambda case: case.provider)
+async def test_write_then_default_cleanup_restores_user_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case: ProviderCase,
+    original: bytes,
+    expected: bytes,
 ) -> None:
     target = tmp_path / case.relative_target
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -141,7 +152,7 @@ async def test_write_then_default_cleanup_restores_user_file_byte_for_byte(
     plugin._write_block(target, "<cao-memory>new</cao-memory>")
     await plugin.on_post_create_terminal(_event(case))
 
-    assert target.read_bytes() == original
+    assert target.read_bytes() == expected
 
 
 @pytest.mark.asyncio
@@ -162,6 +173,48 @@ async def test_default_removes_recognizable_kiro_file_but_not_user_file(
     target.write_text("user steering\n", encoding="utf-8")
     await case.plugin_type().on_post_create_terminal(_event(case))
     assert target.read_text(encoding="utf-8") == "user steering\n"
+    target.write_text('user steering generated="2000-01-01T00:00:00Z"\n', encoding="utf-8")
+    await case.plugin_type().on_post_create_terminal(_event(case))
+    assert target.read_text(encoding="utf-8") == 'user steering generated="2000-01-01T00:00:00Z"\n'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.provider)
+async def test_opt_in_write_matches_base_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: ProviderCase
+) -> None:
+    target = tmp_path / case.relative_target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"user text\n")
+    _install_cwd(monkeypatch, case, tmp_path)
+    monkeypatch.setattr(case.module, "memory_injection_write_project_files_enabled", lambda: True)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.memory_injection._generated_at",
+        lambda: "2000-01-01T00:00:00Z",
+    )
+    monkeypatch.setattr(
+        case.module,
+        "MemoryService",
+        lambda: type(
+            "MemoryService",
+            (),
+            {
+                "get_memory_context_for_terminal": lambda self, _terminal_id: (
+                    "<cao-memory>memory</cao-memory>"
+                )
+            },
+        )(),
+    )
+
+    await case.plugin_type().on_post_create_terminal(_event(case))
+
+    memory = b'<cao-memory generated="2000-01-01T00:00:00Z">memory</cao-memory>'
+    expected = (
+        memory + b"\n"
+        if case.provider == "kiro_cli"
+        else b"user text\n<!-- cao-memory:begin -->\n" + memory + b"\n<!-- cao-memory:end -->\n"
+    )
+    assert target.read_bytes() == expected
 
 
 @pytest.mark.asyncio
