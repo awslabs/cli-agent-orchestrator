@@ -13,6 +13,7 @@ from cli_agent_orchestrator.constants import SECURITY_PROMPT
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.omp import OmpProvider, ProviderError
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -193,6 +194,305 @@ def test_screen_detection_uses_same_precedence():
         provider.get_status_from_screen(["in: 1 out: 2 cache 1 t: 1s tok/s: 1"])
         == TerminalStatus.COMPLETED
     )
+
+
+# ── OMP 18.x TUI (keycap-led working row, box and band composers) ──────
+
+
+OMP18_LIVE_FIXTURES = [
+    "omp18_box_processing.txt",
+    "omp18_band_processing.txt",
+    "omp18_band_tool_running.txt",
+]
+OMP18_READY_FIXTURES = [
+    "omp18_band_idle.txt",
+    "omp18_box_completed.txt",
+    "omp18_band_completed.txt",
+]
+
+
+def _screen_lines(fixture: str) -> list[str]:
+    return strip_terminal_escapes(load_fixture(fixture)).splitlines()
+
+
+@pytest.mark.parametrize("fixture", OMP18_LIVE_FIXTURES)
+def test_omp18_working_row_is_processing(fixture):
+    provider = make_provider()
+
+    assert provider.get_status(load_fixture(fixture)) == TerminalStatus.PROCESSING
+    assert provider.get_status_from_screen(_screen_lines(fixture)) == TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize("fixture", OMP18_READY_FIXTURES)
+def test_omp18_ready_frames_are_idle_then_completed(fixture):
+    provider = make_provider()
+    assert provider.get_status(load_fixture(fixture)) == TerminalStatus.IDLE
+
+    provider.mark_input_received()
+    assert provider.get_status(load_fixture(fixture)) == TerminalStatus.COMPLETED
+    assert provider.get_status_from_screen(_screen_lines(fixture)) == TerminalStatus.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("live", "done"),
+    [
+        ("omp18_box_processing.txt", "omp18_box_completed.txt"),
+        ("omp18_band_processing.txt", "omp18_band_completed.txt"),
+        ("omp18_band_tool_running.txt", "omp18_band_completed.txt"),
+    ],
+)
+def test_omp18_completed_turn_retires_stale_working_row(live, done):
+    provider = make_provider()
+    provider.mark_input_received()
+
+    assert provider.get_status(load_fixture(live) + load_fixture(done)) == (
+        TerminalStatus.COMPLETED
+    )
+
+
+@pytest.mark.parametrize(
+    "marker", ["⎋ Working…", "⎋ Run requested delay", "Working… ⟨esc⟩", "⠋ Running bash ⟨esc⟩"]
+)
+def test_both_working_row_grammars_are_live_above_either_frame(marker):
+    for tail in (
+        "╭── OMP session ──╮\n╰─ ready ─╯",
+        "╭── π > Model ──╮\n╰─ ─╯",
+        " π > Model ─\n╰─",
+    ):
+        assert make_provider().get_status(f"{marker}\n{tail}") == TerminalStatus.PROCESSING
+
+
+def test_omp18_keycap_in_prose_after_ready_frame_is_stale():
+    output = load_fixture("omp18_band_processing.txt") + "\n ACK\n π > Model ─\n╰─"
+
+    provider = make_provider()
+    provider.mark_input_received()
+    assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+
+@pytest.mark.parametrize("fixture", ["omp18_box_completed.txt", "omp18_band_completed.txt"])
+def test_omp18_extracts_final_response_under_theme_background(fixture):
+    assert make_provider().extract_last_message_from_script(load_fixture(fixture)) == "ACK"
+
+
+# ── Dispatch attribution: a ready frame after a dispatch is not yet this turn ──
+
+
+ACK_PROMPT = "Reply with exactly ACK and do not use any tools."
+
+
+def _dispatch(provider: OmpProvider, message: str = ACK_PROMPT) -> None:
+    provider.mark_input_received()
+    provider.record_dispatched_message(message)
+
+
+def _echo_only(fixture: str) -> list[str]:
+    """The completed screen with the response row removed: prompt echoed, turn not started."""
+    return [line for line in _screen_lines(fixture) if line.strip() != "ACK"]
+
+
+@pytest.mark.parametrize("fixture", ["omp18_band_idle.txt", "omp18_box_completed.txt"])
+def test_previous_ready_screen_after_dispatch_is_not_completion(fixture):
+    provider = make_provider()
+    provider.get_status_from_screen(_screen_lines(fixture))
+    _dispatch(provider, "Summarise the repository layout.")
+
+    # The tail of OMP's startup paint lands after the dispatch boundary.
+    provider.record_status_chunk(load_fixture(fixture), epoch=1)
+    assert provider.get_status(load_fixture(fixture)) == TerminalStatus.PROCESSING
+    assert provider.get_status_from_screen(_screen_lines(fixture)) == TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize("fixture", ["omp18_box_completed.txt", "omp18_band_completed.txt"])
+def test_echoed_prompt_before_the_spinner_is_still_pending(fixture):
+    provider = make_provider()
+    _dispatch(provider)
+
+    assert provider.get_status_from_screen(_echo_only(fixture)) == TerminalStatus.PROCESSING
+
+
+def test_first_turn_frame_keycap_over_idle_status_row_is_processing():
+    # Observed live: the turn's first frame draws ``⎋ Working…`` above a ``π`` row.
+    provider = make_provider()
+    _dispatch(provider)
+    frame = ["  ⎋ Working…", "╭── π > Model > /tmp/cao-omp-fixtures ──╮", "╰─  ─╯"]
+
+    assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+    assert provider.get_status("\n".join(frame)) == TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize(
+    "live", ["omp18_band_processing.txt", "omp18_box_processing.txt", "omp18_band_tool_running.txt"]
+)
+def test_turn_seen_working_then_ready_is_completed(live):
+    provider = make_provider()
+    _dispatch(provider)
+    done = live.replace("tool_running", "completed").replace("processing", "completed")
+
+    assert provider.get_status_from_screen(_screen_lines(live)) == TerminalStatus.PROCESSING
+    assert provider.get_status_from_screen(_screen_lines(done)) == TerminalStatus.COMPLETED
+
+
+def test_fast_turn_seen_only_in_chunks_is_completed():
+    provider = make_provider()
+    _dispatch(provider)
+    provider.record_status_chunk(load_fixture("omp18_band_processing.txt"), epoch=1)
+
+    assert (
+        provider.get_status_from_screen(_screen_lines("omp18_band_completed.txt"))
+        == TerminalStatus.COMPLETED
+    )
+
+
+def test_long_turn_whose_frames_left_the_buffer_completes_from_chunk_activity():
+    provider = make_provider()
+    _dispatch(provider, "A prompt that is no longer in the cropped buffer.")
+    provider.record_status_chunk(load_fixture("omp18_band_processing.txt"), epoch=1)
+
+    cropped = [f"line {n} of a long answer" for n in range(40)] + [" π > Model ─", "╰─"]
+    assert provider.get_status_from_screen(cropped) == TerminalStatus.COMPLETED
+
+
+def test_chunks_before_the_dispatch_are_not_turn_activity():
+    provider = make_provider()
+    provider.record_status_chunk(load_fixture("omp18_band_processing.txt"), epoch=0)
+    _dispatch(provider, "Summarise the repository layout.")
+
+    assert provider.get_status(load_fixture("omp18_band_idle.txt")) == TerminalStatus.PROCESSING
+
+
+def test_redelivery_waits_for_its_own_turn():
+    provider = make_provider()
+    _dispatch(provider, "Summarise the repository layout.")
+    provider.mark_redelivery_received()
+    provider.record_dispatched_message("Summarise the repository layout.")
+
+    assert provider.get_status(load_fixture("omp18_band_idle.txt")) == TerminalStatus.PROCESSING
+    provider.record_status_chunk(load_fixture("omp18_band_processing.txt"), epoch=2)
+    assert provider.get_status(load_fixture("omp18_band_completed.txt")) == (
+        TerminalStatus.COMPLETED
+    )
+
+
+def test_spinner_status_row_stays_live_while_the_working_row_is_not_redrawn():
+    # 18.x repaints only the status row per spinner frame; the working row is drawn once.
+    raw = (
+        "  ⎋ Working…\n╭── ⠋ 0s > Model ──╮\n╰─  ─╯\n"
+        "╭── ⠙ 1s > Model ──╮\n╭── ⠹ 2s > Model ──╮\n\n╰─  ─╯"
+    )
+    assert make_provider().get_status(raw) == TerminalStatus.PROCESSING
+
+
+def test_idle_status_row_after_spinner_rows_retires_the_turn():
+    raw = (
+        "  ⎋ Working…\n╭── ⠋ 0s > Model ──╮\n╰─  ─╯\n ACK\n" "╭── π > Model ──╮\n╭── π > Model ──╮"
+    )
+    provider = make_provider()
+    _dispatch(provider)
+    provider.record_status_chunk(raw, epoch=1)
+    assert provider.get_status(raw) == TerminalStatus.COMPLETED
+
+
+# ── OSC 7501 Program Status reports (OMP 18) ────────────────────────────
+
+
+TOOL_TURN_PROMPT = "Use the bash tool to run exactly: sleep 3 && echo DONE. Then reply DONE."
+
+
+def _osc7501(state: str) -> str:
+    return f"\x1b]7501;state={state}:app=omp\x1b\\"
+
+
+def _replay(provider: OmpProvider, stream: str, size: int) -> list[TerminalStatus]:
+    """Feed ``stream`` as the monitor does: per chunk, then classify the cropped buffer."""
+    statuses, buffer = [], ""
+    for start in range(0, len(stream), size):
+        chunk = stream[start : start + size]
+        provider.record_status_chunk(chunk, epoch=1)
+        buffer = (buffer + chunk)[-32768:]
+        status = provider.get_status(buffer)
+        if not statuses or statuses[-1] != status:
+            statuses.append(status)
+    return statuses
+
+
+@pytest.mark.parametrize("size", [37, 333, 1024, 4096])
+def test_recorded_tool_turn_reads_processing_then_completed(size):
+    raw = load_fixture("omp18_tool_turn.raw.txt")
+    dispatch = raw.index(TOOL_TURN_PROMPT) - 150
+    provider = make_provider()
+    provider.record_status_chunk(raw[:dispatch], epoch=0)
+    assert provider.get_status(raw[:dispatch]) == TerminalStatus.IDLE
+
+    _dispatch(provider, TOOL_TURN_PROMPT)
+    assert _replay(provider, raw[dispatch:], size) == [
+        TerminalStatus.PROCESSING,
+        TerminalStatus.COMPLETED,
+    ]
+
+
+def test_idle_report_as_the_paste_lands_is_not_completion():
+    provider = make_provider()
+    provider.record_status_chunk(_osc7501("done"), epoch=0)
+    _dispatch(provider)
+    idle_screen = load_fixture("omp18_band_idle.txt")
+
+    provider.record_status_chunk(_osc7501("idle"), epoch=1)
+    assert provider.get_status(idle_screen) == TerminalStatus.PROCESSING
+    provider.record_status_chunk(_osc7501("working"), epoch=1)
+    assert provider.get_status(idle_screen) == TerminalStatus.PROCESSING
+    provider.record_status_chunk(_osc7501("done"), epoch=1)
+    assert provider.get_status(idle_screen) == TerminalStatus.COMPLETED
+
+
+def test_report_split_across_chunks_is_read_once_complete():
+    provider = make_provider()
+    _dispatch(provider)
+    report = _osc7501("working")
+
+    provider.record_status_chunk(report[:-1], epoch=1)
+    assert provider._program_status is None
+    provider.record_status_chunk(report[-1:], epoch=1)
+    assert provider.get_status(load_fixture("omp18_band_idle.txt")) == TerminalStatus.PROCESSING
+
+
+def test_working_report_beats_a_ready_looking_screen():
+    provider = make_provider()
+    provider.record_status_chunk(_osc7501("working"), epoch=0)
+
+    assert provider.get_status(load_fixture("omp18_band_completed.txt")) == (
+        TerminalStatus.PROCESSING
+    )
+
+
+def test_blocked_report_is_waiting_and_drawn_approval_wins_over_working():
+    provider = make_provider()
+    provider.record_status_chunk(_osc7501("blocked:kind=permission"), epoch=0)
+    assert provider.get_status(load_fixture("omp18_band_idle.txt")) == (
+        TerminalStatus.WAITING_USER_ANSWER
+    )
+
+    provider.record_status_chunk(_osc7501("working"), epoch=0)
+    assert provider.get_status(load_fixture("omp_waiting.txt")) == (
+        TerminalStatus.WAITING_USER_ANSWER
+    )
+
+
+def test_error_report_after_the_turn_ran_is_error_but_a_stale_one_is_not():
+    provider = make_provider()
+    provider.record_status_chunk(_osc7501("error:msg=QVBJIGVycm9y"), epoch=0)
+    _dispatch(provider)
+    assert provider.get_status(load_fixture("omp18_band_idle.txt")) == TerminalStatus.PROCESSING
+
+    provider.record_status_chunk(_osc7501("working") + _osc7501("error:msg=QVBJIGVycm9y"), epoch=1)
+    assert provider.get_status(load_fixture("omp18_band_idle.txt")) == TerminalStatus.ERROR
+
+
+def test_clear_report_falls_back_to_the_screen():
+    provider = make_provider()
+    provider.record_status_chunk(_osc7501("working") + _osc7501("clear"), epoch=0)
+
+    assert provider.get_status(load_fixture("omp18_band_idle.txt")) == TerminalStatus.IDLE
 
 
 def test_raw_status_reports_error_when_omp_exits():
