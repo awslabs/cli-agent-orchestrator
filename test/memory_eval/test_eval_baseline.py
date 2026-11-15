@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from test.memory_eval.harness import (
@@ -34,9 +35,22 @@ def test_fixture_corpus_has_required_synthetic_shapes():
     assert sum(note.get("contradiction", False) for note in notes) == 2
 
 
-def test_harness_refuses_non_temporary_home():
+def _assert_non_temporary_home_rejected():
+    non_temporary_home = Path(tempfile.gettempdir()).resolve().parent / "not-a-temp-home"
     with pytest.raises(ValueError, match="temporary"):
-        assert_temporary_home(Path.cwd())
+        assert_temporary_home(non_temporary_home)
+
+
+def test_harness_refuses_non_temporary_home():
+    _assert_non_temporary_home_rejected()
+
+
+def test_non_temporary_home_guard_from_checkout_under_tmp(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    monkeypatch.chdir(checkout)
+
+    _assert_non_temporary_home_rejected()
 
 
 def test_default_baseline_preserves_known_failure_shapes(baseline_report):
