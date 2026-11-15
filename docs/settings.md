@@ -6,4 +6,4 @@ For the on-demand memory ranking diagnostic, see [Memory explain](memory.md#on-d
 
 `memory.lifecycle.enabled` defaults to `false`; see [Supersedes lifecycle](memory.md#supersedes-lifecycle-opt-in). `CAO_MEMORY_LIFECYCLE_ENABLED` overrides the nested file value.
 
-`memory.non_accessing_inspection` defaults to `false`; see [Operator inspection](memory.md#non-accessing-operator-inspection-opt-in). `CAO_MEMORY_NON_ACCESSING_INSPECTION` overrides the file value.
+`memory.non_accessing_inspection` defaults to `true`; see [Operator inspection](memory.md#non-accessing-operator-inspection). `CAO_MEMORY_NON_ACCESSING_INSPECTION` overrides the file value.

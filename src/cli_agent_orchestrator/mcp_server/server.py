@@ -2051,7 +2051,7 @@ async def memory_store(
                 tags=tags or "",
                 terminal_context=terminal_context,
             )
-        return {
+        result = {
             "success": True,
             "key": memory.key,
             "scope": memory.scope,
@@ -2060,6 +2060,10 @@ async def memory_store(
             "action": memory.action
             or ("updated" if memory.created_at != memory.updated_at else "created"),
         }
+        if key is not None and MemoryService._key_was_truncated(key):
+            result["key_truncated"] = True
+            result["requested_key"] = key
+        return result
     except MemoryPartialWriteError as e:
         return {
             "success": False,

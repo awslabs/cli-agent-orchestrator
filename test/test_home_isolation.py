@@ -6,6 +6,8 @@ selection), because there is then nothing to assert.
 """
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from test import conftest
 
@@ -123,3 +125,57 @@ def test_a_leaked_home_is_repinned_for_the_next_test_part_two():
 @pytest.mark.real_home
 def test_real_home_marker_restores_the_real_home():
     assert os.environ.get("HOME") == conftest._REAL_HOME_ENV.get("HOME")
+
+
+def _run_memory_guard_probe(tmp_path, nodeid):
+    real_home = tmp_path / "guard-real-home"
+    temp_root = tmp_path / "guard-tmp"
+    real_home.mkdir()
+    temp_root.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(real_home),
+            "CAO_HOME_DIR": str(real_home / ".aws" / "cli-agent-orchestrator"),
+            "CAO_TEST_REAL_HOME": "1",
+            "TMPDIR": str(temp_root),
+            "TMUX_TMPDIR": str(temp_root / "tmux"),
+        }
+    )
+    for name in tuple(env):
+        if name.startswith(("HERDR_", "TMUX")) and name != "TMUX_TMPDIR":
+            env.pop(name)
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            nodeid,
+            "-p",
+            "no:cacheprovider",
+            "--basetemp",
+            str(temp_root / "bt"),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_memory_home_guard_rejects_unmarked_real_home(tmp_path):
+    result = _run_memory_guard_probe(
+        tmp_path, "test/test_memory_home_guard_probe.py::test_unmarked_real_home_memory_probe"
+    )
+
+    assert result.returncode != 0
+    assert "real_home_memory" in result.stdout + result.stderr
+
+
+def test_memory_home_guard_allows_explicit_marker(tmp_path):
+    result = _run_memory_guard_probe(
+        tmp_path, "test/test_memory_home_guard_probe.py::test_marked_real_home_memory_probe"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

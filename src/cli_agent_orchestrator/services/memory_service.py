@@ -197,6 +197,23 @@ def _is_memory_enabled() -> bool:
         return True
 
 
+def normalize_memory_key(key: str) -> str:
+    """Normalize a user-provided key before applying the length cap."""
+    key = key.replace("\x00", "")
+    key = os.path.basename(key)
+    key = key.lower()
+    key = re.sub(r"[^a-z0-9\-]", "", key)
+    key = re.sub(r"-+", "-", key).strip("-")
+    if not key:
+        raise ValueError("Key is empty after sanitization")
+    return key
+
+
+def memory_key_was_truncated(key: str) -> bool:
+    """Return whether sanitization discarded characters past the 60-char cap."""
+    return len(normalize_memory_key(key)) > 60
+
+
 # Per-curator dispatch locks. A worker that fails to acquire its session's
 # curator lock falls back to Phase 1 rather than queueing — context injection
 # is best-effort and must never block the worker.
@@ -706,23 +723,23 @@ class MemoryService:
         return slug[:60]
 
     @staticmethod
+    def _normalize_key(key: str) -> str:
+        """Normalize a user-provided key before applying the length cap."""
+        return normalize_memory_key(key)
+
+    @staticmethod
     def _sanitize_key(key: str) -> str:
         """Sanitize a user-provided key to prevent path traversal.
 
         Lowercase slugs only: [a-z0-9\\-], max 60 chars.
         Consistent with auto_generate_key() output format.
         """
-        # Remove null bytes
-        key = key.replace("\x00", "")
-        # Strip directory components — only the basename matters
-        key = os.path.basename(key)
-        # Lowercase, then strip to safe slug characters only
-        key = key.lower()
-        key = re.sub(r"[^a-z0-9\-]", "", key)
-        key = re.sub(r"-+", "-", key).strip("-")
-        if not key:
-            raise ValueError("Key is empty after sanitization")
-        return key[:60]
+        return normalize_memory_key(key)[:60]
+
+    @staticmethod
+    def _key_was_truncated(key: str) -> bool:
+        """Return whether sanitization discarded characters past the 60-char cap."""
+        return memory_key_was_truncated(key)
 
     # -------------------------------------------------------------------------
     # Path helpers
@@ -1831,9 +1848,9 @@ class MemoryService:
     def _parse_related_keys(raw: Optional[str], scope: str = "<unknown>") -> list:
         """Defence-in-depth read of ``MemoryMetadataModel.related_keys``.
 
-        Short-circuit if oversized, drop any token that fails the sanitiser
-        round-trip, dedup, cap at 3. NEVER raises; returns ``[]`` for
-        NULL/empty.
+        Short-circuit if oversized, normalise each token through the same
+        sanitiser used by store/get, dedup, cap at 3. NEVER raises; returns
+        ``[]`` for NULL/empty.
         """
         if not raw:
             return []
@@ -1847,13 +1864,14 @@ class MemoryService:
             if not p:
                 continue
             try:
-                canonical = MemoryService._sanitize_key(p)
+                normalized = MemoryService._normalize_key(p)
             except ValueError:
                 logger.warning("related_keys_unsanitised scope=%s", scope)
                 continue
-            if canonical != p:
+            if normalized != p:
                 logger.warning("related_keys_unsanitised scope=%s", scope)
                 continue
+            canonical = normalized[:60]
             if canonical in seen:
                 continue
             seen.add(canonical)
@@ -2003,11 +2021,12 @@ class MemoryService:
         Memory instance (no cache across recalls).
         """
         try:
-            sanitised = self._sanitize_key(key)
+            normalized = self._normalize_key(key)
         except ValueError:
             return None
-        if sanitised != key:
+        if normalized != key:
             return None
+        sanitised = normalized[:60]
         try:
             wiki_path = self.get_wiki_path(scope, scope_id, sanitised)
         except ValueError:

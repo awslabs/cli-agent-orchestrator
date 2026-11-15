@@ -88,8 +88,24 @@ def resolve_wikilink(
         if resolved_name is None:
             return LinkOutcome("unsupported", finding_code=FindingCode.LINK_TARGET_INVALID)
         name = resolved_name
+    names: tuple[str, ...] = (name,)
+    if not relative_path and "/" not in name and "\\" not in name:
+        try:
+            from cli_agent_orchestrator.services.memory_service import MemoryService
+
+            normalized = MemoryService._normalize_key(name)
+            canonical = MemoryService._sanitize_key(name) if normalized == name else name
+        except ValueError:
+            canonical = name
+        if canonical != name:
+            names = (name, canonical)
     matching = tuple(
-        candidate for candidate in candidates if _matches(name, candidate, exact_path=relative_path)
+        candidate
+        for candidate in candidates
+        if any(
+            _matches(candidate_name, candidate, exact_path=relative_path)
+            for candidate_name in names
+        )
     )
     if not matching:
         if embed and _is_non_markdown_attachment(name):
@@ -120,7 +136,7 @@ def _matches(name: str, candidate: LinkCandidate, *, exact_path: bool = False) -
     basename = plain.rsplit("/", 1)[-1]
     if exact_path:
         return name == candidate.relpath
-    return name in (plain, candidate.relpath, basename) or name in candidate.aliases
+    return name in (candidate.key, plain, candidate.relpath, basename) or name in candidate.aliases
 
 
 def _relative_markdown_destination(destination: str) -> Optional[str]:

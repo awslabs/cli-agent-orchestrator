@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Memory inspection and fixture hygiene are safer by default** (#1329).
+  This resolves #861 Q3: CLI list/show and REST list/show no longer increment
+  `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
+  still counts, while internal recall accepts `record_access=false` for
+  benchmarks. Lesson promotion reads `access_count`, so inspection can no
+  longer make a lesson promotion-eligible. Long key truncation is visible in
+  `memory_store` results and long links resolve through the same sanitiser.
+  `cao memory doctor --fixtures` inventories synthetic residue and audit volume
+  as a dry-run; `--apply` requires a backup and moves files to quarantine
+  without deleting them. The test harness now refuses unmarked access to a
+  real-home memory directory and relocates memory for live-provider test runs.
 - **Codex "Trust this folder?" dialogs (0.156 and later) are accepted before the first input** (#1319).
   Recognise the "Trust this folder?" header and its "enter continue · esc back", "esc quit"
   and "esc cancel" footers while keeping earlier wordings and ignoring dismissed dialogs

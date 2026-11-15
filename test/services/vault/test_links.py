@@ -110,6 +110,20 @@ def test_wikilink_boundary_outcomes(target, embed, candidates, outcome, finding,
     assert result.attributes == attributes
 
 
+def test_full_long_wikilink_resolves_to_truncated_memory_key():
+    requested = "linked-" + "b" * 64
+    truncated = requested[:60]
+
+    result = resolve_wikilink(
+        requested,
+        embed=False,
+        candidates=(LinkCandidate(truncated, f"{truncated}.md"),),
+    )
+
+    assert result.outcome == "resolved"
+    assert result.target_key == truncated
+
+
 def test_wikilink_extraction_preserves_embed_flag_and_raw_target():
     result = extract_wikilinks("See [[Design|display]] and ![[folder/Other#Part]].")
 

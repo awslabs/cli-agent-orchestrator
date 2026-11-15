@@ -1720,7 +1720,16 @@ def _canonical_target(
         # The shaped target shares body-link resolution and exclusion gates,
         # but only an actual body attestation contributes fragment/embed data.
         return outcome.target_key, outcome.finding_code, {}
-    matching = tuple(candidate for candidate in candidates if candidate.key == target)
+    try:
+        from cli_agent_orchestrator.services.memory_service import MemoryService
+
+        normalized_target = MemoryService._normalize_key(target)
+        canonical_target = (
+            MemoryService._sanitize_key(target) if normalized_target == target else target
+        )
+    except ValueError:
+        canonical_target = target
+    matching = tuple(candidate for candidate in candidates if candidate.key == canonical_target)
     if not matching:
         return None, FindingCode.LINK_DANGLING, {}
     available = tuple(candidate for candidate in matching if not candidate.excluded)

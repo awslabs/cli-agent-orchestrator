@@ -10961,6 +10961,7 @@ class InternalMemoryRecallRequest(BaseModel):
     search_mode: str = "hybrid"
     sort_by: str = "recency"
     include_related: bool = False
+    record_access: bool = True
 
 
 class InternalMemoryForgetRequest(BaseModel):
@@ -11022,6 +11023,7 @@ async def internal_memory_recall(
         search_mode=body.search_mode,
         sort_by=body.sort_by,
         include_related=body.include_related,
+        record_access=body.record_access,
     )
     # One serializer for both recall surfaces (this route and the MCP
     # memory_recall tool); see models/memory.py.
