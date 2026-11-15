@@ -1,10 +1,12 @@
 ---
 name: cao-learning
-description: Report task outcomes and distill lessons so the team improves across
-  runs — report_outcome after each unit of work, retrospector handoffs at natural
-  boundaries, and recalling stored lessons. Use in workflows that run repeatedly
-  over similar work items. Requires memory.learning_enabled; degrade silently when
-  the tools report disabled.
+description: Use when a delegated unit of work finishes and its outcome should be
+  reported, when a workflow reaches a natural boundary where a retrospector should
+  distill lessons, or when stored lessons should shape the next attempt. Report task
+  outcomes and distill lessons so the team improves across runs — report_outcome after
+  each unit of work, retrospector handoffs at natural boundaries, and recalling stored
+  lessons. Also use in workflows that run repeatedly over similar work items. Requires
+  memory.learning_enabled; degrade silently when the tools report disabled.
 ---
 
 # CAO Self-Learning
