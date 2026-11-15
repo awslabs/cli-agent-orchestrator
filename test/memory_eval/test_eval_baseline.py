@@ -51,6 +51,8 @@ def test_default_baseline_preserves_known_failure_shapes(baseline_report):
     assert report["arms"]["default"]["kw_p1"] < report["arms"]["bm25"]["kw_p1"]
     assert report["arms"]["default"]["kw_p1"] <= report["arms"]["p3_bm25"]["kw_p1"]
     assert report["arms"]["default"]["multihop_full"] < 1
+    assert report["arms"]["default"]["current_first"] < 0.85
+    assert report["arms"]["default"]["tokens_per_recall"] > 800
     assert elapsed < 60
 
 

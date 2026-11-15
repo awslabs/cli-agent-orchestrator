@@ -104,7 +104,7 @@ def _fixture_content(note: dict[str, Any]) -> str:
                 "The Atlas cartography team records this wholly fictional field observation "
                 "for deterministic retrieval evaluation. "
             )
-            * 14
+            * 160
         )
     return content
 
