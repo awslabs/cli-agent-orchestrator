@@ -412,8 +412,8 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
-        "real_home_memory: explicitly allow a test to resolve MEMORY_BASE_DIR "
-        "under the real HOME",
+        "real_home_memory: explicitly allow a test to resolve "
+        + "MEMORY_BASE_DIR under the real HOME",
     )
     if _ISOLATED_HOME.get("too_late"):
         raise pytest.UsageError(
@@ -593,6 +593,12 @@ def _memory_home_guard(request) -> None:
     """Refuse a session whose unmarked tests could reach real-home memory."""
     from cli_agent_orchestrator.constants import MEMORY_BASE_DIR
 
+    isolated_roots = (
+        _ISOLATED_HOME.get("path"),
+        _ISOLATED_MEMORY_HOME.get("path"),
+    )
+    if any(root and _is_within(str(MEMORY_BASE_DIR), root) for root in isolated_roots):
+        return
     if not _is_within(str(MEMORY_BASE_DIR), _STARTUP_REAL_HOME):
         return
     unmarked = [
