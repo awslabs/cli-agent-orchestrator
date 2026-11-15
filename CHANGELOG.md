@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Docs: the `cao-learning` skill and self-learning guide no longer claim lessons are injected into new sessions** (#1335, #1329).
+  Lessons live in agent scope, which the session-start `<cao-memory>` block does not include, so an agent
+  finds them through `memory_recall` or a promoted `## Learned Patterns` block. Promotion happens only when
+  an operator runs `cao memory promote --apply`, and lessons filed under an ephemeral agent's generated name
+  are not found by a later one.
 - **Codex "Trust this folder?" dialogs (0.156 and later) are accepted before the first input** (#1319).
   Recognise the "Trust this folder?" header and its "enter continue · esc back", "esc quit"
   and "esc cancel" footers while keeping earlier wordings and ignoring dismissed dialogs
