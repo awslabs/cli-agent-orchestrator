@@ -114,8 +114,8 @@ async def recall_memory(
     memory_type: Optional[str],
     limit: int,
     terminal_context: Optional[dict[str, Any]],
-    search_mode: str,
-    sort_by: str,
+    search_mode: Optional[str],
+    sort_by: Optional[str],
     include_related: bool,
 ):
     if not remote_memory_url():
@@ -129,10 +129,9 @@ async def recall_memory(
             sort_by=sort_by,
             include_related=include_related,
         )
-    payload = await asyncio.to_thread(
-        _post,
-        "/internal/memory/recall",
-        {
+    body = {
+        key: value
+        for key, value in {
             "query": query,
             "scope": scope,
             "memory_type": memory_type,
@@ -141,7 +140,13 @@ async def recall_memory(
             "search_mode": search_mode,
             "sort_by": sort_by,
             "include_related": include_related,
-        },
+        }.items()
+        if value is not None
+    }
+    payload = await asyncio.to_thread(
+        _post,
+        "/internal/memory/recall",
+        body,
     )
     from cli_agent_orchestrator.models.memory import Memory
 
