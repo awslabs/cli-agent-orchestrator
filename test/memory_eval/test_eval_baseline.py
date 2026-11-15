@@ -16,6 +16,8 @@ from test.memory_eval.harness import (
 
 import pytest
 
+from cli_agent_orchestrator.services.config_service import MemoryConfig
+
 
 @pytest.fixture(scope="module")
 def baseline_report(tmp_path_factory):
@@ -26,6 +28,7 @@ def baseline_report(tmp_path_factory):
 
 def test_fixture_corpus_has_required_synthetic_shapes():
     notes = json.loads((FIXTURE_DIR / "notes.json").read_text(encoding="utf-8"))
+    questions = json.loads((FIXTURE_DIR / "questions.json").read_text(encoding="utf-8"))
     assert len(notes) >= 60
     assert {note["scope"] for note in notes} >= {"global", "project", "session"}
     assert sum(note["shape"] == "compiled_without_heading" for note in notes) == 6
@@ -38,6 +41,13 @@ def test_fixture_corpus_has_required_synthetic_shapes():
         "revision-03-current": "revision-03-stale",
     }
     assert sum(note.get("contradiction", False) for note in notes) == 2
+
+    hidden_shape_notes = {
+        note["key"]: note["content"] for note in notes if note["shape"] != "normal"
+    }
+    assert len(set(hidden_shape_notes.values())) == len(hidden_shape_notes)
+    question_gold = {key for question in questions for key in question["gold"]}
+    assert hidden_shape_notes.keys() <= question_gold
 
 
 def _assert_non_temporary_home_rejected():
@@ -73,6 +83,27 @@ def test_default_baseline_preserves_known_failure_shapes(baseline_report):
     assert report["arms"]["default"]["current_first"] < 0.85
     assert report["arms"]["default"]["tokens_per_recall"] > 800
     assert elapsed < 60
+
+
+def test_p1a_arm_matches_default_before_parser_setting(baseline_report):
+    if "parser" in MemoryConfig.model_fields:
+        pytest.skip("memory.parser.lenient is implemented")
+
+    report = baseline_report[0]["arms"]
+    assert report["p1a_visibility"] == report["default"]
+
+
+def test_p1a_arm_does_not_regress_retrieval_when_parser_setting_exists(baseline_report):
+    if "parser" not in MemoryConfig.model_fields:
+        pytest.skip("requires memory.parser.lenient from #1331")
+
+    report = baseline_report[0]["arms"]
+    default = report["default"]
+    p1a = report["p1a_visibility"]
+    for metric in ("kw_p1", "kw_p3", "nl_p1", "nl_p3"):
+        assert p1a[metric] >= default[metric]
+    assert p1a["kw_p1"] > default["kw_p1"]
+    assert p1a["nl_p3"] > default["nl_p3"]
 
 
 def test_arm_settings_are_isolated(tmp_path, monkeypatch, baseline_report):

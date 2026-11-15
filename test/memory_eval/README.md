@@ -6,6 +6,14 @@ coverage, whether a current note ranks above a stale note, tokens per recall,
 and invisible notes. It runs the production `MemoryService` in-process against
 a new temporary home; it never reads a configured CAO memory home.
 
+The 60-note P0 corpus currently records these legacy baselines (rounded to two
+decimal places):
+
+| Arm | kw p@1 | kw p@3 | NL p@1 | NL p@3 | multi-hop full | multi-hop coverage | current first | tokens/recall | invisible |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `default` | 0.48 | 0.74 | 0.56 | 0.59 | 0.00 | 0.50 | 0.40 | 3825.54 | 7 |
+| `bm25` | 0.56 | 0.74 | 0.56 | 0.59 | 0.00 | 0.50 | 0.60 | 3825.54 | 7 |
+
 Run the fixture evaluation with a fresh directory below the system temporary
 directory:
 
