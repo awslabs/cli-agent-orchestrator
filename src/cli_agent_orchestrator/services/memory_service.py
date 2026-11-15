@@ -4270,7 +4270,12 @@ class MemoryService:
             last_section = file_content.rsplit(f"## {timestamp_text}", 1)
             latest_content = last_section[-1].strip() if len(last_section) > 1 else ""
 
-        if not latest_content:
+        # A timestamp is sufficient structural evidence that this is a stored
+        # topic.  In lenient mode the derived See-Also projection is stripped
+        # from content, but a See-Also-only topic must remain listable/exportable
+        # just as it was under the legacy parser.  Headingless header-only files
+        # still have neither content nor timestamps and remain invisible.
+        if not latest_content and not timestamps:
             return None
 
         return Memory(

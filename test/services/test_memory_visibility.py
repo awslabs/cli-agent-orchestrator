@@ -107,6 +107,22 @@ def test_header_only_topic_stays_invisible(tmp_path: Path, engine: Any) -> None:
     assert memory is None
 
 
+def test_timestamped_see_also_only_topic_stays_visible(tmp_path: Path, engine: Any) -> None:
+    path = _topic(
+        tmp_path,
+        "link-only",
+        "## See Also\n- [target-topic](../global/target-topic.md)",
+        timestamp="## 2026-11-14T05:53:00Z\n",
+    )
+
+    memory = MemoryService(tmp_path, engine)._parse_wiki_file(
+        path, path.read_text(encoding="utf-8"), _entry("link-only")
+    )
+
+    assert memory is not None
+    assert memory.content == ""
+
+
 def test_lenient_false_restores_legacy_invisibility(
     tmp_path: Path, engine: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
