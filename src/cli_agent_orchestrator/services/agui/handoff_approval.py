@@ -35,6 +35,8 @@ from cli_agent_orchestrator.providers.claude_code import (
     WAITING_USER_ANSWER_PATTERN as CLAUDE_WAITING_PATTERN,
 )
 from cli_agent_orchestrator.providers.codex import TRUST_PROMPT_PATTERN as CODEX_TRUST_PATTERN
+from cli_agent_orchestrator.providers.codex import TRUST_PROMPT_PATTERN_V2 as CODEX_TRUST_PATTERN_V2
+from cli_agent_orchestrator.providers.codex import TRUST_PROMPT_PATTERN_V3 as CODEX_TRUST_PATTERN_V3
 from cli_agent_orchestrator.providers.codex import WAITING_PROMPT_PATTERN as CODEX_WAITING_PATTERN
 from cli_agent_orchestrator.providers.kiro_cli import TUI_PERMISSION_PATTERN as KIRO_TUI_PATTERN
 from cli_agent_orchestrator.providers.kiro_cli import (
@@ -121,7 +123,10 @@ def _classify_local(provider: str, raw_prompt: str) -> str:
 
     elif provider == "codex":
         # Trust prompt
-        if re.search(CODEX_TRUST_PATTERN, raw_prompt):
+        if any(
+            re.search(pattern, raw_prompt)
+            for pattern in (CODEX_TRUST_PATTERN, CODEX_TRUST_PATTERN_V2, CODEX_TRUST_PATTERN_V3)
+        ):
             return "trust_prompt"
         # Approval request
         if re.search(CODEX_WAITING_PATTERN, raw_prompt, re.MULTILINE):
