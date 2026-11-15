@@ -159,7 +159,10 @@ def _fixture_memory_identity(base_dir: Path, path: Path) -> tuple[str, str | Non
     if scope not in {item.value for item in MemoryScope}:
         return None
     scope_id: Optional[str]
-    if scope in {MemoryScope.SESSION.value, MemoryScope.AGENT.value}:
+    if scope in {  # subset-ok: only session and agent paths include scope IDs
+        MemoryScope.SESSION.value,
+        MemoryScope.AGENT.value,
+    }:
         if len(parts) != 5:
             return None
         scope_id, filename = parts[3], parts[4]
