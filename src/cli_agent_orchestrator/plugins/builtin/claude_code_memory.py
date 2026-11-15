@@ -163,13 +163,15 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
         if context_block:
             context_block = stamp_memory_block(context_block)
         elif memory_injection_clear_on_empty_enabled():
-            context_block = empty_memory_block()
+            clear_existing = True
         else:
             logger.debug(
                 "claude_code_memory: no memory context for %s; skipping write",
                 event.terminal_id,
             )
             return
+        if context_block:
+            clear_existing = False
 
         try:
             target = self._validated_target_path(working_directory)
@@ -187,6 +189,10 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
             except FileNotFoundError:
                 existing = ""
             existing_block = uniquely_delimited_block(existing, BEGIN_MARKER, END_MARKER)
+            if clear_existing:
+                if existing_block is None:
+                    return
+                context_block = empty_memory_block()
             if existing_block is not None and memory_blocks_have_same_body(
                 existing_block, context_block
             ):

@@ -170,13 +170,15 @@ class KiroCliMemoryPlugin(CaoPlugin):
         if context_block:
             context_block = stamp_memory_block(context_block)
         elif memory_injection_clear_on_empty_enabled():
-            context_block = empty_memory_block()
+            clear_existing = True
         else:
             logger.debug(
                 "kiro_cli_memory: no memory context for %s; skipping write",
                 event.terminal_id,
             )
             return
+        if context_block:
+            clear_existing = False
 
         try:
             target = self._validated_target_path(working_directory)
@@ -192,7 +194,11 @@ class KiroCliMemoryPlugin(CaoPlugin):
             try:
                 existing = await asyncio.to_thread(target.read_text, encoding="utf-8")
             except FileNotFoundError:
+                if clear_existing:
+                    return
                 existing = ""
+            if clear_existing:
+                context_block = empty_memory_block()
             if memory_blocks_have_same_body(existing, context_block):
                 return
             # Whole-file overwrite (no read-modify-write), but routed through
