@@ -142,6 +142,7 @@ def _run_memory_guard_probe(tmp_path, nodeid):
             "TMUX_TMPDIR": str(temp_root / "tmux"),
         }
     )
+    env.pop("CAO_MUST_RUN", None)
     for name in tuple(env):
         if name.startswith(("HERDR_", "TMUX")) and name != "TMUX_TMPDIR":
             env.pop(name)
