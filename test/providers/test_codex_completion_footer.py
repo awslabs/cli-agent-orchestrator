@@ -24,6 +24,7 @@ from cli_agent_orchestrator.providers.codex import (
 )
 
 STATUS_BAR = "  gpt-6 max · /tmp/project                       ⚠ 1 warning · f2 to view"
+SHORTCUTS_BAR = "  ← for agents · ? for shortcuts                       ⚠ 1 warning · f2 to view"
 COMPOSER = "› Ask Codex to do anything"
 BANNER = [
     "╭──────────────────────────────────────────╮",
@@ -49,6 +50,56 @@ def footer_provider(version=V0160) -> CodexProvider:
 
 def screen(*rows: str) -> list[str]:
     return [*rows, COMPOSER, STATUS_BAR]
+
+
+class TestSeparateShortcutsBar:
+    @pytest.mark.parametrize("separator", [[], [""]])
+    def test_completed_turn_and_extraction(self, separator):
+        frame = [
+            *TASK, "• Mean 3.", "  Worked for 2s • 4:19 PM", "", COMPOSER,
+            STATUS_BAR, *separator, SHORTCUTS_BAR,
+        ]
+        provider = footer_provider((0, 169, 0))
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• Mean 3."
+        assert provider.extract_current_composer("\n".join(frame)) == ""
+
+    def test_active_turn_remains_processing(self):
+        frame = [*TASK, "• Working (12s • esc to interrupt)", COMPOSER, STATUS_BAR, SHORTCUTS_BAR]
+        assert footer_provider().get_status_from_screen(frame) == TerminalStatus.PROCESSING
+
+    def test_streaming_reply_with_quoted_footer_is_not_completed(self):
+        frame = [
+            *TASK, "• Example:", "  Worked for 2s • 4:19 PM", "  More text follows",
+            COMPOSER, STATUS_BAR, SHORTCUTS_BAR,
+        ]
+        assert footer_provider().get_status_from_screen(frame) != TerminalStatus.COMPLETED
+
+    def test_background_notice_is_not_treated_as_completion_evidence(self):
+        frame = [
+            *TASK, "• Example:", "  Worked for 2s • 4:19 PM",
+            "  1 background terminal running · /ps to view · /stop to close",
+            COMPOSER, STATUS_BAR, SHORTCUTS_BAR,
+        ]
+        assert footer_provider().get_status_from_screen(frame) != TerminalStatus.COMPLETED
+
+    def test_quoted_background_notice_is_preserved_in_response(self):
+        notice = "  1 background terminal running · /ps to view · /stop to close"
+        frame = [*TASK, "• Notice:", notice, COMPOSER, STATUS_BAR, SHORTCUTS_BAR]
+        provider = footer_provider((0, 169, 0))
+        assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• Notice:\n" + notice
+
+    def test_scrolled_user_message_does_not_include_composer_or_bars(self):
+        frame = ["• Mean 3.", "  Worked for 2s • 4:19 PM", COMPOSER, STATUS_BAR, SHORTCUTS_BAR]
+        assert footer_provider().extract_last_message_from_script("\n".join(frame)) == "Mean 3."
+
+    def test_draft_composer_excludes_both_bars(self):
+        frame = [
+            *TASK, "• Mean 3.", "  Worked for 2s • 4:19 PM", "› draft message",
+            STATUS_BAR, SHORTCUTS_BAR,
+        ]
+        assert footer_provider().extract_current_composer("\n".join(frame)) == "› draft message"
 
 
 class TestCompletionFooterPattern:

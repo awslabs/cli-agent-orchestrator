@@ -486,6 +486,21 @@ STARTUP_IDLE_PLACEHOLDER_PATTERN = (
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 
 
+def _tui_status_bar_start(lines: list[str]) -> Optional[int]:
+    bottom = max(len(lines) - IDLE_PROMPT_TAIL_LINES, 0)
+    for index in range(len(lines) - 1, bottom - 1, -1):
+        if not re.search(TUI_FOOTER_PATTERN, lines[index]):
+            continue
+        if re.search(r"\?\s+for shortcuts", lines[index]):
+            previous = index - 1
+            while previous >= bottom and not lines[previous].strip():
+                previous -= 1
+            if previous >= bottom and re.search(r"·\s+[~/]", lines[previous]):
+                return previous
+        return index
+    return None
+
+
 def _compute_tui_footer_cutoff(all_lines: list) -> int:
     """Compute the character position where the TUI footer area starts.
 
@@ -498,16 +513,8 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
     where the footer starts. Returns ``len('\\n'.join(all_lines))`` if no
     footer is found.
     """
-    n = len(all_lines)
-    footer_start_idx = n
-
-    # Find the status bar line (last TUI_FOOTER_PATTERN match in the bottom area)
-    for i in range(n - 1, max(n - IDLE_PROMPT_TAIL_LINES - 1, -1), -1):
-        if re.search(TUI_FOOTER_PATTERN, all_lines[i]):
-            footer_start_idx = i
-            break
-
-    if footer_start_idx == n:
+    footer_start_idx = _tui_status_bar_start(all_lines)
+    if footer_start_idx is None:
         return len("\n".join(all_lines))
 
     # Scan upward from the status bar to include blank lines and the
@@ -2891,16 +2898,7 @@ class CodexProvider(BaseProvider):
     def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
         """Return Codex's bottom composer without admitting transcript prompts."""
         lines = rendered_pane.splitlines()
-        footer_index = next(
-            (
-                index
-                for index in range(
-                    len(lines) - 1, max(len(lines) - IDLE_PROMPT_TAIL_LINES - 1, -1), -1
-                )
-                if re.search(TUI_FOOTER_PATTERN, lines[index])
-            ),
-            None,
-        )
+        footer_index = _tui_status_bar_start(lines)
         if footer_index is None:
             return None
 
@@ -2989,12 +2987,9 @@ class CodexProvider(BaseProvider):
             # With --no-alt-screen, the TUI footer (› hint + status bar) has no
             # empty idle prompt. Use cutoff_pos as the boundary when TUI is present.
             idle_after = _strict_idle_prompt_start(clean_output[response_start:])
+            end_pos = cutoff_pos
             if idle_after is not None:
-                end_pos = response_start + idle_after
-            elif tui_footer_detected:
-                end_pos = cutoff_pos
-            else:
-                end_pos = len(clean_output)
+                end_pos = min(end_pos, response_start + idle_after)
 
             response_text = clean_output[response_start:end_pos].strip()
 
@@ -3012,6 +3007,7 @@ class CodexProvider(BaseProvider):
         # Fallback: assistant marker based extraction (no user message found).
         # Filter out "• Called <tool>(...)" MCP tool call markers so we anchor
         # on the model's actual reply, not tool output.
+        clean_output = clean_output[:cutoff_pos]
         all_matches = list(
             re.finditer(ASSISTANT_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
         )
