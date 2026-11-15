@@ -71,6 +71,31 @@ def _install_cwd(monkeypatch: pytest.MonkeyPatch, case: ProviderCase, cwd: Path)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.provider)
+async def test_memory_off_does_not_touch_existing_project_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: ProviderCase
+) -> None:
+    target = tmp_path / case.relative_target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    original = (
+        b"<cao-memory>released content</cao-memory>\n"
+        if case.provider == "kiro_cli"
+        else (
+            f"{case.module.BEGIN_MARKER}\n"
+            "<cao-memory>released content</cao-memory>\n"
+            f"{case.module.END_MARKER}\n"
+        ).encode()
+    )
+    target.write_bytes(original)
+    _install_cwd(monkeypatch, case, tmp_path)
+    monkeypatch.setattr(case.module, "memory_is_enabled", lambda: False)
+
+    await case.plugin_type().on_post_create_terminal(_event(case))
+
+    assert target.read_bytes() == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.provider)
 async def test_default_does_not_create_project_file_or_fetch_memory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: ProviderCase
 ) -> None:
@@ -144,7 +169,6 @@ async def test_write_then_default_cleanup_restores_user_file(
 ) -> None:
     target = tmp_path / case.relative_target
     target.parent.mkdir(parents=True, exist_ok=True)
-    original = b"user text\n"
     target.write_bytes(original)
     _install_cwd(monkeypatch, case, tmp_path)
 

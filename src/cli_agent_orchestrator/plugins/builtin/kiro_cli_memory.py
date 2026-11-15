@@ -140,6 +140,9 @@ class KiroCliMemoryPlugin(CaoPlugin):
         if event.provider != "kiro_cli":
             return
 
+        if not memory_is_enabled():
+            return
+
         try:
             working_directory = self._resolve_working_directory(event)
         except Exception as exc:
@@ -159,9 +162,6 @@ class KiroCliMemoryPlugin(CaoPlugin):
 
         if not memory_injection_write_project_files_enabled():
             await self._remove_project_file_memory(working_directory)
-            return
-
-        if not memory_is_enabled():
             return
 
         try:

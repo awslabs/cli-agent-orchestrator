@@ -582,12 +582,13 @@ explicit recall. An oversized first item is reduced to its first sentence plus
 scope stopping at the oversized item. (`memory_get` is not available yet, so the suffix
 names the key directly.)
 
-These hygiene fixes default on for opted-in project-file writes. Set
+Empty-result cleanup applies only to opted-in project-file writes. Set
 `memory.injection.clear_on_empty` to `false` to keep
-an existing provider block when retrieval is empty. Set `memory.injection.v1_fixes` to
-`false` to restore the legacy stop-at-first-oversized-item behavior and single project
-directory lookup. `memory.enabled=false` remains a full opt-out and does not create or
-rewrite provider files.
+an existing provider block when retrieval is empty. The context builder's traversal,
+clipping, and project-alias fixes apply to both prompt and file delivery; set
+`memory.injection.v1_fixes=false` to restore the legacy stop-at-first-oversized-item
+behavior and single project directory lookup. `memory.enabled=false` is a full opt-out:
+CAO does not inspect, create, rewrite, or clean up provider memory files.
 
 The operator's local `memory.enabled` / `CAO_MEMORY_ENABLED` switch always wins over a
 configured remote memory owner (`CAO_MEMORY_API_URL`) for first-message context injection:

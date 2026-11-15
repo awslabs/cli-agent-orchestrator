@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Claude Code and Codex terminals receive it in their provider start prompt; orchestrated
   terminals retain task-aware first-message delivery. Set
   `memory.injection.write_project_files=true` to opt back into the legacy provider-file
-  behavior.
+  behavior. With `memory.enabled=false`, CAO does not inspect or clean up those files.
 
 - **Memory injection no longer leaves stale provider context or drops a scope behind one
   long note** (#1329). Claude Code, Codex and Kiro provider files receive UTC-stamped

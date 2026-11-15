@@ -893,7 +893,7 @@ class TestCreateTerminal:
         try:
             await create_terminal(provider_name, "developer", new_session=True)
 
-            skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
+            skill_prompt = mock_provider._skill_prompt
             assert skill_prompt == (
                 "<cao-memory>start memory</cao-memory>\n\n"
                 "## Available Skills\n\n"

@@ -3366,13 +3366,6 @@ async def _create_terminal_unguarded(
             if provider == ProviderType.CLAUDE_CODE.value and not resume_session_id
             else None
         )
-        # Interactive prompt-capable providers have no CAO first message, so
-        # inject memory through their launch prompt. Immediate orchestrated
-        # launches retain the task-aware first-message path (and workflow
-        # frozen-memory semantics) by virtue of having ``initial_message``.
-        if provider in RUNTIME_SKILL_PROMPT_PROVIDERS and initial_message is None:
-            skill_prompt = _memory_start_prompt(skill_prompt, terminal_id)
-
         # Only a Kiro helper passes its launch, and only a Claude Code helper the
         # ephemeral flag, so every other call is unchanged. The flag is the bind
         # above, the fact that marks this terminal ephemeral, never the profile
@@ -3400,6 +3393,16 @@ async def _create_terminal_unguarded(
             session_id=fresh_claude_session_id,
             **provider_launch_options,
         )
+        # Interactive prompt-capable providers have no CAO first message, so
+        # inject memory through their launch prompt. Resolve after provider
+        # registration: context lookup can involve a remote owner and must not
+        # widen the row-visible/runtime-missing teardown race. Initialization
+        # has not started yet, so updating the prompt here still precedes command
+        # construction. Immediate orchestrated launches retain the task-aware
+        # first-message path (and workflow frozen-memory semantics).
+        if provider in RUNTIME_SKILL_PROMPT_PROVIDERS and initial_message is None:
+            provider_instance._skill_prompt = _memory_start_prompt(skill_prompt, terminal_id)
+
         # The provider owns the helper's home now: its cleanup removes it.
         ephemeral_state.kiro_home = None
 
