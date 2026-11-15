@@ -2484,8 +2484,8 @@ class MemoryService:
         limit: int = 10,
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
-        search_mode: str = "hybrid",
-        sort_by: str = "recency",
+        search_mode: Optional[str] = None,
+        sort_by: Optional[str] = None,
         include_related: bool = False,
         *,
         record_access: bool = True,
@@ -2518,6 +2518,21 @@ class MemoryService:
         """
         if not _is_memory_enabled():
             return []
+
+        explicit_search_mode = search_mode is not None
+        explicit_sort_by = sort_by is not None
+        search_mode = "hybrid" if search_mode is None else search_mode
+        sort_by = "recency" if sort_by is None else sort_by
+        if query and query.strip() and not explicit_search_mode and not explicit_sort_by:
+            from cli_agent_orchestrator.services.memory_scoring import validate_default_sort
+            from cli_agent_orchestrator.services.settings_service import get_memory_settings
+
+            ranking = get_memory_settings().get("ranking", {})
+            default_sort = validate_default_sort(
+                ranking.get("default_sort") if isinstance(ranking, dict) else None
+            )
+            if default_sort == "bm25":
+                search_mode = "bm25"
 
         if search_mode not in VALID_SEARCH_MODES:
             raise ValueError(

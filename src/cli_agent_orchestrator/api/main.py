@@ -10957,8 +10957,8 @@ class InternalMemoryRecallRequest(BaseModel):
     memory_type: Optional[MemoryType] = None
     limit: int = Field(default=10, ge=1, le=100)
     terminal_context: Optional[InternalMemoryContext] = None
-    search_mode: str = "hybrid"
-    sort_by: str = "recency"
+    search_mode: Optional[str] = None
+    sort_by: Optional[str] = None
     include_related: bool = False
     record_access: bool = True
 

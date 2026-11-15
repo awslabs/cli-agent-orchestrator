@@ -2107,10 +2107,10 @@ async def memory_recall(
         ge=1,
         le=100,
     ),
-    search_mode: str = "hybrid",
-    sort_by: str = Field(
-        default="recency",
-        description='Ranking: "recency" (default), "score" (BM25+recency+usage), "usage", or "relevance" (lexical relevance over a widened pool; needs query, else behaves as recency).',
+    search_mode: Optional[str] = None,
+    sort_by: Optional[str] = Field(
+        default=None,
+        description='Ranking: "recency" (default), "score" (BM25+recency+usage), "usage", or "relevance" (lexical relevance over a widened pool; needs query, else behaves as recency). When both ranking arguments are omitted, memory.ranking.default_sort may select BM25 for query recall.',
     ),
     include_related: bool = Field(
         default=False,

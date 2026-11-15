@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain in place because they can also hold real events. The test harness now
   refuses unmarked access to a real-home memory directory and relocates memory
   for live-provider test runs.
+- **Memory recall can opt into BM25-first query ranking** with
+  `memory.ranking.default_sort="bm25"` (#1329). The default remains `recency`;
+  explicit `search_mode` and `sort_by` arguments keep precedence, and no-query listings
+  remain recency ordered.
 - **Codex "Trust this folder?" dialogs (0.156 and later) are accepted before the first input** (#1319).
   Recognise the "Trust this folder?" header and its "enter continue · esc back", "esc quit"
   and "esc cancel" footers while keeping earlier wordings and ignoring dismissed dialogs
