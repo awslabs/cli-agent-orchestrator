@@ -702,6 +702,46 @@ class TestDeliverPending:
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_codex_background_completion_releases_pending_message(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider("term-1", "session", "window")
+        provider._codex_version = (0, 169, 0)
+        provider._ends_turns_with_footer = True
+        chrome = [
+            "",
+            "1 background terminal running · /ps to view · /stop to close",
+            "",
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "gpt-6 max · /tmp/project",
+            "← for agents · ? for shortcuts · ⚠ 1 warning · f2 to view",
+        ]
+        mock_get.return_value = [_make_message()]
+        svc = InboxService()
+        mock_monitor.get_status.return_value = provider.get_status_from_screen(
+            ["› 1+1", "• 2", *chrome]
+        )
+        svc.deliver_pending("term-1")
+        mock_term_svc.dispatch_input.assert_not_called()
+        mock_update.assert_not_called()
+
+        mock_monitor.get_status.return_value = provider.get_status_from_screen(
+            ["› 1+1", "• 2", "Worked for 1s • 3:43 AM", *chrome]
+        )
+        svc.deliver_pending("term-1")
+        mock_term_svc.dispatch_input.assert_called_once_with(
+            "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
+        )
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_skips_when_no_pending_messages(
         self, mock_get, mock_monitor, mock_term_svc, mock_update
     ):

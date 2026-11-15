@@ -176,6 +176,51 @@ class TestPollerRecheckInput:
         )
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_codex_background_turns_transition_in_monitor(self, mock_codex_backend):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        chrome = [
+            "",
+            "1 background terminal running · /ps to view · /stop to close",
+            "",
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "gpt-6 max · /tmp/project",
+            "← for agents · ? for shortcuts · ⚠ 1 warning · f2 to view",
+        ]
+        previous = ["› old", "• old reply", "Worked for 1s • 3:42 AM"]
+        backend = MagicMock()
+        backend.get_history.return_value = "\n".join([*previous, *chrome])
+        mock_codex_backend.return_value = backend
+        provider = CodexProvider("t1", "session", "window")
+        provider._codex_version = (0, 169, 0)
+        provider._ends_turns_with_footer = True
+        provider.mark_input_received()
+        provider.record_dispatched_message("1+1")
+        monitor = StatusMonitor()
+        monitor._last_status["t1"] = TerminalStatus.PROCESSING
+
+        first = [*previous, "› 1+1", "• 2", "Worked for 1s • 3:43 AM"]
+        with patch("cli_agent_orchestrator.services.status_monitor.bus"):
+            assert monitor._apply_detection(
+                "t1", provider.get_status_from_screen([*first, *chrome])
+            )
+            assert monitor._last_status["t1"] == TerminalStatus.COMPLETED
+            backend.get_history.return_value = "\n".join([*first, *chrome])
+            monitor.notify_input_sent("t1")
+            provider.mark_input_received()
+            provider.record_dispatched_message("2+2")
+            active = [*first, "› 2+2", "• 4"]
+            assert monitor._apply_detection(
+                "t1", provider.get_status_from_screen([*active, *chrome])
+            )
+            assert monitor._last_status["t1"] == TerminalStatus.PROCESSING
+            completed = [*active, "Worked for 1s • 3:44 AM", *chrome]
+            assert monitor._apply_detection("t1", provider.get_status_from_screen(completed))
+            assert monitor._last_status["t1"] == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_codex_old_reply_and_footer_without_bar_do_not_complete_new_dispatch(
         self, mock_codex_backend
     ):

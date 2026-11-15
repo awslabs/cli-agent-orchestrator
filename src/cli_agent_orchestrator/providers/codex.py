@@ -486,6 +486,12 @@ STARTUP_IDLE_PLACEHOLDER_PATTERN = (
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 
 
+_BACKGROUND_TERMINALS_RE = re.compile(
+    r"\s*\d+ background terminals? running · /ps to view · /stop to close\s*"
+)
+_SECOND_STATUS_ROW_RE = re.compile(r"\s*\?\s+for shortcuts\s*")
+
+
 def _compute_tui_footer_cutoff(all_lines: list) -> int:
     """Compute the character position where the TUI footer area starts.
 
@@ -510,6 +516,17 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
     if footer_start_idx == n:
         return len("\n".join(all_lines))
 
+    # Codex can render shortcuts and model information on separate rows in
+    # either order. Both rows belong below the composer.
+    previous = footer_start_idx - 1
+    while previous >= max(0, footer_start_idx - 3) and not all_lines[previous].strip():
+        previous -= 1
+    if previous >= max(0, footer_start_idx - 3) and (
+        _SECOND_STATUS_ROW_RE.fullmatch(all_lines[previous])
+        or re.search(TUI_FOOTER_PATTERN, all_lines[previous])
+    ):
+        footer_start_idx = previous
+
     # Scan upward from the status bar to include blank lines and the
     # suggestion hint (› with text) that are part of the TUI footer chrome.
     for j in range(footer_start_idx - 1, max(footer_start_idx - 4, -1), -1):
@@ -518,6 +535,20 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
             footer_start_idx = j
         elif re.match(rf"\s*{IDLE_PROMPT_PATTERN}", line):
             footer_start_idx = j
+            # A notice without a preceding completion footer could be reply text.
+            # This remains a visual heuristic: a reply can imitate both rows.
+            notice_idx = j - 1
+            while notice_idx >= 0 and not all_lines[notice_idx].strip():
+                notice_idx -= 1
+            if notice_idx >= 0 and _BACKGROUND_TERMINALS_RE.fullmatch(all_lines[notice_idx]):
+                preceding = notice_idx - 1
+                while preceding >= 0 and not all_lines[preceding].strip():
+                    preceding -= 1
+                # Bare clocks are ambiguous without the provider version here.
+                if preceding >= 0 and _is_completion_footer(
+                    all_lines[preceding], BARE_CLOCK_FOOTER_VERSIONS[1]
+                ):
+                    footer_start_idx = notice_idx
             break
         else:
             break
@@ -2915,6 +2946,22 @@ class CodexProvider(BaseProvider):
         if composer_index is None:
             return None
 
+        previous = footer_index - 1
+        while (
+            previous > composer_index
+            and previous >= footer_index - 3
+            and not lines[previous].strip()
+        ):
+            previous -= 1
+        if (
+            previous > composer_index
+            and previous >= footer_index - 3
+            and (
+                _SECOND_STATUS_ROW_RE.fullmatch(lines[previous])
+                or re.search(TUI_FOOTER_PATTERN, lines[previous])
+            )
+        ):
+            footer_index = previous
         composer_lines = lines[composer_index:footer_index]
         if not composer_lines:
             return ""
@@ -2989,12 +3036,9 @@ class CodexProvider(BaseProvider):
             # With --no-alt-screen, the TUI footer (› hint + status bar) has no
             # empty idle prompt. Use cutoff_pos as the boundary when TUI is present.
             idle_after = _strict_idle_prompt_start(clean_output[response_start:])
+            end_pos = cutoff_pos
             if idle_after is not None:
-                end_pos = response_start + idle_after
-            elif tui_footer_detected:
-                end_pos = cutoff_pos
-            else:
-                end_pos = len(clean_output)
+                end_pos = min(end_pos, response_start + idle_after)
 
             response_text = clean_output[response_start:end_pos].strip()
 
@@ -3012,6 +3056,7 @@ class CodexProvider(BaseProvider):
         # Fallback: assistant marker based extraction (no user message found).
         # Filter out "• Called <tool>(...)" MCP tool call markers so we anchor
         # on the model's actual reply, not tool output.
+        clean_output = clean_output[:cutoff_pos]
         all_matches = list(
             re.finditer(ASSISTANT_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
         )
