@@ -81,6 +81,52 @@ def test_project_injection_reads_recorded_cwd_hash_alias(
     assert service.get_memory_context(ctx, budget_chars=9000) == ""
 
 
+def test_project_injection_keeps_only_newest_copy_across_aliases(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://example.com/acme/widgets.git"],
+        cwd=repo,
+        check=True,
+    )
+    ctx = _ctx(repo)
+    service = MemoryService(base_dir=memory_dir)
+    canonical = service.resolve_scope_id("project", ctx)
+    cwd_hash = hashlib.sha256(os.path.realpath(repo).encode()).hexdigest()[:12]
+    assert canonical != cwd_hash
+
+    legacy_service = MemoryService(base_dir=memory_dir)
+    legacy_service.resolve_scope_id = (  # type: ignore[method-assign]
+        lambda scope, terminal_context: cwd_hash if scope == "project" else None
+    )
+    asyncio.run(
+        legacy_service.store(
+            content="make old-target",
+            scope="project",
+            memory_type="project",
+            key="build-cmd",
+            terminal_context=ctx,
+        )
+    )
+    asyncio.run(
+        service.store(
+            content="make new-target",
+            scope="project",
+            memory_type="project",
+            key="build-cmd",
+            terminal_context=ctx,
+        )
+    )
+
+    block = service.get_memory_context(ctx, budget_chars=9000)
+
+    assert "make new-target" in block
+    assert "make old-target" not in block
+    assert block.count("build-cmd") == 1
+
+
 def test_injection_settings_default_to_hygiene_fixes() -> None:
     from cli_agent_orchestrator.services.settings_service import get_memory_settings
 

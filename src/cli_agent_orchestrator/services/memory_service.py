@@ -4509,6 +4509,19 @@ class MemoryService:
             # U7 adds injectable vault candidates here. A missing native index
             # must not skip this scope, because a vault-only mapping has none.
             scope_entries.sort(key=lambda item: item[2].get("updated_at", ""), reverse=True)
+            if scope_val == MemoryScope.PROJECT.value and v1_fixes:
+                # Alias folders can retain an older copy of a key after project
+                # identity becomes canonical. Keep the newest indexed copy so
+                # injection never presents conflicting versions of one fact.
+                deduplicated_entries: list[tuple[Path, str, dict]] = []
+                seen_keys: set[str] = set()
+                for item in scope_entries:
+                    key = item[2]["key"]
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    deduplicated_entries.append(item)
+                scope_entries = deduplicated_entries
 
             scope_memories: list[Memory] = []
             native_entries = (
