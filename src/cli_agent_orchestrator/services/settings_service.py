@@ -24,6 +24,7 @@ _DEFAULTS = {
 
 _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+# Single source for every ``memory.injection.*`` flag and its safe fallback.
 MEMORY_INJECTION_DEFAULTS = {
     "clear_on_empty": True,
     "v1_fixes": True,
@@ -759,6 +760,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "non_accessing_inspection": False,
         "lifecycle": {"enabled": False},
         "injection": dict(MEMORY_INJECTION_DEFAULTS),
+        "ranking": {"default_sort": "recency"},
     }
     saved = settings.get("memory", {})
     if not isinstance(saved, dict):
@@ -836,8 +838,9 @@ def get_memory_settings() -> Dict[str, Any]:
     return result
 
 
-def _memory_injection_flag(key: str, default: bool = True) -> bool:
+def _memory_injection_flag(key: str) -> bool:
     """Read one injection flag; invalid/read errors use its safe default."""
+    default = MEMORY_INJECTION_DEFAULTS[key]
     try:
         injection = get_memory_settings().get("injection", {})
         value = injection.get(key, default) if isinstance(injection, dict) else default
@@ -871,7 +874,7 @@ def is_memory_injection_v1_fixes_enabled() -> bool:
 
 def is_memory_injection_write_project_files_enabled() -> bool:
     """Whether provider plugins write memory into project files (default false)."""
-    return _memory_injection_flag("write_project_files", default=False)
+    return _memory_injection_flag("write_project_files")
 
 
 def get_vault_config(*, canonicalize: bool = True):
@@ -1269,7 +1272,10 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
+        ``injection.clear_on_empty`` (bool) — replace stale provider blocks on empty retrieval.
+        ``injection.v1_fixes`` (bool) — enable injection traversal and clipping fixes.
         ``injection.write_project_files`` (bool) — opt-in provider project-file writes.
+        ``ranking.default_sort`` (str) — ``recency`` or ``bm25`` query recall default.
         ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
@@ -1310,9 +1316,17 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if not isinstance(value, bool):
             raise ValueError("lifecycle.enabled must be a bool")
         coerced = value
-    elif key == "injection.write_project_files":
+    elif key == "ranking.default_sort":
+        from cli_agent_orchestrator.services.memory_scoring import DEFAULT_SORT_VALUES
+
+        if not isinstance(value, str) or value not in DEFAULT_SORT_VALUES:
+            raise ValueError(
+                f"ranking.default_sort must be one of {sorted(DEFAULT_SORT_VALUES)}, got {value!r}"
+            )
+        coerced = value
+    elif key.startswith("injection.") and key.split(".", 1)[1] in MEMORY_INJECTION_DEFAULTS:
         if not isinstance(value, bool):
-            raise ValueError("injection.write_project_files must be a bool")
+            raise ValueError(f"{key} must be a bool")
         coerced = value
     elif key in {"explain_enabled", "non_accessing_inspection"}:
         if not isinstance(value, bool):
@@ -1347,11 +1361,16 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(lifecycle, dict):
                 lifecycle = {}
             memory["lifecycle"] = {**lifecycle, "enabled": coerced}
-        elif key == "injection.write_project_files":
+        elif key.startswith("injection."):
             injection = memory.get("injection", {})
             if not isinstance(injection, dict):
                 injection = {}
-            memory["injection"] = {**injection, "write_project_files": coerced}
+            memory["injection"] = {**injection, key.split(".", 1)[1]: coerced}
+        elif key == "ranking.default_sort":
+            ranking = memory.get("ranking", {})
+            if not isinstance(ranking, dict):
+                ranking = {}
+            memory["ranking"] = {**ranking, "default_sort": coerced}
         else:
             memory[key] = coerced
         settings["memory"] = memory

@@ -180,12 +180,23 @@ async def test_default_removes_recognizable_kiro_file_but_not_user_file(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.provider)
-async def test_opt_in_write_matches_base_output(
+async def test_opt_in_write_matches_e5b708fd_output(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: ProviderCase
 ) -> None:
     target = tmp_path / case.relative_target
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"user text\n")
+    if case.provider == "kiro_cli":
+        target.write_bytes(b"user text\n")
+    else:
+        target.write_bytes(
+            (
+                "before\n\n"
+                f"{case.module.BEGIN_MARKER}\n"
+                "<cao-memory>old</cao-memory>\n"
+                f"{case.module.END_MARKER}\n\n"
+                "after\n"
+            ).encode()
+        )
     _install_cwd(monkeypatch, case, tmp_path)
     monkeypatch.setattr(case.module, "memory_injection_write_project_files_enabled", lambda: True)
     monkeypatch.setattr(
@@ -212,7 +223,9 @@ async def test_opt_in_write_matches_base_output(
     expected = (
         memory + b"\n"
         if case.provider == "kiro_cli"
-        else b"user text\n<!-- cao-memory:begin -->\n" + memory + b"\n<!-- cao-memory:end -->\n"
+        else (
+            b"before\nafter\n<!-- cao-memory:begin -->\n" + memory + b"\n<!-- cao-memory:end -->\n"
+        )
     )
     assert target.read_bytes() == expected
 

@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timezone
 
 _OPENING_TAG_RE = re.compile(r"<cao-memory(?:\s[^>]*)?>")
-_BLOCK_RE = re.compile(r"<cao-memory(?:\s[^>]*)?>(.*?)</cao-memory>", re.DOTALL)
+_CLOSING_TAG = "</cao-memory>"
 
 
 def _generated_at() -> str:
@@ -37,12 +37,18 @@ def stamp_memory_block(block: str, *, generated_at: str | None = None) -> str:
 
 def memory_blocks_have_same_body(existing: str, proposed: str) -> bool:
     """Compare memory bodies while ignoring opening-tag metadata."""
-    existing_match = _BLOCK_RE.search(existing)
-    proposed_match = _BLOCK_RE.search(proposed)
+
+    def body(block: str) -> str | None:
+        opening = _OPENING_TAG_RE.search(block)
+        closing = block.rfind(_CLOSING_TAG)
+        if opening is None or closing < opening.end():
+            return None
+        return block[opening.end() : closing]
+
+    existing_body = body(existing)
+    proposed_body = body(proposed)
     return (
-        existing_match is not None
-        and proposed_match is not None
-        and existing_match.group(1) == proposed_match.group(1)
+        existing_body is not None and proposed_body is not None and existing_body == proposed_body
     )
 
 

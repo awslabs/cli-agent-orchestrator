@@ -185,13 +185,15 @@ class CodexMemoryPlugin(CaoPlugin):
         if context_block:
             context_block = stamp_memory_block(context_block)
         elif memory_injection_clear_on_empty_enabled():
-            context_block = empty_memory_block()
+            clear_existing = True
         else:
             logger.debug(
                 "codex_memory: no memory context for %s; skipping write",
                 event.terminal_id,
             )
             return
+        if context_block:
+            clear_existing = False
 
         try:
             target = self._validated_target_path(working_directory)
@@ -209,6 +211,10 @@ class CodexMemoryPlugin(CaoPlugin):
             except FileNotFoundError:
                 existing = ""
             existing_block = uniquely_delimited_block(existing, BEGIN_MARKER, END_MARKER)
+            if clear_existing:
+                if existing_block is None:
+                    return
+                context_block = empty_memory_block()
             if existing_block is not None and memory_blocks_have_same_body(
                 existing_block, context_block
             ):
@@ -305,7 +311,7 @@ class CodexMemoryPlugin(CaoPlugin):
     def _remove_existing_block(target: Path) -> None:
         locked_atomic_rewrite_or_delete(
             target,
-            CodexMemoryPlugin._strip_existing_block,
+            CodexMemoryPlugin._strip_existing_block_for_cleanup,
             lambda content: not content.strip(),
         )
 
@@ -328,6 +334,27 @@ class CodexMemoryPlugin(CaoPlugin):
             next_begin = content.find(BEGIN_MARKER, begin + len(BEGIN_MARKER))
             if end == -1 or (next_begin != -1 and next_begin < end):
                 # Stray/unclosed BEGIN: drop only the marker, keep all content.
+                content = content[:begin] + content[begin + len(BEGIN_MARKER) :]
+                continue
+            before = content[:begin].rstrip("\n")
+            after = content[end + len(END_MARKER) :].lstrip("\n")
+            if before and after:
+                content = f"{before}\n{after}"
+            else:
+                content = before or after
+
+        return content
+
+    @staticmethod
+    def _strip_existing_block_for_cleanup(content: str) -> str:
+        """Remove managed blocks while restoring CAO's single separator."""
+        while True:
+            begin = content.find(BEGIN_MARKER)
+            if begin == -1:
+                break
+            end = content.find(END_MARKER, begin + len(BEGIN_MARKER))
+            next_begin = content.find(BEGIN_MARKER, begin + len(BEGIN_MARKER))
+            if end == -1 or (next_begin != -1 and next_begin < end):
                 content = content[:begin] + content[begin + len(BEGIN_MARKER) :]
                 continue
             before = content[:begin]

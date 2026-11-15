@@ -209,11 +209,6 @@ async def test_skips_write_when_memory_context_empty(
         "cli_agent_orchestrator.plugins.builtin.codex_memory.MemoryService",
         lambda: type("F", (), {"get_memory_context_for_terminal": lambda self, t: ""})(),
     )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.codex_memory."
-        "memory_injection_clear_on_empty_enabled",
-        lambda: False,
-    )
 
     plugin = CodexMemoryPlugin()
     await plugin.on_post_create_terminal(_event())

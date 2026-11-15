@@ -2473,8 +2473,8 @@ class MemoryService:
         limit: int = 10,
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
-        search_mode: str = "hybrid",
-        sort_by: str = "recency",
+        search_mode: Optional[str] = None,
+        sort_by: Optional[str] = None,
         include_related: bool = False,
         *,
         record_access: bool = True,
@@ -2507,6 +2507,21 @@ class MemoryService:
         """
         if not _is_memory_enabled():
             return []
+
+        explicit_search_mode = search_mode is not None
+        explicit_sort_by = sort_by is not None
+        search_mode = "hybrid" if search_mode is None else search_mode
+        sort_by = "recency" if sort_by is None else sort_by
+        if query and query.strip() and not explicit_search_mode and not explicit_sort_by:
+            from cli_agent_orchestrator.services.memory_scoring import validate_default_sort
+            from cli_agent_orchestrator.services.settings_service import get_memory_settings
+
+            ranking = get_memory_settings().get("ranking", {})
+            default_sort = validate_default_sort(
+                ranking.get("default_sort") if isinstance(ranking, dict) else None
+            )
+            if default_sort == "bm25":
+                search_mode = "bm25"
 
         if search_mode not in VALID_SEARCH_MODES:
             raise ValueError(
@@ -4485,7 +4500,11 @@ class MemoryService:
             )
             scope_entries: list[tuple[Path, str, dict]] = []
             native_wiki_dirs = (
-                [native_dir / "wiki" for native_dir in native_dirs]
+                [
+                    native_dir / "wiki"
+                    for native_dir in native_dirs
+                    if native_dir not in {self.base_dir / "global", self.base_dir / "federated"}
+                ]
                 if scope_val == MemoryScope.PROJECT.value and v1_fixes
                 else ([wiki_dir] if native_dirs else [])
             )
@@ -4509,6 +4528,19 @@ class MemoryService:
             # U7 adds injectable vault candidates here. A missing native index
             # must not skip this scope, because a vault-only mapping has none.
             scope_entries.sort(key=lambda item: item[2].get("updated_at", ""), reverse=True)
+            if scope_val == MemoryScope.PROJECT.value and v1_fixes:
+                # Alias folders can retain an older copy of a key after project
+                # identity becomes canonical. Keep the newest indexed copy so
+                # injection never presents conflicting versions of one fact.
+                deduplicated_entries: list[tuple[Path, str, dict]] = []
+                seen_keys: set[str] = set()
+                for item in scope_entries:
+                    key = item[2]["key"]
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    deduplicated_entries.append(item)
+                scope_entries = deduplicated_entries
 
             scope_memories: list[Memory] = []
             native_entries = (
@@ -5043,4 +5075,4 @@ class MemoryService:
             return ctx
         except Exception as e:
             logger.warning(f"Could not get terminal context for {terminal_id}: {e}")
-            return None
+            raise RuntimeError(f"Could not get terminal context for {terminal_id}") from e

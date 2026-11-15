@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from cli_agent_orchestrator.services.memory_injection import (
     memory_blocks_have_same_body,
@@ -80,6 +81,89 @@ def test_project_injection_reads_recorded_cwd_hash_alias(
     assert service.get_memory_context(ctx, budget_chars=9000) == ""
 
 
+def test_project_injection_keeps_only_newest_copy_across_aliases(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://example.com/acme/widgets.git"],
+        cwd=repo,
+        check=True,
+    )
+    ctx = _ctx(repo)
+    service = MemoryService(base_dir=memory_dir)
+    canonical = service.resolve_scope_id("project", ctx)
+    cwd_hash = hashlib.sha256(os.path.realpath(repo).encode()).hexdigest()[:12]
+    assert canonical != cwd_hash
+
+    legacy_service = MemoryService(base_dir=memory_dir)
+    legacy_service.resolve_scope_id = (  # type: ignore[method-assign]
+        lambda scope, terminal_context: cwd_hash if scope == "project" else None
+    )
+    asyncio.run(
+        legacy_service.store(
+            content="make old-target",
+            scope="project",
+            memory_type="project",
+            key="build-cmd",
+            terminal_context=ctx,
+        )
+    )
+    asyncio.run(
+        service.store(
+            content="make new-target",
+            scope="project",
+            memory_type="project",
+            key="build-cmd",
+            terminal_context=ctx,
+        )
+    )
+
+    block = service.get_memory_context(ctx, budget_chars=9000)
+
+    assert "make new-target" in block
+    assert "make old-target" not in block
+    assert block.count("build-cmd") == 1
+
+
+def test_project_injection_does_not_reparse_machine_wide_indexes(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    ctx = _ctx(repo)
+    service = MemoryService(base_dir=memory_dir)
+    for scope in ("global", "project", "federated"):
+        asyncio.run(
+            service.store(
+                content=f"{scope} note",
+                scope=scope,
+                memory_type="project",
+                key=f"{scope}-note",
+                terminal_context=ctx,
+            )
+        )
+
+    parsed_indexes: list[Path] = []
+    original_parse_index = service._parse_index
+
+    def record_parse(index_path: Path) -> list[dict]:
+        parsed_indexes.append(index_path)
+        return original_parse_index(index_path)
+
+    service._parse_index = record_parse  # type: ignore[method-assign]
+
+    service.get_memory_context(ctx, budget_chars=9000)
+
+    global_index = memory_dir / "global" / "wiki" / "index.md"
+    project_id = service.resolve_scope_id("project", ctx)
+    project_index = memory_dir / str(project_id) / "wiki" / "index.md"
+    federated_index = memory_dir / "federated" / "wiki" / "index.md"
+    assert parsed_indexes.count(global_index) == 2
+    assert parsed_indexes.count(project_index) == 1
+    assert federated_index not in parsed_indexes
+
+
 def test_injection_settings_default_to_hygiene_fixes() -> None:
     from cli_agent_orchestrator.services.settings_service import get_memory_settings
 
@@ -88,6 +172,20 @@ def test_injection_settings_default_to_hygiene_fixes() -> None:
         "v1_fixes": True,
         "write_project_files": False,
     }
+
+
+def test_terminal_context_lookup_failure_is_not_reported_as_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cli_agent_orchestrator.clients import database
+
+    def locked_session():
+        raise OperationalError("SELECT terminals", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(database, "SessionLocal", locked_session)
+
+    with pytest.raises(RuntimeError, match="Could not get terminal context"):
+        MemoryService(base_dir=tmp_path).get_memory_context_for_terminal("worker")
 
 
 def test_idempotency_compares_only_the_uniquely_delimited_managed_block() -> None:
@@ -105,3 +203,18 @@ def test_idempotency_compares_only_the_uniquely_delimited_managed_block() -> Non
 
     assert managed is not None
     assert not memory_blocks_have_same_body(managed, "<cao-memory>SAME</cao-memory>")
+
+
+def test_idempotency_compares_content_after_literal_closing_tag() -> None:
+    existing = (
+        '<cao-memory generated="2000-01-01T00:00:00Z">\n'
+        "Use </cao-memory> literally, then use v1 of the API.\n"
+        "</cao-memory>"
+    )
+    proposed = (
+        '<cao-memory generated="2001-01-01T00:00:00Z">\n'
+        "Use </cao-memory> literally, then use v2 of the API.\n"
+        "</cao-memory>"
+    )
+
+    assert not memory_blocks_have_same_body(existing, proposed)

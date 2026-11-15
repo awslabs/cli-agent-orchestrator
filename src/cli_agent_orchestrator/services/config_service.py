@@ -26,11 +26,12 @@ under the *nested* schema described in issue #357.
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.vault.config import VaultConfig
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite, locked_atomic_write
 
@@ -66,11 +67,23 @@ class LifecycleConfig(BaseModel):
     enabled: bool = False
 
 
+class InjectionConfig(BaseModel):
+    clear_on_empty: bool = True
+    v1_fixes: bool = True
+    write_project_files: bool = False
+
+
+class RankingConfig(BaseModel):
+    default_sort: Literal["recency", "bm25"] = "recency"
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
     explain_enabled: bool = True
     non_accessing_inspection: bool = False
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
+    injection: InjectionConfig = Field(default_factory=InjectionConfig)
+    ranking: RankingConfig = Field(default_factory=RankingConfig)
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
@@ -460,6 +473,20 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "memory":
         if key == "lifecycle.enabled":
             return settings_service.is_memory_lifecycle_enabled()
+        if key.startswith("injection."):
+            injection_key = key.split(".", 1)[1]
+            if injection_key not in settings_service.MEMORY_INJECTION_DEFAULTS:
+                raise KeyError(path)
+            injection = settings_service.get_memory_settings().get("injection", {})
+            injection_default = settings_service.MEMORY_INJECTION_DEFAULTS[injection_key]
+            return (
+                injection.get(injection_key, injection_default)
+                if isinstance(injection, dict)
+                else injection_default
+            )
+        if key == "ranking.default_sort":
+            ranking = settings_service.get_memory_settings().get("ranking", {})
+            return ranking.get("default_sort", default) if isinstance(ranking, dict) else default
         if key == "enabled":
             return settings_service.is_memory_enabled()
         if key == "lint_enabled":
@@ -621,6 +648,7 @@ def _set_keep_finished_value(path: str, value: Any) -> Any:
 
 _ALL_PATHS = sorted(
     set(_PATH_TO_ENV.keys())
+    | {f"memory.injection.{key}" for key in settings_service.MEMORY_INJECTION_DEFAULTS}
     | {
         "agents.dirs",
         "agents.extra_dirs",
@@ -636,6 +664,7 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "memory.ranking.default_sort",
         "memory.vault",
         "terminal.keep_finished.enabled",
         "terminal.keep_finished.idle_window_minutes",
@@ -724,6 +753,15 @@ class ConfigService:
                 explain_enabled=settings_service.is_memory_explain_enabled(),
                 non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
                 lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
+                injection=InjectionConfig(
+                    **{
+                        key: _get_value(f"memory.injection.{key}", default=default)
+                        for key, default in settings_service.MEMORY_INJECTION_DEFAULTS.items()
+                    }
+                ),
+                ranking=RankingConfig(
+                    default_sort=_get_value("memory.ranking.default_sort", default="recency")
+                ),
                 lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),
